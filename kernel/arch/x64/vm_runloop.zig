@@ -340,16 +340,10 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
     // test 09). Skip the wide reads and leave `wide_state_valid=false`
     // so `applyReplyStateToVcpu` keeps `arch_state.started=false` and
     // the next enterGuest stays on the synthetic-exit fallback.
-    // Bound-check only applies when rsp lies *within* the receiver's
-    // user_stack range. Receivers like hyprvOS redirect rsp at a static
-    // data-segment buffer (`vm_exit_buf`) for the syscall — that pointer
-    // is not on the user_stack at all and does not need the
-    // close-to-top guard. Skip the wide read only if rsp+416 would
-    // overrun the actual stack top, i.e. rsp is in [base, top) and the
-    // remaining headroom is < WIDE_VREG_END_OFF.
     if (receiver.user_stack) |us| {
-        const on_stack = rsp >= us.base.addr and rsp < us.top.addr;
-        if (on_stack and rsp +% WIDE_VREG_END_OFF > us.top.addr) return snap;
+        if (rsp +% WIDE_VREG_END_OFF > us.top.addr) return snap;
+    } else {
+        return snap;
     }
 
     cpu_dispatch.userAccessBegin();
