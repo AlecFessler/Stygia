@@ -1,5 +1,5 @@
 -- ============================================================================
--- callgraph oracle DB schema
+-- callgraph DB schema
 -- One file per (arch, commit_sha). Immutable build artifact, no migrations.
 -- Built by the kernel build pipeline; consumed by HTTP/MCP frontends and
 -- analyzer tools (genlock, dead_code, ...) that write findings into

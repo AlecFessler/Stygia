@@ -1,5 +1,5 @@
 //! Minimal SQLite C-API wrapper for the dead-code analyzer.
-//! Read-only access to the per-(arch, commit_sha) oracle DB.
+//! Read-only access to the per-(arch, commit_sha) callgraph DB.
 
 const std = @import("std");
 

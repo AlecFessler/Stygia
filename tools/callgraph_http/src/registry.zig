@@ -38,7 +38,7 @@ pub const Registry = struct {
     /// supported by the SQL backend yet — falls through to /api/* error).
     commits: std.StringHashMap(CommitEntry),
     /// Default sha pointed at on startup. Picked as the lex-largest sha
-    /// in the discovery walk so each `oracle_http` invocation has a
+    /// in the discovery walk so each `callgraph_http` invocation has a
     /// deterministic "default" without us depending on filesystem mtime.
     /// Empty when no DBs were discovered.
     default_sha: []const u8,

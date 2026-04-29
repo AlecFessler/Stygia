@@ -1,5 +1,5 @@
 //! Minimal SQLite C-API wrapper for the genlock analyzer. Mirrors the
-//! shape used by tools/oracle_http/src/sqlite.zig and tools/indexer/src/
+//! shape used by tools/callgraph_http/src/sqlite.zig and tools/indexer/src/
 //! sqlite.zig — kept local so the analyzer is a self-contained binary
 //! with no module deps beyond the system libsqlite3.
 

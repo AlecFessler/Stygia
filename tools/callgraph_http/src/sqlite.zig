@@ -2,7 +2,7 @@
 //!
 //! We use the system libsqlite3 directly rather than depending on a
 //! third-party Zig binding so the project has zero non-system dependencies
-//! and tracks Zig 0.15 cleanly. Surfaces only the calls the oracle frontend
+//! and tracks Zig 0.15 cleanly. Surfaces only the calls the callgraph frontend
 //! needs: open, prepare, bind, step, column readers, exec, finalize, close.
 
 const std = @import("std");

@@ -1,5 +1,5 @@
--- Seed test data for oracle_http. Builds a tiny but plausibly-shaped
--- callgraph oracle DB so every endpoint can return non-empty results
+-- Seed test data for callgraph_http. Builds a tiny but plausibly-shaped
+-- callgraph DB so every endpoint can return non-empty results
 -- before the real indexer is wired up.
 --
 -- Apply against an empty schema:

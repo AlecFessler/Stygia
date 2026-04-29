@@ -1,7 +1,7 @@
 .{
-    .name = .oracle_http,
+    .name = .callgraph_http,
     .version = "0.1.0",
-    .fingerprint = 0x573b86c4501f0bfa,
+    .fingerprint = 0x706b764fd48fe05b,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{},
     .paths = .{

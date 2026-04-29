@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Smoke test for oracle_http: starts the daemon against the per-(arch,
+# Smoke test for callgraph_http: starts the daemon against the per-(arch,
 # commit_sha) DB, hits every public endpoint, and asserts each response
 # is non-empty and contains an expected substring. Exits non-zero on
 # the first failure (other endpoints still attempted; final tally
 # determines exit code).
 #
 # Usage:
-#   tools/oracle_http/test/smoke.sh                 # uses default DB dir
-#   tools/oracle_http/test/smoke.sh /path/to/db     # explicit DB file
+#   tools/callgraph_http/test/smoke.sh                 # uses default DB dir
+#   tools/callgraph_http/test/smoke.sh /path/to/db     # explicit DB file
 #
 # This script expects a real DB built by tools/indexer (not the legacy
 # seed.sql stub). If the DB is missing the script tells you how to
@@ -17,18 +17,18 @@ set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ZAG_ROOT="$(cd -- "$HERE/../../.." && pwd)"
-PORT="${ORACLE_HTTP_PORT:-18190}"
+PORT="${CALLGRAPH_HTTP_PORT:-18190}"
 
 if [[ $# -ge 1 ]]; then
     DB_PATH="$1"
     DB_DIR="$(dirname "$DB_PATH")"
 else
-    DB_DIR="$ZAG_ROOT/tools/oracle_http/test/dbs"
+    DB_DIR="$ZAG_ROOT/tools/callgraph_http/test/dbs"
     DB_PATH="$(ls "$DB_DIR"/x86_64-*.db 2>/dev/null | head -1 || true)"
 fi
 
 if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
-    echo "smoke: no oracle DB found." >&2
+    echo "smoke: no callgraph DB found." >&2
     echo "  build one with: bash tests/test.sh dead-code  (or run the indexer manually)" >&2
     exit 2
 fi
@@ -36,16 +36,16 @@ fi
 HEAD_SHA="$(cd "$ZAG_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
 DB_SHA="$(sqlite3 "$DB_PATH" "SELECT value FROM meta WHERE key='commit_sha'" 2>/dev/null || echo unknown)"
 
-ORACLE_BIN="$ZAG_ROOT/tools/oracle_http/zig-out/bin/oracle_http"
-if [[ ! -x "$ORACLE_BIN" ]]; then
-    (cd "$ZAG_ROOT/tools/oracle_http" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
+CALLGRAPH_BIN="$ZAG_ROOT/tools/callgraph_http/zig-out/bin/callgraph_http"
+if [[ ! -x "$CALLGRAPH_BIN" ]]; then
+    (cd "$ZAG_ROOT/tools/callgraph_http" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 echo "smoke: DB=$DB_PATH (sha=$DB_SHA)"
 echo "       repo HEAD=$HEAD_SHA"
 echo "       port=$PORT"
 
-"$ORACLE_BIN" --db-dir "$DB_DIR" --port "$PORT" --git-root "$ZAG_ROOT" >/tmp/oracle_http_smoke.log 2>&1 &
+"$CALLGRAPH_BIN" --db-dir "$DB_DIR" --port "$PORT" --git-root "$ZAG_ROOT" >/tmp/callgraph_http_smoke.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
@@ -110,6 +110,6 @@ echo
 total=$((ok + fail))
 echo "smoke: $ok / $total endpoints OK"
 if [[ $fail -gt 0 ]]; then
-    echo "       (server log at /tmp/oracle_http_smoke.log)"
+    echo "       (server log at /tmp/callgraph_http_smoke.log)"
     exit 1
 fi

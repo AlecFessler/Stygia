@@ -95,7 +95,7 @@ zig build -Darch=arm -Dprofile=test
 
 All under [`tools/`](tools/). Each builds with `zig build` from its own directory.
 
-### oracle DB — indexed callgraph + analyzer pipeline
+### callgraph DB — indexed callgraph + analyzer pipeline
 
 The kernel is indexed into a per-(arch, commit_sha) SQLite DB built by [`tools/indexer/`](tools/indexer/) and queried by two daemons. The DB carries entities, ir_calls, AST, entry points, alias chains, type refs, binary symbols + disasm + DWARF lines, and analyzer findings — one schema, every consumer.
 
@@ -109,15 +109,15 @@ tools/indexer/zig-out/bin/indexer \
     --kernel-root kernel \
     --extra-source-root routerOS --extra-source-root hyprvOS \
     --extra-source-root bootloader --extra-source-root tools --extra-source-root tests \
-    --out tools/oracle_http/test/dbs/x86_64-$(git rev-parse --short HEAD).db \
+    --out tools/callgraph_http/test/dbs/x86_64-$(git rev-parse --short HEAD).db \
     --arch x86_64 --commit-sha $(git rev-parse HEAD) \
     --ir zig-out/kernel.x86_64.ll --elf zig-out/bin/kernel.elf
 
 # Then either daemon — both auto-discover DBs in their --db-dir:
-cd tools/oracle_http && zig build && ./zig-out/bin/oracle_http \
-    --db-dir ../oracle_http/test/dbs --port 8080   # HTTP API + browser UI
-cd tools/oracle_mcp  && zig build && ./zig-out/bin/oracle_mcp \
-    --db-dir ../oracle_http/test/dbs               # stdio MCP server
+cd tools/callgraph_http && zig build && ./zig-out/bin/callgraph_http \
+    --db-dir ../callgraph_http/test/dbs --port 8080   # HTTP API + browser UI
+cd tools/callgraph_mcp  && zig build && ./zig-out/bin/callgraph_mcp \
+    --db-dir ../callgraph_http/test/dbs               # stdio MCP server
 ```
 
 The MCP server speaks the production callgraph_* tool surface (callgraph_trace, callgraph_callers, callgraph_findings, ...). The HTTP server has the matching /api/* routes plus a graph view, source/diff endpoints, and `/api/findings` for analyzer output.
