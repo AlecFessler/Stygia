@@ -672,6 +672,15 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // No EOI needed for spurious interrupts.
     if (gic.isSpurious(intid)) return;
 
+    // For level-sensitive timer PPIs (CNTV/CNTP, INTID 27/30), the GIC
+    // line stays asserted as long as ISTATUS=1. Issuing EOI without
+    // first masking the timer (IMASK=1) causes the GIC to immediately
+    // re-mark the interrupt as pending, which then fires the moment the
+    // CPU's I-mask drops on ERET — robbing the next dispatched EC of
+    // its full timeslice. ARM ARM D11.2.4 + D13.8.20/D13.8.11 + IHI
+    // 0048B §3.2 (level-sensitive PPI delivery).
+    silenceTimerLineIfFiring(intid);
+
     // EOI must be issued BEFORE dispatchIrq because the timer / scheduler
     // IPI paths can call `scheduler.switchTo`, which is `noreturn` and
     // ERETs to a different thread. Anything queued after dispatchIrq is
@@ -680,6 +689,36 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // same priority (IHI 0069H §4.6: an active interrupt blocks pending).
     gic.endOfInterrupt(intid);
     dispatchIrq(intid, ctx, .user);
+}
+
+/// Mask CNTP/CNTV at the source if their ISTATUS is asserted. Called
+/// before EOI so the level-sensitive PPI line de-asserts at the GIC
+/// before EOI clears the active bit — preventing an immediate re-pend
+/// that would steal the next EC's timeslice. The matching unmask
+/// (IMASK=0) is performed by `armInterruptTimer` writing CNTV_CTL=0x1
+/// in the dispatch case 27,30 path.
+fn silenceTimerLineIfFiring(intid: u32) void {
+    if (intid != 27 and intid != 30) return;
+    var cntp_ctl: u64 = undefined;
+    var cntv_ctl: u64 = undefined;
+    asm volatile ("mrs %[v], cntp_ctl_el0"
+        : [v] "=r" (cntp_ctl),
+    );
+    asm volatile ("mrs %[v], cntv_ctl_el0"
+        : [v] "=r" (cntv_ctl),
+    );
+    if ((cntp_ctl & 0x4) != 0) {
+        asm volatile ("msr cntp_ctl_el0, %[val]"
+            :
+            : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+        );
+    }
+    if ((cntv_ctl & 0x4) != 0) {
+        asm volatile ("msr cntv_ctl_el0, %[val]"
+            :
+            : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+        );
+    }
 }
 
 /// Handler for synchronous exceptions from Current EL (kernel-mode).
@@ -738,6 +777,10 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     const intid = gic.acknowledgeInterrupt();
 
     if (gic.isSpurious(intid)) return;
+
+    // Silence level-sensitive timer PPI line before EOI — see
+    // `handleIrqLowerEl` for rationale.
+    silenceTimerLineIfFiring(intid);
 
     // EOI before dispatch — see handleIrqLowerEl for rationale.
     gic.endOfInterrupt(intid);

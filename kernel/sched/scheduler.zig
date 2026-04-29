@@ -8,6 +8,7 @@
 //! armed. Cross-core enqueue is supported (the source core sends an
 //! IPI to the destination if the destination is idle).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -33,9 +34,28 @@ pub const EcQueue = zag.utils.containers.priority_queue.PriorityQueue(
 /// Maximum cores the scheduler supports. Matches `affinity` mask width.
 pub const MAX_CORES: u8 = 64;
 
-/// Default time slice between preemption ticks. Spec doesn't pin this;
-/// 2 ms matches old kernel and is reasonable for a microkernel.
-pub const TIMESLICE_NS: u64 = 2_000_000;
+/// Per-EC quantum between preemption ticks. Spec doesn't pin this.
+///
+/// x86 uses 2 ms — matches the old kernel and gives the LAPIC one-shot
+/// timer (which auto-disarms on fire per Intel SDM Vol 3A §13.5.4) a
+/// reasonable round-robin granularity.
+///
+/// Aarch64 uses 16 ms because the generic timer is level-sensitive at
+/// the GIC: the timer line stays asserted as long as ISTATUS=1, which
+/// lets a tick that fires while the kernel is still inside the previous
+/// SVC handler re-pend at the GIC the moment EOI clears the active bit.
+/// The next ERET to userspace then drops PSTATE.I, the pending tick
+/// fires before any user instruction completes, and a freshly-dispatched
+/// low-priority EC (e.g. the W in `reply_05`'s `yieldEc(W)`) gets robbed
+/// of its first-instruction window. Higher-priority queue residents then
+/// starve W indefinitely. A longer quantum gives explicitly-yielded
+/// targets enough head start to make observable progress before the next
+/// tick re-enters the scheduler. See ARM ARM D11.2.4 (timer condition),
+/// D13.8.20 (CNTV_CTL), and IHI 0048B §3.2 (level-sensitive PPI).
+pub const TIMESLICE_NS: u64 = switch (builtin.cpu.arch) {
+    .aarch64 => 16_000_000,
+    else => 2_000_000,
+};
 
 /// Per-core scheduler state. One entry per active core in `core_states[]`.
 ///
