@@ -1319,7 +1319,7 @@ pub fn handleTrace(
 // ── /api/commits ──────────────────────────────────────────────────────────
 // Output formats (text + JSON) match the legacy callgraph daemon byte for
 // byte so any shell scripts the user wrote against /api/commits keep
-// working when they switch to oracle_http.
+// working when they switch to callgraph_http.
 
 pub fn handleCommits(
     allocator: std.mem.Allocator,

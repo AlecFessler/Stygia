@@ -13,11 +13,11 @@ const tools = @import("tools.zig");
 
 const PROTOCOL_VERSION = "2024-11-05";
 
-const SERVER_INFO_JSON = "{\"name\":\"oracle-mcp\",\"version\":\"0.1.0\"}";
+const SERVER_INFO_JSON = "{\"name\":\"callgraph-mcp\",\"version\":\"0.1.0\"}";
 const CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
 
 const INSTRUCTIONS =
-    "Callgraph oracle for the Zag kernel — SQLite-backed view over " ++
+    "Callgraph index for the Zag kernel — SQLite-backed view over " ++
     "the per-(arch, commit_sha) DB built by tools/indexer. Provides " ++
     "structured queries over entities, ir_calls, entry points, AST, " ++
     "binaries, DWARF lines, and analyzer findings (lint_finding). " ++
@@ -26,7 +26,7 @@ const INSTRUCTIONS =
 
 const TOOLS_JSON =
     \\[
-    \\  {"name":"callgraph_arches","description":"List (arch, commit_sha) for every loaded oracle DB.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+    \\  {"name":"callgraph_arches","description":"List (arch, commit_sha) for every loaded callgraph DB.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
     \\  {"name":"callgraph_find","description":"FTS5 substring search over entity.qualified_name. Returns name + kind + file:line.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer"}},"required":["q"],"additionalProperties":false}},
     \\  {"name":"callgraph_loc","description":"Definition location for one function: path:def_line:def_col, with [inlined] when is_ast_only=1.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
     \\  {"name":"callgraph_src","description":"Function body sliced from file.source via def_byte_start..def_byte_end.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}},
@@ -80,7 +80,7 @@ pub fn run(gpa: std.mem.Allocator, registry: *tools.Registry) !void {
         if (line.len == 0) continue;
 
         handleMessage(gpa, registry, out, line) catch |err| {
-            std.debug.print("oracle mcp handler error: {s}\n", .{@errorName(err)});
+            std.debug.print("callgraph mcp handler error: {s}\n", .{@errorName(err)});
         };
         try out.flush();
     }
@@ -97,7 +97,7 @@ fn handleMessage(
     const al = arena.allocator();
 
     const parsed = std.json.parseFromSlice(std.json.Value, al, line, .{}) catch |err| {
-        std.debug.print("oracle mcp parse error: {s}: {s}\n", .{ @errorName(err), line });
+        std.debug.print("callgraph mcp parse error: {s}: {s}\n", .{ @errorName(err), line });
         return;
     };
     defer parsed.deinit();

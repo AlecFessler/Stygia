@@ -1,7 +1,7 @@
--- Hand-INSERT test fixture for oracle_mcp until the real indexer ships.
+-- Hand-INSERT test fixture for callgraph_mcp until the real indexer ships.
 -- Apply with:
---   sqlite3 /tmp/oracle.db < tools/indexer/schema.sql
---   sqlite3 /tmp/oracle.db < tools/oracle_mcp/test/seed.sql
+--   sqlite3 /tmp/callgraph.db < tools/indexer/schema.sql
+--   sqlite3 /tmp/callgraph.db < tools/callgraph_mcp/test/seed.sql
 
 BEGIN;
 

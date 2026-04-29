@@ -84,8 +84,8 @@ pub fn build(b: *std.Build) void {
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
     const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (consumed by tools/indexer)") orelse false;
-    const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) oracle SQLite DB to tools/oracle_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
-    const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the oracle DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
+    const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) callgraph SQLite DB to tools/callgraph_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
+    const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the callgraph DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
     if (!std.mem.eql(u8, kernel_profile, "none") and
         !std.mem.eql(u8, kernel_profile, "trace") and
@@ -326,8 +326,8 @@ pub fn build(b: *std.Build) void {
     if (emit_index) {
         // Run the indexer (must already be built — `cd tools/indexer && zig
         // build` once before invoking this) against the just-installed
-        // kernel ELF + IR. Output `.db` lands in tools/oracle_http/test/dbs/
-        // where the oracle daemons auto-discover it.
+        // kernel ELF + IR. Output `.db` lands in tools/callgraph_http/test/dbs/
+        // where the callgraph daemons auto-discover it.
         //
         // We can't bootstrap the indexer's own zig build from here without
         // tripping option-forwarding (the parent `-Dprofile=test
@@ -335,7 +335,7 @@ pub fn build(b: *std.Build) void {
         // they're invalid). Keep them as separate, explicit zig invocations.
         const installed_ir = b.fmt("{s}/kernel.{s}.ll", .{ b.install_path, @tagName(arch) });
         const installed_elf = b.fmt("{s}/{s}/{s}", .{ b.install_path, out_dir, kernel.name });
-        const db_dir = b.path("tools/oracle_http/test/dbs").getPath(b);
+        const db_dir = b.path("tools/callgraph_http/test/dbs").getPath(b);
         const db_filename = b.fmt("{s}-{s}.db", .{ @tagName(arch), commit_sha });
         const db_out = b.fmt("{s}/{s}", .{ db_dir, db_filename });
         const run_indexer = b.addSystemCommand(&.{
@@ -354,7 +354,7 @@ pub fn build(b: *std.Build) void {
         });
         run_indexer.step.dependOn(&install_kernel.step);
         if (maybe_install_ir) |ir| run_indexer.step.dependOn(&ir.step);
-        const index_step = b.step("index", "Run the oracle DB indexer after the kernel build (requires `cd tools/indexer && zig build` and -Demit_index=true)");
+        const index_step = b.step("index", "Run the callgraph DB indexer after the kernel build (requires `cd tools/indexer && zig build` and -Demit_index=true)");
         index_step.dependOn(&run_indexer.step);
     }
 

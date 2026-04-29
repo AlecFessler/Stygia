@@ -1,6 +1,6 @@
 //! Static analyzer for SecureSlab gen-lock coverage / scoping.
 //!
-//! Oracle-DB consumer: reads tokens, AST, entities, and entry_point rows
+//! Callgraph-DB consumer: reads tokens, AST, entities, and entry_point rows
 //! from a per-(arch, commit_sha) DB built by `tools/indexer`. Six checks:
 //!
 //!   1. Slab-backed type discovery — entity.is_slab_backed = 1.
@@ -1871,14 +1871,14 @@ fn parseArgs(gpa: Allocator) !Args {
 
 fn printHelp(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\Usage: check_gen_lock --db <oracle.db> [options]
+        \\Usage: check_gen_lock --db <callgraph.db> [options]
         \\
         \\SQL-backed gen-lock analyzer. Reads tokens, AST, entities, entry
         \\points, and ir_call from the per-(arch, commit_sha) DB built by
         \\tools/indexer.
         \\
         \\Options:
-        \\  --db PATH             oracle DB path (required)
+        \\  --db PATH             callgraph DB path (required)
         \\  --summary             one line per entry with finding counts
         \\  --verbose, -v         per-ident access and lock-op summary
         \\  --entry NAME          drill into a single handler

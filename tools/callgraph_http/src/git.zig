@@ -1,10 +1,10 @@
-//! Git plumbing helpers shared across the oracle daemons. These run
+//! Git plumbing helpers shared across the callgraph daemons. These run
 //! `git -C <git_root> ...` shellouts; they do NOT touch any DB. The new
-//! oracle pipeline produces `.db` files offline, so commit-loading is a
+//! callgraph pipeline produces `.db` files offline, so commit-loading is a
 //! presence check rather than a build orchestration step.
 //!
-//! Duplicated under both `tools/oracle_http/src/` and
-//! `tools/oracle_mcp/src/` because the daemons are separate executables
+//! Duplicated under both `tools/callgraph_http/src/` and
+//! `tools/callgraph_mcp/src/` because the daemons are separate executables
 //! and we want each to compile without reaching out of its own directory.
 
 const std = @import("std");

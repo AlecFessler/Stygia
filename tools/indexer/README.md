@@ -1,4 +1,4 @@
-# callgraph oracle indexer
+# callgraph indexer
 
 Builds a SQLite database that captures the full structural state of a kernel
 build — tokens, AST, pre-optimization LLVM IR + callgraph, DWARF, disassembly,

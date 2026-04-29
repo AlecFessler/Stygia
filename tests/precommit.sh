@@ -67,17 +67,17 @@ stage_arch_layering_lint() {
     return 1
 }
 
-# Build the per-(arch, commit_sha) oracle DB if it isn't present yet.
+# Build the per-(arch, commit_sha) callgraph DB if it isn't present yet.
 # Both the dead-code analyzer and the gen-lock analyzer read from it.
-ensure_oracle_db() {
+ensure_callgraph_db() {
     if ! (cd "$ZAG_ROOT/tools/indexer" && zig build 2>&1); then
-        FAILURES+=("oracle indexer build")
+        FAILURES+=("callgraph indexer build")
         return 1
     fi
     local sha
     sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
-    ORACLE_DB="$ZAG_ROOT/tools/oracle_http/test/dbs/x86_64-${sha}.db"
-    if [[ -f "$ORACLE_DB" ]]; then return 0; fi
+    CALLGRAPH_DB="$ZAG_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
+    if [[ -f "$CALLGRAPH_DB" ]]; then return 0; fi
     # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
     # build left an ARM ELF in zig-out/, the indexer's objdump pass would
     # fail silently and produce an empty bin_inst table.
@@ -102,12 +102,12 @@ ensure_oracle_db() {
         --extra-source-root bootloader \
         --extra-source-root tools \
         --extra-source-root tests \
-        --out "$ORACLE_DB" \
+        --out "$CALLGRAPH_DB" \
         --arch x86_64 \
         --commit-sha "$(git rev-parse HEAD)" \
         --ir zig-out/kernel.x86_64.ll \
         --elf zig-out/bin/kernel.elf 2>&1); then
-        FAILURES+=("oracle DB build")
+        FAILURES+=("callgraph DB build")
         return 1
     fi
 }
@@ -125,34 +125,34 @@ stage_dead_code_report() {
         FAILURES+=("dead-code fixture suite")
         return 1
     fi
-    ensure_oracle_db || return 1
+    ensure_callgraph_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$ORACLE_DB" --target kernel); then
+    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel); then
         FAILURES+=("dead-code findings")
         return 1
     fi
 }
 
-stage_oracle_smokes() {
+stage_callgraph_smokes() {
     echo ""
     echo "=================================================="
-    echo "[0d] Oracle HTTP + MCP smoke (per-commit DB)"
+    echo "[0d] Callgraph HTTP + MCP smoke (per-commit DB)"
     echo "=================================================="
-    if ! (cd "$ZAG_ROOT/tools/oracle_http" && zig build 2>&1); then
-        FAILURES+=("oracle_http build")
+    if ! (cd "$ZAG_ROOT/tools/callgraph_http" && zig build 2>&1); then
+        FAILURES+=("callgraph_http build")
         return 1
     fi
-    if ! (cd "$ZAG_ROOT/tools/oracle_mcp" && zig build 2>&1); then
-        FAILURES+=("oracle_mcp build")
+    if ! (cd "$ZAG_ROOT/tools/callgraph_mcp" && zig build 2>&1); then
+        FAILURES+=("callgraph_mcp build")
         return 1
     fi
-    ensure_oracle_db || return 1
-    if ! bash "$ZAG_ROOT/tools/oracle_http/test/smoke.sh" "$ORACLE_DB"; then
-        FAILURES+=("oracle_http smoke")
+    ensure_callgraph_db || return 1
+    if ! bash "$ZAG_ROOT/tools/callgraph_http/test/smoke.sh" "$CALLGRAPH_DB"; then
+        FAILURES+=("callgraph_http smoke")
         return 1
     fi
-    if ! bash "$ZAG_ROOT/tools/oracle_mcp/test/smoke.sh" "$ORACLE_DB"; then
-        FAILURES+=("oracle_mcp smoke")
+    if ! bash "$ZAG_ROOT/tools/callgraph_mcp/test/smoke.sh" "$CALLGRAPH_DB"; then
+        FAILURES+=("callgraph_mcp smoke")
         return 1
     fi
 }
@@ -166,9 +166,9 @@ stage_gen_lock_analyzer() {
         FAILURES+=("gen-lock analyzer build")
         return 1
     fi
-    ensure_oracle_db || return 1
+    ensure_callgraph_db || return 1
     local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
-    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$ORACLE_DB" --summary); then
+    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --summary); then
         FAILURES+=("gen-lock analyzer findings")
         return 1
     fi
@@ -390,7 +390,7 @@ stage_kernel_perf() {
 stage_arch_layering_lint        || true
 stage_dead_code_report          || true
 stage_gen_lock_analyzer         || true
-stage_oracle_smokes             || true
+stage_callgraph_smokes          || true
 stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true

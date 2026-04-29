@@ -1,4 +1,4 @@
-//! Tool dispatch for the oracle MCP daemon. Each `callgraph_*` handler
+//! Tool dispatch for the callgraph MCP daemon. Each `callgraph_*` handler
 //! issues SQL queries against an open SQLite DB matching tools/indexer/schema.sql.
 //!
 //! The registry holds one open Db per (arch, commit_sha) DB file the daemon
@@ -853,7 +853,7 @@ pub const Registry = struct {
         });
     }
 
-    /// `callgraph_commits` — output identical to oracle_http's
+    /// `callgraph_commits` — output identical to callgraph_http's
     /// `/api/commits?format=text`. Shells out to `git log` against
     /// `self.git_root` and decorates the output with `[stale]` markers.
     fn toolCommits(self: *Registry, al: std.mem.Allocator, args: std.json.Value, out: *std.ArrayList(u8)) !void {

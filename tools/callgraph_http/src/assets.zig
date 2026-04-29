@@ -1,5 +1,5 @@
 //! Static frontend assets, embedded at compile time. Lives in
-//! tools/oracle_http/src/assets/ directly (vendored at the cutover
+//! tools/callgraph_http/src/assets/ directly (vendored at the cutover
 //! when the legacy tools/callgraph/ in-memory daemon was removed).
 
 pub const index_html = @embedFile("assets/index.html");

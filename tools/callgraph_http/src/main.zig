@@ -1,4 +1,4 @@
-//! oracle_http — SQL-backed HTTP server for the kernel callgraph oracle.
+//! callgraph_http — SQL-backed HTTP server for the kernel callgraph index.
 //!
 //! Drop-in replacement for the in-memory `tools/callgraph/src/server.zig`:
 //! same routes, same response shapes, same web UI assets. Reads from
@@ -52,9 +52,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
 
 fn printHelp() !void {
     std.debug.print(
-        \\oracle_http — SQL-backed callgraph oracle daemon
+        \\callgraph_http — SQL-backed callgraph daemon
         \\
-        \\Usage: oracle_http [options]
+        \\Usage: callgraph_http [options]
         \\
         \\  --db-dir PATH    Directory to scan for <arch>-<sha>.db files
         \\                   (default: ./test/dbs)
@@ -93,7 +93,7 @@ pub fn main() !void {
     const addr = try std.net.Address.parseIp("127.0.0.1", args.port);
     var net_server = try addr.listen(.{ .reuse_address = true });
     defer net_server.deinit();
-    std.debug.print("oracle_http listening on http://127.0.0.1:{d}\n", .{args.port});
+    std.debug.print("callgraph_http listening on http://127.0.0.1:{d}\n", .{args.port});
 
     var recv_buffer: [16 * 1024]u8 = undefined;
     var send_buffer: [16 * 1024]u8 = undefined;
@@ -191,7 +191,7 @@ fn handleRequest(
             request,
             .not_implemented,
             "text/plain; charset=utf-8",
-            "review endpoints are out of scope for oracle_http\n",
+            "review endpoints are out of scope for callgraph_http\n",
         );
     }
 

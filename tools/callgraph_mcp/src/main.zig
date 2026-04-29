@@ -1,7 +1,7 @@
-//! Oracle MCP daemon entry point.
+//! Callgraph MCP daemon entry point.
 //!
 //! CLI:
-//!   --db <path>        open a single oracle DB file
+//!   --db <path>        open a single callgraph DB file
 //!   --db-dir <dir>     pick the newest *.db in <dir> (by mtime)
 //!   --git-root <dir>   repo root for git-plumbing tools
 //!                      (`callgraph_commits`); defaults to CWD
@@ -51,7 +51,7 @@ pub fn main() !void {
             git_root_owned = dup;
             git_root = dup;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            std.debug.print("oracle_mcp --db <path> | --db-dir <dir> [--git-root <dir>]\n", .{});
+            std.debug.print("callgraph_mcp --db <path> | --db-dir <dir> [--git-root <dir>]\n", .{});
             return;
         } else {
             std.debug.print("unknown arg: {s}\n", .{arg});

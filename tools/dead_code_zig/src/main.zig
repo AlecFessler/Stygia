@@ -1,4 +1,4 @@
-//! Dead-code analyzer over the per-(arch, commit_sha) oracle DB.
+//! Dead-code analyzer over the per-(arch, commit_sha) callgraph DB.
 //!
 //! Replaces the prior token-walking analyzer with a thin SQL client. The
 //! indexer already encodes every piece of structural information the prior
@@ -801,7 +801,7 @@ pub fn main() !void {
             _ = stdout.write(
                 \\usage: dead_code_zig --db <path> [--target <name>] [--skip <path>] [--update-skip <rel>:<start>-<end>]
                 \\
-                \\Reads the per-(arch, commit_sha) oracle DB and reports unused decls in the target dir.
+                \\Reads the per-(arch, commit_sha) callgraph DB and reports unused decls in the target dir.
                 \\
             ) catch {};
             std.process.exit(0);
@@ -927,8 +927,8 @@ pub fn main() !void {
 
     const skip_errors = try reportSkipDiagnostics();
 
-    // Persist findings into lint_finding so downstream tooling (oracle_http
-    // /api/findings, oracle_mcp callgraph_findings, CI dashboards) can
+    // Persist findings into lint_finding so downstream tooling (callgraph_http
+    // /api/findings, callgraph_mcp callgraph_findings, CI dashboards) can
     // query them by SQL. We close the read-only handle and re-open R/W to
     // write the rows; SQLite WAL mode allows concurrent readers.
     db.close();

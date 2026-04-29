@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Smoke test for oracle_mcp: speaks JSON-RPC over stdio, exercises every
+# Smoke test for callgraph_mcp: speaks JSON-RPC over stdio, exercises every
 # `callgraph_*` tool, asserts each returns a result (not an error).
 #
 # Usage:
-#   tools/oracle_mcp/test/smoke.sh                # uses default DB dir
-#   tools/oracle_mcp/test/smoke.sh /path/to/db    # explicit DB file
+#   tools/callgraph_mcp/test/smoke.sh                # uses default DB dir
+#   tools/callgraph_mcp/test/smoke.sh /path/to/db    # explicit DB file
 
 set -uo pipefail
 
@@ -14,18 +14,18 @@ ZAG_ROOT="$(cd -- "$HERE/../../.." && pwd)"
 if [[ $# -ge 1 ]]; then
     DB_PATH="$1"
 else
-    DB_PATH="$(ls "$ZAG_ROOT"/tools/oracle_http/test/dbs/x86_64-*.db 2>/dev/null | head -1 || true)"
+    DB_PATH="$(ls "$ZAG_ROOT"/tools/callgraph_http/test/dbs/x86_64-*.db 2>/dev/null | head -1 || true)"
 fi
 
 if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
-    echo "smoke: no oracle DB found." >&2
+    echo "smoke: no callgraph DB found." >&2
     echo "  build one with: bash tests/test.sh dead-code  (or run the indexer manually)" >&2
     exit 2
 fi
 
-ORACLE_BIN="$ZAG_ROOT/tools/oracle_mcp/zig-out/bin/oracle_mcp"
-if [[ ! -x "$ORACLE_BIN" ]]; then
-    (cd "$ZAG_ROOT/tools/oracle_mcp" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
+CALLGRAPH_BIN="$ZAG_ROOT/tools/callgraph_mcp/zig-out/bin/callgraph_mcp"
+if [[ ! -x "$CALLGRAPH_BIN" ]]; then
+    (cd "$ZAG_ROOT/tools/callgraph_mcp" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 DB_SHA="$(sqlite3 "$DB_PATH" "SELECT value FROM meta WHERE key='commit_sha'" 2>/dev/null || echo unknown)"
@@ -61,7 +61,7 @@ JSON
 OUT_FILE="$(mktemp)"
 trap 'rm -f "$REQ_FILE" "$OUT_FILE"' EXIT
 
-"$ORACLE_BIN" --db "$DB_PATH" --git-root "$ZAG_ROOT" < "$REQ_FILE" > "$OUT_FILE" 2>/tmp/oracle_mcp_smoke.err
+"$CALLGRAPH_BIN" --db "$DB_PATH" --git-root "$ZAG_ROOT" < "$REQ_FILE" > "$OUT_FILE" 2>/tmp/callgraph_mcp_smoke.err
 
 # Tools 1..15: each must have id:N with "result", not "error".
 fail=0
@@ -88,6 +88,6 @@ echo
 total=$((ok + fail))
 echo "smoke: $ok / $total tools OK"
 if [[ $fail -gt 0 ]]; then
-    echo "       (stderr at /tmp/oracle_mcp_smoke.err)"
+    echo "       (stderr at /tmp/callgraph_mcp_smoke.err)"
     exit 1
 fi

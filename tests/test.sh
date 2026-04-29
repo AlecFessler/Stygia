@@ -22,8 +22,8 @@ Targets:
   linux-arm       Boot Linux guest in hyprvOS (aarch64 TCG), verify 'hello from guest'
   genlock         Run gen-lock static analyzer (gates on err-severity findings)
   dead-code       Run dead-code static analyzer (gates on any findings)
-  oracle          Run oracle_http + oracle_mcp smoke tests against the per-commit DB
-  pre-commit      Run genlock + dead-code + oracle + kernel + linux + router (gate before commit)
+  callgraph       Run callgraph_http + callgraph_mcp smoke tests against the per-commit DB
+  pre-commit      Run genlock + dead-code + callgraph + kernel + linux + router (gate before commit)
   perf            Run kernel performance benchmarks (sequential)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
@@ -122,17 +122,17 @@ run_kernel_tests() {
     PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/tests/tests/run_tests.sh"
 }
 
-# Build the per-(arch, commit_sha) oracle DB if it isn't present yet.
+# Build the per-(arch, commit_sha) callgraph DB if it isn't present yet.
 # Both genlock and dead-code analyzers consume it, so we share the build.
-ensure_oracle_db() {
+ensure_callgraph_db() {
     (cd "$SCRIPT_DIR/tools/indexer" && zig build) \
         || { echo "[FAIL] indexer build failed"; return 1; }
 
     local sha
     sha="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD)"
-    ORACLE_DB="$SCRIPT_DIR/tools/oracle_http/test/dbs/x86_64-${sha}.db"
+    CALLGRAPH_DB="$SCRIPT_DIR/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
 
-    if [[ ! -f "$ORACLE_DB" ]]; then
+    if [[ ! -f "$CALLGRAPH_DB" ]]; then
         # Need .ll AND an x86_64-flavored kernel.elf. A previous
         # `-Darch=arm` build leaves an ARM ELF in zig-out/, which would
         # make objdump fail silently in the indexer's stage-4 pass.
@@ -155,12 +155,12 @@ ensure_oracle_db() {
             --extra-source-root bootloader \
             --extra-source-root tools \
             --extra-source-root tests \
-            --out "$ORACLE_DB" \
+            --out "$CALLGRAPH_DB" \
             --arch x86_64 \
             --commit-sha "$(git rev-parse HEAD)" \
             --ir zig-out/kernel.x86_64.ll \
             --elf zig-out/bin/kernel.elf) \
-            || { echo "[FAIL] oracle DB build failed"; return 1; }
+            || { echo "[FAIL] callgraph DB build failed"; return 1; }
     fi
 }
 
@@ -168,8 +168,8 @@ run_genlock_check() {
     echo "=== Gen-lock Static Analyzer ==="
     (cd "$SCRIPT_DIR/tools/check_gen_lock" && zig build) \
         || { echo "[FAIL] check_gen_lock build failed"; return 1; }
-    ensure_oracle_db || return 1
-    (cd "$SCRIPT_DIR" && tools/check_gen_lock/zig-out/bin/check_gen_lock --db "$ORACLE_DB" --summary) \
+    ensure_callgraph_db || return 1
+    (cd "$SCRIPT_DIR" && tools/check_gen_lock/zig-out/bin/check_gen_lock --db "$CALLGRAPH_DB" --summary) \
         || { echo "[FAIL] gen-lock analyzer reported err-severity findings"; return 1; }
     echo "[PASS] gen-lock analyzer clean"
 }
@@ -184,31 +184,31 @@ run_dead_code_check() {
         echo "[FAIL] dead-code fixture suite failed"
         return 1
     fi
-    ensure_oracle_db || return 1
+    ensure_callgraph_db || return 1
     local detector="$SCRIPT_DIR/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$SCRIPT_DIR" && "$detector" --db "$ORACLE_DB" --target kernel); then
+    if ! (cd "$SCRIPT_DIR" && "$detector" --db "$CALLGRAPH_DB" --target kernel); then
         echo "[FAIL] dead-code analyzer findings"
         return 1
     fi
     echo "[PASS] dead-code analyzer clean"
 }
 
-run_oracle_smokes() {
-    echo "=== Oracle HTTP + MCP smoke ==="
-    (cd "$SCRIPT_DIR/tools/oracle_http" && zig build) \
-        || { echo "[FAIL] oracle_http build failed"; return 1; }
-    (cd "$SCRIPT_DIR/tools/oracle_mcp" && zig build) \
-        || { echo "[FAIL] oracle_mcp build failed"; return 1; }
-    ensure_oracle_db || return 1
-    if ! bash "$SCRIPT_DIR/tools/oracle_http/test/smoke.sh" "$ORACLE_DB"; then
-        echo "[FAIL] oracle_http smoke failed"
+run_callgraph_smokes() {
+    echo "=== Callgraph HTTP + MCP smoke ==="
+    (cd "$SCRIPT_DIR/tools/callgraph_http" && zig build) \
+        || { echo "[FAIL] callgraph_http build failed"; return 1; }
+    (cd "$SCRIPT_DIR/tools/callgraph_mcp" && zig build) \
+        || { echo "[FAIL] callgraph_mcp build failed"; return 1; }
+    ensure_callgraph_db || return 1
+    if ! bash "$SCRIPT_DIR/tools/callgraph_http/test/smoke.sh" "$CALLGRAPH_DB"; then
+        echo "[FAIL] callgraph_http smoke failed"
         return 1
     fi
-    if ! bash "$SCRIPT_DIR/tools/oracle_mcp/test/smoke.sh" "$ORACLE_DB"; then
-        echo "[FAIL] oracle_mcp smoke failed"
+    if ! bash "$SCRIPT_DIR/tools/callgraph_mcp/test/smoke.sh" "$CALLGRAPH_DB"; then
+        echo "[FAIL] callgraph_mcp smoke failed"
         return 1
     fi
-    echo "[PASS] oracle daemons clean"
+    echo "[PASS] callgraph daemons clean"
 }
 
 run_linux_boot_test() {
@@ -388,14 +388,14 @@ case "$TARGET" in
     dead-code)
         run_dead_code_check || exit 1
         ;;
-    oracle)
-        run_oracle_smokes || exit 1
+    callgraph)
+        run_callgraph_smokes || exit 1
         ;;
     pre-commit)
         # Required gate before any agent commits — fails fast on the first failure.
         run_genlock_check || exit 1
         run_dead_code_check || exit 1
-        run_oracle_smokes || exit 1
+        run_callgraph_smokes || exit 1
         run_kernel_tests || exit 1
         run_linux_boot_test || exit 1
         run_router_tests || exit 1
