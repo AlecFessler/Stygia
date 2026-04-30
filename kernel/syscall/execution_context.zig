@@ -430,14 +430,15 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
     }
 
     const cd_ref = ec.domain;
-    const cd = cd_ref.lock(@src()) catch return errors.E_BADCAP;
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_lr.irq_state);
         return errors.E_BADCAP;
     };
     const ref = capability.typedRef(ExecutionContext, entry.*) orelse {
-        cd_ref.unlock();
+        cd_ref.unlockIrqRestore(cd_lr.irq_state);
         return errors.E_BADCAP;
     };
 
@@ -448,12 +449,13 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
     // mutators.
     capability.refreshSnapshot(cd, slot, entry);
 
-    cd_ref.unlock();
+    cd_ref.unlockIrqRestore(cd_lr.irq_state);
 
     // Resolve the target EC pointer under its own gen lock just long
     // enough to hand it off — `yieldTo` consumes a stable pointer.
-    const target_ec = ref.lock(@src()) catch return errors.E_TERM;
-    ref.unlock();
+    const target_lr = ref.lockIrqSave(@src()) catch return errors.E_TERM;
+    const target_ec = target_lr.ptr;
+    ref.unlockIrqRestore(target_lr.irq_state);
     scheduler.yieldTo(target_ec);
     return 0;
 }

@@ -550,8 +550,9 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
     switch (type_tag) {
         .execution_context => {
             const ref = typedRef(ExecutionContext, entry.*) orelse return;
-            const ec = ref.lock(@src()) catch return;
-            defer ref.unlock();
+            const lr = ref.lockIrqSave(@src()) catch return;
+            defer ref.unlockIrqRestore(lr.irq_state);
+            const ec = lr.ptr;
             // field0 bits 0-1 = priority (Spec §[execution_context])
             user_entry.field0 = @intFromEnum(ec.priority);
             // field1 bits 0-63 = affinity mask
@@ -559,8 +560,9 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
         },
         .virtual_address_range => {
             const ref = typedRef(VAR, entry.*) orelse return;
-            const v = ref.lock(@src()) catch return;
-            defer ref.unlock();
+            const lr = ref.lockIrqSave(@src()) catch return;
+            defer ref.unlockIrqRestore(lr.irq_state);
+            const v = lr.ptr;
             // VAR field0 = base vaddr (immutable; refresh is harmless).
             user_entry.field0 = v.base_vaddr.addr;
             // VAR field1: page_count[0..31], sz[32..33], cch[34..35],
@@ -580,8 +582,9 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
         },
         .device_region => {
             const ref = typedRef(DeviceRegion, entry.*) orelse return;
-            const dr = ref.lock(@src()) catch return;
-            defer ref.unlock();
+            const lr = ref.lockIrqSave(@src()) catch return;
+            defer ref.unlockIrqRestore(lr.irq_state);
+            const dr = lr.ptr;
             // Spec §[device_region] handle ABI: field0 packs immutable
             // dev_type (bits 0-3) and, for port_io, base_port (bits 4-19)
             // and port_count (bits 20-35). field1 = irq_count, owned by
@@ -599,8 +602,9 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
         },
         .timer => {
             const ref = typedRef(Timer, entry.*) orelse return;
-            const t = ref.lock(@src()) catch return;
-            defer ref.unlock();
+            const lr = ref.lockIrqSave(@src()) catch return;
+            defer ref.unlockIrqRestore(lr.irq_state);
+            const t = lr.ptr;
             // field0 = counter; field1 bit0 = armed, bit1 = periodic.
             user_entry.field0 = t.counter;
             user_entry.field1 = (@as(u64, @intFromBool(t.armed))) |

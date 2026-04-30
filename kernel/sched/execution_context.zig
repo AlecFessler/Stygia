@@ -96,6 +96,15 @@ pub const State = enum {
     /// Blocked on one or more futex addresses. Wait state lives in the
     /// `futex_*` fields below.
     futex_wait,
+    /// EC trapped on a hardware wait-for-interrupt-like instruction
+    /// (aarch64 wfi, x86 hlt). Off every queue; consumes no CPU. Stays
+    /// alive until its owning capability domain is destroyed, or until
+    /// a sibling EC explicitly suspends it onto a port (treated like
+    /// `.ready` by `suspend`'s pre-suspend state gate). Saved register
+    /// state in `ctx` reflects the post-wait-instruction frame so
+    /// `suspendOnPort` can snapshot vregs / event_rip without needing
+    /// to re-execute anything.
+    idle_wait,
     /// Terminated. Awaiting slab destroy.
     exited,
 };
@@ -558,6 +567,45 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // the slab so outstanding handles still resolve (just to a parked
     // EC) until the owning domain is destroyed.
     ec.state = .exited;
+}
+
+/// Park the calling EC into `.idle_wait` — used by the aarch64 wfi/wfe
+/// trap path to deschedule a worker that issued a wait-for-event/interrupt
+/// instruction in EL0. Distinct from `parkSelfFaulted` in that the EC
+/// remains a valid `suspend` target: the suspend syscall accepts
+/// `.idle_wait` alongside `.running`/`.ready`, transitions the EC into
+/// `.suspended_on_port`, and delivers the suspension event normally. The
+/// EC is removed from this core's `current_ec` slot so the scheduler
+/// dispatches a different EC after this returns.
+///
+/// The state transition is serialized through `ec._gen_lock` so a
+/// concurrent `suspend(target=ec, port)` from another core (which
+/// snapshots state under the same gen lock) cannot interleave a
+/// .running → .suspended_on_port transition with our .running →
+/// .idle_wait write. The lock is held only across the field writes; we
+/// drop it before yielding to the scheduler.
+pub fn parkIdleWait(ec: *ExecutionContext) void {
+    const core_id: u8 = @truncate(arch.smp.coreID());
+    if (scheduler.coreCurrentIs(core_id, ec)) {
+        scheduler.clearCurrentEc(core_id);
+    }
+    const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    if (ec_ref.lockIrqSave(@src())) |lr| {
+        defer ec_ref.unlockIrqRestore(lr.irq_state);
+        // A racing suspend / terminate may have flipped state out of
+        // .running already. Only commit .idle_wait if we still see the
+        // .running we trapped from; otherwise the other path now owns
+        // the lifecycle and our park would corrupt their queueing.
+        if (ec.state == .running) {
+            ec.state = .idle_wait;
+            ec.on_cpu.store(false, .release);
+        }
+    } else |_| {
+        // Slab gen flipped — EC was destroyed mid-trap. Nothing to do;
+        // the trampoline will ERET into a freed slot, but the next
+        // scheduler dispatch picks a different EC and the freed slot
+        // gets recycled lazily.
+    }
 }
 
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
@@ -1072,11 +1120,13 @@ pub fn suspendOnPort(
         port._gen_lock.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
-    std.debug.assert(ec.state == .running or ec.state == .ready);
+    std.debug.assert(ec.state == .running or ec.state == .ready or ec.state == .idle_wait);
 
     if (ec.state == .ready) {
         scheduler.removeFromQueue(ec);
     }
+    // `.idle_wait` ECs are off every queue (parkIdleWait removes from
+    // current_ec and never enqueues), so no removal is needed here.
 
     ec.event_type = event;
     ec.event_subcode = subcode;

@@ -648,6 +648,37 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             return;
         },
 
+        .wf_trapped => {
+            // EL0 wfi / wfe / wfit / wfet trap. SCTLR_EL1.{nTWI,nTWE}
+            // remain at the reset value (0) so wait-for-event/interrupt
+            // instructions issued at EL0 trap to EL1 with EC=0x01.
+            // ARM ARM D13.2.118 (SCTLR_EL1) and D13.2.37 (ESR_EL1).
+            //
+            // Park the EC in the .idle_wait state so it stops consuming
+            // CPU but stays alive and suspendable. Treating wfi as a
+            // protection_fault would `parkSelfFaulted` the EC into
+            // `.exited`, breaking any later `suspend(this_ec, port)`
+            // call (suspend's gate rejects non-{running,ready,idle_wait}
+            // targets with E_INVAL — the precise failure that flaked
+            // reply_transfer_14 on Pi 5 KVM). Permitting native EL0 wfi
+            // (SCTLR.nTWI=1) was the prior attempt; it left dummies
+            // executing wfi forever in EL0 and the destroy walk's UAF
+            // race against an actively-executing EC produced a hang
+            // around test ~144 (batch 36..40).
+            //
+            // The .idle_wait path: advance ELR past the wait instruction
+            // (so resume from suspend / re-dispatch lands at `b 1b` and
+            // not on another immediate wfi-trap), park as .idle_wait
+            // (off every queue, suspendOnPort treats it like .ready),
+            // then dispatch whatever else this core has.
+            ctx.elr_el1 += 4;
+            const ec_ptr = scheduler.currentEc() orelse
+                @panic("wfi trap with no current EC");
+            zag.sched.execution_context.parkIdleWait(ec_ptr);
+            cpu.enableInterrupts();
+            scheduler.run();
+        },
+
         .unknown => {
             // ARM ARM D13.2.37: EC=0x00 is taken for truly unallocated
             // instruction encodings, which includes `udf` (permanently-

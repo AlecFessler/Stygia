@@ -466,7 +466,7 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
-    if (target_ec.state != .running and target_ec.state != .ready) {
+    if (target_ec.state != .running and target_ec.state != .ready and target_ec.state != .idle_wait) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
