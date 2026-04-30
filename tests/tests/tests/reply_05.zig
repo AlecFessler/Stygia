@@ -206,17 +206,22 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 6+7: schedule W and poll. yield(W) runs W next; when W's
-    // timeslice expires the test EC runs. The bound is generous; W's
-    // body is a single store followed by a tight pause loop, so it
-    // completes the store on its first scheduling. The fallback yield
-    // to the scheduler covers cores where W might initially queue
-    // behind other ready ECs.
-    _ = syscall.yieldEc(w_handle);
+    // Step 6+7: schedule W and poll. Each iteration explicitly yields to
+    // W (mirroring yield_03's bounded poll-and-yield-target pattern) and
+    // then re-checks the side-channel. Yielding to the generic scheduler
+    // (`yieldEc(0)`) is insufficient here because W has the default
+    // priority (idle) — lower than the test EC's normal — so a
+    // round-robin pick would always re-dispatch the test EC and starve
+    // W. Re-yielding to W on every iteration matches the spec's
+    // observable-progress contract: yield(W) gives W the CPU, so any
+    // dispatch that gets robbed of its first-instruction window by an
+    // immediate preemption (a tick that pended in the kernel-mode IF=0
+    // window before the iretq into W) is recoverable on the next
+    // iteration rather than starving forever.
     var i: usize = 0;
     while (i < 1024) {
         if (@as(*volatile u64, &observed).* == MAGIC) break;
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldEc(w_handle);
         i += 1;
     }
 
