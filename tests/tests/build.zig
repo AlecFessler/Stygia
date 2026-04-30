@@ -320,6 +320,8 @@ const test_entries = [_]TestEntry{
     .{ .name = "recv_12", .path = "tests/recv_12.zig" },
     .{ .name = "recv_13", .path = "tests/recv_13.zig" },
     .{ .name = "recv_14", .path = "tests/recv_14.zig" },
+    .{ .name = "recv_15", .path = "tests/recv_15.zig" },
+    .{ .name = "recv_16", .path = "tests/recv_16.zig" },
     .{ .name = "remap_01", .path = "tests/remap_01.zig" },
     .{ .name = "remap_02", .path = "tests/remap_02.zig" },
     .{ .name = "remap_03", .path = "tests/remap_03.zig" },

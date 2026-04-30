@@ -1875,7 +1875,7 @@ Returns E_FULL if the caller's handle table cannot accommodate the reply handle 
 [test 13] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 [test 14] returns E_TIMEOUT if [2] timeout_ns is nonzero, no sender is queued, and no sender becomes queued within [2] timeout_ns.
 [test 15] on success when [2] timeout_ns is nonzero and a sender is delivered before the deadline, the deadline is cancelled and no E_TIMEOUT is later observed.
-[test 14] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
+[test 16] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
 ### §[event_type] Event Type
 
