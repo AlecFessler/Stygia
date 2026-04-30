@@ -541,7 +541,21 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             const caller = scheduler.currentEc() orelse
                 @panic("syscall with no current EC");
             const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
-            ctx.regs.x0 = @bitCast(ret);
+
+            // Only commit the syscall return into the saved frame if the
+            // dispatched handler did NOT park `caller`. A handler that
+            // suspends (recv / suspend / futex_wait / fault) clears this
+            // core's `current_ec`; from that moment on `caller.ctx.regs.x0`
+            // is the wake-side delivery slot — `propagateClosedTo*`,
+            // `expireTimedRecvWaiters`, etc. running on a remote core
+            // write E_CLOSED / E_TIMEOUT there directly. Unconditionally
+            // assigning `ret` (always 0 on the suspend path) would race
+            // with that remote write and clobber the real wake value
+            // back to 0.
+            const core: u8 = @truncate(gic.coreID());
+            if (scheduler.coreCurrentIs(core, caller)) {
+                ctx.regs.x0 = @bitCast(ret);
+            }
 
             // Spec §[syscall_abi]: vreg 0 (`[user_sp + 0]`) carries the
             // recv-success syscall return word — `port.deliverEvent`
@@ -554,7 +568,6 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // aarch64 vreg 14 is GPR-backed at x13 — write it into the
             // caller's saved frame so ERET surfaces it. Mirrors
             // arch/x64/interrupts.zig syscallDispatch.
-            const core: u8 = @truncate(gic.coreID());
             if (caller.pending_event_word_valid and
                 scheduler.coreCurrentIs(core, caller))
             {

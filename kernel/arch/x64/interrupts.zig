@@ -239,7 +239,14 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     if ((syscall_word & 0xFFF) == @intFromEnum(SyscallNum.@"suspend") and pair_count_bits == 0) {
         // vreg 1 = rax = target EC handle; vreg 2 = rbx = port handle.
         if (zag.sched.port.suspendFast(caller, r.rax, r.rbx)) |fast_ret| {
-            r.rax = @bitCast(fast_ret);
+            // Same wake-vs-syscall-return race as the slow-path tail
+            // below: if `suspendFast` parked `caller`, a remote core may
+            // already have written E_CLOSED into `caller.ctx.regs.rax`
+            // via `propagateClosedTo*`, and an unconditional assign
+            // would clobber it back to 0.
+            if (scheduler.coreCurrentIs(@truncate(apic.coreID()), caller)) {
+                r.rax = @bitCast(fast_ret);
+            }
             // The fast path may have suspended `caller` (rendezvous
             // success): in that case `current_ec` was cleared and the
             // syscall epilogue would otherwise iretq back to the now-
@@ -265,7 +272,20 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
         r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
     };
     const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
-    r.rax = @bitCast(ret);
+
+    // Only commit the syscall return into the saved frame if the
+    // dispatched handler did NOT park `caller`. A handler that suspends
+    // (recv / suspend / futex_wait / fault) clears this core's
+    // `current_ec`; from that moment on `caller.ctx.regs.rax` is the
+    // wake-side delivery slot — `propagateClosedTo*`,
+    // `expireTimedRecvWaiters`, etc. running on a remote core write
+    // E_CLOSED / E_TIMEOUT there directly. An unconditional assign of
+    // `ret` (always 0 on the suspend path) would race with that remote
+    // write and clobber the real wake value back to 0.
+    const core_id_for_ret: u8 = @truncate(apic.coreID());
+    if (scheduler.coreCurrentIs(core_id_for_ret, caller)) {
+        r.rax = @bitCast(ret);
+    }
 
     // Spec §[syscall_abi]: vreg 0 (`[user_rsp + 0]`) is the syscall
     // word — `recv` event delivery surfaces its return payload here
