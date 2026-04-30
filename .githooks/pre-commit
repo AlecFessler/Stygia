@@ -1,0 +1,15 @@
+#!/bin/bash
+# Repo-checked-in git pre-commit hook — runs only the *required* stages
+# of tests/precommit.sh. Manual full gauntlet is `./tests/precommit.sh`
+# (no flag); that includes the optional stages too.
+#
+# One-time setup per clone (so git uses this hook):
+#   git config --local core.hooksPath .githooks
+#
+# To temporarily skip (e.g. emergency fix), git supports:
+#   git commit --no-verify
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+exec bash "$REPO_ROOT/tests/precommit.sh" --git-hook

@@ -13,26 +13,67 @@
 #   6. kernel perf regression gate (tests/prof/run_perf.sh, kprof trace)
 #
 # Usage:
-#   ./tests/precommit.sh
+#   ./tests/precommit.sh             # full gauntlet (all stages, including optional)
+#   ./tests/precommit.sh --git-hook  # only required stages — used by .githooks/pre-commit
 #
 # Env knobs:
-#   PARALLEL=8           # x86 kernel test concurrency (default 8)
 #   PI_HOST=user@ip      # override Pi SSH target
-#   PI_LIMIT=N           # cap aarch64 test count (default: all)
-#   PI_TIMEOUT=N         # per-test timeout on Pi in seconds (default 15)
+#   PI_REMOTE_DIR=path   # override Pi-side artifact dir (default \$HOME/zag-test)
 
 set -u
+
+REQUIRED_ONLY=0
+case "${1:-}" in
+    --git-hook) REQUIRED_ONLY=1 ;;
+    "" )       ;;
+    *) echo "usage: $0 [--git-hook]" >&2; exit 2 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PARALLEL="${PARALLEL:-8}"
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
 PI_REMOTE_DIR="${PI_REMOTE_DIR:-\$HOME/zag-test}"
-PI_LIMIT="${PI_LIMIT:-0}"
-PI_TIMEOUT="${PI_TIMEOUT:-15}"
 
 FAILURES=()
+
+# Stages flagged here are blockers: --git-hook runs only these and exits
+# 1 if any fail, so `git commit` refuses. The rest run in the full
+# manual invocation but don't gate the hook.
+REQUIRED_STAGES=(
+    verify_coverage
+    x86_kernel_tests
+)
+# Stages tagged as currently-failing-but-meant-to-be-required. Move
+# entries back into REQUIRED_STAGES above as their underlying issues land:
+#   arch_layering_lint          — pre-existing 20 layering violations (real bugs in the kernel)
+#   dead_code_report            — pre-existing dead-field findings under review
+#   gen_lock_analyzer           — pre-existing IRQ-discipline violations in kernel/caps + kernel/syscall
+#   aarch64_kernel_tests_pi     — recv_05 ~1/3 flake on Pi 5 KVM, dedicated agent in flight
+#   hyprvos_x86_linux_boot      — blocked on reply-syscall ABI redesign (user is on this)
+#   hyprvos_aarch64_linux_boot  — same upstream blocker
+#
+# Stages explicitly NOT meant for this gate (each runs in the full
+# manual invocation only):
+#   callgraph_smokes            — tools/* sanity checks, not kernel correctness
+#   redteam_regressions         — too slow + scope mismatch for per-commit gate
+#   kernel_perf                 — same
+
+is_required() {
+    local s
+    for s in "${REQUIRED_STAGES[@]}"; do
+        [[ "$s" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+run_stage() {
+    local name="$1"
+    if [[ $REQUIRED_ONLY -eq 1 ]] && ! is_required "$name"; then
+        return 0
+    fi
+    "stage_$name" || true
+}
 
 # ── Stage runners ─────────────────────────────────────────────────────
 
@@ -160,6 +201,20 @@ stage_gen_lock_analyzer() {
     fi
 }
 
+stage_verify_coverage() {
+    echo ""
+    echo "=================================================="
+    echo "[0e] Spec ↔ test coverage (verify_coverage.py)"
+    echo "=================================================="
+    # Cross-checks docs/kernel/specv3.md `[test NN]` tags against
+    # tests/tests/tests/<section>_NN.zig files; exits 1 on duplicate
+    # tags, missing files, orphan files, or any non-zero mismatch.
+    if ! python3 "$SCRIPT_DIR/tests/verify_coverage.py"; then
+        FAILURES+=("spec/test coverage mismatch")
+        return 1
+    fi
+}
+
 clean_nvvars() {
     local nv="$ZAG_ROOT/zig-out/img/NvVars"
     if [[ -f "$nv" ]] && [[ "$(stat -c %U "$nv" 2>/dev/null)" == "root" ]]; then
@@ -170,31 +225,74 @@ clean_nvvars() {
 stage_x86_kernel_tests() {
     echo ""
     echo "=================================================="
-    echo "[1/4] x86-64 kernel test suite (local KVM)"
+    echo "[1/4] x86-64 kernel test suite (in-kernel runner, local KVM)"
     echo "=================================================="
     clean_nvvars
-    if ! PARALLEL="$PARALLEL" bash "$SCRIPT_DIR/tests/run_tests.sh"; then
-        FAILURES+=("x86-64 kernel tests")
+
+    echo "Building x86 root_service (in-kernel runner with embedded test ELFs)..."
+    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && zig build); then
+        FAILURES+=("x86 root_service build")
         return 1
     fi
+
+    echo "Building x86 kernel..."
+    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test); then
+        FAILURES+=("x86 kernel build")
+        return 1
+    fi
+
+    echo "Booting kernel under QEMU+KVM..."
+    local qemu_log
+    qemu_log=$(mktemp)
+    # Drive root_service.elf is loaded by the kernel from zig-out/img
+    # via the FAT image; in-kernel runner orchestrates all 475 tests
+    # and calls power_shutdown when summarize() finishes.
+    if ! (cd "$ZAG_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
+        echo "[FAIL] qemu run failed or timed out"
+        echo "--- last 30 lines of QEMU output ---"
+        tail -30 "$qemu_log"
+        echo "--- end ---"
+        rm -f "$qemu_log"
+        FAILURES+=("x86 kernel runner timeout/qemu error")
+        return 1
+    fi
+
+    local total
+    total=$(grep -E '^\[runner\] [0-9]+ total' "$qemu_log" | tail -1)
+    if [[ -z "$total" ]]; then
+        echo "[FAIL] in-kernel runner did not report a total — kernel didn't reach summarize()"
+        echo "--- last 30 lines of QEMU output ---"
+        tail -30 "$qemu_log"
+        echo "--- end ---"
+        rm -f "$qemu_log"
+        FAILURES+=("x86 kernel tests (no [runner] total)")
+        return 1
+    fi
+
+    if echo "$total" | grep -qE '0 fail / 0 miss'; then
+        echo "[PASS] x86 kernel tests: ${total#'[runner] '}"
+        rm -f "$qemu_log"
+        return 0
+    fi
+
+    echo "[FAIL] $total"
+    grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
+    rm -f "$qemu_log"
+    FAILURES+=("x86 kernel tests: ${total#'[runner] '}")
+    return 1
 }
 
 stage_aarch64_kernel_tests_pi() {
     echo ""
     echo "=================================================="
-    echo "[2/4] aarch64 kernel test suite (Pi KVM via SSH)"
+    echo "[2/4] aarch64 kernel test suite (in-kernel runner, Pi KVM via SSH)"
     echo "=================================================="
 
-    echo "Building aarch64 test ELFs..."
-    if ! (cd "$SCRIPT_DIR/tests" && zig build -Darch=arm); then
-        FAILURES+=("aarch64 test ELF build")
+    echo "Building aarch64 root_service (in-kernel runner with embedded test ELFs)..."
+    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && zig build -Darch=arm); then
+        FAILURES+=("aarch64 root_service build")
         return 1
     fi
-
-    # Kernel build needs a placeholder root_service.elf.
-    local first_elf
-    first_elf=$(find "$SCRIPT_DIR/tests/bin" -name 's*.elf' | head -1)
-    cp "$first_elf" "$SCRIPT_DIR/tests/bin/root_service.elf"
 
     echo "Building aarch64 kernel..."
     if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=test); then
@@ -203,56 +301,62 @@ stage_aarch64_kernel_tests_pi() {
     fi
 
     echo "Syncing artifacts to $PI_HOST..."
-    # Create target dirs on Pi (expands $HOME there). Wipe stale test ELFs
-    # so a removed test on this box doesn't keep running on the Pi (the
-    # equivalent of rsync --delete, scoped to the filename patterns we
-    # actually push).
-    ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/tests/bin $PI_REMOTE_DIR/img/efi/boot && rm -f $PI_REMOTE_DIR/tests/bin/s*.elf $PI_REMOTE_DIR/tests/bin/root_service.elf" || {
+    if ! ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/img/efi/boot"; then
         FAILURES+=("ssh mkdir on Pi")
         return 1
-    }
-
-    # Test ELFs. tar-over-ssh keeps the per-file filter (s*.elf +
-    # root_service.elf) without needing rsync on this box. The dev box
-    # only needs `tar` + `ssh`; rsync stays on the Pi runner side, which
-    # is fine because we don't call rsync there.
-    local elf_list
-    elf_list=$(cd "$SCRIPT_DIR/tests/bin" && ls s*.elf root_service.elf 2>/dev/null) || {
-        FAILURES+=("no aarch64 test ELFs to sync")
-        return 1
-    }
-    if ! tar -C "$SCRIPT_DIR/tests/bin" -cf - $elf_list \
-        | ssh "$PI_HOST" "tar -C zag-test/tests/bin -xf -"; then
-        FAILURES+=("tar/ssh test ELFs to Pi")
-        return 1
     fi
-
-    # Kernel + EFI loader.
     if ! scp -q "$ZAG_ROOT/zig-out/img/kernel.elf" \
-        "$PI_HOST:zag-test/img/kernel.elf"; then
+        "$PI_HOST:$PI_REMOTE_DIR/img/kernel.elf"; then
         FAILURES+=("scp kernel.elf to Pi")
         return 1
     fi
     if ! scp -q "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
-        "$PI_HOST:zag-test/img/efi/boot/BOOTAA64.EFI"; then
+        "$PI_HOST:$PI_REMOTE_DIR/img/efi/boot/BOOTAA64.EFI"; then
         FAILURES+=("scp BOOTAA64.EFI to Pi")
         return 1
     fi
-
-    # Build runner invocation: if PI_LIMIT=0, run everything by passing a huge LIMIT.
-    local remote_limit="$PI_LIMIT"
-    if [[ "$remote_limit" == "0" ]]; then
-        remote_limit=100000
-    fi
-
-    echo "Running aarch64 tests on Pi (TIMEOUT=${PI_TIMEOUT}s, LIMIT=${remote_limit})..."
-    echo "(Many aarch64 tests are expected to fail during port bring-up.)"
-    if ! ssh "$PI_HOST" "cd zag-test && TIMEOUT=$PI_TIMEOUT LIMIT=$remote_limit PARALLEL=1 bash runner.sh"; then
-        # The Pi runner exits 0 even on failures (it's a progress report), but
-        # catch SSH / infra errors here.
-        FAILURES+=("aarch64 kernel runner (Pi SSH/infra error)")
+    if ! scp -q "$SCRIPT_DIR/tests/bin/root_service.elf" \
+        "$PI_HOST:$PI_REMOTE_DIR/root_service.elf"; then
+        FAILURES+=("scp root_service.elf to Pi")
         return 1
     fi
+
+    echo "Booting kernel under qemu-system-aarch64 + KVM on Pi..."
+    local pi_log
+    pi_log=$(mktemp)
+    if ! ssh "$PI_HOST" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rm -rf \$wd" > "$pi_log" 2>&1; then
+        echo "[FAIL] Pi qemu run failed or timed out"
+        echo "--- last 30 lines of Pi output ---"
+        tail -30 "$pi_log"
+        echo "--- end ---"
+        rm -f "$pi_log"
+        FAILURES+=("aarch64 kernel runner timeout/qemu error")
+        return 1
+    fi
+
+    local total
+    total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
+    if [[ -z "$total" ]]; then
+        echo "[FAIL] in-kernel runner did not report a total — kernel didn't reach summarize()"
+        echo "--- last 30 lines of Pi output ---"
+        tail -30 "$pi_log"
+        echo "--- end ---"
+        rm -f "$pi_log"
+        FAILURES+=("aarch64 kernel tests (no [runner] total)")
+        return 1
+    fi
+
+    if echo "$total" | grep -qE '0 fail / 0 miss'; then
+        echo "[PASS] aarch64 kernel tests: ${total#'[runner] '}"
+        rm -f "$pi_log"
+        return 0
+    fi
+
+    echo "[FAIL] $total"
+    grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
+    rm -f "$pi_log"
+    FAILURES+=("aarch64 kernel tests: ${total#'[runner] '}")
+    return 1
 }
 
 stage_hyprvos_x86_linux_boot() {
@@ -373,24 +477,33 @@ stage_kernel_perf() {
 
 # ── Dispatch ──────────────────────────────────────────────────────────
 
-stage_arch_layering_lint        || true
-stage_dead_code_report          || true
-stage_gen_lock_analyzer         || true
-stage_callgraph_smokes          || true
-stage_x86_kernel_tests          || true
-stage_aarch64_kernel_tests_pi   || true
-stage_hyprvos_x86_linux_boot    || true
-stage_hyprvos_aarch64_linux_boot || true
-stage_redteam_regressions       || true
-stage_kernel_perf               || true
+run_stage arch_layering_lint
+run_stage dead_code_report
+run_stage gen_lock_analyzer
+run_stage callgraph_smokes
+run_stage verify_coverage
+run_stage x86_kernel_tests
+run_stage aarch64_kernel_tests_pi
+run_stage hyprvos_x86_linux_boot
+run_stage hyprvos_aarch64_linux_boot
+run_stage redteam_regressions
+run_stage kernel_perf
 
 echo ""
 echo "=================================================="
 if [[ ${#FAILURES[@]} -eq 0 ]]; then
-    echo "All precommit stages passed."
+    if [[ $REQUIRED_ONLY -eq 1 ]]; then
+        echo "All required precommit stages passed (commit allowed)."
+    else
+        echo "All precommit stages passed."
+    fi
     exit 0
 else
-    echo "Precommit FAILED. Failing stages:"
+    if [[ $REQUIRED_ONLY -eq 1 ]]; then
+        echo "Required precommit stages FAILED — commit BLOCKED. Failing stages:"
+    else
+        echo "Precommit FAILED. Failing stages:"
+    fi
     for f in "${FAILURES[@]}"; do
         echo "  - $f"
     done
