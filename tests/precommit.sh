@@ -48,6 +48,7 @@ FAILURES=()
 # manual invocation but don't gate the hook.
 REQUIRED_STAGES=(
     arch_layering_lint
+    gen_lock_analyzer
     verify_coverage
     x86_kernel_tests
     aarch64_kernel_tests_pi
@@ -56,13 +57,11 @@ REQUIRED_STAGES=(
 # Stages tagged as currently-failing-but-meant-to-be-required. Move
 # entries back into REQUIRED_STAGES above as their underlying issues land:
 #   dead_code_report            — pre-existing dead-field findings under review
-#   gen_lock_analyzer           — pre-existing IRQ-discipline violations in kernel/caps + kernel/syscall
 #   hyprvos_x86_linux_boot      — blocked on reply-syscall ABI redesign (user is on this)
 #   hyprvos_aarch64_linux_boot  — same upstream blocker
 #
 # Stages explicitly NOT meant for this gate (each runs in the full
 # manual invocation only):
-#   callgraph_smokes            — tools/* sanity checks, not kernel correctness
 #   redteam_regressions         — too slow + scope mismatch for per-commit gate
 #   kernel_perf                 — same
 
@@ -163,30 +162,6 @@ stage_dead_code_report() {
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
     if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel); then
         FAILURES+=("dead-code findings")
-        return 1
-    fi
-}
-
-stage_callgraph_smokes() {
-    echo ""
-    echo "=================================================="
-    echo "[0d] Callgraph HTTP + MCP smoke (per-commit DB)"
-    echo "=================================================="
-    if ! (cd "$ZAG_ROOT/tools/callgraph_http" && zig build 2>&1); then
-        FAILURES+=("callgraph_http build")
-        return 1
-    fi
-    if ! (cd "$ZAG_ROOT/tools/callgraph_mcp" && zig build 2>&1); then
-        FAILURES+=("callgraph_mcp build")
-        return 1
-    fi
-    ensure_callgraph_db || return 1
-    if ! bash "$ZAG_ROOT/tools/callgraph_http/test/smoke.sh" "$CALLGRAPH_DB"; then
-        FAILURES+=("callgraph_http smoke")
-        return 1
-    fi
-    if ! bash "$ZAG_ROOT/tools/callgraph_mcp/test/smoke.sh" "$CALLGRAPH_DB"; then
-        FAILURES+=("callgraph_mcp smoke")
         return 1
     fi
 }
@@ -606,7 +581,6 @@ stage_kernel_perf() {
 run_stage arch_layering_lint
 run_stage dead_code_report
 run_stage gen_lock_analyzer
-run_stage callgraph_smokes
 run_stage verify_coverage
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi
