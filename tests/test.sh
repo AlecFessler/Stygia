@@ -186,7 +186,7 @@ run_dead_code_check() {
     fi
     ensure_callgraph_db || return 1
     local detector="$SCRIPT_DIR/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$SCRIPT_DIR" && "$detector" --db "$CALLGRAPH_DB" --target kernel); then
+    if ! (cd "$SCRIPT_DIR" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$SCRIPT_DIR/kernel/.dead-code-skip.txt"); then
         echo "[FAIL] dead-code analyzer findings"
         return 1
     fi

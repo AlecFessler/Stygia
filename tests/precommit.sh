@@ -3,7 +3,7 @@
 #
 # Stages:
 #   0. arch layering lint          (gating — arch-specific / generic boundaries)
-#   0b. dead-code report            (advisory — manual review)
+#   0b. dead-code report            (gating — skip-list checked into the tree)
 #   0c. gen-lock analyzer           (gating — fat-pointer + bracketing invariants)
 #   1. x86-64 kernel test suite   (KVM on this dev PC)
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
@@ -48,6 +48,7 @@ FAILURES=()
 # manual invocation but don't gate the hook.
 REQUIRED_STAGES=(
     arch_layering_lint
+    dead_code_report
     gen_lock_analyzer
     verify_coverage
     x86_kernel_tests
@@ -56,7 +57,6 @@ REQUIRED_STAGES=(
 )
 # Stages tagged as currently-failing-but-meant-to-be-required. Move
 # entries back into REQUIRED_STAGES above as their underlying issues land:
-#   dead_code_report            — pre-existing dead-field findings under review
 #   hyprvos_x86_linux_boot      — blocked on reply-syscall ABI redesign (user is on this)
 #   hyprvos_aarch64_linux_boot  — same upstream blocker
 #
@@ -160,7 +160,7 @@ stage_dead_code_report() {
     fi
     ensure_callgraph_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel); then
+    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$ZAG_ROOT/kernel/.dead-code-skip.txt"); then
         FAILURES+=("dead-code findings")
         return 1
     fi
