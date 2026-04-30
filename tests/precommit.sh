@@ -41,12 +41,12 @@ FAILURES=()
 # 1 if any fail, so `git commit` refuses. The rest run in the full
 # manual invocation but don't gate the hook.
 REQUIRED_STAGES=(
+    arch_layering_lint
     verify_coverage
     x86_kernel_tests
 )
 # Stages tagged as currently-failing-but-meant-to-be-required. Move
 # entries back into REQUIRED_STAGES above as their underlying issues land:
-#   arch_layering_lint          — pre-existing 20 layering violations (real bugs in the kernel)
 #   dead_code_report            — pre-existing dead-field findings under review
 #   gen_lock_analyzer           — pre-existing IRQ-discipline violations in kernel/caps + kernel/syscall
 #   aarch64_kernel_tests_pi     — recv_05 ~1/3 flake on Pi 5 KVM, dedicated agent in flight
