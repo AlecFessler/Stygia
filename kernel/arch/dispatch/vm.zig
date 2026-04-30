@@ -99,6 +99,29 @@ pub fn freeVmArchState(vm: *VirtualMachine) void {
     }
 }
 
+/// Per-VM emulated-device state embedded inline on
+/// `VirtualMachine.arch_devices`. x86-64: LAPIC + IOAPIC pair. aarch64:
+/// empty (vGIC state lives in the per-vCPU/per-VM control cells). The
+/// type is selected at comptime so the generic `VirtualMachine` struct
+/// holds a per-arch field without naming arch-specific modules.
+pub const VmDevices = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vm.VmDevices,
+    .aarch64 => aarch64.kvm.vm.VmDevices,
+    else => unreachable,
+};
+
+/// Wire up per-VM emulated-device cross-pointers on a freshly allocated
+/// VM. On x86-64 this binds the LAPIC and IOAPIC to each other so EOI
+/// can re-deliver level-triggered IRQs and pin asserts can write into
+/// LAPIC IRR. No-op on aarch64.
+pub fn initVmDevices(devices: *VmDevices) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.initVmDevices(devices),
+        .aarch64 => aarch64.kvm.vm.initVmDevices(devices),
+        else => unreachable,
+    }
+}
+
 /// Allocate per-vCPU arch state (VMCS / VMCB save area, sysreg bank).
 /// Stored on the vCPU EC. Spec §[virtual_machine].create_vcpu.
 pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
@@ -123,10 +146,13 @@ pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
 /// should attach to the vm_exit event delivered on the vCPU's
 /// `exit_port`. Layout follows spec §[vm_exit_state] x86-64 / aarch64
 /// sub-codes; the surrounding code is responsible for routing through
-/// `sched.port.fireVmExit`.
-pub const VmExitDelivery = struct {
-    subcode: u8,
-    payload: [3]u64,
+/// `sched.port.fireVmExit`. The struct itself is defined per-arch so
+/// that the per-arch run-loop doesn't need to reach upward into
+/// dispatch; the layouts are identical by design.
+pub const VmExitDelivery = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm_runloop.VmExitDelivery,
+    .aarch64 => struct { subcode: u8, payload: [3]u64 },
+    else => unreachable,
 };
 
 /// Enter the guest bound to `vcpu_ec` via VMLAUNCH/VMRESUME (Intel) or

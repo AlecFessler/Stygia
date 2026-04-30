@@ -8,12 +8,37 @@ const pmm = zag.memory.pmm;
 const vm_hw = zag.arch.x64.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const Ioapic = zag.arch.x64.kvm.ioapic.Ioapic;
+const Lapic = zag.arch.x64.kvm.lapic.Lapic;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
 const VarPageSize = zag.capdom.var_range.PageSize;
 const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+
+/// Per-VM emulated-device state held inline on `VirtualMachine.arch_devices`.
+/// On x86-64 this is the kernel-emulated LAPIC + IOAPIC pair; the run-loop
+/// walks `vm.arch_devices.lapic` for pending vectors and `vm.arch_devices.ioapic`
+/// for pin asserts. The aarch64 backend exposes an empty struct (vGIC state
+/// lives elsewhere). Held here rather than in the dispatch layer so generic
+/// code can hold the field by per-arch type without reaching into x64 namespaces.
+pub const VmDevices = struct {
+    /// Kernel-emulated Local APIC. xAPIC mode, single vCPU. MMIO region
+    /// 0xFEE00000-0xFEE00FFF.
+    lapic: Lapic = .{},
+    /// Kernel-emulated I/O APIC. Intel 82093AA, 24 redirection entries.
+    ioapic: Ioapic = .{},
+};
+
+/// Wire up the bidirectional LAPIC<->IOAPIC pointers on a freshly
+/// allocated VM. Called from generic `capdom.virtual_machine.allocVm`
+/// via the dispatch shim so the cross-pointer init isn't duplicated
+/// in the generic layer.
+pub fn initVmDevices(devices: *VmDevices) void {
+    devices.ioapic.init(&devices.lapic);
+    devices.lapic.init(&devices.ioapic);
+}
 
 /// Kernel-emulated LAPIC/IOAPIC MMIO base addresses. Linux's xAPIC code
 /// hits these page-aligned regions for ICR/EOI/IRR programming and IRQ
@@ -281,9 +306,9 @@ fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: 
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
     if (op.is_write) {
-        vm.lapic.mmioWrite(offset, op.value);
+        vm.arch_devices.lapic.mmioWrite(offset, op.value);
     } else {
-        const value = vm.lapic.mmioRead(offset);
+        const value = vm.arch_devices.lapic.mmioRead(offset);
         mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
     }
     gs.rip += op.len;
@@ -296,9 +321,9 @@ fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys:
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
     if (op.is_write) {
-        vm.ioapic.mmioWrite(offset, op.value);
+        vm.arch_devices.ioapic.mmioWrite(offset, op.value);
     } else {
-        const value = vm.ioapic.mmioRead(offset);
+        const value = vm.arch_devices.ioapic.mmioRead(offset);
         mmio_decode.writeGpr(gs, op.reg, @as(u64, value));
     }
     gs.rip += op.len;
@@ -310,9 +335,9 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
         return zag.syscall.errors.E_INVAL;
     const irq_pin: u5 = @intCast(irq_num);
     if (assert) {
-        vm.ioapic.assertIrq(irq_pin);
+        vm.arch_devices.ioapic.assertIrq(irq_pin);
     } else {
-        vm.ioapic.deassertIrq(irq_pin);
+        vm.arch_devices.ioapic.deassertIrq(irq_pin);
     }
     return 0;
 }

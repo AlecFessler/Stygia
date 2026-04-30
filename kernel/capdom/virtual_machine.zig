@@ -100,16 +100,13 @@ pub const VirtualMachine = struct {
     /// per VM. Slots with `pf == null` are free.
     installs: [MAX_GUEST_INSTALLS]GuestInstall = [_]GuestInstall{.{}} ** MAX_GUEST_INSTALLS,
 
-    /// Kernel-emulated Local APIC. xAPIC mode, single vCPU. MMIO region
-    /// 0xFEE00000-0xFEE00FFF; pending vector consumed by the run loop's
-    /// pre-VMRUN hook in `vm_runloop.enterGuest` and injected via
-    /// `vm.injectInterrupt`.
-    lapic: zag.arch.x64.kvm.lapic.Lapic = .{},
-
-    /// Kernel-emulated I/O APIC. Intel 82093AA, 24 redirection entries.
-    /// `vm_inject_irq` asserts/deasserts pins here; pin → vector → LAPIC
-    /// IRR routing follows the guest-configured redirection table.
-    ioapic: zag.arch.x64.kvm.ioapic.Ioapic = .{},
+    /// Per-arch emulated-device state. On x86-64 this carries the
+    /// kernel-emulated LAPIC + IOAPIC pair consumed by the run loop's
+    /// pre-VMRUN hook (`vm_runloop.enterGuest`) and `vm_inject_irq`. On
+    /// aarch64 it is an empty struct (vGIC state lives elsewhere). Held
+    /// inline so the type is per-arch without the generic struct naming
+    /// arch-specific modules — see `arch.dispatch.vm.VmDevices`.
+    arch_devices: vm_dispatch.VmDevices = .{},
 };
 
 pub const Allocator = SecureSlab(VirtualMachine, 256);
@@ -482,9 +479,8 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
 
     // Initialize emulated APIC pair. Bidirectional: LAPIC notifies IOAPIC
     // on EOI to re-deliver level-triggered IRQs; IOAPIC writes vectors
-    // into LAPIC IRR on pin assert.
-    new_vm.ioapic.init(&new_vm.lapic);
-    new_vm.lapic.init(&new_vm.ioapic);
+    // into LAPIC IRR on pin assert. No-op on aarch64.
+    vm_dispatch.initVmDevices(&new_vm.arch_devices);
 
     incPageFrameRef(policy_pf);
     new_vm.policy_pf = SlabRef(PageFrame).init(policy_pf, policy_pf._gen_lock.currentGen());

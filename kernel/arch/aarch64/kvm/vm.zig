@@ -46,6 +46,19 @@ pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
         return error.InvalidPolicy;
 }
 
+/// Per-VM emulated-device state held inline on `VirtualMachine.arch_devices`.
+/// On aarch64 the vGIC state lives elsewhere (per-vCPU + per-VM CtrlStateCell),
+/// so this is an empty struct present only for cross-arch type uniformity. The
+/// x86-64 backend embeds the kernel-emulated LAPIC + IOAPIC pair here.
+pub const VmDevices = struct {};
+
+/// Per-arch wire-up hook invoked from generic `capdom.virtual_machine.allocVm`.
+/// No-op on aarch64 — see `arch/x64/kvm/vm.zig` for the LAPIC<->IOAPIC pointer
+/// init this exists to mirror.
+pub fn initVmDevices(devices: *VmDevices) void {
+    _ = devices;
+}
+
 /// Per-VM control-state envelope returned from `allocVmArchState`.
 /// Page-sized + page-aligned to fit the PMM's `create`/`destroy`
 /// contract; the only payload today is a placeholder slot. Future

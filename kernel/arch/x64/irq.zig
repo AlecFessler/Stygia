@@ -13,8 +13,8 @@ const kprof_dump = zag.kprof.dump;
 const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const sched = zag.sched.scheduler;
-const time = zag.arch.dispatch.time;
 const timer_wheel = zag.sched.timer;
+const timers = zag.arch.x64.timers;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
@@ -204,7 +204,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // (`emulateVirtualBar` issues `cpu.outb` directly without
     // `print_lock`), interleaving kernel bytes between userspace bytes
     // and corrupting `[runner] PASS …` lines.
-    time.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
+    timers.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
     // Drive any deadline-based wakeups for recv-with-timeout and
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.
     port.expireTimedRecvWaiters();

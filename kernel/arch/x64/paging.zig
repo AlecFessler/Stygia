@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
-const dispatch = zag.arch.dispatch;
 const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
@@ -18,6 +17,13 @@ const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 const VarCacheType = zag.capdom.var_range.CacheType;
 const VarPageSize = zag.capdom.var_range.PageSize;
+
+/// First user-mappable virtual address. The NULL guard `[0, 0x1000)` is
+/// reserved by spec §[address_space] so that NULL dereferences always
+/// fault; this is the upper bound of that guard. Mirrors the value in
+/// `arch.dispatch.paging.user_null_guard.end` — repeated locally so the
+/// arch backend doesn't reach upward through the dispatch boundary.
+const FIRST_USER_PAGE: u64 = 0x1000;
 
 /// Per-MappingKind page-attribute derivation. cache/global/user fields
 /// are owned by the arch backend (Intel SDM Vol 3A §5.10, §11.11).
@@ -290,7 +296,7 @@ pub fn mapPage(
     if (attrs.user_accessible) {
         // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
         // fault. No mapping path may install a leaf into the first page.
-        std.debug.assert(virt.addr >= dispatch.paging.user_null_guard.end);
+        std.debug.assert(virt.addr >= FIRST_USER_PAGE);
     }
     const writable = perms.write;
     const not_executable = !perms.exec;

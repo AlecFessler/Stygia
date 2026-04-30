@@ -10,16 +10,25 @@
 
 const zag = @import("zag");
 
-const cpu_dispatch = zag.arch.dispatch.cpu;
+const cpu = zag.arch.x64.cpu;
 const kvm_vcpu = zag.arch.x64.kvm.vcpu;
 const kvm_vm = zag.arch.x64.kvm.vm;
-const time_dispatch = zag.arch.dispatch.time;
+const timers = zag.arch.x64.timers;
 const vm_hw = zag.arch.x64.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
 const PAddr = zag.memory.address.PAddr;
-const VmExitDelivery = zag.arch.dispatch.vm.VmExitDelivery;
+
+/// VM-exit delivery descriptor returned by `enterGuest`. Mirror of the
+/// dispatch-tier alias in `zag.arch.dispatch.vm.VmExitDelivery` — the
+/// type lives here in the x64 backend so the dispatch layer remains a
+/// pure aliasing shim and arch-specific code doesn't need to import
+/// dispatch. Layout follows spec §[vm_exit_state] x86-64 sub-codes.
+pub const VmExitDelivery = struct {
+    subcode: u8,
+    payload: [3]u64,
+};
 
 // §[vm_exit_state] x86-64 sub-codes (mirror of the table in the spec).
 const SUBCODE_CPUID: u8 = 0;
@@ -77,9 +86,9 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         // the LAPIC timer; without this, programmed initial-counts
         // never countdown to zero and the guest spins forever in
         // interrupt-window exits waiting for a tick that won't come.
-        const now_ns = time_dispatch.currentMonotonicNs();
+        const now_ns = timers.getMonotonicClock().now();
         if (arch_state.last_tick_ns != 0) {
-            vm_ptr.lapic.tick(now_ns - arch_state.last_tick_ns);
+            vm_ptr.arch_devices.lapic.tick(now_ns - arch_state.last_tick_ns);
         }
         arch_state.last_tick_ns = now_ns;
 
@@ -94,8 +103,8 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         // means asserts before Linux unmasks the entry are no-ops.
         if (now_ns -% arch_state.last_auto_inject_ns >= 1_000_000) { // 1ms = 1000Hz
             arch_state.last_auto_inject_ns = now_ns;
-            vm_ptr.ioapic.assertIrq(2);
-            vm_ptr.ioapic.deassertIrq(2);
+            vm_ptr.arch_devices.ioapic.assertIrq(2);
+            vm_ptr.arch_devices.ioapic.deassertIrq(2);
         }
 
         // Auto-inject the guest's PIC-IRQ0 vector at a fixed 4ms
@@ -346,8 +355,8 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
         return snap;
     }
 
-    cpu_dispatch.userAccessBegin();
-    defer cpu_dispatch.userAccessEnd();
+    cpu.stac();
+    defer cpu.clac();
 
     snap.rip = loadU64(rsp, VREG14_RIP_OFF);
     snap.rflags = loadU64(rsp, VREG15_RFLAGS_OFF);
@@ -533,8 +542,8 @@ pub fn populateVmExitVregs(
     recv_frame.regs.r15 = gs.r15;
 
     const rsp = recv_frame.rsp;
-    cpu_dispatch.userAccessBegin();
-    defer cpu_dispatch.userAccessEnd();
+    cpu.stac();
+    defer cpu.clac();
 
     storeU64(rsp, VREG14_RIP_OFF, gs.rip);
     storeU64(rsp, VREG15_RFLAGS_OFF, gs.rflags);
@@ -612,13 +621,13 @@ fn deliverPendingInterrupts(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine, 
     if ((gs.rflags & (1 << 9)) == 0) return;
     if (gs.pending_eventinj != 0) return;
 
-    const vector = vm_ptr.lapic.getPendingVector() orelse return;
+    const vector = vm_ptr.arch_devices.lapic.getPendingVector() orelse return;
     vm_hw.injectInterrupt(gs, .{
         .vector = vector,
         .interrupt_type = 0, // external interrupt
         .error_code_valid = false,
     });
-    vm_ptr.lapic.acceptInterrupt(vector);
+    vm_ptr.arch_devices.lapic.acceptInterrupt(vector);
 }
 
 fn ctrlPhysFor(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine) ?PAddr {
