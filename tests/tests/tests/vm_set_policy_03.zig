@@ -56,9 +56,16 @@ const HandleId = caps.HandleId;
 // = 976 bytes. Same constant as create_virtual_machine_06 / map_guest_05.
 const VM_POLICY_BYTES: usize = 32 * 24 + 8 + 8 * 24 + 8;
 
-// §[vm_policy] x86-64: MAX_CPUID_POLICIES = 32. The smallest count
-// strictly exceeding this bound is 33.
-const OVER_MAX_CPUID: u8 = 33;
+// Per §[vm_policy] kind=0 is bounded by:
+//   x86-64: MAX_CPUID_POLICIES  = 32 → smallest over-max is 33
+//   aarch64: MAX_ID_REG_RESPONSES = 62 → smallest over-max is 63
+// Pick at comptime so the request reaches the kernel just past the
+// active arch's limit.
+const OVER_MAX_KIND0: u8 = switch (@import("builtin").cpu.arch) {
+    .x86_64 => 33,
+    .aarch64 => 63,
+    else => @compileError("vm_set_policy_03 not configured for this arch"),
+};
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -128,10 +135,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. count = 33 exceeds MAX_CPUID_POLICIES = 32 on x86-64 with
-    //    kind = 0. entries = &.{} keeps the per-entry validation gate
+    // 5. `OVER_MAX_KIND0` is one past the active arch's kind=0 bound
+    //    (`MAX_CPUID_POLICIES` on x86-64, `MAX_ID_REG_RESPONSES` on
+    //    aarch64). entries = &.{} keeps the per-entry validation gate
     //    inert; reserved bits in [1] are clear by construction.
-    const result = syscall.vmSetPolicy(vm_handle, 0, OVER_MAX_CPUID, &.{});
+    const result = syscall.vmSetPolicy(vm_handle, 0, OVER_MAX_KIND0, &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(5);

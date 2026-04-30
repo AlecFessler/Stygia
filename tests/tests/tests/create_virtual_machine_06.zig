@@ -24,6 +24,20 @@
 //   under MAX_CR_POLICIES = 8), so test 07 — the symmetric cr-table
 //   overflow — does not fire ahead of this one.
 //
+//   Per §[vm_policy] aarch64, the equivalent of `num_cpuid_responses`
+//   is `num_id_reg_responses`. The aarch64 layout is:
+//
+//     offset    field
+//     0..991    id_reg_responses[62]              (62 * 16 = 992)
+//     992..995  num_id_reg_responses (u32)
+//     996..999  _pad0 (u32)
+//     1000..1767 sysreg_policies[32]              (32 * 24 = 768)
+//     1768..1771 num_sysreg_policies (u32)
+//     1772..1775 _pad1 (u32)
+//
+//   MAX_ID_REG_RESPONSES = 62. We branch on `builtin.cpu.arch` to plant
+//   the overflowed count at the matching offset for the running arch.
+//
 //   Setup chain:
 //     1. create_page_frame(caps={r,w}, props=0, pages=1) — backing
 //        store for the VmPolicy struct. 4 KiB > 976 bytes.
@@ -55,6 +69,8 @@
 //      (success path or any other error code is a spec violation —
 //      the kernel must reject this exact policy with E_INVAL).
 
+const builtin = @import("builtin");
+
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -64,11 +80,28 @@ const testing = lib.testing;
 
 const HandleId = caps.HandleId;
 
-// §[vm_policy] x86-64 constants and offsets.
-const MAX_CPUID_POLICIES: u32 = 32;
-const CPUID_TABLE_BYTES: usize = 32 * 24;
-const NUM_CPUID_OFFSET: usize = CPUID_TABLE_BYTES; // 768
-const VM_POLICY_BYTES: usize = 32 * 24 + 8 + 8 * 24 + 8; // 976
+// Per-arch §[vm_policy] table-overflow probe. The runner builds a
+// single ELF that boots on whichever arch the kernel is built for, so
+// the constants are picked at comptime against `builtin.cpu.arch`.
+const overflow_field: PolicyOverflow = switch (builtin.cpu.arch) {
+    .x86_64 => .{
+        .vm_policy_bytes = 32 * 24 + 8 + 8 * 24 + 8, // 976
+        .field_offset = 32 * 24, // 768 — num_cpuid_responses
+        .max_value = 32, // MAX_CPUID_POLICIES
+    },
+    .aarch64 => .{
+        .vm_policy_bytes = 62 * 16 + 8 + 32 * 24 + 8, // 1776
+        .field_offset = 62 * 16, // 992 — num_id_reg_responses
+        .max_value = 62, // MAX_ID_REG_RESPONSES
+    },
+    else => @compileError("create_virtual_machine_06 not configured for this arch"),
+};
+
+const PolicyOverflow = struct {
+    vm_policy_bytes: usize,
+    field_offset: usize,
+    max_value: u32,
+};
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -114,12 +147,12 @@ pub fn main(cap_table_base: u64) void {
     //    against the kernel's read.
     const policy_dst: [*]volatile u8 = @ptrFromInt(policy_base);
     var i: usize = 0;
-    while (i < VM_POLICY_BYTES) {
+    while (i < overflow_field.vm_policy_bytes) {
         policy_dst[i] = 0;
         i += 1;
     }
-    const num_cpuid_ptr: *volatile u32 = @ptrFromInt(policy_base + NUM_CPUID_OFFSET);
-    num_cpuid_ptr.* = MAX_CPUID_POLICIES + 1; // 33 — one past the bound
+    const overflow_ptr: *volatile u32 = @ptrFromInt(policy_base + overflow_field.field_offset);
+    overflow_ptr.* = overflow_field.max_value + 1; // one past the bound
 
     // 4. The runner grants `crvm` and ceilings_inner.vm_ceiling = 0x01
     //    (the `policy` bit) — so caps={.policy=true} stays subset of
