@@ -77,16 +77,17 @@ def section_name_from_heading(heading_line: str) -> str | None:
     return name
 
 
-def parse_spec(path: str) -> dict[str, dict[str, str]]:
+def parse_spec(path: str) -> tuple[dict[str, dict[str, str]], int]:
     """Parse spec-v3.
 
     Returns:
-      { section_name: { test_num: assertion_text } }
+      ({ section_name: { test_num: assertion_text } }, warning_count)
 
     Sections that produce zero tests are omitted from the result.
     """
     sections: dict[str, dict[str, str]] = defaultdict(dict)
     current: str | None = None
+    warnings = 0
 
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -117,12 +118,13 @@ def parse_spec(path: str) -> dict[str, dict[str, str]]:
                     f"WARNING: duplicate spec test [{num}] under ### {current}",
                     file=sys.stderr,
                 )
+                warnings += 1
                 continue
             sections[current][num] = text
 
     # Drop any sections that ended up empty (e.g. anchor headings whose body
     # contained no `[test]` lines).
-    return {sec: tests for sec, tests in sections.items() if tests}
+    return ({sec: tests for sec, tests in sections.items() if tests}, warnings)
 
 
 def parse_tests(tests_dir: str) -> dict[str, set[str]]:
@@ -173,7 +175,7 @@ def longest_section_match(filename_section: str, spec_sections: set[str]) -> str
 
 
 def main() -> int:
-    spec = parse_spec(SPEC_PATH)
+    spec, spec_warnings = parse_spec(SPEC_PATH)
     tests = parse_tests(TESTS_DIR)
 
     spec_total = sum(len(v) for v in spec.values())
@@ -241,7 +243,7 @@ def main() -> int:
         f"{mismatch_count} mismatches."
     )
 
-    return 0 if mismatch_count == 0 else 1
+    return 0 if (mismatch_count == 0 and spec_warnings == 0) else 1
 
 
 if __name__ == "__main__":
