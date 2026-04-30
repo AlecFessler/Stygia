@@ -173,13 +173,36 @@ pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
     cpu.panEnable();
 }
 
-/// Copy the §[event_state] GPR-backed vregs (vregs 1..31 on aarch64:
-/// x0..x30) from `src` to `dst`. Companion to x86-64's `copyEventStateGprs`;
+/// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on aarch64:
+/// x0..x12) from `src` to `dst`. Companion to x86-64's `copyEventStateGprs`;
 /// used by `reply` (Spec §[reply] test 05) to apply the receiver's vreg
 /// modifications onto the suspended EC's saved iret frame when the
 /// originating EC handle held the `write` cap.
+///
+/// Only vregs 1..13 are propagated — those are the spec's writable
+/// event-state GPR window. The wholesale `dst.regs = src.regs` shape
+/// would clobber x13..x30 (vreg 14 = suspended PC, plus AAPCS64
+/// callee-saved x19..x28, FP x29, and LR x30). LR corruption in
+/// particular makes the resumed EC `RET` to the receiver's stack frame
+/// instead of returning from its own `svc`, which silently traps the
+/// post-resume control flow (including the `delete(SLOT_SELF)` tail in
+/// `libz/start.zig`) — domains never tear down, leaked timer/PMM state
+/// accumulates per test, and the in-kernel-parallel runner stalls in
+/// `createCapabilityDomain` once PMM blocks are exhausted.
 pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
-    dst.regs = src.regs;
+    dst.regs.x0 = src.regs.x0;
+    dst.regs.x1 = src.regs.x1;
+    dst.regs.x2 = src.regs.x2;
+    dst.regs.x3 = src.regs.x3;
+    dst.regs.x4 = src.regs.x4;
+    dst.regs.x5 = src.regs.x5;
+    dst.regs.x6 = src.regs.x6;
+    dst.regs.x7 = src.regs.x7;
+    dst.regs.x8 = src.regs.x8;
+    dst.regs.x9 = src.regs.x9;
+    dst.regs.x10 = src.regs.x10;
+    dst.regs.x11 = src.regs.x11;
+    dst.regs.x12 = src.regs.x12;
 }
 
 /// Snapshot the suspending EC's GPR-backed vregs 1..13 in canonical

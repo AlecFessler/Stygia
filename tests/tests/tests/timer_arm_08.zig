@@ -92,10 +92,17 @@ pub fn main(cap_table_base: u64) void {
     };
     const caps_word: u64 = @as(u64, timer_caps.toU16());
 
-    // 1 ms period: long enough not to thrash the kernel timer path,
-    // short enough that two fires complete inside the 1 s futex wait
-    // timeout below.
-    const deadline_ns: u64 = 1_000_000;
+    // 50 ms period. Two fires complete well within the 1 s futex wait
+    // timeout, but the gap between fires is long enough that the
+    // intervening `sync` + `readCap` window on slow hosts (aarch64 Pi 5
+    // KVM with the in-kernel-parallel runner) cannot overlap a second
+    // fire. The earlier 1 ms period left no margin for futex
+    // wake → user-mode resume → sync → readCap on KVM aarch64; field0
+    // would tick to 2 before the post-wake read landed and the test
+    // tripped on assertion 4. Spec §[timer_arm] only pins the order of
+    // counter values, not their absolute timing, so any period that
+    // keeps the assertion observable is conformant.
+    const deadline_ns: u64 = 50_000_000;
 
     const arm_result = syscall.timerArm(caps_word, deadline_ns, PERIODIC_FLAG);
     if (testing.isHandleError(arm_result.v1)) {
