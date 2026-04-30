@@ -2,7 +2,7 @@
 # Mega precommit: run the full cross-arch gauntlet before a commit.
 #
 # Stages:
-#   0. arch layering lint          (grep — arch-specific / generic boundaries)
+#   0. arch layering lint          (gating — arch-specific / generic boundaries)
 #   0b. dead-code report            (advisory — manual review)
 #   0c. gen-lock analyzer           (gating — fat-pointer + bracketing invariants)
 #   1. x86-64 kernel test suite   (KVM on this dev PC)
@@ -39,32 +39,18 @@ FAILURES=()
 stage_arch_layering_lint() {
     echo ""
     echo "=================================================="
-    echo "[0] Arch layering lint (grep)"
+    echo "[0] Arch layering lint (token-aware analyzer)"
     echo "=================================================="
-    local violations=0
-
-    local up_leak
-    up_leak=$(grep -rn 'zag\.arch\.dispatch' "$ZAG_ROOT/kernel/arch/x64" "$ZAG_ROOT/kernel/arch/aarch64" 2>/dev/null || true)
-    if [[ -n "$up_leak" ]]; then
-        echo "arch-specific code imports zag.arch.dispatch (must not):"
-        echo "$up_leak"
-        violations=$((violations + 1))
+    if ! (cd "$ZAG_ROOT/tools/check_arch_layering" && zig build 2>&1); then
+        FAILURES+=("arch-layering analyzer build")
+        return 1
     fi
-
-    local down_leak
-    down_leak=$(grep -rln 'zag\.arch\.\(x64\|aarch64\)\.' "$ZAG_ROOT/kernel" "$ZAG_ROOT/bootloader" 2>/dev/null | grep -v '/kernel/arch/' || true)
-    if [[ -n "$down_leak" ]]; then
-        echo "generic code reaches into zag.arch.x64/aarch64 (must go through dispatch):"
-        echo "$down_leak"
-        violations=$((violations + 1))
+    ensure_callgraph_db || return 1
+    local analyzer="$ZAG_ROOT/tools/check_arch_layering/zig-out/bin/check_arch_layering"
+    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB"); then
+        FAILURES+=("arch layering lint")
+        return 1
     fi
-
-    if [[ $violations -eq 0 ]]; then
-        echo "[PASS] arch boundaries clean"
-        return 0
-    fi
-    FAILURES+=("arch layering lint")
-    return 1
 }
 
 # Build the per-(arch, commit_sha) callgraph DB if it isn't present yet.
