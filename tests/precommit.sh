@@ -33,7 +33,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
-PI_REMOTE_DIR="${PI_REMOTE_DIR:-\$HOME/zag-test}"
+# Stays as a relative path so both ssh-shell-expansion contexts
+# (`cd $PI_REMOTE_DIR …`) and scp destinations (`host:$PI_REMOTE_DIR/x`,
+# which scp treats relative to login dir, NOT through a shell) resolve
+# to the same place. Don't add a leading $HOME or `~` here — scp
+# wouldn't expand `$HOME` (no remote shell) and `~` only works
+# unquoted, which would break the ssh contexts.
+PI_REMOTE_DIR="${PI_REMOTE_DIR:-zag-test}"
 
 FAILURES=()
 
@@ -44,12 +50,13 @@ REQUIRED_STAGES=(
     arch_layering_lint
     verify_coverage
     x86_kernel_tests
+    aarch64_kernel_tests_pi
+    aarch64_vm_tests_tcg
 )
 # Stages tagged as currently-failing-but-meant-to-be-required. Move
 # entries back into REQUIRED_STAGES above as their underlying issues land:
 #   dead_code_report            — pre-existing dead-field findings under review
 #   gen_lock_analyzer           — pre-existing IRQ-discipline violations in kernel/caps + kernel/syscall
-#   aarch64_kernel_tests_pi     — recv_05 ~1/3 flake on Pi 5 KVM, dedicated agent in flight
 #   hyprvos_x86_linux_boot      — blocked on reply-syscall ABI redesign (user is on this)
 #   hyprvos_aarch64_linux_boot  — same upstream blocker
 #
@@ -225,7 +232,7 @@ clean_nvvars() {
 stage_x86_kernel_tests() {
     echo ""
     echo "=================================================="
-    echo "[1/4] x86-64 kernel test suite (in-kernel runner, local KVM)"
+    echo "[1/4] x86-64 kernel test suite (in-kernel runner, local KVM, 3 reps)"
     echo "=================================================="
     clean_nvvars
 
@@ -241,51 +248,155 @@ stage_x86_kernel_tests() {
         return 1
     fi
 
-    echo "Booting kernel under QEMU+KVM..."
-    local qemu_log
-    qemu_log=$(mktemp)
-    # Drive root_service.elf is loaded by the kernel from zig-out/img
-    # via the FAT image; in-kernel runner orchestrates all 475 tests
-    # and calls power_shutdown when summarize() finishes.
-    if ! (cd "$ZAG_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
-        echo "[FAIL] qemu run failed or timed out"
-        echo "--- last 30 lines of QEMU output ---"
-        tail -30 "$qemu_log"
-        echo "--- end ---"
+    # Three boots in a row, fail the whole stage on the first miss/fail.
+    # Catches flakes that a single run wouldn't surface.
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under QEMU+KVM..."
+        local qemu_log
+        qemu_log=$(mktemp)
+        if ! (cd "$ZAG_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
+            echo "[FAIL] qemu run ${rep}/3 failed or timed out"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$qemu_log"
+            echo "--- end ---"
+            rm -f "$qemu_log"
+            FAILURES+=("x86 kernel runner timeout/qemu error (rep ${rep}/3)")
+            return 1
+        fi
+
+        local total
+        total=$(grep -E '^\[runner\] [0-9]+ total' "$qemu_log" | tail -1)
+        if [[ -z "$total" ]]; then
+            echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$qemu_log"
+            echo "--- end ---"
+            rm -f "$qemu_log"
+            FAILURES+=("x86 kernel tests (no [runner] total, rep ${rep}/3)")
+            return 1
+        fi
+
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3: $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
+            rm -f "$qemu_log"
+            FAILURES+=("x86 kernel tests rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
         rm -f "$qemu_log"
-        FAILURES+=("x86 kernel runner timeout/qemu error")
+    done
+
+    echo "[PASS] x86 kernel tests — 3/3 green"
+    return 0
+}
+
+aarch64_pi_reachable() {
+    # 5s connect timeout, batch mode (no password prompt). Returns
+    # 0 if SSH succeeded, non-zero otherwise.
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI_HOST" 'true' 2>/dev/null
+}
+
+# Run an aarch64 in-kernel test bundle 3× under local QEMU+TCG and
+# report PASS/FAIL the same shape as the Pi path. Caller has already
+# built kernel.elf + the bundled root_service.elf in zig-out/img and
+# tests/tests/bin respectively. label = stage description for logs;
+# fail_tag = prefix for FAILURES entries on this stage.
+run_aarch64_tcg_3reps() {
+    local label="$1"
+    local fail_tag="$2"
+    # Stage a clean FAT image dir so per-rep boots don't share state.
+    local fat
+    fat=$(mktemp -d)
+    mkdir -p "$fat/img/efi/boot"
+    cp "$ZAG_ROOT/zig-out/img/kernel.elf" "$fat/img/"
+    cp "$SCRIPT_DIR/tests/bin/root_service.elf" "$fat/img/"
+    cp "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
+
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under qemu-system-aarch64 + TCG (${label})..."
+        local tcg_log
+        tcg_log=$(mktemp)
+        if ! timeout 600 qemu-system-aarch64 \
+            -M virt,gic-version=3 -m 2G \
+            -bios /usr/share/AAVMF/AAVMF_CODE.fd \
+            -serial stdio -display none -no-reboot \
+            -machine accel=tcg -cpu cortex-a72,pmu=on \
+            -smp cores=4 \
+            -drive file=fat:rw:"$fat/img",format=raw > "$tcg_log" 2>&1; then
+            echo "[FAIL] TCG run ${rep}/3 failed or timed out (${label})"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$tcg_log"
+            echo "--- end ---"
+            rm -f "$tcg_log"
+            rm -rf "$fat"
+            FAILURES+=("${fail_tag}: tcg run timeout/qemu error (rep ${rep}/3)")
+            return 1
+        fi
+        local total
+        total=$(grep -E '^\[runner\] [0-9]+ total' "$tcg_log" | tail -1)
+        if [[ -z "$total" ]]; then
+            echo "[FAIL] rep ${rep}/3 (${label}): no [runner] total — kernel didn't reach summarize()"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$tcg_log"
+            echo "--- end ---"
+            rm -f "$tcg_log"
+            rm -rf "$fat"
+            FAILURES+=("${fail_tag}: no [runner] total (rep ${rep}/3)")
+            return 1
+        fi
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3 (${label}): $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$tcg_log" | head -20
+            rm -f "$tcg_log"
+            rm -rf "$fat"
+            FAILURES+=("${fail_tag} rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
+        rm -f "$tcg_log"
+    done
+
+    rm -rf "$fat"
+    echo "[PASS] ${label} — 3/3 green"
+    return 0
+}
+
+# §[vm_exit_state] / vCPU-execution coverage on aarch64 must be
+# exercised against the real EL2/VHE path, not the spec's E_NODEV
+# degraded-pass branch the Pi 5 KVM gets. Pi 5 KVM doesn't expose
+# nested virt + only supports gic-version=2, so vCPU execution paths
+# can't run there. Build root_service with just the 6 VM-related spec
+# tests and run them under local TCG (gic-version=3). When aarch64
+# kernel-side VM dispatch graduates from stub to real, this gate
+# catches regressions on the real path.
+stage_aarch64_vm_tests_tcg() {
+    echo ""
+    echo "=================================================="
+    echo "[2a/4] aarch64 VM spec tests (local TCG, gic-version=3, 3 reps)"
+    echo "=================================================="
+    echo "Building aarch64 root_service (6-test VM bundle)..."
+    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && \
+          zig build -Darch=arm \
+          -Dtests='acquire_ecs_07,create_vcpu_03,create_vcpu_06,create_vcpu_07,create_virtual_machine_06,create_virtual_machine_07'); then
+        FAILURES+=("aarch64 vm-tests root_service build")
         return 1
     fi
-
-    local total
-    total=$(grep -E '^\[runner\] [0-9]+ total' "$qemu_log" | tail -1)
-    if [[ -z "$total" ]]; then
-        echo "[FAIL] in-kernel runner did not report a total — kernel didn't reach summarize()"
-        echo "--- last 30 lines of QEMU output ---"
-        tail -30 "$qemu_log"
-        echo "--- end ---"
-        rm -f "$qemu_log"
-        FAILURES+=("x86 kernel tests (no [runner] total)")
+    echo "Building aarch64 kernel..."
+    if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=test); then
+        FAILURES+=("aarch64 vm-tests kernel build")
         return 1
     fi
-
-    if echo "$total" | grep -qE '0 fail / 0 miss'; then
-        echo "[PASS] x86 kernel tests: ${total#'[runner] '}"
-        rm -f "$qemu_log"
-        return 0
-    fi
-
-    echo "[FAIL] $total"
-    grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
-    rm -f "$qemu_log"
-    FAILURES+=("x86 kernel tests: ${total#'[runner] '}")
-    return 1
+    run_aarch64_tcg_3reps "aarch64 VM spec tests (TCG)" "aarch64 vm-tests"
 }
 
 stage_aarch64_kernel_tests_pi() {
     echo ""
     echo "=================================================="
-    echo "[2/4] aarch64 kernel test suite (in-kernel runner, Pi KVM via SSH)"
+    echo "[2/4] aarch64 kernel test suite (in-kernel runner; Pi KVM, TCG fallback)"
     echo "=================================================="
 
     echo "Building aarch64 root_service (in-kernel runner with embedded test ELFs)..."
@@ -298,6 +409,14 @@ stage_aarch64_kernel_tests_pi() {
     if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 kernel build")
         return 1
+    fi
+
+    if ! aarch64_pi_reachable; then
+        echo ""
+        echo "Pi (${PI_HOST}) unreachable via SSH — falling back to local TCG."
+        echo "(Full 477-test suite under emulation; expect this to take longer.)"
+        run_aarch64_tcg_3reps "aarch64 kernel tests (TCG fallback)" "aarch64 kernel tests"
+        return $?
     fi
 
     echo "Syncing artifacts to $PI_HOST..."
@@ -321,42 +440,49 @@ stage_aarch64_kernel_tests_pi() {
         return 1
     fi
 
-    echo "Booting kernel under qemu-system-aarch64 + KVM on Pi..."
-    local pi_log
-    pi_log=$(mktemp)
-    if ! ssh "$PI_HOST" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rm -rf \$wd" > "$pi_log" 2>&1; then
-        echo "[FAIL] Pi qemu run failed or timed out"
-        echo "--- last 30 lines of Pi output ---"
-        tail -30 "$pi_log"
-        echo "--- end ---"
-        rm -f "$pi_log"
-        FAILURES+=("aarch64 kernel runner timeout/qemu error")
-        return 1
-    fi
+    # Three boots in a row, fail the whole stage on the first miss/fail.
+    # Catches flakes that a single run wouldn't surface.
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under qemu-system-aarch64 + KVM on Pi..."
+        local pi_log
+        pi_log=$(mktemp)
+        if ! ssh "$PI_HOST" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rm -rf \$wd" > "$pi_log" 2>&1; then
+            echo "[FAIL] Pi qemu run ${rep}/3 failed or timed out"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 kernel runner timeout/qemu error (rep ${rep}/3)")
+            return 1
+        fi
 
-    local total
-    total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
-    if [[ -z "$total" ]]; then
-        echo "[FAIL] in-kernel runner did not report a total — kernel didn't reach summarize()"
-        echo "--- last 30 lines of Pi output ---"
-        tail -30 "$pi_log"
-        echo "--- end ---"
-        rm -f "$pi_log"
-        FAILURES+=("aarch64 kernel tests (no [runner] total)")
-        return 1
-    fi
+        local total
+        total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
+        if [[ -z "$total" ]]; then
+            echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 kernel tests (no [runner] total, rep ${rep}/3)")
+            return 1
+        fi
 
-    if echo "$total" | grep -qE '0 fail / 0 miss'; then
-        echo "[PASS] aarch64 kernel tests: ${total#'[runner] '}"
-        rm -f "$pi_log"
-        return 0
-    fi
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3: $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 kernel tests rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
 
-    echo "[FAIL] $total"
-    grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
-    rm -f "$pi_log"
-    FAILURES+=("aarch64 kernel tests: ${total#'[runner] '}")
-    return 1
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
+        rm -f "$pi_log"
+    done
+
+    echo "[PASS] aarch64 kernel tests — 3/3 green"
+    return 0
 }
 
 stage_hyprvos_x86_linux_boot() {
@@ -484,6 +610,7 @@ run_stage callgraph_smokes
 run_stage verify_coverage
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi
+run_stage aarch64_vm_tests_tcg
 run_stage hyprvos_x86_linux_boot
 run_stage hyprvos_aarch64_linux_boot
 run_stage redteam_regressions
