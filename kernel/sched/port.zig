@@ -65,7 +65,7 @@ var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
 /// completion in IRQ context with IRQs masked, never recurses, and
 /// each core has its own timer. Spec §[port] / kernel/arch/x64/irq.zig
 /// `schedTimerHandler`.
-const RecvSnapshot = struct { ec: *ExecutionContext, deadline: u64 };
+const RecvSnapshot = struct { ec: SlabRef(ExecutionContext), deadline: u64 };
 var expire_recv_scratch: [scheduler.MAX_CORES][MAX_TIMED_RECV_WAITERS]RecvSnapshot = undefined;
 
 fn addTimedRecvWaiter(ec: *ExecutionContext) bool {
@@ -111,14 +111,26 @@ pub fn expireTimedRecvWaiters() void {
         for (&timed_recv_waiters) |*slot| {
             const ec = slot.* orelse continue;
             if (ec.recv_deadline_ns == 0 or now_ns < ec.recv_deadline_ns) continue;
-            expired[expired_count] = .{ .ec = ec, .deadline = ec.recv_deadline_ns };
+            // self-alive: `ec` is pinned by the `timed_recv_waiters`
+            // slot we just dequeued; capturing its current gen here
+            // gives the phase-2 walk a stale-detector if the slot is
+            // freed and reallocated between phases. The deadline
+            // re-check below still catches the wake/re-wait race.
+            expired[expired_count] = .{
+                .ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen()),
+                .deadline = ec.recv_deadline_ns,
+            };
             expired_count += 1;
             slot.* = null;
         }
     }
 
     for (expired[0..expired_count]) |entry| {
-        const ec = entry.ec;
+        // self-alive: `entry.ec` was captured under timed_recv_lock
+        // above and the EC's slot can only be freed after this phase
+        // unwinds the recv-waiter from its port queue. The deadline
+        // check below catches a sender-wake / fresh-recv race.
+        const ec = entry.ec.ptr;
         // Re-check deadline. If a sender wake ran between phases the
         // deadline is now 0; if the EC was woken and made a fresh recv
         // it'd be a different value. Either way this snapshot is stale.

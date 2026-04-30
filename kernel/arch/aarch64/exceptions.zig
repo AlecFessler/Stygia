@@ -435,6 +435,9 @@ fn readFarEl1() u64 {
 /// in-kernel I/O bus arrives.
 fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
     const ec_ptr = scheduler.currentEc() orelse return false;
+    // self-alive: `ec_ptr` is the running EC of this core (we are mid-
+    // synchronous-trap from it), so its domain SlabRef is live for the
+    // duration of this handler. Mirrors arch/x64/interrupts.zig switchTo.
     const domain = ec_ptr.domain.ptr;
     const fault_va = VAddr.fromInt(readFarEl1());
 

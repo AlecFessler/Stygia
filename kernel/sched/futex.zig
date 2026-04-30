@@ -79,7 +79,7 @@ var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext
 /// per core is safe: `schedTimerHandler` runs to completion in IRQ
 /// context with IRQs masked, never recurses, and each core has its
 /// own timer.
-const Snapshot = struct { ec: *ExecutionContext, deadline: u64 };
+const Snapshot = struct { ec: SlabRef(ExecutionContext), deadline: u64 };
 var expire_timed_scratch: [sched.MAX_CORES][MAX_TIMED_WAITERS]Snapshot = undefined;
 
 /// `timed_lock` ordered_group. The wait paths take a bucket.lock first
@@ -501,7 +501,15 @@ pub fn expireTimedWaiters() void {
         for (&timed_waiters) |*slot| {
             const ec = slot.* orelse continue;
             if (ec.futex_deadline_ns == 0 or now_ns < ec.futex_deadline_ns) continue;
-            expired[expired_count] = .{ .ec = ec, .deadline = ec.futex_deadline_ns };
+            // self-alive: `ec` is pinned by the `timed_waiters` slot we
+            // just dequeued; capturing its current gen here gives the
+            // phase-2 walk a stale-detector if the slot is freed and
+            // reallocated between phases. The deadline re-check after
+            // re-locking still rejects re-registered ECs.
+            expired[expired_count] = .{
+                .ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen()),
+                .deadline = ec.futex_deadline_ns,
+            };
             expired_count += 1;
             slot.* = null;
         }
@@ -509,7 +517,12 @@ pub fn expireTimedWaiters() void {
 
     // Phase 2: per-EC, take only bucket.lock (never timed_lock).
     for (expired[0..expired_count]) |entry| {
-        const ec = entry.ec;
+        // self-alive: `entry.ec` was captured under timed_lock above
+        // and the EC's slot can only be freed after its bucket waiters
+        // are unwound, which this very phase performs. The gen carried
+        // by the SlabRef is the structural staleness backstop; the
+        // deadline check below catches the wake/re-wait race.
+        const ec = entry.ec.ptr;
         // Re-check deadline. If wake() ran between phases, deadline is
         // now 0; if the EC was woken and made a new wait, deadline
         // differs. In both cases this snapshot is stale — skip.

@@ -1352,27 +1352,27 @@ pub fn allocExecutionContext(
 /// the caller (`destroyCapabilityDomain` invoked from `releaseSelf`)
 /// already holds it, and SecureSlab gen-locks don't allow recursive
 /// acquire on the same class.
-pub fn destroyEcsInDomain(cd: *CapabilityDomain, cd_gen: u63, cd_addr_space_root: PAddr, keep: ?*ExecutionContext) void {
-    // Visitor packs the four loop-invariant args. The CD ref carries a
+pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root: PAddr, keep_ref: ?SlabRef(ExecutionContext)) void {
+    // Visitor packs the loop-invariant args. The CD ref carries a
     // verified gen so the visitor can reject ECs whose `domain` ptr
     // happens to alias a stale (since-recycled) slot. The keep ref
-    // names the caller-running EC; it MUST NOT carry a gen — its slot
-    // is `parkSelfFaulted`'d (state .exited) and will be reaped lazily,
-    // and we identify it by bare-ptr identity to skip it during the
-    // walk. Both refs use `SlabRef` to satisfy the fat-pointer
-    // invariant, but the visitor never `.lock()`s them (we already
-    // hold cd._gen_lock and the keep EC is the very EC executing this
-    // path) — the `.ptr` accesses on the chains below are bracketed by
-    // that outer lock and are explicitly self-alive.
+    // names the caller-running EC; its slot is `parkSelfFaulted`'d
+    // (state .exited) and will be reaped lazily, and we identify it by
+    // pointer identity to skip it during the walk. Both refs use
+    // `SlabRef` to satisfy the fat-pointer invariant, but the visitor
+    // never `.lock()`s them (we already hold cd._gen_lock and the keep
+    // EC is the very EC executing this path) — the `.ptr` accesses on
+    // the chains below are bracketed by that outer lock and are
+    // explicitly self-alive.
     const Visitor = struct {
         cd_ref: SlabRef(CapabilityDomain),
         cd_addr_space_root: PAddr,
         keep_ref: ?SlabRef(ExecutionContext),
     };
     var ctx = Visitor{
-        .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
+        .cd_ref = cd_ref,
         .cd_addr_space_root = cd_addr_space_root,
-        .keep_ref = if (keep) |k| SlabRef(ExecutionContext).init(k, k._gen_lock.currentGen()) else null,
+        .keep_ref = keep_ref,
     };
     slab_instance.forEachAlive(
         &ctx,

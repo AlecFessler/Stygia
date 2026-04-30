@@ -846,14 +846,21 @@ pub fn allocCapabilityDomain(
 /// EC._gen_lock` and `CD._gen_lock → EC._gen_lock` edges and any
 /// inverse path closes an AB-BA cycle.
 pub const DestroyDeferred = struct {
-    cd: *CapabilityDomain,
-    cd_gen: u63,
+    /// CD identity captured under cd._gen_lock at phase-1 entry. The gen
+    /// is the live odd value at capture; phase-2's EC walk uses
+    /// `cd_ref.ptr` / `cd_ref.gen` for identity-only comparison against
+    /// `ec.domain` (no deref of the freed CD).
+    cd_ref: SlabRef(CapabilityDomain),
     cd_addr_space_root: PAddr,
     vm_ref: ?SlabRef(VirtualMachine),
     user_buf: [*]u8,
     kernel_buf: [*]u8,
     addr_space_id: u16,
-    caller_ec: ?*ExecutionContext,
+    /// Caller-running EC (the one that invoked `delete(SLOT_SELF)`).
+    /// Skipped by phase-2's EC walk because its kernel stack is in
+    /// active use. The gen is captured before `parkSelfFaulted`; the
+    /// walk only uses it for pointer-identity comparison.
+    caller_ec: ?SlabRef(ExecutionContext),
 };
 
 /// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller.
@@ -868,14 +875,16 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
 
     const cd_gen = cd._gen_lock.currentGen();
     const deferred = DestroyDeferred{
-        .cd = cd,
-        .cd_gen = cd_gen,
+        .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
         .cd_addr_space_root = cd.addr_space_root,
         .vm_ref = cd.vm,
         .user_buf = @ptrCast(cd.user_table),
         .kernel_buf = @ptrCast(cd.kernel_table),
         .addr_space_id = cd.addr_space_id,
-        .caller_ec = caller_ec,
+        .caller_ec = if (caller_ec) |ec|
+            SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
+        else
+            null,
     };
 
     slab_instance.destroyLocked(cd, cd_gen);
@@ -893,8 +902,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
     zag.sched.execution_context.destroyEcsInDomain(
-        deferred.cd,
-        deferred.cd_gen,
+        deferred.cd_ref,
         deferred.cd_addr_space_root,
         deferred.caller_ec,
     );

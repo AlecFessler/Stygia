@@ -431,6 +431,13 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half
     // translation walks the right tree. Kernel half lives in TTBR1 and
     // is shared, so no kernel-side TLBI is needed.
+    //
+    // self-alive: `ec` was selected by the scheduler for this core; its
+    // domain is held live by the EC through the dispatch window (the EC
+    // carries a SlabRef into the domain), so reading addr_space_root /
+    // addr_space_id directly off the deref'd pointer without re-locking
+    // the SlabRef is sound here. Mirrors the matching exemption in
+    // arch/x64/interrupts.zig switchTo.
     const dom = ec.domain.ptr;
     const new_root = dom.addr_space_root;
     if (new_root.addr != zag.arch.aarch64.paging.getAddrSpaceRoot().addr) {
