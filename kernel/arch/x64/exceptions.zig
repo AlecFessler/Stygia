@@ -1,6 +1,7 @@
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
+const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
@@ -185,6 +186,24 @@ fn exceptionEvent(vector: u5) ?ExceptionEvent {
     };
 }
 
+/// Probe the user-mode instruction byte at `rip` against the HLT opcode
+/// (0xF4, single byte — Intel SDM Vol 2A "HLT"). Walks the current EC's
+/// capability-domain page tables so we don't depend on the page being
+/// resident in any kernel-side cache. Returns false if there is no
+/// current EC, the page is not resident, or the byte mismatches.
+fn isUserHltAt(rip: u64) bool {
+    const ec = scheduler.currentEc() orelse return false;
+    // self-alive: currentEc() runs on this core; its bound capability
+    // domain stays alive for the duration of this exception handler.
+    const domain = ec.domain.ptr;
+    const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
+    const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse
+        return false;
+    const physmap_base = VAddr.fromPAddr(phys, null).addr;
+    const byte_ptr: *const u8 = @ptrFromInt(physmap_base + (rip & 0xFFF));
+    return byte_ptr.* == 0xF4;
+}
+
 fn exceptionHandler(ctx: *cpu.Context) void {
     const vector: u5 = @intCast(ctx.int_num);
     const exception: Exception = @enumFromInt(vector);
@@ -205,6 +224,29 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     if (from_user) {
         // Debug/single-step from userspace: just resume.
         if (exception == .single_step_debug) return;
+
+        // EL0 hlt trap. Intel SDM Vol 2A "HLT" — executing HLT at CPL > 0
+        // raises #GP(0). Park the EC in `.idle_wait` so it stops consuming
+        // CPU but stays alive and suspendable; the aarch64 wfi-trap path
+        // (kernel/arch/aarch64/exceptions.zig `.wf_trapped`) makes the
+        // same choice for the same reason. Treating user-mode hlt as a
+        // protection_fault would `parkSelfFaulted` the EC into `.exited`,
+        // breaking any later `suspend(this_ec, port)` call (suspend's
+        // gate rejects non-{running,ready,idle_wait} targets with
+        // E_INVAL — the precise failure that flaked reply_transfer_14
+        // aid=3 on x86 when W1's dummy entry got dispatched and trapped
+        // before the test EC's suspend syscall observed it).
+        if (exception == .general_protection_fault and
+            ctx.err_code == 0 and
+            isUserHltAt(ctx.rip))
+        {
+            const ec = scheduler.currentEc() orelse
+                @panic("hlt trap with no current EC");
+            ctx.rip += 1; // advance past the 1-byte HLT opcode
+            execution_context.parkIdleWait(ec);
+            cpu.enableInterrupts();
+            scheduler.run();
+        }
 
         if (exceptionEvent(vector)) |event| {
             const ec = scheduler.currentEc() orelse
