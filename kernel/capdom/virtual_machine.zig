@@ -194,18 +194,19 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     // policies whose num_*_responses fields exceed the static array
     // bounds. The struct lives at offset 0 of the page frame; the
     // arch dispatch reads it through the kernel physmap.
-    vm_dispatch.validateVmPolicy(policy_pf_obj) catch |err| {
-        if (err == error.NoDevice) return errors.E_NODEV;
+    vm_dispatch.validateVmPolicy(policy_pf_obj) catch
         return errors.E_INVAL;
-    };
 
-    const new_vm = allocVm(domain, policy_pf_obj) catch |err| switch (err) {
-        // Spec §[create_virtual_machine]: E_NODEV if the platform
-        // does not support hardware virtualization. The arch dispatch
-        // surfaces this through error.NoDevice from the alloc stubs
-        // when VT-x/SVM/etc. is unavailable or unimplemented.
-        error.NoDevice => return errors.E_NODEV,
-        else => return errors.E_NOMEM,
+    // Spec §[create_virtual_machine]: E_NODEV if the platform does not
+    // support hardware virtualization. The arch dispatch surfaces this
+    // through `error.NoDevice` from the alloc stubs when VT-x/SVM/etc.
+    // is unavailable or unimplemented. allocVm's inferred error set
+    // varies by arch (the aarch64 stubs never raise NoDevice), so we
+    // compare on @errorName rather than a switch arm to keep the
+    // unreached comparison from tripping per-arch error-set diffs.
+    const new_vm = allocVm(domain, policy_pf_obj) catch |err| {
+        if (std.mem.eql(u8, @errorName(err), "NoDevice")) return errors.E_NODEV;
+        return errors.E_NOMEM;
     };
 
     const vm_gen = new_vm._gen_lock.currentGen();

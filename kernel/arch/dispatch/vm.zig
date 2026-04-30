@@ -114,7 +114,7 @@ pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void
 pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
-        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        .aarch64 => aarch64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
         else => unreachable,
     }
 }
