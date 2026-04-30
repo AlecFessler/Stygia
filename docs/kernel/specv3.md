@@ -38,7 +38,13 @@ rsp, rcx, and r11 are not GPR-backed: rsp is the stack pointer anchor, and rcx/r
 
 ### syscall word
 
-Bits 0-11 of vreg 0 carry the syscall number (0..4095). Higher bits are reserved unless a syscall claims them — when claimed, each syscall's spec calls out the layout (e.g., `pair_count` in bits 12-19, `tstart` in bits 20-31, `reply_handle_id` in bits 32-43 on `recv` return / bits 12-23 or 20-31 on `reply` and `reply_transfer` entry, `event_type` in bits 44-48). Bits not assigned by the invoked syscall must be zero on entry; the kernel returns E_INVAL if a reserved bit is set.
+Bits 0-11 of vreg 0 carry the syscall_op (0..4095). The op range is partitioned to let the kernel classify a syscall in two instructions on the IPC fast path:
+
+- `0..13` — fast suspend. The op value IS `payload_count` (and `pair_count` is implicitly 0). The entire syscall word must equal exactly the op value: bits 4-63 must be zero on entry. No other syscall — current or future — may take a value in this range.
+- `14` — suspend (general variant). Carries `pair_count` and `payload_count` as syscall-word fields per §[port].suspend.
+- `15..4095` — every other syscall.
+
+Higher bits are reserved unless a syscall claims them — when claimed, each syscall's spec calls out the layout (e.g., `pair_count` in bits 12-19, `tstart` in bits 20-31, `reply_handle_id` in bits 32-43 on `recv` return / bits 12-23 or 20-31 on `reply` and `reply_transfer` entry, `event_type` in bits 44-48, `payload_count` in bits 49-55 on `recv` return). Bits not assigned by the invoked syscall must be zero on entry; the kernel returns E_INVAL if a reserved bit is set.
 
 ## §[error_codes] Error Codes
 
@@ -133,7 +139,7 @@ Reduces the caps on a handle in place. The new caps must be a subset of the curr
 
 ```
 restrict([1] handle, [2] caps) -> void
-  syscall_num = 0
+  syscall_num = 15
 
   [1] handle: handle in the caller's table (bits 0-11; upper bits _reserved)
   [2] caps: u64 packed as
@@ -157,7 +163,7 @@ Releases a handle from the calling domain's handle table. Type-specific side eff
 
 ```
 delete([1] handle) -> void
-  syscall_num = 1
+  syscall_num = 16
 
   [1] handle: handle in the caller's table (bits 0-11; upper bits _reserved)
 ```
@@ -187,7 +193,7 @@ Releases every handle transitively derived from the target via `copy`, across al
 
 ```
 revoke([1] handle) -> void
-  syscall_num = 2
+  syscall_num = 17
 
   [1] handle: handle in the caller's table (bits 0-11; upper bits _reserved)
 ```
@@ -211,7 +217,7 @@ Refreshes a handle's kernel-mutable field0/field1 snapshot. No-op for handles wh
 
 ```
 sync([1] handle) -> void
-  syscall_num = 3
+  syscall_num = 18
 
   [1] handle: handle in the caller's table
 ```
@@ -373,7 +379,7 @@ Creates a new capability domain from an ELF image carried in a page frame. The c
 ```
 create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_ec_affinity, [6+] passed_handles)
   -> [1] idc_handle
-  syscall_num = 4
+  syscall_num = 19
 
   [1] caps: u64 packed as
     bits  0-15: self_caps          — caps on the new domain's slot-0 self-handle
@@ -484,7 +490,7 @@ Returns handles to all non-vCPU execution contexts bound to the target domain re
 
 ```
 acquire_ecs([1] target) -> [1..N] handles
-  syscall_num = 5
+  syscall_num = 20
 
   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
 
@@ -511,7 +517,7 @@ Returns handles to all `map=1` (pf) and `map=3` (demand) VARs bound to the targe
 
 ```
 acquire_vars([1] target) -> [1..N] handles
-  syscall_num = 6
+  syscall_num = 21
 
   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
 
@@ -628,7 +634,7 @@ Creates a new execution context either in the caller's own domain or in a target
 ```
 create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [6] affinity)
   -> [1] handle
-  syscall_num = 7
+  syscall_num = 22
 
   [1] caps: u64 packed as
     bits  0-15: caps          — caps on the EC handle returned to the caller
@@ -675,7 +681,7 @@ Returns the handle in the caller's table that references the calling execution c
 
 ```
 self() -> [1] handle
-  syscall_num = 8
+  syscall_num = 23
 ```
 
 [test 01] returns E_NOENT if no handle in the caller's table references the calling execution context.
@@ -687,7 +693,7 @@ Terminates the target execution context.
 
 ```
 terminate([1] target) -> void
-  syscall_num = 9
+  syscall_num = 24
 
   [1] target: EC handle
 ```
@@ -713,7 +719,7 @@ Yields the calling EC's timeslice. With `[1] = 0`, the scheduler selects the nex
 
 ```
 yield([1] target) -> void
-  syscall_num = 10
+  syscall_num = 25
 
   [1] target: 0 = yield to scheduler; else an EC handle to yield to
 ```
@@ -731,7 +737,7 @@ Sets the target execution context's priority. The new priority applies to subseq
 
 ```
 priority([1] target, [2] new_priority) -> void
-  syscall_num = 11
+  syscall_num = 26
 
   [1] target: EC handle
   [2] new_priority: 0..3
@@ -754,7 +760,7 @@ Sets the target execution context's CPU affinity mask.
 
 ```
 affinity([1] target, [2] new_affinity) -> void
-  syscall_num = 12
+  syscall_num = 27
 
   [1] target: EC handle
   [2] new_affinity: 64-bit core mask. 0 = kernel picks any core.
@@ -777,7 +783,7 @@ Queries system PMU capabilities.
 
 ```
 perfmon_info() -> [1] caps_word, [2] supported_events
-  syscall_num = 13
+  syscall_num = 28
 
   [1] caps_word: u64 packed as
     bits 0-7: num_counters
@@ -814,7 +820,7 @@ Starts hardware performance counters on the target EC.
 
 ```
 perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] config_threshold) -> void
-  syscall_num = 14
+  syscall_num = 29
 
   [1] target:        EC handle
   [2] num_configs:   N, the number of counter configs supplied
@@ -845,7 +851,7 @@ Reads the current counter values from the target EC.
 
 ```
 perfmon_read([1] target) -> [1..num_counters] counter_values, [num_counters + 1] timestamp
-  syscall_num = 15
+  syscall_num = 30
 
   [1] target: EC handle
 ```
@@ -866,7 +872,7 @@ Stops counting on the target EC and releases PMU state.
 
 ```
 perfmon_stop([1] target) -> void
-  syscall_num = 16
+  syscall_num = 31
 
   [1] target: EC handle
 ```
@@ -981,7 +987,7 @@ Reserves a range of virtual address space bound to the caller's domain.
 
 ```
 create_var([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
-  syscall_num = 17
+  syscall_num = 32
 
   [1] caps: u64 packed as
     bits  0-15: caps        — caps on the VAR handle returned to the caller
@@ -1037,7 +1043,7 @@ Installs page_frames into a regular or DMA-flagged VAR. The kernel dispatches ba
 
 ```
 map_pf([1] var, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
-  syscall_num = 18
+  syscall_num = 33
 
   syscall word bits 12-19: N (number of (offset, page_frame) pairs)
 
@@ -1069,7 +1075,7 @@ Installs a device_region as an MMIO mapping into an MMIO-flagged VAR.
 
 ```
 map_mmio([1] var, [2] device_region) -> void
-  syscall_num = 19
+  syscall_num = 34
 
   [1] var: VAR handle (must have `mmio` cap)
   [2] device_region: device_region handle
@@ -1093,7 +1099,7 @@ Removes mappings from a VAR. Dispatches on the VAR's `map` field. With `N = 0`, 
 
 ```
 unmap([1] var, [2..N+1] selectors) -> void
-  syscall_num = 20
+  syscall_num = 35
 
   syscall word bits 12-19: N (number of selectors; 0 = unmap everything)
 
@@ -1123,7 +1129,7 @@ Updates a VAR's `cur_rwx`, changing the effective permissions on its currently-m
 
 ```
 remap([1] var, [2] new_cur_rwx) -> void
-  syscall_num = 21
+  syscall_num = 36
 
   [1] var: VAR handle
   [2] new_cur_rwx: u64 packed as
@@ -1147,7 +1153,7 @@ Binds a source VAR to a target VAR. On the owning domain's restart, the kernel c
 
 ```
 snapshot([1] target_var, [2] source_var) -> void
-  syscall_num = 22
+  syscall_num = 37
 
   [1] target_var: VAR handle (must have `caps.restart_policy = snapshot` (3))
   [2] source_var: VAR handle (must have `caps.restart_policy = preserve` (2))
@@ -1179,7 +1185,7 @@ Reads qwords from a VAR into the caller's vregs. Used for cross-domain memory in
 
 ```
 idc_read([1] var, [2] offset) -> [3..2+count] qwords
-  syscall_num = 23
+  syscall_num = 38
 
   syscall word bits 12-19: count (number of qwords; max 125)
 
@@ -1204,7 +1210,7 @@ Writes qwords from the caller's vregs into a VAR. Used for cross-domain memory w
 
 ```
 idc_write([1] var, [2] offset, [3..2+count] qwords) -> void
-  syscall_num = 24
+  syscall_num = 39
 
   syscall word bits 12-19: count (number of qwords; max 125)
 
@@ -1285,7 +1291,7 @@ Allocates physical memory and returns a page frame handle.
 
 ```
 create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
-  syscall_num = 25
+  syscall_num = 40
 
   [1] caps: u64 packed as
     bits  0-15: caps        — caps on the page frame handle returned to the caller
@@ -1411,7 +1417,7 @@ Acknowledges accumulated IRQs from a device_region. Atomically reads the current
 
 ```
 ack([1] device_region) -> [1] prior_count
-  syscall_num = 26
+  syscall_num = 41
 
   [1] device_region: device_region handle
 ```
@@ -1474,7 +1480,7 @@ Allocates a VM with its own guest physical address space and initializes kernel-
 
 ```
 create_virtual_machine([1] caps, [2] policy_page_frame) -> [1] handle
-  syscall_num = 27
+  syscall_num = 42
 
   [1] caps: u64 packed as
     bits  0-15: caps       — caps on the VM handle returned to the caller
@@ -1592,7 +1598,7 @@ Creates a vCPU execution context bound to a VM. The vCPU is created suspended on
 
 ```
 create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
-  syscall_num = 28
+  syscall_num = 43
 
   [1] caps: u64 packed as
     bits  0-15: caps       — caps on the EC handle returned to the caller
@@ -1630,7 +1636,7 @@ Installs page_frames into the VM's guest physical address space. Subsequent gues
 
 ```
 map_guest([1] vm, [2 + 2i] guest_addr, [2 + 2i + 1] page_frame) -> void
-  syscall_num = 29
+  syscall_num = 44
 
   syscall word bits 12-19: N (number of (guest_addr, page_frame) pairs)
 
@@ -1655,7 +1661,7 @@ Removes page_frame mappings from a VM's guest physical address space.
 
 ```
 unmap_guest([1] vm, [2 + i] page_frame for i in 0..N-1) -> void
-  syscall_num = 30
+  syscall_num = 45
 
   syscall word bits 12-19: N (number of page_frames to unmap)
 
@@ -1675,7 +1681,7 @@ Replaces a single VmPolicy table on the VM, atomically. Tables for other kinds a
 
 ```
 vm_set_policy([1] vm, [2..] entries) -> void
-  syscall_num = 31
+  syscall_num = 46
 
   syscall word bit 12:     kind
   syscall word bits 13-20: count (number of entries supplied)
@@ -1715,7 +1721,7 @@ Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt controlle
 
 ```
 vm_inject_irq([1] vm, [2] irq_num, [3] assert) -> void
-  syscall_num = 32
+  syscall_num = 47
 
   [1] vm:      VM handle
   [2] irq_num: u64 virtual IRQ line number
@@ -1783,7 +1789,7 @@ Allocates a port and returns a handle to it.
 
 ```
 create_port([1] caps) -> [1] handle
-  syscall_num = 33
+  syscall_num = 48
 
   [1] caps: u64 packed as
     bits  0-15: caps       — caps on the port handle returned to the caller
@@ -1803,9 +1809,33 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 Suspends the target execution context and delivers a suspension event to a port. The event exposes the EC's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the EC.
 
+Suspend has two encodings on the wire — a fast variant for the L4-style IPC fast path (no handle attachments, payload entirely in GPR-backed vregs) and a general variant that supports handle attachments and the full payload range.
+
+**Fast variant** — `syscall_op` ∈ `0..13`. The op value IS `payload_count`; `pair_count` is implicitly 0. The entire syscall word must equal exactly the op value (bits 4-63 must be zero on entry). The fast range is reserved exclusively for this encoding — no other syscall may take a value in `0..13`.
+
 ```
 suspend([1] target, [2] port) -> void
-  syscall_num = 34
+  syscall_op = 0..13   (op value = payload_count; pair_count = 0)
+
+  syscall word entry layout:
+    bits  0- 3: syscall_op
+    bits  4-63: _reserved (must be zero)
+
+  [1] target: EC handle
+  [2] port: port handle (suspension event delivery target)
+```
+
+**General variant** — `syscall_op = 14`.
+
+```
+suspend([1] target, [2] port) -> void
+  syscall_op = 14
+
+  syscall word entry layout:
+    bits  0-11: syscall_op
+    bits 12-19: pair_count           — handles attached by sender (0..63)
+    bits 20-26: payload_count        — count of GPR-backed vregs (1..payload_count) the sender delivers as event-state payload (0..127)
+    bits 27-63: _reserved
 
   [1] target: EC handle
   [2] port: port handle (suspension event delivery target)
@@ -1817,6 +1847,8 @@ Port cap required on [2]: `bind`. Additionally `xfer` if any handles are attache
 `[1]` may reference the calling EC; the syscall returns after the calling EC is resumed.
 
 Handle attachments in the suspension event payload follow §[handle_attachments].
+
+The receiver only reads vregs 1..payload_count as event-state payload; vregs above payload_count are undefined. The sender is responsible for zeroing or otherwise preparing its own register state before issuing suspend — the kernel does not zero or restore unused vregs.
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_BADCAP if [2] is not a valid port handle.
@@ -1837,7 +1869,7 @@ Blocks waiting for an event on a port. On return, the kernel has dequeued one su
 
 ```
 recv([1] port, [2] timeout_ns) -> void
-  syscall_num = 35
+  syscall_num = 49
 
   syscall word return layout (per §[event_state]):
     bits  0-11: _reserved
@@ -1845,7 +1877,8 @@ recv([1] port, [2] timeout_ns) -> void
     bits 20-31: tstart               — slot id of first attached handle
     bits 32-43: reply_handle_id      — slot id of the reply handle
     bits 44-48: event_type
-    bits 49-63: _reserved
+    bits 49-55: payload_count        — count of GPR-backed vregs (1..payload_count) the sender delivered as event-state payload (0..127)
+    bits 56-63: _reserved
 
   [1] port: port handle
   [2] timeout_ns: 0 = block indefinitely; nonzero = give up after this
@@ -1906,8 +1939,11 @@ bits 12-19: pair_count           — count of handles attached by sender (0..63)
 bits 20-31: tstart               — slot id of first attached handle (valid when pair_count > 0)
 bits 32-43: reply_handle_id      — slot id of the inserted reply handle in the receiver's table
 bits 44-48: event_type           — per §[event_type]
-bits 49-63: _reserved
+bits 49-55: payload_count        — count of GPR-backed vregs (1..payload_count) the sender delivered as event-state payload (0..127)
+bits 56-63: _reserved
 ```
+
+The receiver only sees vregs 1..payload_count as the valid event-state window; vregs payload_count+1..127 are undefined.
 
 **x86-64**
 
@@ -2108,7 +2144,7 @@ Installs the kernel-held binding `(target, event_type) → port`. If a binding a
 
 ```
 bind_event_route([1] target, [2] event_type, [3] port) -> void
-  syscall_num = 36
+  syscall_num = 50
 
   [1] target:     EC handle
   [2] event_type: u64; must be a registerable event type (1, 2, 3, or 6)
@@ -2135,7 +2171,7 @@ Removes the binding for `(target, event_type)`. Subsequent firings of that event
 
 ```
 clear_event_route([1] target, [2] event_type) -> void
-  syscall_num = 37
+  syscall_num = 51
 
   [1] target:     EC handle
   [2] event_type: u64; must be a registerable event type
@@ -2203,7 +2239,7 @@ The reply handle id rides in the syscall word rather than vreg 1 so the GPR-back
 
 ```
 reply -> void
-  syscall_num = 38
+  syscall_num = 52
 
   syscall word bits  0-11: syscall_num
   syscall word bits 12-23: reply_handle_id (12 bits)
@@ -2228,7 +2264,7 @@ The reply handle id rides in the syscall word for the same reason as `reply` —
 
 ```
 reply_transfer([128-N..127] pair_entries) -> void
-  syscall_num = 39
+  syscall_num = 53
 
   syscall word bits  0-11: syscall_num
   syscall word bits 12-19: N (1..63)
@@ -2318,7 +2354,7 @@ Mints a new timer handle with its own counter and arms it. Each call yields an i
 
 ```
 timer_arm([1] caps, [2] deadline_ns, [3] flags) -> [1] handle
-  syscall_num = 40
+  syscall_num = 54
 
   [1] caps: u64 packed as
     bits  0-15: caps     — caps on the returned timer handle
@@ -2354,7 +2390,7 @@ Reconfigures an existing timer. Resets `field0` to 0, sets `field1.arm = 1`, set
 
 ```
 timer_rearm([1] timer, [2] deadline_ns, [3] flags) -> void
-  syscall_num = 41
+  syscall_num = 55
 
   [1] timer: timer handle
   [2] deadline_ns: nanoseconds until first fire (and period if periodic)
@@ -2382,7 +2418,7 @@ Disarms a timer. Returns an error if the timer is not currently armed (e.g., a o
 
 ```
 timer_cancel([1] timer) -> void
-  syscall_num = 42
+  syscall_num = 56
 
   [1] timer: timer handle
 ```
@@ -2415,7 +2451,7 @@ Blocks while every `(addr, expected)` pair satisfies `*addr == expected`. Return
 
 ```
 futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
-  syscall_num = 43
+  syscall_num = 57
 
   syscall word bits 12-19: N (1..63)
 
@@ -2443,7 +2479,7 @@ Blocks while every `(addr, target)` pair satisfies `*addr != target`. Returns wh
 
 ```
 futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] addr
-  syscall_num = 44
+  syscall_num = 58
 
   syscall word bits 12-19: N (1..63)
 
@@ -2471,7 +2507,7 @@ Wakes up to `count` ECs blocked in `futex_wait_val` or `futex_wait_change` on th
 
 ```
 futex_wake([1] addr, [2] count) -> [1] woken
-  syscall_num = 45
+  syscall_num = 59
 
   [1] addr: 8-byte-aligned user address in the caller's domain
   [2] count: maximum number of ECs to wake
@@ -2494,7 +2530,7 @@ Returns nanoseconds since boot.
 
 ```
 time_monotonic() -> [1] ns
-  syscall_num = 46
+  syscall_num = 60
 ```
 
 No cap required.
@@ -2507,7 +2543,7 @@ Returns wall-clock time as nanoseconds since the Unix epoch.
 
 ```
 time_getwall() -> [1] ns_since_epoch
-  syscall_num = 47
+  syscall_num = 61
 ```
 
 No cap required.
@@ -2520,7 +2556,7 @@ Sets the wall-clock time to the given nanoseconds-since-epoch.
 
 ```
 time_setwall([1] ns_since_epoch) -> void
-  syscall_num = 48
+  syscall_num = 62
 
   [1] ns_since_epoch: new wall-clock value (nanoseconds since Unix epoch)
 ```
@@ -2539,7 +2575,7 @@ Fills the requested number of vregs with cryptographically random qwords.
 
 ```
 random() -> [1..count] qwords
-  syscall_num = 49
+  syscall_num = 63
 
   syscall word bits 12-19: count (1..127)
 ```
@@ -2557,7 +2593,7 @@ Returns system-wide capacity and capability information.
 
 ```
 info_system() -> [1] cores, [2] features, [3] total_phys_pages, [4] page_size_mask
-  syscall_num = 50
+  syscall_num = 64
 ```
 
 No cap required.
@@ -2587,7 +2623,7 @@ Returns information about a specific core.
 
 ```
 info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
-  syscall_num = 51
+  syscall_num = 65
 
   [1] on input: core id
 ```
@@ -2617,7 +2653,7 @@ Performs an immediate orderly system poweroff. Does not return on success.
 
 ```
 power_shutdown() -> void
-  syscall_num = 52
+  syscall_num = 66
 ```
 
 [test 01] returns E_PERM if the caller's self-handle lacks `power`.
@@ -2628,7 +2664,7 @@ Performs a warm system reboot. Does not return on success.
 
 ```
 power_reboot() -> void
-  syscall_num = 53
+  syscall_num = 67
 ```
 
 [test 02] returns E_PERM if the caller's self-handle lacks `power`.
@@ -2639,7 +2675,7 @@ Enters a system-wide low-power state at the requested depth. Returns when the sy
 
 ```
 power_sleep([1] depth) -> void
-  syscall_num = 54
+  syscall_num = 68
 
   [1] depth: 1 = sleep (S1/S3-equivalent), 3 = deep sleep (S4-equivalent), 4 = hibernate (S5-equivalent)
 ```
@@ -2654,7 +2690,7 @@ Turns the primary display off. Subsequent input wakes it.
 
 ```
 power_screen_off() -> void
-  syscall_num = 55
+  syscall_num = 69
 ```
 
 [test 06] returns E_PERM if the caller's self-handle lacks `power`.
@@ -2665,7 +2701,7 @@ Sets the target frequency for a specific core in Hz.
 
 ```
 power_set_freq([1] core_id, [2] hz) -> void
-  syscall_num = 56
+  syscall_num = 70
 
   [1] core_id: target core
   [2] hz: target frequency in Hz; 0 = let the kernel pick
@@ -2683,7 +2719,7 @@ Sets the idle policy for a specific core.
 
 ```
 power_set_idle([1] core_id, [2] policy) -> void
-  syscall_num = 57
+  syscall_num = 71
 
   [1] core_id: target core
   [2] policy: 0 = busy-poll (no idle entry), 1 = halt only (shallow), 2 = deepest available c-state
