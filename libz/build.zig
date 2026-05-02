@@ -1,5 +1,10 @@
 const std = @import("std");
 
+// libz/build.zig — produces libz.elf, the kernel-shipped userspace
+// shared library that dynamic libz consumers (test ELFs, hyprvOS apps)
+// link against. Static consumers (the test runner, root_service) skip
+// this build entirely and import libz/lib.zig directly.
+
 pub fn build(b: *std.Build) void {
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const optimize = b.standardOptimizeOption(.{});
@@ -36,7 +41,7 @@ pub fn build(b: *std.Build) void {
     };
 
     // os_tag = .linux + abi = .none — Zig refuses dynamic linkage on
-    // .freestanding, but we don't link any Linux runtime: libz_c uses
+    // .freestanding, but we don't link any Linux runtime: libz uses
     // no libc, no syscalls into Linux. The .linux tag is purely the
     // gate that lets addLibrary(.linkage = .dynamic) emit a real ELF
     // shared object with .dynsym / .rela.dyn / etc. Apps load it via
@@ -50,17 +55,6 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = cpu_features_add,
     });
 
-    // Pull in libz/syscall.zig as a sibling module so abi.zig can
-    // forward into the Zig-native wrapper bodies. Zig 0.15 forbids
-    // @import paths outside the current module's path; addImport
-    // routes through the build module graph instead.
-    const libz_syscall_mod = b.createModule(.{
-        .root_source_file = b.path("../libz/syscall.zig"),
-        .target = target,
-        .optimize = optimize,
-        .pic = true,
-    });
-
     const abi_mod = b.createModule(.{
         .root_source_file = b.path("abi.zig"),
         .target = target,
@@ -68,37 +62,35 @@ pub fn build(b: *std.Build) void {
         .pic = true,
         // single_threaded keeps Zig's std lib from emitting TLS
         // references (__tls_get_addr) that would otherwise show up as
-        // unresolved externals in libz_c.elf — we don't have a
-        // userspace TLS runtime in Zag, and libz wrappers don't need
-        // any thread-local state.
+        // unresolved externals — we don't have a userspace TLS runtime
+        // in Zag, and libz wrappers don't need any thread-local state.
         .single_threaded = true,
     });
-    abi_mod.addImport("libz_syscall", libz_syscall_mod);
 
-    const libz_c = b.addLibrary(.{
-        .name = "z_c",
+    const libz = b.addLibrary(.{
+        .name = "z",
         .linkage = .dynamic,
         .root_module = abi_mod,
     });
-    libz_c.root_module.red_zone = false;
-    libz_c.root_module.omit_frame_pointer = false;
+    libz.root_module.red_zone = false;
+    libz.root_module.omit_frame_pointer = false;
 
     // Force LLVM + LLD: Zig 0.15's self-hosted x86_64 backend chokes
-    // on the inline-asm wrappers in libz/syscall_x64.zig (replyTransferAsm
+    // on the inline-asm wrappers in syscall_x64.zig (replyTransferAsm
     // hits "ran out of registers") and on naked-callconv functions
     // pulled in transitively by the linux target. LLVM compiles them
     // cleanly.
-    libz_c.use_llvm = true;
-    libz_c.use_lld = true;
+    libz.use_llvm = true;
+    libz.use_lld = true;
 
-    b.installArtifact(libz_c);
+    b.installArtifact(libz);
 
-    // Stage at libz_c/bin/libz_c.elf to match the convention used by
+    // Stage at libz/bin/libz.elf to match the convention used by
     // routerOS/bin and hyprvOS/bin.
-    const install_libz_c = b.addInstallFile(
-        libz_c.getEmittedBin(),
-        "../bin/libz_c.elf",
+    const install_libz = b.addInstallFile(
+        libz.getEmittedBin(),
+        "../bin/libz.elf",
     );
-    install_libz_c.step.dependOn(&libz_c.step);
-    b.getInstallStep().dependOn(&install_libz_c.step);
+    install_libz.step.dependOn(&libz.step);
+    b.getInstallStep().dependOn(&install_libz.step);
 }
