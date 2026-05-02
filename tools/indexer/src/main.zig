@@ -10,6 +10,7 @@ const writer_mod = @import("writer.zig");
 const ir_pass = @import("ir_pass.zig");
 const bin_pass = @import("bin_pass.zig");
 const refs_pass = @import("refs_pass.zig");
+const dwarf_types_pass = @import("dwarf_types_pass.zig");
 
 const SCHEMA_SQL = @embedFile("schema.sql");
 
@@ -380,6 +381,17 @@ pub fn main() !void {
         if (bin_result.bin_symbols.len > 0) try channel.send(.{ .bin_symbols = bin_result.bin_symbols });
         if (bin_result.bin_insts.len > 0) try channel.send(.{ .bin_insts = bin_result.bin_insts });
         if (bin_result.dwarf_lines.len > 0) try channel.send(.{ .dwarf_lines = bin_result.dwarf_lines });
+
+        // Stage 4.5: walk DWARF type DIEs (struct/union/enum/array/pointer/...)
+        // and emit type / type_field / dwarf_die rows. Reuses qmap_local; the
+        // pass matches DIEs against entity qnames.
+        const dwt = try dwarf_types_pass.pass(palloc, elf_path, &qmap_local);
+        std.log.info("stage 4.5: parsed DWARF types — {d} type, {d} type_field, {d} dwarf_die rows", .{
+            dwt.types.len, dwt.type_fields.len, dwt.dwarf_dies.len,
+        });
+        if (dwt.types.len > 0) try channel.send(.{ .dwarf_types = dwt.types });
+        if (dwt.type_fields.len > 0) try channel.send(.{ .dwarf_type_fields = dwt.type_fields });
+        if (dwt.dwarf_dies.len > 0) try channel.send(.{ .dwarf_dies = dwt.dwarf_dies });
     } else {
         std.log.info("stage 4: skipped (no --elf argument)", .{});
     }

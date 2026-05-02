@@ -137,3 +137,34 @@ pub const DwarfLineRow = struct {
     line: u32,
     col: ?u32,
 };
+
+/// One row per ingested type DIE (struct / union / enum / array / pointer /
+/// primitive). `entity_id` is NULL for anonymous / unmatched types so the
+/// row still exists as a target for `type_field.type_ref`.
+pub const TypeRow = struct {
+    id: u32,
+    entity_id: ?u32,
+    kind: []const u8,
+    size: ?u64,
+    alignment: ?u32,
+};
+
+/// One row per struct/union member. `offset` is NULL when the member's
+/// `DW_AT_data_member_location` is a non-trivial DWARF expression we don't
+/// evaluate. `type_ref` is NULL when the member's type DIE wasn't ingested.
+pub const TypeFieldRow = struct {
+    type_id: u32,
+    idx: u32,
+    name: []const u8,
+    offset: ?u64,
+    type_ref: ?u32,
+};
+
+/// Maps DWARF DIE byte offset (in `.debug_info`) to entity_id. One row per
+/// DIE we ingest that we managed to match against the entity table.
+pub const DwarfDieRow = struct {
+    offset: u64,
+    entity_id: u32,
+    tag: []const u8,
+    parent_offset: ?u64,
+};

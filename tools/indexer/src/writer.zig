@@ -24,6 +24,9 @@ pub const Job = union(enum) {
     bin_symbols: []const types.BinSymbolRow,
     bin_insts: []const types.BinInstRow,
     dwarf_lines: []const types.DwarfLineRow,
+    dwarf_types: []const types.TypeRow,
+    dwarf_type_fields: []const types.TypeFieldRow,
+    dwarf_dies: []const types.DwarfDieRow,
     /// const_alias rows; pre-resolved (alias_id, target_id) pairs.
     const_aliases: []const ConstAliasRow,
     /// entity_type_ref rows; pre-resolved.
@@ -352,6 +355,65 @@ pub const Writer = struct {
                     }
                     rows_in_txn += rows.len;
                 },
+                .dwarf_types => |rows| {
+                    for (rows) |r| {
+                        stmts.insert_type.reset();
+                        try stmts.insert_type.bindInt(1, r.id);
+                        if (r.entity_id) |eid| {
+                            try stmts.insert_type.bindInt(2, eid);
+                        } else {
+                            try stmts.insert_type.bindNull(2);
+                        }
+                        try stmts.insert_type.bindText(3, r.kind);
+                        if (r.size) |s| {
+                            try stmts.insert_type.bindInt(4, @bitCast(s));
+                        } else {
+                            try stmts.insert_type.bindNull(4);
+                        }
+                        if (r.alignment) |a| {
+                            try stmts.insert_type.bindInt(5, a);
+                        } else {
+                            try stmts.insert_type.bindNull(5);
+                        }
+                        try stmts.insert_type.execOnce();
+                    }
+                    rows_in_txn += rows.len;
+                },
+                .dwarf_type_fields => |rows| {
+                    for (rows) |r| {
+                        stmts.insert_type_field.reset();
+                        try stmts.insert_type_field.bindInt(1, r.type_id);
+                        try stmts.insert_type_field.bindInt(2, r.idx);
+                        try stmts.insert_type_field.bindText(3, r.name);
+                        if (r.offset) |o| {
+                            try stmts.insert_type_field.bindInt(4, @bitCast(o));
+                        } else {
+                            try stmts.insert_type_field.bindNull(4);
+                        }
+                        if (r.type_ref) |t| {
+                            try stmts.insert_type_field.bindInt(5, t);
+                        } else {
+                            try stmts.insert_type_field.bindNull(5);
+                        }
+                        try stmts.insert_type_field.execOnce();
+                    }
+                    rows_in_txn += rows.len;
+                },
+                .dwarf_dies => |rows| {
+                    for (rows) |r| {
+                        stmts.insert_dwarf_die.reset();
+                        try stmts.insert_dwarf_die.bindInt(1, @bitCast(r.offset));
+                        try stmts.insert_dwarf_die.bindInt(2, r.entity_id);
+                        try stmts.insert_dwarf_die.bindText(3, r.tag);
+                        if (r.parent_offset) |po| {
+                            try stmts.insert_dwarf_die.bindInt(4, @bitCast(po));
+                        } else {
+                            try stmts.insert_dwarf_die.bindNull(4);
+                        }
+                        try stmts.insert_dwarf_die.execOnce();
+                    }
+                    rows_in_txn += rows.len;
+                },
                 .raw_sql => |sql| {
                     try self.db.exec("COMMIT");
                     try self.db.exec(sql);
@@ -413,6 +475,9 @@ const Statements = struct {
     insert_meta: sqlite.Stmt,
     insert_const_alias: sqlite.Stmt,
     insert_type_ref: sqlite.Stmt,
+    insert_type: sqlite.Stmt,
+    insert_type_field: sqlite.Stmt,
+    insert_dwarf_die: sqlite.Stmt,
 
     fn prepare(db: *sqlite.Db) !Statements {
         return .{
@@ -432,6 +497,9 @@ const Statements = struct {
             .insert_meta = try db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"),
             .insert_const_alias = try db.prepare("INSERT OR IGNORE INTO const_alias (entity_id, target_entity_id) VALUES (?, ?)"),
             .insert_type_ref = try db.prepare("INSERT OR IGNORE INTO entity_type_ref (referrer_entity_id, referred_entity_id, role) VALUES (?, ?, ?)"),
+            .insert_type = try db.prepare("INSERT INTO type (id, entity_id, kind, size, align) VALUES (?, ?, ?, ?, ?)"),
+            .insert_type_field = try db.prepare("INSERT INTO type_field (type_id, idx, name, offset, type_ref) VALUES (?, ?, ?, ?, ?)"),
+            .insert_dwarf_die = try db.prepare("INSERT OR IGNORE INTO dwarf_die (offset, entity_id, tag, parent_offset) VALUES (?, ?, ?, ?)"),
         };
     }
 
@@ -452,5 +520,8 @@ const Statements = struct {
         self.insert_meta.finalize();
         self.insert_const_alias.finalize();
         self.insert_type_ref.finalize();
+        self.insert_type.finalize();
+        self.insert_type_field.finalize();
+        self.insert_dwarf_die.finalize();
     }
 };
