@@ -17,5 +17,14 @@
 // notice. The runner passes 3 handles in its passed_handles array; the
 // child's _start reaches into slot 5 via a self-handle issuance to
 // resolve the libz pf id.
-pub const LIBZ_SLIDE: u64 = 0x4000_0000_0000;
+// LIBZ_SLIDE pins where every dynamic libz consumer maps libz.elf in
+// its own address space. Must be in the §[address_space] static zone
+// (x86_64: [0x1000_0000_0000, 0x8000_0000_0000); aarch64 has the same
+// lower bound). 0x7000_0000_0000 (112 TiB) is high in the static zone
+// — well clear of common probe addresses spec tests reach for when
+// they want a "deep-unmapped" sentinel (futex_wait_change_05 picks
+// 0x4000_0000_0000 for exactly that reason). 1 MiB of libz fits with
+// 16 TiB of static-zone headroom above; future tests probing high
+// static-zone addresses should avoid 0x7000_0000_0000.
+pub const LIBZ_SLIDE: u64 = 0x7000_0000_0000;
 pub const LIBZ_PF_SLOT: u8 = 5;
