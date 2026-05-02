@@ -114,24 +114,15 @@ fn bootstrapLibz(cap_table_base: u64) void {
         .v4 = libz_loader.constants.LIBZ_SLIDE,
         .v5 = 0,
     });
-    // Bootstrap is fatal — if createVar fails we have no libz, no
-    // way to call testing.fail, no way to report. Park on hlt and
-    // let the runner's recv timeout MISS-record the test.
+    // Successful createVar returns a handle word with caps in bits
+    // 48-63 + handle id in bits 0-11; errors (errors.Error variants)
+    // return a small value < 16 in v1. Bootstrap is fatal: if libz
+    // can't be staged, no extern call works — park on hlt and let
+    // the runner's recv timeout MISS-record the test.
+    if (cvar.v1 < 16) haltForever();
     const var_handle: u64 = cvar.v1 & 0xFFF;
-    if (cvar.v1 == 0 or cvar.v1 > 0xFFF) {
-        while (true) {
-            switch (builtin.cpu.arch) {
-                .x86_64 => asm volatile ("hlt"),
-                .aarch64 => asm volatile ("wfi"),
-                else => @compileError("unsupported target architecture"),
-            }
-        }
-    }
 
-    // mapPf with one (offset=0, pf_handle) pair installs the entire
-    // libz pf into the var starting at LIBZ_SLIDE. Pair count = 1,
-    // syscall-word `extra` carries the count in bits 12-19.
-    _ = lib.syscall.issueReg(
+    const mp = lib.syscall.issueReg(
         .map_pf,
         lib.syscall.extraCount(1),
         .{
@@ -140,4 +131,16 @@ fn bootstrapLibz(cap_table_base: u64) void {
             .v3 = pf_handle,
         },
     );
+    // map_pf returns OK (0) on success, error code in v1 on failure.
+    if (mp.v1 != 0) haltForever();
+}
+
+fn haltForever() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
 }
