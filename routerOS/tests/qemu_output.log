@@ -1,1 +1,0 @@
-qemu-system-x86_64: -netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off: could not configure /dev/net/tun (tap0): Operation not permitted
