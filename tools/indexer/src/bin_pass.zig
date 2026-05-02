@@ -60,8 +60,10 @@ fn parseSymbols(
         const line = std.mem.trimRight(u8, raw_line, " \t\r");
         if (line.len < 20) continue;
 
-        // Format: "<addr> <flags...> F <section>\t<size> <name>"
-        // We need: 'F' flag in the flags region, '.text' section.
+        // Format: "<addr> <flags...> <type> <section>\t<size> <name>"
+        // The flags region carries a single-letter type indicator:
+        //   'F' = function (in .text)
+        //   'O' = object   (in .bss / .data / .rodata / .tdata / .tbss)
         const tab_idx = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
         const head = line[0..tab_idx];
         const tail = line[tab_idx + 1 ..];
@@ -71,12 +73,13 @@ fn parseSymbols(
         const addr = std.fmt.parseInt(u64, head[0..addr_end], 16) catch continue;
         if (addr == 0) continue;
 
-        // Function flag: look for ' F ' in the head.
-        if (std.mem.indexOf(u8, head, " F ") == null) continue;
-        // Section: ".text" only.
+        // Section: last whitespace-separated token of head.
         const section_idx = std.mem.lastIndexOfScalar(u8, head, ' ') orelse continue;
         const section = head[section_idx + 1 ..];
-        if (!std.mem.eql(u8, section, ".text")) continue;
+
+        const is_fn = std.mem.indexOf(u8, head, " F ") != null and std.mem.eql(u8, section, ".text");
+        const is_obj = std.mem.indexOf(u8, head, " O ") != null and isDataSection(section);
+        if (!is_fn and !is_obj) continue;
 
         // Tail: "<size_hex> <name>"
         const size_end = std.mem.indexOfScalar(u8, tail, ' ') orelse continue;
@@ -84,8 +87,9 @@ fn parseSymbols(
         const name = std.mem.trimLeft(u8, tail[size_end + 1 ..], " \t");
         if (name.len == 0 or size == 0) continue;
 
-        // Skip LLVM-internal builtins.
+        // Skip LLVM-internal builtins and Zig-internal anonymous globals.
         if (std.mem.startsWith(u8, name, "llvm.")) continue;
+        if (std.mem.startsWith(u8, name, "__anon_")) continue;
 
         const stripped = stripMonoSuffix(name);
         const entity_id = entity_by_qname.get(stripped) orelse continue;
@@ -98,6 +102,19 @@ fn parseSymbols(
         });
     }
     return try rows.toOwnedSlice(palloc);
+}
+
+fn isDataSection(section: []const u8) bool {
+    const data_sections = [_][]const u8{ ".bss", ".data", ".rodata", ".tdata", ".tbss" };
+    for (data_sections) |s| {
+        if (std.mem.eql(u8, section, s)) return true;
+    }
+    // Match `.rodata.cst*`, `.data.rel.ro`, etc. — common compiler-generated
+    // data subsections.
+    for (data_sections) |s| {
+        if (std.mem.startsWith(u8, section, s) and section.len > s.len and section[s.len] == '.') return true;
+    }
+    return false;
 }
 
 // ── objdump -d -M intel ───────────────────────────────────────────────────
