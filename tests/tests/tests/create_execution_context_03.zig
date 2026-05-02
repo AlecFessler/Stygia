@@ -59,6 +59,10 @@ const testing = lib.testing;
 
 const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
 const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
+// Mirrors libz_loader.constants.LIBZ_PF_SLOT — the runner places the
+// staged libz page frame here for every spawned test domain so its
+// _start can mapPf libz at LIBZ_SLIDE.
+const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
 // Portable no-op entry — local to this test so we don't depend on the
 // libz testing.dummyEntry (which is x86-only `hlt`). The kernel never
@@ -112,8 +116,11 @@ pub fn main(cap_table_base: u64) void {
     // ── Parent path ───────────────────────────────────────────────
     // Spawn a child domain that re-enters this same ELF with
     // ec_inner_ceiling = 0x7F. The child then takes the branch above.
+    // `crvr` is required so the child's _start can call createVar to
+    // map libz at LIBZ_SLIDE; without it the libz bootstrap halts.
     const child_self = caps.SelfCap{
         .crec = true,
+        .crvr = true,
         .pri = 3,
     };
 
@@ -139,11 +146,14 @@ pub fn main(cap_table_base: u64) void {
 
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 
-    // Pass both runner-supplied handles through to the child so the
-    // child can report on the shared port. The ELF pf is forwarded
-    // to keep symmetry with the parent layout (the child does not
-    // need to spawn further sub-domains, but uniform slot layout
-    // simplifies cap_table_base offsets).
+    // Pass the runner-supplied handles through to the child so the
+    // child can report on the shared port and bootstrap libz. The ELF
+    // pf is forwarded to keep symmetry with the parent layout (the
+    // child does not need to spawn further sub-domains, but uniform
+    // slot layout simplifies cap_table_base offsets). The libz pf is
+    // mandatory: the spawned grandchild's _start (tests/tests/libz/
+    // start.zig) reads slot SLOT_LIBZ_PF and mapPfs the libz image at
+    // LIBZ_SLIDE before any test code runs.
     const port_caps_struct = caps.PortCap{
         .move = false,
         .copy = false,
@@ -157,7 +167,16 @@ pub fn main(cap_table_base: u64) void {
         .w = false,
     };
     const pf_caps_word = pf_caps_struct.toU16();
-    const passed: [2]u64 = .{
+    // Read our own libz pf cap to forward its source handle id and
+    // build a child cap word matching the runner's pattern (R + X).
+    const libz_pf_cap = caps.readCap(cap_table_base, SLOT_LIBZ_PF);
+    const libz_pf_id = libz_pf_cap.id();
+    const libz_pf_caps_word = (caps.PfCap{
+        .move = false,
+        .r = true,
+        .x = true,
+    }).toU16();
+    const passed: [3]u64 = .{
         (caps.PassedHandle{
             .id = SLOT_RESULT_PORT,
             .caps = port_caps_word,
@@ -166,6 +185,11 @@ pub fn main(cap_table_base: u64) void {
         (caps.PassedHandle{
             .id = SLOT_TEST_ELF_PF,
             .caps = pf_caps_word,
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = libz_pf_id,
+            .caps = libz_pf_caps_word,
             .move = false,
         }).toU64(),
     };
