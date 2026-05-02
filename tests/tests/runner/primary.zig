@@ -27,11 +27,19 @@
 
 const lib = @import("lib");
 const embedded_tests = @import("embedded_tests");
+const libz_loader = @import("libz_loader");
 const serial_mod = @import("serial.zig");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
+
+// Marker read by libz/start.zig at comptime so its libz-bootstrap
+// path no-ops in the runner. The runner is statically linked against
+// libz/syscall.zig (full inline-asm bodies), holds no libz pf in its
+// own cap table, and is the one staging libz.elf for children — it
+// must not try to mapPf libz at LIBZ_SLIDE itself.
+pub const RUNNER_STATIC = true;
 
 // Spec §[port].recv [2] timeout_ns. 5 s is roughly 50× the all-test
 // completion budget (the in-kernel-parallel runner's healthy-tests
@@ -75,6 +83,11 @@ var results: [TOTAL_TESTS]TestResult = blk: {
 
 var serial: serial_mod.Serial = serial_mod.DISABLED;
 
+// Page count of the staged libz image, populated by stageLibzPf at
+// startup. Cached so spawnOne can build the PassedHandle without
+// re-querying the cap table.
+var libz_pf_handle: caps.HandleId = 0;
+
 pub fn main(cap_table_base: u64) void {
     serial = serial_mod.init(cap_table_base);
 
@@ -88,6 +101,12 @@ pub fn main(cap_table_base: u64) void {
     };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
+
+    // Stage libz.elf into a page_frame at startup. Each child spawned
+    // below receives this pf in its passed_handles array; its _start
+    // mapPfs it at LIBZ_SLIDE and patches own GOT/PLT against it via
+    // libz_loader.relocateSelf before app.main runs.
+    libz_pf_handle = stageLibzPf();
 
     serial.print("[runner] starting ");
     serial.printU64(embedded_tests.manifest.len);
@@ -230,12 +249,18 @@ pub fn main(cap_table_base: u64) void {
 fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     const pf_handle = stageElfIntoPageFrame(entry.bytes);
 
-    // Grant the child the result port with bind+xfer, plus a
-    // read-only handle to its own ELF page_frame. Tests that need to
-    // re-spawn themselves into a sub-domain (e.g. to vary
-    // ec_inner_ceiling — see create_execution_context_03) reach for
-    // the pf handle at SLOT_FIRST_PASSED + 1; tests that don't simply
-    // ignore that slot.
+    // Grant the child:
+    //   slot 3 (SLOT_FIRST_PASSED + 0) — result port with bind+xfer.
+    //   slot 4 (SLOT_FIRST_PASSED + 1) — its own ELF page_frame
+    //                                    (R-only). Tests that re-
+    //                                    spawn themselves into a
+    //                                    sub-domain (e.g.
+    //                                    create_execution_context_03)
+    //                                    reach for it via this slot.
+    //   slot 5 (SLOT_FIRST_PASSED + 2 = LIBZ_PF_SLOT) — the staged
+    //                                    libz.elf page_frame, R+X
+    //                                    cap so the child's _start
+    //                                    can mapPf it at LIBZ_SLIDE.
     const child_port_caps = caps.PortCap{
         .move = false,
         .copy = false,
@@ -247,7 +272,13 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         .r = true,
         .w = false,
     };
-    const passed: [2]u64 = .{
+    const child_libz_caps = caps.PfCap{
+        .move = false,
+        .r = true,
+        .w = false,
+        .x = true,
+    };
+    const passed: [3]u64 = .{
         (caps.PassedHandle{
             .id = port_handle,
             .caps = child_port_caps.toU16(),
@@ -256,6 +287,11 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         (caps.PassedHandle{
             .id = pf_handle,
             .caps = child_pf_caps.toU16(),
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = libz_pf_handle,
+            .caps = child_libz_caps.toU16(),
             .move = false,
         }).toU64(),
     };
@@ -318,6 +354,72 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         return false;
     }
     return true;
+}
+
+// Stage libz.elf into a single page_frame at startup:
+//   1. Compute the laid-out image size from libz.elf's PT_LOADs.
+//   2. Allocate a pf big enough to hold the full image.
+//   3. Create a temp Var with R+W (writable view), mapPf the pf into
+//      it, copy the libz_bytes into the laid-out positions, apply
+//      R_*_RELATIVE relocs against image_runtime_base = LIBZ_SLIDE.
+//      `libz_loader.layoutAndPrelink` does steps 3 in one shot once
+//      we hand it a writable byte slice.
+//   4. Delete the temp Var. The pf survives independently and its
+//      bytes are now position-frozen for LIBZ_SLIDE.
+//
+// Returns the libz pf handle. Each child receives this same handle
+// in its passed_handles, mapPfs it at LIBZ_SLIDE with R+X.
+fn stageLibzPf() caps.HandleId {
+    const libz_bytes = embedded_tests.libz_elf;
+    const image_bytes = libz_loader.computeImageSize(libz_bytes);
+    const page_size: u64 = 4096;
+    const pages = (image_bytes + page_size - 1) / page_size;
+
+    // Pf caps: r+w+x so children can later map it executable. The
+    // pf itself is just memory; the child's Var owns the runtime
+    // perm narrowing (R+X for libz.elf).
+    const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true, .x = true };
+    const cpf = syscall.createPageFrame(
+        @as(u64, pf_caps.toU16()),
+        0,
+        pages,
+    );
+    const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
+
+    // Temp Var for the runner's own writable view of the pf. We
+    // create it R+W (no X needed) just long enough to populate the
+    // image bytes; then delete it. The pf keeps the data.
+    const var_caps_word = caps.VarCap{ .r = true, .w = true };
+    const cvar = syscall.createVar(
+        @as(u64, var_caps_word.toU16()),
+        0b011, // cur_rwx = r|w
+        pages,
+        0, // preferred_base = 0 → kernel picks
+        0,
+    );
+    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const var_base: u64 = cvar.v2;
+
+    _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+
+    // Lay out PT_LOADs into the writable image and apply RELATIVE
+    // relocs targeting `image_runtime_base = LIBZ_SLIDE`. The
+    // resulting pf is a position-frozen image: any child mapPf'ing
+    // it at exactly LIBZ_SLIDE sees correct internal pointers
+    // without re-relocation.
+    const image: [*]u8 = @ptrFromInt(var_base);
+    libz_loader.layoutAndPrelink(
+        libz_bytes,
+        image[0..image_bytes],
+        libz_loader.constants.LIBZ_SLIDE,
+    );
+
+    // Drop the temp Var. The pf keeps the data; the runner holds
+    // the pf handle in `libz_pf_handle` for spawnOne's
+    // passed_handles.
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = var_handle });
+
+    return pf_handle;
 }
 
 fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {

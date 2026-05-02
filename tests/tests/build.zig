@@ -778,11 +778,21 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
     });
 
-    // Runner libz: statically linked. The runner is the framework's
-    // bootstrap layer — it cannot itself depend on libz_c.elf because
-    // it's the one that stages libz_c into a page_frame for children.
+    // Runner libz: statically linked, wired to lib_static.zig — its
+    // `syscall` namespace points at the top-level libz/syscall.zig
+    // (full inline-asm bodies, no externs) via the `static_syscall`
+    // module dep. The runner is the framework's bootstrap layer and
+    // cannot itself depend on libz.elf — it's the one that stages
+    // libz.elf into a page_frame for children.
+    const static_syscall_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../libz/syscall.zig" },
+        .target = target_freestanding,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
     const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "libz/lib_static.zig" },
         .target = target_freestanding,
         .optimize = .ReleaseSmall,
         .pic = true,
@@ -790,6 +800,7 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.addImport("lib", lib_mod);
     lib_mod.addImport("test_tag", sentinel_tag_mod);
+    lib_mod.addImport("static_syscall", static_syscall_mod);
 
     const libz = addLibz(b, cpu_arch);
     const libz_loader_src: std.Build.LazyPath = .{ .cwd_relative = "../../libz_loader/lib.zig" };
