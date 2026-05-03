@@ -2,18 +2,32 @@ const std = @import("std");
 const zag = @import("zag");
 
 const hv = zag.arch.aarch64.hv;
+const hv_vcpu = hv.vcpu;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const serial = zag.arch.aarch64.serial;
 const stage2_mod = zag.arch.aarch64.stage2;
 const vgic_mod = hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
+const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
 const VmarPageSize = zag.memory.vmar.PageSize;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+
+// PL011 IPA range Linux's amba-pl011 driver is wired to in our minimal
+// FDT. Inline-handling stage-2 faults on this page in the kernel keeps
+// the boot-time char-by-char busybox console out of the multi-second
+// VMM-roundtrip path under TCG.
+const PL011_IPA_BASE: u64 = 0x0900_0000;
+const PL011_IPA_SIZE: u64 = 0x1000;
+const UARTDR_OFFSET: u64 = 0x000;
+const UARTFR_OFFSET: u64 = 0x018;
+const UARTFR_RXFE: u32 = 1 << 4;
+const UARTFR_TXFE: u32 = 1 << 7;
 
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //
@@ -197,4 +211,83 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     if (irq_num >= vgic_mod.TOTAL_DIST_INTIDS)
         return zag.syscall.errors.E_INVAL;
     return 0;
+}
+
+/// Inline-handle a stage-2 fault from the run loop without bouncing to
+/// the VMM. Currently only PL011 UART accesses, which Linux hits once
+/// per character of console output and the busy-wait FIFO check —
+/// every roundtrip through the VMM under TCG costs many ms, which
+/// stretches the boot to the 10-minute range. Returns true if the
+/// fault was inline-handled (caller advances PC and re-enters guest);
+/// false if the fault must surface to the VMM.
+pub fn tryHandleStage2Mmio(
+    vm: *VirtualMachine,
+    vcpu_ec: *ExecutionContext,
+    guest_phys: u64,
+    iss_valid: bool,
+    is_write: bool,
+    srt: u8,
+) bool {
+    _ = vm;
+    if (!iss_valid) return false;
+    if (guest_phys < PL011_IPA_BASE or guest_phys >= PL011_IPA_BASE + PL011_IPA_SIZE) return false;
+    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return false;
+    const gs = &arch_state.guest_state;
+    const offset = guest_phys - PL011_IPA_BASE;
+    if (is_write) {
+        if (offset == UARTDR_OFFSET) {
+            const ch: u8 = @intCast(readGuestGpr(gs, srt) & 0xFF);
+            const buf: [1]u8 = .{ch};
+            serial.printRaw(buf[0..]);
+        }
+        // Other PL011 writes (baud, line control, IMSC, ICR, …) are
+        // accepted by hardware and have no host-visible effect we care
+        // about for a TX-only console; just swallow.
+        return true;
+    }
+    // Reads.
+    const value: u64 = switch (offset) {
+        UARTDR_OFFSET => 0,
+        UARTFR_OFFSET => UARTFR_RXFE | UARTFR_TXFE,
+        // PrimeCell ID page top-half — Linux's amba bus probe.
+        0xFE0 => 0x11,
+        0xFE4 => 0x10,
+        0xFE8 => 0x34,
+        0xFEC => 0x00,
+        0xFF0 => 0x0D,
+        0xFF4 => 0xF0,
+        0xFF8 => 0x05,
+        0xFFC => 0xB1,
+        else => 0,
+    };
+    writeGuestGpr(gs, srt, value);
+    return true;
+}
+
+inline fn readGuestGpr(gs: *const vm_hw.GuestState, idx: u8) u64 {
+    return switch (idx) {
+        0 => gs.x0,    1 => gs.x1,    2 => gs.x2,    3 => gs.x3,
+        4 => gs.x4,    5 => gs.x5,    6 => gs.x6,    7 => gs.x7,
+        8 => gs.x8,    9 => gs.x9,    10 => gs.x10,  11 => gs.x11,
+        12 => gs.x12,  13 => gs.x13,  14 => gs.x14,  15 => gs.x15,
+        16 => gs.x16,  17 => gs.x17,  18 => gs.x18,  19 => gs.x19,
+        20 => gs.x20,  21 => gs.x21,  22 => gs.x22,  23 => gs.x23,
+        24 => gs.x24,  25 => gs.x25,  26 => gs.x26,  27 => gs.x27,
+        28 => gs.x28,  29 => gs.x29,  30 => gs.x30,
+        else => 0,
+    };
+}
+
+inline fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
+    switch (idx) {
+        0 => gs.x0 = val,    1 => gs.x1 = val,    2 => gs.x2 = val,    3 => gs.x3 = val,
+        4 => gs.x4 = val,    5 => gs.x5 = val,    6 => gs.x6 = val,    7 => gs.x7 = val,
+        8 => gs.x8 = val,    9 => gs.x9 = val,    10 => gs.x10 = val,  11 => gs.x11 = val,
+        12 => gs.x12 = val,  13 => gs.x13 = val,  14 => gs.x14 = val,  15 => gs.x15 = val,
+        16 => gs.x16 = val,  17 => gs.x17 = val,  18 => gs.x18 = val,  19 => gs.x19 = val,
+        20 => gs.x20 = val,  21 => gs.x21 = val,  22 => gs.x22 = val,  23 => gs.x23 = val,
+        24 => gs.x24 = val,  25 => gs.x25 = val,  26 => gs.x26 = val,  27 => gs.x27 = val,
+        28 => gs.x28 = val,  29 => gs.x29 = val,  30 => gs.x30 = val,
+        else => {},
+    }
 }

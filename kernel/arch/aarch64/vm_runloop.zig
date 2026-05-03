@@ -107,6 +107,27 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
                 }
                 return decodeDelivery(exit_info, &arch_state.guest_state);
             },
+            .stage2_fault => |s| {
+                // Inline-handle PL011 MMIO so the guest console TX loop
+                // doesn't roundtrip to the VMM per character. Mirrors x64's
+                // tryHandleMmio for kernel-emulated LAPIC/IOAPIC.
+                const iss_valid = (s.flags & vm_hw.VmExitInfo.Stage2Fault.FLAG_ISS_VALID) != 0;
+                const is_write = (s.flags & vm_hw.VmExitInfo.Stage2Fault.FLAG_IS_WRITE) != 0;
+                if (vcpu_ec.vm) |vm_ref_inner| {
+                    if (vm_ref_inner.lock(@src())) |vm_ptr_inner| {
+                        const handled = hv_vm.tryHandleStage2Mmio(vm_ptr_inner, vcpu_ec, s.guest_phys, iss_valid, is_write, s.srt);
+                        vm_ref_inner.unlock();
+                        if (handled) {
+                            // Advance past the trapping instruction. A64
+                            // instructions are always 32-bit (ARM ARM B2.5.4),
+                            // so unconditional +4 is safe.
+                            arch_state.guest_state.pc +%= 4;
+                            continue;
+                        }
+                    } else |_| {}
+                }
+                return decodeDelivery(exit_info, &arch_state.guest_state);
+            },
             else => return decodeDelivery(exit_info, &arch_state.guest_state),
         }
     }
