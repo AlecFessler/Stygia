@@ -9,7 +9,7 @@
 //!      `[]*T` for slab-backed T are violations. SlabRef(T) is required.
 //!
 //!   3. `.ptr` bypass — chains `<x>.<slabref_field>.ptr` outside an
-//!      explicit lock/unlock bracket, with `// self-alive` exemption.
+//!      explicit lock/unlock bracket, with `// caller-pinned` exemption.
 //!
 //!   4. Per-entry bracketing — every access to a slab-typed local in a
 //!      syscall / exception handler must be tight-preceded by a lock and
@@ -508,6 +508,8 @@ fn checkFatPointerFields(
             const enc_short = shortName(enc_q);
             const line = byteToLine(f.source, bs);
 
+            if (hasCallerPinnedAnnotation(f.source, line)) break;
+
             try findings.append(st.gpa, .{
                 .file_path = f.path,
                 .line = line,
@@ -554,7 +556,7 @@ fn collectSlabFieldNames(db: *sqlite.Db, st: *State) !void {
     }
     // Seed common KernelObject variant names known to be SlabRef-typed.
     const variants = [_][]const u8{
-        "execution_context", "capability_domain", "var_range",
+        "execution_context", "capability_domain", "vmar",
         "page_frame",        "device_region",     "virtual_machine",
         "vcpu",              "port",              "timer",
     };
@@ -563,8 +565,41 @@ fn collectSlabFieldNames(db: *sqlite.Db, st: *State) !void {
     }
 }
 
-fn containsSelfAlive(line_text: []const u8) bool {
-    if (mem.indexOf(u8, line_text, "self-alive")) |_| return true;
+fn containsCallerPinned(line_text: []const u8) bool {
+    if (mem.indexOf(u8, line_text, "caller-pinned")) |_| return true;
+    return false;
+}
+
+// Walk back through the contiguous `//`-comment block immediately above
+// a container field at field_line, looking for `caller-pinned`. Mirrors
+// the .ptr-bypass exemption walker so a field comment can justify a
+// bare `*T` reference where SlabRef(T) would normally be required.
+fn hasCallerPinnedAnnotation(source: []const u8, field_line: u32) bool {
+    // Find start byte of field_line.
+    var line_no: u32 = 1;
+    var i: usize = 0;
+    while (i < source.len and line_no < field_line) : (i += 1) {
+        if (source[i] == '\n') line_no += 1;
+    }
+    if (line_no != field_line) return false;
+    const field_line_start = i;
+    const field_line_end = mem.indexOfScalarPos(u8, source, field_line_start, '\n') orelse source.len;
+    // Same-line annotation.
+    if (mem.indexOf(u8, source[field_line_start..field_line_end], "caller-pinned") != null) return true;
+    // Walk backwards through contiguous `//`-comment block above.
+    if (field_line_start == 0) return false;
+    var pos: usize = field_line_start - 1;
+    while (pos > 0) {
+        var prev_start: usize = pos;
+        while (prev_start > 0 and source[prev_start - 1] != '\n') prev_start -= 1;
+        const prev_line = source[prev_start..pos];
+        const trimmed = trimAscii(prev_line);
+        if (trimmed.len == 0) return false;
+        if (!mem.startsWith(u8, trimmed, "//")) return false;
+        if (mem.indexOf(u8, trimmed, "caller-pinned") != null) return true;
+        if (prev_start == 0) return false;
+        pos = prev_start - 1;
+    }
     return false;
 }
 
@@ -892,7 +927,7 @@ fn checkPtrBypasses(
         if (inList(f.path, &PTR_BYPASS_EXEMPT_FILES)) continue;
         const src = f.source;
         // Walk lines. Maintain a small state machine over contiguous `//`
-        // comment blocks so a `// self-alive` annotation in the lines
+        // comment blocks so a `// caller-pinned` annotation in the lines
         // immediately above a `.ptr` access exempts that access — not
         // just an annotation on the same line. The legacy analyzer
         // checks the comment block above; matching that here drops ~18
@@ -901,7 +936,7 @@ fn checkPtrBypasses(
         var line_start: usize = 0;
         var i: usize = 0;
         var in_comment_block = false;
-        var block_has_self_alive = false;
+        var block_has_caller_pinned = false;
         while (i <= src.len) : (i += 1) {
             const at_eol = (i == src.len) or (src[i] == '\n');
             if (!at_eol) continue;
@@ -913,8 +948,8 @@ fn checkPtrBypasses(
             // line. A blank line breaks the block (legacy behavior).
             if (is_comment) {
                 in_comment_block = true;
-                if (mem.indexOf(u8, trimmed, "self-alive") != null) {
-                    block_has_self_alive = true;
+                if (mem.indexOf(u8, trimmed, "caller-pinned") != null) {
+                    block_has_caller_pinned = true;
                 }
                 line_no += 1;
                 line_start = i + 1;
@@ -922,22 +957,22 @@ fn checkPtrBypasses(
             }
             if (is_blank) {
                 in_comment_block = false;
-                block_has_self_alive = false;
+                block_has_caller_pinned = false;
                 line_no += 1;
                 line_start = i + 1;
                 continue;
             }
             const just_left_block = in_comment_block;
-            const block_self_alive = block_has_self_alive;
+            const block_caller_pinned = block_has_caller_pinned;
             in_comment_block = false;
-            block_has_self_alive = false;
+            block_has_caller_pinned = false;
             // Skip comment (cheap stripped: anything past `//`).
             const stripped_line = blk: {
                 if (mem.indexOf(u8, raw_line, "//")) |idx| break :blk raw_line[0..idx];
                 break :blk raw_line;
             };
-            if (containsSelfAlive(raw_line) or
-                (just_left_block and block_self_alive))
+            if (containsCallerPinned(raw_line) or
+                (just_left_block and block_caller_pinned))
             {
                 line_no += 1;
                 line_start = i + 1;

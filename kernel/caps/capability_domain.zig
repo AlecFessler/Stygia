@@ -226,7 +226,7 @@ pub fn createCapabilityDomain(
 ) i64 {
     if (elf_pf & ~@as(u64, 0xFFF) != 0) return errors.E_INVAL;
 
-    const caller_dom = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const caller_dom = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
 
     // Resolve the ELF page frame in the caller's table. Spec §[14].
     const pf_slot: u12 = @truncate(elf_pf & 0xFFF);
@@ -628,7 +628,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
         var j: u16 = 0;
         while (j < target_cd.var_count) : (j += 1) {
             const v_ref = target_cd.vars[j] orelse continue;
-            // self-alive: VMAR's domain ref pins it for the
+            // caller-pinned: VMAR's domain ref pins it for the
             // duration of this walk (target_cd's gen-lock is held).
             const v = v_ref.ptr;
             switch (v.map) {
@@ -645,7 +645,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
     var i: u16 = 0;
     while (i < target_cd.var_count) : (i += 1) {
         const v_ref = target_cd.vars[i] orelse continue;
-        // self-alive: see prior loop.
+        // caller-pinned: see prior loop.
         const v = v_ref.ptr;
         switch (v.map) {
             .page_frame, .demand => {},
@@ -1140,7 +1140,7 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
             i += 1;
             continue;
         };
-        // self-alive: VMAR's domain ref pins it; cd is the owner here.
+        // caller-pinned: VMAR's domain ref pins it; cd is the owner here.
         const v = v_ref.ptr;
         const sz_bytes: u64 = switch (v.sz) {
             .sz_4k => 0x1000,

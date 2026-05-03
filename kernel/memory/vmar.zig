@@ -244,7 +244,7 @@ pub fn createVmar(
         }
     }
 
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
 
     // DMA VARs require a valid device_region handle with the dma cap.
     var dev_ptr: ?*DeviceRegion = null;
@@ -306,7 +306,7 @@ pub fn createVmar(
 pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i64 {
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -407,7 +407,7 @@ pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i6
 
 /// `map_mmio` syscall handler. Spec §[var].map_mmio.
 pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) i64 {
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const vmar_slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, vmar_slot) orelse return errors.E_BADCAP;
 
@@ -470,7 +470,7 @@ pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) 
 
 /// `unmap` syscall handler. Spec §[var].unmap.
 pub fn unmap(caller: *ExecutionContext, vmar_handle: u64, selectors: []const u64) i64 {
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -527,7 +527,7 @@ pub fn unmap(caller: *ExecutionContext, vmar_handle: u64, selectors: []const u64
 pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 {
     if (new_cur_rwx >> 3 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -554,7 +554,7 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
     if (v.map == .page_frame) {
         var pf_intersect_rwx: u3 = 0b111;
         for (&v.installed_pfs) |*entry| {
-            // self-alive: PF refcount kept by VMAR's installed list;
+            // caller-pinned: PF refcount kept by VMAR's installed list;
             // VMAR's gen-lock is held, so no concurrent install/unmap.
             const pf_ref = entry.pf orelse continue;
             const pf = pf_ref.ptr;
@@ -611,7 +611,7 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
 
 /// `snapshot` syscall handler. Spec §[var].snapshot.
 pub fn snapshot(caller: *ExecutionContext, target_vmar: u64, source_vmar: u64) i64 {
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const t_slot: u12 = @truncate(target_vmar & 0xFFF);
     const s_slot: u12 = @truncate(source_vmar & 0xFFF);
 
@@ -639,7 +639,7 @@ pub fn idcRead(caller: *ExecutionContext, vmar_handle: u64, offset: u64, count: 
     if (count == 0 or count > 125) return errors.E_INVAL;
     if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -660,10 +660,10 @@ pub fn idcRead(caller: *ExecutionContext, vmar_handle: u64, offset: u64, count: 
     // offset 8, ...), then resume. Spec §[idc_read] test 07. The
     // syscall executes with the caller's CR3 active so VMAR.base_vaddr
     // is directly addressable; SMAP gates the user-mem load.
-    // self-alive: VMAR's domain is its owner; the VMAR cannot exist
+    // caller-pinned: VMAR's domain is its owner; the VMAR cannot exist
     // without it (destroyVmar runs ahead of any domain teardown).
     quiesceDomain(v.domain.ptr);
-    defer resumeDomain(v.domain.ptr); // self-alive
+    defer resumeDomain(v.domain.ptr); // caller-pinned
 
     // Per §[var], VARs with `map = unmapped` have no backing storage.
     // Reading from a user vaddr in that range would page-fault under
@@ -711,7 +711,7 @@ pub fn idcWrite(
     if (count == 0 or count > 125) return errors.E_INVAL;
     if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // self-alive: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -738,10 +738,10 @@ pub fn idcWrite(
     // install backing (map_pf / map_mmio) before retrying.
     if (v.map == .unmapped) return errors.E_INVAL;
 
-    // self-alive: VMAR's domain is its owner; the VMAR cannot exist
+    // caller-pinned: VMAR's domain is its owner; the VMAR cannot exist
     // without it.
     quiesceDomain(v.domain.ptr);
-    defer resumeDomain(v.domain.ptr); // self-alive
+    defer resumeDomain(v.domain.ptr); // caller-pinned
 
     const dst_base: u64 = v.base_vaddr.addr + offset;
     dispatch.cpu.userAccessBegin();
@@ -795,7 +795,7 @@ fn resolveVmar(cd: *CapabilityDomain, slot: u12) ?*VMAR {
 /// touching the handle).
 fn refreshVmarSnapshot(cd: *CapabilityDomain, slot: u12, v: *const VMAR) void {
     if (slot >= cd.user_table.len) return;
-    // self-alive: device ref is part of v's mutable state, accessed
+    // caller-pinned: device ref is part of v's mutable state, accessed
     // under v's gen-lock by the caller.
     const dev_id: u12 = if (v.device) |dr_ref| handleIdOf(cd, dr_ref.ptr) else 0;
     cd.user_table[slot].field0 = v.base_vaddr.addr;
@@ -853,7 +853,7 @@ fn allocVmar(
 /// Final teardown — unmaps all installations, releases device/snapshot
 /// refs, removes from `domain.vars[]`, frees VA range, frees slab slot.
 pub fn destroyVmar(v: *VMAR) void {
-    // self-alive: domain owns this VMAR and outlives it (destroyVmar
+    // caller-pinned: domain owns this VMAR and outlives it (destroyVmar
     // runs ahead of any domain teardown).
     const domain = v.domain.ptr;
     const gen = v._gen_lock.currentGen();
@@ -944,7 +944,7 @@ fn domainOverlaps(domain: *const CapabilityDomain, base: u64, bytes: u64) bool {
             i += 1;
             continue;
         };
-        // self-alive: VMAR's domain owns it; the walking caller holds
+        // caller-pinned: VMAR's domain owns it; the walking caller holds
         // the domain alive across this scan.
         const v = v_ref.ptr;
         const v_sz_bytes = pageSizeBytes(v.sz);
@@ -973,7 +973,7 @@ var aslr_fallback_counter: u64 = 0;
 /// IOMMU PTE. Spec §[var].map_pf — installs every page in the page
 /// frame contiguously starting at `offset`.
 fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame) i64 {
-    // self-alive: VMAR's domain is its owner.
+    // caller-pinned: VMAR's domain is its owner.
     const domain = v.domain.ptr;
     const slot_idx = handleSlotOf(v, domain);
     const caps_word: u16 = if (slot_idx < domain.user_table.len)
@@ -1004,7 +1004,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame) i64 {
             pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
         );
         if (vmar_caps.dma) {
-            // self-alive: device ref under VMAR's gen-lock.
+            // caller-pinned: device ref under VMAR's gen-lock.
             const dev_ref = v.device orelse return errors.E_INVAL;
             dispatch.iommu.iommuMapPage(
                 dev_ref.ptr,
@@ -1036,7 +1036,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame) i64 {
 /// Remove an installation, decrements mapcnt, tears down PTE.
 /// Returns the removed page_frame so caller can release its handle ref.
 fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
-    // self-alive: VMAR's domain is its owner.
+    // caller-pinned: VMAR's domain is its owner.
     const domain = v.domain.ptr;
     const slot_idx = handleSlotOf(v, domain);
     const caps_word: u16 = if (slot_idx < domain.user_table.len)
@@ -1049,7 +1049,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     for (&v.installed_pfs) |*entry| {
         if (entry.pf) |pf_ref| {
             if (entry.offset == offset) {
-                // self-alive: PF refcount kept by the installed entry
+                // caller-pinned: PF refcount kept by the installed entry
                 // we are about to remove; caller will release the
                 // mapcnt below.
                 removed = pf_ref.ptr;
@@ -1060,7 +1060,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     }
 
     if (vmar_caps.dma) {
-        // self-alive: device ref under VMAR's gen-lock.
+        // caller-pinned: device ref under VMAR's gen-lock.
         const dev_ref = v.device orelse return removed;
         _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz);
         dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz, 1);
@@ -1111,7 +1111,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // RIP. Spec §[port_io_virtualization]. Plain MMIO faults
             // here are spurious (real PTEs were installed at map time)
             // and route to the EC's memory_fault event.
-            // self-alive: device ref under VMAR's gen-lock.
+            // caller-pinned: device ref under VMAR's gen-lock.
             const dev_ref = v.device orelse return errors.E_BADADDR;
             const dev = dev_ref.ptr;
             if (dev.device_type == .port_io) {
@@ -1137,7 +1137,7 @@ pub fn findVmarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VMAR {
             i += 1;
             continue;
         };
-        // self-alive: VMAR's domain (= cd) owns it.
+        // caller-pinned: VMAR's domain (= cd) owns it.
         const v = v_ref.ptr;
         const sz_bytes = pageSizeBytes(v.sz);
         const end = v.base_vaddr.addr + @as(u64, v.page_count) * sz_bytes;

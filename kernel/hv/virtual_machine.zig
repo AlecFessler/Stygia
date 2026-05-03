@@ -343,7 +343,7 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
         // page_frame already installed in this VM's guest physical
         // address space.
         for (&vm.installs) |*entry| {
-            // self-alive: PF refcount kept by VM for its install
+            // caller-pinned: PF refcount kept by VM for its install
             // bookkeeping; caller holds vm's gen-lock context.
             const entry_pf_ref = entry.pf orelse continue;
             if (installRangesOverlap(guest_addr, pf, entry.guest_addr, entry_pf_ref.ptr)) return errors.E_INVAL;
@@ -497,13 +497,13 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
 /// `policy_pf` reference, clears `domain.vm`, returns slab slot.
 fn destroyVm(vm: *VirtualMachine) void {
     if (vm.policy_pf) |pf_ref| {
-        // self-alive: PF refcount kept by VM for its lifetime.
+        // caller-pinned: PF refcount kept by VM for its lifetime.
         decPageFrameRef(pf_ref.ptr);
         vm.policy_pf = null;
     }
     vm_dispatch.freeVmArchState(vm);
     vm_dispatch.freeStage2Root(vm);
-    // self-alive: VM's domain owns it.
+    // caller-pinned: VM's domain owns it.
     vm.domain.ptr.vm = null;
     const gen = vm._gen_lock.currentGen();
     slab_instance.destroy(vm, gen) catch {};
@@ -601,10 +601,10 @@ fn allocVcpu(
 ) !*ExecutionContext {
     _ = creator_domain;
 
-    // self-alive: VM's domain owns the VM and outlives it (destroyVm
+    // caller-pinned: VM's domain owns the VM and outlives it (destroyVm
     // runs ahead of any domain teardown).
     const vcpu_ec = try ec_mod.allocExecutionContext(
-        vm.domain.ptr, // self-alive
+        vm.domain.ptr, // caller-pinned
         VAddr.fromInt(0),
         0,
         affinity,

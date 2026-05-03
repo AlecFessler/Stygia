@@ -258,7 +258,7 @@ inline fn packField0(page_count: u32, sz: PageSize) u64 {
 /// dispatches via `*anyopaque`; the concrete type is `*ExecutionContext`
 /// whose `domain` SlabRef names the owner.
 fn callerDomain(ec: *ExecutionContext) *CapabilityDomain {
-    return ec.domain.ptr; // self-alive: ec is the running EC; its domain stays alive across this syscall
+    return ec.domain.ptr; // caller-pinned: ec is the running EC; its domain stays alive across this syscall
 }
 
 /// Spec §[create_page_frame] test 01: returns E_PERM if the caller's

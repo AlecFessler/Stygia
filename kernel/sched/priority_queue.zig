@@ -26,7 +26,7 @@ pub fn PriorityQueue(
             if (comptime nextIsSlabRef()) {
                 const maybe = @field(item, next_field);
                 if (maybe) |r| {
-                    // self-alive: the run/wait queue owns its nodes
+                    // caller-pinned: the run/wait queue owns its nodes
                     // until dequeue/remove; the SlabRef cannot go
                     // stale while the node is linked.
                     return r.ptr;

@@ -243,8 +243,8 @@ pub fn main(cap_table_base: u64) void {
     // because W's EC handle had the `write` cap. We bypass the libz
     // `reply` wrapper because that wrapper zeroes vregs 1..13. Under
     // the new ABI the reply_handle_id rides in the syscall word
-    // (bits 12-23 per §[reply]).
-    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 12;
+    // (bits 20-31 per §[reply]).
+    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 20;
     const r = syscall.issueReg(.reply, reply_extra, .{
         .v13 = MAGIC,
     });

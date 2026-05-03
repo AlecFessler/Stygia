@@ -197,7 +197,7 @@ pub fn main(cap_table_base: u64) void {
     // `write` cap on W's originating handle the kernel resumes W with
     // the receiver's current rbx — which is MAGIC by the time the
     // syscall executes.
-    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 12;
+    const reply_extra: u64 = (@as(u64, reply_handle_id) & 0xFFF) << 20;
     const rep = syscall.issueReg(.reply, reply_extra, .{
         .v2 = MAGIC,
     });

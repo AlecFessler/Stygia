@@ -185,7 +185,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
             continue;
         }
 
-        // self-alive: the node lives on the waiting EC's kernel stack
+        // caller-pinned: the node lives on the waiting EC's kernel stack
         // — the EC cannot have been freed while this node is still in
         // our bucket. The gen-locked SlabRef is for tooling uniformity
         // and the implicit liveness assertion.
@@ -501,7 +501,7 @@ pub fn expireTimedWaiters() void {
         for (&timed_waiters) |*slot| {
             const ec = slot.* orelse continue;
             if (ec.futex_deadline_ns == 0 or now_ns < ec.futex_deadline_ns) continue;
-            // self-alive: `ec` is pinned by the `timed_waiters` slot we
+            // caller-pinned: `ec` is pinned by the `timed_waiters` slot we
             // just dequeued; capturing its current gen here gives the
             // phase-2 walk a stale-detector if the slot is freed and
             // reallocated between phases. The deadline re-check after
@@ -517,7 +517,7 @@ pub fn expireTimedWaiters() void {
 
     // Phase 2: per-EC, take only bucket.lock (never timed_lock).
     for (expired[0..expired_count]) |entry| {
-        // self-alive: `entry.ec` was captured under timed_lock above
+        // caller-pinned: `entry.ec` was captured under timed_lock above
         // and the EC's slot can only be freed after its bucket waiters
         // are unwound, which this very phase performs. The gen carried
         // by the SlabRef is the structural staleness backstop; the

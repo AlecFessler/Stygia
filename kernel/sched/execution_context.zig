@@ -175,7 +175,7 @@ pub const ExecutionContext = struct {
     /// list}. Futex waits do NOT use this link — they use per-bucket
     /// WaitNodes (see `futex_wait_nodes`).
     ///
-    /// self-alive: raw `?*EC`, not `?SlabRef`. Queue links are pinned
+    /// caller-pinned: raw `?*EC`, not `?SlabRef`. Queue links are pinned
     /// by the enclosing structure's lock (port._gen_lock for port
     /// waiters; scheduler core_lock for run queues). Destroy paths
     /// must dequeue before freeing, and dequeue requires that same
@@ -190,7 +190,7 @@ pub const ExecutionContext = struct {
     /// destroy), `delete` on a reply (resolve sender with E_ABANDONED),
     /// and cross-EC `suspend`. O(1) instead of O(N) walk.
     ///
-    /// self-alive: raw `?*EC`, same justification as `next` — pinned
+    /// caller-pinned: raw `?*EC`, same justification as `next` — pinned
     /// by the enclosing queue's lock.
     prev: ?*ExecutionContext = null,
 
@@ -1424,7 +1424,7 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
     // never `.lock()`s them (we already hold cd._gen_lock and the keep
     // EC is the very EC executing this path) — the `.ptr` accesses on
     // the chains below are bracketed by that outer lock and are
-    // explicitly self-alive.
+    // explicitly caller-pinned.
     const Visitor = struct {
         cd_ref: SlabRef(CapabilityDomain),
         cd_addr_space_root: PAddr,
@@ -1440,16 +1440,16 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
         struct {
             fn visit(c: *Visitor, ec: *ExecutionContext, _: u63) bool {
                 if (c.keep_ref) |kr| {
-                    // self-alive: keep_ref names the EC running this code
+                    // caller-pinned: keep_ref names the EC running this code
                     // path; pointer identity check, no deref.
                     if (ec == kr.ptr) return true;
                 }
-                // self-alive: cd_ref names the CD whose _gen_lock the
+                // caller-pinned: cd_ref names the CD whose _gen_lock the
                 // outer caller holds; checking ec.domain alignment
                 // against it is pointer arithmetic only, no deref.
                 if (ec.domain.ptr != c.cd_ref.ptr) return true;
                 if (ec.domain.gen != c.cd_ref.gen) return true;
-                // self-alive: same outer-locked CD, passed through to
+                // caller-pinned: same outer-locked CD, passed through to
                 // the per-EC destroy helper which only uses the bare
                 // pointer for caller_cd identity comparison.
                 destroyExecutionContextLocked(ec, c.cd_addr_space_root, c.cd_ref.ptr);

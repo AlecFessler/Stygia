@@ -432,7 +432,7 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // translation walks the right tree. Kernel half lives in TTBR1 and
     // is shared, so no kernel-side TLBI is needed.
     //
-    // self-alive: `ec` was selected by the scheduler for this core; its
+    // caller-pinned: `ec` was selected by the scheduler for this core; its
     // domain is held live by the EC through the dispatch window (the EC
     // carries a SlabRef into the domain), so reading addr_space_root /
     // addr_space_id directly off the deref'd pointer without re-locking

@@ -413,7 +413,7 @@ pub fn SecureSlab(
         /// observer can see the ref; this path writes the gen-lock
         /// word (live, unlocked) but nothing else. While no other
         /// observer holds the ref, field access during init is
-        /// self-alive and does not need lock/unlock bracketing.
+        /// caller-pinned and does not need lock/unlock bracketing.
         pub fn create(self: *Self) AllocError!Ref {
             self.lock.lock(@src());
             defer self.lock.unlock();

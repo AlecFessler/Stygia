@@ -60,7 +60,7 @@ pub fn initSlabs(
 }
 
 fn freeVmNode(node_ref: SlabRef(VmNode)) void {
-    // self-alive: caller proves liveness by holding vmm.lock; the node
+    // caller-pinned: caller proves liveness by holding vmm.lock; the node
     // was just removed from `self.nodes[]` and no other context can
     // observe it after that point.
     // Use the carried gen (from the caller's SlabRef) rather than
@@ -71,7 +71,7 @@ fn freeVmNode(node_ref: SlabRef(VmNode)) void {
 }
 
 fn cmpAddrToNode(ctx_addr: u64, item: SlabRef(VmNode)) std.math.Order {
-    // self-alive: sort comparator runs under vmm.lock; every item in
+    // caller-pinned: sort comparator runs under vmm.lock; every item in
     // the slice is alive for the duration of the search.
     return std.math.order(ctx_addr, item.ptr.start.addr);
 }
@@ -114,7 +114,7 @@ pub const VirtualMemoryManager = struct {
         const idx = lowerBoundIdx(self.slice(), vaddr.addr +| 1);
         if (idx == 0) return null;
         const candidate = self.nodes[idx - 1];
-        // self-alive: vmm.lock is held — the node is still in the array.
+        // caller-pinned: vmm.lock is held — the node is still in the array.
         if (vaddr.addr < candidate.ptr.end()) return candidate;
         return null;
     }
@@ -141,7 +141,7 @@ pub const VirtualMemoryManager = struct {
 };
 
 fn unmapNodePages(node_ref: SlabRef(VmNode), addr_space_root: PAddr, free_phys: bool) void {
-    // self-alive: callers hold vmm.lock; the node is stored in
+    // caller-pinned: callers hold vmm.lock; the node is stored in
     // self.nodes[] or was just removed by the same critical section.
     const node = node_ref.ptr;
 

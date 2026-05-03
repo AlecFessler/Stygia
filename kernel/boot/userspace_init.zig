@@ -558,6 +558,14 @@ fn resolveOrSpawnRootEc(
 }
 
 fn grantDevices(root_cd: *CapabilityDomain) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => grantCom1(root_cd),
+        .aarch64 => grantPl011(root_cd),
+        else => {},
+    }
+}
+
+fn grantCom1(root_cd: *CapabilityDomain) void {
     // Surface a port_io device_region for COM1 (0x3F8/8) so the runner's
     // serial sink can find it via slot scan + `caps.deviceRegionFields`.
     // Without this the runner's `[runner] *` print stream is silent —
@@ -598,5 +606,41 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
         0,
     ) catch {
         arch.boot.print("[boot] WARNING: COM1 device_region handle mint failed\n", .{});
+    };
+}
+
+fn grantPl011(root_cd: *CapabilityDomain) void {
+    // QEMU virt PL011 UART0 sits at 0x09000000/4 KiB. The aarch64
+    // root_service VMMs (linux_guest, suite runner) discover it by
+    // scanning their cap table for a device_region whose mmio fields
+    // match this base. Spec §[device_region] field0 layout (mmio):
+    //   bits  0-3   dev_type (0 = mmio)
+    //   bits  4-51  base_paddr >> 12
+    //   bits 52-63  size_pages
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_SIZE: u64 = 0x1000;
+    const dr = zag.devices.device_region.registerMmio(PAddr.fromInt(PL011_BASE), PL011_SIZE) catch {
+        arch.boot.print("[boot] WARNING: PL011 registerMmio failed; serial disabled\n", .{});
+        return;
+    };
+
+    const field0: u64 = 0 |
+        ((PL011_BASE >> 12) << 4) |
+        ((PL011_SIZE >> 12) << 52);
+    const dr_caps: u16 = 0;
+
+    const erased: zag.caps.capability.ErasedSlabRef = .{
+        .ptr = @ptrCast(dr),
+        .gen = @intCast(dr._gen_lock.currentGen()),
+    };
+    _ = capdom.mintHandle(
+        root_cd,
+        erased,
+        zag.caps.capability.CapabilityType.device_region,
+        dr_caps,
+        field0,
+        0,
+    ) catch {
+        arch.boot.print("[boot] WARNING: PL011 device_region handle mint failed\n", .{});
     };
 }

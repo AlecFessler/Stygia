@@ -172,7 +172,7 @@ pub fn main(cap_table_base: u64) void {
     // With `write` absent, the kernel must discard all sentinels and
     // leave W's state untouched.
     const SENTINEL_BASE: u64 = 0xA1B2C3D4E5F60000;
-    const reply_extra: u64 = (@as(u64, rid1) & 0xFFF) << 12;
+    const reply_extra: u64 = (@as(u64, rid1) & 0xFFF) << 20;
     const reply_result = syscall.issueReg(.reply, reply_extra, .{
         .v1 = SENTINEL_BASE | 0x01,
         .v2 = SENTINEL_BASE | 0x02,

@@ -90,10 +90,10 @@ fn localDummyEntry() noreturn {
     }
 }
 
-// Issue reply_transfer with N=1 and one pair entry at vreg 127.
+// Issue unified reply with pair_count=1 and one pair entry at vreg 127.
 // On x86 vreg 127 = [rsp + 912]; on aarch64 vreg 127 = [sp + 768].
 fn replyTransferOnePair(reply_handle_id: u12, pair_entry: u64) u64 {
-    const word: u64 = 53 |
+    const word: u64 = @as(u64, @intFromEnum(syscall.SyscallNum.reply)) |
         (@as(u64, 1) << 12) |
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
     switch (builtin.cpu.arch) {
