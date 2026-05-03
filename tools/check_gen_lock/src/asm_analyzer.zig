@@ -1037,6 +1037,66 @@ fn classifyLine(line: AsmLine, slab_types: *const StringHashMap(void)) LineClass
     return .other;
 }
 
+/// Find the destination register (AT&T: rightmost operand) for a write
+/// instruction. Returns null when the destination isn't a single register
+/// (memory, no operands, control flow, etc.). Used to invalidate
+/// register-to-slab-type bindings after a register gets overwritten.
+fn instructionDestReg(text: []const u8) ?[]const u8 {
+    // Find first whitespace to separate mnemonic from operands.
+    var i: usize = 0;
+    while (i < text.len and !ascii.isWhitespace(text[i])) i += 1;
+    if (i == text.len) return null; // no operands
+    const mnem = text[0..i];
+
+    // Skip control-flow / no-write mnemonics.
+    if (mem.eql(u8, mnem, "jmp")) return null;
+    if (mem.startsWith(u8, mnem, "j") and mnem.len <= 4) return null; // jcc
+    if (mem.eql(u8, mnem, "ret") or mem.eql(u8, mnem, "iretq")) return null;
+    if (mem.eql(u8, mnem, "call")) return null;
+    if (mem.eql(u8, mnem, "push") or mem.eql(u8, mnem, "pushq")) return null;
+    if (mem.eql(u8, mnem, "test") or mem.eql(u8, mnem, "testq") or
+        mem.eql(u8, mnem, "testl") or mem.eql(u8, mnem, "testb"))
+        return null;
+    if (mem.eql(u8, mnem, "cmp") or mem.eql(u8, mnem, "cmpq") or
+        mem.eql(u8, mnem, "cmpl") or mem.eql(u8, mnem, "cmpb"))
+        return null;
+    if (mem.eql(u8, mnem, "swapgs") or mem.eql(u8, mnem, "stac") or
+        mem.eql(u8, mnem, "clac") or mem.eql(u8, mnem, "pause") or
+        mem.eql(u8, mnem, "ud2") or mem.eql(u8, mnem, "lfence") or
+        mem.eql(u8, mnem, "mfence") or mem.eql(u8, mnem, "sfence"))
+        return null;
+    // `lock` prefix instructions: the destination is memory (the
+    // cmpxchg's second operand). We classify those separately, and
+    // those don't overwrite the base reg.
+    if (mem.eql(u8, mnem, "lock")) return null;
+
+    // Find the rightmost operand. Strip trailing whitespace, then walk
+    // back to a top-level comma (depth 0).
+    var end = text.len;
+    while (end > 0 and ascii.isWhitespace(text[end - 1])) end -= 1;
+    if (end <= i) return null;
+    var p = end;
+    var depth: i32 = 0;
+    while (p > i) {
+        p -= 1;
+        const c = text[p];
+        if (c == ')' or c == ']') depth += 1;
+        if (c == '(' or c == '[') depth -= 1;
+        if (c == ',' and depth == 0) {
+            const rhs_start = p + 1;
+            const rhs = trimAscii(text[rhs_start..end]);
+            // If RHS is `%<reg>`, return the reg name.
+            if (rhs.len < 2 or rhs[0] != '%') return null;
+            var s = rhs[1..];
+            if (s.len > 0 and s[0] == '%') s = s[1..]; // double-`%` from Zig asm
+            // Reject memory operand `(%base)` etc.
+            for (s) |ch| if (!ascii.isAlphanumeric(ch) and ch != '_') return null;
+            return s;
+        }
+    }
+    return null;
+}
+
 fn skipWsAsm(s: []const u8, start: usize) usize {
     var i = start;
     while (i < s.len and ascii.isWhitespace(s[i])) i += 1;
@@ -1246,6 +1306,17 @@ fn analyzeLines(
     while (i < lines.len) : (i += 1) {
         const ln = lines[i];
         const class = classifyLine(ln, slab_types);
+        // Type-tracking invalidation: when a tracked register becomes
+        // the destination of a write, it no longer points to the same
+        // slab. Subsequent symbolic accesses re-type it. We do this
+        // BEFORE classifying acquire/release/etc. — those operate on
+        // memory operands, not register destinations, so they don't
+        // overwrite the base reg.
+        if (class == .other or class == .field_access or class == .raw_access) {
+            if (instructionDestReg(ln.text)) |dest| {
+                _ = state.typed_regs.remove(dest);
+            }
+        }
         switch (class) {
             .label => |name| {
                 if (snaps.get(name)) |snap_ptr| {
