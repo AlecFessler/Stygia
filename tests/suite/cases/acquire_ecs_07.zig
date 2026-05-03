@@ -30,10 +30,10 @@
 //   Setup chain (each step must succeed before the assertion is
 //   meaningful — failures get distinct assertion ids):
 //     1. create_page_frame(1 page) for the VmPolicy buffer.
-//     2. create_var + map_pf to install the page frame at a known
+//     2. create_vmar + map_pf to install the page frame at a known
 //        vaddr so we can zero the policy struct (zero counts ⇒ kernel
 //        reads no entries; spec §[vm_policy] allows num_*=0).
-//     3. zero the VmPolicy bytes through the mapped VAR.
+//     3. zero the VmPolicy bytes through the mapped VMAR.
 //     4. create_virtual_machine(caps=0, policy_pf) — caps=0 keeps the
 //        VM handle's caps within `vm_ceiling` regardless of the
 //        domain's vm_ceiling field.
@@ -57,7 +57,7 @@
 //
 // Assertions
 //   1: setup — create_page_frame returned an error word
-//   2: setup — create_var returned an error word
+//   2: setup — create_vmar returned an error word
 //   3: setup — map_pf returned non-success in vreg 1
 //   4: setup — create_virtual_machine returned an error word
 //   5: setup — create_port returned an error word
@@ -103,9 +103,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

@@ -39,7 +39,7 @@
 //   `move = 1` is required on the source for a `move = 1` pair entry
 //   per §[handle_attachments] [test 07] (E_PERM otherwise). With the
 //   handles being page_frames (not the source EC, the VM, the port,
-//   the vCPU EC, or the policy VAR), the kernel installs them in the
+//   the vCPU EC, or the policy VMAR), the kernel installs them in the
 //   vCPU's domain (= the test's domain) at some [tstart, tstart+2)
 //   slots without coalescing against any pre-existing handle.
 //
@@ -49,7 +49,7 @@
 //
 // Action
 //   1. Standard create_vcpu_09 prelude — page_frame for the policy,
-//      VAR + map_pf, zero the policy bytes, create_virtual_machine
+//      VMAR + map_pf, zero the policy bytes, create_virtual_machine
 //      (E_NODEV → degraded smoke pass), create_port({bind, recv,
 //      xfer}), create_vcpu(caps={susp,read,write}, exit_port).
 //   2. createPageFrame(caps={move,r,w}, sz=0, pages=1) — first
@@ -76,7 +76,7 @@
 //
 // Assertions
 //   1: setup — any syscall in the create_vcpu_09 prelude returned an
-//      error word (createPageFrame / createVar / mapPf / createPort /
+//      error word (createPageFrame / createVmar / mapPf / createPort /
 //      createVcpu).
 //   2: setup — minting the first attachment page_frame failed.
 //   3: setup — minting the second attachment page_frame failed.
@@ -128,9 +128,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 1b. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 1b. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

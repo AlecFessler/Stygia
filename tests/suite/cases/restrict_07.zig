@@ -4,7 +4,7 @@
 //  return E_PERM when invoked via this handle."
 //
 // Strategy
-//   Pick a non-EC, non-VAR handle so the cap-update path is the plain
+//   Pick a non-EC, non-VMAR handle so the cap-update path is the plain
 //   bitwise subset rule and the gated syscall is side-effect free.
 //   Port handles fit: §[port] caps include `recv` (bit 3) which gates
 //   the `recv` syscall (§[recv] test 02 is the matching E_PERM

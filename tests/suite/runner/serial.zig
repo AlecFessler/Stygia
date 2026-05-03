@@ -1,7 +1,7 @@
 // COM1 serial-output glue for the v3 test runner. Discovers the
-// boot-issued port_io device_region for 0x3F8/8, stages an MMIO VAR
+// boot-issued port_io device_region for 0x3F8/8, stages an MMIO VMAR
 // over it via map_mmio, then performs 1-byte MOV stores against the
-// VAR base — each store traps and the kernel issues the equivalent
+// VMAR base — each store traps and the kernel issues the equivalent
 // `out (base_port + offset), al`. Per §[port_io_virtualization], MOV
 // width 1 with `cur_rwx.w = 1` is the simplest form supported.
 
@@ -58,13 +58,13 @@ pub const DISABLED: Serial = .{ .base = null };
 pub fn init(cap_table_base: u64) Serial {
     const dev = findCom1(cap_table_base) orelse return DISABLED;
 
-    // SPEC AMBIGUITY: §[map_mmio] test 05 requires VAR.size ==
+    // SPEC AMBIGUITY: §[map_mmio] test 05 requires VMAR.size ==
     // device_region.size, but §[device_region] does not define a size
     // field for port_io regions (only base_port and port_count). The
     // kernel must reconcile: assume one 4 KiB page covers any port_io
     // range whose port_count fits in 4096 bytes. COM1 has 8 ports so
     // this trivially holds.
-    const var_caps_word = caps.VarCap{
+    const var_caps_word = caps.VmarCap{
         .r = true,
         .w = true,
         .mmio = true,
@@ -72,7 +72,7 @@ pub fn init(cap_table_base: u64) Serial {
     const props: u64 = (1 << 5) | // cch = 1 (uc)
         (0 << 3) | // sz = 0 (4 KiB)
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         props,
         1,
@@ -80,10 +80,10 @@ pub fn init(cap_table_base: u64) Serial {
         0,
     );
     if (cvar.v1 == 0) return DISABLED; // E_* in vreg 1 on failure
-    const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const mm = syscall.mapMmio(var_handle, dev);
+    const mm = syscall.mapMmio(vmar_handle, dev);
     if (mm.v1 != 0) return DISABLED;
 
     return .{ .base = @ptrFromInt(var_base) };

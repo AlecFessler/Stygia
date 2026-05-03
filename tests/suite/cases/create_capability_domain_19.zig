@@ -55,9 +55,9 @@
 // Action
 //   1. readCap(slot 0) — extract caller's cridc_ceiling
 //   2. create_page_frame(1 page, r|w|x) — staging area for the ELF
-//   3. create_var(r|w, 1 page) and map_pf — get a writable mapping
+//   3. create_vmar(r|w, 1 page) and map_pf — get a writable mapping
 //   4. write minimal ELF64 header into the page
-//   5. delete the staging VAR (mirrors primary.zig — kernel re-reads
+//   5. delete the staging VMAR (mirrors primary.zig — kernel re-reads
 //      the page frame independently)
 //   6. create_capability_domain(...) with strict-subset ceilings
 //   7. readCap(returned slot) — verify caps == cridc_ceiling
@@ -65,7 +65,7 @@
 // Assertions
 //   1: readCap of slot 0 produced a non-self-handle type (sanity)
 //   2: create_page_frame returned an error word
-//   3: create_var returned an error word
+//   3: create_vmar returned an error word
 //   4: map_pf returned non-OK
 //   5: create_capability_domain returned an error word in vreg 1
 //   6: returned IDC handle's type tag is not `capability_domain`
@@ -85,7 +85,7 @@ const IdcCap = caps.IdcCap;
 const PassedHandle = caps.PassedHandle;
 const PfCap = caps.PfCap;
 const SelfCap = caps.SelfCap;
-const VarCap = caps.VarCap;
+const VmarCap = caps.VmarCap;
 
 // Minimal ELF64 header constants. Spec source: System V ABI / ELF-64
 // Object File Format. Field offsets / sizes from elf.h equivalents.
@@ -118,7 +118,7 @@ const PAGE_SIZE: usize = 4096;
 // successfully launches will halt rather than fault on undefined ops.
 //
 // `dst` is `volatile` because the kernel re-reads the page frame
-// through a different VA (physmap) after the staging VAR is dropped;
+// through a different VA (physmap) after the staging VMAR is dropped;
 // without volatile, ReleaseSmall optimizes away the stores (see
 // project memory `project_zig_shm_readtable_bug.md` — same class of
 // bug as the runner's stageElfIntoPageFrame which also uses volatile).
@@ -222,10 +222,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 3. Create a writable VAR and install the page frame at offset 0.
-    const var_caps = VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    // 3. Create a writable VMAR and install the page frame at offset 0.
+    const vmar_caps = VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         0b011, // cur_rwx = r|w
         1, // pages
         0, // preferred_base = kernel chooses
@@ -235,10 +235,10 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(3);
         return;
     }
-    const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const map = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const map = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;
@@ -248,9 +248,9 @@ pub fn main(cap_table_base: u64) void {
     const dst: [*]volatile u8 = @ptrFromInt(var_base);
     _ = writeMinimalElf(dst);
 
-    // 5. Drop the staging VAR. The kernel re-reads the page frame
+    // 5. Drop the staging VMAR. The kernel re-reads the page frame
     //    independently of any caller-held mapping.
-    _ = syscall.delete(var_handle);
+    _ = syscall.delete(vmar_handle);
 
     // 6. Build ceilings as strict subsets of the caller's. Mirror of
     //    `runner/primary.zig` spawnOne — every reserved bit zeroed,

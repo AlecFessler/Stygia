@@ -11,5 +11,5 @@ pub const port = @import("port.zig");
 pub const reply = @import("reply.zig");
 pub const system = @import("system.zig");
 pub const timer = @import("timer.zig");
-pub const var_ = @import("var.zig");
+pub const vmar = @import("vmar.zig");
 pub const virtual_machine = @import("virtual_machine.zig");

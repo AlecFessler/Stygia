@@ -5,15 +5,15 @@
 //
 // DEGRADED SMOKE VARIANT
 //   The faithful shape of test 11 requires observing kernel behavior at
-//   the domain-restart boundary when the source VAR violates the
+//   the domain-restart boundary when the source VMAR violates the
 //   demand-paged stability constraint:
 //
 //     pre-restart (live domain N):
-//       1. mint source VAR S with restart_policy = 2 (preserve), `map = 3`
+//       1. mint source VMAR S with restart_policy = 2 (preserve), `map = 3`
 //          (demand-paged), and `cur_rwx.w = 1` so the demand-paging
 //          stability constraint (per spec line 1117) is intentionally
 //          violated.
-//       2. mint target VAR T with restart_policy = 3 (snapshot), same
+//       2. mint target VMAR T with restart_policy = 3 (snapshot), same
 //          size as S so spec test 05 (size match) does not trip.
 //       3. snapshot(T, S) — bind S as T's restart-time source; this call
 //          itself is expected to succeed, the violation is only checked
@@ -41,15 +41,15 @@
 //       a parent-side "wait for restart, observe termination" hook the
 //       runner does not expose.
 //
-//   (b) Achieving `map = 3` (demand-paged) on the source VAR requires
+//   (b) Achieving `map = 3` (demand-paged) on the source VMAR requires
 //       the source to have entered the demand-paged map state, which
 //       happens via page-fault on access (per spec §[remap] line 1092
 //       and the map state transitions). The v0 test child has no path
-//       to take a page fault on the source VAR and validate it landed
+//       to take a page fault on the source VMAR and validate it landed
 //       in map=3 — there is no userspace `mmap`-style operation that
-//       directly forces a VAR into the demand-paged state without a
+//       directly forces a VMAR into the demand-paged state without a
 //       fault, and the test runner does not exercise the fault path
-//       for VAR memory.
+//       for VMAR memory.
 //
 //   Reaching the faithful path needs both:
 //     - a runner-side restart harness (same prerequisite as snapshot_09,
@@ -58,7 +58,7 @@
 //       child and observes termination via absence-of-resume on the
 //       result port;
 //     - a way to either (i) demand-page the source by faulting on it
-//       from the child before restart, or (ii) mint a VAR directly in
+//       from the child before restart, or (ii) mint a VMAR directly in
 //       map=3 from the parent harness.
 //   Neither hook exists; the snapshot suite currently has no test that
 //   crosses the restart boundary observably, and no test that exercises
@@ -66,8 +66,8 @@
 //
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in a
-//   single test EC: mint S as a preserve-policy VAR with `cur_rwx.w = 1`,
-//   mint T as a snapshot-policy VAR, call `snapshot(T, S)`. The actual
+//   single test EC: mint S as a preserve-policy VMAR with `cur_rwx.w = 1`,
+//   mint T as a snapshot-policy VMAR, call `snapshot(T, S)`. The actual
 //   stability check (line 1117) and the resulting domain termination are
 //   not observable here because we cannot cross the restart boundary
 //   from inside the child, and we additionally cannot drive S into
@@ -80,14 +80,14 @@
 //   inside the child domain.
 //
 // Action
-//   1. createVar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives source VAR S. cur_rwx.w
+//   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives source VMAR S. cur_rwx.w
 //      = 1 satisfies the violation precondition for the faithful test;
 //      `map` lands in 0 (no mapping installed yet) rather than 3
 //      because we cannot drive the demand-paged transition from this
 //      surface.
-//   2. createVar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives target VAR T. Size
+//   2. createVmar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives target VMAR T. Size
 //      matches S so test 05 doesn't pre-empt.
 //   3. snapshot(T, S) — *expected* success: the binding-establishment
 //      path doesn't evaluate the restart-time stability constraint
@@ -111,7 +111,7 @@
 //       result port;
 //     - a way for either the parent or the child to drive S into
 //       `map = 3` (demand-paged) before restart — either a syscall
-//       that materializes a VAR directly in map=3, or a faulting
+//       that materializes a VMAR directly in map=3, or a faulting
 //       access path the test child can use that the runner is willing
 //       to allow.
 //   Once both exist, the action becomes:
@@ -134,14 +134,14 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Source VAR S: restart_policy = 2 (preserve), per spec line 1110.
+    // Source VMAR S: restart_policy = 2 (preserve), per spec line 1110.
     // cur_rwx.w = 1 satisfies the violation precondition that the
     // faithful test would check at restart time on the demand-paged
     // path. The source's map state remains 0 here (no mapping installed
     // yet); the faithful test would additionally need map = 3.
-    const src_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 2 };
+    const src_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 2 };
     const src_props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const src = syscall.createVar(
+    const src = syscall.createVmar(
         @as(u64, src_caps.toU16()),
         src_props,
         1, // pages = 1
@@ -156,11 +156,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const src_handle: caps.HandleId = @truncate(src.v1 & 0xFFF);
 
-    // Target VAR T: restart_policy = 3 (snapshot), per spec line 1109.
+    // Target VMAR T: restart_policy = 3 (snapshot), per spec line 1109.
     // Same size as S so spec test 05 (size match) does not trip.
-    const dst_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 3 };
+    const dst_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 3 };
     const dst_props: u64 = 0b011; // cur_rwx = r|w; sz = 0; cch = 0
-    const dst = syscall.createVar(
+    const dst = syscall.createVmar(
         @as(u64, dst_caps.toU16()),
         dst_props,
         1, // pages = 1, matches S

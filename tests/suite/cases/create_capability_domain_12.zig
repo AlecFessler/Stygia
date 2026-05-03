@@ -90,7 +90,7 @@ pub fn main(cap_table_base: u64) void {
     // All other sub-fields of ceilings_inner echo the caller's
     // values to remain subsets:
     //   bits  0-7  ec_inner_ceiling   = 0xFF
-    //   bits  8-23 var_inner_ceiling  = 0x01FF
+    //   bits  8-23 vmar_inner_ceiling  = 0x01FF
     //   bits 24-31 cridc_ceiling      = 0x3F
     //   bits 32-39 pf_ceiling         = 0x1F
     //   bits 40-47 vm_ceiling         = 0x01

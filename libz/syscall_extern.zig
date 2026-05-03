@@ -11,7 +11,7 @@
 // Raw inline-asm primitives (issueRawNoStack / issueRegDiscard /
 // issueRawCaptureWord / replyTransferAsm) are still statically compiled
 // into every test ELF so that start.zig's libz bootstrap can issue
-// `create_var` + `map_pf` BEFORE the relocateSelf pass runs (i.e.
+// `create_vmar` + `map_pf` BEFORE the relocateSelf pass runs (i.e.
 // before any extern call would be safe to make).
 //
 // The companion top-level `libz/syscall.zig` is the source-of-truth
@@ -62,7 +62,7 @@ pub const SyscallNum = enum(u12) {
     sync = 18,
     create_capability_domain = 19,
     acquire_ecs = 20,
-    acquire_vars = 21,
+    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -73,7 +73,7 @@ pub const SyscallNum = enum(u12) {
     perfmon_start = 29,
     perfmon_read = 30,
     perfmon_stop = 31,
-    create_var = 32,
+    create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
     unmap = 35,
@@ -154,7 +154,7 @@ pub fn extraReplyRecvPort(port: u12) u64 {
 //
 // Bootstrap code in start.zig calls into these BEFORE relocateSelf has
 // patched the JUMP_SLOT entries. Keeping them static means the early
-// `create_var` + `map_pf` that establishes the LIBZ_SLIDE mapping is
+// `create_vmar` + `map_pf` that establishes the LIBZ_SLIDE mapping is
 // always callable.
 
 pub fn issueRawNoStack(word: u64, in: Regs) Regs {
@@ -267,7 +267,7 @@ const ext = struct {
         passed_handles_len: usize,
     ) callconv(.c) c.Regs;
     extern fn acquireEcs(target: u16) callconv(.c) c.RecvReturn;
-    extern fn acquireVars(target: u16) callconv(.c) c.RecvReturn;
+    extern fn acquireVmars(target: u16) callconv(.c) c.RecvReturn;
     extern fn createExecutionContext(
         caps: u64,
         entry: u64,
@@ -289,7 +289,7 @@ const ext = struct {
     ) callconv(.c) c.Regs;
     extern fn perfmonRead(target: u16) callconv(.c) c.Regs;
     extern fn perfmonStop(target: u16) callconv(.c) c.Regs;
-    extern fn createVar(
+    extern fn createVmar(
         caps: u64,
         props: u64,
         pages: u64,
@@ -297,21 +297,21 @@ const ext = struct {
         device_region: u64,
     ) callconv(.c) c.Regs;
     extern fn mapPf(
-        var_handle: u16,
+        vmar_handle: u16,
         pairs_ptr: [*]const u64,
         pairs_len: usize,
     ) callconv(.c) c.Regs;
-    extern fn mapMmio(var_handle: u16, device_region: u16) callconv(.c) c.Regs;
+    extern fn mapMmio(vmar_handle: u16, device_region: u16) callconv(.c) c.Regs;
     extern fn unmap(
-        var_handle: u16,
+        vmar_handle: u16,
         selectors_ptr: [*]const u64,
         selectors_len: usize,
     ) callconv(.c) c.Regs;
-    extern fn remap(var_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs;
-    extern fn snapshot(target_var: u16, source_var: u16) callconv(.c) c.Regs;
-    extern fn idcRead(var_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs;
+    extern fn remap(vmar_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs;
+    extern fn snapshot(target_vmar: u16, source_vmar: u16) callconv(.c) c.Regs;
+    extern fn idcRead(vmar_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs;
     extern fn idcWrite(
-        var_handle: u16,
+        vmar_handle: u16,
         offset: u64,
         qwords_ptr: [*]const u64,
         qwords_len: usize,
@@ -444,8 +444,8 @@ pub fn acquireEcs(target: u12) RecvReturn {
     return fromCRecvReturn(ext.acquireEcs(@as(u16, target)));
 }
 
-pub fn acquireVars(target: u12) RecvReturn {
-    return fromCRecvReturn(ext.acquireVars(@as(u16, target)));
+pub fn acquireVmars(target: u12) RecvReturn {
+    return fromCRecvReturn(ext.acquireVmars(@as(u16, target)));
 }
 
 // 7..16: execution-context ops
@@ -496,44 +496,44 @@ pub fn perfmonStop(target: u12) Regs {
     return fromCRegs(ext.perfmonStop(@as(u16, target)));
 }
 
-// 17..24: VAR ops
+// 17..24: VMAR ops
 
-pub fn createVar(
+pub fn createVmar(
     caps: u64,
     props: u64,
     pages: u64,
     preferred_base: u64,
     device_region: u64,
 ) Regs {
-    return fromCRegs(ext.createVar(caps, props, pages, preferred_base, device_region));
+    return fromCRegs(ext.createVmar(caps, props, pages, preferred_base, device_region));
 }
 
-pub fn mapPf(var_handle: u12, pairs: []const u64) Regs {
-    return fromCRegs(ext.mapPf(@as(u16, var_handle), pairs.ptr, pairs.len));
+pub fn mapPf(vmar_handle: u12, pairs: []const u64) Regs {
+    return fromCRegs(ext.mapPf(@as(u16, vmar_handle), pairs.ptr, pairs.len));
 }
 
-pub fn mapMmio(var_handle: u12, device_region: u12) Regs {
-    return fromCRegs(ext.mapMmio(@as(u16, var_handle), @as(u16, device_region)));
+pub fn mapMmio(vmar_handle: u12, device_region: u12) Regs {
+    return fromCRegs(ext.mapMmio(@as(u16, vmar_handle), @as(u16, device_region)));
 }
 
-pub fn unmap(var_handle: u12, selectors: []const u64) Regs {
-    return fromCRegs(ext.unmap(@as(u16, var_handle), selectors.ptr, selectors.len));
+pub fn unmap(vmar_handle: u12, selectors: []const u64) Regs {
+    return fromCRegs(ext.unmap(@as(u16, vmar_handle), selectors.ptr, selectors.len));
 }
 
-pub fn remap(var_handle: u12, new_cur_rwx: u64) Regs {
-    return fromCRegs(ext.remap(@as(u16, var_handle), new_cur_rwx));
+pub fn remap(vmar_handle: u12, new_cur_rwx: u64) Regs {
+    return fromCRegs(ext.remap(@as(u16, vmar_handle), new_cur_rwx));
 }
 
-pub fn snapshot(target_var: u12, source_var: u12) Regs {
-    return fromCRegs(ext.snapshot(@as(u16, target_var), @as(u16, source_var)));
+pub fn snapshot(target_vmar: u12, source_vmar: u12) Regs {
+    return fromCRegs(ext.snapshot(@as(u16, target_vmar), @as(u16, source_vmar)));
 }
 
-pub fn idcRead(var_handle: u12, offset: u64, count: u8) Regs {
-    return fromCRegs(ext.idcRead(@as(u16, var_handle), offset, count));
+pub fn idcRead(vmar_handle: u12, offset: u64, count: u8) Regs {
+    return fromCRegs(ext.idcRead(@as(u16, vmar_handle), offset, count));
 }
 
-pub fn idcWrite(var_handle: u12, offset: u64, qwords: []const u64) Regs {
-    return fromCRegs(ext.idcWrite(@as(u16, var_handle), offset, qwords.ptr, qwords.len));
+pub fn idcWrite(vmar_handle: u12, offset: u64, qwords: []const u64) Regs {
+    return fromCRegs(ext.idcWrite(@as(u16, vmar_handle), offset, qwords.ptr, qwords.len));
 }
 
 // 25: page frame

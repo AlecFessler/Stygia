@@ -1,6 +1,6 @@
 // Spec §[port_io_virtualization] — test 04.
 //
-// "[test 04] a 1-, 2-, or 4-byte MOV load from `VAR.base + offset`
+// "[test 04] a 1-, 2-, or 4-byte MOV load from `VMAR.base + offset`
 //  (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR
 //  holding the value an x86-64 `in` of the matching operand width at
 //  port `base_port + offset` would produce, and execution resumes at
@@ -8,8 +8,8 @@
 //
 // DEGRADED SMOKE VARIANT
 //   This is the first half of the port_io fault-handler contract:
-//   §[port_io_virtualization] requires that an MMIO VAR backed by a
-//   port_io device_region trap each MOV load against `VAR.base +
+//   §[port_io_virtualization] requires that an MMIO VMAR backed by a
+//   port_io device_region trap each MOV load against `VMAR.base +
 //   offset`, decode the operand width, execute an `in` at
 //   `base_port + offset`, deposit the result into the destination
 //   GPR, and advance RIP past the MOV. runner/serial.zig already
@@ -26,41 +26,41 @@
 //
 //   Without a forwarded port_io device_region, `map_mmio` cannot
 //   succeed against any [2] the test child can name, and the MMIO
-//   VAR's pages are therefore never installed-as-trap-only. The
+//   VMAR's pages are therefore never installed-as-trap-only. The
 //   load-decode/`in`/RIP-advance path the spec assertion describes
 //   is unreachable from a test child today.
 //
 // Strategy (smoke prelude)
 //   Mirror the prelude shape a faithful test 04 would use:
-//     - caps = {r, w, mmio} so the VAR is mmio-flagged with read
+//     - caps = {r, w, mmio} so the VMAR is mmio-flagged with read
 //       permission (the spec assertion's `cur_rwx.r = 1`
 //       precondition).
 //     - props = {sz = 0 (4 KiB), cch = 1 (uc), cur_rwx = 0b011}
-//       — sz = 0 is required when caps.mmio = 1 (§[create_var]
-//       test 08); cch = 1 (uc) is required for an MMIO VAR per
+//       — sz = 0 is required when caps.mmio = 1 (§[create_vmar]
+//       test 08); cch = 1 (uc) is required for an MMIO VMAR per
 //       §[var]; cur_rwx.r = 1 is the precondition this assertion
 //       turns on.
-//     - pages = 1 — minimum-size MMIO VAR; once a port_io
+//     - pages = 1 — minimum-size MMIO VMAR; once a port_io
 //       device_region is forwarded, the faithful test would size
-//       the VAR to match that region's port_count (rounded up to a
+//       the VMAR to match that region's port_count (rounded up to a
 //       page).
 //   Pass slot 4095 for [2]: per the create_capability_domain table
 //   layout that slot is guaranteed empty, so the kernel rejects
 //   with E_BADCAP via §[map_mmio] test 02 instead of installing
-//   the VAR for trap-on-access. The MOV-load against VAR.base the
-//   faithful test would issue is therefore not attempted — the VAR
+//   the VMAR for trap-on-access. The MOV-load against VMAR.base the
+//   faithful test would issue is therefore not attempted — the VMAR
 //   is still in `map = 0` and the load would fault as an unmapped
 //   user vaddr, not as a port_io trap.
 //
 // Action
-//   1. createVar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
+//   1. createVmar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
 //                cur_rwx = 0b011}, pages = 1, preferred_base = 0,
 //                device_region = 0) — must succeed; gives a valid
-//      mmio-flagged VAR with cch = 1 and cur_rwx.r = 1 sitting in
+//      mmio-flagged VMAR with cch = 1 and cur_rwx.r = 1 sitting in
 //      `map = 0`.
 //   2. mapMmio(mmio_var, 4095) — observed result is E_BADCAP
 //      (§[map_mmio] test 02). The smoke does not attempt the MOV
-//      load: without map_mmio installing the VAR over a port_io
+//      load: without map_mmio installing the VMAR over a port_io
 //      device_region, the load would observe an unmapped vaddr
 //      rather than the port_io trap path the spec assertion
 //      targets.
@@ -86,12 +86,12 @@
 //   `base_port + offset` and assert the read-back. The action then
 //   becomes, for each width w in {1, 2, 4}:
 //     pio = forwarded port_io device_region (port_count >= w)
-//     create_var(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
+//     create_vmar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
 //                cur_rwx = 0b011}, pages = ceil(pio.port_count /
 //                0x1000), preferred_base = 0, device_region = 0)
 //                -> mmio_var
 //     map_mmio(mmio_var, pio) -> success
-//     // Issue an inline-asm MOV of width w from VAR.base into a
+//     // Issue an inline-asm MOV of width w from VMAR.base into a
 //     // chosen GPR. The kernel must decode the MOV, execute
 //     // `in` at base_port, deposit the result into that GPR,
 //     // and resume at the byte after the MOV. The next
@@ -117,15 +117,15 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build a valid MMIO VAR with caps.mmio = 1, cch = 1 (uc),
+    // Build a valid MMIO VMAR with caps.mmio = 1, cch = 1 (uc),
     // sz = 0 (4 KiB), cur_rwx.r = 1 — the construction §[var]
-    // requires for an MMIO VAR carrying the read precondition this
-    // test turns on. On creation the VAR sits in `map = 0`.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    // requires for an MMIO VMAR carrying the read precondition this
+    // test turns on. On creation the VMAR sits in `map = 0`.
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w — `r` is the precondition for test 04
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1
@@ -154,8 +154,8 @@ pub fn main(cap_table_base: u64) void {
     // The MOV-load decode / `in` / RIP-advance path the spec
     // assertion describes is unreachable from a test child without
     // a forwarded port_io device_region. We deliberately do not
-    // attempt a load against `cvar.v2` (the VAR base): with
-    // map_mmio not having installed the VAR over a port_io region,
+    // attempt a load against `cvar.v2` (the VMAR base): with
+    // map_mmio not having installed the VMAR over a port_io region,
     // the load would observe an unmapped vaddr rather than the
     // port_io trap path. Pass with assertion id 0 to mark this
     // slot as smoke-only in coverage.

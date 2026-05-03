@@ -1,13 +1,13 @@
 // Spec §[create_capability_domain] create_capability_domain — test 26.
 //
 // "[test 26] on success, the new domain's `ec_inner_ceiling`,
-//  `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`,
+//  `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`,
 //  `vm_ceiling`, and `port_ceiling` in field0 are set to the values
 //  supplied in [2] and [1]."
 //
 // Spec §[capability_domain] Self handle field0 layout:
 //   bits  0-7   ec_inner_ceiling   <- from [2] ceilings_inner
-//   bits  8-23  var_inner_ceiling  <- from [2] ceilings_inner
+//   bits  8-23  vmar_inner_ceiling  <- from [2] ceilings_inner
 //   bits 24-31  cridc_ceiling      <- from [2] ceilings_inner
 //   bits 32-39  idc_rx             <- from [1] caps  (bits 16-23)
 //   bits 40-47  pf_ceiling         <- from [2] ceilings_inner
@@ -58,14 +58,14 @@
 //
 // Action
 //   1. create_page_frame                                — must succeed
-//   2. create_var (r|w) sized to one page               — must succeed
+//   2. create_vmar (r|w) sized to one page               — must succeed
 //   3. map_pf the page frame into the var               — must succeed
 //   4. write a minimal valid x86-64 ELF64 header at offset 0
 //   5. create_capability_domain(caps, in, out, pf, [])  — must succeed
 //
 // Assertions
 //   1: create_page_frame setup returned an error word
-//   2: create_var setup returned an error word
+//   2: create_vmar setup returned an error word
 //   3: map_pf setup returned a non-OK word
 //   4: create_capability_domain returned an error code in vreg 1
 
@@ -170,9 +170,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
-    const var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         0b011, // cur_rwx = r|w
         1, // 1 page
         0, // preferred_base = kernel chooses
@@ -182,17 +182,17 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const map = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const map = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
 
     // volatile so ReleaseSmall doesn't optimize away the writes (the
-    // kernel reads through a different VA after we delete the staging VAR).
+    // kernel reads through a different VA after we delete the staging VMAR).
     const dst: [*]volatile u8 = @ptrFromInt(var_base);
     writeElfHeader(dst);
 
@@ -228,7 +228,7 @@ pub fn main(cap_table_base: u64) void {
     // Pack all-valid-bit values with reserved ranges zeroed.
     //
     //   ec_inner_ceiling   bits  0-7   = 0xFF
-    //   var_inner_ceiling  bits  8-23  = 0x01FF (bits 0-8 valid)
+    //   vmar_inner_ceiling  bits  8-23  = 0x01FF (bits 0-8 valid)
     //   cridc_ceiling      bits 24-31  = 0x3F   (IDC bits 0-5)
     //   pf_ceiling         bits 32-39  = 0x1F   (rwx + max_sz)
     //   vm_ceiling         bits 40-47  = 0x01   (policy)
@@ -241,7 +241,7 @@ pub fn main(cap_table_base: u64) void {
     // ceiling-subset checks at call time.
     //
     //   ec_outer_ceiling          bits  0-7   = 0xFF
-    //   var_outer_ceiling         bits  8-15  = 0xFF
+    //   vmar_outer_ceiling         bits  8-15  = 0xFF
     //   restart_policy_ceiling    bits 16-31  = 0x03FE
     //   fut_wait_max              bits 32-37  = 63
     //   bits 38-63 _reserved                  = 0

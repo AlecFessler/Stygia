@@ -6,7 +6,7 @@
 //!      createVirtualMachine consumes it.
 //!   2. Allocate a single contiguous page_frame covering all guest RAM.
 //!   3. map_guest the guest RAM page_frame into the VM at gpa 0.
-//!   4. createVar + map_pf locally so the VMM can read/write guest
+//!   4. createVmar + map_pf locally so the VMM can read/write guest
 //!      memory by host VA (used for bzImage / initramfs / boot_params).
 
 const lib = @import("lib");
@@ -18,7 +18,7 @@ const syscall = lib.syscall;
 
 const HandleId = caps.HandleId;
 const PfCap = caps.PfCap;
-const VarCap = caps.VarCap;
+const VmarCap = caps.VmarCap;
 
 const PAGE_SIZE: u64 = 4096;
 
@@ -62,25 +62,25 @@ pub fn allocPolicyPageFrame() ?HandleId {
     }
     const pf_handle: HandleId = @truncate(pf_r.v1 & 0xFFF);
 
-    // Map locally to zero the frame. The VAR is a regular (non-mmio,
+    // Map locally to zero the frame. The VMAR is a regular (non-mmio,
     // non-dma) range; we install one page_frame at offset 0.
-    const var_caps_word: u64 = @as(u64, (VarCap{
+    const var_caps_word: u64 = @as(u64, (VmarCap{
         .r = true,
         .w = true,
     }).toU16());
     const var_props: u64 = 0b011; // cur_rwx = r|w
-    const var_r = syscall.createVar(var_caps_word, var_props, 1, 0, 0);
+    const var_r = syscall.createVmar(var_caps_word, var_props, 1, 0, 0);
     if (var_r.v1 < 16) {
-        log.print("policy: createVar failed: ");
+        log.print("policy: createVmar failed: ");
         log.dec(var_r.v1);
         log.print("\n");
         return null;
     }
-    const var_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
     const var_base: u64 = var_r.v2;
 
     const map_pairs = [_]u64{ 0, @as(u64, pf_handle) };
-    const map_r = syscall.mapPf(var_handle, &map_pairs);
+    const map_r = syscall.mapPf(vmar_handle, &map_pairs);
     if (map_r.v1 != 0) {
         log.print("policy: mapPf failed: ");
         log.dec(map_r.v1);
@@ -98,7 +98,7 @@ pub fn allocPolicyPageFrame() ?HandleId {
 
 /// Allocate guest RAM as a sequence of buddy-sized page_frames (each
 /// up to MAX_ORDER pages = 64 MiB at 4 KiB), install them contiguously
-/// at gpa 0..size in the VM, and map a single local VAR over them so
+/// at gpa 0..size in the VM, and map a single local VMAR over them so
 /// VMM-side @memcpy etc. see one flat host VA range.
 pub fn setupGuestMemory(size: u64) bool {
     const num_pages = size / PAGE_SIZE;
@@ -162,18 +162,18 @@ pub fn setupGuestMemory(size: u64) bool {
         i += 1;
     }
 
-    // 3) Allocate a local VAR sized to all chunks_needed * CHUNK_PAGES,
+    // 3) Allocate a local VMAR sized to all chunks_needed * CHUNK_PAGES,
     //    then map_pf each chunk at the corresponding offset so VMM-side
     //    code sees one flat host VA range.
     const total_local_pages = chunks_needed * CHUNK_PAGES;
-    const var_caps_word: u64 = @as(u64, (VarCap{
+    const var_caps_word: u64 = @as(u64, (VmarCap{
         .r = true,
         .w = true,
     }).toU16());
     const var_props: u64 = 0b011; // cur_rwx = r|w
-    const var_r = syscall.createVar(var_caps_word, var_props, total_local_pages, 0, 0);
+    const var_r = syscall.createVmar(var_caps_word, var_props, total_local_pages, 0, 0);
     if (var_r.v1 < 16) {
-        log.print("guest_ram: createVar failed: ");
+        log.print("guest_ram: createVmar failed: ");
         log.dec(var_r.v1);
         log.print("\n");
         return false;
@@ -253,18 +253,18 @@ pub noinline fn mapDevicePage(guest_phys: u64) ?[*]volatile u8 {
     const mg_r = syscall.mapGuest(main_mod.vm_handle, &map_pairs);
     if (mg_r.v1 != 0) return null;
 
-    const var_caps_word: u64 = @as(u64, (VarCap{
+    const var_caps_word: u64 = @as(u64, (VmarCap{
         .r = true,
         .w = true,
     }).toU16());
     const var_props: u64 = 0b011;
-    const var_r = syscall.createVar(var_caps_word, var_props, 1, 0, 0);
+    const var_r = syscall.createVmar(var_caps_word, var_props, 1, 0, 0);
     if (var_r.v1 < 16) return null;
-    const var_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
     const var_base: u64 = var_r.v2;
 
     const local_pairs = [_]u64{ 0, @as(u64, pf_handle) };
-    const mp_r = syscall.mapPf(var_handle, &local_pairs);
+    const mp_r = syscall.mapPf(vmar_handle, &local_pairs);
     if (mp_r.v1 != 0) return null;
 
     const ptr: [*]u8 = @ptrFromInt(var_base);

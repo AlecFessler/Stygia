@@ -491,6 +491,8 @@ pub fn vmInit() void {
     // TODO(impl): init VMID allocator
 }
 
+pub fn vmPerCoreInit() void {}
+
 /// Per-core VM initialization. Called from `sched.perCoreInit()` on every
 /// CPU after global init. On ARM the per-core setup is small: ensure EL2
 /// vectors are installed and that per-core trap configuration (HCR_EL2

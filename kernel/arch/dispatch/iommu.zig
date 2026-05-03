@@ -7,7 +7,7 @@ const x64 = zag.arch.x64;
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).
@@ -15,7 +15,7 @@ pub fn iommuMapPage(
     device: *DeviceRegion,
     iova: u64,
     phys: PAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
     switch (builtin.cpu.arch) {
@@ -30,7 +30,7 @@ pub fn iommuMapPage(
 pub fn iommuUnmapPage(
     device: *DeviceRegion,
     iova: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
 ) ?PAddr {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.iommu.iommuUnmapPage(device, iova, sz),
@@ -46,7 +46,7 @@ pub fn iommuUnmapPage(
 pub fn invalidateIotlbRange(
     device: *DeviceRegion,
     iova: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     switch (builtin.cpu.arch) {

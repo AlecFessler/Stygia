@@ -11,7 +11,7 @@
 //   §[restrict] is the right primitive: it reduces caps in place on
 //   any handle and requires no self-handle cap of its own. Most
 //   SelfCap fields use plain bitwise subset semantics; the spec only
-//   pins numeric restart_policy ordering for EC and VAR handles
+//   pins numeric restart_policy ordering for EC and VMAR handles
 //   (§[capabilities] restrict tests 03/04). For the self-handle we
 //   read the current caps verbatim out of the read-only-mapped cap
 //   table, clear bit 6 (`pmu`), and write that reduced word back.

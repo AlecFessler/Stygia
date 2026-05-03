@@ -13,7 +13,7 @@ pub const HandleType = enum(u4) {
     capability_domain = 1,
     execution_context = 2,
     page_frame = 3,
-    virtual_address_range = 4,
+    virtual_memory_address_region = 4,
     device_region = 5,
     port = 6,
     reply = 7,
@@ -140,8 +140,8 @@ pub const EcCap = packed struct(u16) {
     }
 };
 
-// §[var] VAR handle cap bits.
-pub const VarCap = packed struct(u16) {
+// §[var] VMAR handle cap bits.
+pub const VmarCap = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     r: bool = false,
@@ -153,7 +153,7 @@ pub const VarCap = packed struct(u16) {
     restart_policy: u2 = 0,
     _reserved: u5 = 0,
 
-    pub fn toU16(self: VarCap) u16 {
+    pub fn toU16(self: VmarCap) u16 {
         return @bitCast(self);
     }
 };

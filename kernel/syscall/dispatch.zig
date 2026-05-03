@@ -23,7 +23,7 @@ const port = zag.syscall.port;
 const reply = zag.syscall.reply;
 const system = zag.syscall.system;
 const timer = zag.syscall.timer;
-const var_ = zag.syscall.var_;
+const vmar = zag.syscall.vmar;
 const virtual_machine = zag.syscall.virtual_machine;
 
 pub const SyscallNum = enum(u64) {
@@ -34,7 +34,7 @@ pub const SyscallNum = enum(u64) {
     sync = 18,
     create_capability_domain = 19,
     acquire_ecs = 20,
-    acquire_vars = 21,
+    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -45,7 +45,7 @@ pub const SyscallNum = enum(u64) {
     perfmon_start = 29,
     perfmon_read = 30,
     perfmon_stop = 31,
-    create_var = 32,
+    create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
     unmap = 35,
@@ -132,7 +132,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             if (args.len > 5) args[5..] else &.{},
         ),
         .acquire_ecs => capability_domain.acquireEcs(caller, arg(args, 0)),
-        .acquire_vars => capability_domain.acquireVars(caller, arg(args, 0)),
+        .acquire_vmars => capability_domain.acquireVmars(caller, arg(args, 0)),
 
         .create_execution_context => execution_context.createExecutionContext(
             caller,
@@ -157,7 +157,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .perfmon_read => execution_context.perfmonRead(caller, arg(args, 0)),
         .perfmon_stop => execution_context.perfmonStop(caller, arg(args, 0)),
 
-        .create_var => var_.createVar(
+        .create_vmar => vmar.createVmar(
             caller,
             arg(args, 0),
             arg(args, 1),
@@ -173,13 +173,13 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             const n: u64 = (syscall_word >> 12) & 0xFF;
             const pair_words: usize = @intCast(n * 2);
             const end_idx: usize = @min(1 + pair_words, args.len);
-            break :blk var_.mapPf(
+            break :blk vmar.mapPf(
                 caller,
                 arg(args, 0),
                 if (end_idx > 1) args[1..end_idx] else &.{},
             );
         },
-        .map_mmio => var_.mapMmio(caller, arg(args, 0), arg(args, 1)),
+        .map_mmio => vmar.mapMmio(caller, arg(args, 0), arg(args, 1)),
         .unmap => blk: {
             // Spec §[var].unmap: syscall word bits 12-19 carry N, the
             // number of selectors (0 = unmap everything). The selectors
@@ -190,14 +190,14 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // garbage values, breaking the N=0 "unmap everything" path).
             const n: u64 = (syscall_word >> 12) & 0xFF;
             const end_idx: usize = @min(1 + @as(usize, @intCast(n)), args.len);
-            break :blk var_.unmap(
+            break :blk vmar.unmap(
                 caller,
                 arg(args, 0),
                 if (end_idx > 1) args[1..end_idx] else &.{},
             );
         },
-        .remap => var_.remap(caller, arg(args, 0), arg(args, 1)),
-        .snapshot => var_.snapshot(caller, arg(args, 0), arg(args, 1)),
+        .remap => vmar.remap(caller, arg(args, 0), arg(args, 1)),
+        .snapshot => vmar.snapshot(caller, arg(args, 0), arg(args, 1)),
         .idc_read => blk: {
             // Spec §[var].idc_read: syscall word bits 12-19 carry count
             // (number of qwords, max 125). Args carry only [1] var and
@@ -207,7 +207,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // guard before the BADCAP / alignment / size checks ever
             // run, breaking [test 01] / [test 02] / [test 07] / [test 08].
             const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            break :blk var_.idcRead(
+            break :blk vmar.idcRead(
                 caller,
                 arg(args, 0),
                 arg(args, 1),
@@ -223,7 +223,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // entries (test 04 boundary).
             const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
             const end_idx: usize = @min(2 + @as(usize, n), args.len);
-            break :blk var_.idcWrite(
+            break :blk vmar.idcWrite(
                 caller,
                 arg(args, 0),
                 arg(args, 1),

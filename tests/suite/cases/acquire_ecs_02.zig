@@ -16,7 +16,7 @@
 //   verbatim here.
 //
 //   IDC caps use only bitwise-subset semantics — bit 5
-//   (`restart_policy`) is a single bool, not the EC/VAR 2-bit numeric
+//   (`restart_policy`) is a single bool, not the EC/VMAR 2-bit numeric
 //   field — so restrict on an IDC handle has no numeric corner. Other
 //   IDC cap bits (`move`, `copy`, `crec`, `aqvr`, `restart_policy`)
 //   are preserved across the restrict so dropping `aqec` is the only

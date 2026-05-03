@@ -5,7 +5,7 @@
 //!   1. Allocate a page_frame for VmPolicy + map locally to zero it.
 //!   2. createVirtualMachine.
 //!   3. mem.setupGuestMemory: page_frames + mapGuest at GUEST_RAM_BASE
-//!      + local VAR for VMM-side @memcpy access.
+//!      + local VMAR for VMM-side @memcpy access.
 //!   4. Load arm64 Linux Image + initramfs + FDT into guest RAM.
 //!   5. createPort + createVcpu(vm, exit_port).
 //!   6. recv loop on exit_port; first exit is initial_state — install

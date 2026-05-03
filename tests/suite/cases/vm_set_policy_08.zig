@@ -65,7 +65,7 @@
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — smallest valid
 //      frame, backs the VmPolicy struct.
-//   2. createVar + mapPf so userspace can plant a known-zero VmPolicy.
+//   2. createVmar + mapPf so userspace can plant a known-zero VmPolicy.
 //      (zero counts ⇒ valid empty policy on both archs.)
 //   3. Zero the VmPolicy region with volatile stores.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerate
@@ -85,7 +85,7 @@
 //
 // Assertions
 //   1: setup — createPageFrame returned an error word.
-//   2: setup — createVar returned an error word.
+//   2: setup — createVmar returned an error word.
 //   3: setup — mapPf returned non-OK in vreg 1.
 //   (No spec-assertion-under-test fail path is wired; the aarch64
 //    sysreg-replacement guarantee cannot be observed from this rig.)
@@ -120,9 +120,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + mapPf so userspace can plant a zero VmPolicy.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + mapPf so userspace can plant a zero VmPolicy.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

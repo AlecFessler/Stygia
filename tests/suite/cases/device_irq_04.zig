@@ -42,9 +42,9 @@
 //     2. `pass()` — report the spec slot as smoke-only via assertion
 //        id 0.
 //
-//   We deliberately do *not* mint a VAR or any other unrelated
+//   We deliberately do *not* mint a VMAR or any other unrelated
 //   handle. The faithful path's only fixture requirement is a
-//   non-IRQ device_region; no auxiliary VAR/PF/EC construction is
+//   non-IRQ device_region; no auxiliary VMAR/PF/EC construction is
 //   needed in the eventual replacement, so the smoke prelude leaves
 //   that surface untouched.
 //

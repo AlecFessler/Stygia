@@ -25,7 +25,7 @@
 //
 // Strategy
 //   Stage the same VM + vCPU + exit_port prelude as
-//   create_vcpu_09: page frame + VAR + zero VmPolicy +
+//   create_vcpu_09: page frame + VMAR + zero VmPolicy +
 //   create_virtual_machine + create_port (bind|recv) + create_vcpu.
 //   That gives us a real VM handle whose emulated interrupt
 //   controller is live and whose vCPU has been registered.
@@ -42,8 +42,8 @@
 //
 // Caps required
 //   - create_page_frame: caps = {r, w}. Backs the VmPolicy frame
-//     and lets userspace zero it through the VAR window.
-//   - create_var: caps = {r, w}, cur_rwx = r|w. CPU window into
+//     and lets userspace zero it through the VMAR window.
+//   - create_vmar: caps = {r, w}, cur_rwx = r|w. CPU window into
 //     the policy frame.
 //   - create_virtual_machine: caps = {policy=true}. Subset of
 //     vm_ceiling = 0x01.
@@ -69,7 +69,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at
 //      offset 0 — gives userspace a window into the policy frame.
 //   3. Zero the VmPolicy region through volatile stores so the
 //      kernel's read of the policy page sees an all-zero CpuidPolicy
@@ -83,7 +83,7 @@
 //      return OK in vreg 1.
 //
 // Assertions
-//   1: setup — createPageFrame / createVar / mapPf returned an
+//   1: setup — createPageFrame / createVmar / mapPf returned an
 //      error word.
 //   2: setup — createPort returned an error word.
 //   3: setup — createVcpu returned an error word.
@@ -120,9 +120,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

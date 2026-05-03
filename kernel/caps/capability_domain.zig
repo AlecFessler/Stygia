@@ -18,7 +18,7 @@
 //! `acquire_ecs` is an explicitly slow debugger primitive, the linear walk
 //! is fine for it.
 //!
-//! STUB. Forward refs to VAR and VirtualMachine point at intended future
+//! STUB. Forward refs to VMAR and VirtualMachine point at intended future
 //! paths.
 
 const std = @import("std");
@@ -43,7 +43,7 @@ const PageFrame = zag.memory.page_frame.PageFrame;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VAR = zag.memory.var_range.VAR;
+const VMAR = zag.memory.vmar.VMAR;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 const Word0 = zag.caps.capability.Word0;
@@ -83,7 +83,7 @@ pub const IdcCaps = packed struct(u16) {
 const MAX_HANDLES_PER_DOMAIN = zag.caps.capability.MAX_HANDLES_PER_DOMAIN;
 const FREE_LIST_TAIL = zag.caps.capability.FREE_LIST_TAIL;
 
-/// Start of the per-domain VAR bump-allocator range. Placed at 64 GiB
+/// Start of the per-domain VMAR bump-allocator range. Placed at 64 GiB
 /// so it lives above the boot path's hand-mapped text/data/stack/
 /// cap_table regions (which top out near 0x80000000) but inside the
 /// 47-bit user half. v0 expedient — see `next_var_base` doc.
@@ -91,7 +91,7 @@ pub const NEXT_VAR_BASE_START: u64 = 0x0000_0010_0000_0000;
 
 /// Maximum VARs bindable to a single capability domain. 512 × 8 bytes
 /// = 4 KiB inline. Coarse upper bound; well above realistic per-domain
-/// VAR counts (a domain with even a few dozen VARs is unusual).
+/// VMAR counts (a domain with even a few dozen VARs is unusual).
 pub const MAX_VARS_PER_DOMAIN: u16 = 512;
 
 pub const CapabilityDomain = struct {
@@ -119,7 +119,7 @@ pub const CapabilityDomain = struct {
     //                  userspace can read cap word + field0/field1 of
     //                  any handle without a syscall. Kernel writes
     //                  field0/field1 to refresh kernel-mutable
-    //                  snapshots (EC priority/affinity, VAR cur_rwx,
+    //                  snapshots (EC priority/affinity, VMAR cur_rwx,
     //                  device IRQ counters, etc.) directly through
     //                  the kernel R/W view of the same physical pages.
     //
@@ -148,21 +148,21 @@ pub const CapabilityDomain = struct {
     // ── Bound VARs ───────────────────────────────────────────────────
 
     /// Flat array of VARs bound to this domain. Used for:
-    ///   - VA-range overlap check at `create_var` (linear scan)
-    ///   - Enumeration via `acquire_vars` (debugger primitive)
+    ///   - VA-range overlap check at `create_vmar` (linear scan)
+    ///   - Enumeration via `acquire_vmars` (debugger primitive)
     ///   - Walk-and-free at domain destroy
     /// Entries `[0..var_count)` are populated; entries beyond are null.
     /// On removal the tail is moved into the freed slot to keep the
     /// populated prefix dense (no holes to skip).
-    vars: [MAX_VARS_PER_DOMAIN]?SlabRef(VAR) = .{null} ** MAX_VARS_PER_DOMAIN,
+    vars: [MAX_VARS_PER_DOMAIN]?SlabRef(VMAR) = .{null} ** MAX_VARS_PER_DOMAIN,
 
     /// Number of populated entries in `vars`. Range 0..MAX_VARS_PER_DOMAIN.
     var_count: u16 = 0,
 
-    /// Bump pointer for VAR base allocation when the caller passes
+    /// Bump pointer for VMAR base allocation when the caller passes
     /// `preferred_base = 0`. v0 sub-allocator: starts at 64 GiB (well
     /// above the ELF segment / stack / cap_table region used by the
-    /// boot path) and grows upward. Spec §[var].create_var doesn't
+    /// boot path) and grows upward. Spec §[var].create_vmar doesn't
     /// pin layout; this just needs to avoid colliding with other
     /// VARs and the boot-mapped text/stack/cap_table mappings that
     /// don't have backing VARs.
@@ -422,7 +422,7 @@ pub fn createCapabilityDomain(
     return @intCast(Word0.pack(idc_slot, .capability_domain, caller_cridc));
 }
 
-inline fn pageFrameSizeBytes(sz: zag.memory.var_range.PageSize) u64 {
+inline fn pageFrameSizeBytes(sz: zag.memory.vmar.PageSize) u64 {
     return switch (sz) {
         .sz_4k => 0x1000,
         .sz_2m => 0x200000,
@@ -585,13 +585,13 @@ inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
     return Word0.pack(slot, .execution_context, caps_word);
 }
 
-/// `acquire_vars` syscall handler.
-/// Spec §[capability_domain].acquire_vars.
+/// `acquire_vmars` syscall handler.
+/// Spec §[capability_domain].acquire_vmars.
 ///
 /// Enumerates `map=1` (page_frame) and `map=3` (demand) VARs bound to the
 /// target IDC's referenced domain. MMIO and DMA-only VARs (`map=0` / `map=2`)
-/// are excluded — see §[acquire_vars] [test 07].
-pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
+/// are excluded — see §[acquire_vmars] [test 07].
+pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -610,17 +610,17 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
     // IDC test surfaces it.
     if (target_cd != cd) return errors.E_BADCAP;
 
-    // Spec §[acquire_vars] [test 06]: each minted VAR handle gets caps =
-    // `target.var_outer_ceiling` ∩ `idc.var_cap_ceiling`.
-    //   - target.var_outer_ceiling lives in slot-0 self-handle field1
+    // Spec §[acquire_vmars] [test 06]: each minted VMAR handle gets caps =
+    // `target.vmar_outer_ceiling` ∩ `idc.vmar_cap_ceiling`.
+    //   - target.vmar_outer_ceiling lives in slot-0 self-handle field1
     //     bits 8-15 (ceilings_outer layout).
-    //   - idc.var_cap_ceiling lives in user_table[slot].field0 bits 16-23.
-    const var_outer_ceiling: u16 = @truncate((target_cd.user_table[0].field1 >> 8) & 0xFF);
+    //   - idc.vmar_cap_ceiling lives in user_table[slot].field0 bits 16-23.
+    const vmar_outer_ceiling: u16 = @truncate((target_cd.user_table[0].field1 >> 8) & 0xFF);
     const idc_var_cap_ceiling: u16 = @truncate((cd.user_table[slot].field0 >> 16) & 0xFF);
-    const minted_caps: u16 = var_outer_ceiling & idc_var_cap_ceiling;
+    const minted_caps: u16 = vmar_outer_ceiling & idc_var_cap_ceiling;
 
     // E_FULL pre-check ([test 04]): count eligible VARs once. Eligible =
-    // map ∈ {page_frame, demand}. The `vars[]` array tracks every VAR
+    // map ∈ {page_frame, demand}. The `vars[]` array tracks every VMAR
     // bound to the domain; coalescing in `mintHandle` deduplicates against
     // any existing handle in the caller's table.
     var var_count: u32 = 0;
@@ -628,7 +628,7 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
         var j: u16 = 0;
         while (j < target_cd.var_count) : (j += 1) {
             const v_ref = target_cd.vars[j] orelse continue;
-            // self-alive: VAR's domain ref pins it for the
+            // self-alive: VMAR's domain ref pins it for the
             // duration of this walk (target_cd's gen-lock is held).
             const v = v_ref.ptr;
             switch (v.map) {
@@ -655,7 +655,7 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
         if (n >= minted_slots.len) break; // TODO: vreg 6+ writeback
 
         const var_field0: u64 = v.base_vaddr.addr;
-        const var_field1: u64 = zag.memory.var_range.packField1(
+        const vmar_field1: u64 = zag.memory.vmar.packField1(
             v.page_count,
             v.sz,
             v.cch,
@@ -668,26 +668,26 @@ pub fn acquireVars(caller: *ExecutionContext, target_idc: u64) i64 {
             .ptr = @ptrCast(v),
             .gen = @intCast(v._gen_lock.currentGen()),
         };
-        // Spec §[acquire_vars] [test 06] says the returned handle has
-        // caps = `var_outer_ceiling ∩ var_cap_ceiling`. If a handle
-        // to this VAR already exists in the caller's table (the
+        // Spec §[acquire_vmars] [test 06] says the returned handle has
+        // caps = `vmar_outer_ceiling ∩ vmar_cap_ceiling`. If a handle
+        // to this VMAR already exists in the caller's table (the
         // at-most-one-per-(domain,object) invariant + self-IDC case
-        // means the create_var-minted handle is already there), the
+        // means the create_vmar-minted handle is already there), the
         // coalescing path in mintHandle returns that existing slot
         // with its original caps. Detect that case and overwrite caps
         // / field0 / field1 to the spec-required intersection so the
-        // handle reflects what acquire_vars promises.
+        // handle reflects what acquire_vmars promises.
         const new_slot = mintHandle(
             cd,
             var_ref,
-            .virtual_address_range,
+            .virtual_memory_address_region,
             minted_caps,
             var_field0,
-            var_field1,
+            vmar_field1,
         ) catch return errors.E_FULL;
-        cd.user_table[new_slot].word0 = Word0.pack(new_slot, .virtual_address_range, minted_caps);
+        cd.user_table[new_slot].word0 = Word0.pack(new_slot, .virtual_memory_address_region, minted_caps);
         cd.user_table[new_slot].field0 = var_field0;
-        cd.user_table[new_slot].field1 = var_field1;
+        cd.user_table[new_slot].field1 = vmar_field1;
         minted_slots[n] = new_slot;
         n += 1;
     }
@@ -795,24 +795,24 @@ pub fn allocCapabilityDomain(
 
     // Slot 2 — self-IDC. Caps = `cridc_ceiling` from field0_ceilings
     // bits 24-31 per spec §[cridc_ceiling]. The IDC's per-handle
-    // `ec_cap_ceiling` (field0 bits 0-15) and `var_cap_ceiling` (field0
+    // `ec_cap_ceiling` (field0 bits 0-15) and `vmar_cap_ceiling` (field0
     // bits 16-23) are not constrained by the spec at create time; pick
-    // a permissive default so `acquire_ecs` / `acquire_vars` through the
-    // self-IDC mint EC/VAR handles whose cap masks are limited only by
+    // a permissive default so `acquire_ecs` / `acquire_vmars` through the
+    // self-IDC mint EC/VMAR handles whose cap masks are limited only by
     // the domain's `*_outer_ceiling`. Spec §[idc_handle] / §[acquire_ecs]
     // ([test 06]) use this self-IDC to enumerate the calling domain's
     // own ECs; without a permissive `ec_cap_ceiling` the intersection
     // is zero and the minted handles carry no caps.
     //
-    // var_cap_ceiling clears VarCap bit 5 (mmio) — at field0 bit 21 —
-    // so the §[acquire_vars] [test 06] intersection naturally satisfies
+    // vmar_cap_ceiling clears VmarCap bit 5 (mmio) — at field0 bit 21 —
+    // so the §[acquire_vmars] [test 06] intersection naturally satisfies
     // [test 07]'s "MMIO and DMA VARs are not included" invariant. mmio
-    // and dma describe the VAR object (§[var]); minting an mmio cap on
-    // a non-MMIO VAR (the only kind acquire_vars returns) would
-    // misadvertise the handle. dma at VarCap bit 8 falls outside the
-    // 8-bit var_cap_ceiling field, so it is implicitly excluded.
+    // and dma describe the VMAR object (§[var]); minting an mmio cap on
+    // a non-MMIO VMAR (the only kind acquire_vmars returns) would
+    // misadvertise the handle. dma at VmarCap bit 8 falls outside the
+    // 8-bit vmar_cap_ceiling field, so it is implicitly excluded.
     const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
-    const idc_self_field0: u64 = 0x0000_0000_00DF_FFFF; // ec_cap_ceiling=0xFFFF, var_cap_ceiling=0xDF (mmio cleared)
+    const idc_self_field0: u64 = 0x0000_0000_00DF_FFFF; // ec_cap_ceiling=0xFFFF, vmar_cap_ceiling=0xDF (mmio cleared)
     user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
     user_table[2].field0 = idc_self_field0;
     user_table[2].field1 = 0;
@@ -824,7 +824,7 @@ pub fn allocCapabilityDomain(
     return cd;
 }
 
-/// Final teardown — walks `vars` freeing each VAR, walks
+/// Final teardown — walks `vars` freeing each VMAR, walks
 /// `kernel_table` releasing every used slot per type, tears down the
 /// address space, frees the table pages, frees slab.
 ///
@@ -843,7 +843,7 @@ pub fn allocCapabilityDomain(
 /// deliberately leaked for later: page-table page frames (need an
 /// arch.paging walk), page_frame slab refcount drops for handle-table
 /// entries (refcounted PFs survive), VARs (require domain.vars[] walk
-/// + per-VAR unmap + slab destroy). These are smaller per-test than
+/// + per-VMAR unmap + slab destroy). These are smaller per-test than
 /// the table blocks and don't push the full-475-test runner past the
 /// PMM budget on a 1 GB QEMU instance.
 /// Snapshot the destroy state captured under the CD's `_gen_lock` for
@@ -1105,15 +1105,15 @@ fn readSelfField0(cd: *const CapabilityDomain) u64 {
 }
 
 /// Append `v` to `vars[var_count]`. Returns E_FULL when at MAX.
-pub fn appendVar(cd: *CapabilityDomain, v: *VAR) i64 {
+pub fn appendVar(cd: *CapabilityDomain, v: *VMAR) i64 {
     if (cd.var_count >= cd.vars.len) return errors.E_FULL;
-    cd.vars[cd.var_count] = SlabRef(VAR).init(v, v._gen_lock.currentGen());
+    cd.vars[cd.var_count] = SlabRef(VMAR).init(v, v._gen_lock.currentGen());
     cd.var_count += 1;
     return 0;
 }
 
 /// Remove `v` from `vars` by tail-swap; decrements var_count.
-pub fn removeVar(cd: *CapabilityDomain, v: *VAR) void {
+pub fn removeVar(cd: *CapabilityDomain, v: *VMAR) void {
     var i: u16 = 0;
     while (i < cd.var_count) {
         if (cd.vars[i]) |v_ref| {
@@ -1130,7 +1130,7 @@ pub fn removeVar(cd: *CapabilityDomain, v: *VAR) void {
 }
 
 /// Linear-scan `vars[]` for any range overlapping `[base, base + bytes)`.
-/// Returns E_NOSPC on overlap, 0 otherwise. Spec §[var].create_var.
+/// Returns E_NOSPC on overlap, 0 otherwise. Spec §[var].create_vmar.
 pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64) i64 {
     const new_start = base.addr;
     const new_end = new_start + bytes;
@@ -1140,7 +1140,7 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
             i += 1;
             continue;
         };
-        // self-alive: VAR's domain ref pins it; cd is the owner here.
+        // self-alive: VMAR's domain ref pins it; cd is the owner here.
         const v = v_ref.ptr;
         const sz_bytes: u64 = switch (v.sz) {
             .sz_4k => 0x1000,

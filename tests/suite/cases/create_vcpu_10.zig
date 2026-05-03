@@ -42,7 +42,7 @@
 //   create_virtual_machine takes a `policy_page_frame` whose first bytes
 //   are a VmPolicy struct. An all-zero buffer is a valid policy (zero
 //   counts ⇒ kernel scans no entries). We mint a page frame, map it via
-//   a temporary VAR, zero VM_POLICY_BYTES, and pass the frame to
+//   a temporary VMAR, zero VM_POLICY_BYTES, and pass the frame to
 //   create_virtual_machine — the same setup chain as create_vcpu_05.
 //
 // E_NODEV degradation
@@ -57,7 +57,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
 //   3. Zero VM_POLICY_BYTES so num_cpuid_responses = num_cr_policies = 0.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
@@ -98,9 +98,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

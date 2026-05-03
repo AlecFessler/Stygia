@@ -116,7 +116,7 @@ pub fn main(cap_table_base: u64) void {
     // ── Parent path ───────────────────────────────────────────────
     // Spawn a child domain that re-enters this same ELF with
     // ec_inner_ceiling = 0x7F. The child then takes the branch above.
-    // `crvr` is required so the child's _start can call createVar to
+    // `crvr` is required so the child's _start can call createVmar to
     // map libz at LIBZ_SLIDE; without it the libz bootstrap halts.
     const child_self = caps.SelfCap{
         .crec = true,
@@ -131,7 +131,7 @@ pub fn main(cap_table_base: u64) void {
     // load-bearing for this test. Layout matches §[create_capability_domain]
     // [2] ceilings_inner:
     //   bits  0-7   ec_inner_ceiling   = 0x7F (bit 7 cleared)
-    //   bits  8-23  var_inner_ceiling  = 0x01FF (matches runner)
+    //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
     //   bits 24-31  cridc_ceiling      = 0x3F  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01  (matches runner)

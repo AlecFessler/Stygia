@@ -8,7 +8,7 @@
 //
 //   1. Read the libz page_frame handle from cap-table slot
 //      LIBZ_PF_SLOT (= 5; the runner places it there in spawnOne).
-//   2. createVar with R+X covering the libz image, preferred_base =
+//   2. createVmar with R+X covering the libz image, preferred_base =
 //      LIBZ_SLIDE so the kernel-chosen base matches the runner's
 //      pre-applied RELATIVE relocs.
 //   3. mapPf the libz pf into that var. After this the libz code at
@@ -96,37 +96,37 @@ fn bootstrapLibz(cap_table_base: u64) void {
     const pf_handle: u64 = @as(u64, cap.id());
     const page_count: u64 = @as(u64, @truncate(cap.field0 & 0xFFFF_FFFF));
 
-    // createVar(caps={r,x}, props={cur_rwx=r|x, sz=0}, pages=page_count,
+    // createVmar(caps={r,x}, props={cur_rwx=r|x, sz=0}, pages=page_count,
     //           preferred_base=LIBZ_SLIDE, device_region=0)
     //
     // libz.elf is built with read-only PT_LOADs only after pre-link
     // (no writable .data referenced by syscall wrappers), so R+X is
     // sufficient. Pinning preferred_base = LIBZ_SLIDE is what makes
     // the runner's pre-applied RELATIVE relocs land correctly.
-    const var_caps = lib.caps.VarCap{ .r = true, .x = true };
-    const var_caps_word: u64 = @as(u64, var_caps.toU16());
+    const vmar_caps = lib.caps.VmarCap{ .r = true, .x = true };
+    const var_caps_word: u64 = @as(u64, vmar_caps.toU16());
     const props: u64 = 0b101; // cur_rwx = r|x
 
-    const cvar = lib.syscall.issueReg(.create_var, 0, .{
+    const cvar = lib.syscall.issueReg(.create_vmar, 0, .{
         .v1 = var_caps_word,
         .v2 = props,
         .v3 = page_count,
         .v4 = libz_loader.LIBZ_SLIDE,
         .v5 = 0,
     });
-    // Successful createVar returns a handle word with caps in bits
+    // Successful createVmar returns a handle word with caps in bits
     // 48-63 + handle id in bits 0-11; errors (errors.Error variants)
     // return a small value < 16 in v1. Bootstrap is fatal: if libz
     // can't be staged, no extern call works — park on hlt and let
     // the runner's recv timeout MISS-record the test.
     if (cvar.v1 < 16) haltForever();
-    const var_handle: u64 = cvar.v1 & 0xFFF;
+    const vmar_handle: u64 = cvar.v1 & 0xFFF;
 
     const mp = lib.syscall.issueReg(
         .map_pf,
         lib.syscall.extraCount(1),
         .{
-            .v1 = var_handle,
+            .v1 = vmar_handle,
             .v2 = 0,
             .v3 = pf_handle,
         },

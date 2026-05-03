@@ -45,13 +45,13 @@
 //   create_virtual_machine takes a `policy_page_frame` whose first
 //   bytes are a VmPolicy struct. An all-zero buffer is a valid policy
 //   (zero counts ⇒ kernel scans no entries). We mint a page frame,
-//   map it via a temporary VAR, zero VM_POLICY_BYTES, and pass the
+//   map it via a temporary VMAR, zero VM_POLICY_BYTES, and pass the
 //   frame in. This mirrors acquire_ecs_07's setup.
 //
 // Action
 //   1. restrict(SLOT_SELF, SelfCap{crec, crvm, crvr, crpf, crpt, pri=1})
 //      — must succeed (bitwise subset of runner-minted caps).
-//   2. mint policy page frame, VAR, zero policy bytes — setup.
+//   2. mint policy page frame, VMAR, zero policy bytes — setup.
 //   3. create_virtual_machine(caps=0, policy_pf) — must succeed.
 //   4. create_port(caps={bind}) — must succeed.
 //   5. create_vcpu(caps = priority<<32 with priority=2,
@@ -61,7 +61,7 @@
 // Assertions
 //   1: restrict on the self-handle returned non-OK
 //   2: setup — create_page_frame returned an error word
-//   3: setup — create_var returned an error word
+//   3: setup — create_vmar returned an error word
 //   4: setup — map_pf returned non-success in vreg 1
 //   5: setup — create_virtual_machine returned an error word
 //   6: setup — create_port returned an error word
@@ -119,8 +119,8 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

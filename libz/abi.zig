@@ -110,8 +110,8 @@ pub fn acquireEcs(target: u16) callconv(.c) c.RecvReturn {
     return toCRecvReturn(syscall.acquireEcs(@truncate(target)));
 }
 
-pub fn acquireVars(target: u16) callconv(.c) c.RecvReturn {
-    return toCRecvReturn(syscall.acquireVars(@truncate(target)));
+pub fn acquireVmars(target: u16) callconv(.c) c.RecvReturn {
+    return toCRecvReturn(syscall.acquireVmars(@truncate(target)));
 }
 
 pub fn createExecutionContext(
@@ -165,55 +165,55 @@ pub fn perfmonStop(target: u16) callconv(.c) c.Regs {
     return toCRegs(syscall.perfmonStop(@truncate(target)));
 }
 
-pub fn createVar(
+pub fn createVmar(
     caps: u64,
     props: u64,
     pages: u64,
     preferred_base: u64,
     device_region: u64,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.createVar(caps, props, pages, preferred_base, device_region));
+    return toCRegs(syscall.createVmar(caps, props, pages, preferred_base, device_region));
 }
 
 pub fn mapPf(
-    var_handle: u16,
+    vmar_handle: u16,
     pairs_ptr: [*]const u64,
     pairs_len: usize,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.mapPf(@truncate(var_handle), pairs_ptr[0..pairs_len]));
+    return toCRegs(syscall.mapPf(@truncate(vmar_handle), pairs_ptr[0..pairs_len]));
 }
 
-pub fn mapMmio(var_handle: u16, device_region: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.mapMmio(@truncate(var_handle), @truncate(device_region)));
+pub fn mapMmio(vmar_handle: u16, device_region: u16) callconv(.c) c.Regs {
+    return toCRegs(syscall.mapMmio(@truncate(vmar_handle), @truncate(device_region)));
 }
 
 pub fn unmap(
-    var_handle: u16,
+    vmar_handle: u16,
     selectors_ptr: [*]const u64,
     selectors_len: usize,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.unmap(@truncate(var_handle), selectors_ptr[0..selectors_len]));
+    return toCRegs(syscall.unmap(@truncate(vmar_handle), selectors_ptr[0..selectors_len]));
 }
 
-pub fn remap(var_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.remap(@truncate(var_handle), new_cur_rwx));
+pub fn remap(vmar_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs {
+    return toCRegs(syscall.remap(@truncate(vmar_handle), new_cur_rwx));
 }
 
-pub fn snapshot(target_var: u16, source_var: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.snapshot(@truncate(target_var), @truncate(source_var)));
+pub fn snapshot(target_vmar: u16, source_vmar: u16) callconv(.c) c.Regs {
+    return toCRegs(syscall.snapshot(@truncate(target_vmar), @truncate(source_vmar)));
 }
 
-pub fn idcRead(var_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs {
-    return toCRegs(syscall.idcRead(@truncate(var_handle), offset, count));
+pub fn idcRead(vmar_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs {
+    return toCRegs(syscall.idcRead(@truncate(vmar_handle), offset, count));
 }
 
 pub fn idcWrite(
-    var_handle: u16,
+    vmar_handle: u16,
     offset: u64,
     qwords_ptr: [*]const u64,
     qwords_len: usize,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.idcWrite(@truncate(var_handle), offset, qwords_ptr[0..qwords_len]));
+    return toCRegs(syscall.idcWrite(@truncate(vmar_handle), offset, qwords_ptr[0..qwords_len]));
 }
 
 pub fn createPageFrame(caps: u64, props: u64, pages: u64) callconv(.c) c.Regs {
@@ -424,7 +424,7 @@ comptime {
     @export(&sync, .{ .name = "sync" });
     @export(&createCapabilityDomain, .{ .name = "createCapabilityDomain" });
     @export(&acquireEcs, .{ .name = "acquireEcs" });
-    @export(&acquireVars, .{ .name = "acquireVars" });
+    @export(&acquireVmars, .{ .name = "acquireVmars" });
     @export(&createExecutionContext, .{ .name = "createExecutionContext" });
     @export(&self, .{ .name = "self" });
     @export(&terminate, .{ .name = "terminate" });
@@ -435,7 +435,7 @@ comptime {
     @export(&perfmonStart, .{ .name = "perfmonStart" });
     @export(&perfmonRead, .{ .name = "perfmonRead" });
     @export(&perfmonStop, .{ .name = "perfmonStop" });
-    @export(&createVar, .{ .name = "createVar" });
+    @export(&createVmar, .{ .name = "createVmar" });
     @export(&mapPf, .{ .name = "mapPf" });
     @export(&mapMmio, .{ .name = "mapMmio" });
     @export(&unmap, .{ .name = "unmap" });

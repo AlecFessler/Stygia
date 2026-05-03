@@ -4,20 +4,20 @@
 // handle."
 //
 // Strategy
-//   §[map_mmio] orders BADCAP gates: test 01 rejects an invalid VAR
+//   §[map_mmio] orders BADCAP gates: test 01 rejects an invalid VMAR
 //   handle in [1], test 02 rejects an invalid device_region handle
-//   in [2]. To isolate the [2] gate we need a *valid* MMIO VAR in
+//   in [2]. To isolate the [2] gate we need a *valid* MMIO VMAR in
 //   [1] so test 01 cannot fire ahead.
 //
-//   The MMIO VAR is built without an actual map_mmio call. Per
+//   The MMIO VMAR is built without an actual map_mmio call. Per
 //   §[var]:
-//     - caps.mmio = 1 requires props.sz = 0 (create_var test 08),
+//     - caps.mmio = 1 requires props.sz = 0 (create_vmar test 08),
 //       caps.x = 0 (test 11), caps.dma = 0 (test 13).
 //     - cch = 1 (uc) is required for mmio.
 //   The same construction is used by runner/serial.zig and
 //   map_pf_03.zig. With caps = {r, w, mmio} and props = {sz=0,
-//   cch=1, cur_rwx=0b011} the create_var prelude succeeds and the
-//   VAR sits in `map = 0` with `caps.mmio = 1`.
+//   cch=1, cur_rwx=0b011} the create_vmar prelude succeeds and the
+//   VMAR sits in `map = 0` with `caps.mmio = 1`.
 //
 //   For [2] we use slot 4095 — the maximum 12-bit handle id.
 //   The child capability domain's table is populated by the kernel
@@ -27,9 +27,9 @@
 //   handle. The same trick is used by map_pf_01.zig.
 //
 // Action
-//   1. createVar(caps={r,w,mmio}, props={sz=0, cch=1 (uc),
+//   1. createVmar(caps={r,w,mmio}, props={sz=0, cch=1 (uc),
 //      cur_rwx=0b011}, pages=1, preferred_base=0, device_region=0)
-//      — must succeed, gives a valid MMIO VAR.
+//      — must succeed, gives a valid MMIO VMAR.
 //   2. mapMmio(mmio_var_handle, 4095) — must return E_BADCAP in
 //      vreg 1.
 //
@@ -47,13 +47,13 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Stage a valid MMIO VAR so map_mmio's E_BADCAP-on-invalid-VAR
+    // Stage a valid MMIO VMAR so map_mmio's E_BADCAP-on-invalid-VMAR
     // check (test 01) cannot pre-empt the [2] BADCAP rejection.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1
@@ -68,7 +68,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Slot 4095 is guaranteed empty by the create_capability_domain
     // table layout, so it is invalid as a device_region handle. The
-    // [2] BADCAP gate must fire even though [1] is a valid MMIO VAR.
+    // [2] BADCAP gate must fire even though [1] is a valid MMIO VMAR.
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;
 
     const mm = syscall.mapMmio(mmio_var_handle, empty_slot);

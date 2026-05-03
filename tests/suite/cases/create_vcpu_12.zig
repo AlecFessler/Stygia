@@ -62,7 +62,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
 //   3. Zero VM_POLICY_BYTES so num_cpuid_responses = num_cr_policies = 0.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
@@ -76,7 +76,7 @@
 //
 // Assertions
 //   1: setup — createPageFrame returned an error word.
-//   2: setup — createVar returned an error word.
+//   2: setup — createVmar returned an error word.
 //   3: setup — mapPf returned non-OK in vreg 1.
 //   4: setup — createVirtualMachine returned an error word other than
 //      E_NODEV (E_NODEV smoke-passes with assertion id 0).
@@ -119,9 +119,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

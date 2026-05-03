@@ -1,7 +1,7 @@
 // Spec §[port_io_virtualization] — test 09.
 //
 // "[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting
-//  the VAR delivers a `thread_fault` event with the protection_fault
+//  the VMAR delivers a `thread_fault` event with the protection_fault
 //  sub-code."
 //
 // DEGRADED SMOKE VARIANT
@@ -9,7 +9,7 @@
 //   of which a v0 test child can supply:
 //
 //   1. A port_io device_region (dev_type = 1) actually mapped into a
-//      caller-readable MMIO VAR via map_mmio. The runner
+//      caller-readable MMIO VMAR via map_mmio. The runner
 //      (runner/primary.zig spawnOne) forwards exactly one capability
 //      to each test child — the result port at slot 3. Slots 0/1/2
 //      are kernel-installed self / initial EC / self-IDC. No
@@ -22,17 +22,17 @@
 //      tests 01 and 02 for the same blocker.
 //
 //   2. The ability to actually issue an `IN`, `OUT`, `INS`, or
-//      `OUTS` instruction against the VAR's virtual range from the
+//      `OUTS` instruction against the VMAR's virtual range from the
 //      test child. The test child runs in CPL3 (userspace), and on
 //      x86-64 the named string/port mnemonics are CPL-gated by
 //      IOPL. The Zag kernel does not grant IOPL to user processes,
 //      so any `in`/`out`/`ins`/`outs` issued by this ELF would be
 //      rejected by the CPU itself with a #GP delivered as a
 //      thread_fault before the page-fault handler that backs the
-//      port-IO VAR ever runs. The faithful test 09 path — kernel
+//      port-IO VMAR ever runs. The faithful test 09 path — kernel
 //      decodes the faulting instruction, sees a non-MOV mnemonic,
 //      and synthesizes a protection_fault event — is therefore
-//      structurally unreachable from CPL3 even with a port_io VAR
+//      structurally unreachable from CPL3 even with a port_io VMAR
 //      in scope.
 //
 //   3. A thread_fault event harness wired into a test child so the
@@ -48,46 +48,46 @@
 //   here.
 //
 //   This smoke variant pins only the prelude shape the eventual
-//   faithful test will reuse: a valid MMIO VAR exists in [1] with
+//   faithful test will reuse: a valid MMIO VMAR exists in [1] with
 //   the construction §[var] requires when caps.mmio = 1 and
 //   props.cch = 1 (uc) — the cch a port_io device_region demands
 //   per §[port_io_virtualization] test 02 — and a map_mmio call
 //   against it is issued. The gate-order rejection (E_BADCAP via
 //   §[map_mmio] test 02 when [2] is an empty slot) confirms the
-//   call site is wired up; the IN/OUT/INS/OUTS-on-VAR
+//   call site is wired up; the IN/OUT/INS/OUTS-on-VMAR
 //   protection_fault the spec assertion targets is not asserted.
 //
 // Strategy (smoke prelude)
-//   Per §[var], creating an MMIO VAR requires:
+//   Per §[var], creating an MMIO VMAR requires:
 //     - caps.mmio = 1
-//     - caps.x = 0   (per §[create_var] test 11)
-//     - caps.dma = 0 (per §[create_var] test 13)
-//     - props.sz = 0 (per §[create_var] test 08; mmio VARs are
+//     - caps.x = 0   (per §[create_vmar] test 11)
+//     - caps.dma = 0 (per §[create_vmar] test 13)
+//     - props.sz = 0 (per §[create_vmar] test 08; mmio VARs are
 //       4 KiB page-granular)
-//     - props.cch = 1 (uc) — required for an MMIO VAR per §[var]
+//     - props.cch = 1 (uc) — required for an MMIO VMAR per §[var]
 //       and required for a port_io map_mmio per
 //       §[port_io_virtualization] test 02
 //   The construction below mirrors map_mmio_06.zig,
 //   port_io_virtualization_01.zig, and runner/serial.zig.
 //
 //   §[map_mmio]'s gate order on the x86-64 host is:
-//     - test 01 (VAR is invalid)         — pre-empted; we mint a
-//                                           real MMIO VAR.
+//     - test 01 (VMAR is invalid)         — pre-empted; we mint a
+//                                           real MMIO VMAR.
 //     - test 02 (device_region BADCAP)   — fires here, since slot
 //                                           4095 is empty by
 //                                           construction.
 //   The test 09 leg this file targets — kernel rejects an
-//   IN/OUT/INS/OUTS targeting a successfully-mapped port_io VAR
+//   IN/OUT/INS/OUTS targeting a successfully-mapped port_io VMAR
 //   with a protection_fault thread_fault — never runs because
 //   map_mmio rejects the call before any port-IO virtualization
 //   wiring is activated, and even if it did the faulting
 //   instruction can't be issued from CPL3.
 //
 // Action
-//   1. createVar(caps={r,w,mmio}, props={sz=0, cch=1 (uc),
+//   1. createVmar(caps={r,w,mmio}, props={sz=0, cch=1 (uc),
 //                cur_rwx=0b011}, pages=1, preferred_base=0,
 //                device_region=0) — must succeed; gives a valid
-//      MMIO VAR ready to be paired with a hypothetical port_io
+//      MMIO VMAR ready to be paired with a hypothetical port_io
 //      device_region.
 //   2. mapMmio(mmio_var, 4095) — slot 4095 is guaranteed empty by
 //      the create_capability_domain table layout (slots 0/1/2 are
@@ -97,13 +97,13 @@
 //      reaching the port-IO MOV decoder this test targets.
 //
 // Assertion
-//   No assertion is checked — the IN/OUT/INS/OUTS-on-VAR
+//   No assertion is checked — the IN/OUT/INS/OUTS-on-VMAR
 //   protection_fault leg is unreachable from a v0 test child:
 //   no port_io device_region is in scope, the named-mnemonic
 //   instructions can't be issued from CPL3 without IOPL, and there
 //   is no thread_fault observation harness. Passes with assertion
 //   id 0 to mark this slot as smoke-only in coverage. A failure of
-//   the prelude itself (createVar) is also reported as
+//   the prelude itself (createVmar) is also reported as
 //   pass-with-id-0 since no spec assertion is being checked.
 //
 // Faithful-test note
@@ -117,11 +117,11 @@
 //      `passed_handles` so [2] can name a real port_io handle.
 //
 //   2. The test child must be able to issue an IN/OUT/INS/OUTS
-//      against the mapped VAR's virtual range. On x86-64 this
+//      against the mapped VMAR's virtual range. On x86-64 this
 //      requires either (a) the kernel granting IOPL to the test
 //      child so CPL3 IN/OUT do not #GP at the CPU, or (b) routing
 //      the test through a kernel-side helper that issues the
-//      named mnemonic on the child's behalf against the VAR's
+//      named mnemonic on the child's behalf against the VMAR's
 //      virtual range so the port-IO page-fault decoder sees a
 //      non-MOV form. Option (a) is the cleaner mapping to the
 //      spec wording.
@@ -134,7 +134,7 @@
 //
 //   With all three in place, the action becomes:
 //     pio = forwarded port_io device_region
-//     create_var(caps={r,w,mmio}, props={sz=0, cch=1, cur_rwx=0b011},
+//     create_vmar(caps={r,w,mmio}, props={sz=0, cch=1, cur_rwx=0b011},
 //                pages=ceil(port_count/0x1000), preferred_base=0,
 //                device_region=0) -> mmio_var
 //     map_mmio(mmio_var, pio) -> success
@@ -148,7 +148,7 @@
 //
 //   Until then, this file holds the prelude verbatim so the
 //   eventual faithful version can graft on the IN/OUT/INS/OUTS
-//   observation without re-deriving the MMIO-VAR construction.
+//   observation without re-deriving the MMIO-VMAR construction.
 
 const lib = @import("lib");
 
@@ -159,16 +159,16 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build a valid MMIO VAR — caps.mmio = 1, props.sz = 0,
+    // Build a valid MMIO VMAR — caps.mmio = 1, props.sz = 0,
     // cch = 1 (uc), caps.x = 0, caps.dma = 0 — the construction
-    // §[var] requires for an MMIO VAR. cch = 1 also matches what a
+    // §[var] requires for an MMIO VMAR. cch = 1 also matches what a
     // port_io device_region demands per §[port_io_virtualization]
-    // test 02. On creation the VAR sits in `map = 0` per §[var].
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    // test 02. On creation the VMAR sits in `map = 0` per §[var].
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1
@@ -186,14 +186,14 @@ pub fn main(cap_table_base: u64) void {
     // Slot 4095 is guaranteed empty by the create_capability_domain
     // table layout. The map_mmio call returns E_BADCAP via
     // §[map_mmio] test 02 without ever reaching the port-IO MOV
-    // decoder this test targets. The IN/OUT/INS/OUTS-on-VAR
+    // decoder this test targets. The IN/OUT/INS/OUTS-on-VMAR
     // protection_fault leg is not reachable from a v0 test child
     // — see header comment.
     const empty_slot: caps.HandleId = caps.HANDLE_TABLE_MAX - 1;
     _ = syscall.mapMmio(mmio_var_handle, empty_slot);
 
     // No spec assertion is being checked — the
-    // IN/OUT/INS/OUTS-on-VAR protection_fault leg is unreachable
+    // IN/OUT/INS/OUTS-on-VMAR protection_fault leg is unreachable
     // from a v0 test child. Pass with assertion id 0 to mark this
     // slot as smoke-only in coverage.
     testing.pass();

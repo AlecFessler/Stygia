@@ -21,7 +21,7 @@
 //
 //   For [1] we use SLOT_INITIAL_EC, the test domain's initial EC.
 //   The runner mints it with the new domain's `ec_inner_ceiling`,
-//   which by primary.zig's `ceilings_inner` (var_inner_ceiling field
+//   which by primary.zig's `ceilings_inner` (vmar_inner_ceiling field
 //   = 0x01FF, ec_inner_ceiling field = 0xFF — bits 0-7 set) includes
 //   `bind` (EcCap bit 10). Whether or not [1] has `bind` doesn't
 //   matter for this assertion: the spec orders the cap checks per

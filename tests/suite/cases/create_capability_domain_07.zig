@@ -7,7 +7,7 @@
 //   `restart_policy_ceiling` lives in ceilings_outer ([3]) bits 16-31.
 //   Within that 16-bit sub-field:
 //     bits 0-1: ec_restart_max     (numeric: 0=kill / 1=restart / 2=persist / 3=_reserved)
-//     bits 2-3: var_restart_max    (numeric: 0=free / 1=decommit / 2=preserve / 3=snapshot)
+//     bits 2-3: vmar_restart_max    (numeric: 0=free / 1=decommit / 2=preserve / 3=snapshot)
 //     bit  4:   pf_restart_max     (drop / keep)
 //     bit  5:   dr_restart_max     (drop / keep)
 //     bit  6:   port_restart_max   (drop / keep)
@@ -18,7 +18,7 @@
 //
 //   The runner (runner/primary.zig) installs ceilings_outer
 //   = 0x0000_003F_03FE_FFFF, so the test domain's restart_policy_ceiling
-//   sub-field = 0x03FE — ec_restart_max=2, var_restart_max=3, all type
+//   sub-field = 0x03FE — ec_restart_max=2, vmar_restart_max=3, all type
 //   bools=1.
 //
 //   We construct a `ceilings_outer` whose `restart_policy_ceiling`
@@ -91,7 +91,7 @@ pub fn main(cap_table_base: u64) void {
     const ceilings_inner: u64 = 0;
 
     // [3] ceilings_outer: build the violator. ec_outer_ceiling and
-    // var_outer_ceiling (bits 0-15) are zeroed (subsets); fut_wait_max
+    // vmar_outer_ceiling (bits 0-15) are zeroed (subsets); fut_wait_max
     // (bits 32-37) is zero (subset of caller's 63). The
     // restart_policy_ceiling sub-field at bits 16-31 has
     // ec_restart_max = 3, which exceeds the caller's ec_restart_max =
@@ -99,7 +99,7 @@ pub fn main(cap_table_base: u64) void {
     //
     // restart_policy_ceiling sub-field encoding:
     //   bits 0-1: ec_restart_max = 0b11 (= 3)   -> exceeds caller's 2
-    //   bits 2-3: var_restart_max = 0           -> subset
+    //   bits 2-3: vmar_restart_max = 0           -> subset
     //   bits 4-9: pf/dr/port/vm/idc/tm = 0      -> subsets
     //   bits 10-15: reserved = 0
     // = 0x0003

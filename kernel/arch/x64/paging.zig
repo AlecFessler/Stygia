@@ -15,8 +15,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
-const VarCacheType = zag.memory.var_range.CacheType;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarCacheType = zag.memory.vmar.CacheType;
+const VmarPageSize = zag.memory.vmar.PageSize;
 
 /// First user-mappable virtual address. The NULL guard `[0, 0x1000)` is
 /// reserved by spec §[address_space] so that NULL dereferences always
@@ -543,12 +543,12 @@ pub fn mapPageSized(
     addr_space_root: PAddr,
     phys: PAddr,
     virt: VAddr,
-    sz: VarPageSize,
-    cch: VarCacheType,
+    sz: VmarPageSize,
+    cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
     _ = cch;
-    // v0: only 4 KiB pages supported through the VAR-side map path.
+    // v0: only 4 KiB pages supported through the VMAR-side map path.
     // 2 MiB / 1 GiB landings go through `mapPageBoot` for the kernel
     // address space; userspace VARs are spec'd over 4 KiB throughout
     // the test runner so the simple fallback covers what the runner
@@ -560,7 +560,7 @@ pub fn mapPageSized(
 pub fn unmapPageSized(
     addr_space_root: PAddr,
     virt: VAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
 ) ?PAddr {
     std.debug.assert(sz == .sz_4k);
     return unmapPage(addr_space_root, virt);
@@ -587,7 +587,7 @@ pub fn allocAddrSpaceRoot() !PAddr {
 pub fn shootdownTlbRange(
     addr_space_id: u16,
     virt: VAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     _ = addr_space_id;

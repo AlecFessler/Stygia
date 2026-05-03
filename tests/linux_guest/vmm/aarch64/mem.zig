@@ -17,7 +17,7 @@ const syscall = lib.syscall;
 
 const HandleId = caps.HandleId;
 const PfCap = caps.PfCap;
-const VarCap = caps.VarCap;
+const VmarCap = caps.VmarCap;
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -47,18 +47,18 @@ pub fn allocPolicyPageFrame() ?HandleId {
     if (pf_r.v1 < 16) return null;
     const pf_handle: HandleId = @truncate(pf_r.v1 & 0xFFF);
 
-    const var_caps_word: u64 = @as(u64, (VarCap{
+    const var_caps_word: u64 = @as(u64, (VmarCap{
         .r = true,
         .w = true,
     }).toU16());
     const var_props: u64 = 0b011;
-    const var_r = syscall.createVar(var_caps_word, var_props, 1, 0, 0);
+    const var_r = syscall.createVmar(var_caps_word, var_props, 1, 0, 0);
     if (var_r.v1 < 16) return null;
-    const var_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(var_r.v1 & 0xFFF);
     const var_base: u64 = var_r.v2;
 
     const map_pairs = [_]u64{ 0, @as(u64, pf_handle) };
-    const map_r = syscall.mapPf(var_handle, &map_pairs);
+    const map_r = syscall.mapPf(vmar_handle, &map_pairs);
     if (map_r.v1 != 0) return null;
 
     const policy_ptr: [*]u8 = @ptrFromInt(var_base);
@@ -69,7 +69,7 @@ pub fn allocPolicyPageFrame() ?HandleId {
 
 /// Allocate guest RAM as a sequence of buddy-sized page_frames, install
 /// them contiguously at gpa GUEST_RAM_BASE..GUEST_RAM_BASE+size in the
-/// VM, and map a single local VAR over them so VMM-side @memcpy etc.
+/// VM, and map a single local VMAR over them so VMM-side @memcpy etc.
 /// see one flat host VA range.
 pub fn setupGuestMemory(size: u64) bool {
     const num_pages = size / PAGE_SIZE;
@@ -103,12 +103,12 @@ pub fn setupGuestMemory(size: u64) bool {
     }
 
     const total_local_pages = chunks_needed * CHUNK_PAGES;
-    const var_caps_word: u64 = @as(u64, (VarCap{
+    const var_caps_word: u64 = @as(u64, (VmarCap{
         .r = true,
         .w = true,
     }).toU16());
     const var_props: u64 = 0b011;
-    const var_r = syscall.createVar(var_caps_word, var_props, total_local_pages, 0, 0);
+    const var_r = syscall.createVmar(var_caps_word, var_props, total_local_pages, 0, 0);
     if (var_r.v1 < 16) return false;
     guest_ram_var = @truncate(var_r.v1 & 0xFFF);
     host_base = var_r.v2;

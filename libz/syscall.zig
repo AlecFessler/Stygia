@@ -53,7 +53,7 @@ pub const SyscallNum = enum(u12) {
     sync = 18,
     create_capability_domain = 19,
     acquire_ecs = 20,
-    acquire_vars = 21,
+    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -64,7 +64,7 @@ pub const SyscallNum = enum(u12) {
     perfmon_start = 29,
     perfmon_read = 30,
     perfmon_stop = 31,
-    create_var = 32,
+    create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
     unmap = 35,
@@ -248,8 +248,8 @@ pub fn acquireEcs(target: u12) RecvReturn {
     return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
-pub fn acquireVars(target: u12) RecvReturn {
-    const word = buildWord(.acquire_vars, 0);
+pub fn acquireVmars(target: u12) RecvReturn {
+    const word = buildWord(.acquire_vmars, 0);
     return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
 }
 
@@ -325,17 +325,17 @@ pub fn perfmonStop(target: u12) Regs {
 }
 
 // ---------------------------------------------------------------
-// 17..24: VAR ops
+// 17..24: VMAR ops
 // ---------------------------------------------------------------
 
-pub fn createVar(
+pub fn createVmar(
     caps: u64,
     props: u64,
     pages: u64,
     preferred_base: u64,
     device_region: u64,
 ) Regs {
-    return issueReg(.create_var, 0, .{
+    return issueReg(.create_vmar, 0, .{
         .v1 = caps,
         .v2 = props,
         .v3 = pages,
@@ -344,9 +344,9 @@ pub fn createVar(
     });
 }
 
-pub fn mapPf(var_handle: u12, pairs: []const u64) Regs {
+pub fn mapPf(vmar_handle: u12, pairs: []const u64) Regs {
     const n: u8 = @intCast(pairs.len / 2);
-    var in = Regs{ .v1 = var_handle };
+    var in = Regs{ .v1 = vmar_handle };
     if (pairs.len >= 1) in.v2 = pairs[0];
     if (pairs.len >= 2) in.v3 = pairs[1];
     if (pairs.len >= 3) in.v4 = pairs[2];
@@ -366,13 +366,13 @@ pub fn mapPf(var_handle: u12, pairs: []const u64) Regs {
     return issueReg(.map_pf, extra, in);
 }
 
-pub fn mapMmio(var_handle: u12, device_region: u12) Regs {
-    return issueReg(.map_mmio, 0, .{ .v1 = var_handle, .v2 = device_region });
+pub fn mapMmio(vmar_handle: u12, device_region: u12) Regs {
+    return issueReg(.map_mmio, 0, .{ .v1 = vmar_handle, .v2 = device_region });
 }
 
-pub fn unmap(var_handle: u12, selectors: []const u64) Regs {
+pub fn unmap(vmar_handle: u12, selectors: []const u64) Regs {
     const n: u8 = @intCast(selectors.len);
-    var in = Regs{ .v1 = var_handle };
+    var in = Regs{ .v1 = vmar_handle };
     if (selectors.len >= 1) in.v2 = selectors[0];
     if (selectors.len >= 2) in.v3 = selectors[1];
     if (selectors.len >= 3) in.v4 = selectors[2];
@@ -392,21 +392,21 @@ pub fn unmap(var_handle: u12, selectors: []const u64) Regs {
     return issueReg(.unmap, extra, in);
 }
 
-pub fn remap(var_handle: u12, new_cur_rwx: u64) Regs {
-    return issueReg(.remap, 0, .{ .v1 = var_handle, .v2 = new_cur_rwx });
+pub fn remap(vmar_handle: u12, new_cur_rwx: u64) Regs {
+    return issueReg(.remap, 0, .{ .v1 = vmar_handle, .v2 = new_cur_rwx });
 }
 
-pub fn snapshot(target_var: u12, source_var: u12) Regs {
-    return issueReg(.snapshot, 0, .{ .v1 = target_var, .v2 = source_var });
+pub fn snapshot(target_vmar: u12, source_vmar: u12) Regs {
+    return issueReg(.snapshot, 0, .{ .v1 = target_vmar, .v2 = source_vmar });
 }
 
-pub fn idcRead(var_handle: u12, offset: u64, count: u8) Regs {
-    return issueReg(.idc_read, extraCount(count), .{ .v1 = var_handle, .v2 = offset });
+pub fn idcRead(vmar_handle: u12, offset: u64, count: u8) Regs {
+    return issueReg(.idc_read, extraCount(count), .{ .v1 = vmar_handle, .v2 = offset });
 }
 
-pub fn idcWrite(var_handle: u12, offset: u64, qwords: []const u64) Regs {
+pub fn idcWrite(vmar_handle: u12, offset: u64, qwords: []const u64) Regs {
     const n: u8 = @intCast(qwords.len);
-    var in = Regs{ .v1 = var_handle, .v2 = offset };
+    var in = Regs{ .v1 = vmar_handle, .v2 = offset };
     if (qwords.len >= 1) in.v3 = qwords[0];
     if (qwords.len >= 2) in.v4 = qwords[1];
     if (qwords.len >= 3) in.v5 = qwords[2];

@@ -183,10 +183,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const elf_pf: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // Stage the ELF into a writable VAR mapping of the page frame
+    // Stage the ELF into a writable VMAR mapping of the page frame
     // (the kernel reads the page frame contents through physmap).
-    const stage_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const stage_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, stage_var_caps.toU16()),
         0b011,
         1,
@@ -217,7 +217,7 @@ pub fn main(cap_table_base: u64) void {
 
     // ceilings_inner (field0) — subset of the runner-granted ceilings.
     //   bits  0-7   ec_inner_ceiling   = 0x00 (no EC ops needed)
-    //   bits  8-23  var_inner_ceiling  = 0x0000
+    //   bits  8-23  vmar_inner_ceiling  = 0x0000
     //   bits 24-31  cridc_ceiling      = 0x00
     //   bits 32-39  pf_ceiling         = 0x00
     //   bits 40-47  vm_ceiling         = 0x00
@@ -227,7 +227,7 @@ pub fn main(cap_table_base: u64) void {
 
     // ceilings_outer (field1) — also a clean subset.
     //   bits  0-7   ec_outer_ceiling          = 0
-    //   bits  8-15  var_outer_ceiling         = 0
+    //   bits  8-15  vmar_outer_ceiling         = 0
     //   bits 16-31  restart_policy_ceiling    = 0
     //   bits 32-37  fut_wait_max              = 0
     //   bits 38-63  _reserved                 = 0

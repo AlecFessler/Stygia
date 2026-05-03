@@ -11,8 +11,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
-const VarPageSize = zag.memory.var_range.PageSize;
-const VarCacheType = zag.memory.var_range.CacheType;
+const VmarPageSize = zag.memory.vmar.PageSize;
+const VmarCacheType = zag.memory.vmar.CacheType;
 
 // ── Address Space Layout ────────────────────────────────────────────────
 // Architecture-specific virtual address space boundaries. These define
@@ -69,7 +69,7 @@ pub const user_null_guard: Range = .{
 };
 
 /// ASLR zone — kernel-chosen base, randomized at placement time. Used
-/// for ELF segments, EC stacks, and `create_var(preferred_base = 0)`.
+/// for ELF segments, EC stacks, and `create_vmar(preferred_base = 0)`.
 /// Spec §[address_space].
 pub const user_aslr: Range = switch (builtin.cpu.arch) {
     .x86_64 => .{
@@ -83,7 +83,7 @@ pub const user_aslr: Range = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Static zone — userspace-chosen base via `create_var(preferred_base
+/// Static zone — userspace-chosen base via `create_vmar(preferred_base
 /// != 0)`. Placement is deterministic. Spec §[address_space].
 pub const user_static: Range = switch (builtin.cpu.arch) {
     .x86_64 => .{
@@ -255,7 +255,7 @@ pub fn classifyRelocation(rtype: u32) RelocAction {
 }
 
 // ── Spec v3 paging primitives ────────────────────────────────────────
-// Fine-grained per-page mapping/invalidation surface used by VAR
+// Fine-grained per-page mapping/invalidation surface used by VMAR
 // install/unmap, page_frame mapcnt updates, and shootdown coordination.
 
 /// Map a single page of size `sz` at `virt → phys` with `cch` cache
@@ -264,8 +264,8 @@ pub fn mapPageSized(
     addr_space_root: PAddr,
     phys: PAddr,
     virt: VAddr,
-    sz: VarPageSize,
-    cch: VarCacheType,
+    sz: VmarPageSize,
+    cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
     switch (builtin.cpu.arch) {
@@ -280,7 +280,7 @@ pub fn mapPageSized(
 pub fn unmapPageSized(
     addr_space_root: PAddr,
     virt: VAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
 ) ?PAddr {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.unmapPageSized(addr_space_root, virt, sz),
@@ -320,7 +320,7 @@ pub fn allocAddrSpaceRoot() !PAddr {
 pub fn shootdownTlbRange(
     addr_space_id: u16,
     virt: VAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     switch (builtin.cpu.arch) {

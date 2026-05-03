@@ -7,7 +7,7 @@ const vtd = zag.arch.x64.intel.vtd;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 
 const IommuType = enum {
     none,
@@ -45,7 +45,7 @@ pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,
     phys: PAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
     _ = device;
@@ -59,7 +59,7 @@ pub fn iommuMapPage(
 pub fn iommuUnmapPage(
     device: *SpecDeviceRegion,
     iova: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
 ) ?PAddr {
     _ = device;
     _ = iova;
@@ -70,7 +70,7 @@ pub fn iommuUnmapPage(
 pub fn invalidateIotlbRange(
     device: *SpecDeviceRegion,
     iova: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     _ = device;

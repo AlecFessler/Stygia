@@ -7,7 +7,7 @@
 //   bit 2 = arm, "reconfiguring the timer via `timer_rearm`"). Mint a
 //   timer with full operational caps including `arm`, then `restrict`
 //   the handle down to caps without `arm`. Timer caps use the plain
-//   bitwise subset semantics (only `restart_policy` on EC/VAR handles
+//   bitwise subset semantics (only `restart_policy` on EC/VMAR handles
 //   uses the numeric ordering — see §[capabilities]), so dropping a
 //   single bit via restrict is well-defined.
 //

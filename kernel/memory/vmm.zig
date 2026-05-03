@@ -11,7 +11,7 @@ const PAddr = zag.memory.address.PAddr;
 const SlabRef = secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
-const VarCaps = zag.memory.var_range.VarCaps;
+const VmarCaps = zag.memory.vmar.VmarCaps;
 
 /// Per-VMM reservation cap. Reservations live in a sorted inline
 /// `[MAX_RESERVATIONS]SlabRef(VmNode)` array — lookups are
@@ -23,14 +23,14 @@ const VarCaps = zag.memory.var_range.VarCaps;
 pub const MAX_RESERVATIONS: usize = 256;
 
 /// Effective rwx for a private VMM node. Only the `r`/`w`/`x` bits of
-/// `VarCaps` are interpreted here — the rest of the VarCaps fields
+/// `VmarCaps` are interpreted here — the rest of the VmarCaps fields
 /// (move/copy/mmio/dma/restart_policy) have no meaning for an internal
 /// VMM node and are kept zero.
 pub const VmNode = extern struct {
     _gen_lock: GenLock = .{},
     start: VAddr,
     size: u64,
-    rights: VarCaps,
+    rights: VmarCaps,
     _pad: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
 
     pub fn end(self: *const VmNode) u64 {
@@ -40,7 +40,7 @@ pub const VmNode = extern struct {
     /// Populate every non-`_gen_lock` field of a freshly allocated node.
     /// Use this instead of `node.* = .{...}` — a whole-struct assignment
     /// would clobber the gen-lock word that the allocator just set.
-    pub fn init(self: *VmNode, start: VAddr, size: u64, rights: VarCaps) void {
+    pub fn init(self: *VmNode, start: VAddr, size: u64, rights: VmarCaps) void {
         self.start = start;
         self.size = size;
         self.rights = rights;

@@ -29,7 +29,7 @@
 //   the only remaining rejection path — it must fire and return E_INVAL.
 //
 //   Setting up the vCPU follows the same chain as create_vcpu_05 /
-//   create_vcpu_10: page frame backing a zero VmPolicy, a temporary VAR
+//   create_vcpu_10: page frame backing a zero VmPolicy, a temporary VMAR
 //   to write that policy from userspace, create_virtual_machine with
 //   `policy = 1`, a port to serve as the vCPU's exit_port, and finally
 //   create_vcpu. The vCPU's destination port for this test is a
@@ -50,7 +50,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
 //   3. Zero VM_POLICY_BYTES (all-zero counts ⇒ valid empty policy).
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
@@ -94,9 +94,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

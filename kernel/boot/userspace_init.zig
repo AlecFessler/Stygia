@@ -196,12 +196,12 @@ pub fn init(root_service_elf: []const u8) !void {
     // Spec §[capability_domain] root domain: ceilings_inner / ceilings_outer
     // are absolute upper bounds — root must be allowed to mint handles
     // with full caps in every type, otherwise the runner's own
-    // createPageFrame / createVar / createCapabilityDomain calls fail
+    // createPageFrame / createVmar / createCapabilityDomain calls fail
     // E_PERM against zero ceilings before the first test ever runs.
     //
     // Self-handle field0 layout per §[capability_domain] Self handle:
     //   bits  0-7   ec_inner_ceiling          = 0xFF
-    //   bits  8-23  var_inner_ceiling         = 0xFFFF
+    //   bits  8-23  vmar_inner_ceiling         = 0xFFFF
     //   bits 24-31  cridc_ceiling             = 0xFF
     //   bits 32-39  idc_rx                    = 0xFF
     //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
@@ -217,7 +217,7 @@ pub fn init(root_service_elf: []const u8) !void {
         (@as(u64, 0x1C) << 56);
     // ceilings_outer (field1):
     //   bits  0-7   ec_outer_ceiling           = 0xFF
-    //   bits  8-15  var_outer_ceiling          = 0xFF
+    //   bits  8-15  vmar_outer_ceiling          = 0xFF
     //   bits 16-31  restart_policy_ceiling     = 0xFFFF
     //   bits 32-37  fut_wait_max               = 63
     const root_field1_ceilings: u64 =
@@ -525,7 +525,7 @@ fn resolveOrSpawnRootEc(
     );
 
     // allocExecutionContext built an iret frame in kernel-mode (no user
-    // stack was wired through allocVar yet). Patch it for user mode.
+    // stack was wired through allocVmar yet). Patch it for user mode.
     arch.cpu.patchUserModeIretFrame(
         ec.ctx,
         entry,

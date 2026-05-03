@@ -5,7 +5,7 @@
 //
 // Strategy
 //   Drive create_virtual_machine down its success path with the same
-//   prelude as create_virtual_machine_06 (page frame + VAR + map_pf +
+//   prelude as create_virtual_machine_06 (page frame + VMAR + map_pf +
 //   zero VmPolicy buffer), but leave every num_* count at zero so the
 //   policy is a valid empty policy and the kernel takes neither the
 //   cpuid nor cr overflow branch. Reserved bits in [1] stay clean and
@@ -41,7 +41,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1).
-//   2. createVar(caps={r,w}, cur_rwx=0b011, pages=1) + mapPf at
+//   2. createVmar(caps={r,w}, cur_rwx=0b011, pages=1) + mapPf at
 //      offset 0 — gives userspace a CPU window into the policy frame.
 //   3. Zero the VmPolicy region (volatile to keep ReleaseSmall from
 //      folding the store away ahead of the kernel's read).
@@ -50,7 +50,7 @@
 //      {.policy=true}.
 //
 // Assertions
-//   1: setup — any of createPageFrame / createVar / mapPf failed.
+//   1: setup — any of createPageFrame / createVmar / mapPf failed.
 //   2: returned VM handle's caps field does not equal requested caps.
 
 const lib = @import("lib");
@@ -81,10 +81,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer the
+    // 2. VMAR + map_pf so userspace can zero the policy buffer the
     //    kernel will read on the create_virtual_machine path.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

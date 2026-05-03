@@ -23,15 +23,15 @@
 //
 // Action
 //   1. create_page_frame(pages=1, sz=0)
-//   2. create_var(pages=1, cur_rwx=rw)         — staging
+//   2. create_vmar(pages=1, cur_rwx=rw)         — staging
 //   3. map_pf(var, offset=0, pf)
-//   4. write Ehdr (ET_EXEC) + minimal Phdr into the VAR
+//   4. write Ehdr (ET_EXEC) + minimal Phdr into the VMAR
 //   5. delete(var)                              — drop staging map
 //   6. create_capability_domain(0,0,0, pf, []) — must return E_INVAL
 //
 // Assertions
 //   1: create_page_frame returned an error
-//   2: create_var returned an error
+//   2: create_vmar returned an error
 //   3: map_pf returned a non-OK status
 //   4: create_capability_domain didn't return E_INVAL
 
@@ -101,8 +101,8 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
-    const var_caps_word = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const var_caps_word = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         0b011,
         1,
@@ -113,10 +113,10 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const map_result = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const map_result = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -157,7 +157,7 @@ pub fn main(cap_table_base: u64) void {
         .p_align = 0x1000,
     };
 
-    _ = syscall.delete(var_handle);
+    _ = syscall.delete(vmar_handle);
 
     const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_ec_affinity
         &.{});

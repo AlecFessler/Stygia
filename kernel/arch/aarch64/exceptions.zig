@@ -59,7 +59,7 @@ const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
 const timer_wheel = zag.sched.timer;
 const timers = zag.arch.aarch64.timers;
-const var_range = zag.memory.var_range;
+const vmar = zag.memory.vmar;
 
 const VAddr = zag.memory.address.VAddr;
 
@@ -416,7 +416,7 @@ fn readFarEl1() u64 {
 ///   EC=0x24 (Data Abort from lower EL): page fault -- dispatch to fault handler.
 ///   EC=0x20 (Instruction Abort from lower EL): page fault -- dispatch to fault handler.
 ///   Others: route via `port.fireThreadFault` / `port.fireBreakpoint`.
-/// Intercept a data-abort that hit a userspace port-IO VAR (no PTEs
+/// Intercept a data-abort that hit a userspace port-IO VMAR (no PTEs
 /// installed → every access faults) and forward the access to the
 /// underlying port-IO device. Returns `true` when the fault was
 /// handled; the caller skips the generic page-fault router and ERETs.
@@ -442,7 +442,7 @@ fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
     const domain = ec_ptr.domain.ptr;
     const fault_va = VAddr.fromInt(readFarEl1());
 
-    const v = var_range.findVarCovering(domain, fault_va) orelse return false;
+    const v = vmar.findVmarCovering(domain, fault_va) orelse return false;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     const is_port_io = v.map == .mmio and v.device != null and
@@ -602,7 +602,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
         .data_abort_lower_el => {
             // Intercept port-IO virtual_bar faults from userspace before
-            // the generic handler routes them through the var_range
+            // the generic handler routes them through the vmar
             // page-fault dispatch (whose port_io decoder is currently
             // a stub on aarch64). Spec §[port_io_virtualization].
             // Mirrors the arch.x64.exceptions pageFaultHandler shortcut.

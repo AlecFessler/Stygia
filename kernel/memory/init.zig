@@ -14,7 +14,7 @@ const perfmon_mod = zag.sched.perfmon;
 const pmm = zag.memory.pmm;
 const port_mod = zag.sched.port;
 const timer_mod = zag.sched.timer;
-const var_range_mod = zag.memory.var_range;
+const vmar_mod = zag.memory.vmar;
 const virtual_machine_mod = zag.hv.virtual_machine;
 const vmm_mod = zag.memory.vmm;
 
@@ -201,10 +201,10 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.execution_context_slab_ptrs,
         KA.execution_context_slab_links,
     );
-    var_range_mod.initSlab(
-        KA.var_range_slab,
-        KA.var_range_slab_ptrs,
-        KA.var_range_slab_links,
+    vmar_mod.initSlab(
+        KA.vmar_slab,
+        KA.vmar_slab_ptrs,
+        KA.vmar_slab_links,
     );
     port_mod.initSlab(
         KA.port_slab,

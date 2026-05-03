@@ -41,7 +41,7 @@
 //   Setup chain:
 //     1. create_page_frame(caps={r,w}, props=0, pages=1) — backing
 //        store for the VmPolicy struct. 4 KiB > 976 bytes.
-//     2. create_var(caps={r,w}, props={cur_rwx=r|w}, pages=1) +
+//     2. create_vmar(caps={r,w}, props={cur_rwx=r|w}, pages=1) +
 //        map_pf at offset 0 — gives us a CPU-visible window into the
 //        page frame so we can plant the overflowed count.
 //     3. Zero the VmPolicy region, then write num_cpuid_responses =
@@ -63,7 +63,7 @@
 //
 // Assertions
 //   1: setup — create_page_frame returned an error word
-//   2: setup — create_var returned an error word
+//   2: setup — create_vmar returned an error word
 //   3: setup — map_pf returned non-OK in vreg 1
 //   4: create_virtual_machine returned a value other than E_INVAL
 //      (success path or any other error code is a spec violation —
@@ -119,10 +119,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can plant the policy bytes the
+    // 2. VMAR + map_pf so userspace can plant the policy bytes the
     //    kernel will read on the create_virtual_machine path.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

@@ -1,6 +1,6 @@
 // Spec §[port_io_virtualization] — test 06.
 //
-// "[test 06] a MOV access to `VAR.base + offset` with
+// "[test 06] a MOV access to `VMAR.base + offset` with
 //  `offset >= port_count` delivers a `memory_fault` event."
 //
 // DEGRADED SMOKE VARIANT
@@ -20,7 +20,7 @@
 //      could carve out.
 //
 //   2. A memory_fault event harness. Per §[port_io_virtualization],
-//      a CPU access whose computed offset (`fault_vaddr - VAR.base`)
+//      a CPU access whose computed offset (`fault_vaddr - VMAR.base`)
 //      falls outside `[0, port_count)` page-faults into the kernel,
 //      which then synthesises a `memory_fault` event rather than
 //      trapping into the in/out emulator. Observing that event from
@@ -30,8 +30,8 @@
 //      None of that scaffolding exists in this branch's runner.
 //
 //   Without (1), the kernel rejects map_mmio at §[map_mmio] test 02
-//   (E_BADCAP) before any port_io VAR can be installed. Without (2),
-//   even a successfully installed port_io VAR cannot deliver an
+//   (E_BADCAP) before any port_io VMAR can be installed. Without (2),
+//   even a successfully installed port_io VMAR cannot deliver an
 //   observable memory_fault back to the asserting test child — the
 //   kernel would synthesise the event and the test EC would be
 //   left waiting on a port that nothing in this runner is wired to
@@ -40,21 +40,21 @@
 //
 // Strategy (smoke prelude)
 //   Pin the prelude shape the eventual faithful test will reuse: a
-//   valid MMIO VAR exists in [1] with the construction §[var]
+//   valid MMIO VMAR exists in [1] with the construction §[var]
 //   requires when caps.mmio = 1, and a map_mmio call against it is
 //   issued. Per §[port_io_virtualization] a port_io device_region
-//   must be installed into a uc-cached MMIO VAR (cch = 1), so the
+//   must be installed into a uc-cached MMIO VMAR (cch = 1), so the
 //   prelude builds:
-//     - caps = {r, w, mmio} so the VAR is mmio-flagged
+//     - caps = {r, w, mmio} so the VMAR is mmio-flagged
 //       (§[map_mmio] test 03 closed).
 //     - props = {sz = 0 (4 KiB), cch = 1 (uc), cur_rwx = 0b011}
-//       — sz = 0 is required for caps.mmio = 1 (§[create_var] test
+//       — sz = 0 is required for caps.mmio = 1 (§[create_vmar] test
 //         08), cch = 1 (uc) is the only legal cache type for a
 //         port_io map_mmio, cur_rwx ⊆ caps.{r, w}.
-//     - pages = 1 — minimum-size MMIO VAR; once a port_io
+//     - pages = 1 — minimum-size MMIO VMAR; once a port_io
 //       device_region is forwarded, the faithful test would size
-//       the VAR to span at least `port_count` bytes (rounded up to
-//       a page) and then issue a MOV at `VAR.base + port_count` to
+//       the VMAR to span at least `port_count` bytes (rounded up to
+//       a page) and then issue a MOV at `VMAR.base + port_count` to
 //       trip the bounds check.
 //   Pass slot 4095 for [2]: per the create_capability_domain table
 //   layout that slot is guaranteed empty, so the kernel rejects with
@@ -62,10 +62,10 @@
 //   check arm of §[port_io_virtualization] test 06.
 //
 // Action
-//   1. createVar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
+//   1. createVmar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
 //                cur_rwx = 0b011}, pages = 1, preferred_base = 0,
 //                device_region = 0) — must succeed; gives a valid
-//      mmio-flagged VAR with cch = 1 (uc) sitting in `map = 0`.
+//      mmio-flagged VMAR with cch = 1 (uc) sitting in `map = 0`.
 //   2. mapMmio(mmio_var, 4095) — observed result is E_BADCAP
 //      (§[map_mmio] test 02), not the spec'd memory_fault event
 //      (§[port_io_virtualization] test 06). The smoke does not
@@ -75,7 +75,7 @@
 //   No assertion is checked — passes with assertion id 0 because
 //   the `offset >= port_count` arm is unreachable from a test
 //   child without (a) a forwarded port_io device_region installed
-//   into the VAR via map_mmio, and (b) a memory_fault event harness
+//   into the VMAR via map_mmio, and (b) a memory_fault event harness
 //   the test child can recv from. The test ELF still validates
 //   link/load plumbing in CI, and the prelude matches the eventual
 //   faithful test so that wiring a port_io device_region and an
@@ -101,7 +101,7 @@
 //     fault_port = forwarded event port bound to memory_fault
 //                  delivery for this domain
 //     pages = ceil(K / 0x1000)
-//     mmio_var = create_var(caps={r, w, mmio},
+//     mmio_var = create_vmar(caps={r, w, mmio},
 //                           props={sz = 0, cch = 1 (uc),
 //                                  cur_rwx = 0b011},
 //                           pages = pages, preferred_base = 0,
@@ -112,7 +112,7 @@
 //     // emulator is consulted, so the access never reaches a real
 //     // port — it raises memory_fault and userspace observes the
 //     // event via fault_port.
-//     volatile_load_u8(VAR.base + K)     -> raises memory_fault
+//     volatile_load_u8(VMAR.base + K)     -> raises memory_fault
 //     ev = recv(fault_port)              -> *expected* memory_fault
 //   That memory_fault observation is assertion id 1 in a faithful
 //   version. Symmetric variants (write at offset = K, MOV with
@@ -129,17 +129,17 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build a valid MMIO VAR — caps.mmio = 1, props.sz = 0, cch = 1
+    // Build a valid MMIO VMAR — caps.mmio = 1, props.sz = 0, cch = 1
     // (uc), caps.x = 0, caps.dma = 0 — the construction §[var]
-    // requires for an MMIO VAR. cch = 1 (uc) is mandatory for a
+    // requires for an MMIO VMAR. cch = 1 (uc) is mandatory for a
     // port_io map_mmio per §[port_io_virtualization]; the faithful
     // test 06 prelude installs a port_io device_region into a uc
-    // VAR before tripping the offset >= port_count bounds check.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    // VMAR before tripping the offset >= port_count bounds check.
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for port_io mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1

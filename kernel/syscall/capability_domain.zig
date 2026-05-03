@@ -36,7 +36,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///
 ///   [2] ceilings_inner: u64 packed as (matches self-handle field0)
 ///     bits  0-7:  ec_inner_ceiling
-///     bits  8-23: var_inner_ceiling:
+///     bits  8-23: vmar_inner_ceiling:
 ///                    bit  8:     move
 ///                    bit  9:     copy
 ///                    bits 10-12: r/w/x
@@ -61,10 +61,10 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///
 ///   [3] ceilings_outer: u64 packed as (matches self-handle field1)
 ///     bits  0-7: ec_outer_ceiling
-///     bits  8-15: var_outer_ceiling
+///     bits  8-15: vmar_outer_ceiling
 ///     bits 16-31: restart_policy_ceiling:
 ///                    bits 16-17: ec_restart_max     (kill / restart_at_entry / persist / _reserved)
-///                    bits 18-19: var_restart_max    (free / decommit / preserve / snapshot)
+///                    bits 18-19: vmar_restart_max    (free / decommit / preserve / snapshot)
 ///                    bit 20:     pf_restart_max     (drop / keep)
 ///                    bit 21:     dr_restart_max     (drop / keep)
 ///                    bit 22:     port_restart_max   (drop / keep)
@@ -108,8 +108,8 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
 /// [test 03] returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
 /// [test 04] returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
-/// [test 05] returns E_PERM if `var_inner_ceiling` is not a subset of the caller's `var_inner_ceiling`.
-/// [test 06] returns E_PERM if `var_outer_ceiling` is not a subset of the caller's `var_outer_ceiling`.
+/// [test 05] returns E_PERM if `vmar_inner_ceiling` is not a subset of the caller's `vmar_inner_ceiling`.
+/// [test 06] returns E_PERM if `vmar_outer_ceiling` is not a subset of the caller's `vmar_outer_ceiling`.
 /// [test 07] returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
 /// [test 08] returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
 /// [test 09] returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
@@ -129,8 +129,8 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 23] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
 /// [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 /// [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-/// [test 26] on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
-/// [test 27] on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
+/// [test 26] on success, the new domain's `ec_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+/// [test 27] on success, the new domain's `ec_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 /// [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
 /// [test 29] the initial EC begins executing at the entry point declared in the ELF header.
 /// [test 31] on success, the new domain's initial EC has affinity equal to `[5]`.
@@ -193,7 +193,7 @@ pub fn createCapabilityDomain(
     // caller's corresponding field on its self-handle field1. The
     // sub-field is partitioned per the syscall doc above:
     //   bits 16-17 ec_restart_max   (2-bit numeric, 0..3)
-    //   bits 18-19 var_restart_max  (2-bit numeric, 0..3)
+    //   bits 18-19 vmar_restart_max  (2-bit numeric, 0..3)
     //   bit 20     pf_restart_max   (bool)
     //   bit 21     dr_restart_max   (bool)
     //   bit 22     port_restart_max (bool)
@@ -210,12 +210,12 @@ pub fn createCapabilityDomain(
     const requested_rpc: u16 = @truncate((ceilings_outer >> 16) & 0xFFFF);
     const caller_ec_rmax: u2 = @truncate(caller_rpc & 0x3);
     const requested_ec_rmax: u2 = @truncate(requested_rpc & 0x3);
-    const caller_var_rmax: u2 = @truncate((caller_rpc >> 2) & 0x3);
-    const requested_var_rmax: u2 = @truncate((requested_rpc >> 2) & 0x3);
+    const caller_vmar_rmax: u2 = @truncate((caller_rpc >> 2) & 0x3);
+    const requested_vmar_rmax: u2 = @truncate((requested_rpc >> 2) & 0x3);
     const caller_bools: u8 = @truncate((caller_rpc >> 4) & 0x3F);
     const requested_bools: u8 = @truncate((requested_rpc >> 4) & 0x3F);
     if (requested_ec_rmax > caller_ec_rmax or
-        requested_var_rmax > caller_var_rmax or
+        requested_vmar_rmax > caller_vmar_rmax or
         (requested_bools & ~caller_bools) != 0)
     {
         cd_ref.unlockIrqRestore(irq_state);
@@ -312,7 +312,7 @@ pub fn acquireEcs(caller: *anyopaque, target: u64) i64 {
 /// excluded.
 ///
 /// ```
-/// acquire_vars([1] target) -> [1..N] handles
+/// acquire_vmars([1] target) -> [1..N] handles
 ///   syscall_num = 6
 ///
 ///   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
@@ -322,9 +322,9 @@ pub fn acquireEcs(caller: *anyopaque, target: u64) i64 {
 ///
 /// IDC cap required on [1]: `aqvr`.
 ///
-/// Each returned handle has caps = `target.var_outer_ceiling` ∩ the IDC's
-/// `var_cap_ceiling`. While in flight, all ECs in the target domain are
-/// paused — `acquire_vars` and the resulting `idc_read`/`idc_write`
+/// Each returned handle has caps = `target.vmar_outer_ceiling` ∩ the IDC's
+/// `vmar_cap_ceiling`. While in flight, all ECs in the target domain are
+/// paused — `acquire_vmars` and the resulting `idc_read`/`idc_write`
 /// traffic is intended as a debugger primitive, not a performance path.
 ///
 /// [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
@@ -332,9 +332,9 @@ pub fn acquireEcs(caller: *anyopaque, target: u64) i64 {
 /// [test 03] returns E_INVAL if any reserved bits are set in [1].
 /// [test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
 /// [test 05] on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
-/// [test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `var_outer_ceiling` intersected with the IDC's `var_cap_ceiling`.
+/// [test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `vmar_outer_ceiling` intersected with the IDC's `vmar_cap_ceiling`.
 /// [test 07] MMIO and DMA VARs in the target domain are not included in the returned handles.
-pub fn acquireVars(caller: *anyopaque, target: u64) i64 {
+pub fn acquireVmars(caller: *anyopaque, target: u64) i64 {
     return acquireDispatch(caller, target, .aqvr);
 }
 
@@ -343,7 +343,7 @@ pub fn acquireVars(caller: *anyopaque, target: u64) i64 {
 /// entry point handles enumeration.
 const AcquireKind = enum { aqec, aqvr };
 
-/// Shared trampoline body for `acquire_ecs` / `acquire_vars`. Both
+/// Shared trampoline body for `acquire_ecs` / `acquire_vmars`. Both
 /// validate the IDC handle, gate on the kind-specific cap bit, then
 /// hand off to caps.
 fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
@@ -371,6 +371,6 @@ fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
 
     return switch (kind) {
         .aqec => capability_domain.acquireEcs(ec, target),
-        .aqvr => capability_domain.acquireVars(ec, target),
+        .aqvr => capability_domain.acquireVmars(ec, target),
     };
 }

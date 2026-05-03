@@ -10,10 +10,10 @@
 //       byte length is the device_region's intrinsic size.
 //     - dev_type = 1 (port_io): `port_count` consecutive 1-byte ports
 //       starting at `base_port`, so size = port_count bytes (rounded
-//       up to a page for VAR-size comparison purposes; per
-//       §[port_io_virtualization] the kernel reserves the VAR's full
+//       up to a page for VMAR-size comparison purposes; per
+//       §[port_io_virtualization] the kernel reserves the VMAR's full
 //       page-aligned virtual range and faults on every access).
-//   With the device_region in hand, the test would build an MMIO VAR
+//   With the device_region in hand, the test would build an MMIO VMAR
 //   whose `pages × sz` does not match the device_region's size and
 //   confirm `map_mmio` returns E_INVAL.
 //
@@ -30,14 +30,14 @@
 //   the BADCAP/PERM lattice already covered by tests 01-03.
 //
 // Strategy (smoke prelude)
-//   Mirror map_mmio_03's MMIO-VAR construction so the prelude shape
+//   Mirror map_mmio_03's MMIO-VMAR construction so the prelude shape
 //   matches what a faithful test 05 would set up:
-//     - caps = {r, w, mmio} so the VAR is mmio-flagged (test 03 closed).
+//     - caps = {r, w, mmio} so the VMAR is mmio-flagged (test 03 closed).
 //     - props = {sz = 0 (4 KiB), cch = 1 (uc), cur_rwx = 0b011}
-//       — sz = 0 is required for caps.mmio = 1 (§[create_var] test 08),
-//         cch = 1 is required for mmio (§[create_var] test 09),
+//       — sz = 0 is required for caps.mmio = 1 (§[create_vmar] test 08),
+//         cch = 1 is required for mmio (§[create_vmar] test 09),
 //         cur_rwx ⊆ caps.{r, w}.
-//     - pages = 1 — minimum-size MMIO VAR; once a device_region is
+//     - pages = 1 — minimum-size MMIO VMAR; once a device_region is
 //       forwarded, the faithful test would either grow this to a
 //       deliberately mismatched page count or shrink the device_region
 //       to a different size and assert E_INVAL.
@@ -46,10 +46,10 @@
 //   E_BADCAP via test 02 instead of reaching test 05.
 //
 // Action
-//   1. createVar(caps={r, w, mmio}, props={sz = 0, cch = 1, cur_rwx =
+//   1. createVmar(caps={r, w, mmio}, props={sz = 0, cch = 1, cur_rwx =
 //                0b011}, pages = 1, preferred_base = 0,
 //                device_region = 0) — must succeed; gives a valid
-//      MMIO VAR sitting in `map = 0`.
+//      MMIO VMAR sitting in `map = 0`.
 //   2. mapMmio(mmio_var, 4095) — observed result is E_BADCAP
 //      (test 02), not the spec'd E_INVAL (test 05). The smoke does
 //      not assert the rejection code; it pins only the prelude shape.
@@ -70,7 +70,7 @@
 //   port_io) of a known byte size and forward it to the test child
 //   via passed_handles. The action then becomes:
 //     dev = forwarded device_region (size = S)
-//     create_var(caps={r, w, mmio}, props={sz = 0, cch = 1, cur_rwx =
+//     create_vmar(caps={r, w, mmio}, props={sz = 0, cch = 1, cur_rwx =
 //                0b011}, pages = P such that P * 0x1000 != S,
 //                preferred_base = 0, device_region = 0) -> mmio_var
 //     map_mmio(mmio_var, dev) -> *expected* E_INVAL via test 05
@@ -85,14 +85,14 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build a valid MMIO VAR so the prelude matches what a faithful
+    // Build a valid MMIO VMAR so the prelude matches what a faithful
     // test 05 would stage. caps.mmio = 1 forces props.sz = 0 and
-    // props.cch = 1 (uc); pages = 1 is the minimum-size MMIO VAR.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    // props.cch = 1 (uc); pages = 1 is the minimum-size MMIO VMAR.
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1

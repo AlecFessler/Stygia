@@ -9,12 +9,12 @@
 //   that span a domain-restart boundary:
 //
 //     pre-restart (live domain N):
-//       1. mint source VAR S with restart_policy = 2 (preserve), populate
+//       1. mint source VMAR S with restart_policy = 2 (preserve), populate
 //          S with a known sentinel pattern (e.g. fill with 0xA5A5A5A5...).
 //          Stability constraints (per spec line 1116-1117): S.cur_rwx.w
 //          = 0 at restart time, and for map=1 every backing page_frame
 //          has mapcnt = 1.
-//       2. mint target VAR T with restart_policy = 3 (snapshot), populate
+//       2. mint target VMAR T with restart_policy = 3 (snapshot), populate
 //          T with a *different* sentinel pattern (e.g. fill with
 //          0x5A5A5A5A...).
 //       3. snapshot(T, S) — bind S as T's restart-time source.
@@ -74,8 +74,8 @@
 //
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in a
-//   single test EC: mint S as a preserve-policy VAR, mint T as a
-//   snapshot-policy VAR, call `snapshot(T, S)` and verify it does not
+//   single test EC: mint S as a preserve-policy VMAR, mint T as a
+//   snapshot-policy VMAR, call `snapshot(T, S)` and verify it does not
 //   return an error word. That confirms the binding-establishment path
 //   wired into snapshot_07 (replacement) reaches the same dispatch
 //   green-light here, but stops short of the actual copy-on-restart
@@ -87,10 +87,10 @@
 //   content replacement) is unreachable from inside the child domain.
 //
 // Action
-//   1. createVar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives source VAR S in map=0.
-//   2. createVar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives target VAR T in map=0.
+//   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives source VMAR S in map=0.
+//   2. createVmar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives target VMAR T in map=0.
 //   3. snapshot(T, S) — *expected* success: the binding-establishment
 //      path is what snapshot_07 (and its v3 wiring) exercises. The
 //      copy-on-restart side effect that test 09 actually asserts is
@@ -131,12 +131,12 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Source VAR S: restart_policy = 2 (preserve), per spec line 1110.
+    // Source VMAR S: restart_policy = 2 (preserve), per spec line 1110.
     // Caps grant r|w so the source is materially populatable in the
     // faithful version; the smoke does not write to it.
-    const src_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 2 };
+    const src_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 2 };
     const src_props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const src = syscall.createVar(
+    const src = syscall.createVmar(
         @as(u64, src_caps.toU16()),
         src_props,
         1, // pages = 1
@@ -151,11 +151,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const src_handle: caps.HandleId = @truncate(src.v1 & 0xFFF);
 
-    // Target VAR T: restart_policy = 3 (snapshot), per spec line 1109.
+    // Target VMAR T: restart_policy = 3 (snapshot), per spec line 1109.
     // Same size as S so spec test 05 (size match) does not trip.
-    const dst_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 3 };
+    const dst_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 3 };
     const dst_props: u64 = 0b011; // cur_rwx = r|w; sz = 0; cch = 0
-    const dst = syscall.createVar(
+    const dst = syscall.createVmar(
         @as(u64, dst_caps.toU16()),
         dst_props,
         1, // pages = 1, matches S

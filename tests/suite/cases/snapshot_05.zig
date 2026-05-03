@@ -7,33 +7,33 @@
 //   The size-mismatch gate compares the byte size of the two VARs
 //   (`page_count` × `sz`). To isolate that gate we must let every
 //   prior §[snapshot] check pass:
-//     - test 01 / 02 (E_BADCAP): both args are valid VAR handles minted
-//       by `create_var`.
+//     - test 01 / 02 (E_BADCAP): both args are valid VMAR handles minted
+//       by `create_vmar`.
 //     - test 03 (E_INVAL): [1].caps.restart_policy must be 3 (snapshot).
 //     - test 04 (E_INVAL): [2].caps.restart_policy must be 2 (preserve).
 //     - test 06 (E_INVAL): no reserved bits set in [1] or [2] — handles
 //       carry only the requested cap bits.
 //   With those satisfied, the only remaining spec-mandated failure path
-//   is the size mismatch. VAR #1 reserves 1 × 4 KiB page; VAR #2
+//   is the size mismatch. VMAR #1 reserves 1 × 4 KiB page; VMAR #2
 //   reserves 2 × 4 KiB pages. Same page size, different page_count =
 //   different byte size → E_INVAL.
 //
-//   The root domain's `var_inner_ceiling` permits {r, w, max_sz=0} and
-//   its `restart_policy_ceiling.var_restart_max` is 3 (see
+//   The root domain's `vmar_inner_ceiling` permits {r, w, max_sz=0} and
+//   its `restart_policy_ceiling.vmar_restart_max` is 3 (see
 //   runner/primary.zig: ceilings_outer = 0x...03FE...), so both
 //   restart_policy values requested here are within bounds. mmio = 0
 //   and dma = 0 close off device-binding paths; preferred_base = 0 lets
 //   the kernel choose; cur_rwx = 0b011 matches caps.{r,w}; reserved
-//   bits stay clean (this also satisfies create_var test 17).
+//   bits stay clean (this also satisfies create_vmar test 17).
 //
 // Action
-//   1. createVar(caps={r,w,restart_policy=3}, props={cur_rwx=0b011,
+//   1. createVmar(caps={r,w,restart_policy=3}, props={cur_rwx=0b011,
 //                sz=0, cch=0}, pages=1, preferred_base=0,
-//                device_region=0) — must succeed (target VAR, 4 KiB).
-//   2. createVar(caps={r,w,restart_policy=2}, props={cur_rwx=0b011,
+//                device_region=0) — must succeed (target VMAR, 4 KiB).
+//   2. createVmar(caps={r,w,restart_policy=2}, props={cur_rwx=0b011,
 //                sz=0, cch=0}, pages=2, preferred_base=0,
-//                device_region=0) — must succeed (source VAR, 8 KiB).
-//   3. snapshot(target_var, source_var) — must return E_INVAL because
+//                device_region=0) — must succeed (source VMAR, 8 KiB).
+//   3. snapshot(target_vmar, source_vmar) — must return E_INVAL because
 //      the two VARs have different byte sizes.
 //
 // Assertion
@@ -49,11 +49,11 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Target VAR: restart_policy = 3 (snapshot), 1 × 4 KiB = 4 KiB.
-    const target_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 3 };
+    // Target VMAR: restart_policy = 3 (snapshot), 1 × 4 KiB = 4 KiB.
+    const target_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 3 };
     const props_4k: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
 
-    const cv_target = syscall.createVar(
+    const cv_target = syscall.createVmar(
         @as(u64, target_caps.toU16()),
         props_4k,
         1, // pages = 1 → 4 KiB
@@ -66,10 +66,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const target_handle: u12 = @truncate(cv_target.v1 & 0xFFF);
 
-    // Source VAR: restart_policy = 2 (preserve), 2 × 4 KiB = 8 KiB.
-    const source_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 2 };
+    // Source VMAR: restart_policy = 2 (preserve), 2 × 4 KiB = 8 KiB.
+    const source_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 2 };
 
-    const cv_source = syscall.createVar(
+    const cv_source = syscall.createVmar(
         @as(u64, source_caps.toU16()),
         props_4k,
         2, // pages = 2 → 8 KiB (different size from target)

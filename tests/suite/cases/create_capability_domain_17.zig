@@ -9,7 +9,7 @@
 //     [1] caps:           bits 24-63 _reserved
 //     [2] ceilings_inner: bits 56-63 _reserved (plus internal
 //                         reserved sub-fields, e.g. bits 17-23 in
-//                         var_inner_ceiling)
+//                         vmar_inner_ceiling)
 //     [3] ceilings_outer: bits 38-63 _reserved
 //     [5+] passed_handle: bits 12-15 and 33-63 _reserved
 //

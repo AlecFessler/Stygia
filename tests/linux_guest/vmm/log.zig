@@ -4,8 +4,8 @@
 /// the port-IO virtualization path: the bootloader hands the kernel a
 /// `device_region` for COM1 with `dev_type = port_io`; the kernel
 /// passes it into the root-service domain at create-time as a passed
-/// handle. We discover it by scanning the cap table, build an MMIO VAR
-/// over it via `map_mmio`, and 1-byte stores to the VAR's base address
+/// handle. We discover it by scanning the cap table, build an MMIO VMAR
+/// over it via `map_mmio`, and 1-byte stores to the VMAR's base address
 /// trap and emulate as `out (base_port + offset), al` per
 /// §[port_io_virtualization].
 ///
@@ -25,14 +25,14 @@ const COM1_PORT_COUNT: u16 = 8;
 
 var serial_base: ?[*]volatile u8 = null;
 
-/// Discover COM1 in the cap table, map an MMIO VAR over it, store the
+/// Discover COM1 in the cap table, map an MMIO VMAR over it, store the
 /// base for `print`/`hex*`/`dec` to use. Idempotent — repeated calls
 /// are no-ops once `serial_base` is set.
 pub fn init(cap_table_base: u64) void {
     if (serial_base != null) return;
     const dev = findCom1(cap_table_base) orelse return;
 
-    const var_caps_word = caps.VarCap{
+    const var_caps_word = caps.VmarCap{
         .r = true,
         .w = true,
         .mmio = true,
@@ -40,7 +40,7 @@ pub fn init(cap_table_base: u64) void {
     const props: u64 = (1 << 5) | // cch = 1 (uc)
         (0 << 3) | // sz = 0 (4 KiB)
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         props,
         1,
@@ -60,10 +60,10 @@ pub fn init(cap_table_base: u64) void {
     // `cvar.v1 <` and `lib.errors.isError` before flipping the
     // convention.
     if (cvar.v1 < 16) return;
-    const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const mm = syscall.mapMmio(var_handle, dev);
+    const mm = syscall.mapMmio(vmar_handle, dev);
     if (mm.v1 != 0) return;
 
     serial_base = @ptrFromInt(var_base);

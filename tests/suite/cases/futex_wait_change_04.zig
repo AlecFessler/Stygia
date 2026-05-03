@@ -22,15 +22,15 @@
 //
 //   Setup:
 //     1. createPageFrame(caps={r,w}, props=0, pages=1) — backing
-//        storage so the VAR has live, mapped bytes.
-//     2. createVar(caps={r,w}, props={cur_rwx=r|w, sz=0, cch=0},
-//        pages=1, preferred_base=0, device_region=0) — regular VAR
+//        storage so the VMAR has live, mapped bytes.
+//     2. createVmar(caps={r,w}, props={cur_rwx=r|w, sz=0, cch=0},
+//        pages=1, preferred_base=0, device_region=0) — regular VMAR
 //        whose base vaddr is reported in field0 (cvar.v2). With
 //        cur_rwx = r|w the kernel can resolve the vaddr to a paddr
 //        once we install a page_frame, defeating any future test 05
 //        ordering surprise.
 //     3. mapPf(var, &.{ 0, pf }) — install the page_frame at offset
-//        0 of the VAR; map transitions 0 -> 1.
+//        0 of the VMAR; map transitions 0 -> 1.
 //
 //   Action:
 //     futexWaitChange(timeout_ns = 0, pairs = .{ var_base + 1, 0 }).
@@ -41,7 +41,7 @@
 //     call from suspending if the alignment gate were skipped.
 //
 // Assertions
-//   1: a setup syscall returned an error (createPageFrame, createVar,
+//   1: a setup syscall returned an error (createPageFrame, createVmar,
 //      or mapPf) — the precondition for the assertion is broken so we
 //      cannot proceed.
 //   2: futex_wait_change did not return E_INVAL after passing a
@@ -58,7 +58,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Step 1: page_frame with caps = r|w. Provides backing storage
-    // for the VAR so the addr we later pass resolves to a real paddr.
+    // for the VMAR so the addr we later pass resolves to a real paddr.
     const pf_caps = caps.PfCap{ .r = true, .w = true };
     const cpf = syscall.createPageFrame(
         @as(u64, pf_caps.toU16()),
@@ -71,14 +71,14 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Step 2: regular VAR with caps = r|w and cur_rwx = r|w. The
+    // Step 2: regular VMAR with caps = r|w and cur_rwx = r|w. The
     // kernel chooses the base; field0 (cvar.v2) reports it. The base
     // is page-aligned (4 KiB), hence 8-byte aligned, so adding 1
     // produces a guaranteed-misaligned addr.
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         1, // pages = 1
         0, // preferred_base = kernel chooses
@@ -88,13 +88,13 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
     // Step 3: install the page_frame at offset 0. After this, CPU
-    // accesses to VAR.base[0..4096] hit the page_frame and the
+    // accesses to VMAR.base[0..4096] hit the page_frame and the
     // kernel can resolve vaddrs in that range to a paddr.
-    const mr = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const mr = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (errors.isError(mr.v1)) {
         testing.fail(1);
         return;

@@ -1347,7 +1347,7 @@ pub fn allocExecutionContext(
     // stack. The arch helper writes RIP=entry, RFLAGS=0x202 (IF set),
     // CS/SS=user-mode selectors, RSP=user stack top (or null when no
     // user stack — currently the case for v0 ECs that have not had
-    // their domain VMM allocate a stack VAR yet). When ustack is null
+    // their domain VMM allocate a stack VMAR yet). When ustack is null
     // the resulting frame still iret's, but to user RSP=0 — fine for
     // first-dispatch debugging since the panic shows up sooner than
     // an infinite hang.

@@ -1,6 +1,6 @@
 // Spec §[map_mmio] map_mmio — test 01.
 //
-// "[test 01] returns E_BADCAP if [1] is not a valid VAR handle."
+// "[test 01] returns E_BADCAP if [1] is not a valid VMAR handle."
 //
 // Strategy
 //   The child capability domain's table is populated by the kernel at
@@ -11,7 +11,7 @@
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid
-//   as a VAR handle.
+//   as a VMAR handle.
 //
 //   The §[map_mmio] gate order rejects an invalid [1] before
 //   consulting [2], so we can supply the same empty slot for both
@@ -20,7 +20,7 @@
 //
 // Action
 //   1. map_mmio(invalid_var_slot, invalid_dev_slot) — must return
-//      E_BADCAP because [1] (the VAR slot) is empty.
+//      E_BADCAP because [1] (the VMAR slot) is empty.
 //
 // Assertions
 //   1: map_mmio returned something other than E_BADCAP.

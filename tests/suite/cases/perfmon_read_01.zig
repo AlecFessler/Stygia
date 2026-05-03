@@ -19,7 +19,7 @@
 //   caps verbatim out of the read-only-mapped cap table, clear bit 6
 //   (`pmu`), and write that reduced word back via §[restrict]. Most
 //   SelfCap fields use plain bitwise subset semantics; the spec only
-//   pins numeric restart_policy ordering for EC and VAR handles
+//   pins numeric restart_policy ordering for EC and VMAR handles
 //   (§[capabilities] restrict tests 03/04). Every other bit stays
 //   identical, so neither the bitwise subset check nor any
 //   reserved-bit rejection can fire — restrict must succeed, and the

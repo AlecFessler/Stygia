@@ -14,7 +14,7 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 /// Per-VM emulated-device state held inline on `VirtualMachine.arch_devices`.
@@ -166,7 +166,7 @@ pub fn stage2MapPage(
     vm: *VirtualMachine,
     guest_phys: u64,
     host_phys: PAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
     _ = sz;
@@ -175,7 +175,7 @@ pub fn stage2MapPage(
     try vm_hw.mapGuestPage(ctrl_phys, guest_phys, host_phys, rights);
 }
 
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VmarPageSize) void {
     _ = sz;
     const ctrl_phys = ctrlPhysFor(vm) orelse return;
     vm_hw.unmapGuestPage(ctrl_phys, guest_phys);
@@ -184,7 +184,7 @@ pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) vo
 pub fn invalidateStage2Range(
     vm: *VirtualMachine,
     guest_phys: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     // `unmapGuestPage` already invokes INVEPT/INVNPT on the current core

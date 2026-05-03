@@ -6,5 +6,5 @@ pub const page_frame = @import("page_frame.zig");
 pub const paging = @import("paging.zig");
 pub const pmm = @import("pmm.zig");
 pub const stack = @import("stack.zig");
-pub const var_range = @import("var_range.zig");
+pub const vmar = @import("vmar.zig");
 pub const vmm = @import("vmm.zig");

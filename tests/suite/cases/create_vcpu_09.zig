@@ -96,7 +96,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset
 //      0 — gives userspace a CPU window into the policy frame.
 //   3. Zero the VmPolicy region.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf).
@@ -123,7 +123,7 @@
 //      vreg-by-vreg without an oracle).
 //
 // Assertions
-//   1: setup — createPageFrame / createVar / mapPf / createPort /
+//   1: setup — createPageFrame / createVmar / mapPf / createPort /
 //      createVcpu returned an error word.
 //   2: suspend on the vCPU EC handle returned something other than
 //      E_INVAL.
@@ -161,9 +161,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

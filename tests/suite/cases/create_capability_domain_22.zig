@@ -9,8 +9,8 @@
 //   mapped read-only into its own address space — the *parent* (this
 //   test) cannot reach across domain boundaries to read the child's
 //   slot 2 directly. The spec exposes no syscall that lets one domain
-//   peek at another's table contents (even `acquire_ecs` / `acquire_vars`
-//   only mint EC/VAR handles into the caller's table; they don't
+//   peek at another's table contents (even `acquire_ecs` / `acquire_vmars`
+//   only mint EC/VMAR handles into the caller's table; they don't
 //   inspect the target's slots). To run a faithful assertion the child
 //   ELF would have to read its own slot-2 cap, compare caps() to the
 //   `cridc_ceiling` it was created with, and report the result back
@@ -64,14 +64,14 @@
 //
 // Action
 //   1. create_page_frame(1 page)                       — must succeed
-//   2. create_var(r|w) and map the page frame          — must succeed
+//   2. create_vmar(r|w) and map the page frame          — must succeed
 //   3. write a minimal valid ELF64 header into the var — best effort
 //   4. delete the var (mirrors runner's reclaim pattern)
 //   5. call create_capability_domain with valid ceilings — must succeed
 //
 // Assertions
 //   1: create_page_frame returned an error word
-//   2: create_var returned an error word
+//   2: create_vmar returned an error word
 //   3: map_pf returned an error word
 //   4: create_capability_domain returned an error word (spec §[error_codes]
 //      values 1..15) instead of an IDC handle to the new domain
@@ -188,10 +188,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
-    // Map the page frame into a temporary VAR so we can write the
+    // Map the page frame into a temporary VMAR so we can write the
     // minimal ELF header into byte offset 0 of the page frame.
-    const var_caps_word = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const var_caps_word = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         0b011, // cur_rwx = r|w
         1,
@@ -202,10 +202,10 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const map_result = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const map_result = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -213,12 +213,12 @@ pub fn main(cap_table_base: u64) void {
 
     // Write the minimal valid ELF64 header into the staged page frame.
     // volatile so ReleaseSmall doesn't optimize away the writes (the
-    // kernel reads through a different VA after we delete the staging VAR).
+    // kernel reads through a different VA after we delete the staging VMAR).
     const dst: [*]volatile u8 = @ptrFromInt(var_base);
     writeMinimalElf64(dst);
 
-    // Reclaim the staging VAR (mirrors runner/primary.zig's pattern).
-    _ = syscall.delete(var_handle);
+    // Reclaim the staging VMAR (mirrors runner/primary.zig's pattern).
+    _ = syscall.delete(vmar_handle);
 
     // SelfCap subset of what the runner granted us. Strict subset so
     // [test 02] (E_PERM if self_caps not subset) cannot fire.

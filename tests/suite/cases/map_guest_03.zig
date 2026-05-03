@@ -6,7 +6,7 @@
 //   To isolate the N == 0 rejection from every other gate in
 //   §[map_guest] we need a real, valid VM handle so test 01
 //   (E_BADCAP for invalid VM) cannot fire first. Stage a VmPolicy
-//   page frame, map it through a VAR so userspace can zero the
+//   page frame, map it through a VMAR so userspace can zero the
 //   policy bytes, then create_virtual_machine with caps={.policy=true}
 //   exactly like create_vcpu_02 / map_guest_05. With a valid VM the
 //   only gate left for an empty pairs list is N == 0, which the spec
@@ -22,14 +22,14 @@
 //   guard intercepting it.
 //
 // Action
-//   1. Stage VmPolicy (PF + VAR + map_pf + zero).
+//   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
 //   2. createVirtualMachine — VM handle (or smoke-pass on E_NODEV).
 //   3. mapGuest(vm, &.{}) — must return E_INVAL.
 //
 // Assertions
 //   1: setup — create_page_frame for the policy frame returned an
 //      error word.
-//   2: setup — create_var for the policy mapping returned an error
+//   2: setup — create_vmar for the policy mapping returned an error
 //      word.
 //   3: setup — map_pf for the policy mapping returned non-OK.
 //   4: setup — create_virtual_machine returned an unexpected error
@@ -67,9 +67,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf_policy.v1 & 0xFFF);
 
-    // 2. VAR + map so userspace can zero the policy bytes.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map so userspace can zero the policy bytes.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

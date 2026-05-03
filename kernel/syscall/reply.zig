@@ -1,3 +1,4 @@
+const std = @import("std");
 const zag = @import("zag");
 
 const capability = zag.caps.capability;
@@ -62,24 +63,64 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 /// [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 /// [test 07] on success, the suspended EC is resumed.
 pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
-    // Spec §[reply]: syscall word claims bits 0-11 (syscall_num) and
-    // 12-23 (reply_handle_id). Bits 24-63 are reserved and must be zero
-    // on entry — test 02.
-    const REPLY_RESERVED_MASK: u64 = ~@as(u64, 0xFFFFFF);
+    // Spec §[reply] unified syscall word:
+    //   bits  0-11: syscall_num
+    //   bits 12-19: pair_count (0..63; 0 = bare reply)
+    //   bits 20-31: reply_handle_id
+    //   bits 32-43: recv_port_handle_id (0 = no recv mode)
+    //   bits 44-63: _reserved (must be 0 — test 02)
+    const REPLY_RESERVED_MASK: u64 = ~@as(u64, 0xFFFFFFFFFFF);
     if (syscall_word & REPLY_RESERVED_MASK != 0) return errors.E_INVAL;
 
-    const reply_handle: u64 = (syscall_word >> 12) & 0xFFF;
+    const pair_count: u8 = @truncate((syscall_word >> 12) & 0xFF);
+    const reply_handle: u64 = (syscall_word >> 20) & 0xFFF;
+    const recv_port: u64 = (syscall_word >> 32) & 0xFFF;
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const slot: u12 = @truncate(reply_handle);
 
-    const cd_ref = ec.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const entry_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
-    cd_ref.unlockIrqRestore(lr.irq_state);
-    if (!entry_present) return errors.E_BADCAP;
+    // Test 10 — pair_count range. 0 is the bare-reply path.
+    if (@as(usize, pair_count) > MAX_PAIR_COUNT) return errors.E_INVAL;
 
-    return port.reply(ec, reply_handle);
+    if (recv_port != 0) {
+        const port_slot: u12 = @truncate(recv_port);
+        const cd_ref_p = ec.domain;
+        const lr_p = cd_ref_p.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const cd_p = lr_p.ptr;
+        const entry_p = capability.resolveHandleOnDomain(cd_p, port_slot, .port);
+        var has_recv = false;
+        if (entry_p != null) {
+            const port_caps_word: u16 = @truncate(Word0.caps(cd_p.user_table[port_slot].word0));
+            const port_caps: port.PortCaps = @bitCast(port_caps_word);
+            has_recv = port_caps.recv;
+        }
+        cd_ref_p.unlockIrqRestore(lr_p.irq_state);
+        if (entry_p == null) return errors.E_BADCAP;
+        if (!has_recv) return errors.E_PERM;
+    }
+
+    const reply_result = if (pair_count > 0)
+        replyTransferInternal(ec, syscall_word, pair_count)
+    else blk: {
+        const slot: u12 = @truncate(reply_handle);
+        const cd_ref = ec.domain;
+        const lr = cd_ref.lockIrqSave(@src()) catch break :blk errors.E_BADCAP;
+        const cd = lr.ptr;
+        const entry_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
+        cd_ref.unlockIrqRestore(lr.irq_state);
+        if (!entry_present) break :blk errors.E_BADCAP;
+        break :blk port.reply(ec, reply_handle);
+    };
+
+    if (reply_result != errors.OK) return reply_result;
+
+    if (recv_port != 0) {
+        // Spec §[reply] tests 24/26: atomic recv-after-reply parks the
+        // caller on the named port for the next event. The recv contract's
+        // return word + vregs ride out via the iretq epilogue (port.recv
+        // stages `pending_event_word` on synchronous match or suspend).
+        return port.recv(ec, recv_port, 0);
+    }
+
+    return errors.OK;
 }
 
 /// Consumes a reply handle, resumes the suspended EC, and attaches N
@@ -120,18 +161,14 @@ pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended EC is resumed.
-pub fn replyTransfer(caller: *anyopaque, syscall_word: u64, n: u8) i64 {
-    // Spec §[reply_transfer]: syscall word claims bits 0-11 (syscall_num),
-    // 12-19 (N), and 20-31 (reply_handle_id). Bits 32-63 are reserved
-    // and must be zero on entry — test 04a.
-    const RT_RESERVED_MASK: u64 = ~@as(u64, 0xFFFFFFFF);
-    if (syscall_word & RT_RESERVED_MASK != 0) return errors.E_INVAL;
-
-    // Spec §[reply].reply_transfer test 03: N range.
-    if (@as(usize, n) < MIN_PAIR_COUNT or @as(usize, n) > MAX_PAIR_COUNT) return errors.E_INVAL;
+fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8) i64 {
+    // Caller (`reply`) already validated the unified-syscall reserved
+    // bits (44-63) and N ≤ 63. N == 0 is the bare-reply path and never
+    // reaches here.
+    std.debug.assert(n > 0 and @as(usize, n) <= MAX_PAIR_COUNT);
 
     const reply_handle: u64 = (syscall_word >> 20) & 0xFFF;
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const ec: *ExecutionContext = caller;
     const slot: u12 = @truncate(reply_handle);
 
     // Pre-resolve the reply handle so test 02 (xfer cap) can fire

@@ -4,9 +4,9 @@
 //  demand-allocated pages are removed and `map` is set to 0."
 //
 // Strategy
-//   Build a regular VAR (caps.mmio = 0, caps.dma = 0) starting at
+//   Build a regular VMAR (caps.mmio = 0, caps.dma = 0) starting at
 //   `map = 0` per §[var] line 877, then drive it to `map = 1` via a
-//   single map_pf installation. Per §[map_pf] test 14, the VAR
+//   single map_pf installation. Per §[map_pf] test 14, the VMAR
 //   handle's field0/field1 snapshot is refreshed from the kernel's
 //   authoritative state on every map_pf call, so a readCap right
 //   after mapPf observes `map = 1` without needing an explicit sync.
@@ -29,9 +29,9 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — pf.
-//   2. createVar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
+//   2. createVmar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
 //                pages=2, preferred_base=0, device_region=0) — must
-//      succeed; gives a regular VAR in `map = 0`.
+//      succeed; gives a regular VMAR in `map = 0`.
 //   3. mapPf(var, &.{ 0, pf }) — must succeed, drives `map = 1`.
 //   4. readCap(self) — confirm `map` field is 1 before unmap.
 //   5. unmap(var, &.{}) — N = 0, "unmap everything"; must succeed.
@@ -39,7 +39,7 @@
 //      under test).
 //
 // Assertions
-//   1: setup failed — createPageFrame, createVar, mapPf returned an
+//   1: setup failed — createPageFrame, createVmar, mapPf returned an
 //      error, or the post-mapPf snapshot did not show `map = 1`, or
 //      the unmap call itself returned an error.
 //   2: after `unmap(var, &.{})` (N = 0, unmap everything), field1
@@ -75,15 +75,15 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Regular VAR: caps.mmio = 0, caps.dma = 0; per §[var] line 877
+    // Regular VMAR: caps.mmio = 0, caps.dma = 0; per §[var] line 877
     // it starts at `map = 0`. Two pages so the spec phrasing "all
     // installations" has more than the bare minimum to remove (the
     // assertion is "everything is gone, map = 0", and starting from
-    // a multi-page VAR makes the empty-selector contract explicit).
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    // a multi-page VMAR makes the empty-selector contract explicit).
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         2,
         0,
@@ -93,18 +93,18 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
     // Drive `map = 0 -> 1` with a single map_pf installation at
     // offset 0. Per §[map_pf] test 14, the snapshot in the cap table
     // is refreshed as a side effect of this call.
-    const r_map = syscall.mapPf(var_handle, &.{ 0, pf });
+    const r_map = syscall.mapPf(vmar_handle, &.{ 0, pf });
     if (errors.isError(r_map.v1)) {
         testing.fail(1);
         return;
     }
 
-    const cap_pre = caps.readCap(cap_table_base, var_handle);
+    const cap_pre = caps.readCap(cap_table_base, vmar_handle);
     if (mapField(cap_pre.field1) != 1) {
         testing.fail(1);
         return;
@@ -113,7 +113,7 @@ pub fn main(cap_table_base: u64) void {
     // The assertion under test: with N = 0 (empty selector list,
     // syscall word bits 12-19 = 0), unmap removes "all installations
     // or demand-allocated pages" and sets `map` to 0.
-    const r_unmap = syscall.unmap(var_handle, &.{});
+    const r_unmap = syscall.unmap(vmar_handle, &.{});
     if (errors.isError(r_unmap.v1)) {
         testing.fail(1);
         return;
@@ -122,7 +122,7 @@ pub fn main(cap_table_base: u64) void {
     // Per §[unmap] test 12, field0/field1 are refreshed from the
     // kernel's authoritative state as a side effect of every unmap
     // call, so this readCap observes the post-unmap snapshot.
-    const cap_post = caps.readCap(cap_table_base, var_handle);
+    const cap_post = caps.readCap(cap_table_base, vmar_handle);
     if (mapField(cap_post.field1) != 0) {
         testing.fail(2);
         return;

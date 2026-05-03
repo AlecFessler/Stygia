@@ -1,16 +1,16 @@
 // Spec §[port_io_virtualization] — test 08.
 //
-// "[test 08] a MOV store when `VAR.cur_rwx.w = 0` delivers a
+// "[test 08] a MOV store when `VMAR.cur_rwx.w = 0` delivers a
 //  `memory_fault` event."
 //
 // DEGRADED SMOKE VARIANT
 //   This assertion turns on the kernel's port-IO MOV decoder
 //   observing the faulting CPU access, intersecting the requested
-//   access type (write) with `VAR.cur_rwx`, and — when the write
+//   access type (write) with `VMAR.cur_rwx`, and — when the write
 //   bit is clear — delivering a `memory_fault` event to the EC's
 //   bound event port instead of executing an `out`. Per
 //   §[port_io_virtualization] effective permissions follow
-//   `VAR.cur_rwx`: a write MOV when `cur_rwx.w = 0` is rejected
+//   `VMAR.cur_rwx`: a write MOV when `cur_rwx.w = 0` is rejected
 //   with `memory_fault`, mirroring the analogous read-side
 //   rejection in test 07.
 //
@@ -30,7 +30,7 @@
 //      platform analogue the runner could carve out. Without a
 //      real port_io device_region in [2], `map_mmio` rejects at
 //      §[map_mmio] test 02 (E_BADCAP) before the kernel ever has
-//      a port-IO range installed in the VAR's address space, so
+//      a port-IO range installed in the VMAR's address space, so
 //      no MOV against that range can be issued.
 //
 //   2. No `memory_fault` event harness exists in the test child.
@@ -45,11 +45,11 @@
 //      `testing.pass(1)`.
 //
 //   With both legs blocked, the strict test 08 path
-//   (write-disabled VAR + port_io device_region + MOV store +
+//   (write-disabled VMAR + port_io device_region + MOV store +
 //   event-port observation of memory_fault) cannot be exercised
 //   end-to-end here. This smoke variant pins only the prelude
 //   shape the eventual faithful test will reuse: an MMIO-flagged
-//   VAR with `cur_rwx.w = 0` exists in [1], and a `map_mmio`
+//   VMAR with `cur_rwx.w = 0` exists in [1], and a `map_mmio`
 //   call against it is issued. The gate-order rejection on the
 //   x86-64 host (E_BADCAP via §[map_mmio] test 02 when [2] is an
 //   empty slot) confirms the call site is wired up; the
@@ -57,21 +57,21 @@
 //   assertion targets is not asserted.
 //
 // Strategy (smoke prelude)
-//   Build an MMIO-flagged VAR whose `cur_rwx` has the write bit
+//   Build an MMIO-flagged VMAR whose `cur_rwx` has the write bit
 //   clear so the prelude shape matches what a faithful test 08
 //   would set up:
-//     - caps = {r, w, mmio} so the VAR is mmio-flagged
+//     - caps = {r, w, mmio} so the VMAR is mmio-flagged
 //       (§[map_mmio] test 03 closed) and `w` is in caps so
-//       cur_rwx is permitted to drop it (§[create_var] test 16
+//       cur_rwx is permitted to drop it (§[create_vmar] test 16
 //       requires cur_rwx ⊆ caps.{r, w, x}).
 //     - props = {sz = 0 (4 KiB), cch = 1 (uc), cur_rwx = 0b001}
-//       — sz = 0 is required for caps.mmio = 1 (§[create_var]
-//         test 08), cch = 1 (uc) is required for an MMIO VAR per
+//       — sz = 0 is required for caps.mmio = 1 (§[create_vmar]
+//         test 08), cch = 1 (uc) is required for an MMIO VMAR per
 //         §[var], cur_rwx = 0b001 (r-only) is the configuration
 //         the faithful test asserts the write rejection against.
-//     - pages = 1 — minimum-size MMIO VAR; once a port_io
+//     - pages = 1 — minimum-size MMIO VMAR; once a port_io
 //       device_region is forwarded, the faithful test would size
-//       the VAR to match that device_region's port_count
+//       the VMAR to match that device_region's port_count
 //       (rounded up to a page).
 //   Pass slot 4095 for [2]: per the create_capability_domain
 //   table layout that slot is guaranteed empty, so the kernel
@@ -79,10 +79,10 @@
 //   reaching the port-IO MOV-decoder path.
 //
 // Action
-//   1. createVar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
+//   1. createVmar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
 //                cur_rwx = 0b001}, pages = 1, preferred_base = 0,
 //                device_region = 0) — must succeed; gives a valid
-//      mmio-flagged VAR with cur_rwx.w = 0 sitting in `map = 0`.
+//      mmio-flagged VMAR with cur_rwx.w = 0 sitting in `map = 0`.
 //   2. mapMmio(mmio_var, 4095) — observed result is E_BADCAP
 //      (§[map_mmio] test 02), not the spec'd memory_fault event
 //      (§[port_io_virtualization] test 08). The smoke does not
@@ -97,7 +97,7 @@
 //   the eventual faithful test so that wiring a port_io
 //   device_region into the runner and binding the test EC's event
 //   port lets the assertion id 1 step in without re-deriving the
-//   VAR construction.
+//   VMAR construction.
 //
 // Faithful-test note
 //   Faithful test deferred pending two independent runner
@@ -118,7 +118,7 @@
 //
 //   With both in place, the action becomes:
 //     pio = forwarded port_io device_region (port_count = K)
-//     create_var(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
+//     create_vmar(caps={r, w, mmio}, props={sz = 0, cch = 1 (uc),
 //                cur_rwx = 0b001}, pages = ceil(K / 0x1000),
 //                preferred_base = 0, device_region = 0) -> mmio_var
 //     map_mmio(mmio_var, pio) -> success
@@ -135,7 +135,7 @@
 //
 //   Until then, this file holds the prelude verbatim so the
 //   eventual faithful version can graft on the MOV + event-port
-//   observation without re-deriving the MMIO-VAR construction.
+//   observation without re-deriving the MMIO-VMAR construction.
 
 const lib = @import("lib");
 
@@ -146,20 +146,20 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build an MMIO-flagged VAR with cur_rwx.w = 0. caps.mmio = 1
-    // forces props.sz = 0 (§[create_var] test 08); cch = 1 (uc) is
-    // required for an MMIO VAR per §[var]; cur_rwx = 0b001 (r-only)
+    // Build an MMIO-flagged VMAR with cur_rwx.w = 0. caps.mmio = 1
+    // forces props.sz = 0 (§[create_vmar] test 08); cch = 1 (uc) is
+    // required for an MMIO VMAR per §[var]; cur_rwx = 0b001 (r-only)
     // is the configuration the faithful §[port_io_virtualization]
-    // test 08 turns on; pages = 1 is the minimum-size MMIO VAR.
+    // test 08 turns on; pages = 1 is the minimum-size MMIO VMAR.
     // caps must include `w` so cur_rwx is permitted to *drop* it
-    // (cur_rwx ⊆ caps.{r, w, x} per §[create_var] test 16); the
+    // (cur_rwx ⊆ caps.{r, w, x} per §[create_vmar] test 16); the
     // write capability is present on the handle but cleared in
     // cur_rwx for this test.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b001; // cur_rwx = r only; w cleared to arm the rejection
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1

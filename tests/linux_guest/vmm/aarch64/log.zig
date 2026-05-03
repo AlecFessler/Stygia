@@ -2,7 +2,7 @@
 //!
 //! On boot the kernel passes an MMIO device_region for the host PL011
 //! UART (QEMU virt machine UART0 @ 0x09000000) into root_service's cap
-//! table. `init` scans for it, allocates a VAR with the `mmio` cap,
+//! table. `init` scans for it, allocates a VMAR with the `mmio` cap,
 //! `mapMmio`s the device into it, and pins the resulting host VA so
 //! `print`/`hex*`/`dec` and `pl011.bindTxSink` can write bytes that
 //! end up on QEMU's `-serial stdio`.
@@ -28,7 +28,7 @@ pub fn init(cap_table_base: u64) void {
     if (sink != null) return;
     const dev = findPl011(cap_table_base) orelse return;
 
-    const var_caps_word = caps.VarCap{
+    const var_caps_word = caps.VmarCap{
         .r = true,
         .w = true,
         .mmio = true,
@@ -36,7 +36,7 @@ pub fn init(cap_table_base: u64) void {
     const props: u64 = (1 << 5) | // cch = 1 (uc)
         (0 << 3) | // sz = 0 (4 KiB)
         0b011; // cur_rwx = r|w
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         props,
         1,
@@ -44,10 +44,10 @@ pub fn init(cap_table_base: u64) void {
         0,
     );
     if (cvar.v1 < 16) return;
-    const var_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    const mm = syscall.mapMmio(var_handle, dev);
+    const mm = syscall.mapMmio(vmar_handle, dev);
     if (mm.v1 != 0) return;
 
     sink = @ptrFromInt(var_base);

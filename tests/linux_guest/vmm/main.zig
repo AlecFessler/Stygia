@@ -3,10 +3,10 @@
 //! Spec-v3 port. The lifecycle:
 //!   1. Discover COM1 device_region (log.init).
 //!   2. Allocate a page_frame for the VmPolicy struct; map it locally
-//!      via createVar + mapPf so we can write the policy bytes.
+//!      via createVmar + mapPf so we can write the policy bytes.
 //!   3. createVirtualMachine(caps, policy_pf).
 //!   4. mem.setupGuestMemory: createPageFrame for guest RAM; map_guest
-//!      into the VM at gpa 0; createVar + mapPf locally so the VMM can
+//!      into the VM at gpa 0; createVmar + mapPf locally so the VMM can
 //!      read/write guest memory by host VA.
 //!   5. Optional: vm_set_policy to seed CPUID + CR tables (skipped for
 //!      now; all CPUID/CR exits route to userspace).

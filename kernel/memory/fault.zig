@@ -11,7 +11,7 @@ const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const sync_debug = zag.utils.sync.debug;
-const var_range = zag.memory.var_range;
+const vmar = zag.memory.vmar;
 
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
@@ -51,7 +51,7 @@ fn demandPageKernel(faulting_virt: VAddr) void {
 }
 
 /// Translate (is_write, is_exec) into the rwx triple consumed by
-/// `var_range.handlePageFault` (R=1, W=2, X=4 per spec §[var]).
+/// `vmar.handlePageFault` (R=1, W=2, X=4 per spec §[var]).
 fn accessRwx(is_write: bool, is_exec: bool) u3 {
     if (is_exec) return 0b100;
     if (is_write) return 0b010;
@@ -152,12 +152,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     };
     const dom = dom_lr.ptr;
 
-    const rc = var_range.handlePageFault(dom, faulting_virt, accessRwx(is_write, is_exec));
+    const rc = vmar.handlePageFault(dom, faulting_virt, accessRwx(is_write, is_exec));
     dom_ref.unlockIrqRestore(dom_lr.irq_state);
 
-    // Spec v3 var_range.handlePageFault returns 0 on a resolved fault
+    // Spec v3 vmar.handlePageFault returns 0 on a resolved fault
     // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero
-    // return — E_BADADDR (no covering VAR), E_PERM (rights mismatch),
+    // return — E_BADADDR (no covering VMAR), E_PERM (rights mismatch),
     // E_NOMEM (demand alloc exhausted) — routes through the EC's
     // memory_fault event. fireMemoryFault either suspends the EC on the
     // bound port or applies the no-route fallback (restart or destroy

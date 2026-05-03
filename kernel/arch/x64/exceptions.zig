@@ -13,7 +13,7 @@ const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
-const var_range = zag.memory.var_range;
+const vmar = zag.memory.vmar;
 
 const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
@@ -21,7 +21,7 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const VAR = zag.memory.var_range.VAR;
+const VMAR = zag.memory.vmar.VMAR;
 const VAddr = zag.memory.address.VAddr;
 
 /// thread_fault sub-codes for exception-derived faults (spec §[event_type]
@@ -336,7 +336,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     const from_user = (ctx.cs & ring_3) == ring_3;
 
     // Intercept port-IO virtual_bar faults from userspace before the
-    // generic handler. A VAR mapped via `map_mmio` to a port-IO
+    // generic handler. A VMAR mapped via `map_mmio` to a port-IO
     // device_region intentionally has no PTEs — every CPU access faults
     // and the kernel decodes the MOV, performs the port I/O on behalf
     // of the EC, and advances RIP. Spec §[port_io_virtualization].
@@ -346,7 +346,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         // caller-pinned: currentEc() runs on this core; its bound
         // capability domain is alive across this PF handler.
         const domain = ec.domain.ptr;
-        if (var_range.findVarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
+        if (vmar.findVmarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
             const v_irq = v._gen_lock.lockIrqSave(@src());
             const is_port_io = v.map == .mmio and
                 v.device != null and
@@ -371,7 +371,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     zag.memory.fault.handlePageFault(&pf_ctx);
 }
 
-/// Emulate a port I/O access through a port-IO VAR.
+/// Emulate a port I/O access through a port-IO VMAR.
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
 ///
@@ -383,17 +383,17 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 fn emulateVirtualBar(
     ctx: *cpu.Context,
     ec: *ExecutionContext,
-    v: *VAR,
+    v: *VMAR,
     faulting_addr: u64,
     domain: *CapabilityDomain,
 ) void {
     // Snapshot under the lock then release before any path that may
     // suspend or terminate `ec`: the fault-routing handlers may unwind
-    // through the scheduler and never return here, so holding the VAR
+    // through the scheduler and never return here, so holding the VMAR
     // lock across them would strand the gen and deadlock any future
     // walk of the domain's vars[]. The DeviceRegion pointer is stable
     // for the kernel's lifetime once bound and `base_vaddr` is
-    // immutable on the VAR, so the snapshot is safe to use unlocked.
+    // immutable on the VMAR, so the snapshot is safe to use unlocked.
     const v_irq = v._gen_lock.lockIrqSave(@src());
     // caller-pinned: device ref under v's gen-lock; the DeviceRegion is
     // stable for the kernel's lifetime once bound.

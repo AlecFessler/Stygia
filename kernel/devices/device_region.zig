@@ -1,6 +1,6 @@
 //! Spec-v3 device_region object. A reference to a physical device's MMIO
 //! region or x86-64 I/O port range. Holders use it to install device
-//! memory into a VAR, take IRQs, and (with the `dma` cap) authorize an
+//! memory into a VMAR, take IRQs, and (with the `dma` cap) authorize an
 //! IOMMU mapping. Spec §[device_region] §[device_irq]
 //! §[port_io_virtualization].
 

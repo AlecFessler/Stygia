@@ -3,7 +3,7 @@
 //! capability domains creates shared memory. See spec §[page_frame].
 //!
 //! Refcount lifetime — total handles across all capability domains
-//! plus VAR installations keep the underlying physical pages alive.
+//! plus VMAR installations keep the underlying physical pages alive.
 //! When the last handle drops the physical memory returns to the free
 //! pool.
 
@@ -15,7 +15,7 @@ const capability = zag.caps.capability;
 const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const pmm = zag.memory.pmm;
-const var_range = zag.memory.var_range;
+const vmar = zag.memory.vmar;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityType = capability.CapabilityType;
@@ -27,8 +27,8 @@ const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const VAddr = zag.memory.address.VAddr;
 
 /// Page size encoding (immutable per page frame). Same enum used by
-/// VAR — re-exported for convenience.
-pub const PageSize = var_range.PageSize;
+/// VMAR — re-exported for convenience.
+pub const PageSize = vmar.PageSize;
 
 /// Cap bits in `Capability.word0[48..63]` for page_frame handles.
 /// Spec §[page_frame] cap layout.

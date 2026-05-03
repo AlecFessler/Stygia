@@ -56,7 +56,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1) — backs VmPolicy.
-//   2. createVar + mapPf so userspace can zero the policy buffer.
+//   2. createVmar + mapPf so userspace can zero the policy buffer.
 //   3. Zero VM_POLICY_BYTES so both num_* counts seed at zero.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf).
 //   5. vmSetPolicy(vm, kind=0, count=1, one CPUID entry) — must OK.
@@ -103,10 +103,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer the
+    // 2. VMAR + map_pf so userspace can zero the policy buffer the
     //    kernel reads on the create_virtual_machine path.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

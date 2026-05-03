@@ -76,7 +76,7 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1) — backs VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
 //   3. Zero the VmPolicy region.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
@@ -90,7 +90,7 @@
 //      INITIAL_STATE_SUBCODE (the re-delivered synthetic initial exit).
 //
 // Assertions
-//   1: setup — createPageFrame / createVar / mapPf / createPort /
+//   1: setup — createPageFrame / createVmar / mapPf / createPort /
 //      createVcpu returned an error word.
 //   2: first recv on exit_port returned an error word in vreg 1.
 //   3: first recv's syscall_word event_type field (bits 44-48) was not
@@ -138,9 +138,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

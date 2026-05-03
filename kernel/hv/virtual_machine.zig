@@ -34,7 +34,7 @@ const Priority = zag.sched.execution_context.Priority;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 const Word0 = zag.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for VM handles.
@@ -60,7 +60,7 @@ pub const GuestInstall = struct {
     pf: ?SlabRef(PageFrame) = null,
     guest_addr: u64 = 0,
     page_count: u32 = 0,
-    sz: VarPageSize = .sz_4k,
+    sz: VmarPageSize = .sz_4k,
 };
 
 pub const VirtualMachine = struct {
@@ -685,7 +685,7 @@ pub fn guestPhysToHost(vm: *const VirtualMachine, gpa: u64, len: usize) ?[*]u8 {
     return null;
 }
 
-fn pageStride(sz: VarPageSize) u64 {
+fn pageStride(sz: VmarPageSize) u64 {
     return switch (sz) {
         .sz_4k => 0x1000,
         .sz_2m => 0x20_0000,

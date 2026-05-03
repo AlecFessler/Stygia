@@ -165,21 +165,21 @@ pub const KernelVA = struct {
             .start = execution_context_slab_ptrs.end,
             .end = execution_context_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const var_range_slab: Range = .{
+        pub const vmar_slab: Range = .{
             .start = execution_context_slab_links.end,
             .end = execution_context_slab_links.end + SLAB_RESERVATION,
         };
-        pub const var_range_slab_ptrs: Range = .{
-            .start = var_range_slab.end,
-            .end = var_range_slab.end + SLAB_RESERVATION,
+        pub const vmar_slab_ptrs: Range = .{
+            .start = vmar_slab.end,
+            .end = vmar_slab.end + SLAB_RESERVATION,
         };
-        pub const var_range_slab_links: Range = .{
-            .start = var_range_slab_ptrs.end,
-            .end = var_range_slab_ptrs.end + SLAB_RESERVATION,
+        pub const vmar_slab_links: Range = .{
+            .start = vmar_slab_ptrs.end,
+            .end = vmar_slab_ptrs.end + SLAB_RESERVATION,
         };
         pub const port_slab: Range = .{
-            .start = var_range_slab_links.end,
-            .end = var_range_slab_links.end + SLAB_RESERVATION,
+            .start = vmar_slab_links.end,
+            .end = vmar_slab_links.end + SLAB_RESERVATION,
         };
         pub const port_slab_ptrs: Range = .{
             .start = port_slab.end,
@@ -305,10 +305,10 @@ pub const MemoryPerms = packed struct(u8) {
 ///   memory). WB cache, global, supervisor-only.
 /// `kernel_mmio`: kernel-mapped device MMIO (IOMMU registers, ACPI
 ///   tables, LAPIC). UC cache, non-global, supervisor-only.
-/// `user_data`: VAR-installed RAM exposed to userspace. Cache attribute
-///   comes from the VAR's `cch` field via `mapPageSized`. Non-global,
+/// `user_data`: VMAR-installed RAM exposed to userspace. Cache attribute
+///   comes from the VMAR's `cch` field via `mapPageSized`. Non-global,
 ///   user-accessible.
-/// `user_mmio`: VAR-installed MMIO exposed to userspace. UC cache,
+/// `user_mmio`: VMAR-installed MMIO exposed to userspace. UC cache,
 ///   non-global, user-accessible.
 pub const MappingKind = enum {
     kernel_data,

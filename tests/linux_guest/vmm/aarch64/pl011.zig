@@ -26,7 +26,7 @@ const log = @import("log.zig");
 
 // Forwarding sink for guest UARTDR writes. Set by `bindTxSink` once
 // the boot path has discovered a host MMIO surface (e.g. the host
-// PL011 device_region passed in at boot, mapped via createVar +
+// PL011 device_region passed in at boot, mapped via createVmar +
 // mapMmio). Until then, TX bytes are dropped. The marker
 // `"hello from guest"` only appears in the host serial output once
 // this is wired.
@@ -186,7 +186,7 @@ pub fn write(offset: u64, value: u64) void {
         0x000 => {
             // UARTDR: low 8 bits are the TX byte; forward to the
             // bound host serial sink (set by `bindTxSink` after the
-            // VMM maps a host PL011 MMIO VAR). Without a sink, drop
+            // VMM maps a host PL011 MMIO VMAR). Without a sink, drop
             // silently — Linux still progresses, just quietly.
             const ch: u8 = @intCast(value & 0xFF);
             if (tx_sink) |sink| sink[0] = ch;

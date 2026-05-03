@@ -78,13 +78,13 @@ pub fn main(cap_table_base: u64) void {
     // pf/vm/port sub-fields land at the wrong offsets and trip
     // tests 10/11/12 before the test 09 cridc check fires.
     const caller_ec_inner: u64 = self_cap.field0 & 0xFF;
-    const caller_var_inner: u64 = (self_cap.field0 >> 8) & 0xFFFF;
+    const caller_vmar_inner: u64 = (self_cap.field0 >> 8) & 0xFFFF;
     const caller_pf: u64 = (self_cap.field0 >> FIELD0_PF_SHIFT) & 0xFF;
     const caller_vm: u64 = (self_cap.field0 >> FIELD0_VM_SHIFT) & 0xFF;
     const caller_port: u64 = (self_cap.field0 >> FIELD0_PORT_SHIFT) & 0xFF;
     const base_inner: u64 =
         caller_ec_inner |
-        (caller_var_inner << 8) |
+        (caller_vmar_inner << 8) |
         (caller_pf << INNER_PF_SHIFT) |
         (caller_vm << INNER_VM_SHIFT) |
         (caller_port << INNER_PORT_SHIFT);

@@ -25,7 +25,7 @@
 //   Until such a ceiling-restriction syscall lands, the faithful
 //   E_PERM path for test 02 is unreachable from a userspace test
 //   domain. This mirrors create_var_03's degraded-smoke rationale
-//   for the var_inner_ceiling.max_sz analogue.
+//   for the vmar_inner_ceiling.max_sz analogue.
 //
 //   This file lands a degraded *smoke* variant in place of the
 //   faithful test: it issues a create_page_frame with caps.r/w/x =

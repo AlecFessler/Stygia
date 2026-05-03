@@ -1,7 +1,7 @@
 // Spec §[capability_domain] create_capability_domain — test 27.
 //
 // "[test 27] on success, the new domain's `ec_outer_ceiling` and
-//  `var_outer_ceiling` in field1 are set to the values supplied in [3]."
+//  `vmar_outer_ceiling` in field1 are set to the values supplied in [3]."
 //
 // Strategy
 //   This test runs *inside* a freshly-created capability domain — it
@@ -9,7 +9,7 @@
 //   spawned it via `create_capability_domain` and passed a known
 //   `ceilings_outer` word as syscall arg [3]. Per §[capability_domain]
 //   Self handle, the new domain's self-handle field1 carries
-//   ec_outer_ceiling at bits 0-7 and var_outer_ceiling at bits 8-15.
+//   ec_outer_ceiling at bits 0-7 and vmar_outer_ceiling at bits 8-15.
 //   That self-handle lives at slot 0 of our own handle table and is
 //   visible read-only via `cap_table_base` (the entry-point arg).
 //
@@ -19,21 +19,21 @@
 //   The runner's `ceilings_outer` is documented in `runner/primary.zig`
 //   `spawnOne` as `0x0000_003F_03FE_FFFF`, which gives:
 //     ec_outer_ceiling  (bits  0-7)  = 0xFF
-//     var_outer_ceiling (bits  8-15) = 0xFF
+//     vmar_outer_ceiling (bits  8-15) = 0xFF
 //   The full low-16-bit slice is therefore 0xFFFF. We compare against
 //   that exact slice rather than reconstructing per-field to keep the
 //   assertion tight against [3]'s low bytes verbatim.
 //
 //   Field1 carries `restart_policy_ceiling` (bits 16-31) and
 //   `fut_wait_max` (bits 32-37) above the two outer ceilings. Test 27
-//   only governs ec_outer_ceiling and var_outer_ceiling, so we mask
+//   only governs ec_outer_ceiling and vmar_outer_ceiling, so we mask
 //   field1 to its low 16 bits before the equality check; the higher
 //   fields are out of scope here and exercised by other tests in this
 //   section.
 //
 // Action
 //   1. readCap(cap_table_base, SLOT_SELF) — pull the self-handle.
-//   2. field1 & 0xFFFF — extract ec_outer_ceiling || var_outer_ceiling.
+//   2. field1 & 0xFFFF — extract ec_outer_ceiling || vmar_outer_ceiling.
 //   3. compare against EXPECTED_OUTER_CEILINGS_LOW16 (mirrors the
 //      runner's documented `ceilings_outer` low bytes).
 //
@@ -57,7 +57,7 @@ const testing = lib.testing;
 
 // Mirrors `ceilings_outer` in tests/suite/runner/primary.zig:spawnOne.
 //   bits  0-7  ec_outer_ceiling  = 0xFF
-//   bits  8-15 var_outer_ceiling = 0xFF
+//   bits  8-15 vmar_outer_ceiling = 0xFF
 // If the runner's value is ever retuned, update both sites in lockstep.
 const EXPECTED_OUTER_CEILINGS_LOW16: u64 = 0xFFFF;
 

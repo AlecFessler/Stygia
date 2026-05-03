@@ -104,13 +104,13 @@ fn findCom1(cap_table_base: u64) ?caps.HandleId {
 
 fn initSerial(cap_table_base: u64) Serial {
     const dev = findCom1(cap_table_base) orelse return .{ .base = null };
-    const var_caps_word = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    const var_caps_word = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | 0b011; // cch=uc, cur_rwx=r|w
-    const cvar = syscall.createVar(@as(u64, var_caps_word.toU16()), props, 1, 0, 0);
+    const cvar = syscall.createVmar(@as(u64, var_caps_word.toU16()), props, 1, 0, 0);
     if (cvar.v1 < 16) return .{ .base = null };
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
-    const mm = syscall.mapMmio(var_handle, dev);
+    const mm = syscall.mapMmio(vmar_handle, dev);
     if (mm.v1 != 0) return .{ .base = null };
     return .{ .base = @ptrFromInt(var_base) };
 }

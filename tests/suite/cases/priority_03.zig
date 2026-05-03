@@ -11,7 +11,7 @@
 //
 //   `restrict` on the self-handle uses bitwise subset semantics —
 //   §[capabilities] restrict notes the only fields with numeric
-//   semantics are EC and VAR `restart_policy`. `pri = 3` has both bits
+//   semantics are EC and VMAR `restart_policy`. `pri = 3` has both bits
 //   set; `pri = 1` has only bit 0 (i.e. SelfCap bit 14) set, which is
 //   a strict subset, so restrict accepts it.
 //

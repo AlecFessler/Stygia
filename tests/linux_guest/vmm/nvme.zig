@@ -6,9 +6,9 @@
 //!      only port_io device_regions are exposed; PCI MMIO discovery
 //!      goes through the bootloader's cap-table seeding).
 //!   2. DMA VARs for the prp lists and data buffer, using
-//!      `createVar` with `caps.dma = 1` and the device_region as
-//!      `[5] device_region` per §[create_var].
-//!   3. Doorbell writes through an `mmio` VAR mapped over the
+//!      `createVmar` with `caps.dma = 1` and the device_region as
+//!      `[5] device_region` per §[create_vmar].
+//!   3. Doorbell writes through an `mmio` VMAR mapped over the
 //!      controller's BAR0.
 //!
 //! Until that lands, `disk.init` always returns false and the

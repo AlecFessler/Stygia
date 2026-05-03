@@ -9,29 +9,29 @@
 //   the libz wrapper derives N from `pairs.len / 2`. An empty pairs
 //   slice therefore drives N = 0 in the syscall word.
 //
-//   To isolate the N == 0 rejection we need [1] to be a valid VAR
-//   handle so test 01 (E_BADCAP for an invalid VAR) does not pre-empt
-//   test 04. We also want a non-mmio VAR so test 03 (E_PERM on
+//   To isolate the N == 0 rejection we need [1] to be a valid VMAR
+//   handle so test 01 (E_BADCAP for an invalid VMAR) does not pre-empt
+//   test 04. We also want a non-mmio VMAR so test 03 (E_PERM on
 //   caps.mmio) cannot fire. Tests 02 and 05-09 all dereference the
 //   pairs slice; with no pairs in flight none of them have anything
 //   to inspect, so test 04 is the only check left to fail. Test 10
-//   inspects field1 `map`, which on a freshly minted VAR is 0 — the
+//   inspects field1 `map`, which on a freshly minted VMAR is 0 — the
 //   exact state pf installation accepts.
 //
-//   The freshly-minted VAR therefore satisfies every prerequisite for
+//   The freshly-minted VMAR therefore satisfies every prerequisite for
 //   test 04 to be the surfacing rejection: the only remaining gate on
 //   an empty pairs slice is N == 0.
 //
 // Action
-//   1. createVar(caps={r,w}, props=0b011, pages=1) — must return a
-//      VAR handle in vreg 1 (assertion 2 guards this precondition).
-//   2. mapPf(var_handle, &.{}) — empty pairs slice, so N = 0. The
+//   1. createVmar(caps={r,w}, props=0b011, pages=1) — must return a
+//      VMAR handle in vreg 1 (assertion 2 guards this precondition).
+//   2. mapPf(vmar_handle, &.{}) — empty pairs slice, so N = 0. The
 //      kernel must return E_INVAL per §[map_pf] test 04.
 //
 // Assertions
 //   1: vreg 1 was not E_INVAL after mapPf with an empty pairs slice
 //      (the spec assertion under test).
-//   2: createVar returned an error code in vreg 1 — the precondition
+//   2: createVmar returned an error code in vreg 1 — the precondition
 //      for the assertion is broken so we cannot proceed.
 
 const lib = @import("lib");
@@ -44,11 +44,11 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
 
-    const cv = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cv = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         1, // pages = 1
         0, // preferred_base = kernel chooses
@@ -59,9 +59,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const var_handle: caps.HandleId = @truncate(cv.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cv.v1 & 0xFFF);
 
-    const result = syscall.mapPf(var_handle, &.{});
+    const result = syscall.mapPf(vmar_handle, &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(1);

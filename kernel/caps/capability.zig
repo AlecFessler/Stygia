@@ -32,7 +32,7 @@ const page_frame = zag.memory.page_frame;
 const port = zag.sched.port;
 const secure_slab = zag.memory.allocators.secure_slab;
 const timer = zag.sched.timer;
-const var_range = zag.memory.var_range;
+const vmar = zag.memory.vmar;
 const virtual_machine = zag.hv.virtual_machine;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -41,7 +41,7 @@ const ExecutionContext = execution_context.ExecutionContext;
 const PageFrame = page_frame.PageFrame;
 const Port = port.Port;
 const Timer = timer.Timer;
-const VAR = var_range.VAR;
+const VMAR = vmar.VMAR;
 const VirtualMachine = virtual_machine.VirtualMachine;
 
 /// Maximum handles per capability domain. Spec: 12-bit handle id.
@@ -61,7 +61,7 @@ pub const CapabilityType = enum(u4) {
     capability_domain = 1,
     execution_context = 2,
     page_frame = 3,
-    virtual_address_range = 4,
+    virtual_memory_address_region = 4,
     device_region = 5,
     port = 6,
     reply = 7,
@@ -401,7 +401,7 @@ pub fn resolveHandleOnDomain(
 /// the parallel user `Capability`) and apply the type-specific delete
 /// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion,
 /// Timer) call their `decHandleRef` to release their per-handle
-/// increment; capability-domain-lifetime types (EC, VAR, VM) and
+/// increment; capability-domain-lifetime types (EC, VMAR, VM) and
 /// system-lifetime IDC handles do not — those die only with the
 /// owning domain. Spec §[capabilities].delete table.
 pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
@@ -435,17 +435,17 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             const ref = typedRef(PageFrame, entry.*) orelse return;
             page_frame.releaseHandle(ref.ptr);
         },
-        .virtual_address_range => {
-            // Spec §[capabilities].delete (virtual_address_range row):
+        .virtual_memory_address_region => {
+            // Spec §[capabilities].delete (virtual_memory_address_region row):
             // "Delete unmaps everything installed, frees the address
-            // range, releases the handle." VAR holds exactly one handle
+            // range, releases the handle." VMAR holds exactly one handle
             // by construction (non-transferable), so the per-handle
             // delete is the same teardown that fires when the owning
-            // capability domain dies — `destroyVar` unmaps every
-            // installed page, removes the VAR from `domain.vars[]` so
+            // capability domain dies — `destroyVmar` unmaps every
+            // installed page, removes the VMAR from `domain.vars[]` so
             // the address range is reusable, and frees the slab slot.
-            const ref = typedRef(VAR, entry.*) orelse return;
-            var_range.destroyVar(ref.ptr);
+            const ref = typedRef(VMAR, entry.*) orelse return;
+            vmar.destroyVmar(ref.ptr);
         },
         .device_region => {
             const ref = typedRef(DeviceRegion, entry.*) orelse return;
@@ -526,7 +526,7 @@ fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType)
 fn restartPolicyMask(type_tag: CapabilityType) u16 {
     return switch (type_tag) {
         .execution_context => 0b11 << 8, // EcCaps bits 8-9
-        .virtual_address_range => 0b11 << 9, // VarCaps bits 9-10
+        .virtual_memory_address_region => 0b11 << 9, // VmarCaps bits 9-10
         .port => 0b1 << 5, // PortCaps bit 5
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
         .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
@@ -558,19 +558,19 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             // field1 bits 0-63 = affinity mask
             user_entry.field1 = ec.affinity;
         },
-        .virtual_address_range => {
-            const ref = typedRef(VAR, entry.*) orelse return;
+        .virtual_memory_address_region => {
+            const ref = typedRef(VMAR, entry.*) orelse return;
             const lr = ref.lockIrqSave(@src()) catch return;
             defer ref.unlockIrqRestore(lr.irq_state);
             const v = lr.ptr;
-            // VAR field0 = base vaddr (immutable; refresh is harmless).
+            // VMAR field0 = base vaddr (immutable; refresh is harmless).
             user_entry.field0 = v.base_vaddr.addr;
-            // VAR field1: page_count[0..31], sz[32..33], cch[34..35],
+            // VMAR field1: page_count[0..31], sz[32..33], cch[34..35],
             // cur_rwx[36..38], map[39..40], device[41..52]. cur_rwx,
             // map, and device are the kernel-mutable subset. The device
             // sub-field is the device's handle id in the holding
             // domain; resolution is done via a reverse lookup that
-            // depends on the per-VAR DeviceRegion → CapabilityDomain
+            // depends on the per-VMAR DeviceRegion → CapabilityDomain
             // back-reference (not yet plumbed through). Until then the
             // device sub-field stays 0.
             const new_field1 = (@as(u64, v.page_count)) |

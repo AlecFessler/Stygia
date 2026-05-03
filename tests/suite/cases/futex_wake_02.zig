@@ -21,8 +21,8 @@
 //   To keep the test 03 (E_BADADDR) gate from masking the alignment
 //   check, we feed a misaligned address that lies inside a valid
 //   user-mapped page in the caller's domain. We construct that by
-//   creating a VAR backed by a fresh page frame, then offsetting the
-//   VAR's base vaddr by 1 byte. The result is a real, mapped, R/W
+//   creating a VMAR backed by a fresh page frame, then offsetting the
+//   VMAR's base vaddr by 1 byte. The result is a real, mapped, R/W
 //   user address that is unambiguously not 8-byte aligned. Whatever
 //   gate ordering the kernel uses, the only error path that can fire
 //   on this input is E_INVAL.
@@ -33,17 +33,17 @@
 // Action
 //   1. createPageFrame(caps={r,w}, props=0 [4 KiB], pages=1)
 //      — must succeed; gives a backing PF.
-//   2. createVar(caps={r,w}, props={cur_rwx=r|w, sz=0, cch=0}, pages=1)
-//      — must succeed; gives a 1-page user VAR with a base vaddr.
-//   3. mapPf(var_handle, .{ 0, pf_handle })
-//      — binds page 0 of the VAR to the PF so the vaddr is actually
+//   2. createVmar(caps={r,w}, props={cur_rwx=r|w, sz=0, cch=0}, pages=1)
+//      — must succeed; gives a 1-page user VMAR with a base vaddr.
+//   3. mapPf(vmar_handle, .{ 0, pf_handle })
+//      — binds page 0 of the VMAR to the PF so the vaddr is actually
 //      mapped in the caller's domain.
 //   4. futexWake(var_base + 1, 0)
 //      — must return E_INVAL because var_base + 1 is not 8-byte
 //      aligned.
 //
 // Assertions
-//   1: prelude (PF / VAR creation) failed; cannot exercise the gate.
+//   1: prelude (PF / VMAR creation) failed; cannot exercise the gate.
 //   2: futexWake on a misaligned-but-mapped address did not return
 //      E_INVAL.
 
@@ -70,10 +70,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // Step 2: VAR with cur_rwx = r|w, 1 page, kernel-chosen base.
-    const var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    // Step 2: VMAR with cur_rwx = r|w, 1 page, kernel-chosen base.
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         0b011, // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
         1, // pages = 1
         0, // preferred_base = kernel chooses
@@ -83,13 +83,13 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    // Step 3: bind page 0 of the VAR to the PF so var_base is mapped.
-    _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    // Step 3: bind page 0 of the VMAR to the PF so var_base is mapped.
+    _ = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
 
-    // VAR bases are page-aligned by construction; +1 byte is therefore
+    // VMAR bases are page-aligned by construction; +1 byte is therefore
     // unambiguously misaligned (any of the low three bits being set
     // violates 8-byte alignment).
     const misaligned_addr: u64 = var_base + 1;

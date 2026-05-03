@@ -9,16 +9,16 @@
 //   that the test capability domain cannot trigger or witness from
 //   inside itself:
 //
-//     1. Bind a source VAR to a target VAR via `snapshot`.
-//     2. `delete` the source VAR handle. Per §[delete] line 173, the
-//        VAR's address space is freed and the handle released; per
+//     1. Bind a source VMAR to a target VMAR via `snapshot`.
+//     2. `delete` the source VMAR handle. Per §[delete] line 173, the
+//        VMAR's address space is freed and the handle released; per
 //        §[snapshot] test 08, the kernel is supposed to clear the
 //        target's source binding as a side effect of that source
 //        deletion (the binding is internal kernel state — there is no
 //        v3 syscall that reads "the source bound to this target").
 //     3. Cause the calling capability domain to restart (e.g., fault
 //        every EC, or kill the self-handle with `restart` cap set).
-//        The kernel walks the target VAR's `restart_policy = snapshot`,
+//        The kernel walks the target VMAR's `restart_policy = snapshot`,
 //        looks up its bound source, finds none, and per the spec line
 //        TERMINATES the domain rather than restarting it.
 //     4. From outside, observe that the domain did not restart.
@@ -28,7 +28,7 @@
 //
 //     - Step (2)'s side effect — "the binding is cleared" — is not
 //       directly observable: there is no `get_snapshot_source` syscall
-//       and `sync` on the target VAR refreshes only `cur_rwx`, `map`,
+//       and `sync` on the target VMAR refreshes only `cur_rwx`, `map`,
 //       `device` (per §[var] field1), not the bound-source identity.
 //     - Step (3) requires triggering a restart of *this same domain*,
 //       which destroys the EC running the test. Even if we could trip
@@ -54,15 +54,15 @@
 //   Until either lands, this file holds the prelude verbatim so the
 //   eventual faithful version can graft the restart trigger and
 //   parent-side termination check on top without re-deriving the
-//   create_var/snapshot/delete plumbing.
+//   create_vmar/snapshot/delete plumbing.
 //
 // Strategy (smoke prelude)
 //   We exercise the bind-then-delete portion that is reachable from
 //   inside the child:
-//     1. create_var(caps={r,w, restart_policy=2 (preserve)}, ...) — the
-//        source. `var_restart_max = 3` in the runner ceiling permits
+//     1. create_vmar(caps={r,w, restart_policy=2 (preserve)}, ...) — the
+//        source. `vmar_restart_max = 3` in the runner ceiling permits
 //        restart_policy = 2.
-//     2. create_var(caps={r,w, restart_policy=3 (snapshot)}, ...) — the
+//     2. create_vmar(caps={r,w, restart_policy=3 (snapshot)}, ...) — the
 //        target, same size as the source (1 page each).
 //     3. snapshot(target, source) — bind the source to the target.
 //     4. delete(source) — releases the source handle and (per spec
@@ -75,12 +75,12 @@
 //   checked (mirrors unmap_06.zig's smoke pattern).
 //
 // Action
-//   1. createVar(caps={r, w, restart_policy=2}, props={cur_rwx=r|w},
+//   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=r|w},
 //                pages=1, preferred_base=0, device_region=0)
-//      — the source VAR.
-//   2. createVar(caps={r, w, restart_policy=3}, props={cur_rwx=r|w},
+//      — the source VMAR.
+//   2. createVmar(caps={r, w, restart_policy=3}, props={cur_rwx=r|w},
 //                pages=1, preferred_base=0, device_region=0)
-//      — the target VAR (same size as source: 1 × 4 KiB).
+//      — the target VMAR (same size as source: 1 × 4 KiB).
 //   3. snapshot(target_handle, source_handle)
 //      — binds source to target.
 //   4. delete(source_handle)
@@ -101,8 +101,8 @@
 //   whether the domain restarted or was terminated. With that, the
 //   action becomes:
 //
-//     create_var(restart_policy=2, ...) -> source
-//     create_var(restart_policy=3, ...) -> target
+//     create_vmar(restart_policy=2, ...) -> source
+//     create_vmar(restart_policy=3, ...) -> target
 //     snapshot(target, source)
 //     delete(source)
 //     <signal parent: "now trip my restart">
@@ -127,18 +127,18 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Source VAR: restart_policy = 2 (preserve) is the only value
+    // Source VMAR: restart_policy = 2 (preserve) is the only value
     // §[snapshot] test 04 accepts as a snapshot source. Within
-    // var_restart_max = 3 ceiling. Single 4 KiB page; cur_rwx = r|w.
-    const source_caps = caps.VarCap{
+    // vmar_restart_max = 3 ceiling. Single 4 KiB page; cur_rwx = r|w.
+    const source_caps = caps.VmarCap{
         .r = true,
         .w = true,
         .restart_policy = 2, // preserve
     };
-    // §[create_var] props: cur_rwx in bits 0-2, sz in bits 3-4, cch in
+    // §[create_vmar] props: cur_rwx in bits 0-2, sz in bits 3-4, cch in
     // bits 5-6. cur_rwx = r|w = 0b011; sz = 0 (4 KiB); cch = 0 (wb).
     const props: u64 = 0b011;
-    const csource = syscall.createVar(
+    const csource = syscall.createVmar(
         @as(u64, source_caps.toU16()),
         props,
         1, // pages = 1
@@ -153,15 +153,15 @@ pub fn main(cap_table_base: u64) void {
     }
     const source_handle: caps.HandleId = @truncate(csource.v1 & 0xFFF);
 
-    // Target VAR: restart_policy = 3 (snapshot) is the only value
+    // Target VMAR: restart_policy = 3 (snapshot) is the only value
     // §[snapshot] test 03 accepts as a snapshot target. Same size as
     // the source (1 page) so test 05 (size mismatch) does not fire.
-    const target_caps = caps.VarCap{
+    const target_caps = caps.VmarCap{
         .r = true,
         .w = true,
         .restart_policy = 3, // snapshot
     };
-    const ctarget = syscall.createVar(
+    const ctarget = syscall.createVmar(
         @as(u64, target_caps.toU16()),
         props,
         1, // pages = 1 (matches source)
@@ -180,7 +180,7 @@ pub fn main(cap_table_base: u64) void {
     // bind-time anomaly would be caught by snapshot tests 01-07.
     _ = syscall.snapshot(target_handle, source_handle);
 
-    // Delete the source. Per §[delete] line 173 the VAR is unmapped
+    // Delete the source. Per §[delete] line 173 the VMAR is unmapped
     // and the handle released; per §[snapshot] test 08 the binding on
     // the target is supposed to be cleared as a side effect. The
     // cleared-binding observable is invisible from inside the child

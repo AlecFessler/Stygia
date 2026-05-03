@@ -51,9 +51,9 @@
 //
 // Action
 //   1. create_page_frame(pages=1, sz=0)              — must succeed
-//   2. create_var(pages=1, cur_rwx=rw)               — must succeed
+//   2. create_vmar(pages=1, cur_rwx=rw)               — must succeed
 //   3. map_pf(var, offset=0, pf)                     — must succeed
-//   4. write Ehdr + Phdr into the mapped VAR
+//   4. write Ehdr + Phdr into the mapped VMAR
 //   5. delete(var) — drop the staging mapping; the page frame
 //                    handle still references the underlying memory
 //   6. create_capability_domain(0, 0, 0, pf, [])     — must return
@@ -61,9 +61,9 @@
 //
 // Assertions
 //   1: create_page_frame returned an error
-//   2: create_var returned an error
+//   2: create_vmar returned an error
 //   3: map_pf returned a non-OK status
-//   4: delete of the staging VAR returned non-OK
+//   4: delete of the staging VMAR returned non-OK
 //   5: create_capability_domain returned something other than E_INVAL
 
 const lib = @import("lib");
@@ -126,7 +126,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 1: mint a 1-page (4 KiB) page frame. props.sz = 0 selects
     // the 4 KiB size class. caps include r/w so we can stage bytes
-    // through a mapped VAR; move stays so we can later hand the PF
+    // through a mapped VMAR; move stays so we can later hand the PF
     // off to create_capability_domain.
     const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true };
     const cpf = syscall.createPageFrame(
@@ -140,10 +140,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
-    // Step 2: mint a 1-page VAR with cur_rwx = r|w so we can write
+    // Step 2: mint a 1-page VMAR with cur_rwx = r|w so we can write
     // the ELF bytes through it.
-    const var_caps_word = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const var_caps_word = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         0b011, // cur_rwx = r|w (bit 0 = r, bit 1 = w, bit 2 = x)
         1, // 1 page
@@ -154,11 +154,11 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    // Step 3: install the page frame at offset 0 of the VAR.
-    const map_result = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    // Step 3: install the page frame at offset 0 of the VMAR.
+    const map_result = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -205,10 +205,10 @@ pub fn main(cap_table_base: u64) void {
         .p_align = 0x1000,
     };
 
-    // Step 5: drop the staging VAR. The page frame still holds the
+    // Step 5: drop the staging VMAR. The page frame still holds the
     // backing memory because PF refcount > 0 (we still hold the
     // PF handle).
-    const del = syscall.delete(var_handle);
+    const del = syscall.delete(vmar_handle);
     if (del.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

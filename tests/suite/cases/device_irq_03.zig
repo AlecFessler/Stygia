@@ -20,7 +20,7 @@
 //         no in-test syscall in libz/syscall.zig synthesises one.
 //         `mapMmio` (syscall 25) and `ack` (syscall 26) are present,
 //         but they presuppose a device_region handle the test EC does
-//         not own. createVar(... device_region=...) similarly requires
+//         not own. createVmar(... device_region=...) similarly requires
 //         a pre-existing device_region.
 //
 //     (b) A second EC blocked in `futex_wait_val(addr=&handle.field1,

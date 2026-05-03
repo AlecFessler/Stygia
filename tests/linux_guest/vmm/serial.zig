@@ -6,10 +6,10 @@
 //!
 //! Spec-v3 host-RX bridging is deferred. The pre-port driver wired
 //! `pollHostRx` into the exit loop, polling the host LSR via a
-//! private MMIO VAR and asserting IRQ 4 when bytes arrived. To
+//! private MMIO VMAR and asserting IRQ 4 when bytes arrived. To
 //! restore that path:
 //!   1. Expose `serial_base` from log.zig (or do a second
-//!      `createVar` + `map_mmio` over the same COM1 device_region,
+//!      `createVmar` + `map_mmio` over the same COM1 device_region,
 //!      with the read-side caps).
 //!   2. In `pollHostRx`, peek at `host_serial_base + REG_LSR`; on
 //!      data-ready, read `REG_DATA` into rx_buf and set irq_pending.

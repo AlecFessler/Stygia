@@ -11,7 +11,7 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const VAddr = zag.memory.address.VAddr;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
@@ -124,7 +124,7 @@ pub fn stage2MapPage(
     vm: *VirtualMachine,
     guest_phys: u64,
     host_phys: PAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
     _ = vm;
@@ -134,7 +134,7 @@ pub fn stage2MapPage(
     _ = perms;
 }
 
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VmarPageSize) void {
     _ = vm;
     _ = guest_phys;
     _ = sz;
@@ -143,7 +143,7 @@ pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) vo
 pub fn invalidateStage2Range(
     vm: *VirtualMachine,
     guest_phys: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     _ = vm;

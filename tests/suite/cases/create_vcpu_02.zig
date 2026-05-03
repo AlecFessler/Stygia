@@ -31,7 +31,7 @@
 //   rather than E_INVAL):
 //     1. create_page_frame(caps={r,w}, sz=0, pages=1) — 4 KiB backing
 //        store for the VmPolicy struct.
-//     2. create_var(caps={r,w}, cur_rwx=r|w, pages=1) + map_pf at
+//     2. create_vmar(caps={r,w}, cur_rwx=r|w, pages=1) + map_pf at
 //        offset 0 — CPU-visible window so we can zero the bytes.
 //     3. Zero VM_POLICY_BYTES so num_cpuid_responses / num_cr_policies
 //        are both 0 (well under MAX_* — tests 06/07 cannot fire).
@@ -62,7 +62,7 @@
 //       = 0.
 //
 // Action
-//   1. Stage VmPolicy (PF + VAR + map + zero).
+//   1. Stage VmPolicy (PF + VMAR + map + zero).
 //   2. createVirtualMachine — must return a VM handle (or E_NODEV,
 //      treated as a non-failure no-op on platforms without VT-x).
 //   3. createPort(caps={bind}) — must return a port handle.
@@ -71,7 +71,7 @@
 //
 // Assertions
 //   1: create_page_frame returned an error word.
-//   2: create_var returned an error word.
+//   2: create_vmar returned an error word.
 //   3: map_pf returned non-OK.
 //   4: create_virtual_machine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
@@ -107,9 +107,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map so userspace can zero the policy bytes.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map so userspace can zero the policy bytes.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
     // ceilings_outer: zero `restart_policy_ceiling` so a faithful
     // run of this test (under a runner that gave us
     // idc_restart_max = 0) would propagate the constraint correctly.
-    // ec_outer_ceiling/var_outer_ceiling/fut_wait_max all 0.
+    // ec_outer_ceiling/vmar_outer_ceiling/fut_wait_max all 0.
     const sub_ceilings_outer: u64 = 0;
 
     // Issue the call. Under v0 with idc_restart_max = 1 this either

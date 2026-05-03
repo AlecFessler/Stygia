@@ -23,7 +23,7 @@
 //     - The runner's child capability domain has no preconfigured
 //       page_frame for shared memory between the test EC and worker
 //       ECs; staging one in-test would compose `create_page_frame`,
-//       `create_var`, `map_pf`, and per-EC stack-relative addressing
+//       `create_vmar`, `map_pf`, and per-EC stack-relative addressing
 //       not yet validated end-to-end in the kernel.
 //     - Kernel-side priority-ordered futex wake ordering is itself
 //       unverified by any prior test in the suite.

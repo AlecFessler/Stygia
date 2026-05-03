@@ -8,7 +8,7 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
-const VarPageSize = zag.memory.var_range.PageSize;
+const VmarPageSize = zag.memory.vmar.PageSize;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 // Generic-kernel-facing VM dispatch. Arch-internal primitives (guest-page
@@ -198,7 +198,7 @@ pub fn stage2MapPage(
     vm: *VirtualMachine,
     guest_phys: u64,
     host_phys: PAddr,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
     return switch (builtin.cpu.arch) {
@@ -210,7 +210,7 @@ pub fn stage2MapPage(
 
 /// Unmap a single guest page from stage-2 at `guest_phys`.
 /// Spec §[virtual_machine].unmap_guest.
-pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
+pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VmarPageSize) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.hv.vm.stage2UnmapPage(vm, guest_phys, sz),
         .aarch64 => aarch64.hv.vm.stage2UnmapPage(vm, guest_phys, sz),
@@ -223,7 +223,7 @@ pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) vo
 pub fn invalidateStage2Range(
     vm: *VirtualMachine,
     guest_phys: u64,
-    sz: VarPageSize,
+    sz: VmarPageSize,
     page_count: u32,
 ) void {
     switch (builtin.cpu.arch) {

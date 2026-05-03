@@ -1,15 +1,15 @@
 // Spec §[map_mmio] — test 08.
 //
-// "[test 08] on success, CPU accesses to the VAR's range use
-//  effective permissions = `VAR.cur_rwx`."
+// "[test 08] on success, CPU accesses to the VMAR's range use
+//  effective permissions = `VMAR.cur_rwx`."
 //
 // DEGRADED SMOKE VARIANT
 //   The faithful assertion requires a *successful* map_mmio call to
 //   the kernel — only after `map` transitions to 2 does the spec
-//   guarantee anything about CPU accesses to the VAR's range. The
+//   guarantee anything about CPU accesses to the VMAR's range. The
 //   "success" gate ahead of the CPU-access observation is governed
 //   by §[map_mmio] tests 01-05:
-//     - test 01: [1] must be a valid VAR handle.
+//     - test 01: [1] must be a valid VMAR handle.
 //     - test 02: [2] must be a valid device_region handle.
 //     - test 03: [1] must have caps.mmio = 1.
 //     - test 04: [1].field1.map must be 0 (no prior mapping).
@@ -34,12 +34,12 @@
 //     - findCom1() (serial.zig:92-113) scans the runner's cap table
 //       for the COM1 port_io device_region (base_port = 0x3F8,
 //       port_count = 8) issued at boot.
-//     - init() (serial.zig:58-90) creates an MMIO VAR over it with
+//     - init() (serial.zig:58-90) creates an MMIO VMAR over it with
 //       caps = {r, w, mmio}, props = {sz=0, cch=1 (uc),
-//       cur_rwx=0b011}, then calls syscall.mapMmio(var_handle, dev).
-//     - On return the runner stores `cur.v2` as the VAR base and uses
+//       cur_rwx=0b011}, then calls syscall.mapMmio(vmar_handle, dev).
+//     - On return the runner stores `cur.v2` as the VMAR base and uses
 //       1-byte MOV stores against `base[0]` (Serial.putc) to drive
-//       the trapped port_io path — i.e., CPU accesses to the VAR's
+//       the trapped port_io path — i.e., CPU accesses to the VMAR's
 //       range really do use cur_rwx as their effective permission set
 //       (cur_rwx.w = 1 lets the store retire as `out (0x3F8), al`).
 //   That working primary path is the proof point that test 08 holds
@@ -48,22 +48,22 @@
 //
 //   With map_mmio unable to succeed inside a test child, the CPU-
 //   access semantics it grants cannot be observed. This file therefore
-//   pins only the prelude shape — a properly-formed MMIO VAR ready to
+//   pins only the prelude shape — a properly-formed MMIO VMAR ready to
 //   accept a forwarded device_region — and reports pass-with-id-0 to
 //   mark the slot as smoke-only.
 //
 // Strategy (smoke prelude)
-//   The MMIO VAR is built the same way runner/serial.zig builds its
-//   COM1 VAR (serial.zig:67-82) and the same way map_mmio_02.zig
+//   The MMIO VMAR is built the same way runner/serial.zig builds its
+//   COM1 VMAR (serial.zig:67-82) and the same way map_mmio_02.zig
 //   builds its [1] handle:
 //     caps.mmio = 1 requires:
-//       - props.sz = 0 per §[create_var] test 08 (mmio VARs must use
+//       - props.sz = 0 per §[create_vmar] test 08 (mmio VARs must use
 //         the smallest page size).
-//       - caps.x = 0 per §[create_var] test 11 (mmio VARs cannot be
+//       - caps.x = 0 per §[create_vmar] test 11 (mmio VARs cannot be
 //         executable).
-//       - caps.dma = 0 per §[create_var] test 13 (an MMIO VAR cannot
-//         also be a DMA VAR).
-//     props.cch must be 1 (uc) for an mmio VAR — required by the
+//       - caps.dma = 0 per §[create_vmar] test 13 (an MMIO VMAR cannot
+//         also be a DMA VMAR).
+//     props.cch must be 1 (uc) for an mmio VMAR — required by the
 //     port_io / mmio path's uncached semantics.
 //     props.cur_rwx = 0b011 (r|w) gives non-empty read+write
 //     effective permissions; this is the value test 08 would observe
@@ -71,15 +71,15 @@
 //     setup exactly.
 //
 //   pages = 1 mirrors the COM1 setup. In the faithful flow, the
-//   forwarded device_region's size would have to match this VAR
+//   forwarded device_region's size would have to match this VMAR
 //   (§[map_mmio] test 05); the v0 framework gap is precisely that
 //   no such forwarded device_region exists.
 //
 // Action
-//   1. createVar(caps={r, w, mmio}, props={sz=0, cch=1 (uc),
+//   1. createVmar(caps={r, w, mmio}, props={sz=0, cch=1 (uc),
 //                cur_rwx=0b011}, pages=1, preferred_base=0,
 //                device_region=0) — must succeed; gives a valid
-//      MMIO VAR sitting in `map = 0` with cur_rwx = r|w.
+//      MMIO VMAR sitting in `map = 0` with cur_rwx = r|w.
 //
 // Assertion
 //   No assertion is checked — passes with assertion id 0 because
@@ -96,7 +96,7 @@
 //   already performs), package it into the child's `passed_handles`
 //   with appropriate caps, and pin its slot id at a known location
 //   (e.g., slot 4, just past the result port). The test then becomes:
-//     1. createVar(caps={r, w, mmio}, props={sz=0, cch=1,
+//     1. createVmar(caps={r, w, mmio}, props={sz=0, cch=1,
 //                  cur_rwx=0b011}, pages=1, preferred_base=0,
 //                  device_region=0) -> mmio_var, var_base = result.v2
 //     2. mapMmio(mmio_var, forwarded_dev) -> success (mm.v1 == 0)
@@ -107,8 +107,8 @@
 //        (or otherwise be rejected), evidencing the new cur_rwx.w = 0
 //        takes effect.
 //   The before/after pair pins test 08's observable: CPU access
-//   permissions are governed by `VAR.cur_rwx` and only by `VAR.cur_rwx`
-//   for an MMIO VAR (no per-page mask intersection because there are
+//   permissions are governed by `VMAR.cur_rwx` and only by `VMAR.cur_rwx`
+//   for an MMIO VMAR (no per-page mask intersection because there are
 //   no per-page page_frames in an MMIO mapping). The runner-side
 //   evidence in serial.zig already covers the cur_rwx.w = 1 leg of
 //   that pair; what is still needed inside a test child is the
@@ -124,16 +124,16 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Build the same MMIO VAR shape runner/serial.zig stages over
-    // COM1. A successful map_mmio against this VAR is the only state
+    // Build the same MMIO VMAR shape runner/serial.zig stages over
+    // COM1. A successful map_mmio against this VMAR is the only state
     // in which test 08's CPU-access semantics can be observed; the
     // missing piece in a v0 test child is a forwarded device_region
-    // for [2], not the VAR construction itself.
-    const mmio_caps = caps.VarCap{ .r = true, .w = true, .mmio = true };
+    // for [2], not the VMAR construction itself.
+    const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
         0b011; // cur_rwx = r|w — the value test 08 would observe
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
         1, // pages = 1 (matches the COM1 prelude)

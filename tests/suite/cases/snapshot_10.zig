@@ -8,20 +8,20 @@
 // DEGRADED SMOKE VARIANT
 //   The faithful shape of test 10 requires the same domain-restart
 //   observability that test 09 needs, with the additional twist that
-//   the source VAR must be in a *deliberately unstable* state at the
+//   the source VMAR must be in a *deliberately unstable* state at the
 //   restart instant, and the post-restart observable is "the domain
 //   was terminated rather than restarted":
 //
 //     pre-restart (live domain N):
-//       1. mint source VAR S with restart_policy = 2 (preserve), in
+//       1. mint source VMAR S with restart_policy = 2 (preserve), in
 //          map=1 (page_frame-backed). S must be configured so its
 //          stability constraint per spec line 1116 is *violated* at
 //          restart time. Two violation modes:
 //            (a) some backing page_frame has `mapcnt > 1` — i.e. the
-//                page_frame is also installed in another VAR (or
+//                page_frame is also installed in another VMAR (or
 //                installed twice in S itself). This requires creating
 //                a page_frame, mapping it into S via `map_pf`, and
-//                also mapping it into a second VAR so its `mapcnt`
+//                also mapping it into a second VMAR so its `mapcnt`
 //                reaches 2.
 //            (b) the source's effective write permission is nonzero,
 //                where effective write = `S.cur_rwx.w` AND any backing
@@ -29,7 +29,7 @@
 //                writable page_frame and leaving `S.cur_rwx.w = 1` at
 //                restart time (i.e. not calling `remap` to drop write
 //                first).
-//       2. mint target VAR T with restart_policy = 3 (snapshot),
+//       2. mint target VMAR T with restart_policy = 3 (snapshot),
 //          populate however (its post-restart contents are irrelevant
 //          because the restart is supposed to fail).
 //       3. snapshot(T, S) — bind S as T's restart-time source.
@@ -78,7 +78,7 @@
 //     - mints S (preserve, map=1) and T (snapshot) in the parent and
 //       grants them to the test child;
 //     - additionally installs S's backing page_frame into a second
-//       VAR (mode a) OR leaves S.cur_rwx.w = 1 with a writable
+//       VMAR (mode a) OR leaves S.cur_rwx.w = 1 with a writable
 //       page_frame (mode b) — staging the violation;
 //     - lets the test call `snapshot(T, S)`, then signal "ready" via
 //       the result port;
@@ -93,7 +93,7 @@
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in
 //   a single test EC, mirroring snapshot_09's smoke shape: mint S as a
-//   preserve-policy VAR, mint T as a snapshot-policy VAR, call
+//   preserve-policy VMAR, mint T as a snapshot-policy VMAR, call
 //   `snapshot(T, S)` and verify the binding-establishment dispatch
 //   does not error out. We do *not* attempt to stage the stability
 //   violation — the violation only matters at the restart boundary,
@@ -109,14 +109,14 @@
 //   child domain.
 //
 // Action
-//   1. createVar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives source VAR S in map=0
+//   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives source VMAR S in map=0
 //      initially. The faithful test would walk S into map=1 with a
 //      writable page_frame to stage violation mode (b); the smoke
 //      stops short of that, since the binding-establishment path
 //      doesn't gate on map state.
-//   2. createVar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
-//                pages=1) — must succeed; gives target VAR T.
+//   2. createVmar(caps={r, w, restart_policy=3}, props={cur_rwx=0b011},
+//                pages=1) — must succeed; gives target VMAR T.
 //   3. snapshot(T, S) — *expected* success: the binding-establishment
 //      path is what snapshot_07/snapshot_09 exercise. The
 //      restart-time termination that test 10 actually asserts is not
@@ -142,7 +142,7 @@
 //       domain reports terminated.
 //   Once that exists, the action becomes:
 //     <parent: mint S (preserve, map=1, writable page_frame)>
-//     <parent: stage violation — install pf into a second VAR for
+//     <parent: stage violation — install pf into a second VMAR for
 //              mode (a), or leave S.cur_rwx.w=1 for mode (b)>
 //     <parent: mint T (snapshot, same size)>
 //     <parent: hand S, T to child, run child>
@@ -161,13 +161,13 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Source VAR S: restart_policy = 2 (preserve), per spec line 1110.
+    // Source VMAR S: restart_policy = 2 (preserve), per spec line 1110.
     // Caps grant r|w so the faithful test could stage a writable
     // page_frame to violate the stability constraint; the smoke does
     // not actually stage the violation.
-    const src_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 2 };
+    const src_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 2 };
     const src_props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const src = syscall.createVar(
+    const src = syscall.createVmar(
         @as(u64, src_caps.toU16()),
         src_props,
         1, // pages = 1
@@ -182,11 +182,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const src_handle: caps.HandleId = @truncate(src.v1 & 0xFFF);
 
-    // Target VAR T: restart_policy = 3 (snapshot), per spec line 1109.
+    // Target VMAR T: restart_policy = 3 (snapshot), per spec line 1109.
     // Same size as S so spec test 05 (size match) does not trip.
-    const dst_caps = caps.VarCap{ .r = true, .w = true, .restart_policy = 3 };
+    const dst_caps = caps.VmarCap{ .r = true, .w = true, .restart_policy = 3 };
     const dst_props: u64 = 0b011; // cur_rwx = r|w; sz = 0; cch = 0
-    const dst = syscall.createVar(
+    const dst = syscall.createVmar(
         @as(u64, dst_caps.toU16()),
         dst_props,
         1, // pages = 1, matches S

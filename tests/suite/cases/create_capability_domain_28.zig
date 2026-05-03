@@ -14,7 +14,7 @@
 //   Per §[capability_domain] Self handle, field0 lays idc_rx at bits
 //   32-39:
 //     bits  0-7   ec_inner_ceiling
-//     bits  8-23  var_inner_ceiling
+//     bits  8-23  vmar_inner_ceiling
 //     bits 24-31  cridc_ceiling
 //     bits 32-39  idc_rx
 //     bits 40-47  pf_ceiling

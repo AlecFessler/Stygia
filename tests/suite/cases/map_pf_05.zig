@@ -1,21 +1,21 @@
 // Spec §[map_pf] — test 05.
 //
 // "[test 05] returns E_INVAL if any offset is not aligned to the
-//  VAR's `sz` page size."
+//  VMAR's `sz` page size."
 //
 // Strategy
 //   To isolate the offset-alignment rejection in map_pf, every other
 //   gate that could fire ahead of test 05 must stay inert with a
 //   single (offset, page_frame) pair (N = 1):
-//     - test 01 (VAR is invalid) — pass a freshly-minted regular VAR
+//     - test 01 (VMAR is invalid) — pass a freshly-minted regular VMAR
 //       handle.
 //     - test 02 (page_frame is invalid) — pass a freshly-minted real
 //       page_frame handle.
 //     - test 03 (caps.mmio set) — caps = {r,w}, mmio = 0.
 //     - test 04 (N == 0) — N = 1 (one pair).
-//     - test 06 (pf.sz < VAR.sz) — both pf and VAR use sz = 0 (4 KiB),
-//       so pf.sz == VAR.sz.
-//     - test 07 (range exceeds VAR size) — VAR has 1 page (4 KiB) and
+//     - test 06 (pf.sz < VMAR.sz) — both pf and VMAR use sz = 0 (4 KiB),
+//       so pf.sz == VMAR.sz.
+//     - test 07 (range exceeds VMAR size) — VMAR has 1 page (4 KiB) and
 //       offset 0x1 is in-range (0x1 + 4 KiB <= 4 KiB is false, but the
 //       range check is performed against an aligned offset which never
 //       arises here because the alignment check fires first).
@@ -25,19 +25,19 @@
 //       1 byte and trivially in-range under any reasonable byte-range
 //       semantics, while still being unaligned to 4 KiB.
 //     - test 08 (overlap between pairs) — only one pair.
-//     - test 09 (overlap with existing mapping) — fresh VAR has no
+//     - test 09 (overlap with existing mapping) — fresh VMAR has no
 //       existing mappings.
-//     - test 10 (VAR.map ∈ {2,3}) — fresh VAR has map = 0.
+//     - test 10 (VMAR.map ∈ {2,3}) — fresh VMAR has map = 0.
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0 (sz=0), pages=1) — must
 //      succeed; provides a valid pf for the pair so test 02 cannot
 //      pre-empt the alignment check.
-//   2. createVar(caps={r,w}, props=0b011, pages=1) — sz = 0 (4 KiB),
-//      cur_rwx = r|w. Must return a valid VAR handle so test 01
+//   2. createVmar(caps={r,w}, props=0b011, pages=1) — sz = 0 (4 KiB),
+//      cur_rwx = r|w. Must return a valid VMAR handle so test 01
 //      cannot pre-empt the alignment check.
-//   3. mapPf(var_handle, &.{ 0x1, pf_handle }) — offset 0x1 is 1 byte,
-//      unaligned to the VAR's 4 KiB page size, so the kernel must
+//   3. mapPf(vmar_handle, &.{ 0x1, pf_handle }) — offset 0x1 is 1 byte,
+//      unaligned to the VMAR's 4 KiB page size, so the kernel must
 //      return E_INVAL per §[map_pf] test 05.
 //
 // Assertions
@@ -45,7 +45,7 @@
 //   2: createPageFrame returned an error code in vreg 1 — the
 //      success-path precondition is broken so we cannot proceed to
 //      verify the map_pf alignment path.
-//   3: createVar returned an error code in vreg 1 — same precondition
+//   3: createVmar returned an error code in vreg 1 — same precondition
 //      issue.
 
 const lib = @import("lib");
@@ -72,12 +72,12 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Build a regular VAR with sz = 0 (4 KiB) so that any non-4KiB
+    // Build a regular VMAR with sz = 0 (4 KiB) so that any non-4KiB
     // aligned offset trips test 05.
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const cv = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cv = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         1, // pages = 1
         0, // preferred_base = kernel chooses
@@ -87,10 +87,10 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(3);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cv.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cv.v1 & 0xFFF);
 
-    // offset = 0x1 (1 byte) — unaligned to the VAR's 4 KiB page size.
-    const result = syscall.mapPf(var_handle, &.{ 0x1, pf_handle });
+    // offset = 0x1 (1 byte) — unaligned to the VMAR's 4 KiB page size.
+    const result = syscall.mapPf(vmar_handle, &.{ 0x1, pf_handle });
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(1);

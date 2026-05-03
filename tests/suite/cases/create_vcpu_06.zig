@@ -30,10 +30,10 @@
 //        backing store. 4 KiB > sizeof(VmPolicy) (= 976 bytes), so
 //        create_virtual_machine test 05 (page_frame too small) cannot
 //        fire ahead of us.
-//     2. create_var(caps={r,w}, cur_rwx=r|w, pages=1) + map_pf at
+//     2. create_vmar(caps={r,w}, cur_rwx=r|w, pages=1) + map_pf at
 //        offset 0 — gives a CPU-visible window so we can zero the
 //        policy buffer.
-//     3. Zero VmPolicy bytes through the mapped VAR. Zero counts
+//     3. Zero VmPolicy bytes through the mapped VMAR. Zero counts
 //        (num_cpuid_responses = num_cr_policies = 0) are valid per
 //        §[vm_policy], so create_virtual_machine accepts the policy.
 //     4. create_virtual_machine(caps=0, policy_pf) — caps=0 sidesteps
@@ -47,7 +47,7 @@
 //
 // Assertions
 //   1: setup — create_page_frame returned an error word
-//   2: setup — create_var returned an error word
+//   2: setup — create_vmar returned an error word
 //   3: setup — map_pf returned non-OK in vreg 1
 //   4: setup — create_virtual_machine returned an error word
 //   5: setup — create_port returned an error word
@@ -86,9 +86,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

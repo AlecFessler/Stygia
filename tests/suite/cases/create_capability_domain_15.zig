@@ -40,17 +40,17 @@
 //
 // SPEC AMBIGUITY: §[create_capability_domain] doesn't pin whether the
 //   kernel reads the page frame via its own kernel mapping or via the
-//   caller's VAR. Following the runner pattern, we keep the staging
-//   VAR mapped while we write, then unmap before the syscall. If the
-//   kernel actually requires a live VAR mapping during the call, the
+//   caller's VMAR. Following the runner pattern, we keep the staging
+//   VMAR mapped while we write, then unmap before the syscall. If the
+//   kernel actually requires a live VMAR mapping during the call, the
 //   kernel-side handler will need its own kernel mapping and the test
 //   will still observe E_INVAL — we never assert OK.
 //
 // Action
 //   1. create_page_frame(caps={r,w,move}, props=0, pages=1)
-//   2. create_var(caps={r,w}, props={cur_rwx=r|w}, pages=1) — staging
+//   2. create_vmar(caps={r,w}, props={cur_rwx=r|w}, pages=1) — staging
 //   3. map_pf(var, [{0, pf}])
-//   4. zero the first page through the VAR mapping (clobbers the
+//   4. zero the first page through the VMAR mapping (clobbers the
 //      ELF magic)
 //   5. delete(var)                                — drop staging map
 //   6. create_capability_domain(caps=0, ceilings_inner=0,
@@ -59,7 +59,7 @@
 //
 // Assertions
 //   1: create_page_frame returned an error word
-//   2: create_var returned an error word
+//   2: create_vmar returned an error word
 //   3: map_pf returned non-OK
 //   4: create_capability_domain didn't return E_INVAL
 
@@ -74,7 +74,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // §[page_frame] mint a 1-page (4 KiB) page frame. caps include
-    // r|w so the staging VAR can map it for write; move is set so the
+    // r|w so the staging VMAR can map it for write; move is set so the
     // create_capability_domain call below — which conceptually
     // consumes the frame's contents — can do whatever transfer
     // semantics it needs without an extra cap-bit hurdle.
@@ -90,13 +90,13 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
-    // §[var] mint a temporary VAR to gain a writable mapping over the
+    // §[var] mint a temporary VMAR to gain a writable mapping over the
     // page frame. caps.r|w; props.cur_rwx = r|w (subset of caps);
     // pages = 1; preferred_base = 0 (kernel chooses); device_region
     // = 0 (caps.dma = 0 so it's ignored).
-    const var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         0b011, // cur_rwx = r|w
         1, // pages
         0, // preferred_base
@@ -106,12 +106,12 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
     // §[map_pf] pairs encoding: each pair is {var_offset_pages,
     // pf_handle}. Map the entire frame at offset 0.
-    const mp = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const mp = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (mp.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -130,12 +130,12 @@ pub fn main(cap_table_base: u64) void {
         i += 1;
     }
 
-    // Drop the staging VAR. Per the runner's spawnOne path this is
-    // optimistic: if the kernel needs a live VAR mapping during
+    // Drop the staging VMAR. Per the runner's spawnOne path this is
+    // optimistic: if the kernel needs a live VMAR mapping during
     // create_capability_domain it will surface a different error and
     // assertion 4 will fire. The faithful E_INVAL path is unaffected
     // since the page frame itself still holds the zeroed bytes.
-    _ = syscall.delete(var_handle);
+    _ = syscall.delete(vmar_handle);
 
     // [1] caps = 0, [2] ceilings_inner = 0, [3] ceilings_outer = 0
     // — all-zero is a subset of every ceiling, dodging tests 02-12,

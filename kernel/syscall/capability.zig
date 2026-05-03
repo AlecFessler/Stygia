@@ -22,7 +22,7 @@ const CAPS_MASK: u64 = 0xFFFF;
 ///
 /// Most cap fields use bitwise subset semantics: a bit set in `[2].caps`
 /// must also be set in the handle's current caps. The `restart_policy`
-/// field on EC handles (bits 8-9) and VAR handles (bits 9-10) is a 2-bit
+/// field on EC handles (bits 8-9) and VMAR handles (bits 9-10) is a 2-bit
 /// enum ordered by privilege (lowest privilege = numeric 0); for these
 /// fields "reducing" means the new numeric value is less than or equal to
 /// the current value, not bitwise subset.
@@ -30,7 +30,7 @@ const CAPS_MASK: u64 = 0xFFFF;
 /// [test 01] returns E_BADCAP if [1] is not a valid handle.
 /// [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
 /// [test 03] returns E_PERM if the handle is an EC handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
-/// [test 04] returns E_PERM if the handle is a VAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
+/// [test 04] returns E_PERM if the handle is a VMAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 /// [test 05] returns E_INVAL if any reserved bits are set in [1] or [2].
 /// [test 06] on success, the handle's caps field equals [2].caps.
 /// [test 07] on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
@@ -58,7 +58,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
 /// | `capability_domain` (IDC) | Release handle. Domain has system lifetime; it does not terminate when IDC handles drop |
 /// | `execution_context` | Release handle. ECs have capability-domain lifetime; they are not destroyed by handle drops |
 /// | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
-/// | `virtual_address_range` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
+/// | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 /// | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
 /// | `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
 /// | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |

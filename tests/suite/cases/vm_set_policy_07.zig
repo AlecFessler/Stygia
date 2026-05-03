@@ -33,7 +33,7 @@
 //   target. Setup mirrors tests 05/06 — a zeroed VmPolicy page frame
 //   plus a VM minted with caps.policy = true so the earlier gates
 //   (test 01 / 02 / 03 / 04) are inert. The sole assertion checked is
-//   that the prelude (page-frame + VAR + map_pf + VM creation) reaches
+//   that the prelude (page-frame + VMAR + map_pf + VM creation) reaches
 //   the syscall site without an unexpected handle error; a smoke-pass
 //   on E_NODEV preserves the no-virt path. The kind=0 vm_set_policy
 //   call's return is *not* checked: on x86-64 it touches the
@@ -41,7 +41,7 @@
 //   spec sentence is about.
 //
 // Action
-//   1. Stage VmPolicy (PF + VAR + map_pf + zero).
+//   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
 //   2. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
 //      (or smoke-pass on E_NODEV).
 //   3. vmSetPolicy call shape only — return ignored, since the aarch64
@@ -50,7 +50,7 @@
 // Assertions
 //   1: setup — create_page_frame for the policy frame returned an
 //      error word.
-//   2: setup — create_var for the policy mapping returned an error
+//   2: setup — create_vmar for the policy mapping returned an error
 //      word.
 //   3: setup — map_pf for the policy mapping returned non-OK.
 //   4: setup — create_virtual_machine returned an unexpected error
@@ -98,9 +98,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf_policy.v1 & 0xFFF);
 
-    // 2. VAR + map so userspace can zero the policy bytes.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map so userspace can zero the policy bytes.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

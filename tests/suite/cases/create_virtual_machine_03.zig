@@ -53,8 +53,8 @@
 // Action
 //   1. createPageFrame(caps={r,w}, sz=0, pages=1) — must succeed; gives
 //      the page frame backing VmPolicy.
-//   2. createVar(caps={r,w}, cur_rwx=0b011, pages=1) — must succeed;
-//      gives the VAR mapped over policy_pf so userspace can zero it.
+//   2. createVmar(caps={r,w}, cur_rwx=0b011, pages=1) — must succeed;
+//      gives the VMAR mapped over policy_pf so userspace can zero it.
 //   3. mapPf(policy_var, {0, policy_pf}) — must succeed.
 //   4. Zero the VmPolicy buffer (all-zero counts ⇒ kernel scans no
 //      cpuid/cr entries on guest exits).
@@ -117,9 +117,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

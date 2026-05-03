@@ -1,6 +1,6 @@
 // Spec §[snapshot] snapshot — test 01.
 //
-// "[test 01] returns E_BADCAP if [1] is not a valid VAR handle."
+// "[test 01] returns E_BADCAP if [1] is not a valid VMAR handle."
 //
 // Strategy
 //   The child capability domain's table is populated by the kernel at
@@ -11,7 +11,7 @@
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid
-//   as a VAR handle.
+//   as a VMAR handle.
 //
 //   The §[snapshot] gate order rejects an invalid [1] before consulting
 //   [2], so passing slot 4095 for both args still observes E_BADCAP
@@ -19,7 +19,7 @@
 //
 // Action
 //   1. snapshot(invalid_var_slot, invalid_var_slot) — must return
-//      E_BADCAP because [1] (the target VAR slot) is empty.
+//      E_BADCAP because [1] (the target VMAR slot) is empty.
 //
 // Assertions
 //   1: snapshot returned something other than E_BADCAP.

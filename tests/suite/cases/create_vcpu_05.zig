@@ -20,7 +20,7 @@
 //   The kernel can only reach the exit_port handle-validity check after
 //   resolving slot [2] to a real VM, so we need a VM handle minted via
 //   `create_virtual_machine` first. The setup mirrors
-//   create_virtual_machine_06 — page frame for VmPolicy, VAR + map_pf
+//   create_virtual_machine_06 — page frame for VmPolicy, VMAR + map_pf
 //   to plant zero bytes, then create_virtual_machine.
 //
 //   The test capability domain's table is populated by the kernel at
@@ -47,7 +47,7 @@
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs the
 //      VmPolicy struct.
-//   2. createVar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0
+//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0
 //      — gives a CPU-visible window so we can zero the policy.
 //   3. Zero the VmPolicy bytes (§[vm_policy] x86-64 = 976 B fits in
 //      4 KiB). All-zero counts ⇒ valid empty policy.
@@ -60,7 +60,7 @@
 //
 // Assertions
 //   1: setup — createPageFrame returned an error word.
-//   2: setup — createVar returned an error word.
+//   2: setup — createVmar returned an error word.
 //   3: setup — mapPf returned non-OK in vreg 1.
 //   4: createVcpu did not return E_BADCAP (the spec assertion under
 //      test).
@@ -94,9 +94,9 @@ pub fn main(cap_table_base: u64) void {
     }
     const policy_pf: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 2. VAR + map_pf so userspace can zero the policy buffer.
-    const policy_var_caps = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    // 2. VMAR + map_pf so userspace can zero the policy buffer.
+    const policy_var_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, policy_var_caps.toU16()),
         0b011, // cur_rwx = r|w
         1,

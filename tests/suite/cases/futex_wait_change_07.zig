@@ -17,11 +17,11 @@
 //   (E_BADADDR otherwise per test 05). The minimal construction is:
 //
 //     create_page_frame(caps={r,w}, sz=0, pages=1)   — backing 4 KiB
-//     create_var(caps={r,w}, cur_rwx=r|w, pages=1)   — reserves vaddr
+//     create_vmar(caps={r,w}, cur_rwx=r|w, pages=1)   — reserves vaddr
 //     map_pf(var, &.{ 0, pf })                       — maps base→pf
 //
-//   After map_pf the VAR's `map` is 1 (pf-installed) per §[map_pf]
-//   test 11; CPU stores at VAR.base land in the page_frame and
+//   After map_pf the VMAR's `map` is 1 (pf-installed) per §[map_pf]
+//   test 11; CPU stores at VMAR.base land in the page_frame and
 //   subsequent kernel reads of those qwords observe the same bytes
 //   (same model that idc_read_07 uses for cross-mode visibility).
 //
@@ -63,14 +63,14 @@
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props={sz=0}, pages=1)
-//   2. createVar(caps={r,w}, props={cur_rwx=r|w, sz=0}, pages=1)
+//   2. createVmar(caps={r,w}, props={cur_rwx=r|w, sz=0}, pages=1)
 //   3. mapPf(var, &.{ 0, pf })
 //   4. plant base[0] = 0, base[1] = TARGET_HIT (volatile stores)
 //   5. futexWaitChange(timeout=1s, &.{ base+0, TARGET_PAIR_A,
 //                                     base+8, TARGET_HIT })
 //
 // Assertions
-//   1: a setup syscall (createPageFrame / createVar / mapPf)
+//   1: a setup syscall (createPageFrame / createVmar / mapPf)
 //      returned an error word — prelude broke before the spec
 //      assertion under test could be exercised.
 //   2: futex_wait_change returned an error in vreg 1 — the fast
@@ -98,7 +98,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Step 1: 4 KiB page_frame with r|w. Effective perms after the
-    // map_pf intersect with the VAR's cur_rwx = r|w yield r|w on the
+    // map_pf intersect with the VMAR's cur_rwx = r|w yield r|w on the
     // mapped range, so CPU writes succeed.
     const pf_caps = caps.PfCap{ .r = true, .w = true };
     const cpf = syscall.createPageFrame(
@@ -112,13 +112,13 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Step 2: regular VAR sized to 1 page with caps={r,w} and
+    // Step 2: regular VMAR sized to 1 page with caps={r,w} and
     // cur_rwx = r|w. The kernel chooses the base; field0 (cvar.v2)
-    // reports it per §[create_var] test 19.
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    // reports it per §[create_vmar] test 19.
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         1, // pages = 1
         0, // preferred_base = kernel chooses
@@ -128,14 +128,14 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
     // Step 3: install the page_frame at offset 0 — drives `map`
     // 0 -> 1 per §[map_pf] test 11. After this, CPU stores at
     // var_base land in the page_frame and the kernel can observe
     // them through its own mapping when it reads the futex addr.
-    const mr = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const mr = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (errors.isError(mr.v1)) {
         testing.fail(1);
         return;

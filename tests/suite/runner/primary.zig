@@ -321,7 +321,7 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
 
     // Spec §[create_capability_domain] [2] ceilings_inner field layout:
     //   bits  0-7   ec_inner_ceiling   = 0xFF
-    //   bits  8-23  var_inner_ceiling  = 0x01FF
+    //   bits  8-23  vmar_inner_ceiling  = 0x01FF
     //   bits 24-31  cridc_ceiling      = 0x3F
     //   bits 32-39  pf_ceiling         = 0x1F   (max_rwx | max_sz)
     //   bits 40-47  vm_ceiling         = 0x01   (policy bit)
@@ -412,18 +412,18 @@ fn stageLibzPf() caps.HandleId {
     // Temp Var for the runner's own writable view of the pf. We
     // create it R+W (no X needed) just long enough to populate the
     // image bytes; then delete it. The pf keeps the data.
-    const var_caps_word = caps.VarCap{ .r = true, .w = true };
-    const cvar = syscall.createVar(
+    const var_caps_word = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         0b011, // cur_rwx = r|w
         pages,
         0, // preferred_base = 0 → kernel picks
         0,
     );
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    _ = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
 
     // Lay out PT_LOADs into the writable image and apply RELATIVE
     // relocs targeting `image_runtime_base = LIBZ_SLIDE`. The
@@ -440,7 +440,7 @@ fn stageLibzPf() caps.HandleId {
     // Drop the temp Var. The pf keeps the data; the runner holds
     // the pf handle in `libz_pf_handle` for spawnOne's
     // passed_handles.
-    syscall.issueRegDiscard(.delete, 0, .{ .v1 = var_handle });
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = vmar_handle });
 
     return pf_handle;
 }
@@ -457,21 +457,21 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
     );
     const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    const var_caps_word = caps.VarCap{
+    const var_caps_word = caps.VmarCap{
         .r = true,
         .w = true,
     };
-    const cvar = syscall.createVar(
+    const cvar = syscall.createVmar(
         @as(u64, var_caps_word.toU16()),
         0b011,
         @intCast(pages),
         0,
         0,
     );
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
     const var_base: u64 = cvar.v2;
 
-    _ = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    _ = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
 
     const dst: [*]volatile u8 = @ptrFromInt(var_base);
     var i: usize = 0;
@@ -480,7 +480,7 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
         i += 1;
     }
 
-    syscall.issueRegDiscard(.delete, 0, .{ .v1 = var_handle });
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = vmar_handle });
 
     return pf_handle;
 }

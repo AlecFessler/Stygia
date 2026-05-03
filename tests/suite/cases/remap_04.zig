@@ -11,9 +11,9 @@
 //   Earlier remap gates have to be inert by construction so the test
 //   exercises test 04 in isolation:
 //
-//     - test 01 (BADCAP on [1]):           pass a real VAR handle.
+//     - test 01 (BADCAP on [1]):           pass a real VMAR handle.
 //     - test 02 (E_INVAL when map ∈ {0,2}): drive `map` to 1 by calling
-//       `map_pf` after `create_var` (a fresh VAR starts at `map = 0`,
+//       `map_pf` after `create_vmar` (a fresh VMAR starts at `map = 0`,
 //       per §[var]; §[map_pf] test 11 transitions it to 1).
 //     - test 03 (cur_rwx ⊄ caps.rwx):      pick caps and new_cur_rwx
 //       so that new_cur_rwx is a subset of caps. Here caps = {r, w}
@@ -29,17 +29,17 @@
 //   makes the w bit fall outside that intersection, so test 04 must
 //   return E_INVAL.
 //
-//   The VAR's `cur_rwx` at create time is r|w (props = 0b011) so that
+//   The VMAR's `cur_rwx` at create time is r|w (props = 0b011) so that
 //   the §[map_pf] success precondition for `map = 1` is reached
 //   without triggering any §[map_pf] gate. A page_frame with caps = {r}
-//   has fewer effective rights than the VAR's cur_rwx; §[map_pf] does
+//   has fewer effective rights than the VMAR's cur_rwx; §[map_pf] does
 //   not reject such an install (the intersection is taken on access,
 //   per §[map_pf] test 12). So `map_pf` succeeds and `map` becomes 1.
 //
 // Action
 //   1. createPageFrame(caps={r}, props=0, pages=1) — must succeed;
 //      the page_frame whose r-only caps will define the intersection.
-//   2. createVar(caps={r, w}, props={cur_rwx=0b011, sz=0, cch=0},
+//   2. createVmar(caps={r, w}, props={cur_rwx=0b011, sz=0, cch=0},
 //                pages=1, preferred_base=0, device_region=0) — must
 //      succeed. Per §[var] line 877 starts at `map = 0`.
 //   3. mapPf(var, &.{ 0, pf }) — must succeed (all §[map_pf] gates
@@ -53,7 +53,7 @@
 // Assertions
 //   1: vreg 1 was not E_INVAL on the remap call (the spec assertion
 //      under test).
-//   2: a setup syscall (createPageFrame, createVar, or the success-leg
+//   2: a setup syscall (createPageFrame, createVmar, or the success-leg
 //      mapPf) returned an unexpected status — the precondition for
 //      test 04 is broken so we cannot proceed to verify the rule.
 
@@ -83,14 +83,14 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Step 2: regular VAR with caps = {r, w} and cur_rwx = r|w. The
+    // Step 2: regular VMAR with caps = {r, w} and cur_rwx = r|w. The
     // generous caps keep §[remap] test 03 inert (new_cur_rwx r|w ⊆
     // caps r|w). caps.dma = 0 keeps test 05 inert. caps.mmio = 0 and
     // no device_region binding by construction.
-    const var_caps = caps.VarCap{ .r = true, .w = true };
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0.
-    const cvar = syscall.createVar(
-        @as(u64, var_caps.toU16()),
+    const cvar = syscall.createVmar(
+        @as(u64, vmar_caps.toU16()),
         props,
         1, // pages
         0, // preferred_base = kernel chooses
@@ -100,14 +100,14 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
     // Step 3: install the r-only page_frame at offset 0. By
-    // construction every §[map_pf] gate 01-10 is inert (valid VAR,
+    // construction every §[map_pf] gate 01-10 is inert (valid VMAR,
     // valid page_frame, N = 1, sz match, offset 0 within range, no
     // mmio/dma corner cases). §[map_pf] test 11 transitions `map`
     // from 0 to 1, which is the precondition for §[remap] test 04.
-    const map_call = syscall.mapPf(var_handle, &.{ 0, pf_handle });
+    const map_call = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
     if (map_call.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(2);
         return;
@@ -117,7 +117,7 @@ pub fn main(cap_table_base: u64) void {
     // installed page_frames is r (only the one r-only pf is
     // installed); the w bit falls outside that intersection, so per
     // §[remap] test 04 the call must return E_INVAL.
-    const result = syscall.remap(var_handle, 0b011);
+    const result = syscall.remap(vmar_handle, 0b011);
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(1);

@@ -2,7 +2,7 @@
 //!
 //! Spec-v3 stub: NVMe device discovery and the controller driver
 //! ride on a PCI passthrough device_region with bound DMA VARs (see
-//! §[device_region] and §[create_var] caps.dma path). Both pieces
+//! §[device_region] and §[create_vmar] caps.dma path). Both pieces
 //! exist in the prior-ABI form (see git history before the spec-v3
 //! port), but the device-discovery + DMA mapping migration is
 //! deferred — the NVMe blob is large and the embedded-asset path in
@@ -11,7 +11,7 @@
 //! For now `init` always reports "no controller found", which steers
 //! main.zig into the embedded path. When NVMe support comes back we
 //! restore the controller wiring on top of `caps.readCap` for the PCI
-//! device_region and `createVar` with `caps.dma = 1` for the prp lists.
+//! device_region and `createVmar` with `caps.dma = 1` for the prp lists.
 
 const log = @import("log.zig");
 

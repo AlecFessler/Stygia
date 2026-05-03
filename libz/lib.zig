@@ -11,6 +11,8 @@
 // block at the bottom of syscall.zig: the three together define the
 // libz ABI.
 
+pub const caps = @import("caps.zig");
+pub const errors = @import("errors.zig");
 pub const syscall = @import("syscall.zig");
 
 pub const Regs = syscall.Regs;
