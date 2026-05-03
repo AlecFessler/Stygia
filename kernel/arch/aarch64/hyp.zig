@@ -169,7 +169,16 @@ pub const WorldSwitchCtx = extern struct {
     /// on the instruction after the host's hvc.
     host_elr_el2: u64 = 0,
     host_spsr_el2: u64 = 0,
-    _pad: u64 = 0,
+    /// PA of the per-vCPU `vgic.VcpuHwShadow`. `hvc_vcpu_run` flushes
+    /// `ICH_LR<n>_EL2` + AP/VMCR/HCR from this shadow on entry;
+    /// `guest_exit_entry` snapshots them back on exit. EL2 has
+    /// `SCTLR_EL2.M = 0`, so this must be a raw PA.
+    vgic_shadow_pa: u64 = 0,
+    /// PA of the per-vCPU `vgic.VtimerState`. Same calling convention
+    /// as `vgic_shadow_pa`. Inlined-load/save replaces the previous
+    /// per-vmexit `hvc_vtimer_load_guest` / `hvc_vtimer_save_guest`
+    /// round-trips.
+    vtimer_pa: u64 = 0,
 };
 
 comptime {
@@ -184,6 +193,8 @@ comptime {
     std.debug.assert(@offsetOf(WorldSwitchCtx, "exit_hpfar") == 0x40);
     std.debug.assert(@offsetOf(WorldSwitchCtx, "host_elr_el2") == 0x48);
     std.debug.assert(@offsetOf(WorldSwitchCtx, "host_spsr_el2") == 0x50);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "vgic_shadow_pa") == 0x58);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "vtimer_pa") == 0x60);
 
     // GuestState offsets hardcoded in the HVC stubs below.
     std.debug.assert(@offsetOf(GuestState, "x0") == 0x00);
@@ -382,6 +393,8 @@ pub fn vmResume(
     control_block_pa: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
     arch_scratch: *align(16) ArchScratch,
+    vgic_shadow_pa: u64,
+    vtimer_pa: u64,
 ) VmExitInfo {
     const ctx = &arch_scratch.ctx;
     const host_save = &arch_scratch.host_save;
@@ -411,6 +424,8 @@ pub fn vmResume(
     ctx.guest_state_pa = gs_pa.addr;
     ctx.host_save_pa = hs_pa.addr;
     ctx.stage2_root_pa = vm_structures.addr;
+    ctx.vgic_shadow_pa = vgic_shadow_pa;
+    ctx.vtimer_pa = vtimer_pa;
     // VTTBR_EL2 layout (ARM ARM D13.2.151):
     //   [63:48] VMID  — stage-2 TLB tag, managed by kvm/vmid.zig
     //   [47:1]  BADDR — stage-2 root PA (bits [47:x], with `x` dictated
@@ -1213,6 +1228,61 @@ export fn hvc_vcpu_run() linksection(".hyp_text") callconv(.naked) noreturn {
         \\  msr     sp_el1, x3
         \\  isb
         \\
+        \\  // ---- Inline vtimer load (replaces hvc_vtimer_load_guest) ----
+        \\  // x4 = ctx.vtimer_pa
+        \\  ldr     x4, [x18, #0x60]
+        \\  cbz     x4, 7f
+        \\  ldr     x3, [x4, #0x20]         // primed
+        \\  cbnz    x3, 6f
+        \\  mrs     x3, cntpct_el0
+        \\  str     x3, [x4, #0x00]         // cntvoff = CNTPCT (zero guest CNTVCT)
+        \\  mov     x3, #1
+        \\  str     x3, [x4, #0x20]         // primed = 1
+        \\6:
+        \\  ldr     x3, [x4, #0x00]
+        \\  msr     cntvoff_el2, x3
+        \\  ldr     x3, [x4, #0x18]
+        \\  msr     cntkctl_el1, x3
+        \\  ldr     x3, [x4, #0x10]
+        \\  msr     cntv_cval_el0, x3
+        \\  ldr     x3, [x4, #0x08]
+        \\  msr     cntv_ctl_el0, x3
+        \\7:
+        \\
+        \\  // ---- Inline vGIC list-register flush (replaces
+        \\  //      hvc_vgic_prepare_entry). Walks `num_lrs` LRs, then
+        \\  //      AP0R0/AP1R0/VMCR/HCR. Disabling HCR is the LAST
+        \\  //      write so the guest's view of the LRs is coherent
+        \\  //      before delivery starts.
+        \\  ldr     x4, [x18, #0x58]        // ctx.vgic_shadow_pa
+        \\  cbz     x4, 8f
+        \\  ldr     x5, [x4, #0xA8]         // num_lrs
+        \\  ldr     x3, [x4, #0x00]
+        \\  msr     S3_4_C12_C12_0, x3      // ICH_LR0_EL2
+        \\  cmp     x5, #1
+        \\  b.ls    8f
+        \\  ldr     x3, [x4, #0x08]
+        \\  msr     S3_4_C12_C12_1, x3
+        \\  cmp     x5, #2
+        \\  b.ls    8f
+        \\  ldr     x3, [x4, #0x10]
+        \\  msr     S3_4_C12_C12_2, x3
+        \\  cmp     x5, #3
+        \\  b.ls    8f
+        \\  ldr     x3, [x4, #0x18]
+        \\  msr     S3_4_C12_C12_3, x3
+        \\8:
+        \\  cbz     x4, 9f
+        \\  ldr     x3, [x4, #0x90]
+        \\  msr     S3_4_C12_C8_0, x3       // ICH_AP0R0_EL2
+        \\  ldr     x3, [x4, #0x98]
+        \\  msr     S3_4_C12_C9_0, x3       // ICH_AP1R0_EL2
+        \\  ldr     x3, [x4, #0x88]
+        \\  msr     S3_4_C12_C11_7, x3      // ICH_VMCR_EL2
+        \\  ldr     x3, [x4, #0x80]
+        \\  msr     S3_4_C12_C11_0, x3      // ICH_HCR_EL2 (En=1 forced by caller)
+        \\9:
+        \\
         \\  // ---- Program ELR_EL2 / SPSR_EL2 from guest.pc / guest.pstate ----
         \\  ldr     x3, [x2, #0x108]        // guest.pc
         \\  msr     elr_el2, x3
@@ -1339,6 +1409,58 @@ export fn guest_exit_entry() linksection(".hyp_text") callconv(.naked) noreturn 
         \\  str     x0, [x18, #0x38]
         \\  mrs     x0, hpfar_el2
         \\  str     x0, [x18, #0x40]
+        \\
+        \\  // ---- Inline vGIC list-register snapshot (replaces
+        \\  //      hvc_vgic_save_exit). Mirror of the prepare_entry
+        \\  //      sequence in hvc_vcpu_run. Disable ICH_HCR last so
+        \\  //      a stale virtual interrupt can't deliver into host
+        \\  //      context after our ERET back to EL1.
+        \\  ldr     x4, [x18, #0x58]        // ctx.vgic_shadow_pa
+        \\  cbz     x4, 11f
+        \\  ldr     x5, [x4, #0xA8]         // num_lrs
+        \\  mrs     x3, S3_4_C12_C12_0      // ICH_LR0_EL2
+        \\  str     x3, [x4, #0x00]
+        \\  cmp     x5, #1
+        \\  b.ls    10f
+        \\  mrs     x3, S3_4_C12_C12_1
+        \\  str     x3, [x4, #0x08]
+        \\  cmp     x5, #2
+        \\  b.ls    10f
+        \\  mrs     x3, S3_4_C12_C12_2
+        \\  str     x3, [x4, #0x10]
+        \\  cmp     x5, #3
+        \\  b.ls    10f
+        \\  mrs     x3, S3_4_C12_C12_3
+        \\  str     x3, [x4, #0x18]
+        \\10:
+        \\  mrs     x3, S3_4_C12_C8_0       // ICH_AP0R0_EL2
+        \\  str     x3, [x4, #0x90]
+        \\  mrs     x3, S3_4_C12_C9_0       // ICH_AP1R0_EL2
+        \\  str     x3, [x4, #0x98]
+        \\  mrs     x3, S3_4_C12_C11_7      // ICH_VMCR_EL2
+        \\  str     x3, [x4, #0x88]
+        \\  mrs     x3, S3_4_C12_C11_4      // ICH_MISR_EL2
+        \\  str     x3, [x4, #0xA0]
+        \\  // Disable virtual CPU interface. Ensures no stray vintid
+        \\  // delivers into the host's EL1 vector after ERET.
+        \\  msr     S3_4_C12_C11_0, xzr     // ICH_HCR_EL2 = 0
+        \\11:
+        \\
+        \\  // ---- Inline vtimer snapshot (replaces hvc_vtimer_save_guest).
+        \\  //      Mask the timer (CTL = IMASK only) so a post-exit
+        \\  //      virtual-timer match cannot fire while we run host
+        \\  //      code (mirror of arch_timer.c timer_save_state).
+        \\  ldr     x4, [x18, #0x60]        // ctx.vtimer_pa
+        \\  cbz     x4, 12f
+        \\  mrs     x3, cntv_ctl_el0
+        \\  str     x3, [x4, #0x08]
+        \\  mrs     x3, cntv_cval_el0
+        \\  str     x3, [x4, #0x10]
+        \\  mrs     x3, cntkctl_el1
+        \\  str     x3, [x4, #0x18]
+        \\  mov     x3, #0x2
+        \\  msr     cntv_ctl_el0, x3
+        \\12:
         \\
         \\  // ---- Reload host EL1 sysregs from host_save ----
         \\  ldr     x2, [x18, #0x08]        // host_save_pa
