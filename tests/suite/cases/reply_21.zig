@@ -1,27 +1,27 @@
-// Spec §[reply_transfer] — test 16.
+// Spec §[reply] reply — test 21.
 //
-// "[test 16] on success when the reply_transfer is typed `vm_exit` and
-//  the receiver wrote the `initial_state` sub-code into the reply
-//  (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an
+// "[test 21] on success when `pair_count > 0` and the reply is typed
+//  `vm_exit` and the receiver wrote the `initial_state` sub-code (vreg
+//  70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an
 //  initial vm_exit on the vCPU's exit_port without entering guest mode;
 //  the N attached handles are still installed in the vCPU's domain at
-//  slots [tstart, tstart+N) per the standard reply_transfer rules."
+//  slots [tstart, tstart+N)."
 //
 // Spec semantics
-//   §[reply] / §[reply_transfer] route reply handles by their event_type
-//   tag at recv time. A reply tagged `vm_exit` projects the
-//   §[vm_exit_state] window from the receiver's user stack onto the
-//   vCPU's GuestState, then resumes the vCPU into guest mode — UNLESS
-//   the receiver wrote `initial_state` into the exit sub-code slot
-//   (vreg 70 on x86-64, vreg 117 on aarch64), in which case the kernel
-//   keeps the vCPU not-started and re-enqueues an initial vm_exit on the
-//   bound exit_port.
+//   §[reply] routes reply handles by their event_type tag at recv
+//   time. A reply tagged `vm_exit` projects the §[vm_exit_state]
+//   window from the receiver's user stack onto the vCPU's GuestState,
+//   then resumes the vCPU into guest mode — UNLESS the receiver wrote
+//   `initial_state` into the exit sub-code slot (vreg 70 on x86-64,
+//   vreg 117 on aarch64), in which case the kernel keeps the vCPU
+//   not-started and re-enqueues an initial vm_exit on the bound
+//   exit_port.
 //
 //   The "stay not-started" handshake suppresses guest entry, but the
-//   standard reply_transfer payload-handling rules still execute: the
-//   N pair entries at vregs [128-N..127] are validated and installed
-//   into the vCPU's owning domain at slots [tstart, tstart+N) per
-//   §[handle_attachments]. Test 16 exercises that joint contract:
+//   standard pair-attachment rules still execute: the N pair entries
+//   at vregs [128-N..127] are validated and installed into the vCPU's
+//   owning domain at slots [tstart, tstart+N) per
+//   §[handle_attachments]. Test 21 exercises that joint contract:
 //   the not-started re-delivery AND the handle install both fire.
 //
 // Strategy
@@ -45,7 +45,7 @@
 //
 //   The exit_port carries `xfer` so the recv-minted reply handle is
 //   tagged `xfer = 1` (§[reply] reply-cap minting) — the reply cap
-//   §[reply_transfer] [test 02] gates on.
+//   §[reply] [test 09] gates on.
 //
 // Action
 //   1. Standard create_vcpu_09 prelude — page_frame for the policy,
@@ -179,8 +179,8 @@ pub fn main(cap_table_base: u64) void {
     // 1e. Exit port. `bind` for create_vcpu's [4], `recv` for the
     //     test EC to dequeue events, `xfer` so the recv-minted reply
     //     handle carries `xfer = 1` per §[reply] reply-cap minting —
-    //     the cap §[reply_transfer] [test 02] gates on. All three
-    //     bits sit inside the runner-granted port_ceiling = 0x1C.
+    //     the cap §[reply] [test 09] gates on. All three bits sit
+    //     inside the runner-granted port_ceiling = 0x1C.
     const exit_port_caps = caps.PortCap{
         .bind = true,
         .recv = true,
@@ -255,8 +255,8 @@ pub fn main(cap_table_base: u64) void {
     }
     const reply_handle: HandleId = @truncate((got.word >> 32) & 0xFFF);
 
-    // 5. reply_transfer typed `vm_exit` with the initial_state
-    //    handshake AND two pair entries (move = 1). The libz wrapper
+    // 5. reply typed `vm_exit` with the initial_state handshake AND
+    //    two pair entries (move = 1). The libz wrapper
     //    reserves the §[vm_exit_state] window above SP, zeroes it,
     //    writes INITIAL_STATE_SUBCODE at vreg 70 (x86-64) / 117
     //    (aarch64), and writes the N pair entries at vregs
