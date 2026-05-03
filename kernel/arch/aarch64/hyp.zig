@@ -1483,7 +1483,7 @@ export fn guest_exit_entry() linksection(".hyp_text") callconv(.naked) noreturn 
         \\  str     x3, [x4, #0x98]
         \\  mrs     x3, S3_4_C12_C11_7      // ICH_VMCR_EL2
         \\  str     x3, [x4, #0x88]
-        \\  mrs     x3, S3_4_C12_C11_4      // ICH_MISR_EL2
+        \\  mrs     x3, S3_4_C12_C11_2      // ICH_MISR_EL2
         \\  str     x3, [x4, #0xA0]
         \\  // Disable virtual CPU interface. Ensures no stray vintid
         \\  // delivers into the host's EL1 vector after ERET.

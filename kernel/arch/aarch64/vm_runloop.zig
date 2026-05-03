@@ -17,8 +17,15 @@ const hv_vm = zag.arch.aarch64.hv.vm;
 const hyp = zag.arch.aarch64.hyp;
 const kprof = zag.kprof.trace_id;
 const psci = zag.arch.aarch64.hv.psci;
+const serial = zag.arch.aarch64.serial;
 const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
+
+// Diagnostic counters — used to attribute boot stall to (a) enterGuest
+// not being called, (b) vmResume not returning, (c) specific exit types.
+var dbg_eg_calls: u64 = 0;
+var dbg_resume_count: u64 = 0;
+var dbg_exit_count: u64 = 0;
 
 /// GICv3 PPI 27 = virtual timer (CNTV) interrupt. Linux's arm_arch_timer
 /// driver wires `arch_timer_handler_virt` to PPI 27 by default.
@@ -63,6 +70,13 @@ const SUBCODE_INITIAL_STATE: u8 = 10;
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     kprof.enter(.vm_enter);
     defer kprof.exit(.vm_enter);
+
+    dbg_eg_calls += 1;
+    if (dbg_eg_calls <= 4 or dbg_eg_calls % 256 == 0) {
+        serial.print("[hv] enterGuest #{d} resumes={d} exits={d}\n", .{
+            dbg_eg_calls, dbg_resume_count, dbg_exit_count,
+        });
+    }
 
     if (!vm_hw.vmSupported()) return null;
 
@@ -126,6 +140,12 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             arch_state.vtimer.cntv_ctl_el0 |= CNTV_CTL_IMASK;
         }
 
+        dbg_resume_count += 1;
+        if (dbg_resume_count <= 4 or dbg_resume_count % 1024 == 0) {
+            serial.print("[hv] vmResume #{d} pc=0x{x}\n", .{
+                dbg_resume_count, arch_state.guest_state.pc,
+            });
+        }
         const exit_info = hyp.vmResume(
             &arch_state.guest_state,
             stage2_root,
@@ -136,6 +156,29 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             vtimer_pa,
         );
         arch_state.last_exit = exit_info;
+        dbg_exit_count += 1;
+        if (dbg_exit_count <= 16 or dbg_exit_count % 1024 == 0) {
+            const tag: []const u8 = switch (exit_info) {
+                .hvc => "hvc",
+                .smc => "smc",
+                .stage2_fault => "s2f",
+                .sysreg_trap => "sys",
+                .wfi_wfe => "wfi",
+                .unknown_ec => "uec",
+                .synchronous_el1 => "sel1",
+                .halt => "halt",
+                .shutdown => "shut",
+                .unknown => "unk",
+            };
+            const gp: u64 = switch (exit_info) {
+                .stage2_fault => |s| s.guest_phys,
+                .hvc => |h| h.imm,
+                else => 0,
+            };
+            serial.print("[hv] X#{d} {s} pc=0x{x} gp/imm=0x{x}\n", .{
+                dbg_exit_count, tag, arch_state.guest_state.pc, gp,
+            });
+        }
 
         switch (exit_info) {
             .hvc => |h| {
