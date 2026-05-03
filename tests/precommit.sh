@@ -552,9 +552,12 @@ stage_linux_guest_aarch64_boot() {
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
+    # End-to-end marker — the busybox initramfs `init` script prints
+    # "hello from guest" once Linux has reached userspace. Anything short
+    # of that means Linux didn't actually run.
     local found=0
     for _ in $(seq 1 600); do
-        if grep -q "=== linux_guest (spec-v3) ===" "$qemu_log" 2>/dev/null; then
+        if grep -q "hello from guest" "$qemu_log" 2>/dev/null; then
             found=1
             break
         fi
@@ -566,12 +569,12 @@ stage_linux_guest_aarch64_boot() {
     wait "$qemu_pid" 2>/dev/null || true
 
     if [[ $found -eq 1 ]]; then
-        echo "[PASS] linux_guest VMM came up (aarch64 TCG)"
+        echo "[PASS] linux_guest aarch64 booted Linux to busybox init"
         rm -f "$qemu_log"
         rm -rf "$fat"
         return 0
     else
-        echo "[FAIL] linux_guest VMM did not print banner within 600s (aarch64 TCG)"
+        echo "[FAIL] linux_guest aarch64 did not reach busybox init within 600s"
         echo "--- last 30 lines of QEMU output ---"
         tail -30 "$qemu_log"
         echo "--- end ---"

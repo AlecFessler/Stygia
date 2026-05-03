@@ -708,6 +708,8 @@ pub const HCR_EL2_LINUX_GUEST: u64 = HCR_EL2_VM |
     HCR_EL2_FMO |
     HCR_EL2_IMO |
     HCR_EL2_AMO |
+    HCR_EL2_TWI |
+    HCR_EL2_TWE |
     HCR_EL2_RW;
 
 // ===========================================================================

@@ -61,20 +61,32 @@ pub const VERSION_1_2: u32 = 0x0001_0002;
 pub const Outcome = enum { handled, forward_to_vmm };
 
 /// Dispatch an HVC/SMC call whose X0 holds an SMCCC function ID. For
-/// first-light Linux boot every real PSCI function returns
-/// PSCI_NOT_SUPPORTED — guests fall back to non-PSCI paths gracefully.
+/// the single-vCPU busybox boot path:
+///   * PSCI_VERSION returns 1.2 so Linux's PSCI driver registers a real
+///     version (returning NOT_SUPPORTED here makes Linux print
+///     "PSCIv65535.65535 detected" and bias its boot path on a bogus
+///     value — confuses the early arm-timer init).
+///   * AFFINITY_INFO(self, 0) returns 0 (ON); other targets return 1
+///     (OFF) so a single-vCPU guest doesn't try to bring up CPU 1.
+///   * MIGRATE_INFO_TYPE returns 2 (MIGRATE not required).
+///   * Everything else returns NOT_SUPPORTED — single-vCPU guests don't
+///     hit CPU_ON/CPU_OFF in this path.
 pub fn dispatch(guest_state: *GuestState) Outcome {
     const fid_raw: u32 = @truncate(guest_state.x0);
     const fid: FunctionId = @enumFromInt(fid_raw);
 
     const reply: u64 = switch (fid) {
-        .psci_version,
+        .psci_version => @as(u64, VERSION_1_2),
+        .affinity_info => blk: {
+            // x1 = target affinity (MPIDR). Single-vCPU guest: only 0 is ON.
+            const target_aff: u64 = guest_state.x1;
+            break :blk if (target_aff == 0) 0 else 1; // ON / OFF
+        },
+        .migrate_info_type => @as(u64, 2), // MIGRATE not required (DEN0022F §5.10)
         .cpu_suspend,
         .cpu_off,
         .cpu_on,
-        .affinity_info,
         .migrate,
-        .migrate_info_type,
         .migrate_info_up_cpu,
         .system_off,
         .system_reset,

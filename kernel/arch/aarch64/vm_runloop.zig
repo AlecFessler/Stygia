@@ -107,6 +107,30 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
                 }
                 return decodeDelivery(exit_info, &arch_state.guest_state);
             },
+            .unknown => |raw| {
+                // `irq_exit_entry` writes `IRQ_EXIT_SENTINEL` (all-ones)
+                // into ctx.exit_esr to flag an async exit (IRQ / FIQ /
+                // SError). The pending physical IRQ was taken by the
+                // host's EL1 vector during the EL2→EL1 ERET (HCR_EL2.IMO
+                // was cleared on the exit path), so re-enter the guest
+                // at the same PC — ELR_EL2 was the about-to-execute
+                // instruction, so PC is correct as-is. Without this,
+                // every async exit decodes as `unknown` and the VMM
+                // would advance PC by 4, silently skipping a guest
+                // instruction per host-tick.
+                if (raw == hyp.IRQ_EXIT_SENTINEL) continue;
+                return decodeDelivery(exit_info, &arch_state.guest_state);
+            },
+            .wfi_wfe => {
+                // Inline-handle WFI/WFE — advance past the hint and
+                // re-enter. ARM ARM B1.5: WFI is a hint, not a state
+                // change. With HCR.TWI=1 every guest WFI traps; we
+                // skip it because we have no virtual-timer injection
+                // yet — letting WFI block (TWI=0 + halt) or surfacing
+                // each iteration to the VMM both wedge the boot.
+                arch_state.guest_state.pc +%= 4;
+                continue;
+            },
             .stage2_fault => |s| {
                 // Inline-handle PL011 MMIO so the guest console TX loop
                 // doesn't roundtrip to the VMM per character. Mirrors x64's

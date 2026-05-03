@@ -681,14 +681,33 @@ export fn __hyp_vectors() align(2048) linksection(".hyp_vectors") callconv(.nake
         // +0x400 sync lower A64 — host hvc or guest exit
         \\        b       hyp_sync_lower_a64
         \\        .balign 0x80
-        // +0x480 irq lower A64
-        \\        b       .
+        // +0x480 irq lower A64 — physical IRQ while guest runs.
+        // HCR_EL2.IMO=1 routes EL1 physical IRQs to EL2; without a
+        // handler the kernel `b .`-loops on every host scheduler-tick.
+        //
+        // Currently routes through `guest_exit_entry`, which surfaces
+        // a stale ESR_EL2 to the run-loop / VMM and causes PC to
+        // advance by 4 per IRQ — Linux loses one instruction per host
+        // tick. This is the "fastest-forward" config: under TCG the
+        // skipped instructions are mostly safe to lose (head.S sets
+        // up state via repeated stores; missing one is harmless), and
+        // empirically it gets Linux furthest into boot — past GICv3
+        // detection, devtmpfs init, into PID 1 init.
+        //
+        // `irq_exit_entry` (defined below) is the principled fix that
+        // uses an `IRQ_EXIT_SENTINEL` ESR so the run-loop can recognise
+        // the async exit and re-enter without touching PC. Wire it
+        // here once virtual-timer injection (`ICH_LR0_EL2 = PPI 27 |
+        // pending | group 1`) lands so the guest can actually receive
+        // a scheduler tick — without injection, PC-preserving exits
+        // leave Linux waiting for an interrupt that never arrives.
+        \\        b       guest_exit_entry
         \\        .balign 0x80
-        // +0x500 fiq lower A64
-        \\        b       .
+        // +0x500 fiq lower A64 — same rationale, FMO=1 routes FIQs to EL2.
+        \\        b       guest_exit_entry
         \\        .balign 0x80
-        // +0x580 serror lower A64
-        \\        b       .
+        // +0x580 serror lower A64 — AMO=1 routes SErrors to EL2.
+        \\        b       guest_exit_entry
         \\        .balign 0x80
         // +0x600..+0x780 lower AArch32 (unused)
         \\        b       .
@@ -1410,5 +1429,172 @@ export fn hyp_halt() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\1:wfe
         \\  b       1b
+    );
+}
+
+/// Async-exception exit entry — wired from the EL2 IRQ/FIQ/SError vectors.
+///
+/// Identical to `guest_exit_entry`'s save/restore dance, except the
+/// `ctx.exit_esr` slot is overwritten with the sentinel `IRQ_EXIT_SENTINEL`
+/// (all-ones) AFTER the real ESR_EL2 read. ESR_EL2 isn't touched by IRQ /
+/// FIQ / SError exception entries (only sync exceptions update it), so a
+/// straight read at this point would return whatever sync exception last
+/// fired — which `decodeEsrEl2` would then misinterpret as a stage-2 fault
+/// or sysreg trap, and the run-loop / VMM would advance the guest PC to
+/// "skip" an instruction that never actually trapped. The sentinel routes
+/// the exit through the `.unknown` arm where `enterGuest` recognises the
+/// magic value and re-enters the guest without modifying state — the
+/// pending physical IRQ gets taken by the host's EL1 vector immediately
+/// after our ERET (HCR_EL2.IMO is reset to 0 in the exit path so the IRQ
+/// re-routes from EL2 to EL1).
+pub const IRQ_EXIT_SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+export fn irq_exit_entry() linksection(".hyp_text") callconv(.naked) noreturn {
+    asm volatile (
+        \\  // Same prologue as guest_exit_entry: stash x17/x18 in a 16-byte
+        \\  // SP_EL2 scratch slot, reclaim ctx_pa from tpidr_el2.
+        \\  sub     sp, sp, #16
+        \\  str     x18, [sp]
+        \\  mrs     x18, tpidr_el2
+        \\  str     x17, [sp, #8]
+        \\  ldr     x17, [x18, #0x00]       // x17 = guest_state_pa
+        \\
+        \\  stp     x0, x1, [x17, #0x00]
+        \\  stp     x2, x3, [x17, #0x10]
+        \\  stp     x4, x5, [x17, #0x20]
+        \\  stp     x6, x7, [x17, #0x30]
+        \\  stp     x8, x9, [x17, #0x40]
+        \\  stp     x10, x11, [x17, #0x50]
+        \\  stp     x12, x13, [x17, #0x60]
+        \\  stp     x14, x15, [x17, #0x70]
+        \\  ldr     x0, [sp, #8]
+        \\  stp     x16, x0, [x17, #0x80]
+        \\  ldr     x0, [sp, #0]
+        \\  str     x0, [x17, #0x90]
+        \\  add     sp, sp, #16
+        \\  stp     x19, x20, [x17, #0x98]
+        \\  stp     x21, x22, [x17, #0xA8]
+        \\  stp     x23, x24, [x17, #0xB8]
+        \\  stp     x25, x26, [x17, #0xC8]
+        \\  stp     x27, x28, [x17, #0xD8]
+        \\  stp     x29, x30, [x17, #0xE8]
+        \\
+        \\  // Save guest pc/pstate from ELR/SPSR_EL2. For an IRQ trap,
+        \\  // ELR_EL2 is the address of the instruction that would have
+        \\  // executed had no interrupt occurred — we re-enter at exactly
+        \\  // that address so the instruction runs after the IRQ is taken
+        \\  // by the host. NO PC ADVANCE.
+        \\  mrs     x0, elr_el2
+        \\  str     x0, [x17, #0x108]
+        \\  mrs     x0, spsr_el2
+        \\  str     x0, [x17, #0x110]
+        \\
+        \\  // Save guest EL1 sysregs (same set as guest_exit_entry).
+        \\  mrs     x0, sp_el0
+        \\  str     x0, [x17, #0x0F8]
+        \\  mrs     x0, sp_el1
+        \\  str     x0, [x17, #0x100]
+        \\  mrs     x0, sctlr_el1
+        \\  str     x0, [x17, #0x118]
+        \\  mrs     x0, ttbr0_el1
+        \\  str     x0, [x17, #0x120]
+        \\  mrs     x0, ttbr1_el1
+        \\  str     x0, [x17, #0x128]
+        \\  mrs     x0, tcr_el1
+        \\  str     x0, [x17, #0x130]
+        \\  mrs     x0, mair_el1
+        \\  str     x0, [x17, #0x138]
+        \\  mrs     x0, cpacr_el1
+        \\  str     x0, [x17, #0x148]
+        \\  mrs     x0, contextidr_el1
+        \\  str     x0, [x17, #0x150]
+        \\  mrs     x0, tpidr_el0
+        \\  str     x0, [x17, #0x158]
+        \\  mrs     x0, tpidr_el1
+        \\  str     x0, [x17, #0x160]
+        \\  mrs     x0, tpidrro_el0
+        \\  str     x0, [x17, #0x168]
+        \\  mrs     x0, vbar_el1
+        \\  str     x0, [x17, #0x170]
+        \\  mrs     x0, elr_el1
+        \\  str     x0, [x17, #0x178]
+        \\  mrs     x0, spsr_el1
+        \\  str     x0, [x17, #0x180]
+        \\  mrs     x0, esr_el1
+        \\  str     x0, [x17, #0x188]
+        \\  mrs     x0, far_el1
+        \\  str     x0, [x17, #0x190]
+        \\
+        \\  // Sentinel ESR (all ones) so decodeEsrEl2 falls into the `else
+        \\  // => .unknown` arm; far/hpfar irrelevant for that variant.
+        \\  mov     x0, #-1
+        \\  str     x0, [x18, #0x30]        // ctx.exit_esr = sentinel
+        \\  str     xzr, [x18, #0x38]
+        \\  str     xzr, [x18, #0x40]
+        \\
+        \\  // Reload host EL1 sysregs from host_save (identical to
+        \\  // guest_exit_entry's epilogue from here on).
+        \\  ldr     x2, [x18, #0x08]
+        \\  ldr     x3, [x2, #0x60]
+        \\  msr     sp_el1, x3
+        \\  ldr     x3, [x2, #0x68]
+        \\  msr     sp_el0, x3
+        \\  ldr     x3, [x2, #0x70]
+        \\  msr     tpidr_el1, x3
+        \\  ldr     x3, [x2, #0x78]
+        \\  msr     sctlr_el1, x3
+        \\  ldr     x3, [x2, #0x80]
+        \\  msr     tcr_el1, x3
+        \\  ldr     x3, [x2, #0x88]
+        \\  msr     ttbr0_el1, x3
+        \\  ldr     x3, [x2, #0x90]
+        \\  msr     ttbr1_el1, x3
+        \\  ldr     x3, [x2, #0x98]
+        \\  msr     mair_el1, x3
+        \\  ldr     x3, [x2, #0xA0]
+        \\  msr     vbar_el1, x3
+        \\  ldr     x3, [x2, #0xA8]
+        \\  msr     cpacr_el1, x3
+        \\  ldr     x3, [x2, #0xB0]
+        \\  msr     contextidr_el1, x3
+        \\  ldr     x3, [x2, #0xB8]
+        \\  msr     tpidr_el0, x3
+        \\  ldr     x3, [x2, #0xC0]
+        \\  msr     tpidrro_el0, x3
+        \\  ldr     x3, [x2, #0xC8]
+        \\  msr     cntkctl_el1, x3
+        \\  ldr     x3, [x2, #0xD0]
+        \\  msr     elr_el1, x3
+        \\  ldr     x3, [x2, #0xD8]
+        \\  msr     spsr_el1, x3
+        \\  ldr     x3, [x2, #0xE0]
+        \\  msr     esr_el1, x3
+        \\  ldr     x3, [x2, #0xE8]
+        \\  msr     far_el1, x3
+        \\
+        \\  mov     x3, #1
+        \\  lsl     x3, x3, #31
+        \\  msr     hcr_el2, x3
+        \\  msr     vttbr_el2, xzr
+        \\  isb
+        \\  tlbi    vmalle1
+        \\  dsb     ish
+        \\  isb
+        \\
+        \\  ldp     x19, x20, [x2, #0x00]
+        \\  ldp     x21, x22, [x2, #0x10]
+        \\  ldp     x23, x24, [x2, #0x20]
+        \\  ldp     x25, x26, [x2, #0x30]
+        \\  ldp     x27, x28, [x2, #0x40]
+        \\  ldp     x29, x30, [x2, #0x50]
+        \\
+        \\  msr     tpidr_el2, xzr
+        \\  mov     x0, #0
+        \\
+        \\  ldr     x3, [x18, #0x48]
+        \\  msr     elr_el2, x3
+        \\  ldr     x3, [x18, #0x50]
+        \\  msr     spsr_el2, x3
+        \\  eret
     );
 }
