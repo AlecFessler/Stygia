@@ -9,6 +9,7 @@ const futex = zag.sched.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const kprof = zag.kprof.trace_id;
 const kprof_dump = zag.kprof.dump;
 const kprof_log = zag.kprof.log;
 const paging_mod = zag.arch.x64.paging;
@@ -199,6 +200,9 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
 /// invocation just resets the next tick to `TIMESLICE_NS` from now.
 fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
+    kprof.enter(.sched_tick);
+    defer kprof.exit(.sched_tick);
+
     // No periodic debug print here. The runner emits its own per-batch
     // heartbeat over COM1, and any kernel-side periodic `serial.print`
     // races against the runner's user-side port-IO trap path

@@ -24,6 +24,7 @@
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const kprof = zag.kprof.trace_id;
 const scheduler = zag.sched.scheduler;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -35,6 +36,9 @@ const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 /// trap. Safe to call with interrupts disabled (which is the natural
 /// state inside an exception entry).
 pub fn handleTrap(current: *ExecutionContext) void {
+    kprof.enter(.fpu_swap);
+    defer kprof.exit(.fpu_swap);
+
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];
 
@@ -46,7 +50,7 @@ pub fn handleTrap(current: *ExecutionContext) void {
     per_core.fpu_trap_armed = false;
 
     if (per_core.last_fpu_owner) |prev_ref| {
-        // self-alive: prev FPU owner is either still alive (handle
+        // caller-pinned: prev FPU owner is either still alive (handle
         // refcount) or being torn down — `last_fpu_core` clear in
         // `flushIpiHandler` keeps this slot consistent.
         const p = prev_ref.ptr;
@@ -78,7 +82,7 @@ pub fn flushIpiHandler(ec: *ExecutionContext) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];
     if (per_core.last_fpu_owner) |ref| {
-        // self-alive: identity compare on `last_fpu_owner` slot.
+        // caller-pinned: identity compare on `last_fpu_owner` slot.
         if (ref.ptr == ec) {
             arch.cpu.fpuSave(&ec.fpu_state);
             per_core.last_fpu_owner = null;

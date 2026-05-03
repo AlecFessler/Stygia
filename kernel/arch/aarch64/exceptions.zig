@@ -49,6 +49,7 @@ const fpu = zag.sched.fpu;
 const futex = zag.sched.futex;
 const gic = zag.arch.aarch64.gic;
 const interrupts = zag.arch.aarch64.interrupts;
+const kprof = zag.kprof.trace_id;
 const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
 const port = zag.sched.port;
@@ -435,7 +436,7 @@ fn readFarEl1() u64 {
 /// in-kernel I/O bus arrives.
 fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
     const ec_ptr = scheduler.currentEc() orelse return false;
-    // self-alive: `ec_ptr` is the running EC of this core (we are mid-
+    // caller-pinned: `ec_ptr` is the running EC of this core (we are mid-
     // synchronous-trap from it), so its domain SlabRef is live for the
     // duration of this handler. Mirrors arch/x64/interrupts.zig switchTo.
     const domain = ec_ptr.domain.ptr;
@@ -516,6 +517,9 @@ fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
 }
 
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
+    kprof.enter(.exception);
+    defer kprof.exit(.exception);
+
     const esr = readEsrEl1();
     const ec = extractEc(esr);
 
@@ -604,8 +608,10 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // Mirrors the arch.x64.exceptions pageFaultHandler shortcut.
             if (interceptPortIoFault(ctx, esr)) return;
 
+            const far = readFarEl1();
+            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
-                .faulting_address = readFarEl1(),
+                .faulting_address = far,
                 .is_kernel_privilege = false,
                 .is_write = isWriteFault(esr),
                 .is_exec = false,
@@ -616,8 +622,10 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .instruction_abort_lower_el => {
+            const far = readFarEl1();
+            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
-                .faulting_address = readFarEl1(),
+                .faulting_address = far,
                 .is_kernel_privilege = false,
                 .is_write = false,
                 .is_exec = true,
@@ -702,6 +710,9 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// ICC_IAR1_EL1), dispatches to the registered device handler, and
 /// signals end-of-interrupt (ICC_EOIR1_EL1).
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
+    kprof.enter(.irq);
+    defer kprof.exit(.irq);
+
     // lockdep: hardware took the IRQ vector with PSTATE.I masked
     // (ARM ARM D1.10.4 — async exceptions auto-mask on entry), so any
     // lock acquired beneath here is in async-IRQ-handler context. The
@@ -774,14 +785,19 @@ fn silenceTimerLineIfFiring(intid: u32) void {
 /// Only Data Aborts (demand paging) are expected in kernel mode.
 /// All other exceptions are fatal.
 fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
+    kprof.enter(.exception);
+    defer kprof.exit(.exception);
+
     const esr = readEsrEl1();
     const ec = extractEc(esr);
 
     switch (ec) {
         .data_abort_same_el => {
             const is_write = isWriteFault(esr);
+            const far = readFarEl1();
+            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
-                .faulting_address = readFarEl1(),
+                .faulting_address = far,
                 .is_kernel_privilege = true,
                 .is_write = is_write,
                 .is_exec = false,
@@ -792,8 +808,10 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .instruction_abort_same_el => {
+            const far = readFarEl1();
+            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
-                .faulting_address = readFarEl1(),
+                .faulting_address = far,
                 .is_kernel_privilege = true,
                 .is_write = false,
                 .is_exec = true,
@@ -815,6 +833,9 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
+    kprof.enter(.irq);
+    defer kprof.exit(.irq);
+
     // lockdep: see handleIrqLowerEl. The kernel-mode IRQ vector is just as
     // much an async-IRQ-handler entry — the interrupted code may have been
     // holding any locks at all when the IRQ landed.
@@ -868,6 +889,9 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
         // it through the same path as the timer tick so the scheduler picks
         // a new runnable thread on this core.
         0 => {
+            kprof.enter(.sched_tick);
+            defer kprof.exit(.sched_tick);
+
             // Pi 5 KVM vGICv2 workaround: broadcast a scheduler tick
             // to all secondary cores whenever the BSP runs through
             // its scheduler (via yield self-IPI, cross-core wake,
@@ -900,7 +924,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             const core_idx: u8 = @truncate(gic.coreID());
             const slot = &cpu.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
-                // self-alive: the requesting core pins the target EC
+                // caller-pinned: the requesting core pins the target EC
                 // across the IPI and waits for ack before releasing it;
                 // we cannot observe a freed slot here.
                 const target: *ExecutionContext = @ptrCast(@alignCast(opq));
@@ -909,6 +933,9 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             slot.ackDone();
         },
         gic.SGI_BCAST_TICK => {
+            kprof.enter(.sched_tick);
+            defer kprof.exit(.sched_tick);
+
             // BSP-driven broadcast scheduler tick (Pi 5 KVM vGICv2
             // workaround). The BSP's CNTP PPI 30 handler fans out an
             // SGI on INTID `SGI_BCAST_TICK` to every other core on
@@ -934,6 +961,9 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             pmu.pmiHandler(ctx);
         },
         27, 30 => {
+            kprof.enter(.sched_tick);
+            defer kprof.exit(.sched_tick);
+
             // EL1 timer preemption tick. Mask the firing line while we
             // run the scheduler tick; the scheduler re-arms via
             // `armInterruptTimer`, which writes ENABLE=1, IMASK=0 and

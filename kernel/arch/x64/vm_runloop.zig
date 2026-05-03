@@ -13,6 +13,7 @@ const zag = @import("zag");
 const cpu = zag.arch.x64.cpu;
 const hv_vcpu = zag.arch.x64.hv.vcpu;
 const hv_vm = zag.arch.x64.hv.vm;
+const kprof = zag.kprof.trace_id;
 const timers = zag.arch.x64.timers;
 const vm_hw = zag.arch.x64.vm;
 
@@ -49,6 +50,9 @@ const SUBCODE_UNKNOWN: u8 = 12;
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support hardware virt).
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
+    kprof.enter(.vm_enter);
+    defer kprof.exit(.vm_enter);
+
     if (!vm_hw.vmSupported()) return null;
 
     // Resolve the VM's per-vCPU state and the VM's control-state PAddr.
@@ -62,7 +66,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     if (!arch_state.started) return null;
 
     const vm_ref = vcpu_ec.vm orelse return null;
-    // self-alive: the vCPU EC holds a SlabRef on its VM for its lifetime;
+    // caller-pinned: the vCPU EC holds a SlabRef on its VM for its lifetime;
     // the run loop is the only consumer that needs the live pointer.
     const vm_ptr = vm_ref.lock(@src()) catch return null;
     const ctrl_phys = ctrlPhysFor(vm_ptr);

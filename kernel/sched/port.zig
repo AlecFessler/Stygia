@@ -112,7 +112,7 @@ pub fn expireTimedRecvWaiters() void {
         for (&timed_recv_waiters) |*slot| {
             const ec = slot.* orelse continue;
             if (now_ns < ec.recv_deadline_ns) continue;
-            // self-alive: `ec` is pinned by the `timed_recv_waiters`
+            // caller-pinned: `ec` is pinned by the `timed_recv_waiters`
             // slot we just dequeued; capturing its current gen here
             // gives the phase-2 walk a stale-detector if the slot is
             // freed and reallocated between phases. The deadline
@@ -127,7 +127,7 @@ pub fn expireTimedRecvWaiters() void {
     }
 
     for (expired[0..expired_count]) |entry| {
-        // self-alive: `entry.ec` was captured under timed_recv_lock
+        // caller-pinned: `entry.ec` was captured under timed_recv_lock
         // above and the EC's slot can only be freed after this phase
         // unwinds the recv-waiter from its port queue. The deadline
         // check below catches a sender-wake / fresh-recv race.
@@ -995,6 +995,8 @@ pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
 /// Fire a vm_exit event for a vCPU EC. Routes to `ec.exit_port`
 /// directly (not through `event_routes`). Spec §[vm_exit_state].
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
+    kprof.point(.vm_exit, subcode);
+
     const exit_port_ref = ec.exit_port orelse return;
     const exit_lr = exit_port_ref.lockIrqSave(@src()) catch return;
     const port_ptr = exit_lr.ptr;

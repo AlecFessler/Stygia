@@ -193,7 +193,7 @@ fn exceptionEvent(vector: u5) ?ExceptionEvent {
 /// current EC, the page is not resident, or the byte mismatches.
 fn isUserHltAt(rip: u64) bool {
     const ec = scheduler.currentEc() orelse return false;
-    // self-alive: currentEc() runs on this core; its bound capability
+    // caller-pinned: currentEc() runs on this core; its bound capability
     // domain stays alive for the duration of this exception handler.
     const domain = ec.domain.ptr;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
@@ -205,6 +205,9 @@ fn isUserHltAt(rip: u64) bool {
 }
 
 fn exceptionHandler(ctx: *cpu.Context) void {
+    kprof.enter(.exception);
+    defer kprof.exit(.exception);
+
     const vector: u5 = @intCast(ctx.int_num);
     const exception: Exception = @enumFromInt(vector);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
@@ -320,6 +323,9 @@ fn exceptionHandler(ctx: *cpu.Context) void {
 /// address; the error code on the stack encodes the fault reason per
 /// Figure 5-12.
 fn pageFaultHandler(ctx: *cpu.Context) void {
+    kprof.enter(.page_fault);
+    defer kprof.exit(.page_fault);
+
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {
         @panic("Page tables have reserved bits set (RSVD).");
@@ -337,14 +343,14 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     if (from_user and !pf_err.present) {
         const ec = scheduler.currentEc() orelse
             @panic("user page fault with no current EC");
-        // self-alive: currentEc() runs on this core; its bound
+        // caller-pinned: currentEc() runs on this core; its bound
         // capability domain is alive across this PF handler.
         const domain = ec.domain.ptr;
         if (var_range.findVarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
             const v_irq = v._gen_lock.lockIrqSave(@src());
             const is_port_io = v.map == .mmio and
                 v.device != null and
-                // self-alive: device ref under v's gen-lock.
+                // caller-pinned: device ref under v's gen-lock.
                 v.device.?.ptr.device_type == .port_io;
             v._gen_lock.unlockIrqRestore(v_irq);
             if (is_port_io) {
@@ -389,7 +395,7 @@ fn emulateVirtualBar(
     // for the kernel's lifetime once bound and `base_vaddr` is
     // immutable on the VAR, so the snapshot is safe to use unlocked.
     const v_irq = v._gen_lock.lockIrqSave(@src());
-    // self-alive: device ref under v's gen-lock; the DeviceRegion is
+    // caller-pinned: device ref under v's gen-lock; the DeviceRegion is
     // stable for the kernel's lifetime once bound.
     const device: *DeviceRegion = v.device.?.ptr;
     const var_base_addr = v.base_vaddr.addr;

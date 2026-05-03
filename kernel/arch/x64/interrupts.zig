@@ -6,6 +6,7 @@ const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
+const kprof = zag.kprof.trace_id;
 const paging = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
 const sync_debug = zag.utils.sync.debug;
@@ -1571,6 +1572,9 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
+    kprof.enter(.irq);
+    defer kprof.exit(.irq);
+
     // Pointer-index `vector_table[]` to avoid Debug-mode codegen
     // copying the entire [256]VectorEntry array (~4 KiB) onto the IRQ
     // kernel stack on every interrupt. See the matching note in

@@ -13,6 +13,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const kprof = zag.kprof.trace_id;
 const port_mod = zag.sched.port;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -230,19 +231,23 @@ pub fn switchTo(ec: *ExecutionContext) void {
     const core: u8 = @truncate(arch.smp.coreID());
     setCurrentEc(core, current);
     current.state = .running;
+    kprof.point(.dispatch, @intFromPtr(current));
     arch.cpu.loadEcContextAndReturn(current);
 }
 
 /// Voluntary yield — current EC drops back into ready, scheduler
 /// picks the next. If `target` is non-null and runnable, it runs next.
 pub fn yieldTo(target: ?*ExecutionContext) void {
+    kprof.enter(.yield);
+    defer kprof.exit(.yield);
+
     const core: u8 = @truncate(arch.smp.coreID());
     const state = &core_states[core];
     const lock = &core_locks[core];
 
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     if (state.current_ec) |cur_ref| {
-        // self-alive: `current_ec` names the EC running on this core
+        // caller-pinned: `current_ec` names the EC running on this core
         // — caller is in its syscall path so the slot is pinned.
         const cur = cur_ref.ptr;
         cur.state = .ready;
@@ -314,7 +319,7 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
     if (state.run_queue.dequeue()) |ec| return ec;
     if (state.idle_ec) |idle_ref| {
-        // self-alive: per-core idle EC is allocated at perCoreInit and
+        // caller-pinned: per-core idle EC is allocated at perCoreInit and
         // never freed — it's the dispatch-of-last-resort target.
         return idle_ref.ptr;
     }
@@ -354,7 +359,7 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     const self_core: u8 = @truncate(arch.smp.coreID());
 
     const target_current_ptr: ?*ExecutionContext = if (target_current) |r|
-        // self-alive: read-only snapshot of target core's current_ec
+        // caller-pinned: read-only snapshot of target core's current_ec
         // for wake/preempt decision. Worst-case stale ptr just costs
         // a spurious IPI; real ptr deref is gated below.
         r.ptr
@@ -370,7 +375,7 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     }
 
     // Target is busy. Decide whether `ec` should preempt the running EC.
-    // self-alive: snapshot ptr; race-tolerant priority compare.
+    // caller-pinned: snapshot ptr; race-tolerant priority compare.
     const cur = target_current_ptr.?;
     if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
 
@@ -421,7 +426,7 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
 pub fn currentEc() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
     const ref = (&core_states[core]).current_ec orelse return null;
-    // self-alive: `current_ec` names the EC actually executing on this
+    // caller-pinned: `current_ec` names the EC actually executing on this
     // very core; the slot can't be freed under us while this code runs.
     return ref.ptr;
 }
@@ -431,7 +436,7 @@ pub fn currentEc() ?*ExecutionContext {
 /// dispatch slot when the running EC parks itself.
 pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
     if ((&core_states[core]).current_ec) |ref| {
-        // self-alive: identity compare on `current_ec` slot.
+        // caller-pinned: identity compare on `current_ec` slot.
         return ref.ptr == ec;
     }
     return false;

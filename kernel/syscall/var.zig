@@ -2,6 +2,7 @@ const zag = @import("zag");
 
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
+const kprof = zag.kprof.trace_id;
 const var_range = zag.memory.var_range;
 
 const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
@@ -142,6 +143,9 @@ pub fn createVar(
 /// [test 13] on success, when [1].caps.dma = 1, a DMA read by the bound device from `VAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
 /// [test 14] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn mapPf(caller: *anyopaque, var_handle: u64, pairs: []const u64) i64 {
+    kprof.enter(.map_pf);
+    defer kprof.exit(.map_pf);
+
     if (var_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     // Pairs slice always carries a (offset, page_frame) tuple per i — odd
     // length means the dispatcher mis-parsed N from the syscall word.
@@ -325,6 +329,9 @@ pub fn snapshot(caller: *anyopaque, target_var: u64, source_var: u64) i64 {
 /// [test 07] on success, vregs `[3..2+count]` contain the qwords from the VAR starting at [2] offset.
 /// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn idcRead(caller: *anyopaque, var_handle: u64, offset: u64, count: u8) i64 {
+    kprof.enter(.idc_read);
+    defer kprof.exit(.idc_read);
+
     if (var_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     // Offset must be 8-byte aligned per spec [test 03].
     if (offset & 0x7 != 0) return errors.E_INVAL;
@@ -364,6 +371,9 @@ pub fn idcRead(caller: *anyopaque, var_handle: u64, offset: u64, count: u8) i64 
 /// [test 07] on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
 /// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn idcWrite(caller: *anyopaque, var_handle: u64, offset: u64, count: u8, qwords: []const u64) i64 {
+    kprof.enter(.idc_write);
+    defer kprof.exit(.idc_write);
+
     if (var_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (offset & 0x7 != 0) return errors.E_INVAL;
     // The raw count comes straight from the syscall word so we can gate

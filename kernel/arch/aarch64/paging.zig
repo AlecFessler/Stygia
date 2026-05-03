@@ -57,6 +57,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
@@ -276,6 +277,7 @@ pub fn mapPage(
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
+    kprof.point(.map_page, virt.addr);
 
     const pmm_mgr = &pmm.global_pmm.?;
 
@@ -455,6 +457,8 @@ pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
 ) ?PAddr {
+    kprof.point(.unmap_page, virt.addr);
+
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
@@ -698,6 +702,8 @@ fn dsbIsh() void {
 /// The full sequence for a PTE change is:
 ///   DSB ISHST -> TLBI VAE1IS -> DSB ISH -> ISB
 fn tlbiVae1is(vaddr: u64) void {
+    kprof.point(.tlb_shootdown, vaddr);
+
     const page_addr = vaddr >> 12;
     dsbIshst();
     asm volatile ("tlbi vae1is, %[addr]"

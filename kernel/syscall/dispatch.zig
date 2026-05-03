@@ -17,6 +17,7 @@ const errors = zag.syscall.errors;
 const event_route = zag.syscall.event_route;
 const execution_context = zag.syscall.execution_context;
 const futex = zag.syscall.futex;
+const kprof = zag.kprof.trace_id;
 const page_frame = zag.syscall.page_frame;
 const port = zag.syscall.port;
 const reply = zag.syscall.reply;
@@ -95,10 +96,14 @@ inline fn arg(args: []const u64, i: usize) u64 {
 }
 
 pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
+    kprof.enter(.syscall);
+    defer kprof.exit(.syscall);
+
     // Spec §[syscall]: syscall number lives in bits 0-11 of the syscall
     // word. Anything beyond that range is per-syscall metadata
     // (pair_count, kind, etc.) and is the handler's responsibility.
     const num_raw: u64 = syscall_word & 0xFFF;
+    kprof.point(.syscall, num_raw);
 
     // Fast-suspend wire format: syscall_op in 0..13 encodes a suspend
     // with payload_count = syscall_op and pair_count = 0. The asm L4

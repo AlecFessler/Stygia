@@ -5,6 +5,7 @@ const capability = zag.caps.capability;
 const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
+const kprof = zag.kprof.trace_id;
 const scheduler = zag.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -93,6 +94,9 @@ pub fn createExecutionContext(
     target: u64,
     affinity_mask: u64,
 ) i64 {
+    kprof.enter(.create_ec);
+    defer kprof.exit(.create_ec);
+
     if (caps & ~CREATE_EC_CAPS_MASK != 0) return errors.E_INVAL;
     if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     if (stack_pages == 0) return errors.E_INVAL;

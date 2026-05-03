@@ -35,8 +35,38 @@ pub const TraceId = enum(u32) {
     reply,
     deliver_event,
 
-    // ── VM exit handling ─────────────────────────────────────
+    // ── Scheduler ────────────────────────────────────────────
+    sched_tick = 300,
+    yield,
+    dispatch,
+
+    // ── Virtualization ───────────────────────────────────────
     vm_exit = 400,
+    vm_enter,
+
+    // ── Outer kernel-entry pairs ─────────────────────────────
+    // Wrap the very top of every hardware-/syscall-driven kernel
+    // entry handler so a single (enter, exit) pair brackets total
+    // kernel residency for that boundary class. `syscall` carries
+    // the syscall number as a `point` arg right after the enter.
+    exception = 500,
+    page_fault,
+    irq,
+    syscall,
+
+    // ── Heavy syscall handlers ───────────────────────────────
+    // Per-handler scoped pairs for the syscalls expected to dominate
+    // the syscall budget — futex fan-out, var bulk paths, EC/cap-domain
+    // create, FPU swap. The dispatcher-level `syscall` pair already
+    // brackets every syscall coarsely; these add per-name attribution.
+    futex_wait = 600,
+    futex_wake,
+    map_pf,
+    idc_read,
+    idc_write,
+    create_cap_domain,
+    create_ec,
+    fpu_swap,
 };
 
 /// Emit an enter record for a scoped tracepoint. Paired with `exit`.
