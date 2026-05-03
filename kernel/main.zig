@@ -70,9 +70,7 @@ export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
 
 fn kMain(boot_info: *BootInfo) !void {
     arch.boot.init();
-    arch.boot.printRaw("[k] hello\n");
     try memory.init(boot_info.mmap);
-    arch.boot.printRaw("[k] mem\n");
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide);
     try arch.boot.parseFirmwareTables(boot_info.xsdp_phys);
     // Promote getMonotonicClock() from HPET MMIO to invariant TSC if the
@@ -96,15 +94,12 @@ fn kMain(boot_info: *BootInfo) !void {
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
-    arch.boot.printRaw("[k] before userspace_init\n");
     try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
-    arch.boot.printRaw("[k] before smpInit\n");
     try arch.smp.smpInit();
     zag.utils.sync.debug.markSmpReady();
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();
-    arch.boot.printRaw("[k] entering sched.run\n");
     // Spec v3: BSP enters the scheduler loop. Root EC was enqueued by
     // userspace_init.init; sched.run picks it up and dispatches.
     sched.run();
