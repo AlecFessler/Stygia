@@ -95,6 +95,44 @@ Exit status is nonzero if any err-severity findings are emitted.
        kernel ABI hands the syscall handler a pointer to the running
        ExecutionContext, which cannot be reaped during the syscall.
 
+## Inline-assembly checker (x86_64, fully-naked-asm fns only)
+
+For functions whose entire body is a single `asm volatile (...)`
+expression — currently only `syscallEntry` — the regular AST/source
+checker can't see what the asm is doing with `cmpxchg` and `andq`
+against `_gen_lock`. The asm checker (`src/asm_analyzer.zig`) steps
+in for that one case:
+
+- Resolves `std.fmt.comptimePrint("...{[name]d}...", .{ .name = expr })`
+  blocks. When `expr` is `@offsetOf(T, "field")`, the placeholder is
+  bound to a symbolic reference `T.field`. Composite expressions like
+  `@offsetOf(KernelHandle, "ref") + @offsetOf(ErasedSlabRef, "ptr")`
+  remain opaque (we trust them but can't pin a field).
+- Recognizes `lock cmpxchgq %src, <T._gen_lock>(%base)` followed by
+  `je .L<name>` as a CONDITIONAL acquire — the lock is held only on
+  the `.L<name>` branch.
+- Recognizes `andq $-2, <T._gen_lock>(%base)` as a release.
+- For any other access `<T.field>(%base)` against a slab-backed `T`,
+  requires that `lock(T at %base)` be currently held.
+- Rejects raw numeric offsets `<num>(%base)` when `%base` is currently
+  typed as a slab pointer (use `@offsetOf` via `comptimePrint`).
+- Walks the asm linearly with per-label state snapshots; jumps to a
+  label snapshot the lock state at the jump site, and revisits must
+  match.
+
+Findings emitted under rule names `asm_unlocked_field_access`,
+`asm_release_without_acquire`, `asm_raw_offset_on_slab`, and
+`asm_label_state_mismatch` / `asm_jump_state_mismatch`.
+
+A function can opt out by adding `// asm-genlock: skip` anywhere in
+its source (typically a doc comment over the fn). Use this on
+functions where the per-register lock-bracket model is too coarse —
+e.g., L4-style hand-off where one lock provides exclusive access to a
+hand-off target without acquiring the target's own lock.
+
+Out of scope (deliberately): aarch64 (different mnemonics), functions
+with mixed Zig and asm, composite-offset field-pinning.
+
 ## Spec-v3 conventions baked into the analyzer
 
 - Entry-point discovery treats every `pub fn` in

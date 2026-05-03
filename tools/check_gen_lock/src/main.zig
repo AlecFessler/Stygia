@@ -45,6 +45,7 @@ const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 const sqlite = @import("sqlite.zig");
+const asm_analyzer = @import("asm_analyzer.zig");
 
 // ── Domain-knowledge tables (carried over from the legacy analyzer) ────
 
@@ -2235,6 +2236,25 @@ pub fn main() !u8 {
         }
     }
 
+    // ── Inline-asm gen-lock checker (x86_64 fully-naked-asm fns only) ─
+    var asm_findings: ArrayList(asm_analyzer.Finding) = .empty;
+    defer asm_findings.deinit(gpa);
+    {
+        var inputs: ArrayList(asm_analyzer.Input) = .empty;
+        defer inputs.deinit(gpa);
+        for (fn_rows.items) |fr| {
+            const f = fileById(&st, fr.file_id) orelse continue;
+            try inputs.append(gpa, .{
+                .qname = fr.qname,
+                .file_path = f.path,
+                .file_source = f.source,
+                .fn_text = fr.body,
+                .fn_byte_start = fr.byte_start,
+            });
+        }
+        try asm_analyzer.scanAll(gpa, st.arena.allocator(), inputs.items, &st.slab_types, &asm_findings);
+    }
+
     // ── Output ────────────────────────────────────────────────────────
     var total_errs: u32 = 0;
     var total_tracked: u32 = 0;
@@ -2337,16 +2357,26 @@ pub fn main() !u8 {
     }
     if (!skip_bypass) total_errs += @intCast(ptr_findings.items.len);
 
+    // Pre-tally IRQ + asm findings so the Summary line reflects everything.
+    const skip_asm_pre = if (args.rule_filter) |rf|
+        !(mem.startsWith(u8, rf, "asm_"))
+    else
+        false;
+    const summary_total_errs = total_errs
+        + n_discipline + n_pairing
+        + (if (skip_asm_pre) @as(u32, 0) else @as(u32, @intCast(asm_findings.items.len)));
+
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{
         entries_by_qname.items.len,
         total_tracked,
-        total_errs,
+        summary_total_errs,
         @as(u32, 0),
     });
     try w.print("         {d} slab-backed types discovered\n", .{st.slab_types.count()});
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_findings.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_findings.items.len});
+    try w.print("         {d} inline-asm gen-lock violations\n", .{asm_findings.items.len});
 
     // IRQ-discipline output.
     try w.writeAll("\n=== IRQ-acquired lock classes ===\n");
@@ -2380,6 +2410,21 @@ pub fn main() !u8 {
 
     total_errs += n_discipline + n_pairing;
 
+    // ── Inline-asm gen-lock findings ──────────────────────────────────
+    const skip_asm = if (args.rule_filter) |rf|
+        !(mem.startsWith(u8, rf, "asm_"))
+    else
+        false;
+    if (!skip_asm and asm_findings.items.len > 0) {
+        try w.writeAll("\n=== Inline-asm gen-lock violations ===\n");
+        for (asm_findings.items) |f| {
+            try w.print("  [ERR ] {s}:{d}  ({s})  {s}\n", .{
+                f.file_path, f.line, f.rule, f.message,
+            });
+        }
+    }
+    if (!skip_asm) total_errs += @intCast(asm_findings.items.len);
+
     try w.flush();
 
     // Persist findings to lint_finding so /api/findings + callgraph_findings
@@ -2393,6 +2438,7 @@ pub fn main() !u8 {
         release_findings.items,
         discipline_findings.items,
         pairing_findings.items,
+        asm_findings.items,
     ) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "warning: failed to write lint_finding rows: {s}\n", .{@errorName(err)}) catch "warning: lint_finding write failed\n";
@@ -2411,6 +2457,7 @@ fn writeGenlockFindings(
     release: []const ReleaseFinding,
     discipline: []const DisciplineFinding,
     pairing: []const PairingFinding,
+    asm_finds: []const asm_analyzer.Finding,
 ) !void {
     var rwdb = try sqlite.Db.openReadWrite(db_path, gpa);
     defer rwdb.close();
@@ -2508,6 +2555,9 @@ fn writeGenlockFindings(
     }
     for (pairing) |f| {
         try insert(&ins, &lookup, f.file_path, f.line, "irq_pairing_mismatch", f.message, reset, clear);
+    }
+    for (asm_finds) |f| {
+        try insert(&ins, &lookup, f.file_path, f.line, f.rule, f.message, reset, clear);
     }
 
     try rwdb.exec("COMMIT");

@@ -77,8 +77,20 @@ for fixture in "$FIXTURES_DIR"/*.zig; do
     # Debug a single fixture by uncommenting:
     # echo "$out" | sed 's/^/  >>> /'
 
-    err_count="$(echo "$out" | sed -n 's/.*err= *\([0-9]\+\).*/\1/p' | head -n 1)"
-    err_count="${err_count:-0}"
+    # Per-entry rows print `err= N` (space-padded); the Summary line
+    # prints `<N> err,`. Sum both: per-entry covers fn-scoped findings,
+    # Summary covers asm/IRQ/etc. that aren't pinned to one entry.
+    per_entry="$(echo "$out" | sed -n 's/.*err= *\([0-9]\+\).*/\1/p' | head -n 1)"
+    per_entry="${per_entry:-0}"
+    summary="$(echo "$out" | sed -n 's/^Summary:.* \([0-9]\+\) err,.*/\1/p' | head -n 1)"
+    summary="${summary:-0}"
+    # The Summary err count already includes per-entry errors (it's the
+    # rolling total). Prefer Summary when present; fall back to per-entry.
+    if [[ "$summary" -gt 0 ]]; then
+        err_count="$summary"
+    else
+        err_count="$per_entry"
+    fi
 
     case "$expected" in
         clean)
