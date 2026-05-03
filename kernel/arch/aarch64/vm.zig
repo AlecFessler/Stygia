@@ -589,6 +589,19 @@ pub const HypCallId = enum(u64) {
     /// host-side virtual timer expiry (ARM ARM D13.11.17). Returns 0.
     /// Dispatches to `hvc_vtimer_save_guest`.
     vtimer_save_guest = 7,
+    /// No argument. Initialise the EL2-side GICv3 system-register
+    /// interface so `ICH_LR<n>_EL2` writes from the inline-vGIC path
+    /// in `hvc_vcpu_run` actually deliver into the guest. Sets
+    /// `ICC_SRE_EL2 = 0xF` (SRE | DFB | DIB | ENABLE; GICv3 §12.5.21):
+    ///   - SRE      enables EL2's own sysreg interface.
+    ///   - ENABLE   permits EL1/0 ICC_SRE_EL1 access (Linux's GICv3
+    ///              driver sets ICC_SRE_EL1.SRE during init).
+    ///   - DIB/DFB  disables IRQ/FIQ "bypass" so the vCPU interface
+    ///              actually owns delivery (matches Linux KVM).
+    /// Must run once on the BSP after `installHypVectors` (when our
+    /// own EL2 vector table is live). Returns 0. Dispatches to
+    /// `hvc_init_gic`.
+    init_gic = 8,
 };
 
 /// Issue `hvc #0` with (id, arg) and return the 64-bit result in x0.

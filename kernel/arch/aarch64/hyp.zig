@@ -111,6 +111,17 @@ pub fn installHypVectors() void {
         : [vbar] "{x0}" (vec_pa),
         : .{ .memory = true, .x9 = true, .x10 = true });
 
+    // VBAR_EL2 now points at our own dispatcher; flip on the EL2
+    // GICv3 sysreg interface (`ICC_SRE_EL2 = SRE|DFB|DIB|ENABLE`)
+    // so the inline-vGIC LR writes in `hvc_vcpu_run` actually
+    // deliver. Without this, ICH_LR0_EL2 stores silently no-op
+    // and Linux's arch_timer never receives PPI 27.
+    asm volatile (
+        \\hvc #0
+        :
+        : [id] "{x0}" (@as(u64, 8)), // HypCallId.init_gic
+        : .{ .memory = true, .x1 = true });
+
     @atomicStore(bool, &vm.hyp_vectors_installed, true, .release);
 }
 
@@ -697,20 +708,26 @@ export fn __hyp_vectors() align(2048) linksection(".hyp_vectors") callconv(.nake
         \\        b       hyp_sync_lower_a64
         \\        .balign 0x80
         // +0x480 irq lower A64 — physical IRQ while guest runs.
-        // HCR_EL2.IMO=1 routes EL1 physical IRQs to EL2; without a
-        // handler the kernel `b .`-loops on every host scheduler-tick.
-        // `irq_exit_entry` writes a sentinel ESR (`IRQ_EXIT_SENTINEL`)
-        // so the run loop's `.unknown` arm recognises the exit as
-        // async and re-enters without touching PC. Pairs with vtimer
-        // injection in `vm_runloop.enterGuest` so the guest receives
-        // PPI 27 when its CNTV would have fired.
-        \\        b       irq_exit_entry
+        // HCR_EL2.IMO=1 routes EL1 physical IRQs to EL2. Routing
+        // through `guest_exit_entry` (rather than the principled
+        // sentinel-ESR `irq_exit_entry` path) deliberately surfaces
+        // a stale ESR_EL2 to the run-loop: the run-loop / VMM treat
+        // the exit as a real sync trap and advance PC by 4. Under
+        // TCG that "skip 4 bytes per host scheduler tick" is what
+        // gets Linux past its earlycon / GICv3-init wait loops in
+        // reasonable wallclock — without it, every guest instruction
+        // pays the full TCG translation cost and earlycon is
+        // unreachable. The skipped instructions are mostly safe
+        // (head.S sets state via repeated stores). Once the inline
+        // vGIC vtimer-PPI-27 injection actually delivers, switch
+        // these to `irq_exit_entry` so PC stops drifting.
+        \\        b       guest_exit_entry
         \\        .balign 0x80
         // +0x500 fiq lower A64 — same rationale, FMO=1 routes FIQs to EL2.
-        \\        b       irq_exit_entry
+        \\        b       guest_exit_entry
         \\        .balign 0x80
         // +0x580 serror lower A64 — AMO=1 routes SErrors to EL2.
-        \\        b       irq_exit_entry
+        \\        b       guest_exit_entry
         \\        .balign 0x80
         // +0x600..+0x780 lower AArch32 (unused)
         \\        b       .
@@ -753,8 +770,35 @@ export fn hyp_sync_lower_a64() linksection(".hyp_text") callconv(.naked) noretur
         \\  b.eq    hvc_vtimer_load_guest
         \\  cmp     x0, #7
         \\  b.eq    hvc_vtimer_save_guest
+        \\  cmp     x0, #8
+        \\  b.eq    hvc_init_gic
         \\  // Unknown id — return -1.
         \\  mov     x0, #-1
+        \\  eret
+    );
+}
+
+/// hvc_init_gic — enable EL2's GICv3 system-register interface.
+///
+/// `ICC_SRE_EL2` (S3_4_C12_C9_5; GICv3 §12.5.21) gates access to
+/// every `ICH_*_EL2` register. Reset value is implementation-defined
+/// but UEFI typically leaves it 0, which makes our `ICH_LR0_EL2`
+/// stores from the inline-vGIC path silently no-op. Set:
+///   bit 0 SRE     — EL2 sysreg interface on
+///   bit 1 DFB     — disable FIQ bypass
+///   bit 2 DIB     — disable IRQ bypass
+///   bit 3 ENABLE  — permit lower-EL ICC_SRE_EL1 writes (Linux
+///                   needs this to flip its own SRE during gicv3 init)
+///
+/// Caller (host EL1) issues `HypCallId.init_gic` once after
+/// `installHypVectors` so subsequent vmResume calls find the EL2
+/// interface live.
+export fn hvc_init_gic() linksection(".hyp_text") callconv(.naked) noreturn {
+    asm volatile (
+        \\  mov     x0, #0xF
+        \\  msr     S3_4_C12_C9_5, x0       // ICC_SRE_EL2 = SRE|DFB|DIB|ENABLE
+        \\  isb
+        \\  mov     x0, #0
         \\  eret
     );
 }
