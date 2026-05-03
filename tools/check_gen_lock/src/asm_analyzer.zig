@@ -100,10 +100,13 @@ fn scanFn(
 ) !void {
     // Gate 1: callconv(.naked).
     if (mem.indexOf(u8, f.fn_text, "callconv(.naked)") == null) return;
-    // Gate 2: per-fn opt-out marker. Use this on functions where the
-    // analyzer's per-register lock-bracket model is too coarse — e.g.,
-    // L4-style hand-off where one lock provides exclusive access to a
-    // hand-off target without acquiring the target's own lock.
+    // Gate 2: per-fn opt-out marker. Reach for this only when there's
+    // a documented reason the per-register lock-bracket model is
+    // genuinely too coarse — NOT as a way to silence inconvenient
+    // findings. An unlocked access through a slab pointer is almost
+    // always a real race against operations that other handles to the
+    // same object can mount via their own holding domains, even when
+    // a different lock (e.g. a Port lock) is held.
     if (mem.indexOf(u8, f.fn_text, "// asm-genlock: skip") != null) return;
     // Gate 3: body is a single asm volatile(...) statement.
     const block = findFnBlock(f.fn_text) orelse return;

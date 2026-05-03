@@ -125,10 +125,12 @@ Findings emitted under rule names `asm_unlocked_field_access`,
 `asm_label_state_mismatch` / `asm_jump_state_mismatch`.
 
 A function can opt out by adding `// asm-genlock: skip` anywhere in
-its source (typically a doc comment over the fn). Use this on
-functions where the per-register lock-bracket model is too coarse —
-e.g., L4-style hand-off where one lock provides exclusive access to a
-hand-off target without acquiring the target's own lock.
+its source (typically a doc comment over the fn). Reach for this only
+when there's a documented reason the per-register lock-bracket model
+is genuinely too coarse for this fn — NOT as a way to silence findings
+that look inconvenient. A flagged unlocked field access on a slab
+pointer is almost always a real race against syscalls that other
+handles to the same object can make through their own holding domains.
 
 Out of scope (deliberately): aarch64 (different mnemonics), functions
 with mixed Zig and asm, composite-offset field-pinning.
