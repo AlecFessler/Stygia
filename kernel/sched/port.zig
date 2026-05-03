@@ -553,14 +553,27 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     // reply ops on that slot return E_ABANDONED rather than E_TERM.
     if (reply_caps.abandoned) return errors.E_ABANDONED;
 
-    // §[vm_exit_state] writeback snapshot: capture the receiver's
-    // user-stack vreg window BEFORE taking the sender lock. The reads
-    // are SMAP-bracketed and can fault on demand-paged user pages; if
-    // they did so under the sender lock, `memory.fault.handlePageFault`
-    // would abandon the syscall frame without releasing the lock bit
-    // and the next destroy walking that EC would deadlock. Snapshot is
-    // discarded for non-vCPU / no-write-cap senders.
-    const reply_snap = arch.vm.snapshotReplyVregs(caller);
+    // Spec §[reply] typed routing: the kernel reads the wide
+    // §[vm_exit_state] window from the receiver's user stack ONLY for
+    // replies typed `vm_exit` (per the originating event_type captured
+    // at recv time). Non-vm_exit replies skip the wide read entirely —
+    // saves the SMAP bracket + 416-byte stack load on every IPC reply,
+    // and avoids faulting on receivers that called the L4-narrow-frame
+    // `reply` helper without reserving the wide window. Take a brief
+    // sender lock to read `event_type`, drop, then snapshot conditionally
+    // OUTSIDE the lock so a fault on the user-stack reads can unwind
+    // the syscall without leaking the sender's lock bit.
+    const event_type = blk: {
+        const sender_lr_peek = sender_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+        const et = sender_lr_peek.ptr.event_type;
+        sender_ref.unlockIrqRestore(sender_lr_peek.irq_state);
+        break :blk et;
+    };
+
+    const reply_snap = if (event_type == .vm_exit)
+        arch.vm.snapshotReplyVregs(caller)
+    else
+        arch.vm.ReplyVregSnapshot{};
 
     // IRQ-saving acquire: `consumeReply` runs with the sender's
     // EC._gen_lock held; masking IRQs across the held window prevents
@@ -573,7 +586,7 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     const sender_irq_state = sender_lr.irq_state;
     defer sender_ref.unlockIrqRestore(sender_irq_state);
 
-    consumeReply(entry, caller, sender, &reply_snap);
+    consumeReply(entry, caller, sender, &reply_snap, event_type);
     return 0;
 }
 
@@ -669,6 +682,10 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     };
     const sender = sender_lr.ptr;
     const sender_cd_ref = sender.domain;
+    // Spec §[reply] typed routing — pick up the originating event_type
+    // while we hold the sender lock so reply-side state writeback below
+    // can branch on it without re-locking.
+    const sender_event_type = sender.event_type;
     sender_ref.unlockIrqRestore(sender_lr.irq_state);
 
     // Phase 3 — sender's CD: reserve N contiguous slots and install
@@ -718,7 +735,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
         const sender2 = sender2_lr.ptr;
         defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
-        deliverReplyTransferResume(caller, sender2, n, tstart, new_rip);
+        deliverReplyTransferResume(caller, sender2, n, tstart, new_rip, sender_event_type);
         return errors.OK;
     };
     const cd_phase4 = cd_phase4_lr.ptr;
@@ -748,7 +765,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
     const sender2 = sender2_lr.ptr;
     defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
-    deliverReplyTransferResume(caller, sender2, n, tstart, new_rip);
+    deliverReplyTransferResume(caller, sender2, n, tstart, new_rip, sender_event_type);
     return errors.OK;
 }
 
@@ -767,25 +784,30 @@ fn deliverReplyTransferResume(
     pair_count: u8,
     tstart: u12,
     new_rip: u64,
+    event_type: EventType,
 ) void {
     // Stage the §[event_state] post-resume word for the sender. Field
     // positions mirror the recv-side composition: pair_count at bits
     // 12-19, tstart at bits 20-31. event_type/reply_handle_id are
     // zeroed — the resumed sender is exiting `suspend`, not entering
-    // a recv, so those fields stay 0.
+    // a recv, so those fields stay 0. For vm_exit reply_transfer the
+    // sender is a vCPU EC that resumes via guest entry, not via a
+    // user-mode iretq, but staging the word is harmless (the vCPU's
+    // user_rsp is unused on guest re-entry).
     const ret_word: u64 =
         (@as(u64, pair_count) << PAIR_COUNT_SHIFT) |
         (@as(u64, tstart) << TSTART_SHIFT);
     sender.pending_event_word = ret_word;
     sender.pending_event_word_valid = true;
 
-    // Apply receiver-side GPR mods if the originating handle had
-    // write. Mirrors `consumeReply`: receiver's current syscall frame
-    // holds the post-recv, pre-reply_transfer GPR values; copy them
-    // into the sender's saved frame. Spec §[reply_transfer] test 14
-    // additionally re-installs vreg 14 (RIP) — the receiver may have
-    // rewritten the resume RIP between recv and reply_transfer.
-    if (sender.originating_write_cap) {
+    // Apply receiver-side GPR mods only for non-vm_exit replies. For
+    // vm_exit reply_transfer the sender's `iret_frame` is the vCPU's
+    // saved kernel-mode run-loop frame (not a user-mode resume frame),
+    // so writing user-style GPRs would corrupt the kernel's own state.
+    // Spec test 16 covers the initial_state handshake on
+    // reply_transfer; the vCPU stays not-started (synthetic-exit
+    // re-delivery), so guest-state writeback is unnecessary here.
+    if (event_type != .vm_exit and sender.originating_write_cap) {
         const sender_frame = sender.iret_frame orelse sender.ctx;
         const receiver_frame = caller.iret_frame orelse caller.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
@@ -1391,16 +1413,22 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
 
 /// Resume the sender via the reply path, applying receiver's GPR
 /// modifications (gated by originating EC handle's `write` cap).
-/// Spec §[reply] tests 05/06.
+/// Spec §[reply] tests 05/06 plus typed routing (test 08).
 ///
 /// `snap` was captured by the caller BEFORE acquiring the sender's
 /// `_gen_lock` so a fault on the receiver's SMAP-bracketed user-stack
 /// reads can't strand the lock bit. Apply is pure memory writes.
+///
+/// `event_type` is the originating event_type captured at recv time —
+/// the kernel projects the wide §[vm_exit_state] window onto the vCPU's
+/// GuestState only when this is `.vm_exit`. Snap is `.{}` (zero) for
+/// non-vm_exit replies, so `applyReplyStateToVcpu` becomes a no-op.
 fn consumeReply(
     holder: *KernelHandle,
     receiver: *ExecutionContext,
     sender: *ExecutionContext,
     snap: *const arch.vm.ReplyVregSnapshot,
+    event_type: EventType,
 ) void {
     _ = holder;
     // The write-cap snapshot was stamped onto `sender` at suspend time
@@ -1416,9 +1444,14 @@ fn consumeReply(
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
-    // Spec §[vm_exit_state] reply writeback for vCPUs. Non-vCPU senders
-    // short-circuit inside the per-arch impl.
-    if (sender.originating_write_cap) arch.vm.applyReplyStateToVcpu(sender, snap);
+    // Spec §[vm_exit_state] reply writeback only for vm_exit-typed
+    // replies. Non-vm_exit reply paths (`suspension`, fault events)
+    // never carry a vCPU sender, so `applyReplyStateToVcpu` would also
+    // no-op via `archStateOf == null`, but skipping the call entirely
+    // is the explicit type-driven gate.
+    if (event_type == .vm_exit and sender.originating_write_cap) {
+        arch.vm.applyReplyStateToVcpu(sender, snap);
+    }
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 

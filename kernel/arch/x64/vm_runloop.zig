@@ -291,14 +291,13 @@ pub const ReplyVregSnapshot = extern struct {
     dr6: u64 = 0,
     dr7: u64 = 0,
     intr_nmi: u64 = 0,
-    /// True iff the receiver's user stack covered the full vreg-14..73
-    /// window (last byte at user_rsp + WIDE_VREG_END_OFF). False means
-    /// only the in-register vregs 1..13 are populated; CR/segment/MSR
-    /// fields are zero and `applyReplyStateToVcpu` skips the broad
-    /// projection + the `started=true` flip so subsequent enterGuest
-    /// calls keep using the synthetic-exit fallback rather than
-    /// VM-entering with garbage state.
-    wide_state_valid: bool = false,
+    /// Exit sub-code the receiver wrote at vreg 70 — the spec
+    /// `initial_state` value (13 on x86-64) signals "stay not-started"
+    /// and `applyReplyStateToVcpu` keeps `arch_state.started = false`
+    /// so the next `enterGuest` falls back to synthetic-exit re-delivery.
+    /// Any other value flips `started = true` and the next enter does
+    /// VMLAUNCH/VMRUN with the projected state.
+    exit_subcode: u64 = 0,
 };
 
 // Last byte of the wide §[vm_exit_state] reply window read by
@@ -314,9 +313,12 @@ const WIDE_VREG_END_OFF: u64 = VREG64_INTR_NMI_OFF + 8;
 /// for vregs 14..73. Receiver MUST be the running EC on the current
 /// core (so CR3 already references the receiver's address space).
 ///
-/// Run BEFORE acquiring the sender's `_gen_lock`: a page fault on the
-/// user-stack reads aborts the syscall via `memory.fault.handlePageFault`
-/// without touching the sender, so no lock bit can leak.
+/// Caller MUST only invoke this for vm_exit-typed replies (per the
+/// originating event_type captured at recv time). The receiver opted
+/// in to the wide §[vm_exit_state] window contract by recv'ing a
+/// vm_exit; if their stack reservation is too small the SMAP-bracketed
+/// reads fault and `memory.fault.handlePageFault` aborts the syscall —
+/// safe because we run BEFORE acquiring the sender's `_gen_lock`.
 pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
     var snap: ReplyVregSnapshot = .{};
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
@@ -336,24 +338,6 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
     snap.r15 = recv_frame.regs.r15;
 
     const rsp = recv_frame.rsp;
-
-    // Bound-check the wide §[vm_exit_state] window against the receiver's
-    // mapped user stack. Receivers that called reply via the L4-style
-    // narrow-frame helper (`issueReg*` reserves only 16 bytes for the
-    // syscall word) may sit close enough to `user_stack.top` that the
-    // CR/segment/MSR slot reads at `user_rsp + 416` extend past the last
-    // mapped page. Reading there would trip `memory.fault.handlePageFault`
-    // which fires a memory_fault on the receiver and reaps the EC — the
-    // result is a silent MISS for tests that exercise the recv→reply
-    // cycle without supplying real guest state (spec §[create_vcpu]
-    // test 09). Skip the wide reads and leave `wide_state_valid=false`
-    // so `applyReplyStateToVcpu` keeps `arch_state.started=false` and
-    // the next enterGuest stays on the synthetic-exit fallback.
-    if (receiver.user_stack) |us| {
-        if (rsp +% WIDE_VREG_END_OFF > us.top.addr) return snap;
-    } else {
-        return snap;
-    }
 
     cpu.stac();
     defer cpu.clac();
@@ -398,29 +382,24 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 
     snap.intr_nmi = loadU64(rsp, VREG64_INTR_NMI_OFF);
 
-    snap.wide_state_valid = true;
+    snap.exit_subcode = loadU64(rsp, VREG70_EXIT_SUBCODE_OFF);
     return snap;
 }
 
 /// Project a `ReplyVregSnapshot` onto the vCPU's GuestState. Pure
 /// memory writes — no user-VA access, so safe under the sender's
-/// `_gen_lock`. Called from `port.consumeReply` after `snapshotReplyVregs`.
+/// `_gen_lock`. Called from `port.consumeReply` after `snapshotReplyVregs`
+/// for vm_exit-typed replies only.
 ///
-/// On first successful reply this also flips `arch_state.started = true`,
-/// arming the next `enterGuest` to actually execute VMLAUNCH/VMRUN with
-/// the supplied initial guest state.
+/// Spec §[reply] initial-state handshake: when the receiver wrote
+/// `initial_state` (sub-code 13 on x86-64) into vreg 70, the kernel
+/// keeps `arch_state.started = false` so the next `switchTo` falls back
+/// to synthetic-exit re-delivery instead of VMLAUNCHing with the
+/// zero-initialized state. Any other sub-code projects the full state
+/// and flips `started = true` so the next `enterGuest` does a real
+/// VMRUN.
 pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
     const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
-    // Receiver didn't reserve enough stack for the §[vm_exit_state]
-    // CR/segment/MSR window, so the VMM hasn't supplied real initial
-    // guest state. Leave `arch_state.started=false` so the next
-    // enterGuest stays on the synthetic-exit fallback rather than
-    // VM-entering with zero CR0/CR4/etc. (which would fail VMX-entry
-    // consistency checks and either hang in the resume loop or surface
-    // an unhelpful unknown exit). The vCPU still resumes — this only
-    // affects whether the kernel attempts a real guest entry on the
-    // subsequent dispatch.
-    if (!snap.wide_state_valid) return;
     const gs = &arch_state.guest_state;
 
     gs.rax = snap.rax;
@@ -488,6 +467,12 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
         }
     }
 
+    // Spec §[reply] initial-state handshake — sub-code `initial_state`
+    // (13 on x86-64) means "stay not-started"; the receiver has not yet
+    // supplied real guest state. Leave `started = false` so the next
+    // switchTo synthesizes another initial vm_exit instead of attempting
+    // VMRUN with whatever zero/garbage values landed in GuestState.
+    if (snap.exit_subcode == zag.hv.virtual_machine.INITIAL_STATE_SUBCODE) return;
     arch_state.started = true;
 }
 

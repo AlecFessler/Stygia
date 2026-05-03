@@ -447,11 +447,15 @@ pub fn applyVmPolicyTable(
 
 // ── Internal API ─────────────────────────────────────────────────────
 
-/// Initial-state vm_exit sub-code delivered immediately on
-/// `create_vcpu` so the creator can install real guest state via
-/// reply. Per-arch dispatch maps this sentinel to the architecture's
-/// initial-state slot before the first `enterGuest`.
-pub const INITIAL_STATE_SUBCODE: u8 = 0xFF;
+/// Initial-state vm_exit sub-code per spec §[vm_exit_state] — the
+/// "vCPU has not yet entered guest mode" value the kernel injects at
+/// `create_vcpu` and after a reply that left the vCPU not-started.
+/// Per-arch table values: x86-64 = 13, aarch64 = 10.
+pub const INITIAL_STATE_SUBCODE: u8 = switch (@import("builtin").cpu.arch) {
+    .x86_64 => 13,
+    .aarch64 => 10,
+    else => @compileError("unsupported arch"),
+};
 
 /// Allocate a VM bound to `domain`. Allocates stage-2 page-table root
 /// from PMM, allocates arch control structure, retains a reference on

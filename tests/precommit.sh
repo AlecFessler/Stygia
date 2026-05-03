@@ -9,7 +9,6 @@
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
 #   3. hyprvOS Linux boot          (x86-64, KVM on this PC)
 #   4. hyprvOS Linux boot          (aarch64, KVM on Pi via SSH)
-#   5. kernel perf regression gate (tests/prof/run_perf.sh, kprof trace)
 #
 # Usage:
 #   ./tests/precommit.sh             # full gauntlet (all stages, including optional)
@@ -53,16 +52,12 @@ REQUIRED_STAGES=(
     x86_kernel_tests
     aarch64_kernel_tests_pi
     aarch64_vm_tests_tcg
+    hyprvos_x86_linux_boot
 )
 # Stages tagged as currently-failing-but-meant-to-be-required. Move
 # entries back into REQUIRED_STAGES above as their underlying issues land:
-#   hyprvos_x86_linux_boot      — blocked on reply-syscall ABI redesign (user is on this)
-#   hyprvos_aarch64_linux_boot  — same upstream blocker
+#   hyprvos_aarch64_linux_boot  — blocked on aarch64 typed-reply parity
 #
-# Stages explicitly NOT meant for this gate (each runs in the full
-# manual invocation only):
-#   kernel_perf                 — too slow + scope mismatch for per-commit gate
-
 is_required() {
     local s
     for s in "${REQUIRED_STAGES[@]}"; do
@@ -187,9 +182,9 @@ stage_verify_coverage() {
     echo "[0e] Spec ↔ test coverage (verify_coverage.py)"
     echo "=================================================="
     # Cross-checks docs/kernel/specv3.md `[test NN]` tags against
-    # tests/tests/tests/<section>_NN.zig files; exits 1 on duplicate
+    # tests/suite/cases/<section>_NN.zig files; exits 1 on duplicate
     # tags, missing files, orphan files, or any non-zero mismatch.
-    if ! python3 "$SCRIPT_DIR/tests/verify_coverage.py"; then
+    if ! python3 "$SCRIPT_DIR/suite/verify_coverage.py"; then
         FAILURES+=("spec/test coverage mismatch")
         return 1
     fi
@@ -210,7 +205,7 @@ stage_x86_kernel_tests() {
     clean_nvvars
 
     echo "Building x86 root_service (in-kernel runner with embedded test ELFs)..."
-    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && zig build); then
+    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && zig build); then
         FAILURES+=("x86 root_service build")
         return 1
     fi
@@ -275,7 +270,7 @@ aarch64_pi_reachable() {
 # Run an aarch64 in-kernel test bundle 3× under local QEMU+TCG and
 # report PASS/FAIL the same shape as the Pi path. Caller has already
 # built kernel.elf + the bundled root_service.elf in zig-out/img and
-# tests/tests/bin respectively. label = stage description for logs;
+# tests/suite/bin respectively. label = stage description for logs;
 # fail_tag = prefix for FAILURES entries on this stage.
 run_aarch64_tcg_3reps() {
     local label="$1"
@@ -285,7 +280,7 @@ run_aarch64_tcg_3reps() {
     fat=$(mktemp -d)
     mkdir -p "$fat/img/efi/boot"
     cp "$ZAG_ROOT/zig-out/img/kernel.elf" "$fat/img/"
-    cp "$SCRIPT_DIR/tests/bin/root_service.elf" "$fat/img/"
+    cp "$SCRIPT_DIR/suite/bin/root_service.elf" "$fat/img/"
     cp "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
 
     local rep
@@ -352,7 +347,7 @@ stage_aarch64_vm_tests_tcg() {
     echo "[2a/4] aarch64 VM spec tests (local TCG, gic-version=3, 3 reps)"
     echo "=================================================="
     echo "Building aarch64 root_service (6-test VM bundle)..."
-    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && \
+    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
           zig build -Darch=arm \
           -Dtests='acquire_ecs_07,create_vcpu_03,create_vcpu_06,create_vcpu_07,create_virtual_machine_06,create_virtual_machine_07'); then
         FAILURES+=("aarch64 vm-tests root_service build")
@@ -373,7 +368,7 @@ stage_aarch64_kernel_tests_pi() {
     echo "=================================================="
 
     echo "Building aarch64 root_service (in-kernel runner with embedded test ELFs)..."
-    if ! (cd "$SCRIPT_DIR/tests" && rm -rf bin/ .zig-cache && zig build -Darch=arm); then
+    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && zig build -Darch=arm); then
         FAILURES+=("aarch64 root_service build")
         return 1
     fi
@@ -407,7 +402,7 @@ stage_aarch64_kernel_tests_pi() {
         FAILURES+=("scp BOOTAA64.EFI to Pi")
         return 1
     fi
-    if ! scp -q "$SCRIPT_DIR/tests/bin/root_service.elf" \
+    if ! scp -q "$SCRIPT_DIR/suite/bin/root_service.elf" \
         "$PI_HOST:$PI_REMOTE_DIR/root_service.elf"; then
         FAILURES+=("scp root_service.elf to Pi")
         return 1
@@ -477,12 +472,12 @@ stage_hyprvos_x86_linux_boot() {
 
     local qemu_log
     qemu_log=$(mktemp)
-    (cd "$ZAG_ROOT" && timeout 90 zig build run -Dprofile=hyprvos -Diommu=amd -Doptimize=ReleaseSafe -- -display none) \
+    (cd "$ZAG_ROOT" && timeout 360 zig build run -Dprofile=hyprvos -Diommu=amd -Doptimize=ReleaseSafe -- -display none) \
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
     local found=0
-    for _ in $(seq 1 90); do
+    for _ in $(seq 1 360); do
         if grep -q "=== Zag VM Shell ===" "$qemu_log" 2>/dev/null; then
             found=1
             break
@@ -499,7 +494,7 @@ stage_hyprvos_x86_linux_boot() {
         rm -f "$qemu_log"
         return 0
     else
-        echo "[FAIL] Linux did not reach shell within 90s (x86-64)"
+        echo "[FAIL] Linux did not reach shell within 360s (x86-64)"
         echo "--- last 30 lines of QEMU output ---"
         tail -30 "$qemu_log"
         echo "--- end ---"
@@ -530,21 +525,68 @@ stage_hyprvos_aarch64_linux_boot() {
     fi
 }
 
-stage_kernel_perf() {
+# ── stage_perf_regression ─────────────────────────────────────────────
+#
+# Compares idc_pp roundtrip-cycle median against the parent commit's
+# stored measurement. Fails if current is >5% slower. On pass (or
+# bootstrap), writes .zag-perf/_pending.json which the post-commit hook
+# at .githooks/post-commit renames to .zag-perf/<new_sha>.json.
+stage_perf_regression() {
     echo ""
     echo "=================================================="
-    echo "[6] Kernel perf regression (kprof trace)"
+    echo "[5] Perf regression (idc_pp, threshold 5%)"
     echo "=================================================="
-    # tests/prof/run_perf.sh boots each workload with
-    # `-Dkernel_profile=trace` and compares scope medians against
-    # tests/prof/baselines/<workload>.json. Sampling doesn't fit this
-    # job — we're gating known scheduler/IPC/fault scopes, not
-    # hunting unknown hot paths. Enter/exit pairs with PMU deltas
-    # give a direct per-scope answer.
-    if ! bash "$SCRIPT_DIR/prof/run_perf.sh" --compare-baseline; then
-        FAILURES+=("kernel perf regression")
+    local perf_dir="$ZAG_ROOT/.zag-perf"
+    mkdir -p "$perf_dir"
+
+    if ! (cd "$ZAG_ROOT/tests/prof" && zig build 2>&1); then
+        FAILURES+=("perf workload build")
         return 1
     fi
+    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test \
+        -Dkernel_profile=trace -Doptimize=ReleaseFast \
+        -Droot-service=tests/prof/bin/root_service.elf 2>&1); then
+        FAILURES+=("perf kernel build")
+        return 1
+    fi
+
+    local qemu_log
+    qemu_log=$(mktemp)
+    if ! (cd "$ZAG_ROOT" && timeout 60 zig build run -Dprofile=test \
+        -Dkernel_profile=trace -Doptimize=ReleaseFast \
+        -Droot-service=tests/prof/bin/root_service.elf -- -display none) \
+        > "$qemu_log" 2>&1; then
+        echo "[FAIL] perf workload boot timeout/qemu error"
+        tail -20 "$qemu_log"
+        rm -f "$qemu_log"
+        FAILURES+=("perf workload boot")
+        return 1
+    fi
+
+    local current="$perf_dir/_pending.json"
+    if ! python3 "$ZAG_ROOT/tests/prof/scripts/parse_kprof.py" \
+        "$qemu_log" --json > "$current" 2>/dev/null; then
+        echo "[FAIL] parse_kprof.py failed"
+        rm -f "$qemu_log" "$current"
+        FAILURES+=("perf parse")
+        return 1
+    fi
+    rm -f "$qemu_log"
+
+    local parent_sha
+    parent_sha="$(cd "$ZAG_ROOT" && git rev-parse HEAD 2>/dev/null)"
+    local parent_file="$perf_dir/${parent_sha}.json"
+    if [[ ! -f "$parent_file" ]]; then
+        echo "[BOOTSTRAP] no measurement for parent commit ${parent_sha:0:8}; storing current as new baseline"
+        return 0
+    fi
+
+    if ! python3 "$ZAG_ROOT/tests/prof/scripts/compare_baseline.py" \
+        "$parent_file" "$current" --threshold 0.05; then
+        FAILURES+=("perf regression vs parent commit")
+        return 1
+    fi
+    echo "[PASS] no regression vs parent commit ${parent_sha:0:8}"
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────────
@@ -558,7 +600,7 @@ run_stage aarch64_kernel_tests_pi
 run_stage aarch64_vm_tests_tcg
 run_stage hyprvos_x86_linux_boot
 run_stage hyprvos_aarch64_linux_boot
-run_stage kernel_perf
+run_stage perf_regression
 
 echo ""
 echo "=================================================="

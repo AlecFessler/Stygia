@@ -200,13 +200,22 @@ pub fn switchTo(ec: *ExecutionContext) void {
         clearCurrentEc(core);
         const irq = arch.cpu.saveAndDisableInterrupts();
         const delivery = arch.vm.enterGuest(current) orelse blk: {
-            // Synthetic-exit fallback — preserves the spec-test smoke
-            // contract (recv/reply on exit_port works) on platforms
-            // without VMX/SVM. Zero out ec.ctx.regs so the receiver
-            // observes a clean "guest not running" snapshot rather
-            // than the prior `consumeReply`'s reply-time GPRs.
+            // Synthetic-exit fallback — covers two cases:
+            //  (1) platforms without VMX/SVM at all
+            //  (2) `arch_state.started == false` because the VMM has not
+            //      yet supplied real initial guest state (spec §[reply]
+            //      `initial_state` handshake)
+            // Either way we re-deliver a vm_exit with sub-code
+            // `initial_state` so the receiver observes the well-defined
+            // not-yet-started condition rather than a synthetic cpuid /
+            // unknown exit. Zero out ec.ctx.regs so the receiver sees a
+            // clean "guest not running" GPR snapshot rather than the
+            // prior `consumeReply`'s reply-time values.
             @memset(std.mem.asBytes(&current.ctx.regs), 0);
-            break :blk arch.vm.VmExitDelivery{ .subcode = 0, .payload = .{ 0, 0, 0 } };
+            break :blk arch.vm.VmExitDelivery{
+                .subcode = zag.hv.virtual_machine.INITIAL_STATE_SUBCODE,
+                .payload = .{ 0, 0, 0 },
+            };
         };
         port_mod.fireVmExit(current, delivery.subcode, delivery.payload);
         arch.cpu.restoreInterrupts(irq);
