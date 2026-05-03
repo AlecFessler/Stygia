@@ -803,8 +803,16 @@ pub fn allocCapabilityDomain(
     // ([test 06]) use this self-IDC to enumerate the calling domain's
     // own ECs; without a permissive `ec_cap_ceiling` the intersection
     // is zero and the minted handles carry no caps.
+    //
+    // var_cap_ceiling clears VarCap bit 5 (mmio) — at field0 bit 21 —
+    // so the §[acquire_vars] [test 06] intersection naturally satisfies
+    // [test 07]'s "MMIO and DMA VARs are not included" invariant. mmio
+    // and dma describe the VAR object (§[var]); minting an mmio cap on
+    // a non-MMIO VAR (the only kind acquire_vars returns) would
+    // misadvertise the handle. dma at VarCap bit 8 falls outside the
+    // 8-bit var_cap_ceiling field, so it is implicitly excluded.
     const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
-    const idc_self_field0: u64 = 0x0000_0000_00FF_FFFF; // ec_cap_ceiling=0xFFFF, var_cap_ceiling=0xFF
+    const idc_self_field0: u64 = 0x0000_0000_00DF_FFFF; // ec_cap_ceiling=0xFFFF, var_cap_ceiling=0xDF (mmio cleared)
     user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
     user_table[2].field0 = idc_self_field0;
     user_table[2].field1 = 0;

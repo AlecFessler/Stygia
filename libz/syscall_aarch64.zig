@@ -266,13 +266,15 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         \\ b.ne 1b
         // Write attachments into vregs [128-N..127] at offsets
         // [sp + (128-N-31)*8 .. sp + 768]. x15 = src ptr, x14 = N,
-        // x13 = first dst offset = (97 - N) * 8 + sp.
+        // x13 = first dst offset = sp + (97 - N) * 8.
+        // AArch64: `add Xd, Xn, sp` is not encodable; `add Xd, sp, Xn`
+        // is the legal extended-register form with SP as base.
         \\ mov x15, %[atts_ptr]
         \\ mov x14, %[n]
         \\ mov x13, #97
         \\ sub x13, x13, x14
         \\ lsl x13, x13, #3
-        \\ add x13, x13, sp
+        \\ add x13, sp, x13
         \\2: ldr x16, [x15]
         \\ str x16, [x13]
         \\ add x15, x15, #8
@@ -302,7 +304,7 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
              .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
              .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true, .cc = true });
+             .x29 = true, .x30 = true, .memory = true });
     return .{
         .v1 = ov1,
         .v2 = ov2,
