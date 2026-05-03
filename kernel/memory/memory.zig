@@ -7,4 +7,3 @@ pub const paging = @import("paging.zig");
 pub const pmm = @import("pmm.zig");
 pub const stack = @import("stack.zig");
 pub const vmar = @import("vmar.zig");
-pub const vmm = @import("vmm.zig");

@@ -558,7 +558,92 @@ devices/device_region.zig:79-79    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ec
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
 sched/execution_context.zig:81-81    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
-sched/port.zig:1068-1068    sha256:412ca345ccf75bf9c0806bce695be8de808b79984251a7a54d202cf6101dd451
+sched/port.zig:1068-1068    sha256:0490adbbf23c08ae4fabe2d72fbd66b72c22f7775183d23bc7d07830b889d78a
 syscall/errors.zig:32-32    sha256:2745d7e8f7ad434662cee5fca8244d0741daef88c2b2ebde686283526773f967
 sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
 arch/x64/exceptions.zig:43-43    sha256:6567179afdbc127a6c09287ab0cffbda8467127c98513783be98004d730bd314
+
+# ── Recovery merge (c94aea42) additions ──────────────────────────────────
+#   * arch/aarch64/exceptions.zig (ExceptionClass.{serror,*_same_el}, ThreadFaultSubcode.stack_overflow)
+#     — ARM ESR_EL1 EC + thread-fault sub-code catalogs; spec-mandated value space.
+#   * arch/aarch64/hyp.zig (WorldSwitchCtx.host_*, HostFpState.*)
+#     — host-context save/restore slots written and read only by the EL2 world-switch asm.
+#   * arch/aarch64/stage2.zig (Stage2Entry.* bit fields)
+#     — ARMv8 stage-2 PTE bit layout; hardware fidelity, MMU-read.
+#   * arch/aarch64/stage2.zig (sysregPassthrough) — HVC stub reserved for sysreg passthrough bring-up.
+#   * arch/aarch64/vm.zig (HypCallId.{noop,vcpu_run,vgic_*,vtimer_*})
+#     — full hypercall id catalog reserved for vGIC + vtimer wiring.
+#   * arch/aarch64/vm.zig (HCR_EL2_VF/VI/TTLB/TGE) — ARM HCR_EL2 bit catalog (D13.2.46).
+#   * arch/aarch64/vm.zig (isWrite/issValid, GuestInterrupt.intid, GuestException.{far,vector_slot})
+#     — ESR_EL2 ISS decoder helpers + exit-info scaffold for full vCPU exit handling.
+#   * arch/aarch64/vm_runloop.zig (SUBCODE_INITIAL_STATE, VREG79_CNTP_TVAL_EL0_OFF, WIDE_VREG_END_OFF)
+#     — vm_exit-state ABI markers (also referenced from kernel/arch/x64/vm_runloop.zig).
+#   * arch/x64/vm_runloop.zig (WIDE_VREG_END_OFF) — vm_exit-state ABI marker (sister to aarch64).
+#   * kprof/dump.zig (EndReason.oneshot) — third dump-trigger variant reserved for one-shot syscall path.
+#   * kprof/log.zig (epoch) — rolling-dump epoch counter reserved for future rolling-dump mode.
+#
+# Libz ABI-load-bearing entries (paths shown as `libz/...` though they live
+# above `kernel/`; analyzer's view prefixes "kernel/" cosmetically):
+#   * libz/errors.zig (E_REFUSED) — spec-mandated error code 13 (§[error_codes]).
+#   * libz/caps.zig (PassedHandle/PairEntry._reserved_lo/_hi)
+#     — packed-struct padding load-bearing for the spec-defined u64 bit layout.
+#
+arch/aarch64/exceptions.zig:83-83    sha256:00f74004fe5d6c96c4716a834c046dd0a9ea15dbfd77faa570ccbd8e0bd865d6
+arch/aarch64/exceptions.zig:85-85    sha256:915bb4d3f09477295e9a515b896a7996b6e9e9df97e6595e4b29f3d221074b0a
+arch/aarch64/exceptions.zig:87-87    sha256:38a8c4a782ab95a230659d945f14cc0af263ed65dbf0d43f2632852679539666
+arch/aarch64/exceptions.zig:89-89    sha256:3d0d714c72873450f8491720de4ee87265c0c93f98d75299ee35b10b840faa54
+arch/aarch64/exceptions.zig:117-117    sha256:e0b170ed7d51ca8f27daa29bcd13f3eaa1f15cdcfc70945b4a014b5ca6def279
+arch/aarch64/hyp.zig:170-170    sha256:153daade694ad96a9fca6919baa75c118017af8e5440161e2f66eb3fc1dd01b2
+arch/aarch64/hyp.zig:171-171    sha256:9bca0ec231de07d5eb6c433ba69cb3a1ce8922eef3d83911efa5c9124c0d7704
+arch/aarch64/hyp.zig:273-273    sha256:277ed268940699b93384cb5c52354fe1e13fd7c486a81de2d387165515c435ec
+arch/aarch64/hyp.zig:274-274    sha256:53112e5e3b2b1f7d8485a4e5f07a1724d078bf478b7a75b3dc3699ba1a080f9f
+arch/aarch64/hyp.zig:275-275    sha256:de1a000a35d804ab1b33e4687b5583c8857ac16caf287c5a3666bd3c4cdcdf7b
+arch/aarch64/paging.zig:133-133    sha256:dc3d82b96888fbcd763f8be3fa05379c61668241b0c96b4df7145e51710d08bd
+arch/aarch64/paging.zig:155-155    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
+arch/aarch64/paging.zig:161-161    sha256:3f17e403c5eac89d87b0ad6312c31ec965abb3cc58c2d3323c84afaca86615ae
+arch/aarch64/paging.zig:163-163    sha256:64de2c918a497dc524f47621b377c73d2d885e1d7601114127e51ad8b014399d
+arch/aarch64/paging.zig:165-165    sha256:652b19ee3f7032217985854e70d688df338dfb727899fbc85289fa0280edeb97
+arch/aarch64/stage2.zig:171-171    sha256:4f4d9b70d21ba8bbe9c365280b369907cc93eb6d2082524a896c985b60adab1f
+arch/aarch64/stage2.zig:175-175    sha256:0400880bea535dc86ac9e1d4409b36f86d7ca85973c643cf6390cb8337b7de3a
+arch/aarch64/stage2.zig:177-177    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
+arch/aarch64/stage2.zig:178-178    sha256:61114a63f55b9625e8abfb47d20a7fd9542ea90ddf390d3197c884473ee626b0
+arch/aarch64/stage2.zig:181-181    sha256:3f17e403c5eac89d87b0ad6312c31ec965abb3cc58c2d3323c84afaca86615ae
+arch/aarch64/stage2.zig:182-182    sha256:5cbb7f68f1c5cbd72cda5ca37a80f472e43938d12b110bde4c3e13260adfd8f2
+arch/aarch64/stage2.zig:183-183    sha256:8c5e065ccaf3ed5bbe3b74dab30ad1cd15b38adc7984ee55119df4a488836b2a
+arch/aarch64/stage2.zig:579-579    sha256:b54491985e8eddb43e52ffdbe27b5d537b5025166f45ad6f90871febeec51093
+arch/aarch64/vm.zig:283-283    sha256:b543028d5caab9f60958da0f5946ec54f3ed2efc71d7a3f08d0d75a12794ebac
+arch/aarch64/vm.zig:286-286    sha256:9cedbdc18e976504a3298370222905b8a4a3453220eb0ddf466cf9230fd201b6
+arch/aarch64/vm.zig:346-346    sha256:ffcbe9095bc554a72b455df6673f876305a95d1b58e169abe7d3b66874dd23da
+arch/aarch64/vm.zig:361-361    sha256:0a7fa672bc0d1f0959b5bcad03f9a1a4ae3f654704750f688e18c712cf181911
+arch/aarch64/vm.zig:364-364    sha256:e523407388e3e4c7323df57c2ff8a98d173f13a745a89bbd8f3385b3214464fa
+arch/aarch64/vm.zig:387-387    sha256:f198d267bf30f8c0f5d3f686b196d956cdb646678c81f71e734ee5a2645228d4
+arch/aarch64/vm.zig:390-390    sha256:76724d4459dfb677471389c98badc276cc06a5c42e7f866a66ae8377468c10c2
+arch/aarch64/vm.zig:392-392    sha256:ec94b44a36fe7c832d701cf1d60895b5b957bff5c327ede4d626a7bfb0a2c26f
+arch/aarch64/vm.zig:395-395    sha256:8603838db7be95f29842a5dbef63af828b2f6a48925f329fe088debd92d7b882
+arch/aarch64/vm.zig:549-549    sha256:d57595811317bb83c81917c4e57540bce1af7c7e300cf0e91856aa338ab9bb64
+arch/aarch64/vm.zig:553-553    sha256:d5a7d1728503337616f02b2604a5748920e5ba329123f088be2f25751952dfeb
+arch/aarch64/vm.zig:566-566    sha256:b6796d7908b98f010209bac8caefef66e6e33bcf8a9c971aff95d5298d8f916b
+arch/aarch64/vm.zig:573-573    sha256:d2ea6377ded8a07149c61a5f7395c16a861651d70e18b4148052f277c830bc75
+arch/aarch64/vm.zig:579-579    sha256:ef4aa10c59a3dddc345e885b6c368c9e887bba08dc596ca244be30800558a9af
+arch/aarch64/vm.zig:585-585    sha256:4bc337b6d8bfbec55cfd58f258a8def92c5c7b1d775321ae586fa6fb6d2b1ac3
+arch/aarch64/vm.zig:591-591    sha256:cc91d11d3a17eedee0bfe99d3b4676b22b6a7c3703fc991d1d34787b8e87f0f7
+arch/aarch64/vm.zig:646-646    sha256:8e05bc986648a9a624f20139bc3518501ecdc546bc2499b1a343b473bb9d3e27
+arch/aarch64/vm.zig:647-647    sha256:7536fa7880903e9381ad9ebad6b1a7959d3cb85661dab8e45e3dc80178b394a4
+arch/aarch64/vm.zig:657-657    sha256:11f7371148c34a7e771348406d8f96daba868ec9e04fc41ef5a2d1bd96a4b039
+arch/aarch64/vm.zig:659-659    sha256:f5770cc47b8e4f5f183b07a39d63896bee6060e4f26c8a3ab7e10daf16a4826e
+arch/aarch64/vm_runloop.zig:48-48    sha256:51b9437cc28611bc8f3f397e4831477368042d5d19583cd14cd2590a45aa33b4
+arch/aarch64/vm_runloop.zig:166-166    sha256:a1903fbfe775e65ba24f4ec25e581572229400769d4501fecbae33dbd304b1f4
+arch/aarch64/vm_runloop.zig:178-178    sha256:ecef1f28bbddb8a4ab075372a91da468019da8d073bb77ae8391b4701c661a72
+arch/x64/vm_runloop.zig:312-312    sha256:c3e78392222ead648841450e2705106ce1c9079fb447198afc871a3411081225
+kprof/dump.zig:95-95    sha256:327220a1464cc1c697c83c084114d2dfc463311baf70cde00eb34208e0f1e68f
+kprof/log.zig:88-88    sha256:5c727663310af9bd9d5399a21753aca082bbd90893c767bc250ea4f84a06e549
+libz/errors.zig:19-19    sha256:c39f1cc906475be7923d0b66d2978a89000bcda0177631962211600880904022
+libz/caps.zig:246-246    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
+libz/caps.zig:249-249    sha256:e10cc8c94ad99bbf67176d548b57d10d8074e08acf528b24830fd7e9b8cf98b9
+libz/caps.zig:259-259    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
+libz/caps.zig:262-262    sha256:e10cc8c94ad99bbf67176d548b57d10d8074e08acf528b24830fd7e9b8cf98b9
+arch/x64/interrupts.zig:103-103    sha256:6affcd02f8e8b8fc9fd8a687227179bbfb3f4eb13b4e1660f6359661c962dab2
+arch/x64/interrupts.zig:106-106    sha256:36dc77860efa04de21740249fa2a81a41b7012a8239f191a023123228f75711c
+arch/x64/interrupts.zig:128-128    sha256:b83483777960b4f3c5144bf02d5b64b84ebd342cfd81cf32439e79a790409d66
+arch/x64/interrupts.zig:145-145    sha256:0991dfe3f307117ee4f4cc84b4c83f4d6129ef60740d8d42a433195a5b663a9c
+sched/port.zig:1002-1002    sha256:3aabb8459d594f065a73cb7acf1eb5a90c99a002782ad62c7592fd19e9d0c139

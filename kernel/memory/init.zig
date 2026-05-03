@@ -16,7 +16,6 @@ const port_mod = zag.sched.port;
 const timer_mod = zag.sched.timer;
 const vmar_mod = zag.memory.vmar;
 const virtual_machine_mod = zag.hv.virtual_machine;
-const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
 const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
@@ -180,12 +179,6 @@ pub fn init(firmware_mmap: MMap) !void {
 
     pmm.global_pmm = PhysicalMemoryManager.init(&buddy_allocator);
 
-
-    vmm_mod.initSlabs(
-        KA.vm_node_slab,
-        KA.vm_node_slab_ptrs,
-        KA.vm_node_slab_links,
-    );
     dev_region_mod.initSlab(
         KA.dev_region_slab,
         KA.dev_region_slab_ptrs,

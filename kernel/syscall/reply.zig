@@ -24,7 +24,6 @@ const PAIR_CAPS_MASK: u64 = @as(u64, 0xFFFF) << 16;
 const PAIR_MOVE_BIT: u64 = @as(u64, 1) << 32;
 const PAIR_VALID_MASK: u64 = PAIR_SOURCE_MASK | PAIR_CAPS_MASK | PAIR_MOVE_BIT;
 
-const MIN_PAIR_COUNT: usize = 1;
 const MAX_PAIR_COUNT: usize = 63;
 
 /// Stack-allocated upper bound for pair entries read from the user
