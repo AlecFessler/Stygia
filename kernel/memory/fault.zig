@@ -11,7 +11,7 @@ const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const sync_debug = zag.utils.sync.debug;
-const var_range = zag.capdom.var_range;
+const var_range = zag.memory.var_range;
 
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;

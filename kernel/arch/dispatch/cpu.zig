@@ -110,6 +110,36 @@ pub fn halt() noreturn {
     }
 }
 
+/// Send a kprof-dump IPI to every core except the caller. Invoked by
+/// the dumping core inside `kprof.dump.end()` to quiesce every other
+/// CPU before serial-dumping. Per-arch backend resolves the IPI vector
+/// (x86: `IntVecs.kprof_dump`; aarch64: SGI 1).
+pub fn broadcastKprofIpi() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            const lapics = x64.apic.lapics orelse return;
+            const self_id = x64.apic.coreID();
+            const vec = @intFromEnum(x64.interrupts.IntVecs.kprof_dump);
+            for (lapics, 0..) |la, i| {
+                if (i == self_id) continue;
+                x64.apic.sendIpi(@intCast(la.apic_id), vec);
+            }
+        },
+        .aarch64 => {
+            const self_id = aarch64.gic.coreID();
+            const n = aarch64.gic.coreCount();
+            var i: u64 = 0;
+            while (i < n) {
+                if (i != self_id) {
+                    aarch64.gic.sendIpiToCore(i, 1);
+                }
+                i += 1;
+            }
+        },
+        else => unreachable,
+    }
+}
+
 /// Align a stack pointer for the target architecture's calling convention.
 /// x86-64: 16-byte aligned minus 8 (simulates the return address push by `call`).
 /// aarch64: 16-byte aligned (SP must be 16-byte aligned at all times).

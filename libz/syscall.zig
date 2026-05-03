@@ -35,65 +35,76 @@ pub const Regs = struct {
     v13: u64 = 0,
 };
 
+// L4 IPC fast-path classifier: syscall_op in 0..13 means "fast-suspend
+// with payload_count = syscall_op". The kernel's asm classifier
+// (`cmpq $13, %rcx; jbe .Lsyscall_suspend_fast`) treats those words as
+// inline IPC rendezvous; every other syscall must use a syscall_op
+// >= 14 so the classifier falls through to the slow Zig dispatch path.
+// The slow-path `.@"suspend"` handler stays at 14 so a fast-suspend
+// predicate miss (no receiver, lock contended, etc.) routes through
+// the same dispatch, with payload_count = 0.
+//
+// Numbering must match `kernel/syscall/dispatch.zig`'s `SyscallNum`.
 pub const SyscallNum = enum(u12) {
-    restrict = 0,
-    delete = 1,
-    revoke = 2,
-    sync = 3,
-    create_capability_domain = 4,
-    acquire_ecs = 5,
-    acquire_vars = 6,
-    create_execution_context = 7,
-    self = 8,
-    terminate = 9,
-    yield = 10,
-    priority = 11,
-    affinity = 12,
-    perfmon_info = 13,
-    perfmon_start = 14,
-    perfmon_read = 15,
-    perfmon_stop = 16,
-    create_var = 17,
-    map_pf = 18,
-    map_mmio = 19,
-    unmap = 20,
-    remap = 21,
-    snapshot = 22,
-    idc_read = 23,
-    idc_write = 24,
-    create_page_frame = 25,
-    ack = 26,
-    create_virtual_machine = 27,
-    create_vcpu = 28,
-    map_guest = 29,
-    unmap_guest = 30,
-    vm_set_policy = 31,
-    vm_inject_irq = 32,
-    create_port = 33,
-    @"suspend" = 34,
-    recv = 35,
-    bind_event_route = 36,
-    clear_event_route = 37,
-    reply = 38,
-    reply_transfer = 39,
-    timer_arm = 40,
-    timer_rearm = 41,
-    timer_cancel = 42,
-    futex_wait_val = 43,
-    futex_wait_change = 44,
-    futex_wake = 45,
-    time_monotonic = 46,
-    time_getwall = 47,
-    time_setwall = 48,
-    random = 49,
-    info_system = 50,
-    info_cores = 51,
-    power_shutdown = 52,
-    power_reboot = 53,
-    power_sleep = 54,
-    power_screen_off = 55,
-    power_set_freq = 56,
-    power_set_idle = 57,
+    @"suspend" = 14,
+    restrict = 15,
+    delete = 16,
+    revoke = 17,
+    sync = 18,
+    create_capability_domain = 19,
+    acquire_ecs = 20,
+    acquire_vars = 21,
+    create_execution_context = 22,
+    self = 23,
+    terminate = 24,
+    yield = 25,
+    priority = 26,
+    affinity = 27,
+    perfmon_info = 28,
+    perfmon_start = 29,
+    perfmon_read = 30,
+    perfmon_stop = 31,
+    create_var = 32,
+    map_pf = 33,
+    map_mmio = 34,
+    unmap = 35,
+    remap = 36,
+    snapshot = 37,
+    idc_read = 38,
+    idc_write = 39,
+    create_page_frame = 40,
+    ack = 41,
+    create_virtual_machine = 42,
+    create_vcpu = 43,
+    map_guest = 44,
+    unmap_guest = 45,
+    vm_set_policy = 46,
+    vm_inject_irq = 47,
+    create_port = 48,
+    recv = 49,
+    bind_event_route = 50,
+    clear_event_route = 51,
+    reply = 52,
+    reply_transfer = 53,
+    timer_arm = 54,
+    timer_rearm = 55,
+    timer_cancel = 56,
+    futex_wait_val = 57,
+    futex_wait_change = 58,
+    futex_wake = 59,
+    time_monotonic = 60,
+    time_getwall = 61,
+    time_setwall = 62,
+    random = 63,
+    info_system = 64,
+    info_cores = 65,
+    power_shutdown = 66,
+    power_reboot = 67,
+    power_sleep = 68,
+    power_screen_off = 69,
+    power_set_freq = 70,
+    power_set_idle = 71,
+    kprof_dump = 72,
 };
 
 // SPEC AMBIGUITY: spec §[syscall_abi] does not pin which bits of the
@@ -532,10 +543,14 @@ pub fn createPort(caps: u64) Regs {
 }
 
 pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
-    const n: u8 = @intCast(attachments.len);
-    const extra = extraCount(n);
     if (attachments.len == 0) {
-        return issueReg(.@"suspend", extra, .{ .v1 = target, .v2 = port });
+        // Fast-suspend wire format (spec §[syscall_abi] L4 IPC fast
+        // path): syscall_word = payload_count (0 here). The kernel's
+        // asm classifier `cmpq $13, %rcx; jbe` triggers the inline
+        // rendezvous. The slow-path .@"suspend" (= 14) handler also
+        // accepts a fast-suspend miss, so this is safe even if the
+        // fast path bails for any reason.
+        return issueRawNoStack(0, .{ .v1 = target, .v2 = port });
     }
     // SPEC AMBIGUITY: §[handle_attachments] places pair entries at
     // vregs [128-N..127] — the *high* end of the vreg space, not vregs
@@ -708,5 +723,13 @@ pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
 
 pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
     return issueReg(.power_set_idle, 0, .{ .v1 = core_id, .v2 = policy });
+}
+
+// ---------------------------------------------------------------
+// 72: kprof
+// ---------------------------------------------------------------
+
+pub fn kprofDump() void {
+    issueRegDiscard(.kprof_dump, 0, .{});
 }
 

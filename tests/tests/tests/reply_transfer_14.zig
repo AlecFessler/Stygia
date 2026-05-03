@@ -62,13 +62,13 @@
 //   yet wired through `issueStack`, so this test inlines the recv +
 //   reply_transfer pair into a single asm volatile block that:
 //     1. allocates the 920-byte pad with `subq $920, %rsp`;
-//     2. issues recv (syscall_num = 35) reading port handle from vreg 1;
+//     2. issues recv (syscall_num = 49) reading port handle from vreg 1;
 //     3. saves the kernel-returned syscall word (carries reply_handle_id
 //        in bits 32..43 per §[recv]);
 //     4. modifies [rsp + 8] = vreg 14 (RIP) to the worker entry;
 //     5. writes the pair entry at [rsp + 912] = vreg 127;
 //     6. extracts reply_handle_id and places it in rax = vreg 1;
-//     7. issues reply_transfer (syscall_num = 39 | (1 << 12));
+//     7. issues reply_transfer (syscall_num = 53 | (1 << 12));
 //     8. tears down the pad.
 //   recv and reply_transfer share the pad: recv populates vregs 14..127
 //   with W's snapshot, the test mutates only vreg 14 and vreg 127, and
@@ -240,9 +240,9 @@ fn recvAndReplyTransferWithRipMod(
     // §[syscall_abi] / libz/syscall.zig comment: syscall_num lives in
     // bits 0-11 of vreg 0; reply_transfer's `pair_count` lives in bits
     // 12-19; reply_handle_id (per the new ABI) lives in bits 20-31.
-    // Both syscall words are inlined as immediates below: recv = 35
+    // Both syscall words are inlined as immediates below: recv = 49
     // (syscall_num only, extra = 0). reply_transfer's word is computed
-    // at runtime as (39 | (1 << 12)) | (rid << 20) = 4135 | (rid << 20)
+    // at runtime as (53 | (1 << 12)) | (rid << 20) = 4149 | (rid << 20)
     // because rid comes out of recv's returned word.
     //
     // Stack-pad layout after `subq $920, %rsp`:
@@ -256,7 +256,7 @@ fn recvAndReplyTransferWithRipMod(
         .x86_64 => asm volatile (
             \\ subq $920, %%rsp
             // ─── PHASE 1 — recv ───────────────────────────────────────────
-            \\ movq $35, (%%rsp)
+            \\ movq $49, (%%rsp)
             \\ movq asm_io+0(%%rip), %%rax
             \\ syscall
             \\ movq %%rax, asm_io+24(%%rip)
@@ -272,7 +272,7 @@ fn recvAndReplyTransferWithRipMod(
             \\ movabsq $0xFFF00000000, %%rcx
             \\ andq %%rcx, %%rax
             \\ shrq $12, %%rax
-            \\ orq $4135, %%rax
+            \\ orq $4149, %%rax
             \\ movq %%rax, (%%rsp)
             \\ syscall
             \\ movq %%rax, asm_io+32(%%rip)
@@ -290,8 +290,8 @@ fn recvAndReplyTransferWithRipMod(
             // vreg 14 = x13 — modified directly between phases).
             \\ sub sp, sp, #784
             // ─── PHASE 1 — recv ───────────────────────────────────────────
-            // syscall word = 35 (recv), no extra fields.
-            \\ mov x9, #35
+            // syscall word = 49 (recv), no extra fields.
+            \\ mov x9, #49
             \\ str x9, [sp]
             // vreg 1 (port) = x0; vreg 2 unused for our purposes.
             \\ adrp x9, asm_io
@@ -319,11 +319,11 @@ fn recvAndReplyTransferWithRipMod(
             \\ str x11, [sp, #768]
             // reply_transfer syscall word: extract rid from saved
             // recv word (bits 32-43), shift down by 12 so it sits in
-            // bits 20-31, then OR in syscall_num (39) | (1 << 12) =
-            // 4135.
+            // bits 20-31, then OR in syscall_num (53) | (1 << 12) =
+            // 4149.
             \\ ubfx x12, x10, #32, #12
             \\ lsl x12, x12, #20
-            \\ mov x14, #4135
+            \\ mov x14, #4149
             \\ orr x12, x12, x14
             \\ str x12, [sp]
             \\ svc #0

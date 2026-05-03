@@ -1,7 +1,7 @@
 const zag = @import("zag");
 
 const capability = zag.caps.capability;
-const capability_domain = zag.capdom.capability_domain;
+const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
 
@@ -147,7 +147,7 @@ pub fn createCapabilityDomain(
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     // Spec §[create_capability_domain]: passed_handles uses an all-zero
     // entry as end-of-list sentinel (matches the convention the kernel
-    // capdom layer follows). The aarch64 SVC ABI passes vregs 1..31 in
+    // caps layer follows). The aarch64 SVC ABI passes vregs 1..31 in
     // x0..x30, so trailing reserved-vreg slots above the caller's last
     // populated entry contain whatever the user-side syscall asm left
     // in those GPRs. Stop reserved-bit validation at the first zero.
@@ -165,7 +165,7 @@ pub fn createCapabilityDomain(
     // CRCD lives in the self-handle's cap word at slot 0. Lock the
     // domain just long enough to read the cap and validate the elf
     // handle resolves; the heavy lifting (ceiling-subset checks, ELF
-    // load, table mint) happens in capdom under its own locking.
+    // load, table mint) happens in caps under its own locking.
     const self_caps_word = Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0);
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crcd) {
@@ -245,7 +245,7 @@ pub fn createCapabilityDomain(
     // in the caller's table. This check fires BEFORE the ELF parse
     // (test 15 / 16) per the spec test ordering — userspace can pre-
     // validate its source slots without having to also stage a valid
-    // ELF image. The all-zero entry sentinel mirrors capdom's
+    // ELF image. The all-zero entry sentinel mirrors caps's
     // convention: an entry of 0 means "end of list" (no handle 0 has
     // caps=0 / move=0 — the canonical termination pattern).
     for (passed_handles) |entry| {
@@ -335,13 +335,13 @@ pub fn acquireVars(caller: *anyopaque, target: u64) i64 {
 }
 
 /// IDC cap selector for `acquireDispatch`. Distinguishes which cap bit
-/// gates the call (`aqec` for ECs, `aqvr` for VARs) and which capdom
+/// gates the call (`aqec` for ECs, `aqvr` for VARs) and which caps
 /// entry point handles enumeration.
 const AcquireKind = enum { aqec, aqvr };
 
 /// Shared trampoline body for `acquire_ecs` / `acquire_vars`. Both
 /// validate the IDC handle, gate on the kind-specific cap bit, then
-/// hand off to capdom.
+/// hand off to caps.
 fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
     if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
 

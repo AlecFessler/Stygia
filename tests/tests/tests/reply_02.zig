@@ -17,7 +17,7 @@
 //   delete_02 / ack_04) rely on the same shape.
 //
 //   To exercise the gate we craft a syscall word whose low 12 bits hold
-//   syscall_num = 38, whose `reply_handle_id` band is zeroed, and whose
+//   syscall_num = 52, whose `reply_handle_id` band is zeroed, and whose
 //   reserved band (bits 24-63) has bit 63 set. Bit 63 mirrors the
 //   reference pattern in ack_04.zig — it sits well above any plausible
 //   future field on the syscall word.
@@ -93,7 +93,7 @@ fn issueRawReplyArm(word: u64) u64 {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // syscall_num = 38 in bits 0-11; bits 12-23 (reply_handle_id) = 0;
+    // syscall_num = 52 in bits 0-11; bits 12-23 (reply_handle_id) = 0;
     // bit 63 of the reserved band set. The ABI-layer reserved-bit gate
     // must fire regardless of the empty handle-id band.
     const syscall_num: u64 = @intFromEnum(syscall.SyscallNum.reply);

@@ -120,7 +120,7 @@ fn localDummyEntry() noreturn {
 }
 
 fn recvCaptureRipX64(port: u12) RecvRip {
-    const word: u64 = 35; // syscall_num for recv per §[recv]
+    const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
 
@@ -150,7 +150,7 @@ fn recvCaptureRipX64(port: u12) RecvRip {
 // bytes (16-byte aligned) for the syscall word slot only and read x13
 // directly out of the asm.
 fn recvCaptureRipArm(port: u12) RecvRip {
-    const word: u64 = 35; // syscall_num for recv per §[recv]
+    const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
 

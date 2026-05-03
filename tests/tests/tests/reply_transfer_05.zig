@@ -41,7 +41,7 @@
 //   Spec §[reply].reply_transfer:
 //
 //     reply_transfer([1] reply, [128-N..127] pair_entries) -> void
-//       syscall_num = 39
+//       syscall_num = 53
 //       syscall word bits 12-19: N (1..63)
 //
 //   With N=1 the single pair entry occupies vreg 127. Per §[syscall_abi]
@@ -100,7 +100,7 @@ fn localDummyEntry() noreturn {
 fn replyTransferOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
     // Spec §[syscall_abi] / §[reply_transfer]: syscall_num in bits 0-11;
     // pair_count `N` in bits 12-19; reply_handle_id in bits 20-31. N=1.
-    const word: u64 = (@as(u64, 39) & 0xFFF) |
+    const word: u64 = (@as(u64, 53) & 0xFFF) |
         ((@as(u64, 1) & 0xFF) << 12) |
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
 

@@ -2,9 +2,9 @@ const zag = @import("zag");
 
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
-const vm_obj = zag.capdom.virtual_machine;
+const vm_obj = zag.hv.virtual_machine;
 
-const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
+const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PortCaps = zag.sched.port.PortCaps;
 const VmCaps = vm_obj.VmCaps;
@@ -92,7 +92,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     // requested caps word is the 16-bit cap layout from §[virtual_machine].
     // The ceiling gates `policy` (bit 0); `restart_policy` is gated
     // separately by restart_policy_ceiling per §[restart_semantics] and
-    // is enforced inside the capdom layer.
+    // is enforced inside the caps layer.
     const requested: u16 = @truncate(caps);
     const requested_policy = requested & 0x1;
     const ceiling_policy = vm_ceiling & 0x1;

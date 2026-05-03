@@ -320,6 +320,11 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     return false;
 }
 
+/// Intel trace-counter stub. Wire IA32_PERFEVTSELx programming here
+/// when an Intel test rig exists. Currently the host test machine is
+/// AMD, so this is intentionally unimplemented.
+pub fn kprofTraceCountersPerCoreInit() void {}
+
 /// Intel trace-counter read stub. Zeros the output so trace records
 /// built on Intel at least produce well-defined numbers instead of
 /// garbage until the real backend lands.

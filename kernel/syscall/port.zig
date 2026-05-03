@@ -5,7 +5,7 @@ const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const port_obj = zag.sched.port;
 
-const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
+const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const EcCaps = zag.sched.execution_context.EcCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PortCaps = port_obj.PortCaps;

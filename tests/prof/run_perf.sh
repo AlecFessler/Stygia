@@ -11,7 +11,7 @@
 #      rolling dump fires every time a per-CPU log fills, so a few
 #      seconds is enough to get multiple [KPROF] begin…done cycles
 #      into the serial capture.
-#   4. Feed the capture through kernel/kprof/tools/parse_kprof.py --json.
+#   4. Feed the capture through tests/prof/parse_kprof.py --json.
 #   5. Compare the scope medians to the committed baseline under
 #      tests/prof/baselines/<workload>.json.
 #
@@ -34,7 +34,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-PARSE_KPROF="$ZAG_ROOT/kernel/kprof/tools/parse_kprof.py"
+PARSE_KPROF="$SCRIPT_DIR/parse_kprof.py"
 COMPARE="$SCRIPT_DIR/compare_baseline.py"
 BASELINE_DIR="$SCRIPT_DIR/baselines"
 CURRENT_DIR="$SCRIPT_DIR/current"

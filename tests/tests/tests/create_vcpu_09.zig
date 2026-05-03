@@ -12,30 +12,50 @@
 //   that port's recv/reply lifecycle, NOT through the explicit
 //   `suspend` syscall — §[suspend] [test 06] codifies that as
 //   E_INVAL when [1] references a vCPU. After consuming the initial
-//   exit and replying with a resume action, the kernel re-enters
-//   guest mode and on the next exit delivers a fresh vm_exit event
-//   whose layout matches §[vm_exit_state] for the VM's arch.
+//   exit and replying, the kernel re-delivers a fresh vm_exit event
+//   on the exit_port whose layout matches §[vm_exit_state] for the
+//   VM's arch.
+//
+//   Typed-reply routing (§[reply]): reply handles are tagged at recv
+//   time with the originating event_type. For a reply typed
+//   `vm_exit`, the kernel projects the §[vm_exit_state] window from
+//   the receiver's user stack onto the vCPU's GuestState UNLESS the
+//   receiver wrote `initial_state` into the exit sub-code slot
+//   (vreg 70 on x86-64, vreg 117 on aarch64), in which case the
+//   kernel keeps the vCPU not-started and re-delivers an initial
+//   vm_exit on the bound exit_port.
 //
 // Strategy
 //   Drive create_vcpu down its success path with the same defusing
 //   prelude as create_vcpu_08 / create_vcpu_10, then exercise the
-//   three observable predicates of test 09 in sequence:
+//   four observable predicates of test 09 in sequence:
 //     (a) suspend(ec_handle, exit_port) returns E_INVAL.
 //     (b) recv(exit_port) consumes the initial vm_exit and yields a
 //         reply handle id in syscall_word bits 32-43.
-//     (c) reply(reply_handle) resumes the vCPU.
+//     (c) replyVmExit(reply_handle, INITIAL_STATE_SUBCODE) — the
+//         initial_state handshake. Tells the kernel "stay
+//         not-started"; the kernel does not VMLAUNCH and instead
+//         re-enqueues an initial vm_exit on the exit_port.
 //     (d) a second recv(exit_port) returns successfully — i.e. the
 //         kernel delivered another vm_exit on the same port without
 //         turning the recv path into an error.
 //
-//   Per the task brief we deliberately do NOT pin specific guest
-//   register values in the second exit's vreg layout: the vCPU
-//   resumes with zeroed guest state, and the precise sub-code +
-//   register values of the next exit are not load-bearing for the
-//   spec property under test (which is "a vm_exit is delivered with
-//   the §[vm_exit_state] layout"). All we need from observation is
-//   that recv returned without setting an error code in vreg 1, i.e.
-//   the call traversed the success path in §[recv] rather than
+//   Replying with the initial_state sub-code is what makes the
+//   re-delivered vm_exit safe: a plain `reply` would project the
+//   (zeroed) guest-state vregs we did not modify onto the vCPU's
+//   GuestState, mark the vCPU started, and the kernel would VMLAUNCH
+//   with all-zero state on the next entry. The handshake suppresses
+//   the projection + start so the second recv still witnesses a
+//   fresh vm_exit (with sub-code = `initial_state`), satisfying the
+//   spec property "subsequent recv on [4] returns a vm_exit whose
+//   vreg layout matches §[vm_exit_state]".
+//
+//   Per the task brief we deliberately do NOT pin specific vreg
+//   values in the second exit beyond the fact that recv took the
+//   success path: the layout itself is established by the kernel's
+//   recv state-transfer path. All we need from observation is that
+//   recv returned without setting an error code in vreg 1, i.e. the
+//   call traversed the success path in §[recv] rather than
 //   surfacing E_BADCAP / E_PERM / E_CLOSED / E_FULL.
 //
 // Caps required to reach the success paths under test
@@ -88,7 +108,13 @@
 //      §[suspend] [test 06].
 //   8. recv(exit_port) — must succeed (no error word) and yield a
 //      reply handle id.
-//   9. reply(reply_handle) — must succeed.
+//   9. replyVmExit(reply_handle, INITIAL_STATE_SUBCODE) — the
+//      initial_state handshake. Reserves the §[vm_exit_state] stack
+//      window above SP, zeroes it, writes the initial_state sub-code
+//      at vreg 70 (x86-64) / vreg 117 (aarch64), and invokes `reply`.
+//      Per typed-reply routing in §[reply], the kernel keeps the
+//      vCPU not-started and re-enqueues an initial vm_exit on the
+//      exit_port instead of attempting guest entry. Must succeed.
 //  10. recv(exit_port) — must succeed (no error word). This is the
 //      "subsequent recv" of the spec property; success here
 //      witnesses that a vm_exit was delivered on the port with the
@@ -102,7 +128,7 @@
 //   2: suspend on the vCPU EC handle returned something other than
 //      E_INVAL.
 //   3: first recv on the exit_port returned an error word in vreg 1.
-//   4: reply on the recv'd reply handle returned non-OK.
+//   4: replyVmExit on the recv'd reply handle returned non-OK.
 //   5: second recv on the exit_port returned an error word in vreg 1.
 
 const lib = @import("lib");
@@ -245,10 +271,17 @@ pub fn main(cap_table_base: u64) void {
     }
     const reply_handle: HandleId = @truncate((first.word >> 32) & 0xFFF);
 
-    // 9. Reply with no state modifications. Per §[reply] this resumes
-    //    the suspended vCPU; the kernel re-enters guest mode with the
-    //    (zeroed) guest-state vregs we did not modify.
-    const reply_result = syscall.reply(reply_handle);
+    // 9. Reply with the initial_state handshake. Per §[reply]'s
+    //    typed-reply routing, a vm_exit-typed reply normally projects
+    //    the §[vm_exit_state] stack window onto the vCPU's GuestState
+    //    and marks the vCPU started — which here would mean VMLAUNCH
+    //    with all-zero guest state on the next entry. Writing the
+    //    `initial_state` sub-code (vreg 70 on x86-64, vreg 117 on
+    //    aarch64) tells the kernel to keep the vCPU not-started and
+    //    re-deliver another initial vm_exit on the exit_port, so the
+    //    second recv below witnesses a fresh vm_exit with the
+    //    §[vm_exit_state] layout (sub-code = `initial_state`).
+    const reply_result = syscall.replyVmExit(reply_handle, syscall.INITIAL_STATE_SUBCODE);
     if (reply_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;

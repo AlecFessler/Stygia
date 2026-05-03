@@ -58,7 +58,7 @@ const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
 const timer_wheel = zag.sched.timer;
 const timers = zag.arch.aarch64.timers;
-const var_range = zag.capdom.var_range;
+const var_range = zag.memory.var_range;
 
 const VAddr = zag.memory.address.VAddr;
 

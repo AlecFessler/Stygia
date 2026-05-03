@@ -4,14 +4,14 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
-const capdom = zag.capdom.capability_domain;
+const capdom = zag.caps.capability_domain;
 const elf_util = zag.utils.elf;
 const execution_context = zag.sched.execution_context;
 const paging_consts = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const EcCaps = zag.sched.execution_context.EcCaps;
 const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -537,8 +537,17 @@ fn resolveOrSpawnRootEc(
         .ptr = ec,
         .gen = @intCast(ec._gen_lock.currentGen()),
     };
-    _ = try capdom.mintHandle(
+    // Pin the root EC to slot 1 (= caps.SLOT_INITIAL_EC). Child CDs
+    // get their initial EC at slot 1 via the explicit `user_table[1] =
+    // ...` block in create_capability_domain; the root CD's existing
+    // path used `mintHandle` (which pops `free_head` starting at 3),
+    // so the root EC silently landed at slot 3 and the root service's
+    // `priority(SLOT_INITIAL_EC, ...)` syscall returned E_BADCAP. Slots
+    // 0, 1, 2 are reserved (not on the free list), so `mintHandleAt`
+    // can drop a handle there without unlinking.
+    capdom.mintHandleAt(
         root_cd,
+        1,
         obj_ref,
         .execution_context,
         @bitCast(ROOT_EC_CAPS),

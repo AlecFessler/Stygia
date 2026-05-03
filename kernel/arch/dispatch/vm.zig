@@ -8,8 +8,8 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
-const VarPageSize = zag.capdom.var_range.PageSize;
-const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const VarPageSize = zag.memory.var_range.PageSize;
+const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 // Generic-kernel-facing VM dispatch. Arch-internal primitives (guest-page
 // mapping, interrupt injection, world-switch, sysreg passthrough, etc.)
@@ -66,8 +66,8 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
 /// page. Spec §[virtual_machine].create_virtual_machine.
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.allocVmArchState(vm, policy_pf),
-        .aarch64 => aarch64.kvm.vm.allocVmArchState(vm, policy_pf),
+        .x86_64 => x64.hv.vm.allocVmArchState(vm, policy_pf),
+        .aarch64 => aarch64.hv.vm.allocVmArchState(vm, policy_pf),
         else => unreachable,
     };
 }
@@ -83,8 +83,8 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
 /// Spec §[create_virtual_machine] tests 05, 06, 07.
 pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.validateVmPolicy(policy_pf),
-        .aarch64 => aarch64.kvm.vm.validateVmPolicy(policy_pf),
+        .x86_64 => x64.hv.vm.validateVmPolicy(policy_pf),
+        .aarch64 => aarch64.hv.vm.validateVmPolicy(policy_pf),
         else => unreachable,
     };
 }
@@ -93,8 +93,8 @@ pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
 /// already torn down all vCPUs and stage-2 mappings.
 pub fn freeVmArchState(vm: *VirtualMachine) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.freeVmArchState(vm),
-        .aarch64 => aarch64.kvm.vm.freeVmArchState(vm),
+        .x86_64 => x64.hv.vm.freeVmArchState(vm),
+        .aarch64 => aarch64.hv.vm.freeVmArchState(vm),
         else => unreachable,
     }
 }
@@ -105,8 +105,8 @@ pub fn freeVmArchState(vm: *VirtualMachine) void {
 /// type is selected at comptime so the generic `VirtualMachine` struct
 /// holds a per-arch field without naming arch-specific modules.
 pub const VmDevices = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vm.VmDevices,
-    .aarch64 => aarch64.kvm.vm.VmDevices,
+    .x86_64 => x64.hv.vm.VmDevices,
+    .aarch64 => aarch64.hv.vm.VmDevices,
     else => unreachable,
 };
 
@@ -116,8 +116,8 @@ pub const VmDevices = switch (builtin.cpu.arch) {
 /// LAPIC IRR. No-op on aarch64.
 pub fn initVmDevices(devices: *VmDevices) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.initVmDevices(devices),
-        .aarch64 => aarch64.kvm.vm.initVmDevices(devices),
+        .x86_64 => x64.hv.vm.initVmDevices(devices),
+        .aarch64 => aarch64.hv.vm.initVmDevices(devices),
         else => unreachable,
     }
 }
@@ -126,8 +126,8 @@ pub fn initVmDevices(devices: *VmDevices) void {
 /// Stored on the vCPU EC. Spec §[virtual_machine].create_vcpu.
 pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        .x86_64 => x64.hv.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        .aarch64 => aarch64.hv.vcpu.allocVcpuArchState(vm, vcpu_ec),
         else => unreachable,
     };
 }
@@ -136,8 +136,8 @@ pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void
 /// Counterpart to `allocVcpuArchState`; called on EC destruction.
 pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
-        .aarch64 => aarch64.kvm.vcpu.freeVcpuArchState(vcpu_ec),
+        .x86_64 => x64.hv.vcpu.freeVcpuArchState(vcpu_ec),
+        .aarch64 => aarch64.hv.vcpu.freeVcpuArchState(vcpu_ec),
         else => unreachable,
     }
 }
@@ -177,8 +177,8 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
 /// is stored in `VirtualMachine.guest_pt_root`.
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.allocStage2Root(vm),
-        .aarch64 => aarch64.kvm.vm.allocStage2Root(vm),
+        .x86_64 => x64.hv.vm.allocStage2Root(vm),
+        .aarch64 => aarch64.hv.vm.allocStage2Root(vm),
         else => unreachable,
     };
 }
@@ -186,8 +186,8 @@ pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
 /// Free the stage-2 root and any intermediate tables.
 pub fn freeStage2Root(vm: *VirtualMachine) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.freeStage2Root(vm),
-        .aarch64 => aarch64.kvm.vm.freeStage2Root(vm),
+        .x86_64 => x64.hv.vm.freeStage2Root(vm),
+        .aarch64 => aarch64.hv.vm.freeStage2Root(vm),
         else => unreachable,
     }
 }
@@ -202,8 +202,8 @@ pub fn stage2MapPage(
     perms: MemoryPerms,
 ) !void {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
-        .aarch64 => aarch64.kvm.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
+        .x86_64 => x64.hv.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
+        .aarch64 => aarch64.hv.vm.stage2MapPage(vm, guest_phys, host_phys, sz, perms),
         else => unreachable,
     };
 }
@@ -212,8 +212,8 @@ pub fn stage2MapPage(
 /// Spec §[virtual_machine].unmap_guest.
 pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VarPageSize) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
-        .aarch64 => aarch64.kvm.vm.stage2UnmapPage(vm, guest_phys, sz),
+        .x86_64 => x64.hv.vm.stage2UnmapPage(vm, guest_phys, sz),
+        .aarch64 => aarch64.hv.vm.stage2UnmapPage(vm, guest_phys, sz),
         else => unreachable,
     }
 }
@@ -227,8 +227,8 @@ pub fn invalidateStage2Range(
     page_count: u32,
 ) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
-        .aarch64 => aarch64.kvm.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
+        .x86_64 => x64.hv.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
+        .aarch64 => aarch64.hv.vm.invalidateStage2Range(vm, guest_phys, sz, page_count),
         else => unreachable,
     }
 }
@@ -241,8 +241,8 @@ pub fn invalidateStage2Range(
 /// or a negative error code.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
-        .aarch64 => aarch64.kvm.vm.applyVmPolicyTable(vm, kind, count, entries),
+        .x86_64 => x64.hv.vm.applyVmPolicyTable(vm, kind, count, entries),
+        .aarch64 => aarch64.hv.vm.applyVmPolicyTable(vm, kind, count, entries),
         else => unreachable,
     };
 }
@@ -253,8 +253,8 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
 /// controller. Spec §[virtual_machine].vm_inject_irq tests 02/04/05.
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
-        .aarch64 => aarch64.kvm.vm.vmInjectIrq(vm, irq_num, assert),
+        .x86_64 => x64.hv.vm.vmInjectIrq(vm, irq_num, assert),
+        .aarch64 => aarch64.hv.vm.vmInjectIrq(vm, irq_num, assert),
         else => unreachable,
     };
 }
@@ -302,7 +302,7 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
 pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            if (x64.kvm.vcpu.archStateOf(ec)) |arch_state| {
+            if (x64.hv.vcpu.archStateOf(ec)) |arch_state| {
                 arch_state.last_exit_payload = payload;
             }
         },

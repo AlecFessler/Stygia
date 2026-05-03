@@ -13,7 +13,7 @@
 #     We model the full struct so reads at fixed offsets are correct even when
 #     today's code only consumes a subset. Deleting fields would corrupt the
 #     binary layout.
-#   * arch/aarch64/kvm/regs.zig                        — EL2 sysreg bit-field
+#   * arch/aarch64/hv/regs.zig                        — EL2 sysreg bit-field
 #     reference set (HCR_EL2 / VTCR_EL2 / VTTBR_EL2 / ESR_EL2 / CPTR_EL2 /
 #     HPFAR_EL2 etc.). Kept whole so future EL2 bring-up grabs bits without
 #     re-deriving from the ARM ARM.
@@ -33,7 +33,7 @@
 #     (PageEntry). Hardware layout fidelity; flags like dirty/contiguous etc.
 #     are read by the MMU even if the kernel never asserts them today.
 #   * arch/aarch64/exceptions.zig (ExceptionClass),
-#     arch/aarch64/kvm/regs.zig (EC),
+#     arch/aarch64/hv/regs.zig (EC),
 #     arch/aarch64/gic.zig                             — ARM ESR_EL1 / ESR_EL2
 #     ExceptionClass / GICD register enum value spaces.
 #   * arch/aarch64/interrupts.zig, arch/aarch64/pmu.zig — register-block /
@@ -47,7 +47,7 @@
 #     struct (id_reg_responses / sysreg_policies). Layout-defined ABI with
 #     comptime size assertion; consumed by the EL2 trap handler when bring-up
 #     resumes.
-#   * arch/aarch64/kvm/{vcpu,vm}.zig (_placeholder)    — page-sized control
+#   * arch/aarch64/hv/{vcpu,vm}.zig (_placeholder)    — page-sized control
 #     state cells reserved for future EL2 vCPU / VM state.
 #   * arch/x64/vm.zig                                  — VM policy padding
 #     fields + sysregPassthrough helper reserved for VMX policy bring-up.
@@ -59,8 +59,6 @@
 #     padding for AArch64-EL2 placeholder slot.
 #   * memory/address.zig (UserVA, null_guard)          — VA-space landmark
 #     constants kept for the systems.md reference.
-#   * memory/device_region.zig                         — DeviceRegion union
-#     payload + DeviceClass spec values. Hardware-class taxonomy kept whole.
 #   * sched/execution_context.zig (Priority.high)      — third tier of the
 #     fixed-size priority enum; kept so .high is reachable when bring-up
 #     wires it.
@@ -69,10 +67,10 @@
 #     it once that bring-up lands.
 #   * syscall/errors.zig (E_AGAIN)                     — POSIX-shape error
 #     code reserved for future blocking syscalls.
-#   * utils/containers/priority_queue.zig (enqueueFront) — generic re-queue
+#   * sched/priority_queue.zig (enqueueFront) — generic re-queue
 #     helper documented for IPC cap-transfer rollback (kept until that
 #     rollback path lands).
-#   * capdom/var_range.zig (CacheType.* / RestartPolicy.decommit) — VarRange
+#   * memory/var_range.zig (CacheType.* / RestartPolicy.decommit) — VarRange
 #     attribute / restart-policy enums; spec-mandated value space.
 #   * devices/device_region.zig (_pad0)                — explicit pad slot
 #     in the DeviceRegion ABI struct.
@@ -126,119 +124,119 @@ arch/aarch64/exceptions.zig:86-86    sha256:38a8c4a782ab95a230659d945f14cc0af263
 arch/aarch64/exceptions.zig:88-88    sha256:3d0d714c72873450f8491720de4ee87265c0c93f98d75299ee35b10b840faa54
 arch/aarch64/gic.zig:65-65    sha256:5ed157761ee63f3bf9c9759895586d045dcb63dee4827200d59c75cc32013c4d
 arch/aarch64/interrupts.zig:77-77    sha256:83e3618c2c346385baea120f7719d6929fad6350031b5293501d6a11fdc4c4c4
-arch/aarch64/kvm/regs.zig:23-23    sha256:b8ba77df3ad29b93f3c8f0f62af3a7e5d75dcae4589b5df90fc9fbc124fbd90b
-arch/aarch64/kvm/regs.zig:29-29    sha256:c0310201619d1e38642d26e0b1b8015b4e51b04fa327025c5979428fa7346a42
-arch/aarch64/kvm/regs.zig:35-35    sha256:07f6c1340cb330d8ae0d55f38dc5bec719b2b831774a6760b5702062a3e99404
-arch/aarch64/kvm/regs.zig:39-39    sha256:cb53af460a81fd602a0a85a3610f4a56866059a0fae3fb065b37d993ee36bed6
-arch/aarch64/kvm/regs.zig:43-43    sha256:a0342d55fd068a33375aebffba8551f8cc7dce4d27ff634e788bd4aa20bbcff5
-arch/aarch64/kvm/regs.zig:47-47    sha256:1f2ce95fb92a013cc927a562c6f7d1ac73636c38410e60853f1855b773eb4c67
-arch/aarch64/kvm/regs.zig:51-51    sha256:229fd2007ac180994050fa7a035bd9e97e9eca2401a26f4639e72f9ae3c1e3f2
-arch/aarch64/kvm/regs.zig:54-54    sha256:f110b8df0d0668e765872319c9382c2c4c1fbbafe91c39f7fcb0e59df28231ce
-arch/aarch64/kvm/regs.zig:57-57    sha256:85ea4fc8531f397c093ff0f9ee653a313848fdc2fbd965a298ef227558b6c042
-arch/aarch64/kvm/regs.zig:62-62    sha256:92a951e6fc07193d80b0ab8b9042ff82c53c6a8c97db2869c27d66b439e9aa98
-arch/aarch64/kvm/regs.zig:67-67    sha256:6b49ae042505959edcbdd5706170d232bc7c03d9900d0ee4c3cbc0a7357ff099
-arch/aarch64/kvm/regs.zig:71-71    sha256:b0e2ccb1d9f901a33c01e20a8d8a8b0b4f478a4a72c06da99ddeec27f2a03fd4
-arch/aarch64/kvm/regs.zig:75-75    sha256:c2b8a3f01f037e53245fcbc202f84f72334faf91e4adf8e2bf07379bcb013ab3
-arch/aarch64/kvm/regs.zig:78-78    sha256:180a1cd51d676e0cb52ee8d88f04c4d3d8de1edee6a67bb097f6bef9767acadc
-arch/aarch64/kvm/regs.zig:81-81    sha256:0852913efdb90083cbed14a161af03bc4265d92c4cdc3d4e65eca444a8313d65
-arch/aarch64/kvm/regs.zig:84-84    sha256:7648090eb27d6c3bee462782c563d717d90e39490ced97e359728611069af607
-arch/aarch64/kvm/regs.zig:87-87    sha256:e1b2ee6579fdb40e06465e6f6b1898420428a553af1e0237dc3e5f0b2e0035b9
-arch/aarch64/kvm/regs.zig:91-91    sha256:dee2dd9fe66d1df7f6600246c31a8b5d44042a29471b111e14280f9b467015e5
-arch/aarch64/kvm/regs.zig:94-94    sha256:1098a476a923e27720da435d1fbf0fc0f61cc2b9be98610803a99d656dffb3dd
-arch/aarch64/kvm/regs.zig:97-97    sha256:36019b655764a853893504ae3de6777ece8e1ca7f83ab5e657c41571d7db9567
-arch/aarch64/kvm/regs.zig:100-100    sha256:54c702d3464d67f1535bfacd3c3d22e21397aff024a4fd60b8c65cdc788e5f36
-arch/aarch64/kvm/regs.zig:103-103    sha256:f112daf0155879d50e6d2462347152ac3a9fa94ec94f90f6068cc932ac9ad5d0
-arch/aarch64/kvm/regs.zig:106-106    sha256:fea2d9037dac286f9be89686c85da6d47544fee9e35ff49fbbead4bf3f232a29
-arch/aarch64/kvm/regs.zig:109-109    sha256:308d3b124d9a31f4e63c2bccf1bb1851e73242c8c51ddd74bc363d06e537bf02
-arch/aarch64/kvm/regs.zig:116-116    sha256:cbcbd0ab5a1adc9174f868f1d87c60f966a877182140cafba3cf278831023a91
-arch/aarch64/kvm/regs.zig:120-120    sha256:b8f1ef292917cd2d354d4d101f81a38f03e7aa27fb7ada4f5cd4f9eb33dce6c5
-arch/aarch64/kvm/regs.zig:123-123    sha256:7d1ea598343efd04f2b398aa376166f0c1239928d9e98a3692360cae7810fe34
-arch/aarch64/kvm/regs.zig:126-126    sha256:69b6e1254805f977c123a0a66e9542cca5380bcfccac7b6dbb460c3c31e7b6b4
-arch/aarch64/kvm/regs.zig:129-129    sha256:60fb39e8dfbaac0eee5a288e462a1350d32e147c9903e5118caa4ad0e3dab1e1
-arch/aarch64/kvm/regs.zig:133-133    sha256:ec15839b74ad059e27745ed91bf172bcb1ec5f1bea8adeaa661f55b5e3aab404
-arch/aarch64/kvm/regs.zig:138-138    sha256:71fbfeed5e1fc065aea5d6ab79f3cfedb8132943903ebeacc851166f3dd04a7c
-arch/aarch64/kvm/regs.zig:141-141    sha256:0126537e52abd4df1df27d9730dbd52c1d2f14af35cf7cfd4f836bde461e0e8b
-arch/aarch64/kvm/regs.zig:145-145    sha256:a186a01c9c2dbea9b6d8b6612cd96b6077bb70b19c336b2899629f23937d3b5a
-arch/aarch64/kvm/regs.zig:150-150    sha256:ae8cb110a18eae828771e3ff50e15d1c2dba8057efbc296ee25af5fe3d01c721
-arch/aarch64/kvm/regs.zig:159-159    sha256:471314aa9db42f864d84ee1da355e50e52e4726f01dc372d8c4ce3f651375d12
-arch/aarch64/kvm/regs.zig:160-160    sha256:812c59638a9d70e368a3b6e62cb406294f7b619bb294f46189b7a37a12f37eac
-arch/aarch64/kvm/regs.zig:168-168    sha256:917fd37bffedd03055ee29f60b9d3ce4f1153414df5c846475be3582d2612f90
-arch/aarch64/kvm/regs.zig:169-169    sha256:19c32b5c98f98fb6553209c1bd9d1defd0c46f51deaa4555fccbf01f9d3de07c
-arch/aarch64/kvm/regs.zig:170-170    sha256:79f02ae4e123d77f7e8004413f76929bdd1bfee6489d3cdb400d9701df51b2f1
-arch/aarch64/kvm/regs.zig:174-174    sha256:9ea6e59f87e41233ff1312c3caad7c719c771eeeb0251b8dd47cc66f6cc85724
-arch/aarch64/kvm/regs.zig:175-175    sha256:ae25e500f20993824ef5c2083ef2159e372627aec831540a6e02ebde7518ac58
-arch/aarch64/kvm/regs.zig:178-178    sha256:8d19f85450391c25b85cd54253e3a214b6ce52d21943a489a96bfda432e8a59f
-arch/aarch64/kvm/regs.zig:179-179    sha256:b0f3d0897bf692662ec5ac2c5f7fa5e9a5d2fa84b34bcfa107a8e42383da81f4
-arch/aarch64/kvm/regs.zig:182-182    sha256:66de51fe59d1fbccf3f236dacf7c0398ea1650832438ec18c428754f82dace8e
-arch/aarch64/kvm/regs.zig:183-183    sha256:ece5717bbcf3b0ffbd5e410ebc044a72acadafe45b77a381043cdcf316d2e0b8
-arch/aarch64/kvm/regs.zig:189-189    sha256:5945c1dd1aff351f9918eadb8708e7d7710a238cb565eccdf42ff6db9ed28ece
-arch/aarch64/kvm/regs.zig:199-199    sha256:65ed9e9e47f57d526847e6e47bace5b34030963198a988ea8f500cb3d8dbb97c
-arch/aarch64/kvm/regs.zig:200-200    sha256:1fe5a8bbbf45c3cc899df60611b06760ab39a3c8f4fb979f5c274df4c4a21b4c
-arch/aarch64/kvm/regs.zig:203-203    sha256:bf5824678c352d9af7a904795ff5d588e296101c591c8043f000ff2359741f31
-arch/aarch64/kvm/regs.zig:206-206    sha256:ed37e2e615fe8950c9887ad87b4bb5a625900c1e0d7eeb8f6a3b38a2827d95fa
-arch/aarch64/kvm/regs.zig:209-209    sha256:9c23c20f78ae52b81f46e82956fb7df053095a38bdab5fa89d350ad5a2820456
-arch/aarch64/kvm/regs.zig:212-212    sha256:22591ad1f1b447fead9ac57f915a8c25356f625603f2bb2e5c134d8883c11b13
-arch/aarch64/kvm/regs.zig:222-222    sha256:a35ded1d86810873d9c137f749a89b4ec596f720a56bd9a4307947fa054ca125
-arch/aarch64/kvm/regs.zig:225-225    sha256:aff52260eff5a082fee106509798f8d0f784f64440564efed76a35603451c9da
-arch/aarch64/kvm/regs.zig:239-239    sha256:8ea76398f0633fc52b4e0c97cc4832b1b95ebb3a2613f817496df94400983c7a
-arch/aarch64/kvm/regs.zig:240-240    sha256:ac5e34b5772677781944b940283e27906a9df2ce336e6c61eaecaa25165d08ad
-arch/aarch64/kvm/regs.zig:242-242    sha256:e067a4729140512ba19c5578f8372d182d02f35c730d7f5d3ec4472203edc644
-arch/aarch64/kvm/regs.zig:244-244    sha256:bb4872316ae7d4a63b18a270868b7b4bba24c11e3b3e1c0e4f23008c57ddd731
-arch/aarch64/kvm/regs.zig:249-249    sha256:35d784f0ca397b9f12317b53e5778574611e869fa69d5ce804de1962035e86c2
-arch/aarch64/kvm/regs.zig:253-253    sha256:6e3f2d27a61780f633433f2b8af96f0fb436e7996abfba5eaf3b9e1989d66508
-arch/aarch64/kvm/regs.zig:255-255    sha256:f480fc8038d95984324912872829e616d0c03220b8614e861b963836c3aa9eb2
-arch/aarch64/kvm/regs.zig:257-257    sha256:c00b56ab5b82f3d295228de90963bb058cfcd56cbdb37539b5839726330ae916
-arch/aarch64/kvm/regs.zig:259-259    sha256:1cae2041bde2b87f116bd69dd4f994ba3e7a2834584edce87fb44398ae8f21ee
-arch/aarch64/kvm/regs.zig:261-261    sha256:9c9ad72c769bb020fb7a4b33cf6bb2c2d9e091edcfb18a775b9c4d08311f2302
-arch/aarch64/kvm/regs.zig:263-263    sha256:2650992097d23297ad00a4210232d7a68a2a336c44d61958febc03ebadb98d74
-arch/aarch64/kvm/regs.zig:265-265    sha256:7fa843024267245774ba0b883ce5b7333c8ad2bd54f214b1fcb91b3d5993e8a1
-arch/aarch64/kvm/regs.zig:267-267    sha256:1d8dc392a0a788a212d2c5341c05d40ca0552f1ca3e4161df9b08d4b7c3fb6af
-arch/aarch64/kvm/regs.zig:269-269    sha256:7c47c9d650b866cb532eb806ff7024fec1d437b0a0b691940c6445371ebcaf72
-arch/aarch64/kvm/regs.zig:271-271    sha256:32270136fd2afb58965a6a66ed82b021cad7e3bac1c94faa10b03a4d8b02a762
-arch/aarch64/kvm/regs.zig:274-274    sha256:7821e6535c9681cd2581a5fa99f36ed6ac6390c2a92233fdebd296f1f5a065df
-arch/aarch64/kvm/regs.zig:276-276    sha256:7330bcc97fa8bec74ba2740989f201c86b35707d71a8eeb7597cba29e3be7776
-arch/aarch64/kvm/regs.zig:279-279    sha256:f2ad3c499086fd54730a4840ec93c7f94f121487c789a6308ec66aae2a13f0a7
-arch/aarch64/kvm/regs.zig:281-281    sha256:b51bce471a33557d3cf8f2b3d436598686c27a8f8da9a63cce9fcf51313a065d
-arch/aarch64/kvm/regs.zig:283-283    sha256:be0b538275abfe0799f5345a7e9d7ffbb8bfaf125ca87dc32bc2325d1d60d0b8
-arch/aarch64/kvm/regs.zig:286-286    sha256:49aef35abc2be5d89e6d5014a9d4eae88ddf5996ced156b461088879005925a6
-arch/aarch64/kvm/regs.zig:288-288    sha256:b8c1bb4db2aacee2620147435d247f9c3ff3e4ede3f35f925f3f2afb6cca36f5
-arch/aarch64/kvm/regs.zig:290-290    sha256:360ea89ecab3170a043d73106c69966c953eb84c72528ae83754994023cef1ce
-arch/aarch64/kvm/regs.zig:292-292    sha256:3e23420cb01f8721c00f1d6e75187fcc673904530844f92ece8bcdef327ca9cf
-arch/aarch64/kvm/regs.zig:294-294    sha256:e14c69bebb44b2ea533eb0e9516a4349b87133cfe58a000a86a5295ad31ea2fc
-arch/aarch64/kvm/regs.zig:296-296    sha256:bbc6600c41244298462d16b6675439ee0e370fc2ea3900167b766898478447da
-arch/aarch64/kvm/regs.zig:298-298    sha256:d49d76d50e4240426b9b484eb5fd30af211fab694935e5fe1ac2b24a8c66ed6b
-arch/aarch64/kvm/regs.zig:300-300    sha256:dc7e45ad9a8a2abf32056eb6def529e7311269cb9f0529dc92f1f6134a231d7f
-arch/aarch64/kvm/regs.zig:302-302    sha256:d5f303f2ad7eac92f30e9299e1bb178843db236ce24ba2e5e1861cf173fa1d22
-arch/aarch64/kvm/regs.zig:311-311    sha256:7cc3627e920469b368239fedcdbc506a03b7104c321633cf5dc388c0fd32eb63
-arch/aarch64/kvm/regs.zig:313-313    sha256:df65f3e73858c5ccd9f0df707c1fee7a8bdbcb2bf6df4cabb40420036afd6d37
-arch/aarch64/kvm/regs.zig:314-314    sha256:f30decb4f2a4392c9bd2697656a8427136f0dedef7eeeabcaccc91548adc3d95
-arch/aarch64/kvm/regs.zig:316-316    sha256:cb2e0a7ed78e15b029a37f491a77c1b4676228d1aa6abc9dfb95371fbaa5dcaa
-arch/aarch64/kvm/regs.zig:318-318    sha256:cd44b57f226102f2455e7b0895085219c930548f7268d742966ee65a9908187d
-arch/aarch64/kvm/regs.zig:319-319    sha256:1bb75255ccc224164927ca11dfb21d964d83f2bdb8b0b855455004480cbefb55
-arch/aarch64/kvm/regs.zig:321-321    sha256:6477eaf6a8136f0ee5cc3bb47d72aa6b3f44e92c78b471ea192e5039bc4581a4
-arch/aarch64/kvm/regs.zig:323-323    sha256:29a8fc84da9ced0f47cedc30678b91afb9d4585c88c84e4cd9d22e92ba2a7549
-arch/aarch64/kvm/regs.zig:325-325    sha256:247a1477a036392d00ffc0e0a8890ab96daa66470b54c77a9233161e14df55ff
-arch/aarch64/kvm/regs.zig:328-328    sha256:60b4a1123e1dce969030d9e20f7cc33928773f56ae45cbca2504851168d1c567
-arch/aarch64/kvm/regs.zig:335-335    sha256:2c02358a7825114b3878710c5075d6054b76ec6f0e20b49221cfa65bbf19dcda
-arch/aarch64/kvm/regs.zig:336-336    sha256:5ff1aee6b012a1b0efadfb4f32af84da528b396eecfec645d0a4e014f1025603
-arch/aarch64/kvm/regs.zig:338-338    sha256:9bcc3532b0b341906ded06c0ebb1b7ea41f7b185d6d38629806f8f4e76a34ffb
-arch/aarch64/kvm/regs.zig:339-339    sha256:f5deaee99630f29cf47dcd63cb97982ef3ebbdb86c94abc3630f7dcab51c558d
-arch/aarch64/kvm/regs.zig:341-341    sha256:c80225ee7b2023b62220b8a93b61cc061a5ee12f4faca1f085a0014eb10ba79e
-arch/aarch64/kvm/regs.zig:342-342    sha256:a2fcf0b1b8b800066130c6ac0cb6533e5e3188e4cde5f917252131d156b19148
-arch/aarch64/kvm/regs.zig:344-344    sha256:b1ab63dbb119d5b41d6dcb753fa6dd0613c70e2644c1f61c441147de03310961
-arch/aarch64/kvm/regs.zig:345-345    sha256:75375f2203d521b8fd2eccbd74dfb045d6b0234f53fccb280f38da0b7e62ac42
-arch/aarch64/kvm/regs.zig:347-347    sha256:a5be8a0c00b96544092dceb14918f66cfbda579d7d84164fea84f89bf27e3f85
-arch/aarch64/kvm/regs.zig:348-348    sha256:e22e47cbd0b2f7e6faee36652ef1ab3aba415c78c82b615bde5fb2aba31f7674
-arch/aarch64/kvm/regs.zig:350-350    sha256:fa3f87a3aa2a15c67aa823ad2f2db839c38ae1ac8e2d9db043ba1d76df345366
-arch/aarch64/kvm/regs.zig:351-351    sha256:35cabd924e5cf4c2f6f4f5cd7b7910a00262fd99a5040f2aff452043e88cfa32
-arch/aarch64/kvm/regs.zig:353-353    sha256:57b5e92951d05e79a6bd68fa8c62c4d80e71a6ec8f408c1ea1fdb15d4758716f
-arch/aarch64/kvm/regs.zig:367-367    sha256:9823334673aaf889f725b38498339fcd39c50eaa207fb9f0a30c1a5eeb21fceb
-arch/aarch64/kvm/regs.zig:368-368    sha256:2d0280fe2964a475d0498e799cd975bff067a46ff33ca333f91a9278069a02e1
-arch/aarch64/kvm/regs.zig:376-376    sha256:720fca160c47c4d943e5d355340ff24b03b92e489d8266b211fa9e6ae454e757
-arch/aarch64/kvm/regs.zig:379-379    sha256:520b53455740f7bf462f95fe2f616e420d530739de649167ec4a18649077e0bf
-arch/aarch64/kvm/regs.zig:383-383    sha256:c1ed923a6c348452995cd36e3b4658150a37a168a2c5a0010a1a897ed17be3d9
-arch/aarch64/kvm/vcpu.zig:21-21    sha256:b1fb3b3570255117d186dc88e996f6134458146a4c736c6d37d1220f51133999
-arch/aarch64/kvm/vm.zig:68-68    sha256:b1fb3b3570255117d186dc88e996f6134458146a4c736c6d37d1220f51133999
+arch/aarch64/hv/regs.zig:23-23    sha256:b8ba77df3ad29b93f3c8f0f62af3a7e5d75dcae4589b5df90fc9fbc124fbd90b
+arch/aarch64/hv/regs.zig:29-29    sha256:c0310201619d1e38642d26e0b1b8015b4e51b04fa327025c5979428fa7346a42
+arch/aarch64/hv/regs.zig:35-35    sha256:07f6c1340cb330d8ae0d55f38dc5bec719b2b831774a6760b5702062a3e99404
+arch/aarch64/hv/regs.zig:39-39    sha256:cb53af460a81fd602a0a85a3610f4a56866059a0fae3fb065b37d993ee36bed6
+arch/aarch64/hv/regs.zig:43-43    sha256:a0342d55fd068a33375aebffba8551f8cc7dce4d27ff634e788bd4aa20bbcff5
+arch/aarch64/hv/regs.zig:47-47    sha256:1f2ce95fb92a013cc927a562c6f7d1ac73636c38410e60853f1855b773eb4c67
+arch/aarch64/hv/regs.zig:51-51    sha256:229fd2007ac180994050fa7a035bd9e97e9eca2401a26f4639e72f9ae3c1e3f2
+arch/aarch64/hv/regs.zig:54-54    sha256:f110b8df0d0668e765872319c9382c2c4c1fbbafe91c39f7fcb0e59df28231ce
+arch/aarch64/hv/regs.zig:57-57    sha256:85ea4fc8531f397c093ff0f9ee653a313848fdc2fbd965a298ef227558b6c042
+arch/aarch64/hv/regs.zig:62-62    sha256:92a951e6fc07193d80b0ab8b9042ff82c53c6a8c97db2869c27d66b439e9aa98
+arch/aarch64/hv/regs.zig:67-67    sha256:6b49ae042505959edcbdd5706170d232bc7c03d9900d0ee4c3cbc0a7357ff099
+arch/aarch64/hv/regs.zig:71-71    sha256:b0e2ccb1d9f901a33c01e20a8d8a8b0b4f478a4a72c06da99ddeec27f2a03fd4
+arch/aarch64/hv/regs.zig:75-75    sha256:c2b8a3f01f037e53245fcbc202f84f72334faf91e4adf8e2bf07379bcb013ab3
+arch/aarch64/hv/regs.zig:78-78    sha256:180a1cd51d676e0cb52ee8d88f04c4d3d8de1edee6a67bb097f6bef9767acadc
+arch/aarch64/hv/regs.zig:81-81    sha256:0852913efdb90083cbed14a161af03bc4265d92c4cdc3d4e65eca444a8313d65
+arch/aarch64/hv/regs.zig:84-84    sha256:7648090eb27d6c3bee462782c563d717d90e39490ced97e359728611069af607
+arch/aarch64/hv/regs.zig:87-87    sha256:e1b2ee6579fdb40e06465e6f6b1898420428a553af1e0237dc3e5f0b2e0035b9
+arch/aarch64/hv/regs.zig:91-91    sha256:dee2dd9fe66d1df7f6600246c31a8b5d44042a29471b111e14280f9b467015e5
+arch/aarch64/hv/regs.zig:94-94    sha256:1098a476a923e27720da435d1fbf0fc0f61cc2b9be98610803a99d656dffb3dd
+arch/aarch64/hv/regs.zig:97-97    sha256:36019b655764a853893504ae3de6777ece8e1ca7f83ab5e657c41571d7db9567
+arch/aarch64/hv/regs.zig:100-100    sha256:54c702d3464d67f1535bfacd3c3d22e21397aff024a4fd60b8c65cdc788e5f36
+arch/aarch64/hv/regs.zig:103-103    sha256:f112daf0155879d50e6d2462347152ac3a9fa94ec94f90f6068cc932ac9ad5d0
+arch/aarch64/hv/regs.zig:106-106    sha256:fea2d9037dac286f9be89686c85da6d47544fee9e35ff49fbbead4bf3f232a29
+arch/aarch64/hv/regs.zig:109-109    sha256:308d3b124d9a31f4e63c2bccf1bb1851e73242c8c51ddd74bc363d06e537bf02
+arch/aarch64/hv/regs.zig:116-116    sha256:cbcbd0ab5a1adc9174f868f1d87c60f966a877182140cafba3cf278831023a91
+arch/aarch64/hv/regs.zig:120-120    sha256:b8f1ef292917cd2d354d4d101f81a38f03e7aa27fb7ada4f5cd4f9eb33dce6c5
+arch/aarch64/hv/regs.zig:123-123    sha256:7d1ea598343efd04f2b398aa376166f0c1239928d9e98a3692360cae7810fe34
+arch/aarch64/hv/regs.zig:126-126    sha256:69b6e1254805f977c123a0a66e9542cca5380bcfccac7b6dbb460c3c31e7b6b4
+arch/aarch64/hv/regs.zig:129-129    sha256:60fb39e8dfbaac0eee5a288e462a1350d32e147c9903e5118caa4ad0e3dab1e1
+arch/aarch64/hv/regs.zig:133-133    sha256:ec15839b74ad059e27745ed91bf172bcb1ec5f1bea8adeaa661f55b5e3aab404
+arch/aarch64/hv/regs.zig:138-138    sha256:71fbfeed5e1fc065aea5d6ab79f3cfedb8132943903ebeacc851166f3dd04a7c
+arch/aarch64/hv/regs.zig:141-141    sha256:0126537e52abd4df1df27d9730dbd52c1d2f14af35cf7cfd4f836bde461e0e8b
+arch/aarch64/hv/regs.zig:145-145    sha256:a186a01c9c2dbea9b6d8b6612cd96b6077bb70b19c336b2899629f23937d3b5a
+arch/aarch64/hv/regs.zig:150-150    sha256:ae8cb110a18eae828771e3ff50e15d1c2dba8057efbc296ee25af5fe3d01c721
+arch/aarch64/hv/regs.zig:159-159    sha256:471314aa9db42f864d84ee1da355e50e52e4726f01dc372d8c4ce3f651375d12
+arch/aarch64/hv/regs.zig:160-160    sha256:812c59638a9d70e368a3b6e62cb406294f7b619bb294f46189b7a37a12f37eac
+arch/aarch64/hv/regs.zig:168-168    sha256:917fd37bffedd03055ee29f60b9d3ce4f1153414df5c846475be3582d2612f90
+arch/aarch64/hv/regs.zig:169-169    sha256:19c32b5c98f98fb6553209c1bd9d1defd0c46f51deaa4555fccbf01f9d3de07c
+arch/aarch64/hv/regs.zig:170-170    sha256:79f02ae4e123d77f7e8004413f76929bdd1bfee6489d3cdb400d9701df51b2f1
+arch/aarch64/hv/regs.zig:174-174    sha256:9ea6e59f87e41233ff1312c3caad7c719c771eeeb0251b8dd47cc66f6cc85724
+arch/aarch64/hv/regs.zig:175-175    sha256:ae25e500f20993824ef5c2083ef2159e372627aec831540a6e02ebde7518ac58
+arch/aarch64/hv/regs.zig:178-178    sha256:8d19f85450391c25b85cd54253e3a214b6ce52d21943a489a96bfda432e8a59f
+arch/aarch64/hv/regs.zig:179-179    sha256:b0f3d0897bf692662ec5ac2c5f7fa5e9a5d2fa84b34bcfa107a8e42383da81f4
+arch/aarch64/hv/regs.zig:182-182    sha256:66de51fe59d1fbccf3f236dacf7c0398ea1650832438ec18c428754f82dace8e
+arch/aarch64/hv/regs.zig:183-183    sha256:ece5717bbcf3b0ffbd5e410ebc044a72acadafe45b77a381043cdcf316d2e0b8
+arch/aarch64/hv/regs.zig:189-189    sha256:5945c1dd1aff351f9918eadb8708e7d7710a238cb565eccdf42ff6db9ed28ece
+arch/aarch64/hv/regs.zig:199-199    sha256:65ed9e9e47f57d526847e6e47bace5b34030963198a988ea8f500cb3d8dbb97c
+arch/aarch64/hv/regs.zig:200-200    sha256:1fe5a8bbbf45c3cc899df60611b06760ab39a3c8f4fb979f5c274df4c4a21b4c
+arch/aarch64/hv/regs.zig:203-203    sha256:bf5824678c352d9af7a904795ff5d588e296101c591c8043f000ff2359741f31
+arch/aarch64/hv/regs.zig:206-206    sha256:ed37e2e615fe8950c9887ad87b4bb5a625900c1e0d7eeb8f6a3b38a2827d95fa
+arch/aarch64/hv/regs.zig:209-209    sha256:9c23c20f78ae52b81f46e82956fb7df053095a38bdab5fa89d350ad5a2820456
+arch/aarch64/hv/regs.zig:212-212    sha256:22591ad1f1b447fead9ac57f915a8c25356f625603f2bb2e5c134d8883c11b13
+arch/aarch64/hv/regs.zig:222-222    sha256:a35ded1d86810873d9c137f749a89b4ec596f720a56bd9a4307947fa054ca125
+arch/aarch64/hv/regs.zig:225-225    sha256:aff52260eff5a082fee106509798f8d0f784f64440564efed76a35603451c9da
+arch/aarch64/hv/regs.zig:239-239    sha256:8ea76398f0633fc52b4e0c97cc4832b1b95ebb3a2613f817496df94400983c7a
+arch/aarch64/hv/regs.zig:240-240    sha256:ac5e34b5772677781944b940283e27906a9df2ce336e6c61eaecaa25165d08ad
+arch/aarch64/hv/regs.zig:242-242    sha256:e067a4729140512ba19c5578f8372d182d02f35c730d7f5d3ec4472203edc644
+arch/aarch64/hv/regs.zig:244-244    sha256:bb4872316ae7d4a63b18a270868b7b4bba24c11e3b3e1c0e4f23008c57ddd731
+arch/aarch64/hv/regs.zig:249-249    sha256:35d784f0ca397b9f12317b53e5778574611e869fa69d5ce804de1962035e86c2
+arch/aarch64/hv/regs.zig:253-253    sha256:6e3f2d27a61780f633433f2b8af96f0fb436e7996abfba5eaf3b9e1989d66508
+arch/aarch64/hv/regs.zig:255-255    sha256:f480fc8038d95984324912872829e616d0c03220b8614e861b963836c3aa9eb2
+arch/aarch64/hv/regs.zig:257-257    sha256:c00b56ab5b82f3d295228de90963bb058cfcd56cbdb37539b5839726330ae916
+arch/aarch64/hv/regs.zig:259-259    sha256:1cae2041bde2b87f116bd69dd4f994ba3e7a2834584edce87fb44398ae8f21ee
+arch/aarch64/hv/regs.zig:261-261    sha256:9c9ad72c769bb020fb7a4b33cf6bb2c2d9e091edcfb18a775b9c4d08311f2302
+arch/aarch64/hv/regs.zig:263-263    sha256:2650992097d23297ad00a4210232d7a68a2a336c44d61958febc03ebadb98d74
+arch/aarch64/hv/regs.zig:265-265    sha256:7fa843024267245774ba0b883ce5b7333c8ad2bd54f214b1fcb91b3d5993e8a1
+arch/aarch64/hv/regs.zig:267-267    sha256:1d8dc392a0a788a212d2c5341c05d40ca0552f1ca3e4161df9b08d4b7c3fb6af
+arch/aarch64/hv/regs.zig:269-269    sha256:7c47c9d650b866cb532eb806ff7024fec1d437b0a0b691940c6445371ebcaf72
+arch/aarch64/hv/regs.zig:271-271    sha256:32270136fd2afb58965a6a66ed82b021cad7e3bac1c94faa10b03a4d8b02a762
+arch/aarch64/hv/regs.zig:274-274    sha256:7821e6535c9681cd2581a5fa99f36ed6ac6390c2a92233fdebd296f1f5a065df
+arch/aarch64/hv/regs.zig:276-276    sha256:7330bcc97fa8bec74ba2740989f201c86b35707d71a8eeb7597cba29e3be7776
+arch/aarch64/hv/regs.zig:279-279    sha256:f2ad3c499086fd54730a4840ec93c7f94f121487c789a6308ec66aae2a13f0a7
+arch/aarch64/hv/regs.zig:281-281    sha256:b51bce471a33557d3cf8f2b3d436598686c27a8f8da9a63cce9fcf51313a065d
+arch/aarch64/hv/regs.zig:283-283    sha256:be0b538275abfe0799f5345a7e9d7ffbb8bfaf125ca87dc32bc2325d1d60d0b8
+arch/aarch64/hv/regs.zig:286-286    sha256:49aef35abc2be5d89e6d5014a9d4eae88ddf5996ced156b461088879005925a6
+arch/aarch64/hv/regs.zig:288-288    sha256:b8c1bb4db2aacee2620147435d247f9c3ff3e4ede3f35f925f3f2afb6cca36f5
+arch/aarch64/hv/regs.zig:290-290    sha256:360ea89ecab3170a043d73106c69966c953eb84c72528ae83754994023cef1ce
+arch/aarch64/hv/regs.zig:292-292    sha256:3e23420cb01f8721c00f1d6e75187fcc673904530844f92ece8bcdef327ca9cf
+arch/aarch64/hv/regs.zig:294-294    sha256:e14c69bebb44b2ea533eb0e9516a4349b87133cfe58a000a86a5295ad31ea2fc
+arch/aarch64/hv/regs.zig:296-296    sha256:bbc6600c41244298462d16b6675439ee0e370fc2ea3900167b766898478447da
+arch/aarch64/hv/regs.zig:298-298    sha256:d49d76d50e4240426b9b484eb5fd30af211fab694935e5fe1ac2b24a8c66ed6b
+arch/aarch64/hv/regs.zig:300-300    sha256:dc7e45ad9a8a2abf32056eb6def529e7311269cb9f0529dc92f1f6134a231d7f
+arch/aarch64/hv/regs.zig:302-302    sha256:d5f303f2ad7eac92f30e9299e1bb178843db236ce24ba2e5e1861cf173fa1d22
+arch/aarch64/hv/regs.zig:311-311    sha256:7cc3627e920469b368239fedcdbc506a03b7104c321633cf5dc388c0fd32eb63
+arch/aarch64/hv/regs.zig:313-313    sha256:df65f3e73858c5ccd9f0df707c1fee7a8bdbcb2bf6df4cabb40420036afd6d37
+arch/aarch64/hv/regs.zig:314-314    sha256:f30decb4f2a4392c9bd2697656a8427136f0dedef7eeeabcaccc91548adc3d95
+arch/aarch64/hv/regs.zig:316-316    sha256:cb2e0a7ed78e15b029a37f491a77c1b4676228d1aa6abc9dfb95371fbaa5dcaa
+arch/aarch64/hv/regs.zig:318-318    sha256:cd44b57f226102f2455e7b0895085219c930548f7268d742966ee65a9908187d
+arch/aarch64/hv/regs.zig:319-319    sha256:1bb75255ccc224164927ca11dfb21d964d83f2bdb8b0b855455004480cbefb55
+arch/aarch64/hv/regs.zig:321-321    sha256:6477eaf6a8136f0ee5cc3bb47d72aa6b3f44e92c78b471ea192e5039bc4581a4
+arch/aarch64/hv/regs.zig:323-323    sha256:29a8fc84da9ced0f47cedc30678b91afb9d4585c88c84e4cd9d22e92ba2a7549
+arch/aarch64/hv/regs.zig:325-325    sha256:247a1477a036392d00ffc0e0a8890ab96daa66470b54c77a9233161e14df55ff
+arch/aarch64/hv/regs.zig:328-328    sha256:60b4a1123e1dce969030d9e20f7cc33928773f56ae45cbca2504851168d1c567
+arch/aarch64/hv/regs.zig:335-335    sha256:2c02358a7825114b3878710c5075d6054b76ec6f0e20b49221cfa65bbf19dcda
+arch/aarch64/hv/regs.zig:336-336    sha256:5ff1aee6b012a1b0efadfb4f32af84da528b396eecfec645d0a4e014f1025603
+arch/aarch64/hv/regs.zig:338-338    sha256:9bcc3532b0b341906ded06c0ebb1b7ea41f7b185d6d38629806f8f4e76a34ffb
+arch/aarch64/hv/regs.zig:339-339    sha256:f5deaee99630f29cf47dcd63cb97982ef3ebbdb86c94abc3630f7dcab51c558d
+arch/aarch64/hv/regs.zig:341-341    sha256:c80225ee7b2023b62220b8a93b61cc061a5ee12f4faca1f085a0014eb10ba79e
+arch/aarch64/hv/regs.zig:342-342    sha256:a2fcf0b1b8b800066130c6ac0cb6533e5e3188e4cde5f917252131d156b19148
+arch/aarch64/hv/regs.zig:344-344    sha256:b1ab63dbb119d5b41d6dcb753fa6dd0613c70e2644c1f61c441147de03310961
+arch/aarch64/hv/regs.zig:345-345    sha256:75375f2203d521b8fd2eccbd74dfb045d6b0234f53fccb280f38da0b7e62ac42
+arch/aarch64/hv/regs.zig:347-347    sha256:a5be8a0c00b96544092dceb14918f66cfbda579d7d84164fea84f89bf27e3f85
+arch/aarch64/hv/regs.zig:348-348    sha256:e22e47cbd0b2f7e6faee36652ef1ab3aba415c78c82b615bde5fb2aba31f7674
+arch/aarch64/hv/regs.zig:350-350    sha256:fa3f87a3aa2a15c67aa823ad2f2db839c38ae1ac8e2d9db043ba1d76df345366
+arch/aarch64/hv/regs.zig:351-351    sha256:35cabd924e5cf4c2f6f4f5cd7b7910a00262fd99a5040f2aff452043e88cfa32
+arch/aarch64/hv/regs.zig:353-353    sha256:57b5e92951d05e79a6bd68fa8c62c4d80e71a6ec8f408c1ea1fdb15d4758716f
+arch/aarch64/hv/regs.zig:367-367    sha256:9823334673aaf889f725b38498339fcd39c50eaa207fb9f0a30c1a5eeb21fceb
+arch/aarch64/hv/regs.zig:368-368    sha256:2d0280fe2964a475d0498e799cd975bff067a46ff33ca333f91a9278069a02e1
+arch/aarch64/hv/regs.zig:376-376    sha256:720fca160c47c4d943e5d355340ff24b03b92e489d8266b211fa9e6ae454e757
+arch/aarch64/hv/regs.zig:379-379    sha256:520b53455740f7bf462f95fe2f616e420d530739de649167ec4a18649077e0bf
+arch/aarch64/hv/regs.zig:383-383    sha256:c1ed923a6c348452995cd36e3b4658150a37a168a2c5a0010a1a897ed17be3d9
+arch/aarch64/hv/vcpu.zig:21-21    sha256:b1fb3b3570255117d186dc88e996f6134458146a4c736c6d37d1220f51133999
+arch/aarch64/hv/vm.zig:68-68    sha256:b1fb3b3570255117d186dc88e996f6134458146a4c736c6d37d1220f51133999
 arch/aarch64/paging.zig:132-132    sha256:dc3d82b96888fbcd763f8be3fa05379c61668241b0c96b4df7145e51710d08bd
 arch/aarch64/paging.zig:154-154    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
 arch/aarch64/paging.zig:160-160    sha256:3f17e403c5eac89d87b0ad6312c31ec965abb3cc58c2d3323c84afaca86615ae
@@ -527,10 +525,10 @@ arch/x64/intel/vmx.zig:249-249    sha256:da7313b69b793cfc61f5abd18a991c092564580
 arch/x64/intel/vmx.zig:256-256    sha256:a1584e81ce67507493780ec3f89b40f91c9657c33240ca28ebb4a9e6cc7d618e
 arch/x64/intel/vmx.zig:257-257    sha256:5dbea2421db966cce99ca4ee87d88a69be31543def79df8f46550a2c313a1d80
 arch/x64/intel/vmx.zig:258-258    sha256:8ece195049657f46f310c4c8b7b1641075df909b6ccd607440e29b9497a8eb35
-arch/x64/interrupts.zig:93-93    sha256:6affcd02f8e8b8fc9fd8a687227179bbfb3f4eb13b4e1660f6359661c962dab2
-arch/x64/interrupts.zig:96-96    sha256:36dc77860efa04de21740249fa2a81a41b7012a8239f191a023123228f75711c
-arch/x64/interrupts.zig:98-98    sha256:517588b4ec1a71046ec0b247bdb5c1faf47c625de2ca82cee75aa5eeb98d466f
-arch/x64/interrupts.zig:109-109    sha256:b83483777960b4f3c5144bf02d5b64b84ebd342cfd81cf32439e79a790409d66
+arch/x64/interrupts.zig:92-92    sha256:6affcd02f8e8b8fc9fd8a687227179bbfb3f4eb13b4e1660f6359661c962dab2
+arch/x64/interrupts.zig:95-95    sha256:36dc77860efa04de21740249fa2a81a41b7012a8239f191a023123228f75711c
+arch/x64/interrupts.zig:97-97    sha256:517588b4ec1a71046ec0b247bdb5c1faf47c625de2ca82cee75aa5eeb98d466f
+arch/x64/interrupts.zig:108-108    sha256:b83483777960b4f3c5144bf02d5b64b84ebd342cfd81cf32439e79a790409d66
 arch/x64/paging.zig:142-142    sha256:fe83edbb5456c5c88c09b659c3b4f00687c91a060593a64b780cc9247692b6a3
 arch/x64/paging.zig:152-152    sha256:ce0cadce231d1d8073fb242adc468279fcdfbf54eed17ca959716e496b68e5c0
 arch/x64/paging.zig:156-156    sha256:ecc461fa34590f7e0f9b1e09b7c9d4f2230e14d24f2a44d7aae96a6549ce2e6d
@@ -551,32 +549,16 @@ arch/x64/vm.zig:189-189    sha256:76724d4459dfb677471389c98badc276cc06a5c42e7f86
 arch/x64/vm.zig:195-195    sha256:8603838db7be95f29842a5dbef63af828b2f6a48925f329fe088debd92d7b882
 arch/x64/vm.zig:288-288    sha256:d9ed2e44dd9572bc36ff175bf5375ca0fd2b0912ac999f12ec26e76b1e7c247d
 boot/protocol.zig:57-57    sha256:704f6312b332cf2d95fabe4f419334f9438ca77561dace2d328aacae58c9a64c
-capdom/var_range.zig:56-56    sha256:b63b3474139e834c1dd6b31fdd21a07e9d1b3f64bf4f196460cd3e60415888d0
-capdom/var_range.zig:57-57    sha256:1a593cece0a5140d2b360ae4915a82ff8887ead91f3d1898efa77566950bceae
-capdom/var_range.zig:58-58    sha256:a304e6dcb27904e7262b9cc402a3feacf1f5bab98544c7111e018daec11dccb4
-capdom/var_range.zig:59-59    sha256:16cae723b1579c3d93559c9d2f0caff77d0e781127192aacbfd93ad314ee546c
-capdom/var_range.zig:78-78    sha256:a288911c380720c587d59bb322fc8502fd9aa7fb0c98e76752bc2ef4cb93b44e
+memory/var_range.zig:56-56    sha256:b63b3474139e834c1dd6b31fdd21a07e9d1b3f64bf4f196460cd3e60415888d0
+memory/var_range.zig:57-57    sha256:1a593cece0a5140d2b360ae4915a82ff8887ead91f3d1898efa77566950bceae
+memory/var_range.zig:58-58    sha256:a304e6dcb27904e7262b9cc402a3feacf1f5bab98544c7111e018daec11dccb4
+memory/var_range.zig:59-59    sha256:16cae723b1579c3d93559c9d2f0caff77d0e781127192aacbfd93ad314ee546c
+memory/var_range.zig:78-78    sha256:a288911c380720c587d59bb322fc8502fd9aa7fb0c98e76752bc2ef4cb93b44e
 devices/device_region.zig:79-79    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
-memory/device_region.zig:17-17    sha256:5fb9ebf2527c740b388dc5529bc5a33261d6a17ae1fe17ae29ac040d6840ffd0
-memory/device_region.zig:18-18    sha256:6196046e658757c581a6a29a6c96a8080f920477415e998f5dc752381b2bbf19
-memory/device_region.zig:20-20    sha256:e2f03559843fc67aca977d98e5c0c5845ae22cffa0c122ab1bc2bc816f168d97
-memory/device_region.zig:44-44    sha256:2f0b739cbfa83bd57d57ff9a14a0786afdb73d7e208c74b5c0fa445b3229013d
-memory/device_region.zig:47-47    sha256:16747bd9984dad805340fa560662b4ce9fbcba267290cf82cdafc50dab0288b5
-memory/device_region.zig:49-49    sha256:780cce940b355b1eb33fabae21d90c39a868e0fbfc72d8a6eac6aec702576cbd
-memory/device_region.zig:52-52    sha256:0dc0b0ac1b76c8e79b4ead405a2edd8e772b2c45aff672ca916c4cd24955f6c2
-memory/device_region.zig:53-53    sha256:22a046a706ab2c2fb1e2873ad21803d604926401a64d56af0ffea7d1b351d6be
-memory/device_region.zig:57-57    sha256:e4693c2e237a491447fbafa5e50851a8c20c8d4d1ac02d72db4aa084a61d277c
-memory/device_region.zig:58-58    sha256:5d07096a82c54b025eefb1024566a3d195330edd6dbf8e6ec59a1a605394819c
-memory/device_region.zig:59-59    sha256:018364f93a0fe8dc63c1a4dba4837bb7b1ebcc0d7b541deafe85c81e59d3890c
-memory/device_region.zig:60-60    sha256:13c3aa3f28dbaf8ca57b6332666d3c7dc80b838b4f1e42b595e241e85d75aa90
-memory/device_region.zig:65-65    sha256:525794d3853f12fa1c6036773c8c75b1cb99c0a4bb0a873c84edb7f54355a380
-memory/device_region.zig:66-66    sha256:9452243ff500122dbe38a9b931db8efc5d6b6345549c8a731a9bbb30a67b0325
-memory/device_region.zig:79-79    sha256:22c8a48faabd56cde59f785eb98aa2b1fb484fd3132fa7725efdc5ee3e7e6863
-memory/device_region.zig:81-81    sha256:ba5880c390f55a3062582986df1c172dc397abcb418e11f27f0a17eaca0c1e73
 sched/execution_context.zig:81-81    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
 sched/port.zig:1068-1068    sha256:3aabb8459d594f065a73cb7acf1eb5a90c99a002782ad62c7592fd19e9d0c139
 syscall/errors.zig:32-32    sha256:2745d7e8f7ad434662cee5fca8244d0741daef88c2b2ebde686283526773f967
-utils/containers/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
+sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
 arch/x64/exceptions.zig:43-43    sha256:6567179afdbc127a6c09287ab0cffbda8467127c98513783be98004d730bd314

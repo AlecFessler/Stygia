@@ -55,64 +55,65 @@ pub const RecvReturn = struct {
 };
 
 pub const SyscallNum = enum(u12) {
-    restrict = 0,
-    delete = 1,
-    revoke = 2,
-    sync = 3,
-    create_capability_domain = 4,
-    acquire_ecs = 5,
-    acquire_vars = 6,
-    create_execution_context = 7,
-    self = 8,
-    terminate = 9,
-    yield = 10,
-    priority = 11,
-    affinity = 12,
-    perfmon_info = 13,
-    perfmon_start = 14,
-    perfmon_read = 15,
-    perfmon_stop = 16,
-    create_var = 17,
-    map_pf = 18,
-    map_mmio = 19,
-    unmap = 20,
-    remap = 21,
-    snapshot = 22,
-    idc_read = 23,
-    idc_write = 24,
-    create_page_frame = 25,
-    ack = 26,
-    create_virtual_machine = 27,
-    create_vcpu = 28,
-    map_guest = 29,
-    unmap_guest = 30,
-    vm_set_policy = 31,
-    vm_inject_irq = 32,
-    create_port = 33,
-    @"suspend" = 34,
-    recv = 35,
-    bind_event_route = 36,
-    clear_event_route = 37,
-    reply = 38,
-    reply_transfer = 39,
-    timer_arm = 40,
-    timer_rearm = 41,
-    timer_cancel = 42,
-    futex_wait_val = 43,
-    futex_wait_change = 44,
-    futex_wake = 45,
-    time_monotonic = 46,
-    time_getwall = 47,
-    time_setwall = 48,
-    random = 49,
-    info_system = 50,
-    info_cores = 51,
-    power_shutdown = 52,
-    power_reboot = 53,
-    power_sleep = 54,
-    power_screen_off = 55,
-    power_set_freq = 56,
-    power_set_idle = 57,
+    @"suspend" = 14,
+    restrict = 15,
+    delete = 16,
+    revoke = 17,
+    sync = 18,
+    create_capability_domain = 19,
+    acquire_ecs = 20,
+    acquire_vars = 21,
+    create_execution_context = 22,
+    self = 23,
+    terminate = 24,
+    yield = 25,
+    priority = 26,
+    affinity = 27,
+    perfmon_info = 28,
+    perfmon_start = 29,
+    perfmon_read = 30,
+    perfmon_stop = 31,
+    create_var = 32,
+    map_pf = 33,
+    map_mmio = 34,
+    unmap = 35,
+    remap = 36,
+    snapshot = 37,
+    idc_read = 38,
+    idc_write = 39,
+    create_page_frame = 40,
+    ack = 41,
+    create_virtual_machine = 42,
+    create_vcpu = 43,
+    map_guest = 44,
+    unmap_guest = 45,
+    vm_set_policy = 46,
+    vm_inject_irq = 47,
+    create_port = 48,
+    recv = 49,
+    bind_event_route = 50,
+    clear_event_route = 51,
+    reply = 52,
+    reply_transfer = 53,
+    timer_arm = 54,
+    timer_rearm = 55,
+    timer_cancel = 56,
+    futex_wait_val = 57,
+    futex_wait_change = 58,
+    futex_wake = 59,
+    time_monotonic = 60,
+    time_getwall = 61,
+    time_setwall = 62,
+    random = 63,
+    info_system = 64,
+    info_cores = 65,
+    power_shutdown = 66,
+    power_reboot = 67,
+    power_sleep = 68,
+    power_screen_off = 69,
+    power_set_freq = 70,
+    power_set_idle = 71,
+    kprof_dump = 72,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -156,7 +157,7 @@ pub fn extraReplyTransferHandle(handle: u12) u64 {
 // `create_var` + `map_pf` that establishes the LIBZ_SLIDE mapping is
 // always callable.
 
-fn issueRawNoStack(word: u64, in: Regs) Regs {
+pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     return arch_impl.issueRawNoStack(word, in);
 }
 
@@ -611,6 +612,42 @@ pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
     ));
 }
 
+/// Spec §[vm_exit_state] `initial_state` sub-code per arch — the
+/// "vCPU has not yet entered guest mode" sentinel. A receiver replying
+/// to a vm_exit with this sub-code keeps the vCPU not-started and the
+/// kernel re-delivers an initial vm_exit on the bound exit_port.
+pub const INITIAL_STATE_SUBCODE: u8 = switch (builtin.cpu.arch) {
+    .x86_64 => 13,
+    .aarch64 => 10,
+    else => @compileError("unsupported target architecture"),
+};
+
+/// Reply to a vm_exit-typed reply handle. The receiver's user stack
+/// must hold the §[vm_exit_state] window: vregs 14..73 (x86-64) or
+/// 32..127 (aarch64), with the exit sub-code at vreg 70 / 117. The
+/// underlying asm reserves the wide window above SP, zeroes it, writes
+/// `subcode` into the sub-code slot, and invokes `reply` (syscall 52).
+pub fn replyVmExit(reply_handle: u12, subcode: u8) Regs {
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
+        (@as(u64, reply_handle) << 12);
+    return arch_impl.replyVmExitAsm(word, @as(u64, subcode));
+}
+
+/// reply_transfer for vm_exit-typed reply handles. Same wide-window
+/// discipline as `replyVmExit`, plus N attached handles installed in
+/// vregs [128-N..127] per §[handle_attachments]. `attachments.len`
+/// must be in 1..63.
+pub fn replyTransferVmExit(reply_handle: u12, attachments: []const u64, subcode: u8) Regs {
+    const n: u8 = @intCast(attachments.len);
+    if (n == 0 or n > 63) @panic("replyTransferVmExit: N must be 1..63");
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
+        (@as(u64, n) << 12) |
+        (@as(u64, reply_handle) << 20);
+    return arch_impl.replyTransferVmExitAsm(word, attachments.ptr, @as(u64, n), @as(u64, subcode));
+}
+
 // 40..42: timer
 
 pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) Regs {
@@ -691,12 +728,19 @@ pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
     return fromCRegs(ext.powerSetIdle(core_id, policy));
 }
 
+/// Drain the kernel kprof log to serial. Wrapped via `issueRegDiscard`
+/// so ReleaseSmall can't strip the call as dead.
+pub fn kprofDump() void {
+    issueRegDiscard(.kprof_dump, 0, .{});
+}
+
 // Compile-time guard against accidentally reordering the SyscallNum
 // enum above. Matches the spec assignments verbatim.
 comptime {
-    std.debug.assert(@intFromEnum(SyscallNum.power_set_idle) == 57);
-    std.debug.assert(@intFromEnum(SyscallNum.create_capability_domain) == 4);
-    std.debug.assert(@intFromEnum(SyscallNum.@"suspend") == 34);
-    std.debug.assert(@intFromEnum(SyscallNum.recv) == 35);
-    std.debug.assert(@intFromEnum(SyscallNum.reply) == 38);
+    std.debug.assert(@intFromEnum(SyscallNum.@"suspend") == 14);
+    std.debug.assert(@intFromEnum(SyscallNum.restrict) == 15);
+    std.debug.assert(@intFromEnum(SyscallNum.create_capability_domain) == 19);
+    std.debug.assert(@intFromEnum(SyscallNum.recv) == 49);
+    std.debug.assert(@intFromEnum(SyscallNum.reply) == 52);
+    std.debug.assert(@intFromEnum(SyscallNum.power_set_idle) == 71);
 }

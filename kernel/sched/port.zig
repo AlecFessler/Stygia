@@ -17,9 +17,10 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const arch_syscall = zag.arch.dispatch.syscall;
 const capability = zag.caps.capability;
-const capability_domain = zag.capdom.capability_domain;
+const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
+const kprof = zag.kprof.trace_id;
 const scheduler = zag.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -46,13 +47,13 @@ const Word0 = capability.Word0;
 // 256 slots is more than the spec needs (one EC can hold at most one
 // recv-with-timeout in flight; concurrent recv-with-timeout count is
 // bounded by core count plus user-space concurrency).
-const MAX_TIMED_RECV_WAITERS: usize = 256;
-var timed_recv_waiters: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = blk: {
+pub const MAX_TIMED_RECV_WAITERS: usize = 256;
+pub var timed_recv_waiters: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = blk: {
     var arr: [MAX_TIMED_RECV_WAITERS]?*ExecutionContext = undefined;
     for (&arr) |*slot| slot.* = null;
     break :blk arr;
 };
-var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
+pub var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
 
 /// Per-core BSS scratch for `expireTimedRecvWaiters` Phase 1 → Phase 2
 /// hand-off. At 256 × 16 = 4 KiB the snapshot used to live on the IRQ
@@ -110,7 +111,7 @@ pub fn expireTimedRecvWaiters() void {
         defer timed_recv_lock.unlockIrqRestore(irq);
         for (&timed_recv_waiters) |*slot| {
             const ec = slot.* orelse continue;
-            if (ec.recv_deadline_ns == 0 or now_ns < ec.recv_deadline_ns) continue;
+            if (now_ns < ec.recv_deadline_ns) continue;
             // self-alive: `ec` is pinned by the `timed_recv_waiters`
             // slot we just dequeued; capturing its current gen here
             // gives the phase-2 walk a stale-detector if the slot is
@@ -235,11 +236,10 @@ pub const Port = struct {
     waiter_kind: WaiterKind = .none,
 };
 
-// Layout asserts for the L4 IPC fast path. The current Zig
-// `suspendFast` reaches `Port` through normal field access, so these
-// guard against drift that would silently break a future Phase 4 asm
-// rendezvous (which references `_gen_lock`, `waiters`, and
-// `waiter_kind` as immediate displacements off `*Port`).
+// Layout asserts for the L4 IPC fast path. The asm rendezvous in
+// `kernel/arch/x64/interrupts.zig::syscallEntry` references
+// `_gen_lock`, `waiters`, and `waiter_kind` as immediate
+// displacements off `*Port`; these guard against drift.
 comptime {
     if (@offsetOf(Port, "waiter_kind") <= @offsetOf(Port, "waiters")) {
         @compileError("Port.waiter_kind must follow Port.waiters (asm fast path)");
@@ -310,114 +310,6 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
     return @intCast(Word0.pack(slot, .port, port_caps_word));
 }
 
-/// L4 IPC fast path (Phase 2 + 3 in Zig). Resolves `target` and `port`
-/// handles inline against `caller.domain`, validates `susp` and `bind`
-/// caps, and — if a receiver is queued on the port — performs the
-/// rendezvous via `suspendOnPort` without going back through the slow
-/// path's argument-slice + dispatch-switch.
-///
-/// Returns `null` to signal predicate miss; caller must fall through to
-/// the slow path (which performs identical state mutations on success
-/// and surfaces the appropriate error code on validation failures, so
-/// the fall-through is observably equivalent to running the fast path
-/// to completion).
-///
-/// Predicate (must ALL hold; returns null otherwise):
-///   - `target` and `port` resolve cleanly in the caller's `user_table`
-///     to the expected types (`execution_context`, `port`).
-///   - The target EC is the caller itself — self-suspend, the dominant
-///     test pattern. Cross-EC suspend stays on the slow path because it
-///     needs an extra EC `_gen_lock` round trip and a separate state
-///     check that would dilute the fast path's branch budget.
-///   - The target handle has the `susp` cap and the port handle has the
-///     `bind` cap.
-///   - The caller is not a vCPU.
-///   - The port has at least one queued receiver
-///     (`waiter_kind == .receivers`).
-///
-/// On predicate match the result is identical to what `suspendEc` would
-/// have produced via `suspendOnPort` → `rendezvousWithReceiver`: caller
-/// transitions to `.suspended_on_port`, the highest-priority receiver
-/// is dequeued and made `.ready` with the §[event_state] vregs filled,
-/// and `current_ec` is cleared on this core so the syscall epilogue
-/// dispatches the next ready EC.
-///
-/// Lock order: CD → Port (canonical, matches §[delete] release path).
-/// CD is dropped before Port is taken, so `suspendOnPort` →
-/// `rendezvousWithReceiver` can acquire the receiver's CD without
-/// inverting the order.
-pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
-    if (target & ~capability.HANDLE_ARG_MASK != 0) return null;
-    if (port & ~capability.HANDLE_ARG_MASK != 0) return null;
-    if (caller.vm != null) return null;
-
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return null;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
-
-    const target_slot: u12 = @truncate(target);
-    const port_slot: u12 = @truncate(port);
-
-    const target_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    };
-    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    };
-
-    // Self-suspend predicate: target EC must be the caller itself. The
-    // typed ref's ptr is the underlying object pointer; when it points
-    // back at `caller` we can skip the cross-EC lock dance entirely.
-    const target_ref = capability.typedRef(ExecutionContext, target_entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    };
-    if (target_ref.ptr != caller) {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    }
-
-    const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
-    if (!ec_caps.susp) {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    }
-    const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
-    if (!port_caps.bind) {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    }
-
-    const port_ref = capability.typedRef(Port, port_entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
-        return null;
-    };
-    cd_ref.unlockIrqRestore(cd_irq_state);
-
-    const plr = port_ref.lockIrqSave(@src()) catch return null;
-    const p = plr.ptr;
-    const port_irq_state = plr.irq_state;
-
-    // Only commit to the fast path when there's a receiver to hand off
-    // to. The no-receiver branch (sender parks on the port) requires
-    // the same state mutations but produces no observable speedup over
-    // the slow path, so let the slow path own it — keeps this function
-    // a single tight predicate→rendezvous path.
-    if (p.waiter_kind != .receivers) {
-        port_ref.unlockIrqRestore(port_irq_state);
-        return null;
-    }
-
-    // `suspendOnPort` requires the port lock held on entry; it releases
-    // the lock either directly (no-receiver path) or transitively via
-    // `rendezvousWithReceiver` (success path, drops port before locking
-    // receiver's CD to honor CD → Port).
-    return execution_context.suspendOnPort(caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, port_irq_state);
-}
-
 /// `suspend` syscall handler. Spec §[port].suspend.
 ///
 /// Slow-path mirror of arch/x64/interrupts.zig fast suspend: on success
@@ -426,6 +318,8 @@ pub fn suspendFast(caller: *ExecutionContext, target: u64, port: u64) ?i64 {
 /// delivered. State produced here MUST match what the fast path produces
 /// so the two are interchangeable.
 pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
+    kprof.enter(.suspend_ec);
+    defer kprof.exit(.suspend_ec);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -517,6 +411,8 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 /// so the canonical CD → Port order is never inverted — see the lock-
 /// order note on `deliverEvent`.
 pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
+    kprof.enter(.recv);
+    defer kprof.exit(.recv);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -626,6 +522,8 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
 
 /// `reply` syscall handler. Spec §[reply].reply.
 pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
+    kprof.enter(.reply);
+    defer kprof.exit(.reply);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -1254,6 +1152,8 @@ fn deliverEvent(
     pair_count: u8,
     port_xfer: bool,
 ) i64 {
+    kprof.enter(.deliver_event);
+    defer kprof.exit(.deliver_event);
     // Spec §[reply]: minted reply handle inherits `xfer = 1` iff the
     // recv'ing port carried the `xfer` cap. Caller threads that bit
     // through from the recv-time port-handle resolution (it is NOT

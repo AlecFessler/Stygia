@@ -15,7 +15,7 @@ const scheduler = zag.sched.scheduler;
 const stack = zag.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const CapabilityType = zag.caps.capability.CapabilityType;
 const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
@@ -27,7 +27,7 @@ const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const Stack = zag.memory.stack.Stack;
 const VAddr = zag.memory.address.VAddr;
-const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 const WaitNode = zag.sched.futex.WaitNode;
 
 /// Upper bound on simultaneous futex wait addresses for a single EC.
@@ -174,14 +174,25 @@ pub const ExecutionContext = struct {
     /// Mutually exclusive across {run queue, port wait queue, exited
     /// list}. Futex waits do NOT use this link — they use per-bucket
     /// WaitNodes (see `futex_wait_nodes`).
-    next: ?SlabRef(ExecutionContext) = null,
+    ///
+    /// self-alive: raw `?*EC`, not `?SlabRef`. Queue links are pinned
+    /// by the enclosing structure's lock (port._gen_lock for port
+    /// waiters; scheduler core_lock for run queues). Destroy paths
+    /// must dequeue before freeing, and dequeue requires that same
+    /// lock — so any pointer reachable from a held queue cannot be
+    /// torn down. Slab type stability backs this up: the slot can
+    /// only ever hold an EC. Mirror of futex's `WaitNode.next: ?*WaitNode`.
+    next: ?*ExecutionContext = null,
 
     /// Backward link companion to `next`. Required by spec ops that
     /// arbitrarily remove or reposition an EC: `priority` (re-bucket on
     /// change), `affinity` (migration), `terminate` (drop from queue on
     /// destroy), `delete` on a reply (resolve sender with E_ABANDONED),
     /// and cross-EC `suspend`. O(1) instead of O(N) walk.
-    prev: ?SlabRef(ExecutionContext) = null,
+    ///
+    /// self-alive: raw `?*EC`, same justification as `next` — pinned
+    /// by the enclosing queue's lock.
+    prev: ?*ExecutionContext = null,
 
     /// Current scheduling priority. Mirrors handle field0.pri.
     priority: Priority = .normal,

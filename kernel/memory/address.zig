@@ -38,29 +38,25 @@ pub const KernelVA = struct {
             .start = vm_node_slab.end,
             .end = vm_node_slab.end + SLAB_RESERVATION,
         };
-        pub const device_region_slab: Range = .{
+        pub const proc_slab: Range = .{
             .start = shm_slab.end,
             .end = shm_slab.end + SLAB_RESERVATION,
-        };
-        pub const proc_slab: Range = .{
-            .start = device_region_slab.end,
-            .end = device_region_slab.end + SLAB_RESERVATION,
         };
         pub const thread_slab: Range = .{
             .start = proc_slab.end,
             .end = proc_slab.end + SLAB_RESERVATION,
         };
-        pub const kvm_vm_slab: Range = .{
+        pub const hv_vm_slab: Range = .{
             .start = thread_slab.end,
             .end = thread_slab.end + SLAB_RESERVATION,
         };
-        pub const kvm_vcpu_slab: Range = .{
-            .start = kvm_vm_slab.end,
-            .end = kvm_vm_slab.end + SLAB_RESERVATION,
+        pub const hv_vcpu_slab: Range = .{
+            .start = hv_vm_slab.end,
+            .end = hv_vm_slab.end + SLAB_RESERVATION,
         };
         pub const pmu_state_slab: Range = .{
-            .start = kvm_vcpu_slab.end,
-            .end = kvm_vcpu_slab.end + SLAB_RESERVATION,
+            .start = hv_vcpu_slab.end,
+            .end = hv_vcpu_slab.end + SLAB_RESERVATION,
         };
 
         // SecureSlab out-of-band metadata regions. Each gen-protected slab
@@ -96,33 +92,25 @@ pub const KernelVA = struct {
             .start = thread_slab_ptrs.end,
             .end = thread_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const kvm_vm_slab_ptrs: Range = .{
+        pub const hv_vm_slab_ptrs: Range = .{
             .start = thread_slab_links.end,
             .end = thread_slab_links.end + SLAB_RESERVATION,
         };
-        pub const kvm_vm_slab_links: Range = .{
-            .start = kvm_vm_slab_ptrs.end,
-            .end = kvm_vm_slab_ptrs.end + SLAB_RESERVATION,
+        pub const hv_vm_slab_links: Range = .{
+            .start = hv_vm_slab_ptrs.end,
+            .end = hv_vm_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const kvm_vcpu_slab_ptrs: Range = .{
-            .start = kvm_vm_slab_links.end,
-            .end = kvm_vm_slab_links.end + SLAB_RESERVATION,
+        pub const hv_vcpu_slab_ptrs: Range = .{
+            .start = hv_vm_slab_links.end,
+            .end = hv_vm_slab_links.end + SLAB_RESERVATION,
         };
-        pub const kvm_vcpu_slab_links: Range = .{
-            .start = kvm_vcpu_slab_ptrs.end,
-            .end = kvm_vcpu_slab_ptrs.end + SLAB_RESERVATION,
-        };
-        pub const device_region_slab_ptrs: Range = .{
-            .start = kvm_vcpu_slab_links.end,
-            .end = kvm_vcpu_slab_links.end + SLAB_RESERVATION,
-        };
-        pub const device_region_slab_links: Range = .{
-            .start = device_region_slab_ptrs.end,
-            .end = device_region_slab_ptrs.end + SLAB_RESERVATION,
+        pub const hv_vcpu_slab_links: Range = .{
+            .start = hv_vcpu_slab_ptrs.end,
+            .end = hv_vcpu_slab_ptrs.end + SLAB_RESERVATION,
         };
         pub const vm_node_slab_ptrs: Range = .{
-            .start = device_region_slab_links.end,
-            .end = device_region_slab_links.end + SLAB_RESERVATION,
+            .start = hv_vcpu_slab_links.end,
+            .end = hv_vcpu_slab_links.end + SLAB_RESERVATION,
         };
         pub const vm_node_slab_links: Range = .{
             .start = vm_node_slab_ptrs.end,
@@ -137,9 +125,6 @@ pub const KernelVA = struct {
             .end = proc_slab_ptrs.end + SLAB_RESERVATION,
         };
 
-        // Spec-v3 §[device_region] slab (kernel/devices/device_region.zig).
-        // Distinct from the legacy `device_region_slab` above, which still
-        // backs the IOMMU PCI/DMA shape pending its spec-v3 rework.
         pub const dev_region_slab: Range = .{
             .start = proc_slab_links.end,
             .end = proc_slab_links.end + SLAB_RESERVATION,

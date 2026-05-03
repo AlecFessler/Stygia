@@ -7,7 +7,7 @@ const vtd = zag.arch.x64.intel.vtd;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
-const VarPageSize = zag.capdom.var_range.PageSize;
+const VarPageSize = zag.memory.var_range.PageSize;
 
 const IommuType = enum {
     none,

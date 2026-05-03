@@ -113,7 +113,7 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// §[suspend] syscall_num = 34. Pair-count goes in bits 12-19 of the
+// §[suspend] syscall_num = 14. Pair-count goes in bits 12-19 of the
 // syscall word per §[handle_attachments]. With N = 1 and vreg 127
 // being the only attachment, the asm sequence reserves stack space
 // for vregs 14..127 (114 quadwords = 912 bytes) plus 8 bytes for the
@@ -149,7 +149,7 @@ fn localDummyEntry() noreturn {
 }
 
 fn suspendWithOneAttachmentX64(target: u12, port: u12, entry: u64) u64 {
-    const SUSPEND_NUM: u64 = 34;
+    const SUSPEND_NUM: u64 = 14;
     const PAIR_COUNT_ONE: u64 = 1 << 12;
     const word: u64 = SUSPEND_NUM | PAIR_COUNT_ONE;
     var v1_out: u64 = undefined;
@@ -175,7 +175,7 @@ fn suspendWithOneAttachmentX64(target: u12, port: u12, entry: u64) u64 {
 // vreg 127 lives at [sp + 768]. We reserve 784 bytes (16-byte aligned)
 // to cover the syscall word at [sp+0] and vreg 127 at [sp+768].
 fn suspendWithOneAttachmentArm(target: u12, port: u12, entry: u64) u64 {
-    const SUSPEND_NUM: u64 = 34;
+    const SUSPEND_NUM: u64 = 14;
     const PAIR_COUNT_ONE: u64 = 1 << 12;
     const word: u64 = SUSPEND_NUM | PAIR_COUNT_ONE;
     var x0_out: u64 = undefined;

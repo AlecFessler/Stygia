@@ -115,7 +115,7 @@ fn localDummyEntry() noreturn {
 // rcx is reserved for the syscall word (sysret clobber); r11 is
 // likewise reserved. Memory clobber covers our pad writes.
 fn issueReplyTransferDup(reply_id: u12, entry: u64) u64 {
-    // syscall_num = 39 (reply_transfer), N=2 in bits 12-19,
+    // syscall_num = 53 (reply_transfer), N=2 in bits 12-19,
     // reply_handle_id in bits 20-31 (per the new §[reply_transfer] ABI).
     const word: u64 =
         @as(u64, @intFromEnum(syscall.SyscallNum.reply_transfer)) |

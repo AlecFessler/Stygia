@@ -117,7 +117,7 @@ fn siblingEntry() callconv(.c) noreturn {
     const port_id: u64 = g_port_handle_id;
     const self_ec_id: u64 = g_sibling_self_handle_id;
 
-    // Self-suspend on the port. syscall_num = 34 (suspend), no pair
+    // Self-suspend on the port. syscall_num = 14 (suspend), no pair
     // attachments from the sender side. Capture the post-resume syscall
     // word so we can read pair_count / tstart.
     const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
@@ -283,7 +283,7 @@ pub fn main(cap_table_base: u64) void {
     //      syscall
     //      add  $920, %rsp            # discard pad + word
     //
-    //    Syscall word: syscall_num=39 (reply_transfer) | (N=1)<<12 |
+    //    Syscall word: syscall_num=53 (reply_transfer) | (N=1)<<12 |
     //    (reply_handle_id<<20). Per the new §[reply_transfer] ABI the
     //    reply_handle_id rides in syscall-word bits 20-31 rather than
     //    in vreg 1.

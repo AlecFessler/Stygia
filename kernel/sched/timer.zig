@@ -15,7 +15,7 @@ const capability = zag.caps.capability;
 const futex = zag.sched.futex;
 const scheduler = zag.sched.scheduler;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const CapabilityType = zag.caps.capability.CapabilityType;
 const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -320,7 +320,7 @@ pub fn timerArm(caller: *anyopaque, caps: u64, deadline_ns: u64, flags: u64) i64
         .gen = @intCast(t._gen_lock.currentGen()),
     };
 
-    const slot = zag.capdom.capability_domain.mintHandle(
+    const slot = zag.caps.capability_domain.mintHandle(
         caller_domain,
         ref,
         .timer,
@@ -689,7 +689,7 @@ fn propagateAndWake(t: *Timer, gen: u63, value: u64) void {
         .timer_ref = SlabRef(Timer).init(t, gen),
         .value = value,
     };
-    zag.capdom.capability_domain.slab_instance.forEachAlive(
+    zag.caps.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField0Visitor,
     );
@@ -703,7 +703,7 @@ fn propagateField1(t: *Timer, gen: u63, value: u64) void {
         .timer_ref = SlabRef(Timer).init(t, gen),
         .value = value,
     };
-    zag.capdom.capability_domain.slab_instance.forEachAlive(
+    zag.caps.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField1Visitor,
     );
@@ -871,17 +871,3 @@ fn computeFieldPaddr(cd: *CapabilityDomain, slot: u12, which: HandleField) PAddr
 fn currentNs() u64 {
     return arch.time.currentMonotonicNs();
 }
-
-// ── Unit tests ───────────────────────────────────────────────────────
-//
-// Standalone unit tests for `TimerHeap` live in
-// `kernel/sched/timer_heap_test.zig` because this file is a member of
-// the `zag` kernel module and cannot simultaneously be a `zig test`
-// root. Run with:
-//
-//   zig test --dep zag -Mtest=kernel/sched/timer_heap_test.zig \
-//            --dep zag -Mzag=kernel/zag.zig
-//
-// The driver imports `TimerHeap` through `zag.sched.timer.*` and
-// exercises insert / pop / cancel / fill+drain plus heap-invariant
-// assertions.

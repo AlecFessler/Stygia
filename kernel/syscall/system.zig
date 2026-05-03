@@ -6,7 +6,7 @@ const smp = zag.arch.dispatch.smp;
 const sync = zag.utils.sync;
 const time = zag.arch.dispatch.time;
 
-const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
+const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PowerAction = cpu.PowerAction;
 const SpinLock = sync.spin_lock.SpinLock;

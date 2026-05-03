@@ -2,7 +2,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
-const capability_domain = zag.capdom.capability_domain;
+const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
 const scheduler = zag.sched.scheduler;

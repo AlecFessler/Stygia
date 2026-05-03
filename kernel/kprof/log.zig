@@ -29,8 +29,12 @@ const Record = record_mod.Record;
 /// Kept tight because every bump costs `LOG_SIZE_BYTES` of BSS.
 pub const MAX_CPUS: usize = 4;
 
-/// Bytes per per-CPU log.
-pub const LOG_SIZE_BYTES: usize = 256 * 1024;
+/// Bytes per per-CPU log. 16 MiB × MAX_CPUS = 64 MiB BSS when kprof is
+/// compiled in (zero when `-Dkernel_profile=none`). Sized to fit the
+/// full 477-test run on the busiest core (cpu=0 receives the bulk of
+/// the page-fault + map_page point records when the L4 fast path keeps
+/// the rendezvous local) before any overflow → end-of-session dump.
+pub const LOG_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Inline BSS backing for every per-CPU log. Zero bytes when profiling
 /// is compiled out; `MAX_CPUS * LOG_SIZE_BYTES` bytes otherwise.
@@ -63,16 +67,24 @@ pub var active: bool = false;
 /// kicks off the IPI-coordinated dump in `dump.end(.log_full)`.
 pub var terminate_requested: u32 = 0;
 
+/// Single-shot "session is ending" flag. The first core to call `dump.end`
+/// (either the timer-tick observer of `terminate_requested` or root-exit
+/// path) cmpxchg's this from false → true and becomes the dumper; concurrent
+/// callers fall into `parkForDump` so their in-flight `emit()`s drain.
+pub var ending: bool = false;
+
 /// Non-dumping cores increment this while parked in the dump IPI handler.
 /// The dumping core spins until it reaches `n_cpus - 1` before emitting
 /// records, guaranteeing no in-flight `emit()` can race with the dump.
 pub var parked_cores: u32 = 0;
 
-/// Monotonically incremented by the dumping core after each completed
-/// rolling dump. Non-dumping cores snapshot this on entry to
-/// `parkForDump()` and spin until it changes, so every dump cycle has
-/// a distinct "all clear" signal that can't be lost if a parked core
-/// happens to read the counter before the dumper bumps it.
+/// Set to 1 by the dumper after the serial dump completes. Parked cores
+/// spin on this in `parkForDump` and halt once they observe it set.
+pub var dump_done: u32 = 0;
+
+/// Reserved for future rolling-dump epochs (currently unused — the dump
+/// is a single-shot session-end event, not rolling). Kept so the IPI
+/// handler can be extended without an ABI break.
 pub var epoch: u64 = 0;
 
 /// Point every per-CPU CpuLog at its slice of the inline BSS backing.

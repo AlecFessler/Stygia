@@ -21,7 +21,6 @@
 //!
 //! Spec §[execution_context] lazy FPU.
 
-const build_options = @import("build_options");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
@@ -29,12 +28,6 @@ const scheduler = zag.sched.scheduler;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-
-/// Build-time switch (`-Dlazy_fpu`). When false, the FP-disable trap is
-/// never armed and the scheduler falls back to unconditional eager
-/// fpuSave/fpuRestore. Used for A/B perf comparison; production
-/// kernels run with this true.
-pub const lazy_enabled: bool = build_options.lazy_fpu;
 
 /// Called from the arch-specific FP-trap handler (#NM on x64,
 /// ESR_EL1.EC=0x07 on aarch64). Swaps FPU state ownership on this core

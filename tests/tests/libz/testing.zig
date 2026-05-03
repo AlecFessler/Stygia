@@ -18,7 +18,7 @@ pub const PASS_CODE: u64 = 1;
 pub const FAIL_CODE: u64 = 0;
 
 pub fn report(result_code: u64, assertion_id: u64) void {
-    _ = syscall.issueReg(.@"suspend", 0, .{
+    _ = syscall.issueRawNoStack(0, .{
         .v1 = caps.SLOT_INITIAL_EC,
         .v2 = caps.SLOT_FIRST_PASSED,
         .v3 = result_code,

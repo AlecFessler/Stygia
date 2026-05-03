@@ -217,7 +217,7 @@ pub fn perCoreInit() void {
 }
 
 /// Allocate and zero a 4K page to serve as the NPT PML4 root.
-/// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
+/// Spec-v3 split: caller (`arch.x64.hv.vm.allocStage2Root`) holds this
 /// PAddr in `VirtualMachine.guest_pt_root`. On AMD the NPT root has to
 /// be patched into the VMCB (`N_CR3`) by per-VM control state setup.
 pub fn allocNptRoot() ?PAddr {

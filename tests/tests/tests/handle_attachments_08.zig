@@ -255,7 +255,7 @@ pub fn main(cap_table_base: u64) void {
     //     offset 912 after the word push, push the word, syscall,
     //     and unwind.
     //
-    // syscall word: syscall_num = 34 (suspend) in bits 0-11,
+    // syscall word: syscall_num = 14 (suspend) in bits 0-11,
     // pair_count = 1 in bits 12-19. Other bits reserved = 0.
     const suspend_word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(1));
 

@@ -41,6 +41,20 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     }
 }
 
+/// Program PMCs 0/1/2 on the local core for free-running
+/// cycles / cache-miss / branch-mispredict counting. Called under
+/// `-Dkernel_profile=trace` from `sched.perCoreInit`. Counters run
+/// unattended forever; the trace helpers in `kprof.trace_id`
+/// snapshot them into each emitted record so the post-processor
+/// can compute per-scope deltas.
+pub fn kprofTraceCountersPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.kprofTraceCountersPerCoreInit(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 /// Read the three free-running trace counters into `out` in the
 /// order (cycles, cache_misses, branch_misses). NMI-safe: pure
 /// RDMSR reads, no allocation, no locks. On aarch64 (stub) fills

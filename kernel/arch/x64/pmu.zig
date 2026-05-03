@@ -162,6 +162,16 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     };
 }
 
+/// kprof trace-mode per-core init. Programs three PMCs for
+/// free-running cycles / L1 DC refill / branch-mispredict counting.
+pub fn kprofTraceCountersPerCoreInit() void {
+    switch (active_backend) {
+        .intel => intel_pmu.kprofTraceCountersPerCoreInit(),
+        .amd => amd_pmu.kprofTraceCountersPerCoreInit(),
+        .none => {},
+    }
+}
+
 /// kprof trace-mode counter snapshot. Reads the three trace PMCs
 /// into `out` in (cycles, cache_misses, branch_misses) order.
 pub inline fn kprofTraceCountersRead(out: *[3]u64) void {

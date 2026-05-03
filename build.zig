@@ -10,34 +10,12 @@ const Profile = struct {
 };
 
 const profiles = struct {
-    const router = Profile{
-        .root_service = "routerOS/bin/routerOS.elf",
-        .net = "tap",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-    };
     const test_ = Profile{
         .root_service = "tests/tests/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
         .iommu = "intel",
-    };
-    const bench = Profile{
-        .root_service = "tests/tests/bin/bench.elf",
-        .net = "none",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-    };
-    const desktop = Profile{
-        .root_service = "desktopOS/bin/desktopOS.elf",
-        .net = "none",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-        .display = "gtk",
     };
     const hyprvos = Profile{
         .root_service = "hyprvOS/bin/hyprvOS.elf",
@@ -56,10 +34,7 @@ const profiles = struct {
 };
 
 fn getProfile(name: []const u8) ?Profile {
-    if (std.mem.eql(u8, name, "router")) return profiles.router;
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
-    if (std.mem.eql(u8, name, "bench")) return profiles.bench;
-    if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
     if (std.mem.eql(u8, name, "hyprvos")) return profiles.hyprvos;
     if (std.mem.eql(u8, name, "prof")) return profiles.prof;
 
@@ -67,7 +42,7 @@ fn getProfile(name: []const u8) ?Profile {
 }
 
 pub fn build(b: *std.Build) void {
-    const profile_name = b.option([]const u8, "profile", "Build profile: router, test, bench (sets defaults for other flags)");
+    const profile_name = b.option([]const u8, "profile", "Build profile: test, hyprvos, prof (sets defaults for other flags)");
     const profile = if (profile_name) |name| getProfile(name) else null;
 
     const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse
@@ -94,11 +69,12 @@ pub fn build(b: *std.Build) void {
         @panic("-Dkernel_profile must be one of: none, trace, sample");
     }
     const kprof_enabled = !std.mem.eql(u8, kernel_profile, "none");
-    // Lazy-FPU on/off switch. Default on. With -Dlazy_fpu=false the
-    // kernel arms no FP-disable trap and unconditionally save/restores
-    // FPU state on every context switch — exposes the eager baseline
-    // for A/B perf comparison.
-    const lazy_fpu = b.option(bool, "lazy_fpu", "Lazy FPU save/restore (default: on)") orelse true;
+    // L4 IPC fast-path classifier on/off switch. Default on. With
+    // -Dkernel_fastpath=false the classifier in `syscallEntry` skips
+    // the `cmpq $13 / jbe .Lsyscall_suspend_fast` test, so every
+    // syscall (including suspend) takes the slow Zig dispatch path —
+    // exposes the slow-path baseline for A/B perf comparison.
+    const kernel_fastpath = b.option(bool, "kernel_fastpath", "L4 IPC fast-path classifier (default: on)") orelse true;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -182,7 +158,7 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
-    build_opts.addOption(bool, "lazy_fpu", lazy_fpu);
+    build_opts.addOption(bool, "kernel_fastpath", kernel_fastpath);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
@@ -401,16 +377,11 @@ pub fn build(b: *std.Build) void {
             "-device intel-iommu,intremap=off"
         else
             "-device amd-iommu";
-        const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
-            \\-device qemu-xhci,id=xhci \
-            \\-device usb-kbd,bus=xhci.0 \
-            \\-device usb-mouse,bus=xhci.0
-        else
-            "";
-        const qemu_nvme_args: []const u8 = if (profile_name != null and
-            (std.mem.eql(u8, profile_name.?, "desktop") or std.mem.eql(u8, profile_name.?, "hyprvos")))
-            \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
-            \\-device nvme,drive=nvme0,serial=zagdisk0
+        const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "hyprvos"))
+            b.fmt(
+                \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0 \
+                \\-device nvme,drive=nvme0,serial=zagdisk0
+            , .{b.install_path})
         else
             "";
         const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
@@ -445,20 +416,24 @@ pub fn build(b: *std.Build) void {
             \\ {s} \
             \\ {s} \
             \\ {s} \
-            \\ {s} \
             \\ -smp cores=4
-        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args, qemu_nvme_args });
+        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_nvme_args });
     };
-    // Create NVMe disk image if it doesn't exist
-    const create_nvme_img = b.addSystemCommand(&[_][]const u8{
-        "sh", "-c", "test -f nvme.img || dd if=/dev/zero of=nvme.img bs=1M count=64 2>/dev/null",
-    });
 
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });
     qemu_cmd.step.dependOn(b.getInstallStep());
-    qemu_cmd.step.dependOn(&create_nvme_img.step);
+
+    if (profile_name != null and std.mem.eql(u8, profile_name.?, "hyprvos")) {
+        const create_nvme_img = b.addSystemCommand(&[_][]const u8{
+            "sh", "-c", b.fmt(
+                "mkdir -p {s} && test -f {s}/nvme.img || dd if=/dev/zero of={s}/nvme.img bs=1M count=64 2>/dev/null",
+                .{ b.install_path, b.install_path, b.install_path },
+            ),
+        });
+        qemu_cmd.step.dependOn(&create_nvme_img.step);
+    }
     const run_qemu_cmd = b.step("run", "Run QEMU");
     run_qemu_cmd.dependOn(&qemu_cmd.step);
 }

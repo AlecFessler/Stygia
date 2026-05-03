@@ -14,10 +14,10 @@
 /// does not gate kernel-mode VAs).
 const zag = @import("zag");
 
-const virtual_machine = zag.capdom.virtual_machine;
+const virtual_machine = zag.hv.virtual_machine;
 
 const GuestState = zag.arch.x64.vm.GuestState;
-const VirtualMachine = zag.capdom.virtual_machine.VirtualMachine;
+const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {

@@ -46,7 +46,7 @@ pub const WaitNode = struct {
     priority: Priority,
 };
 
-const WaitNodePriorityQueue = zag.utils.containers.priority_queue.PriorityQueue(
+const WaitNodePriorityQueue = zag.sched.priority_queue.PriorityQueue(
     WaitNode,
     "next",
     "priority",

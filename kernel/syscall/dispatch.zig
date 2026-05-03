@@ -26,64 +26,65 @@ const var_ = zag.syscall.var_;
 const virtual_machine = zag.syscall.virtual_machine;
 
 pub const SyscallNum = enum(u64) {
-    ack = 26,
-    acquire_ecs = 5,
-    acquire_vars = 6,
-    affinity = 12,
-    bind_event_route = 36,
-    clear_event_route = 37,
-    create_capability_domain = 4,
-    create_execution_context = 7,
-    create_page_frame = 25,
-    create_port = 33,
-    create_var = 17,
-    create_vcpu = 28,
-    create_virtual_machine = 27,
-    delete = 1,
-    futex_wait_change = 44,
-    futex_wait_val = 43,
-    futex_wake = 45,
-    idc_read = 23,
-    idc_write = 24,
-    info_cores = 51,
-    info_system = 50,
-    map_guest = 29,
-    map_mmio = 19,
-    map_pf = 18,
-    perfmon_info = 13,
-    perfmon_read = 15,
-    perfmon_start = 14,
-    perfmon_stop = 16,
-    power_reboot = 53,
-    power_screen_off = 55,
-    power_set_freq = 56,
-    power_set_idle = 57,
-    power_shutdown = 52,
-    power_sleep = 54,
-    priority = 11,
-    random = 49,
-    recv = 35,
-    remap = 21,
-    reply = 38,
-    reply_transfer = 39,
-    restrict = 0,
-    revoke = 2,
-    self = 8,
-    snapshot = 22,
-    @"suspend" = 34,
-    sync = 3,
-    terminate = 9,
-    time_getwall = 47,
-    time_monotonic = 46,
-    time_setwall = 48,
-    timer_arm = 40,
-    timer_cancel = 42,
-    timer_rearm = 41,
-    unmap = 20,
-    unmap_guest = 30,
-    vm_inject_irq = 32,
-    vm_set_policy = 31,
-    yield = 10,
+    @"suspend" = 14,
+    restrict = 15,
+    delete = 16,
+    revoke = 17,
+    sync = 18,
+    create_capability_domain = 19,
+    acquire_ecs = 20,
+    acquire_vars = 21,
+    create_execution_context = 22,
+    self = 23,
+    terminate = 24,
+    yield = 25,
+    priority = 26,
+    affinity = 27,
+    perfmon_info = 28,
+    perfmon_start = 29,
+    perfmon_read = 30,
+    perfmon_stop = 31,
+    create_var = 32,
+    map_pf = 33,
+    map_mmio = 34,
+    unmap = 35,
+    remap = 36,
+    snapshot = 37,
+    idc_read = 38,
+    idc_write = 39,
+    create_page_frame = 40,
+    ack = 41,
+    create_virtual_machine = 42,
+    create_vcpu = 43,
+    map_guest = 44,
+    unmap_guest = 45,
+    vm_set_policy = 46,
+    vm_inject_irq = 47,
+    create_port = 48,
+    recv = 49,
+    bind_event_route = 50,
+    clear_event_route = 51,
+    reply = 52,
+    reply_transfer = 53,
+    timer_arm = 54,
+    timer_rearm = 55,
+    timer_cancel = 56,
+    futex_wait_val = 57,
+    futex_wait_change = 58,
+    futex_wake = 59,
+    time_monotonic = 60,
+    time_getwall = 61,
+    time_setwall = 62,
+    random = 63,
+    info_system = 64,
+    info_cores = 65,
+    power_shutdown = 66,
+    power_reboot = 67,
+    power_sleep = 68,
+    power_screen_off = 69,
+    power_set_freq = 70,
+    power_set_idle = 71,
+    kprof_dump = 72,
 };
 
 /// Read `args[i]`, returning 0 when the index is past the end. Lets
@@ -98,6 +99,17 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     // word. Anything beyond that range is per-syscall metadata
     // (pair_count, kind, etc.) and is the handler's responsibility.
     const num_raw: u64 = syscall_word & 0xFFF;
+
+    // Fast-suspend wire format: syscall_op in 0..13 encodes a suspend
+    // with payload_count = syscall_op and pair_count = 0. The asm L4
+    // fast path normally handles this; reaching the slow path means
+    // a predicate failed (no receiver queued, port lock contended,
+    // wrong type tag, etc.). Route through the regular suspend handler
+    // so the same caps + state mutations apply.
+    if (num_raw <= 13) {
+        return port.@"suspend"(caller, arg(args, 0), arg(args, 1), 0);
+    }
+
     const num = std.meta.intToEnum(SyscallNum, num_raw) catch return errors.E_INVAL;
 
     return switch (num) {
@@ -398,5 +410,12 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .power_screen_off => system.powerScreenOff(caller),
         .power_set_freq => system.powerSetFreq(caller, arg(args, 0), arg(args, 1)),
         .power_set_idle => system.powerSetIdle(caller, arg(args, 0), arg(args, 1)),
+        .kprof_dump => blk: {
+            // Stop-the-world quiesce + dump. IPIs every other core to
+            // park, drains in-flight emits, dumps every CPU's log to
+            // serial in core-id order, then halts. Doesn't return.
+            zag.kprof.dump.end(.root_exit);
+            break :blk 0;
+        },
     };
 }

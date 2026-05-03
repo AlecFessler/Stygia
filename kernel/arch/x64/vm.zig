@@ -310,7 +310,7 @@ pub fn vmFreeStructures(paddr: PAddr) void {
 }
 
 /// Allocate the stage-2 nested-paging root page (EPT PML4 / NPT PML4).
-/// Spec-v3 dispatch primitive — backs `kvm.vm.allocStage2Root`.
+/// Spec-v3 dispatch primitive — backs `hv.vm.allocStage2Root`.
 pub fn allocStage2RootPage() ?PAddr {
     return switch (active_backend) {
         .intel_vmx => vmx.allocEptRoot(),

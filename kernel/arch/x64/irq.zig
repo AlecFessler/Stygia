@@ -10,6 +10,7 @@ const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const kprof_dump = zag.kprof.dump;
+const kprof_log = zag.kprof.log;
 const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const sched = zag.sched.scheduler;
@@ -204,6 +205,14 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // (`emulateVirtualBar` issues `cpu.outb` directly without
     // `print_lock`), interleaving kernel bytes between userspace bytes
     // and corrupting `[runner] PASS …` lines.
+    //
+    // Kprof session-end gate: once any CPU's per-CPU log fills, `emit`
+    // sets `terminate_requested`. The first scheduler tick that
+    // observes it set kicks off the IPI-coordinated stop-the-world
+    // dump and never returns. No-op when kprof is compiled out.
+    if (kprof_log.terminate_requested != 0) {
+        kprof_dump.end(.log_full);
+    }
     timers.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
     // Drive any deadline-based wakeups for recv-with-timeout and
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.

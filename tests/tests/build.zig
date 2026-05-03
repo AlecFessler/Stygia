@@ -805,7 +805,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("static_syscall", static_syscall_mod);
 
     const libz = addLibz(b, cpu_arch);
-    const libz_loader_src: std.Build.LazyPath = .{ .cwd_relative = "../../libz_loader/lib.zig" };
+    const libz_loader_src: std.Build.LazyPath = .{ .cwd_relative = "../../libz/loader.zig" };
 
     const ctx = TestBuildCtx{
         .target_freestanding = target_freestanding,

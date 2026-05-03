@@ -18,7 +18,6 @@
 const zag = @import("zag");
 
 const exceptions = zag.arch.aarch64.exceptions;
-const fpu = zag.sched.fpu;
 const paging = zag.arch.aarch64.paging;
 const serial = zag.arch.aarch64.serial;
 
@@ -56,12 +55,7 @@ pub fn init() void {
     // CPACR_EL1.FPEN globally open. Set it to 0b01 (trap EL0 only,
     // EL1 unrestricted) — switchTo flips between 0b01 and 0b11 from
     // here on as it tracks per-core FPU ownership. ARM ARM D13.2.30.
-    //
-    // Eager baseline (-Dlazy_fpu=false): leave FPEN at its firmware
-    // default (FPEN=0b11, no trap) so the eager save/restore in
-    // scheduler.switchToWithPmu owns the FPU lifecycle and the trap
-    // handler never fires.
-    if (comptime fpu.lazy_enabled) armFpTrapEl0();
+    armFpTrapEl0();
     // Enable SP alignment checking at EL0 (SCTLR_EL1.SA0, bit 4). Without
     // this, EL0 SP-relative loads with a misaligned SP silently succeed
     // and the §6.8 alignment_fault behaviour cannot be exercised.

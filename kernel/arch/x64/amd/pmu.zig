@@ -25,6 +25,7 @@
 //!   * Event codes differ from Intel; we only encode the always-present
 //!     core events (cycles, retired instructions, branches, mispredicts).
 
+const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
@@ -331,12 +332,44 @@ const KPROF_SAMPLE_PMC: u8 = 0;
 ///         (all refill sources). An umask of 0 counts nothing, which
 ///         is why the first attempt showed cmiss=0 everywhere.
 ///   PMC2: event 0xC3 umask 0x00 = Retired Branch Mispredicts
+/// Counter slots reserved for kprof. Userspace `perfmon_start`
+/// allocates from PMC0 upward; kprof picks the top 3 of AMD's 6
+/// extended PMCs (0xC001_0200..0xC001_020B) so the two never overlap
+/// — without this split, a perfmon test running mid-trace would
+/// silently zero PMC0 and the kprof scope deltas would all read 0.
+pub const KPROF_PMC_CYCLES: u8 = 3;
+pub const KPROF_PMC_CACHE_MISSES: u8 = 4;
+pub const KPROF_PMC_BRANCH_MISSES: u8 = 5;
+
+pub fn kprofTraceCountersPerCoreInit() void {
+    const cfg = [_]struct { pmc: u8, event: u8, umask: u8 }{
+        .{ .pmc = KPROF_PMC_CYCLES, .event = 0x76, .umask = 0x00 },
+        .{ .pmc = KPROF_PMC_CACHE_MISSES, .event = 0x43, .umask = 0xFF },
+        .{ .pmc = KPROF_PMC_BRANCH_MISSES, .event = 0xC3, .umask = 0x00 },
+    };
+    const PERFEVTSEL_OS: u64 = 1 << 17;
+    var i: usize = 0;
+    while (i < cfg.len) {
+        const c = cfg[i];
+        cpu.wrmsr(perfevtselMsr(c.pmc), 0);
+        cpu.wrmsr(perfctrMsr(c.pmc), 0);
+        const word: u64 =
+            @as(u64, c.event) |
+            (@as(u64, c.umask) << 8) |
+            PERFEVTSEL_USR |
+            PERFEVTSEL_OS |
+            PERFEVTSEL_EN;
+        cpu.wrmsr(perfevtselMsr(c.pmc), word);
+        i += 1;
+    }
+}
+
 /// Snapshot the three trace counters. Masked to AMD's 48-bit
 /// counter width so the raw MSR value doesn't carry high-bit noise.
 pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
-    out[0] = cpu.rdmsr(perfctrMsr(0)) & COUNTER_MASK;
-    out[1] = cpu.rdmsr(perfctrMsr(1)) & COUNTER_MASK;
-    out[2] = cpu.rdmsr(perfctrMsr(2)) & COUNTER_MASK;
+    out[0] = cpu.rdmsr(perfctrMsr(KPROF_PMC_CYCLES)) & COUNTER_MASK;
+    out[1] = cpu.rdmsr(perfctrMsr(KPROF_PMC_CACHE_MISSES)) & COUNTER_MASK;
+    out[2] = cpu.rdmsr(perfctrMsr(KPROF_PMC_BRANCH_MISSES)) & COUNTER_MASK;
 }
 
 /// Called from the NMI handler. Reads PMC 0 — if it's below the

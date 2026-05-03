@@ -21,7 +21,7 @@
 // Strategy
 //   Case A — reserved bit in the syscall word.
 //     The reply_transfer syscall word carries:
-//       bits  0-11: syscall_num (= 39)
+//       bits  0-11: syscall_num (= 53)
 //       bits 12-19: N
 //       bits 20-31: reply_handle_id
 //       bits 32-63: _reserved

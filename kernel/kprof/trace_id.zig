@@ -21,6 +21,20 @@ pub const TraceId = enum(u32) {
     unmap_page,
     tlb_shootdown,
 
+    // ── IPC suspend ↔ recv rendezvous ─────────────────────────
+    // Each scoped pair brackets one Zig handler in `kernel/sched/port.zig`.
+    // Use these to compare per-handler cycle costs before/after the L4
+    // zero-copy fast path lands. Existing tests exercise the slow Zig
+    // path (libz emits `suspend = 14` with `pair_count` in the syscall
+    // word, so the asm classifier `cmpq $13` falls through). When
+    // userspace adopts the fast-suspend ABI (`syscall_op = 0..13`), the
+    // asm path bypasses these points entirely — apparent zero-cost there
+    // is the proof of zero-copy.
+    suspend_ec = 200,
+    recv,
+    reply,
+    deliver_event,
+
     // ── VM exit handling ─────────────────────────────────────
     vm_exit = 400,
 };

@@ -11,8 +11,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
-const VarPageSize = zag.capdom.var_range.PageSize;
-const VarCacheType = zag.capdom.var_range.CacheType;
+const VarPageSize = zag.memory.var_range.PageSize;
+const VarCacheType = zag.memory.var_range.CacheType;
 
 // ── Address Space Layout ────────────────────────────────────────────────
 // Architecture-specific virtual address space boundaries. These define

@@ -14,16 +14,10 @@
 //   replies with a resume action to enter guest mode.
 //
 //   §[vm_exit_state] enumerates per-arch vm_exit sub-codes (cpuid, io,
-//   mmio, ept, hlt, ...) but the named "initial-state" sub-code is a
-//   sentinel that lives outside the per-arch fault enumeration — the
-//   kernel uses it to mark the synthetic exit injected at create_vcpu
-//   time rather than mis-attributing a real fault category. The
-//   in-kernel sentinel is `INITIAL_STATE_SUBCODE = 0xFF`
-//   (kernel/capdom/virtual_machine.zig); per the design note there it
-//   is mapped to the architecture's initial-state slot before the
-//   first `enterGuest`. The spec table reserves sub-code values 0..12
-//   (x86-64) and 0..9 (aarch64) for fault categories, so a high
-//   sentinel (0xFF) is a non-overlapping slot in either taxonomy.
+//   mmio, ept, hlt, ...). The `initial_state` sub-code is the explicit
+//   table entry for the synthetic exit injected at create_vcpu time:
+//   sub-code 13 on x86-64, sub-code 10 on aarch64. libz exposes the
+//   arch-dispatched value as `syscall.INITIAL_STATE_SUBCODE`.
 //
 // Strategy
 //   The setup mirrors create_vcpu_10 — mint a VmPolicy page frame, map
@@ -76,7 +70,8 @@
 //      lets us observe the kernel-injected initial vm_exit.
 //   6. createVcpu(caps_word=0, vm_handle, affinity=0, exit_port).
 //   7. recv(exit_port) — must return OK with the initial vm_exit.
-//   8. regs.v2 == INITIAL_STATE_SUBCODE (0xFF).
+//   8. regs.v2 == syscall.INITIAL_STATE_SUBCODE (13 on x86-64, 10 on
+//      aarch64; §[vm_exit_state]).
 //   9. regs.v3 and regs.v4..v13 all zero.
 //
 // Assertions
@@ -89,8 +84,8 @@
 //   6: setup — createVcpu returned an error word.
 //   7: recv on the exit_port did not return OK in vreg 1 (the spec
 //      assertion: an initial vm_exit must already be queued).
-//   8: the recv'd event's sub-code (vreg 2) is not the initial-state
-//      sub-code (0xFF).
+//   8: the recv'd event's sub-code (vreg 2) is not the §[vm_exit_state]
+//      `initial_state` sub-code (x86-64: 13, aarch64: 10).
 //   9: any guest-state vreg observed via the register-passed slots is
 //      non-zero — vreg 3 (= guest rdx / event_addr, expected 0) and
 //      vregs 4..13 (= guest rbp, rsi, rdi, r8, r9, r10, r12..r15).
@@ -107,13 +102,6 @@ const HandleId = caps.HandleId;
 // §[vm_policy] x86-64: 32 CpuidPolicy (24 B) + num_cpuid (4 B) + pad
 // (4 B) + 8 CrPolicy (24 B) + num_cr (4 B) + pad (4 B) = 976 B.
 const VM_POLICY_BYTES: usize = 32 * 24 + 8 + 8 * 24 + 8;
-
-// Initial-state vm_exit sub-code sentinel (kernel/capdom/virtual_machine.zig
-// `INITIAL_STATE_SUBCODE`). 0xFF is outside the §[vm_exit_state]
-// per-arch fault enumeration (x86-64: 0..12; aarch64: 0..9), so it is
-// an unambiguous mark for the synthetic exit injected at create_vcpu
-// time on either architecture.
-const INITIAL_STATE_SUBCODE: u64 = 0xFF;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -222,8 +210,9 @@ pub fn main(cap_table_base: u64) void {
 
     // 8. §[vm_exit_state]: the exit sub-code rides in the receiver's
     //    vreg 2 (rbx on x86-64). Per §[create_vcpu] the synthetic
-    //    initial event must carry the initial-state sub-code sentinel.
-    if (got.regs.v2 != INITIAL_STATE_SUBCODE) {
+    //    initial event must carry the `initial_state` sub-code (13 on
+    //    x86-64, 10 on aarch64).
+    if (got.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
         testing.fail(8);
         return;
     }

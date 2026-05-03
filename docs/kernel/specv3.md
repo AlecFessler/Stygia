@@ -1613,7 +1613,7 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
 
 Caps required: caller's self-handle must have `crec`. Holding the VM handle implies the authority to spawn vCPUs in it.
 
-The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events. Immediately upon creation, the kernel enqueues a vm_exit-style delivery on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the initial-state sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
+The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events. Immediately upon creation, the kernel enqueues a vm_exit-style delivery on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
 
 Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
 
@@ -1628,7 +1628,7 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 09] on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 [test 10] on success, the EC's priority is set to `[1].priority`.
 [test 11] on success, the EC's affinity is set to `[3]`.
-[test 12] immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
+[test 12] immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the `initial_state` sub-code.
 
 ### map_guest
 
@@ -2025,6 +2025,7 @@ Exit sub-codes:
 | 10 | shutdown | guest triggered shutdown |
 | 11 | triple | guest triple-faulted |
 | 12 | unknown | unknown or unhandled exit reason |
+| 13 | initial_state | vCPU has not yet been entered; reply with this sub-code keeps the vCPU not-started and re-delivers an initial vm_exit (see §[reply]) |
 
 vreg layout:
 
@@ -2067,6 +2068,7 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 | except | `{vector u8}` | error_code | _reserved |
 | intwin, hlt, shutdown, triple | _reserved | _reserved | _reserved |
 | unknown | raw exit reason | _reserved | _reserved |
+| initial_state | _reserved | _reserved | _reserved |
 
 **aarch64**
 
@@ -2084,6 +2086,7 @@ Exit sub-codes:
 | 7 | halt | guest requested halt |
 | 8 | shutdown | guest triggered shutdown |
 | 9 | unknown | other unhandled exit |
+| 10 | initial_state | vCPU has not yet been entered; reply with this sub-code keeps the vCPU not-started and re-delivers an initial vm_exit (see §[reply]) |
 
 vreg layout:
 
@@ -2118,6 +2121,7 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 | sync_el1 | ESR_EL2 | _reserved | _reserved |
 | halt, shutdown | _reserved | _reserved | _reserved |
 | unknown | raw ESR_EL2 | _reserved | _reserved |
+| initial_state | _reserved | _reserved | _reserved |
 
 ## §[event_route] Event Route
 
@@ -2237,6 +2241,13 @@ Consumes a reply handle and resumes the suspended EC. State modifications writte
 
 The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
 
+The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
+
+- For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
+- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`, `pmu_overflow`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
+
+The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
+
 ```
 reply -> void
   syscall_num = 52
@@ -2255,6 +2266,7 @@ No self-handle cap required — the reply handle itself authorizes the operation
 [test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 [test 07] on success, the suspended EC is resumed.
+[test 08] on success when the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code into the reply (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; a subsequent `recv` on the exit_port returns a vm_exit whose sub-code is `initial_state`.
 
 ### reply_transfer
 
@@ -2291,6 +2303,7 @@ Reply cap required on the reply handle: `xfer`.
 [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 [test 15] on success, the suspended EC is resumed.
+[test 16] on success when the reply_transfer is typed `vm_exit` and the receiver wrote the `initial_state` sub-code into the reply (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; the N attached handles are still installed in the vCPU's domain at slots [tstart, tstart+N) per the standard reply_transfer rules.
 
 ## §[timer] Timer
 

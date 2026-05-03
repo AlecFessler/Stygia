@@ -168,7 +168,7 @@ fn siblingEntry() callconv(.c) noreturn {
 // listed as clobbers because the syscall instruction's restore
 // boundary may touch them.
 fn replyTransferOne(reply_handle_id: u12, pair_entry: u64) u64 {
-    const word: u64 = (@as(u64, 39) & 0xFFF) |
+    const word: u64 = (@as(u64, 53) & 0xFFF) |
         (@as(u64, 1) << 12) |
         ((@as(u64, reply_handle_id) & 0xFFF) << 20);
     switch (builtin.cpu.arch) {

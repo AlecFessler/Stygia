@@ -58,7 +58,7 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-const SUSPEND_NUM: u64 = 34;
+const SUSPEND_NUM: u64 = 14;
 
 fn buildSuspendWord(pair_count: u8) u64 {
     return SUSPEND_NUM | (@as(u64, pair_count) << 12);

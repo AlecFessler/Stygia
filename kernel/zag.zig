@@ -1,8 +1,8 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
-pub const capdom = @import("capdom/capdom.zig");
 pub const caps = @import("caps/caps.zig");
 pub const devices = @import("devices/devices.zig");
+pub const hv = @import("hv/hv.zig");
 pub const kprof = @import("kprof");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");

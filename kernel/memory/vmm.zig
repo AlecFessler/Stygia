@@ -11,7 +11,7 @@ const PAddr = zag.memory.address.PAddr;
 const SlabRef = secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
-const VarCaps = zag.capdom.var_range.VarCaps;
+const VarCaps = zag.memory.var_range.VarCaps;
 
 /// Per-VMM reservation cap. Reservations live in a sorted inline
 /// `[MAX_RESERVATIONS]SlabRef(VmNode)` array — lookups are

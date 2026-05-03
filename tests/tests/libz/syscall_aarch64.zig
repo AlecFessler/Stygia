@@ -237,6 +237,154 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
 // vregs 32..127 at [sp + 8..768]), zero it so the kernel reads 0 for
 // vregs we don't explicitly set, write the attachment u64s into the
 // high band, drop the syscall word at [sp+0], and `svc #0`.
+// Reply path for vm_exit-typed replies (spec §[reply] / §[vm_exit_state]).
+// On aarch64 the kernel reads vregs 32..127 from [sp + 8 .. sp + 776],
+// so reserve 784 bytes and write the exit sub-code at vreg 117 = [sp + 688].
+pub fn replyVmExitAsm(word: u64, subcode: u64) Regs {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ mov x13, sp
+        \\ mov x14, #97
+        \\1: str xzr, [x13]
+        \\ add x13, x13, #8
+        \\ subs x14, x14, #1
+        \\ b.ne 1b
+        // Sub-code at vreg 117 = [sp + 688].
+        \\ str %[subcode], [sp, #688]
+        // Syscall word at [sp+0].
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [v1] "={x0}" (ov1),
+          [v2] "={x1}" (ov2),
+          [v3] "={x2}" (ov3),
+          [v4] "={x3}" (ov4),
+          [v5] "={x4}" (ov5),
+          [v6] "={x5}" (ov6),
+          [v7] "={x6}" (ov7),
+          [v8] "={x7}" (ov8),
+          [v9] "={x8}" (ov9),
+          [v10] "={x9}" (ov10),
+          [v11] "={x10}" (ov11),
+          [v12] "={x11}" (ov12),
+          [v13] "={x12}" (ov13),
+        : [word] "r" (word),
+          [subcode] "r" (subcode),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+             .x29 = true, .x30 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
+// reply_transfer for vm_exit-typed replies. Combines the wide
+// §[vm_exit_state] window write (sub-code at vreg 117) with attached
+// handles in vregs [128-N..127].
+pub fn replyTransferVmExitAsm(word: u64, attachments_ptr: [*]const u64, n: u64, subcode: u64) Regs {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ mov x13, sp
+        \\ mov x14, #97
+        \\1: str xzr, [x13]
+        \\ add x13, x13, #8
+        \\ subs x14, x14, #1
+        \\ b.ne 1b
+        // Sub-code at vreg 117 = [sp + 688].
+        \\ str %[subcode], [sp, #688]
+        // Attachments in vregs [128-N..127]. Mirror of replyTransferAsm.
+        \\ mov x15, %[atts_ptr]
+        \\ mov x14, %[n]
+        \\ mov x13, #97
+        \\ sub x13, x13, x14
+        \\ lsl x13, x13, #3
+        \\ add x13, x13, sp
+        \\2: ldr x16, [x15]
+        \\ str x16, [x13]
+        \\ add x15, x15, #8
+        \\ add x13, x13, #8
+        \\ subs x14, x14, #1
+        \\ b.ne 2b
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [v1] "={x0}" (ov1),
+          [v2] "={x1}" (ov2),
+          [v3] "={x2}" (ov3),
+          [v4] "={x3}" (ov4),
+          [v5] "={x4}" (ov5),
+          [v6] "={x5}" (ov6),
+          [v7] "={x6}" (ov7),
+          [v8] "={x7}" (ov8),
+          [v9] "={x8}" (ov9),
+          [v10] "={x9}" (ov10),
+          [v11] "={x10}" (ov11),
+          [v12] "={x11}" (ov12),
+          [v13] "={x12}" (ov13),
+        : [word] "r" (word),
+          [atts_ptr] "r" (attachments_ptr),
+          [n] "r" (n),
+          [subcode] "r" (subcode),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+             .x29 = true, .x30 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
 pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;

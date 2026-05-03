@@ -66,8 +66,8 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
-const VarCacheType = zag.capdom.var_range.CacheType;
-const VarPageSize = zag.capdom.var_range.PageSize;
+const VarCacheType = zag.memory.var_range.CacheType;
+const VarPageSize = zag.memory.var_range.PageSize;
 
 /// Per-MappingKind descriptor attributes. cache/global/user fields are
 /// owned by the arch backend (ARM ARM D5.4, D13.2.97).

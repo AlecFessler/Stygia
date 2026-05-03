@@ -41,12 +41,15 @@ const syscall = lib.syscall;
 // must not try to mapPf libz at LIBZ_SLIDE itself.
 pub const RUNNER_STATIC = true;
 
-// Spec §[port].recv [2] timeout_ns. 5 s is roughly 50× the all-test
-// completion budget (the in-kernel-parallel runner's healthy-tests
-// path finishes near-instant per result), so any test still pending
-// at this point is hung and gets recorded as MISS via the not_run
-// initial state of the results table.
-const RECV_TIMEOUT_NS: u64 = 5_000_000_000;
+// Spec §[port].recv [2] timeout_ns. 30 s is the trace-mode budget;
+// `-Dkernel_profile=trace` injects 2 log records + 3 PMU MSR reads
+// per scope at every IPC/page-fault/IRQ point, and the CR3-swap-heavy
+// timer batch otherwise pushes past the 10 s no-trace budget the
+// non-trace path already needed for timer_rearm_07's 100M+ pause-loop
+// iterations on healthy runs. Trace just adds a constant per-record
+// cost on top. Overhead-free when the batch finishes early; only
+// costs extra wall-clock on a genuine hang.
+const RECV_TIMEOUT_NS: u64 = 30_000_000_000;
 
 // Tag magic. The build emits each test ELF with `test_tag.TAG =
 // TAG_MAGIC | manifest_index`. Tests that explicitly suspend their
@@ -90,6 +93,19 @@ var libz_pf_handle: caps.HandleId = 0;
 
 pub fn main(cap_table_base: u64) void {
     serial = serial_mod.init(cap_table_base);
+
+    // Spec §[execution_context].priority — bump self to `.high` (=2)
+    // so the receiver preempts test ECs the moment a result lands. Two
+    // effects matter for the L4 fast path: (a) when a child suspends,
+    // primary is already parked in `recv` and `port.waiter_kind ==
+    // .receivers`, so the asm rendezvous matches its predicate and
+    // bypasses the slow Zig path entirely; (b) primary's reply →
+    // recv → next-suspend cycle stays head-of-queue so the next child
+    // also finds primary parked. Without this nudge, primary and
+    // children all tie at `.normal` and the round-robin scheduler
+    // gives children a chance to suspend before primary parks — the
+    // fast path predicate then fails 100% of the time.
+    _ = syscall.priority(caps.SLOT_INITIAL_EC, 2);
 
     // §[port] / §[create_port] — mint a single shared result port.
     const port_caps = caps.PortCap{
@@ -236,6 +252,13 @@ pub fn main(cap_table_base: u64) void {
     }
 
     summarize();
+
+    // Drain the kernel kprof log to serial after every test has
+    // reported but before tearing down child CDs in shutdown. Children
+    // intentionally do NOT call kprofDump from their start.zig — the
+    // first child to do so would win the dumpOnce cmpxchg and emit a
+    // partial log mid-run. Single-shot here captures the whole run.
+    syscall.kprofDump();
 
     // Stop the system. power_shutdown requires the `power` cap on
     // the self-handle, which the primary holds by construction.
@@ -411,7 +434,7 @@ fn stageLibzPf() caps.HandleId {
     libz_loader.layoutAndPrelink(
         libz_bytes,
         image[0..image_bytes],
-        libz_loader.constants.LIBZ_SLIDE,
+        libz_loader.LIBZ_SLIDE,
     );
 
     // Drop the temp Var. The pf keeps the data; the runner holds

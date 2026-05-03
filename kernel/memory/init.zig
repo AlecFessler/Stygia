@@ -4,9 +4,8 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const boot = zag.boot;
-const capability_domain_mod = zag.capdom.capability_domain;
+const capability_domain_mod = zag.caps.capability_domain;
 const dev_region_mod = zag.devices.device_region;
-const device_region_mod = zag.memory.device_region;
 const execution_context_mod = zag.sched.execution_context;
 const KA = address.KernelVA.KernelAllocators;
 const page_frame_mod = zag.memory.page_frame;
@@ -15,8 +14,8 @@ const perfmon_mod = zag.sched.perfmon;
 const pmm = zag.memory.pmm;
 const port_mod = zag.sched.port;
 const timer_mod = zag.sched.timer;
-const var_range_mod = zag.capdom.var_range;
-const virtual_machine_mod = zag.capdom.virtual_machine;
+const var_range_mod = zag.memory.var_range;
+const virtual_machine_mod = zag.hv.virtual_machine;
 const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
@@ -187,15 +186,6 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.vm_node_slab_ptrs,
         KA.vm_node_slab_links,
     );
-    device_region_mod.initSlab(
-        KA.device_region_slab,
-        KA.device_region_slab_ptrs,
-        KA.device_region_slab_links,
-    );
-    // Spec-v3 §[device_region] slab. Boot-time PCI / serial enumerators
-    // call into devices.device_region.registerMmio / registerPortIo
-    // before any userspace runs, so the slab must be live before
-    // arch.boot.parseFirmwareTables.
     dev_region_mod.initSlab(
         KA.dev_region_slab,
         KA.dev_region_slab_ptrs,

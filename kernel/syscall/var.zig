@@ -2,9 +2,9 @@ const zag = @import("zag");
 
 const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
-const var_range = zag.capdom.var_range;
+const var_range = zag.memory.var_range;
 
-const CapabilityDomainCaps = zag.capdom.capability_domain.CapabilityDomainCaps;
+const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Word0 = capability.Word0;
 

@@ -4,7 +4,7 @@ const errors = zag.syscall.errors;
 const futex = zag.sched.futex;
 const paging = zag.arch.dispatch.paging;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PAddr = zag.memory.address.PAddr;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;

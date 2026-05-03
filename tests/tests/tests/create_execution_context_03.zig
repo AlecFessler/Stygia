@@ -59,7 +59,7 @@ const testing = lib.testing;
 
 const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
 const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
-// Mirrors libz_loader.constants.LIBZ_PF_SLOT — the runner places the
+// Mirrors libz_loader.LIBZ_PF_SLOT — the runner places the
 // staged libz page frame here for every spawned test domain so its
 // _start can mapPf libz at LIBZ_SLIDE.
 const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5

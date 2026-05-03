@@ -23,7 +23,7 @@
 
 const zag = @import("zag");
 
-const capability_domain = zag.capdom.capability_domain;
+const capability_domain = zag.caps.capability_domain;
 const derivation = zag.caps.derivation;
 const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
@@ -32,8 +32,8 @@ const page_frame = zag.memory.page_frame;
 const port = zag.sched.port;
 const secure_slab = zag.memory.allocators.secure_slab;
 const timer = zag.sched.timer;
-const var_range = zag.capdom.var_range;
-const virtual_machine = zag.capdom.virtual_machine;
+const var_range = zag.memory.var_range;
+const virtual_machine = zag.hv.virtual_machine;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;

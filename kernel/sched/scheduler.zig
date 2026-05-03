@@ -24,7 +24,7 @@ const SpinLock = zag.utils.sync.SpinLock;
 /// field and ordered by `priority`. Shared by per-core run queues and
 /// port wait queues. Futex buckets use a separate WaitNode-based queue
 /// (see sched/futex.zig).
-pub const EcQueue = zag.utils.containers.priority_queue.PriorityQueue(
+pub const EcQueue = zag.sched.priority_queue.PriorityQueue(
     ExecutionContext,
     "next",
     "priority",
@@ -139,6 +139,11 @@ pub fn perCoreInit() void {
     // VMLAUNCH/VMRUN; safe no-op when the platform doesn't support
     // hardware virt.
     arch.vm.vmPerCoreInit();
+    // Program kprof trace counters (PMC0/1/2 = cycles / cache misses /
+    // branch misses). No-op unless `-Dkernel_profile=trace`. Counters
+    // free-run; tracepoints snapshot them into each emitted record so
+    // the post-processor can compute per-scope deltas.
+    arch.pmu.kprofTraceCountersPerCoreInit();
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -158,7 +163,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // the kernel re-enters guest mode and on the subsequent guest exit
     // delivers a vm_exit event on its `exit_port`. Real VMX/SVM guest
     // re-entry (loadGuestState → VMLAUNCH/VMRESUME → exit decode) is
-    // still a TODO in `arch/x64/kvm/vcpu.zig` — until that lands, fire a
+    // still a TODO in `arch/x64/hv/vcpu.zig` — until that lands, fire a
     // synthetic exit immediately so the recv/reply lifecycle remains
     // observable end-to-end. The vCPU re-suspends on its exit_port via
     // `fireVmExit` (which may rendezvous with a parked VMM receiver and

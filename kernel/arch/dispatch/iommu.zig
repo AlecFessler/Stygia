@@ -7,7 +7,7 @@ const x64 = zag.arch.x64;
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const VarPageSize = zag.capdom.var_range.PageSize;
+const VarPageSize = zag.memory.var_range.PageSize;
 
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).

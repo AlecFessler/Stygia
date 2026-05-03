@@ -252,6 +252,166 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
 // 928 bytes (16-byte aligned, covers [rsp + 0..920] = vreg 0 + vregs
 // 14..127), populate the high band with the attachment u64s, drop the
 // syscall word at [rsp+0], and execute syscall.
+// Reply path for vm_exit-typed replies (spec §[reply] / §[vm_exit_state]).
+// The kernel reads the §[vm_exit_state] window from the receiver's user
+// stack at [rsp + 8 .. rsp + 480] (vregs 14..73). Tests that reply on a
+// vm_exit must reserve that window so the kernel reads zeros (not caller
+// stack garbage) and write the exit sub-code at vreg 70 = [rsp + 456] —
+// the kernel uses sub-code = `initial_state` (13 on x86-64) as the
+// "stay not-started" handshake; other sub-codes attempt guest entry with
+// whatever the wide window contains.
+pub fn replyVmExitAsm(word: u64, subcode: u64) Regs {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+    // Reserve 496 bytes — covers vreg 0 at [rsp+0] and vregs 14..73 at
+    // [rsp + 8 .. rsp + 480]. 488 rounded up to 16-byte alignment.
+        \\ subq $496, %%rsp
+        // Zero the 62 reserved u64 slots so vregs the kernel reads but
+        // we don't explicitly set come back as 0 rather than caller-
+        // frame stack garbage.
+        \\ movq %%rsp, %%rax
+        \\ movq $62, %%rcx
+        \\1: movq $0, (%%rax)
+        \\ addq $8, %%rax
+        \\ decq %%rcx
+        \\ jnz 1b
+        // Sub-code at vreg 70 = [rsp + 456].
+        \\ movq %[subcode], %%rax
+        \\ movq %%rax, 456(%%rsp)
+        // Syscall word at [rsp+0].
+        \\ movq %[word], %%rax
+        \\ movq %%rax, (%%rsp)
+        \\ syscall
+        \\ addq $496, %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [word] "r" (word),
+          [subcode] "r" (subcode),
+        : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
+// reply_transfer for vm_exit-typed replies. Combines the wide
+// §[vm_exit_state] window write (sub-code at vreg 70) with attached
+// handles in vregs [128-N..127]. Total stack window = 928 bytes (covers
+// vreg 0 + vregs 14..127). Mirror of `replyTransferAsm` with an extra
+// sub-code store.
+pub fn replyTransferVmExitAsm(word: u64, attachments_ptr: [*]const u64, n: u64, subcode: u64) Regs {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ subq $928, %%rsp
+        \\ movq %%rsp, %%rax
+        \\ movq $116, %%rcx
+        \\1: movq $0, (%%rax)
+        \\ addq $8, %%rax
+        \\ decq %%rcx
+        \\ jnz 1b
+        // Sub-code at vreg 70 = [rsp + 456].
+        \\ movq %[subcode], %%rax
+        \\ movq %%rax, 456(%%rsp)
+        // Attachments into vregs [128-N..127] at offsets
+        // [rsp + (128-N-13)*8 .. rsp + 912].
+        \\ movq %[atts_ptr], %%rsi
+        \\ movq %[n], %%rcx
+        \\ movq %%rcx, %%rdi
+        \\ negq %%rdi
+        \\ addq $115, %%rdi
+        \\ shlq $3, %%rdi
+        \\ addq %%rsp, %%rdi
+        \\2: movq (%%rsi), %%rax
+        \\ movq %%rax, (%%rdi)
+        \\ addq $8, %%rsi
+        \\ addq $8, %%rdi
+        \\ decq %%rcx
+        \\ jnz 2b
+        \\ movq %[word], %%rax
+        \\ movq %%rax, (%%rsp)
+        \\ syscall
+        \\ addq $928, %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [word] "r" (word),
+          [atts_ptr] "r" (attachments_ptr),
+          [n] "r" (n),
+          [subcode] "r" (subcode),
+        : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
 pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;

@@ -13,15 +13,15 @@ const paging_mod = zag.arch.x64.paging;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
-const var_range = zag.capdom.var_range;
+const var_range = zag.memory.var_range;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = zag.devices.device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const VAR = zag.capdom.var_range.VAR;
+const VAR = zag.memory.var_range.VAR;
 const VAddr = zag.memory.address.VAddr;
 
 /// thread_fault sub-codes for exception-derived faults (spec §[event_type]

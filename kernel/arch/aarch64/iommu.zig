@@ -35,7 +35,7 @@ const zag = @import("zag");
 const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
-const VarPageSize = zag.capdom.var_range.PageSize;
+const VarPageSize = zag.memory.var_range.PageSize;
 
 // SMMU driver is not yet implemented. QEMU `virt` does not expose an IORT
 // SMMU node by default, and the kernel test rig does not need real stage-2

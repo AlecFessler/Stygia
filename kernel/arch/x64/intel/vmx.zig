@@ -472,7 +472,7 @@ pub fn perCoreInit() void {
 /// the first 4 bytes per Table 25-1.
 /// Returns the physical address of the VMCS, or null on failure.
 /// Allocate and zero a single 4K page to serve as the EPT PML4 root.
-/// Spec-v3 split: caller (`arch.x64.kvm.vm.allocStage2Root`) holds this
+/// Spec-v3 split: caller (`arch.x64.hv.vm.allocStage2Root`) holds this
 /// PAddr in `VirtualMachine.guest_pt_root` and feeds it into
 /// `allocVmcsWithEpt` when the per-VM control state is allocated.
 pub fn allocEptRoot() ?PAddr {
@@ -1216,8 +1216,8 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
 /// VMX transitions; SDM 28.3.3.1). VPID is currently not enabled, which
 /// changes linear/combined mapping invalidation but not EPT-only mappings.
 ///
-/// Caller contract (per Zag's current kvm architecture, see
-/// `kernel/arch/x64/kvm/vm.zig` and `guest_memory.zig`):
+/// Caller contract (per Zag's current hv architecture, see
+/// `kernel/arch/x64/hv/vm.zig` and `guest_memory.zig`):
 ///
 ///   1. `guest_mem.deinit` teardown path — called only from `Vm.destroy`,
 ///      which first sets every vCPU to `.exited` and spins on

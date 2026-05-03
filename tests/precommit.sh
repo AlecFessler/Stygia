@@ -9,8 +9,7 @@
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
 #   3. hyprvOS Linux boot          (x86-64, KVM on this PC)
 #   4. hyprvOS Linux boot          (aarch64, KVM on Pi via SSH)
-#   5. red-team regression PoCs   (tests/redteam/run_all.sh)
-#   6. kernel perf regression gate (tests/prof/run_perf.sh, kprof trace)
+#   5. kernel perf regression gate (tests/prof/run_perf.sh, kprof trace)
 #
 # Usage:
 #   ./tests/precommit.sh             # full gauntlet (all stages, including optional)
@@ -62,8 +61,7 @@ REQUIRED_STAGES=(
 #
 # Stages explicitly NOT meant for this gate (each runs in the full
 # manual invocation only):
-#   redteam_regressions         — too slow + scope mismatch for per-commit gate
-#   kernel_perf                 — same
+#   kernel_perf                 — too slow + scope mismatch for per-commit gate
 
 is_required() {
     local s
@@ -532,33 +530,6 @@ stage_hyprvos_aarch64_linux_boot() {
     fi
 }
 
-stage_redteam_regressions() {
-    echo ""
-    echo "=================================================="
-    echo "[5] Red-team regression PoCs"
-    echo "=================================================="
-    # tests/redteam/run_all.sh iterates every PoC that emits a
-    # `POC-<id>: PATCHED` marker, reusing the per-PoC run.sh pipeline.
-    # SKIPPED outcomes (e.g. no VMX) are allowed; VULNERABLE or a
-    # missing marker (kernel panic before AFTER) fails the gate.
-
-    # Stages 3 and 4 overwrite zig-out/img/kernel.elf with hyprvos
-    # builds (x86 then aarch64). run.sh copies whatever kernel.elf
-    # is present; without rebuilding, the PoCs would boot an aarch64
-    # kernel under x86 QEMU and die in the bootloader. Rebuild the
-    # x86 test-profile kernel before the red-team run.
-    clean_nvvars
-    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test 2>&1); then
-        FAILURES+=("red-team kernel rebuild")
-        return 1
-    fi
-
-    if ! bash "$SCRIPT_DIR/redteam/run_all.sh"; then
-        FAILURES+=("red-team regressions")
-        return 1
-    fi
-}
-
 stage_kernel_perf() {
     echo ""
     echo "=================================================="
@@ -587,7 +558,6 @@ run_stage aarch64_kernel_tests_pi
 run_stage aarch64_vm_tests_tcg
 run_stage hyprvos_x86_linux_boot
 run_stage hyprvos_aarch64_linux_boot
-run_stage redteam_regressions
 run_stage kernel_perf
 
 echo ""

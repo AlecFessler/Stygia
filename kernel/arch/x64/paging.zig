@@ -15,8 +15,8 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
-const VarCacheType = zag.capdom.var_range.CacheType;
-const VarPageSize = zag.capdom.var_range.PageSize;
+const VarCacheType = zag.memory.var_range.CacheType;
+const VarPageSize = zag.memory.var_range.PageSize;
 
 /// First user-mappable virtual address. The NULL guard `[0, 0x1000)` is
 /// reserved by spec §[address_space] so that NULL dereferences always

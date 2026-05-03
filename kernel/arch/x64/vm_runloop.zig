@@ -1,9 +1,9 @@
 //! x86-64 vCPU run-loop driver.
 //!
 //! Stitches the per-arch VMX/SVM `vmResume` to the kernel's per-vCPU
-//! storage (`kvm.vcpu.VcpuArchState`) and the per-VM control state
+//! storage (`hv.vcpu.VcpuArchState`) and the per-VM control state
 //! (VMCS on Intel, VMCB on AMD) pinned on `VirtualMachine.arch_state`
-//! via `kvm.vm.allocVmArchState`. Exit reasons are decoded by the
+//! via `hv.vm.allocVmArchState`. Exit reasons are decoded by the
 //! per-arch backend into the cross-arch `vm_hw.VmExitInfo`; this module
 //! folds that into the spec-v3 §[vm_exit_state] sub-code + 3-vreg
 //! payload the scheduler hands to `sched.port.fireVmExit`.
@@ -11,8 +11,8 @@
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
-const kvm_vcpu = zag.arch.x64.kvm.vcpu;
-const kvm_vm = zag.arch.x64.kvm.vm;
+const hv_vcpu = zag.arch.x64.hv.vcpu;
+const hv_vm = zag.arch.x64.hv.vm;
 const timers = zag.arch.x64.timers;
 const vm_hw = zag.arch.x64.vm;
 
@@ -52,7 +52,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     if (!vm_hw.vmSupported()) return null;
 
     // Resolve the VM's per-vCPU state and the VM's control-state PAddr.
-    const arch_state = kvm_vcpu.archStateOf(vcpu_ec) orelse return null;
+    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return null;
 
     // Defer real VMLAUNCH/VMRUN until the VMM has supplied initial
     // guest state via reply. Otherwise we would VM-enter with a zeroed
@@ -144,7 +144,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
 
         switch (exit_info) {
             .ept_violation => |ept| {
-                if (!kvm_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
+                if (!hv_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
                 // Handled inline — re-enter the guest immediately.
             },
             // EXIT_REASON_EXTERNAL_INT — a host IRQ was pending when the
@@ -410,7 +410,7 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 /// arming the next `enterGuest` to actually execute VMLAUNCH/VMRUN with
 /// the supplied initial guest state.
 pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
-    const arch_state = kvm_vcpu.archStateOf(vcpu_ec) orelse return;
+    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
     // Receiver didn't reserve enough stack for the §[vm_exit_state]
     // CR/segment/MSR window, so the VMM hasn't supplied real initial
     // guest state. Leave `arch_state.started=false` so the next
@@ -522,7 +522,7 @@ pub fn populateVmExitVregs(
     subcode: u8,
     payload: [3]u64,
 ) void {
-    const arch_state = kvm_vcpu.archStateOf(vcpu_ec) orelse return;
+    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
     const gs = &arch_state.guest_state;
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
@@ -608,14 +608,14 @@ pub fn populateVmExitVregsIfStarted(
     sender: *ExecutionContext,
     subcode: u8,
 ) void {
-    const arch_state = kvm_vcpu.archStateOf(sender) orelse return;
+    const arch_state = hv_vcpu.archStateOf(sender) orelse return;
     if (!arch_state.started) return;
     populateVmExitVregs(receiver, sender, subcode, arch_state.last_exit_payload);
     receiver.pending_event_rip = 0;
     receiver.pending_event_rip_valid = false;
 }
 
-fn deliverPendingInterrupts(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine, gs: *vm_hw.GuestState) void {
+fn deliverPendingInterrupts(vm_ptr: *zag.hv.virtual_machine.VirtualMachine, gs: *vm_hw.GuestState) void {
     // Skip if guest interrupts are masked. On AMD, also skip if a prior
     // EVENTINJ is still pending (the guest hasn't entered yet).
     if ((gs.rflags & (1 << 9)) == 0) return;
@@ -630,9 +630,9 @@ fn deliverPendingInterrupts(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine, 
     vm_ptr.arch_devices.lapic.acceptInterrupt(vector);
 }
 
-fn ctrlPhysFor(vm_ptr: *zag.capdom.virtual_machine.VirtualMachine) ?PAddr {
+fn ctrlPhysFor(vm_ptr: *zag.hv.virtual_machine.VirtualMachine) ?PAddr {
     const erased = vm_ptr.arch_state orelse return null;
-    const cell: *kvm_vm.CtrlStateCell = @ptrCast(@alignCast(erased));
+    const cell: *hv_vm.CtrlStateCell = @ptrCast(@alignCast(erased));
     return cell.ctrl_phys;
 }
 

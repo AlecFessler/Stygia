@@ -6,7 +6,7 @@ const device_region = zag.devices.device_region;
 const errors = zag.syscall.errors;
 const port = zag.sched.port;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;

@@ -57,7 +57,7 @@ pub export fn _start(cap_table_base: u64) noreturn {
     if (!is_runner) {
         bootstrapLibz(cap_table_base);
         const slide = @intFromPtr(&__ehdr_start);
-        _ = libz_loader.relocateSelf(slide, libz_loader.constants.LIBZ_SLIDE);
+        _ = libz_loader.relocateSelf(slide, libz_loader.LIBZ_SLIDE);
     }
     app.main(cap_table_base);
     // Fall-through: drop the self-handle, which per spec §[delete]
@@ -92,7 +92,7 @@ fn bootstrapLibz(cap_table_base: u64) void {
     // passed_handles in spawnOne. Kernel-mutable snapshot in
     // `field0` (bits 0-31) carries the pf's page count — we use
     // it to size the Var rather than baking a constant.
-    const cap = lib.caps.readCap(cap_table_base, libz_loader.constants.LIBZ_PF_SLOT);
+    const cap = lib.caps.readCap(cap_table_base, libz_loader.LIBZ_PF_SLOT);
     const pf_handle: u64 = @as(u64, cap.id());
     const page_count: u64 = @as(u64, @truncate(cap.field0 & 0xFFFF_FFFF));
 
@@ -111,7 +111,7 @@ fn bootstrapLibz(cap_table_base: u64) void {
         .v1 = var_caps_word,
         .v2 = props,
         .v3 = page_count,
-        .v4 = libz_loader.constants.LIBZ_SLIDE,
+        .v4 = libz_loader.LIBZ_SLIDE,
         .v5 = 0,
     });
     // Successful createVar returns a handle word with caps in bits

@@ -12,10 +12,10 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
-const capability_domain = zag.capdom.capability_domain;
+const capability_domain = zag.caps.capability_domain;
 const errors = zag.syscall.errors;
 const pmm = zag.memory.pmm;
-const var_range = zag.capdom.var_range;
+const var_range = zag.memory.var_range;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityType = capability.CapabilityType;
