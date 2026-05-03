@@ -245,6 +245,93 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
     return issueRawNoStack(word, in);
 }
 
+// Reply + atomic recv-on-port — bare. Wraps issueRawCaptureWord.
+pub fn replyRecvAsm(word: u64) RecvReturn {
+    return issueRawCaptureWord(word, .{});
+}
+
+// Reply + attachments + atomic recv-on-port. Combines the wide
+// attachment-write path with the post-syscall vreg-0 readback.
+// 928-byte pad covers vreg 0 + vregs 14..127.
+pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) RecvReturn {
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    var oword: u64 = undefined;
+    asm volatile (
+        \\ subq $928, %%rsp
+        \\ movq %%rsp, %%r11
+        \\ movq $116, %%rcx
+        \\1: movq $0, (%%r11)
+        \\ addq $8, %%r11
+        \\ decq %%rcx
+        \\ jnz 1b
+        \\ movq %[atts_ptr], %%r11
+        \\ movq %[n], %%rcx
+        \\ movq %%rcx, %%rax
+        \\ negq %%rax
+        \\ addq $115, %%rax
+        \\ shlq $3, %%rax
+        \\ addq %%rsp, %%rax
+        \\2: movq (%%r11), %%rdx
+        \\ movq %%rdx, (%%rax)
+        \\ addq $8, %%r11
+        \\ addq $8, %%rax
+        \\ decq %%rcx
+        \\ jnz 2b
+        \\ movq %[word], %%rcx
+        \\ movq %%rcx, (%%rsp)
+        \\ syscall
+        \\ movq (%%rsp), %%rcx
+        \\ addq $928, %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+          [oword] "={rcx}" (oword),
+        : [word] "r" (word),
+          [atts_ptr] "r" (attachments_ptr),
+          [n] "r" (n),
+        : .{ .r11 = true, .memory = true, .cc = true });
+    return .{
+        .word = oword,
+        .regs = .{
+            .v1 = ov1,
+            .v2 = ov2,
+            .v3 = ov3,
+            .v4 = ov4,
+            .v5 = ov5,
+            .v6 = ov6,
+            .v7 = ov7,
+            .v8 = ov8,
+            .v9 = ov9,
+            .v10 = ov10,
+            .v11 = ov11,
+            .v12 = ov12,
+            .v13 = ov13,
+        },
+    };
+}
+
 // Reply-transfer high-vreg path. Spec §[handle_attachments]: pair
 // entries occupy vregs `[128-N..127]` — the *high* end of the vreg
 // space. For N entries, vreg (128-N) sits at `[rsp + (128-N-13)*8]`

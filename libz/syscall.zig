@@ -85,7 +85,6 @@ pub const SyscallNum = enum(u12) {
     bind_event_route = 50,
     clear_event_route = 51,
     reply = 52,
-    reply_transfer = 53,
     timer_arm = 54,
     timer_rearm = 55,
     timer_cancel = 56,
@@ -128,17 +127,19 @@ pub fn extraVmKind(kind: u1, count: u8) u64 {
     return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
-/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23 so
-/// the GPR-backed event-state vregs survive intact across the syscall
-/// and the L4-style fast path is preserved.
+/// Spec §[reply]: `reply_handle_id` at syscall-word bits 20-31
+/// (`pair_count` at 12-19, `recv_port_handle_id` at 32-43). Carrying
+/// the handle id in the syscall word rather than vreg 1 keeps the
+/// GPR-backed event-state vregs intact across the syscall and
+/// preserves the L4-style fast path.
 pub fn extraReplyHandle(handle: u12) u64 {
-    return (@as(u64, handle) & 0xFFF) << 12;
+    return (@as(u64, handle) & 0xFFF) << 20;
 }
 
-/// Spec §[reply_transfer]: reply_handle_id rides in syscall-word bits
-/// 20-31 (with N at bits 12-19).
-pub fn extraReplyTransferHandle(handle: u12) u64 {
-    return (@as(u64, handle) & 0xFFF) << 20;
+/// Spec §[reply]: `recv_port_handle_id` at bits 32-43 enables the
+/// atomic reply-then-recv mode (seL4 ReplyRecv). 0 = no recv mode.
+pub fn extraReplyRecvPort(port: u12) u64 {
+    return (@as(u64, port) & 0xFFF) << 32;
 }
 
 pub const RecvReturn = struct {
@@ -578,27 +579,52 @@ pub fn clearEventRoute(target: u12, event_type: u64) Regs {
 }
 
 pub fn reply(reply_handle: u12) Regs {
-    // Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
-    // Pass empty regs — vregs 1..13 are receiver-side state mods that
-    // survive the syscall as-is when the receiver hasn't modified them.
+    // Spec §[reply]: bare reply, no attachments, no recv mode. Reply
+    // handle id at syscall-word bits 20-31. Pass empty regs — vregs
+    // 1..13 are receiver-side state mods that survive the syscall as-is
+    // when the receiver hasn't modified them.
     return issueReg(.reply, extraReplyHandle(reply_handle), .{});
 }
 
 pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
-    // Spec §[handle_attachments]: pair entries occupy vregs `[128-N..127]`
-    // — the *high* end of the vreg space. The arch backend handles the
-    // platform-specific stack reservation and high-vreg slot layout
-    // (different on x86-64 vs aarch64 because their GPR-backed vreg
-    // bands differ in width). The reply handle id rides in syscall-word
-    // bits 20-31; N rides in bits 12-19; syscall_num in bits 0-11. See
-    // §[reply_transfer].
+    // Spec §[reply] with `pair_count > 0`: pair entries occupy vregs
+    // `[128-N..127]`. Syscall-word: bits 0-11 = syscall_num, 12-19 = N,
+    // 20-31 = reply_handle_id, 32-43 = recv_port (0 here).
     const n: u8 = @intCast(attachments.len);
-    if (n == 0 or n > 63) @panic("reply_transfer: N must be 1..63");
+    if (n == 0 or n > 63) @panic("reply with pair_count: N must be 1..63");
     const word: u64 =
-        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
+        (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
         (@as(u64, n) << 12) |
         (@as(u64, reply_handle) << 20);
     return arch_impl.replyTransferAsm(word, attachments.ptr, @as(u64, n));
+}
+
+pub fn replyRecv(reply_handle: u12, recv_port: u12) RecvReturn {
+    // Spec §[reply] recv mode: bare reply, then atomic park on
+    // `recv_port`. Returns the recv contract on the named port.
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
+        (@as(u64, reply_handle) << 20) |
+        (@as(u64, recv_port) << 32);
+    return arch_impl.issueRawCaptureWord(word, .{});
+}
+
+pub fn replyTransferRecv(
+    reply_handle: u12,
+    attachments: []const u64,
+    recv_port: u12,
+) RecvReturn {
+    // Spec §[reply] combo mode: pair attachments + recv mode applied
+    // atomically. Pair entries at vregs [128-N..127]; recv-side return
+    // captured via the high-vreg-aware asm path.
+    const n: u8 = @intCast(attachments.len);
+    if (n == 0 or n > 63) @panic("replyTransferRecv: N must be 1..63");
+    const word: u64 =
+        (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
+        (@as(u64, n) << 12) |
+        (@as(u64, reply_handle) << 20) |
+        (@as(u64, recv_port) << 32);
+    return arch_impl.replyTransferRecvAsm(word, attachments.ptr, @as(u64, n));
 }
 
 // ---------------------------------------------------------------

@@ -107,7 +107,7 @@ Syscall arguments that take a handle carry only the 12-bit handle id — the cal
 
 A capability domain's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
 
-Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an EC handle's priority and affinity, a VAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
+Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an EC handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
 
 Handle types a capability domain can hold:
 
@@ -117,7 +117,7 @@ Handle types a capability domain can hold:
 | capability_domain (IDC handle) | `create_capability_domain`; received via suspend/reply transfer |
 | execution_context | `create_execution_context`; received via suspend/reply transfer |
 | page_frame | `create_page_frame`; received via suspend/reply transfer |
-| virtual_address_range | `create_var`; received via suspend/reply transfer |
+| virtual_memory_address_region | `create_vmar`; received via suspend/reply transfer |
 | device_region | kernel-issued at boot to root service; received via suspend/reply transfer |
 | port | `create_port`; received via suspend/reply transfer |
 | reply | created by recv |
@@ -130,7 +130,7 @@ Kernel objects are grouped by the **ceiling** of their lifetime — the longest 
 
 - **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
 - **Refcount lifetime** — Port, Page Frame, Timer. Bounded by the distributed set of handles referencing them.
-- **Capability domain lifetime** — Execution Context, Virtual Address Range, Virtual Machine. Cannot outlive the capability domain they are bound to.
+- **Capability domain lifetime** — Execution Context, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
 - **Execution context lifetime** — Event Route, Reply. Event routes are kernel-held bindings (not handles) that are swept when the execution context they route from is destroyed. Replies cannot outlive the execution context they are bound to.
 
 ### restrict
@@ -147,12 +147,12 @@ restrict([1] handle, [2] caps) -> void
     bits 16-63: _reserved
 ```
 
-Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on EC handles (bits 8-9) and VAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
+Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on EC handles (bits 8-9) and VMAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
 
 [test 01] returns E_BADCAP if [1] is not a valid handle.
 [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
 [test 03] returns E_PERM if the handle is an EC handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
-[test 04] returns E_PERM if the handle is a VAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
+[test 04] returns E_PERM if the handle is a VMAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 [test 05] returns E_INVAL if any reserved bits are set in [1] or [2].
 [test 06] on success, the handle's caps field equals [2].caps.
 [test 07] on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
@@ -176,7 +176,7 @@ No self-handle cap required.
 | `capability_domain` (IDC) | Release handle. Domain has system lifetime; it does not terminate when IDC handles drop |
 | `execution_context` | Release handle. ECs have capability-domain lifetime; they are not destroyed by handle drops |
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
-| `virtual_address_range` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
+| `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
 | `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
@@ -244,16 +244,16 @@ word 0:
 word 1 (field0):
  63    56 55     48 47     40 39     32 31     24 23                  8 7         0
 ┌────────┬─────────┬─────────┬─────────┬─────────┬──────────────────────┬───────────┐
-│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   var_inner_clg      │ec_inner_clg│
+│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   vmar_inner_clg     │ec_inner_clg│
 │  (8)   │  (8)    │   (8)   │   (8)   │   (8)   │       (16)           │    (8)    │
 └────────┴─────────┴─────────┴─────────┴─────────┴──────────────────────┴───────────┘
 
 word 2 (field1):
- 63              38 37        32 31              16 15        8 7         0
-┌──────────────────┬────────────┬──────────────────┬─────────────┬───────────┐
-│ _reserved (26)   │fut_wait_max│restart_policy_clg│var_outer_clg│ec_outer_clg│
-│                  │    (6)     │      (16)        │    (8)      │    (8)    │
-└──────────────────┴────────────┴──────────────────┴─────────────┴───────────┘
+ 63              38 37        32 31              16 15         8 7         0
+┌──────────────────┬────────────┬──────────────────┬──────────────┬───────────┐
+│ _reserved (26)   │fut_wait_max│restart_policy_clg│vmar_outer_clg│ec_outer_clg│
+│                  │    (6)     │      (16)        │     (8)      │    (8)    │
+└──────────────────┴────────────┴──────────────────┴──────────────┴───────────┘
 ```
 
 cap (word 0, bits 48-63):
@@ -270,7 +270,7 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `crcd` — create capability domain | `create_capability_domain` syscall |
 | 1 | `crec` — create execution context | `create_execution_context` syscall (target = self) |
-| 2 | `crvr` — create virtual address range | `create_var` syscall |
+| 2 | `crvr` — create virtual memory address region | `create_vmar` syscall |
 | 3 | `crpf` — create page frame | `create_page_frame` syscall |
 | 4 | `crvm` — create virtual machine | `create_virtual_machine` syscall |
 | 5 | `crpt` — create port | `create_port` syscall |
@@ -288,7 +288,7 @@ field0:
 | field | bits | meaning |
 |---|---|---|
 | ec_inner_ceiling | 0-7 | max caps on EC handles held by this domain itself referencing its own ECs |
-| var_inner_ceiling | 8-23 | max caps on VAR handles held by this domain itself referencing its own VARs (16 bits to fit all VAR caps) |
+| vmar_inner_ceiling | 8-23 | max caps on VMAR handles held by this domain itself referencing its own VMARs (16 bits to fit all VMAR caps) |
 | cridc_ceiling | 24-31 | see §[cridc_ceiling] |
 | idc_rx | 32-39 | mask intersected with sent caps when this domain receives an IDC handle |
 | pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this domain (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
@@ -300,7 +300,7 @@ field1:
 | field | bits | meaning |
 |---|---|---|
 | ec_outer_ceiling | 0-7 | max caps on EC handles held by other domains referencing ECs in this domain |
-| var_outer_ceiling | 8-15 | max caps on VAR handles held by other domains referencing VARs in this domain |
+| vmar_outer_ceiling | 8-15 | max caps on VMAR handles held by other domains referencing VMARs in this domain |
 | restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this domain (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
 | fut_wait_max | 32-37 | max number of addresses the domain may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
 
@@ -335,7 +335,7 @@ word 0:
 word 1 (field0):
  63                                          24 23        16 15           0
 ┌─────────────────────────────────────────────┬─────────────┬───────────────┐
-│              _reserved (40)                 │var_cap_clg  │ec_cap_ceiling │
+│              _reserved (40)                 │vmar_cap_clg │ec_cap_ceiling │
 │                                             │    (8)      │     (16)      │
 └─────────────────────────────────────────────┴─────────────┴───────────────┘
 
@@ -351,7 +351,7 @@ Field layout:
 | field | location | meaning |
 |---|---|---|
 | ec_cap_ceiling | field0 bits 0-15 | per-IDC ceiling on caps of EC handles minted via `acquire_ecs` through this IDC |
-| var_cap_ceiling | field0 bits 16-23 | per-IDC ceiling on caps of VAR handles minted via `acquire_vars` through this IDC |
+| vmar_cap_ceiling | field0 bits 16-23 | per-IDC ceiling on caps of VMAR handles minted via `acquire_vmars` through this IDC |
 
 cap (word 0, bits 48-63):
 
@@ -369,7 +369,7 @@ cap (word 0, bits 48-63):
 | 1 | `copy` | transferring this handle via copy to another capability domain |
 | 2 | `crec` — create execution context in referenced domain | `create_execution_context` with this handle as `target` |
 | 3 | `aqec` — acquire ECs | `acquire_ecs` syscall on this IDC |
-| 4 | `aqvr` — acquire VARs | `acquire_vars` syscall on this IDC |
+| 4 | `aqvr` — acquire VMARs | `acquire_vmars` syscall on this IDC |
 | 5 | `restart_policy` | IDC handle behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_capability_domain
@@ -388,7 +388,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
   [2] ceilings_inner: u64 packed as (matches self-handle field0)
     bits  0-7:  ec_inner_ceiling
-    bits  8-23: var_inner_ceiling:
+    bits  8-23: vmar_inner_ceiling:
                    bit  8:     move
                    bit  9:     copy
                    bits 10-12: r/w/x
@@ -413,10 +413,10 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
   [3] ceilings_outer: u64 packed as (matches self-handle field1)
     bits  0-7: ec_outer_ceiling
-    bits  8-15: var_outer_ceiling
+    bits  8-15: vmar_outer_ceiling
     bits 16-31: restart_policy_ceiling:
                    bits 16-17: ec_restart_max     (kill / restart_at_entry / persist / _reserved)
-                   bits 18-19: var_restart_max    (free / decommit / preserve / snapshot)
+                   bits 18-19: vmar_restart_max    (free / decommit / preserve / snapshot)
                    bit 20:     pf_restart_max     (drop / keep)
                    bit 21:     dr_restart_max     (drop / keep)
                    bit 22:     port_restart_max   (drop / keep)
@@ -454,8 +454,8 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
 [test 03] returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
 [test 04] returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
-[test 05] returns E_PERM if `var_inner_ceiling` is not a subset of the caller's `var_inner_ceiling`.
-[test 06] returns E_PERM if `var_outer_ceiling` is not a subset of the caller's `var_outer_ceiling`.
+[test 05] returns E_PERM if `vmar_inner_ceiling` is not a subset of the caller's `vmar_inner_ceiling`.
+[test 06] returns E_PERM if `vmar_outer_ceiling` is not a subset of the caller's `vmar_outer_ceiling`.
 [test 07] returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
 [test 08] returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
 [test 09] returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
@@ -476,8 +476,8 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 [test 23] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
 [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-[test 26] on success, the new domain's `ec_inner_ceiling`, `var_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
-[test 27] on success, the new domain's `ec_outer_ceiling` and `var_outer_ceiling` in field1 are set to the values supplied in [3].
+[test 26] on success, the new domain's `ec_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+[test 27] on success, the new domain's `ec_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
 [test 29] the initial EC begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
 [test 30] on success, two successive `create_capability_domain` calls with the same ELF image place the image at different randomized base addresses with high probability (ASLR jitter test — see §[address_space]).
@@ -511,12 +511,12 @@ Returns E_FULL if the caller's handle table cannot accommodate all returned hand
 [test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
 [test 07] vCPUs in the target domain are not included in the returned handles.
 
-### acquire_vars
+### acquire_vmars
 
-Returns handles to all `map=1` (pf) and `map=3` (demand) VARs bound to the target domain referenced by an IDC handle. MMIO and DMA VARs are excluded.
+Returns handles to all `map=1` (pf) and `map=3` (demand) VMARs bound to the target domain referenced by an IDC handle. MMIO and DMA VMARs are excluded.
 
 ```
-acquire_vars([1] target) -> [1..N] handles
+acquire_vmars([1] target) -> [1..N] handles
   syscall_num = 21
 
   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
@@ -526,15 +526,15 @@ acquire_vars([1] target) -> [1..N] handles
 
 IDC cap required on [1]: `aqvr`.
 
-Each returned handle has caps = `target.var_outer_ceiling` ∩ the IDC's `var_cap_ceiling`. While in flight, all ECs in the target domain are paused — `acquire_vars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
+Each returned handle has caps = `target.vmar_outer_ceiling` ∩ the IDC's `vmar_cap_ceiling`. While in flight, all ECs in the target domain are paused — `acquire_vmars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
 
 [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
 [test 02] returns E_PERM if [1] does not have the `aqvr` cap.
 [test 03] returns E_INVAL if any reserved bits are set in [1].
 [test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-[test 05] on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
-[test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `var_outer_ceiling` intersected with the IDC's `var_cap_ceiling`.
-[test 07] MMIO and DMA VARs in the target domain are not included in the returned handles.
+[test 05] on success, the syscall word's count field equals the number of `map=1` and `map=3` VMARs bound to the target domain.
+[test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VMARs, each with caps = target's `vmar_outer_ceiling` intersected with the IDC's `vmar_cap_ceiling`.
+[test 07] MMIO and DMA VMARs in the target domain are not included in the returned handles.
 
 ### §[restart_semantics] Restart Semantics
 
@@ -546,7 +546,7 @@ Per-handle policies are ordered least-to-most privileged. The `restart_policy` c
 |---|---|---|
 | `capability_domain_self` | always preserved | the restart target itself |
 | `execution_context` | 0=kill / 1=restart_at_entry / 2=persist | `persist` keeps the EC running through the restart, including its stack pages; otherwise the EC re-enters at its original entry point (1) or is killed (0) |
-| `virtual_address_range` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VAR lives in exactly one domain's address space; the owning domain's handle's `restart_policy` determines what happens to the VAR. Cross-domain handles to the same VAR carry their own `restart_policy` for whether the foreign handle survives the foreign domain's restart |
+| `virtual_memory_address_region` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VMAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VMAR lives in exactly one domain's address space; the owning domain's handle's `restart_policy` determines what happens to the VMAR. Cross-domain handles to the same VMAR carry their own `restart_policy` for whether the foreign handle survives the foreign domain's restart |
 | `page_frame` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `device_region` | 0=drop / 1=keep | |
 | `port` | 0=drop / 1=keep | refcount semantics apply on `drop` |
@@ -558,7 +558,7 @@ Per-handle policies are ordered least-to-most privileged. The `restart_policy` c
 Each handle's `restart_policy` value is bounded at create time (and at copy time) by the domain's `restart_policy_ceiling` corresponding field on its self-handle.
 
 [test 01] returns E_PERM if `create_execution_context` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.ec_restart_max`.
-[test 02] returns E_PERM if `create_var` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.var_restart_max`.
+[test 02] returns E_PERM if `create_vmar` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.vmar_restart_max`.
 [test 03] returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.pf_restart_max = 0`.
 [test 04] returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.vm_restart_max = 0`.
 [test 05] returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.port_restart_max = 0`.
@@ -893,8 +893,8 @@ Each capability domain owns a per-domain virtual address space. The user half is
 | Zone | Placement |
 |---|---|
 | NULL guard | unmapped; any access faults |
-| ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, EC stacks, and `create_var` with `preferred_base = 0` |
-| Static zone | userspace-chosen base via `create_var` with `preferred_base != 0`. Placement is deterministic |
+| ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, EC stacks, and `create_vmar` with `preferred_base = 0` |
+| Static zone | userspace-chosen base via `create_vmar` with `preferred_base != 0`. Placement is deterministic |
 
 ELF images loaded by `create_capability_domain` must be position-independent; the kernel relocates them to a randomized base in the ASLR zone. The first faulted page in the NULL guard always faults regardless of any other mapping.
 
@@ -916,11 +916,11 @@ aarch64 (4-level paging, 48-bit TTBR0 user VA):
 | ASLR zone | `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` | ~16 TiB |
 | Static zone | `[0x0000_1000_0000_0000, 0x0001_0000_0000_0000)` | 240 TiB |
 
-## §[var] Virtual Address Range
+## §[vmar] Virtual Memory Address Region
 
-A virtual address range is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions. See §[address_space] for the zone layout governing where VARs are placed.
+A virtual memory address region is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions. See §[address_space] for the zone layout governing where VMARs are placed.
 
-A regular VAR (`caps.mmio = 0, caps.dma = 0`) created without explicit mapping starts at `map = 0`. The first faulted access transitions it to `map = 3` (demand): the kernel allocates a fresh zero-filled page_frame and installs it at the faulting offset, with effective permissions = `VAR.cur_rwx`. Once `map = 3`, the VAR cannot be `map_pf`'d until it is `unmap`'d back to `map = 0`.
+A regular VMAR (`caps.mmio = 0, caps.dma = 0`) created without explicit mapping starts at `map = 0`. The first faulted access transitions it to `map = 3` (demand): the kernel allocates a fresh zero-filled page_frame and installs it at the faulting offset, with effective permissions = `VMAR.cur_rwx`. Once `map = 3`, the VMAR cannot be `map_pf`'d until it is `unmap`'d back to `map = 0`.
 
 Handle ABI:
 
@@ -948,13 +948,13 @@ Field layout:
 
 | field | location | meaning |
 |---|---|---|
-| base vaddr | field0 bits 0-63 | base virtual address of the VAR (or base IOVA, for DMA VARs) |
+| base vaddr | field0 bits 0-63 | base virtual address of the VMAR (or base IOVA, for DMA VMARs) |
 | page_count | field1 bits 0-31 | number of pages (in `sz` units) |
 | sz | field1 bits 32-33 | page size (immutable): 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
 | cch | field1 bits 34-35 | cache type (immutable): 0=wb, 1=uc, 2=wc, 3=wt |
 | cur_rwx | field1 bits 36-38 | current mapping permissions (bit 36=r, 37=w, 38=x) |
 | map | field1 bits 39-40 | mapping type: 0=unmapped, 1=pf, 2=mmio, 3=demand |
-| device | field1 bits 41-52 | bound device_region handle id (DMA VARs immutably from `create_var`; MMIO VARs set by `map_mmio` and cleared by `unmap_mmio`; 0 otherwise) |
+| device | field1 bits 41-52 | bound device_region handle id (DMA VMARs immutably from `create_vmar`; MMIO VMARs set by `map_mmio` and cleared by `unmap_mmio`; 0 otherwise) |
 
 cap (word 0, bits 48-63):
 
@@ -975,22 +975,22 @@ cap (word 0, bits 48-63):
 | 4 | `x` | max execute |
 | 5 | `mmio` | mmio mode |
 | 6-7 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
-| 8 | `dma` | dma mode (VAR represents a device-IOVA range) |
-| 9-10 | `restart_policy` | VAR behavior on domain restart: 0=free, 1=decommit, 2=preserve, 3=snapshot (see §[restart_semantics]) |
+| 8 | `dma` | dma mode (VMAR represents a device-IOVA range) |
+| 9-10 | `restart_policy` | VMAR behavior on domain restart: 0=free, 1=decommit, 2=preserve, 3=snapshot (see §[restart_semantics]) |
 | 11-15 | `_reserved` | |
 
-`r`/`w`/`x` and `max_sz` are ceiling-checked against the domain's `var_inner_ceiling`. `mmio`, `dma`, and `max_sz` describe the VAR object and are immutable after creation. `mmio` and `dma` are mutually exclusive. `dma` VARs cannot have `x` set. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VAR. Move/copy semantics on VARs are bounded by `var_outer_ceiling` for the receiving handle.
+`r`/`w`/`x` and `max_sz` are ceiling-checked against the domain's `vmar_inner_ceiling`. `mmio`, `dma`, and `max_sz` describe the VMAR object and are immutable after creation. `mmio` and `dma` are mutually exclusive. `dma` VMARs cannot have `x` set. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VMAR. Move/copy semantics on VMARs are bounded by `vmar_outer_ceiling` for the receiving handle.
 
-### create_var
+### create_vmar
 
 Reserves a range of virtual address space bound to the caller's domain.
 
 ```
-create_var([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
+create_vmar([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
   syscall_num = 32
 
   [1] caps: u64 packed as
-    bits  0-15: caps        — caps on the VAR handle returned to the caller
+    bits  0-15: caps        — caps on the VMAR handle returned to the caller
     bits 16-63: _reserved
 
   [2] props: u64 packed as
@@ -1011,9 +1011,9 @@ Self-handle cap required: `crvr`.
 Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address space has no room for the requested range; returns E_FULL if the caller's handle table has no free slot.
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crvr`.
-[test 02] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `var_inner_ceiling`'s r/w/x bits.
-[test 03] returns E_PERM if caps.max_sz exceeds the caller's `var_inner_ceiling`'s max_sz.
-[test 04] returns E_PERM if caps.mmio = 1 and the caller's `var_inner_ceiling` does not permit mmio.
+[test 02] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `vmar_inner_ceiling`'s r/w/x bits.
+[test 03] returns E_PERM if caps.max_sz exceeds the caller's `vmar_inner_ceiling`'s max_sz.
+[test 04] returns E_PERM if caps.mmio = 1 and the caller's `vmar_inner_ceiling` does not permit mmio.
 [test 05] returns E_INVAL if [3] pages is 0.
 [test 06] returns E_INVAL if [4] preferred_base is nonzero and not aligned to the page size encoded in props.sz.
 [test 07] returns E_INVAL if caps.max_sz is 3 (reserved).
@@ -1027,90 +1027,90 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address sp
 [test 15] returns E_PERM if caps.dma = 1 and [5] does not have the `dma` cap.
 [test 16] returns E_INVAL if props.cur_rwx is not a subset of caps.r/w/x.
 [test 17] returns E_INVAL if any reserved bits are set in [1] or [2].
-[test 18] on success, the caller receives a VAR handle with caps = `[1].caps`.
+[test 18] on success, the caller receives a VMAR handle with caps = `[1].caps`.
 [test 19] on success, field0 contains the assigned base address.
 [test 20] on success, field1 contains `[2].props` together with `[3]` pages.
 [test 21] on success, when [4] preferred_base is nonzero and the range is available, the assigned base address equals `[4]`.
-[test 22] on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VAR routes the bound device's accesses at field0 + offset to the installed page_frame.
+[test 22] on success, when caps.dma = 1, field1's `device` field equals [5]'s handle id, and a subsequent `map_pf` into this VMAR routes the bound device's accesses at field0 + offset to the installed page_frame.
 [test 23] returns E_INVAL if [4] preferred_base is nonzero and the requested range does not lie wholly within the static zone (see §[address_space]).
 [test 24] on success, when [4] preferred_base = 0, the assigned base address lies within the ASLR zone (see §[address_space]).
 
 ### map_pf
 
-Installs page_frames into a regular or DMA-flagged VAR. The kernel dispatches based on `caps.dma`:
-- Regular VAR (`caps.dma = 0`): pages are mapped into the CPU's virtual address space at `VAR.base + offset`.
-- DMA VAR (`caps.dma = 1`): pages are mapped into the bound device's IOMMU page tables at `VAR.base + offset` (an IOVA).
+Installs page_frames into a regular or DMA-flagged VMAR. The kernel dispatches based on `caps.dma`:
+- Regular VMAR (`caps.dma = 0`): pages are mapped into the CPU's virtual address space at `VMAR.base + offset`.
+- DMA VMAR (`caps.dma = 1`): pages are mapped into the bound device's IOMMU page tables at `VMAR.base + offset` (an IOVA).
 
 ```
-map_pf([1] var, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
+map_pf([1] vmar, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
   syscall_num = 33
 
   syscall word bits 12-19: N (number of (offset, page_frame) pairs)
 
-  [1] var: VAR handle
-  [2 + 2i] offset: byte offset within the VAR
+  [1] vmar: VMAR handle
+  [2 + 2i] offset: byte offset within the VMAR
   [2 + 2i + 1] page_frame: page_frame handle to install at that offset
 
   for i in 0..N-1.
 ```
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
-[test 03] returns E_PERM if [1].caps has `mmio` set (mmio VARs accept only `map_mmio`).
+[test 03] returns E_PERM if [1].caps has `mmio` set (mmio VMARs accept only `map_mmio`).
 [test 04] returns E_INVAL if N is 0.
-[test 05] returns E_INVAL if any offset is not aligned to the VAR's `sz` page size.
-[test 06] returns E_INVAL if any page_frame's `sz` is smaller than the VAR's `sz`.
-[test 07] returns E_INVAL if any pair's range exceeds the VAR's size.
+[test 05] returns E_INVAL if any offset is not aligned to the VMAR's `sz` page size.
+[test 06] returns E_INVAL if any page_frame's `sz` is smaller than the VMAR's `sz`.
+[test 07] returns E_INVAL if any pair's range exceeds the VMAR's size.
 [test 08] returns E_INVAL if any two pairs' ranges overlap.
-[test 09] returns E_INVAL if any pair's range overlaps an existing mapping in the VAR.
+[test 09] returns E_INVAL if any pair's range overlaps an existing mapping in the VMAR.
 [test 10] returns E_INVAL if [1].field1 `map` is 2 (mmio) or 3 (demand) — pf installation requires `map = 0` or `map = 1`.
 [test 11] on success, [1].field1 `map` becomes 1 if it was 0; otherwise stays 1.
-[test 12] on success, when [1].caps.dma = 0, CPU accesses to `VAR.base + offset` use effective permissions = `VAR.cur_rwx` ∩ `page_frame.r/w/x` per page.
-[test 13] on success, when [1].caps.dma = 1, a DMA read by the bound device from `VAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
+[test 12] on success, when [1].caps.dma = 0, CPU accesses to `VMAR.base + offset` use effective permissions = `VMAR.cur_rwx` ∩ `page_frame.r/w/x` per page.
+[test 13] on success, when [1].caps.dma = 1, a DMA read by the bound device from `VMAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VMAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
 [test 14] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ### map_mmio
 
-Installs a device_region as an MMIO mapping into an MMIO-flagged VAR.
+Installs a device_region as an MMIO mapping into an MMIO-flagged VMAR.
 
 ```
-map_mmio([1] var, [2] device_region) -> void
+map_mmio([1] vmar, [2] device_region) -> void
   syscall_num = 34
 
-  [1] var: VAR handle (must have `mmio` cap)
+  [1] vmar: VMAR handle (must have `mmio` cap)
   [2] device_region: device_region handle
 ```
 
-VAR cap required on [1]: `mmio`.
+VMAR cap required on [1]: `mmio`.
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_BADCAP if [2] is not a valid device_region handle.
 [test 03] returns E_PERM if [1] does not have the `mmio` cap.
-[test 04] returns E_INVAL if [1].field1 `map` is not 0 (mmio mappings are atomic; the VAR must be unmapped).
+[test 04] returns E_INVAL if [1].field1 `map` is not 0 (mmio mappings are atomic; the VMAR must be unmapped).
 [test 05] returns E_INVAL if [2]'s size does not equal [1]'s size.
 [test 06] on success, [1].field1 `map` becomes 2.
 [test 07] on success, [1].field1 `device` is set to [2]'s handle id.
-[test 08] on success, CPU accesses to the VAR's range use effective permissions = `VAR.cur_rwx`.
+[test 08] on success, CPU accesses to the VMAR's range use effective permissions = `VMAR.cur_rwx`.
 [test 09] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ### unmap
 
-Removes mappings from a VAR. Dispatches on the VAR's `map` field. With `N = 0`, unmaps everything; with `N > 0`, the selectors specify which mappings to remove and depend on `map`.
+Removes mappings from a VMAR. Dispatches on the VMAR's `map` field. With `N = 0`, unmaps everything; with `N > 0`, the selectors specify which mappings to remove and depend on `map`.
 
 ```
-unmap([1] var, [2..N+1] selectors) -> void
+unmap([1] vmar, [2..N+1] selectors) -> void
   syscall_num = 35
 
   syscall word bits 12-19: N (number of selectors; 0 = unmap everything)
 
-  [1] var: VAR handle
+  [1] vmar: VMAR handle
   [2..N+1] selectors:
     - map = 1 (pf):     page_frame handles to unmap
-    - map = 3 (demand): byte offsets into the VAR
+    - map = 3 (demand): byte offsets into the VMAR
     - map = 2 (mmio):   N must be 0
 ```
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
 [test 03] returns E_INVAL if [1].field1 `map` is 2 (mmio) and N > 0.
 [test 04] returns E_BADCAP if [1].field1 `map` is 1 and any selector is not a valid page_frame handle.
@@ -1125,19 +1125,19 @@ unmap([1] var, [2..N+1] selectors) -> void
 
 ### remap
 
-Updates a VAR's `cur_rwx`, changing the effective permissions on its currently-mapped pages. Applies to pf and demand mappings only.
+Updates a VMAR's `cur_rwx`, changing the effective permissions on its currently-mapped pages. Applies to pf and demand mappings only.
 
 ```
-remap([1] var, [2] new_cur_rwx) -> void
+remap([1] vmar, [2] new_cur_rwx) -> void
   syscall_num = 36
 
-  [1] var: VAR handle
+  [1] vmar: VMAR handle
   [2] new_cur_rwx: u64 packed as
     bits 0-2: new r/w/x
     bits 3-63: _reserved
 ```
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
 [test 03] returns E_INVAL if [2] new_cur_rwx is not a subset of [1]'s caps r/w/x.
 [test 04] returns E_INVAL if [1].field1 `map` is 1 and [2] new_cur_rwx is not a subset of the intersection of all installed page_frames' r/w/x caps.
@@ -1149,14 +1149,14 @@ remap([1] var, [2] new_cur_rwx) -> void
 
 ### snapshot
 
-Binds a source VAR to a target VAR. On the owning domain's restart, the kernel copies the source's contents into the target before the domain resumes. Used together with `restart_policy = snapshot` on the target VAR — see §[restart_semantics].
+Binds a source VMAR to a target VMAR. On the owning domain's restart, the kernel copies the source's contents into the target before the domain resumes. Used together with `restart_policy = snapshot` on the target VMAR — see §[restart_semantics].
 
 ```
-snapshot([1] target_var, [2] source_var) -> void
+snapshot([1] target_vmar, [2] source_vmar) -> void
   syscall_num = 37
 
-  [1] target_var: VAR handle (must have `caps.restart_policy = snapshot` (3))
-  [2] source_var: VAR handle (must have `caps.restart_policy = preserve` (2))
+  [1] target_vmar: VMAR handle (must have `caps.restart_policy = snapshot` (3))
+  [2] source_vmar: VMAR handle (must have `caps.restart_policy = preserve` (2))
 ```
 
 Calling `snapshot` again replaces any prior binding for `[1]`.
@@ -1167,8 +1167,8 @@ At restart time, the source-to-target copy succeeds only if the source is stable
 
 If the source's stability cannot be verified at restart, the restart fails and the domain is terminated.
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
-[test 02] returns E_BADCAP if [2] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
+[test 02] returns E_BADCAP if [2] is not a valid VMAR handle.
 [test 03] returns E_INVAL if [1].caps.restart_policy is not 3 (snapshot).
 [test 04] returns E_INVAL if [2].caps.restart_policy is not 2 (preserve).
 [test 05] returns E_INVAL if [1] and [2] have different sizes (`page_count` × `sz`).
@@ -1181,58 +1181,58 @@ If the source's stability cannot be verified at restart, the restart fails and t
 
 ### idc_read
 
-Reads qwords from a VAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VAR's contents). The kernel pauses every EC in the VAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
+Reads qwords from a VMAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VMAR's contents). The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
 
 ```
-idc_read([1] var, [2] offset) -> [3..2+count] qwords
+idc_read([1] vmar, [2] offset) -> [3..2+count] qwords
   syscall_num = 38
 
   syscall word bits 12-19: count (number of qwords; max 125)
 
-  [1] var:    VAR handle
-  [2] offset: byte offset within the VAR (must be 8-byte aligned)
+  [1] vmar:    VMAR handle
+  [2] offset: byte offset within the VMAR (must be 8-byte aligned)
 ```
 
-VAR cap required on [1]: `r`.
+VMAR cap required on [1]: `r`.
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_PERM if [1] does not have the `r` cap.
 [test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
 [test 04] returns E_INVAL if count is 0 or count > 125.
-[test 05] returns E_INVAL if [2] + count*8 exceeds the VAR's size.
+[test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
 [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-[test 07] on success, vregs `[3..2+count]` contain the qwords from the VAR starting at [2] offset.
+[test 07] on success, vregs `[3..2+count]` contain the qwords from the VMAR starting at [2] offset.
 [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ### idc_write
 
-Writes qwords from the caller's vregs into a VAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VAR's contents). The kernel pauses every EC in the VAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
+Writes qwords from the caller's vregs into a VMAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VMAR's contents). The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
 
 ```
-idc_write([1] var, [2] offset, [3..2+count] qwords) -> void
+idc_write([1] vmar, [2] offset, [3..2+count] qwords) -> void
   syscall_num = 39
 
   syscall word bits 12-19: count (number of qwords; max 125)
 
-  [1] var:    VAR handle
-  [2] offset: byte offset within the VAR (must be 8-byte aligned)
-  [3..2+count] qwords: bytes to write into the VAR
+  [1] vmar:    VMAR handle
+  [2] offset: byte offset within the VMAR (must be 8-byte aligned)
+  [3..2+count] qwords: bytes to write into the VMAR
 ```
 
-VAR cap required on [1]: `w`.
+VMAR cap required on [1]: `w`.
 
-[test 01] returns E_BADCAP if [1] is not a valid VAR handle.
+[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_PERM if [1] does not have the `w` cap.
 [test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
 [test 04] returns E_INVAL if count is 0 or count > 125.
-[test 05] returns E_INVAL if [2] + count*8 exceeds the VAR's size.
+[test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
 [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-[test 07] on success, the qwords from vregs `[3..2+count]` are written into the VAR starting at [2] offset.
+[test 07] on success, the qwords from vregs `[3..2+count]` are written into the VMAR starting at [2] offset.
 [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 ## §[page_frame] Page Frame
 
-A page frame is a reference to physical memory. Installing it into virtual address ranges bound to multiple capability domains creates shared memory.
+A page frame is a reference to physical memory. Installing it into virtual memory address regions bound to multiple capability domains creates shared memory.
 
 Handle ABI:
 
@@ -1262,7 +1262,7 @@ Field layout:
 |---|---|---|
 | page_count | field0 bits 0-31 | number of pages (in `sz` units) |
 | sz | field0 bits 32-33 | page size (immutable): 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
-| mapcnt | field1 bits 0-31 | total number of active installations of this physical page across all VARs and IOMMU domains; sync-refreshed on any syscall touching the handle |
+| mapcnt | field1 bits 0-31 | total number of active installations of this physical page across all VMARs and IOMMU domains; sync-refreshed on any syscall touching the handle |
 
 cap (word 0, bits 48-63):
 
@@ -1278,9 +1278,9 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `r` | read; applied only if the installing VAR's `cur_rwx.r` is set |
-| 3 | `w` | write; applied only if the installing VAR's `cur_rwx.w` is set |
-| 4 | `x` | execute; applied only if the installing VAR's `cur_rwx.x` is set |
+| 2 | `r` | read; applied only if the installing VMAR's `cur_rwx.r` is set |
+| 3 | `w` | write; applied only if the installing VMAR's `cur_rwx.w` is set |
+| 4 | `x` | execute; applied only if the installing VMAR's `cur_rwx.x` is set |
 | 5-6 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
 | 7 | `restart_policy` | page_frame behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 | 8-15 | `_reserved` | |
@@ -1321,7 +1321,7 @@ Returns E_NOMEM if insufficient physical memory; returns E_FULL if the caller's 
 
 ## §[device_region] Device Region
 
-A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual address range makes the device directly accessible to execution contexts in that capability domain.
+A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual memory address region makes the device directly accessible to execution contexts in that capability domain.
 
 Handle ABI:
 
@@ -1369,31 +1369,31 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `dma` | binding this device_region to a DMA-flagged VAR via `create_var`, authorizing IOMMU mappings for the device |
+| 2 | `dma` | binding this device_region to a DMA-flagged VMAR via `create_vmar`, authorizing IOMMU mappings for the device |
 | 3 | `irq` | acknowledging IRQs from this device via `ack` |
 | 4 | `restart_policy` | device_region behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### §[port_io_virtualization] x86-64 Port I/O Virtualization
 
-A device_region with `dev_type = port_io` carries a 16-bit `base_port` and `port_count`. Installing it into an MMIO VAR via `map_mmio` reserves the VAR's virtual range without populating CPU page tables: every CPU access to the range page-faults into the kernel.
+A device_region with `dev_type = port_io` carries a 16-bit `base_port` and `port_count`. Installing it into an MMIO VMAR via `map_mmio` reserves the VMAR's virtual range without populating CPU page tables: every CPU access to the range page-faults into the kernel.
 
-The kernel handles such faults by decoding the faulting MOV instruction, computing the target port as `base_port + (fault_vaddr - VAR.base)`, executing the corresponding x86-64 `in`/`out` of the operand width, writing the result into the destination GPR (loads) or committing the source value (stores), and advancing RIP past the instruction.
+The kernel handles such faults by decoding the faulting MOV instruction, computing the target port as `base_port + (fault_vaddr - VMAR.base)`, executing the corresponding x86-64 `in`/`out` of the operand width, writing the result into the destination GPR (loads) or committing the source value (stores), and advancing RIP past the instruction.
 
 Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — deliver a `thread_fault` event with the protection_fault sub-code.
 
-Effective permissions follow `VAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, delivers a `memory_fault` event. Accesses with computed offset `>= port_count` deliver a `memory_fault` event.
+Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, delivers a `memory_fault` event. Accesses with computed offset `>= port_count` deliver a `memory_fault` event.
 
 [test 01] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
 [test 02] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].field1.cch != 1 (uc).
 [test 03] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and [1].caps.x is set.
-[test 04] a 1-, 2-, or 4-byte MOV load from `VAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR holding the value an x86-64 `in` of the matching operand width at port `base_port + offset` would produce, and execution resumes at the instruction immediately following the MOV.
-[test 05] a 1-, 2-, or 4-byte MOV store to `VAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
-[test 06] a MOV access to `VAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
-[test 07] a MOV load when `VAR.cur_rwx.r = 0` delivers a `memory_fault` event.
-[test 08] a MOV store when `VAR.cur_rwx.w = 0` delivers a `memory_fault` event.
-[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
-[test 10] a `LOCK`-prefixed MOV targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
-[test 11] an 8-byte MOV access targeting the VAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 04] a 1-, 2-, or 4-byte MOV load from `VMAR.base + offset` (offset < port_count, `cur_rwx.r = 1`) leaves the destination GPR holding the value an x86-64 `in` of the matching operand width at port `base_port + offset` would produce, and execution resumes at the instruction immediately following the MOV.
+[test 05] a 1-, 2-, or 4-byte MOV store to `VMAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
+[test 06] a MOV access to `VMAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
+[test 07] a MOV load when `VMAR.cur_rwx.r = 0` delivers a `memory_fault` event.
+[test 08] a MOV store when `VMAR.cur_rwx.w = 0` delivers a `memory_fault` event.
+[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 10] a `LOCK`-prefixed MOV targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 11] an 8-byte MOV access targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
 
 ### §[device_irq] Device IRQ Delivery
 

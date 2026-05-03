@@ -1,0 +1,15 @@
+#!/bin/bash
+# Rotate .zag-perf/_pending.json (written by stage_perf_regression in
+# tests/precommit.sh) into .zag-perf/<new_sha>.json so the next commit
+# can compare against it.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+PERF_DIR="$REPO_ROOT/.zag-perf"
+PENDING="$PERF_DIR/_pending.json"
+
+if [[ -f "$PENDING" ]]; then
+    SHA="$(git rev-parse HEAD)"
+    mv "$PENDING" "$PERF_DIR/${SHA}.json"
+fi
