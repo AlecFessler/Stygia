@@ -29,17 +29,6 @@ const UARTFR_OFFSET: u64 = 0x018;
 const UARTFR_RXFE: u32 = 1 << 4;
 const UARTFR_TXFE: u32 = 1 << 7;
 
-// GICv3 distributor + redistributor IPA windows the FDT advertises.
-// Without a vGIC, every Linux probe of these regions trapped through
-// the VMM, which dropped the access and resumed — adding multiple
-// minutes to the early init under TCG. Inline-handling them here
-// produces the same observable behaviour (read=0, write swallowed)
-// without the round-trip.
-const GICD_IPA_BASE: u64 = 0x0800_0000;
-const GICD_IPA_SIZE: u64 = 0x0001_0000;
-const GICR_IPA_BASE: u64 = 0x080A_0000;
-const GICR_IPA_SIZE: u64 = 0x0002_0000;
-
 // ── Spec-v3 dispatch backings ────────────────────────────────────────
 //
 // Stage-2 mapping, world-switch entry/exit, and EL2 vector install are
@@ -241,49 +230,38 @@ pub fn tryHandleStage2Mmio(
 ) bool {
     _ = vm;
     if (!iss_valid) return false;
+    if (guest_phys < PL011_IPA_BASE or guest_phys >= PL011_IPA_BASE + PL011_IPA_SIZE) return false;
     const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return false;
     const gs = &arch_state.guest_state;
-
-    // PL011.
-    if (guest_phys >= PL011_IPA_BASE and guest_phys < PL011_IPA_BASE + PL011_IPA_SIZE) {
-        const offset = guest_phys - PL011_IPA_BASE;
-        if (is_write) {
-            if (offset == UARTDR_OFFSET) {
-                const ch: u8 = @intCast(readGuestGpr(gs, srt) & 0xFF);
-                const buf: [1]u8 = .{ch};
-                serial.printRaw(buf[0..]);
-            }
-            return true;
+    const offset = guest_phys - PL011_IPA_BASE;
+    if (is_write) {
+        if (offset == UARTDR_OFFSET) {
+            const ch: u8 = @intCast(readGuestGpr(gs, srt) & 0xFF);
+            const buf: [1]u8 = .{ch};
+            serial.printRaw(buf[0..]);
         }
-        const value: u64 = switch (offset) {
-            UARTDR_OFFSET => 0,
-            UARTFR_OFFSET => UARTFR_RXFE | UARTFR_TXFE,
-            0xFE0 => 0x11, // PrimeCell IDs (PL011 r1p5 §4.3 Table 4-2).
-            0xFE4 => 0x10,
-            0xFE8 => 0x34,
-            0xFEC => 0x00,
-            0xFF0 => 0x0D,
-            0xFF4 => 0xF0,
-            0xFF8 => 0x05,
-            0xFFC => 0xB1,
-            else => 0,
-        };
-        writeGuestGpr(gs, srt, value);
+        // Other PL011 writes (baud, line control, IMSC, ICR, …) are
+        // accepted by hardware and have no host-visible effect we care
+        // about for a TX-only console; just swallow.
         return true;
     }
-
-    // GICv3 distributor + redistributor — drop accesses and pretend
-    // it's quiescent (read = 0, write swallowed). The vGIC isn't
-    // wired yet; without inline handling Linux's GIC probe round-
-    // trips through the VMM ~hundreds of times during init.
-    const in_gicd = guest_phys >= GICD_IPA_BASE and guest_phys < GICD_IPA_BASE + GICD_IPA_SIZE;
-    const in_gicr = guest_phys >= GICR_IPA_BASE and guest_phys < GICR_IPA_BASE + GICR_IPA_SIZE;
-    if (in_gicd or in_gicr) {
-        if (!is_write) writeGuestGpr(gs, srt, 0);
-        return true;
-    }
-
-    return false;
+    // Reads.
+    const value: u64 = switch (offset) {
+        UARTDR_OFFSET => 0,
+        UARTFR_OFFSET => UARTFR_RXFE | UARTFR_TXFE,
+        // PrimeCell ID page top-half — Linux's amba bus probe.
+        0xFE0 => 0x11,
+        0xFE4 => 0x10,
+        0xFE8 => 0x34,
+        0xFEC => 0x00,
+        0xFF0 => 0x0D,
+        0xFF4 => 0xF0,
+        0xFF8 => 0x05,
+        0xFFC => 0xB1,
+        else => 0,
+    };
+    writeGuestGpr(gs, srt, value);
+    return true;
 }
 
 inline fn readGuestGpr(gs: *const vm_hw.GuestState, idx: u8) u64 {
