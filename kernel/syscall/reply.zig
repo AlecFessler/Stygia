@@ -1,6 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const capability = zag.caps.capability;
 const cpu = zag.arch.dispatch.cpu;
 const device_region = zag.devices.device_region;
@@ -110,14 +111,23 @@ pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
         break :blk port.reply(ec, reply_handle);
     };
 
-    if (reply_result != errors.OK) return reply_result;
+    if (reply_result != errors.OK) {
+        if (recv_port != 0 and pair_count > 0) arch.boot.printRaw("[dbg] reply: replyXfer fail\n");
+        return reply_result;
+    }
 
     if (recv_port != 0) {
         // Spec §[reply] tests 24/26: atomic recv-after-reply parks the
         // caller on the named port for the next event. The recv contract's
         // return word + vregs ride out via the iretq epilogue (port.recv
         // stages `pending_event_word` on synchronous match or suspend).
-        return port.recv(ec, recv_port, 0);
+        if (pair_count > 0) arch.boot.printRaw("[dbg] reply: about to recv\n");
+        const r = port.recv(ec, recv_port, 0);
+        if (pair_count > 0) {
+            if (r == errors.OK) arch.boot.printRaw("[dbg] reply: recv OK\n")
+            else arch.boot.printRaw("[dbg] reply: recv non-OK\n");
+        }
+        return r;
     }
 
     return errors.OK;

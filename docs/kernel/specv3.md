@@ -44,7 +44,7 @@ Bits 0-11 of vreg 0 carry the syscall_op (0..4095). The op range is partitioned 
 - `14` — suspend (general variant). Carries `pair_count` and `payload_count` as syscall-word fields per §[port].suspend.
 - `15..4095` — every other syscall.
 
-Higher bits are reserved unless a syscall claims them — when claimed, each syscall's spec calls out the layout (e.g., `pair_count` in bits 12-19, `tstart` in bits 20-31, `reply_handle_id` in bits 32-43 on `recv` return / bits 12-23 or 20-31 on `reply` and `reply_transfer` entry, `event_type` in bits 44-48, `payload_count` in bits 49-55 on `recv` return). Bits not assigned by the invoked syscall must be zero on entry; the kernel returns E_INVAL if a reserved bit is set.
+Higher bits are reserved unless a syscall claims them — when claimed, each syscall's spec calls out the layout (e.g., `pair_count` in bits 12-19, `tstart` in bits 20-31, `reply_handle_id` in bits 32-43 on `recv` return / bits 20-31 on `reply` entry, `recv_port_handle_id` in bits 32-43 on `reply` entry, `event_type` in bits 44-48, `payload_count` in bits 49-55 on `recv` return). Bits not assigned by the invoked syscall must be zero on entry; the kernel returns E_INVAL if a reserved bit is set.
 
 ## §[error_codes] Error Codes
 
@@ -2193,7 +2193,7 @@ EC cap required on [1]: `unbind`.
 
 ## §[reply] Reply
 
-A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply`, `reply_transfer`, or `delete`) is the only way to free the suspended sender.
+A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply` or `delete`) is the only way to free the suspended sender.
 
 Handle ABI:
 
@@ -2230,14 +2230,14 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `move` | transferring this reply handle via move to another capability domain |
 | 1 | `copy` | always 0 — reply handles are one-shot and cannot be duplicated |
-| 2 | `xfer` | attaching handles to the resumption via `reply_transfer` |
+| 2 | `xfer` | attaching handles to the resumption via `reply` (when `pair_count > 0`) |
 | 3-15 | `_reserved` | |
 
 The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and `xfer = 1` if and only if the recv'ing port had the `xfer` cap; otherwise `xfer = 0`. A holder may `restrict` away `move` or `xfer` to hand a more limited reply handle to another domain. `copy` cannot be set, so `restrict` cannot grant it.
 
 ### reply
 
-Consumes a reply handle and resumes the suspended EC. State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
+Consumes a reply handle and resumes the suspended EC. Optionally attaches up to 63 handles to the resumption (when `pair_count > 0`) and/or atomically blocks the caller on a port for the next event (when `recv_port_handle_id != 0`). State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
 
 The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
 
@@ -2248,62 +2248,51 @@ The reply handle is typed by the originating event_type at recv time. The kernel
 
 The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
 
+When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain). The `xfer` cap on the reply handle is required for any `pair_count > 0` call.
+
+When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another EC to interleave a syscall on the caller in between. The named port must have the `recv` cap. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended EC was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
+
 ```
-reply -> void
+reply([128-N..127] pair_entries when pair_count > 0) -> void
   syscall_num = 52
 
   syscall word bits  0-11: syscall_num
-  syscall word bits 12-23: reply_handle_id (12 bits)
-  syscall word bits 24-63: _reserved
+  syscall word bits 12-19: pair_count (0..63)
+  syscall word bits 20-31: reply_handle_id (12 bits)
+  syscall word bits 32-43: recv_port_handle_id (12 bits; 0 = no recv-on-reply)
+  syscall word bits 44-63: _reserved
+
+  vregs [128-pair_count..127]: pair entries packed per §[handle_attachments]
 ```
 
-No self-handle cap required — the reply handle itself authorizes the operation.
+No self-handle cap required — the reply handle itself authorizes the operation. The `xfer` cap on the reply handle is required when `pair_count > 0`. The `recv` cap on the port handle is required when `recv_port_handle_id != 0`.
 
 [test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
 [test 02] returns E_INVAL if any reserved bits are set in the syscall word.
-[test 03] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed.
-[test 04] on success, the reply handle is consumed (removed from the caller's table).
+[test 03] returns E_TERM if the suspended EC was terminated before reply could deliver and `pair_count = 0`; the reply handle is consumed.
+[test 04] on success when `pair_count = 0` and `recv_port_handle_id = 0`, the reply handle is consumed (removed from the caller's table).
 [test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 [test 07] on success, the suspended EC is resumed.
 [test 08] on success when the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code into the reply (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; a subsequent `recv` on the exit_port returns a vm_exit whose sub-code is `initial_state`.
-
-### reply_transfer
-
-Consumes a reply handle, resumes the suspended EC, and attaches N handles to the resumption. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain). State writes are applied per `reply` semantics.
-
-The reply handle id rides in the syscall word for the same reason as `reply` — see the §[reply] note on the L4-style IPC fast path.
-
-```
-reply_transfer([128-N..127] pair_entries) -> void
-  syscall_num = 53
-
-  syscall word bits  0-11: syscall_num
-  syscall word bits 12-19: N (1..63)
-  syscall word bits 20-31: reply_handle_id (12 bits)
-  syscall word bits 32-63: _reserved
-
-  [128-N..127]: pair entries packed per §[handle_attachments]
-```
-
-Reply cap required on the reply handle: `xfer`.
-
-[test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
-[test 02] returns E_PERM if the reply handle does not have the `xfer` cap.
-[test 03] returns E_INVAL if N is 0 or N > 63.
-[test 04] returns E_INVAL if any reserved bits are set in the syscall word or any pair entry.
-[test 05] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
-[test 06] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
-[test 07] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
-[test 08] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
-[test 09] returns E_INVAL if two pair entries reference the same source handle.
-[test 10] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
-[test 11] returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
-[test 12] on success, the reply handle is consumed; the resumed EC's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
-[test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
-[test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
-[test 15] on success, the suspended EC is resumed.
-[test 16] on success when the reply_transfer is typed `vm_exit` and the receiver wrote the `initial_state` sub-code into the reply (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; the N attached handles are still installed in the vCPU's domain at slots [tstart, tstart+N) per the standard reply_transfer rules.
+[test 09] returns E_PERM when `pair_count > 0` and the reply handle does not have the `xfer` cap.
+[test 10] returns E_INVAL when `pair_count > 63`.
+[test 11] returns E_INVAL if any reserved bits are set in any pair entry.
+[test 12] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
+[test 13] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
+[test 14] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
+[test 15] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
+[test 16] returns E_INVAL if two pair entries reference the same source handle.
+[test 17] returns E_TERM if the suspended EC was terminated before reply could deliver and `pair_count > 0`; the reply handle is consumed and no handle transfer occurs.
+[test 18] returns E_FULL if `pair_count > 0` and the resumed EC's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+[test 19] on success when `pair_count > 0`, the resumed EC's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+[test 20] on success when `pair_count > 0`, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
+[test 21] on success when `pair_count > 0` and the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; the N attached handles are still installed in the vCPU's domain at slots `[tstart, tstart+N)` per the standard pair-attachment rules.
+[test 22] returns E_BADCAP when `recv_port_handle_id != 0` and that slot does not name a valid port handle in the caller's domain; the reply handle is NOT consumed and the caller does not park.
+[test 23] returns E_PERM when `recv_port_handle_id != 0` and the named port handle does not have the `recv` cap; the reply handle is NOT consumed and the caller does not park.
+[test 24] on success when `recv_port_handle_id != 0`, after the suspended EC is resumed the caller is parked on the named port and a subsequent event delivered on that port wakes the caller with the standard recv return.
+[test 25] returns E_TERM when `recv_port_handle_id != 0` and the suspended EC was terminated before reply could deliver; the reply handle is consumed and the caller does NOT park on the recv port.
+[test 26] on success when both `pair_count > 0` and `recv_port_handle_id != 0`, both effects are applied atomically: the resumed EC receives the attached handles, then the caller parks on the named port.
 
 ## §[timer] Timer
 
