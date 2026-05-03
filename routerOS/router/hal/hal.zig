@@ -1,5 +1,0 @@
-pub const dma = @import("dma.zig");
-pub const e1000 = @import("e1000.zig");
-pub const headers = @import("headers.zig");
-pub const iface = @import("iface.zig");
-pub const nic = @import("nic.zig");

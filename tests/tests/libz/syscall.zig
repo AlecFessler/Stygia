@@ -1,14 +1,22 @@
-// Spec v3 vreg-ABI syscall wrappers. Architecture dispatch lives in
-// the arch backends (`syscall_x64.zig`, `syscall_aarch64.zig`). This
-// file owns the public API, the syscall-word encoding, and the per-
-// syscall wrappers — all of which are arch-neutral.
+// Spec v3 vreg-ABI syscall wrappers — TEST ELF flavor.
 //
-// `Regs` carries the lowest 13 vregs (v1..v13). On x86-64 these are
-// the only register-backed vregs; on aarch64 vregs 14..31 are also
-// register-backed (x13..x30) but no current libz call site populates
-// them, so `Regs` is intentionally not widened. A future spec tweak
-// that exposes vregs 14..31 to userspace would lift the API; until
-// then the narrow shape keeps both backends symmetric.
+// Each high-level wrapper (createPort, recv, mapPf, …) is now an
+// extern declaration that resolves at runtime against libz.elf via
+// `libz_loader.relocateSelf` patching this ELF's JUMP_SLOT/GLOB_DAT
+// relocations. The Zig-native call signatures (slices, u12, u1, native
+// Regs/RecvReturn) used by the 475 test source files are preserved as
+// thin wrappers that translate to/from the C-ABI shapes that libz.elf
+// actually exports (see libz/abi.zig).
+//
+// Raw inline-asm primitives (issueRawNoStack / issueRegDiscard /
+// issueRawCaptureWord / replyTransferAsm) are still statically compiled
+// into every test ELF so that start.zig's libz bootstrap can issue
+// `create_var` + `map_pf` BEFORE the relocateSelf pass runs (i.e.
+// before any extern call would be safe to make).
+//
+// The companion top-level `libz/syscall.zig` is the source-of-truth
+// implementation that ends up inside libz.elf via abi.zig — that file
+// keeps the full static bodies and is unchanged.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +26,12 @@ const arch_impl = switch (builtin.cpu.arch) {
     .aarch64 => @import("syscall_aarch64.zig"),
     else => @compileError("unsupported target architecture for libz syscall"),
 };
+
+// ── Public Zig-native types ─────────────────────────────────────────
+//
+// These are the shapes the test sources see. `Regs` and `RecvReturn`
+// remain plain (non-extern) structs with default field values so test
+// call sites can keep using `.{ .v1 = … }` literals.
 
 pub const Regs = struct {
     v1: u64 = 0,
@@ -33,6 +47,11 @@ pub const Regs = struct {
     v11: u64 = 0,
     v12: u64 = 0,
     v13: u64 = 0,
+};
+
+pub const RecvReturn = struct {
+    word: u64,
+    regs: Regs,
 };
 
 pub const SyscallNum = enum(u12) {
@@ -96,6 +115,8 @@ pub const SyscallNum = enum(u12) {
     power_set_idle = 57,
 };
 
+// ── Syscall-word encoding helpers ───────────────────────────────────
+//
 // SPEC AMBIGUITY: spec §[syscall_abi] does not pin which bits of the
 // syscall word carry syscall_num. Several syscalls put `pair_count` /
 // `count` in bits 12-19 and `tstart` / sub-fields in bits 20-31, which
@@ -117,9 +138,7 @@ pub fn extraVmKind(kind: u1, count: u8) u64 {
     return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
-/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23 so
-/// the GPR-backed event-state vregs survive intact across the syscall
-/// and the L4-style fast path is preserved.
+/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
 pub fn extraReplyHandle(handle: u12) u64 {
     return (@as(u64, handle) & 0xFFF) << 12;
 }
@@ -130,10 +149,12 @@ pub fn extraReplyTransferHandle(handle: u12) u64 {
     return (@as(u64, handle) & 0xFFF) << 20;
 }
 
-pub const RecvReturn = struct {
-    word: u64,
-    regs: Regs,
-};
+// ── Raw issue primitives — statically compiled, no extern dispatch ──
+//
+// Bootstrap code in start.zig calls into these BEFORE relocateSelf has
+// patched the JUMP_SLOT entries. Keeping them static means the early
+// `create_var` + `map_pf` that establishes the LIBZ_SLIDE mapping is
+// always callable.
 
 fn issueRawNoStack(word: u64, in: Regs) Regs {
     return arch_impl.issueRawNoStack(word, in);
@@ -168,35 +189,229 @@ pub fn issueStack(num: SyscallNum, extra: u64, in: Regs, stack_vregs: []const u6
     return arch_impl.issueRawWithSlots(buildWord(num, extra), in, &slots, stack_vregs.len);
 }
 
-// Per-syscall wrappers below. Each returns the kernel's vreg snapshot
-// (Regs) plus, where applicable, the syscall word (some recv paths
-// depend on the returned syscall word for reply_handle_id / event_type
-// / pair_count / tstart). For those cases we issue with a peek of the
-// word via a dedicated helper.
+// ── C-ABI shape mirrors and conversions ─────────────────────────────
+//
+// libz/abi.zig exports its bridge functions with `extern struct`
+// returns (so they pass through callconv(.c)). These mirrors duplicate
+// types.zig's layout locally so this file doesn't pull in a libz/types
+// import path through the test build graph.
 
-// ---------------------------------------------------------------
+const CRegs = extern struct {
+    v1: u64 = 0,
+    v2: u64 = 0,
+    v3: u64 = 0,
+    v4: u64 = 0,
+    v5: u64 = 0,
+    v6: u64 = 0,
+    v7: u64 = 0,
+    v8: u64 = 0,
+    v9: u64 = 0,
+    v10: u64 = 0,
+    v11: u64 = 0,
+    v12: u64 = 0,
+    v13: u64 = 0,
+};
+
+const CRecvReturn = extern struct {
+    word: u64,
+    regs: CRegs,
+};
+
+const c = struct {
+    pub const Regs = CRegs;
+    pub const RecvReturn = CRecvReturn;
+};
+
+inline fn fromCRegs(r: c.Regs) Regs {
+    return .{
+        .v1 = r.v1,
+        .v2 = r.v2,
+        .v3 = r.v3,
+        .v4 = r.v4,
+        .v5 = r.v5,
+        .v6 = r.v6,
+        .v7 = r.v7,
+        .v8 = r.v8,
+        .v9 = r.v9,
+        .v10 = r.v10,
+        .v11 = r.v11,
+        .v12 = r.v12,
+        .v13 = r.v13,
+    };
+}
+
+inline fn fromCRecvReturn(rr: c.RecvReturn) RecvReturn {
+    return .{ .word = rr.word, .regs = fromCRegs(rr.regs) };
+}
+
+// ── Extern declarations resolved against libz.elf at runtime ────────
+//
+// Names match libz/abi.zig's @export block exactly (no `_c` suffix).
+// They live in a struct namespace so the local Zig identifiers don't
+// clash with the public wrapper names below — only the dynsym name
+// (which is the bare `extern fn` identifier) matters at link time.
+
+const ext = struct {
+    extern fn restrict(handle: u16, new_caps: u64) callconv(.c) c.Regs;
+    extern fn delete(handle: u16) callconv(.c) c.Regs;
+    extern fn revoke(handle: u16) callconv(.c) c.Regs;
+    extern fn sync(handle: u16) callconv(.c) c.Regs;
+    extern fn createCapabilityDomain(
+        caps: u64,
+        ceilings_inner: u64,
+        ceilings_outer: u64,
+        elf_pf: u16,
+        initial_ec_affinity: u64,
+        passed_handles_ptr: [*]const u64,
+        passed_handles_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn acquireEcs(target: u16) callconv(.c) c.RecvReturn;
+    extern fn acquireVars(target: u16) callconv(.c) c.RecvReturn;
+    extern fn createExecutionContext(
+        caps: u64,
+        entry: u64,
+        stack_pages: u64,
+        target: u64,
+        affinity_mask: u64,
+    ) callconv(.c) c.Regs;
+    extern fn self() callconv(.c) c.Regs;
+    extern fn terminate(target: u16) callconv(.c) c.Regs;
+    extern fn yieldEc(target: u64) callconv(.c) c.Regs;
+    extern fn priority(target: u16, new_priority: u64) callconv(.c) c.Regs;
+    extern fn affinity(target: u16, new_affinity: u64) callconv(.c) c.Regs;
+    extern fn perfmonInfo() callconv(.c) c.Regs;
+    extern fn perfmonStart(
+        target: u16,
+        num_configs: u64,
+        configs_ptr: [*]const u64,
+        configs_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn perfmonRead(target: u16) callconv(.c) c.Regs;
+    extern fn perfmonStop(target: u16) callconv(.c) c.Regs;
+    extern fn createVar(
+        caps: u64,
+        props: u64,
+        pages: u64,
+        preferred_base: u64,
+        device_region: u64,
+    ) callconv(.c) c.Regs;
+    extern fn mapPf(
+        var_handle: u16,
+        pairs_ptr: [*]const u64,
+        pairs_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn mapMmio(var_handle: u16, device_region: u16) callconv(.c) c.Regs;
+    extern fn unmap(
+        var_handle: u16,
+        selectors_ptr: [*]const u64,
+        selectors_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn remap(var_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs;
+    extern fn snapshot(target_var: u16, source_var: u16) callconv(.c) c.Regs;
+    extern fn idcRead(var_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs;
+    extern fn idcWrite(
+        var_handle: u16,
+        offset: u64,
+        qwords_ptr: [*]const u64,
+        qwords_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn createPageFrame(caps: u64, props: u64, pages: u64) callconv(.c) c.Regs;
+    extern fn ack(device_region: u16) callconv(.c) c.Regs;
+    extern fn createVirtualMachine(caps: u64, policy_pf: u16) callconv(.c) c.Regs;
+    extern fn createVcpu(
+        caps: u64,
+        vm_handle: u16,
+        affinity_mask: u64,
+        exit_port: u16,
+    ) callconv(.c) c.Regs;
+    extern fn mapGuest(
+        vm_handle: u16,
+        pairs_ptr: [*]const u64,
+        pairs_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn unmapGuest(
+        vm_handle: u16,
+        page_frames_ptr: [*]const u64,
+        page_frames_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn vmSetPolicy(
+        vm_handle: u16,
+        kind: u8,
+        count: u8,
+        entries_ptr: [*]const u64,
+        entries_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn vmInjectIrq(vm_handle: u16, irq_num: u64, assert_word: u64) callconv(.c) c.Regs;
+    extern fn createPort(caps: u64) callconv(.c) c.Regs;
+    extern fn suspendEc(
+        target: u16,
+        port: u16,
+        attachments_ptr: [*]const u64,
+        attachments_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn recv(port: u16, timeout_ns: u64) callconv(.c) c.RecvReturn;
+    extern fn bindEventRoute(target: u16, event_type: u64, port: u16) callconv(.c) c.Regs;
+    extern fn clearEventRoute(target: u16, event_type: u64) callconv(.c) c.Regs;
+    extern fn reply(reply_handle: u16) callconv(.c) c.Regs;
+    extern fn replyTransfer(
+        reply_handle: u16,
+        attachments_ptr: [*]const u64,
+        attachments_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn timerArm(caps: u64, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
+    extern fn timerRearm(timer_handle: u16, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
+    extern fn timerCancel(timer_handle: u16) callconv(.c) c.Regs;
+    extern fn futexWaitVal(
+        timeout_ns: u64,
+        pairs_ptr: [*]const u64,
+        pairs_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn futexWaitChange(
+        timeout_ns: u64,
+        pairs_ptr: [*]const u64,
+        pairs_len: usize,
+    ) callconv(.c) c.Regs;
+    extern fn futexWake(addr: u64, count: u64) callconv(.c) c.Regs;
+    extern fn timeMonotonic() callconv(.c) c.Regs;
+    extern fn timeGetwall() callconv(.c) c.Regs;
+    extern fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs;
+    extern fn random(count: u8) callconv(.c) c.Regs;
+    extern fn infoSystem() callconv(.c) c.Regs;
+    extern fn infoCores(core_id: u64) callconv(.c) c.Regs;
+    extern fn powerShutdown() callconv(.c) c.Regs;
+    extern fn powerReboot() callconv(.c) c.Regs;
+    extern fn powerSleep(depth: u64) callconv(.c) c.Regs;
+    extern fn powerScreenOff() callconv(.c) c.Regs;
+    extern fn powerSetFreq(core_id: u64, hz: u64) callconv(.c) c.Regs;
+    extern fn powerSetIdle(core_id: u64, policy: u64) callconv(.c) c.Regs;
+};
+
+// ── Public Zig-native wrappers ──────────────────────────────────────
+//
+// Signatures match the historical syscall.zig contract exactly so the
+// 475 test sources don't have to change. Each wrapper widens
+// u12/u1 → u16/u8, decomposes slices into ptr+len, and converts the
+// extern struct return back to the native `Regs` / `RecvReturn`.
+
 // 0..3: cap-table-wide ops
-// ---------------------------------------------------------------
 
 pub fn restrict(handle: u12, new_caps: u64) Regs {
-    return issueReg(.restrict, 0, .{ .v1 = handle, .v2 = new_caps });
+    return fromCRegs(ext.restrict(@as(u16, handle), new_caps));
 }
 
 pub fn delete(handle: u12) Regs {
-    return issueReg(.delete, 0, .{ .v1 = handle });
+    return fromCRegs(ext.delete(@as(u16, handle)));
 }
 
 pub fn revoke(handle: u12) Regs {
-    return issueReg(.revoke, 0, .{ .v1 = handle });
+    return fromCRegs(ext.revoke(@as(u16, handle)));
 }
 
 pub fn sync(handle: u12) Regs {
-    return issueReg(.sync, 0, .{ .v1 = handle });
+    return fromCRegs(ext.sync(@as(u16, handle)));
 }
 
-// ---------------------------------------------------------------
 // 4..6: capability-domain ops
-// ---------------------------------------------------------------
 
 pub fn createCapabilityDomain(
     caps: u64,
@@ -206,44 +421,26 @@ pub fn createCapabilityDomain(
     initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
-    // Spec §[create_capability_domain]: [5] is the initial EC affinity
-    // mask, passed handles start at [6+]. Up to 8 passed handles fit
-    // in register vregs 6..13; beyond that issueStack handles spill.
-    var in = Regs{
-        .v1 = caps,
-        .v2 = ceilings_inner,
-        .v3 = ceilings_outer,
-        .v4 = elf_pf,
-        .v5 = initial_ec_affinity,
-    };
-    if (passed_handles.len >= 1) in.v6 = passed_handles[0];
-    if (passed_handles.len >= 2) in.v7 = passed_handles[1];
-    if (passed_handles.len >= 3) in.v8 = passed_handles[2];
-    if (passed_handles.len >= 4) in.v9 = passed_handles[3];
-    if (passed_handles.len >= 5) in.v10 = passed_handles[4];
-    if (passed_handles.len >= 6) in.v11 = passed_handles[5];
-    if (passed_handles.len >= 7) in.v12 = passed_handles[6];
-    if (passed_handles.len >= 8) in.v13 = passed_handles[7];
-    if (passed_handles.len > 8) {
-        return issueStack(.create_capability_domain, 0, in, passed_handles[8..]);
-    }
-    return issueReg(.create_capability_domain, 0, in);
+    return fromCRegs(ext.createCapabilityDomain(
+        caps,
+        ceilings_inner,
+        ceilings_outer,
+        @as(u16, elf_pf),
+        initial_ec_affinity,
+        passed_handles.ptr,
+        passed_handles.len,
+    ));
 }
 
 pub fn acquireEcs(target: u12) RecvReturn {
-    // count is set by the kernel on return in syscall word bits 12-19.
-    const word = buildWord(.acquire_ecs, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
+    return fromCRecvReturn(ext.acquireEcs(@as(u16, target)));
 }
 
 pub fn acquireVars(target: u12) RecvReturn {
-    const word = buildWord(.acquire_vars, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
+    return fromCRecvReturn(ext.acquireVars(@as(u16, target)));
 }
 
-// ---------------------------------------------------------------
 // 7..16: execution-context ops
-// ---------------------------------------------------------------
 
 pub fn createExecutionContext(
     caps: u64,
@@ -252,69 +449,46 @@ pub fn createExecutionContext(
     target: u64,
     affinity_mask: u64,
 ) Regs {
-    return issueReg(.create_execution_context, 0, .{
-        .v1 = caps,
-        .v2 = entry,
-        .v3 = stack_pages,
-        .v4 = target,
-        .v5 = affinity_mask,
-    });
+    return fromCRegs(ext.createExecutionContext(caps, entry, stack_pages, target, affinity_mask));
 }
 
 pub fn self() Regs {
-    return issueReg(.self, 0, .{});
+    return fromCRegs(ext.self());
 }
 
 pub fn terminate(target: u12) Regs {
-    return issueReg(.terminate, 0, .{ .v1 = target });
+    return fromCRegs(ext.terminate(@as(u16, target)));
 }
 
 pub fn yieldEc(target: u64) Regs {
-    return issueReg(.yield, 0, .{ .v1 = target });
+    return fromCRegs(ext.yieldEc(target));
 }
 
 pub fn priority(target: u12, new_priority: u64) Regs {
-    return issueReg(.priority, 0, .{ .v1 = target, .v2 = new_priority });
+    return fromCRegs(ext.priority(@as(u16, target), new_priority));
 }
 
 pub fn affinity(target: u12, new_affinity: u64) Regs {
-    return issueReg(.affinity, 0, .{ .v1 = target, .v2 = new_affinity });
+    return fromCRegs(ext.affinity(@as(u16, target), new_affinity));
 }
 
 pub fn perfmonInfo() Regs {
-    return issueReg(.perfmon_info, 0, .{});
+    return fromCRegs(ext.perfmonInfo());
 }
 
 pub fn perfmonStart(target: u12, num_configs: u64, configs: []const u64) Regs {
-    var in = Regs{ .v1 = target, .v2 = num_configs };
-    if (configs.len >= 1) in.v3 = configs[0];
-    if (configs.len >= 2) in.v4 = configs[1];
-    if (configs.len >= 3) in.v5 = configs[2];
-    if (configs.len >= 4) in.v6 = configs[3];
-    if (configs.len >= 5) in.v7 = configs[4];
-    if (configs.len >= 6) in.v8 = configs[5];
-    if (configs.len >= 7) in.v9 = configs[6];
-    if (configs.len >= 8) in.v10 = configs[7];
-    if (configs.len >= 9) in.v11 = configs[8];
-    if (configs.len >= 10) in.v12 = configs[9];
-    if (configs.len >= 11) in.v13 = configs[10];
-    if (configs.len > 11) {
-        return issueStack(.perfmon_start, 0, in, configs[11..]);
-    }
-    return issueReg(.perfmon_start, 0, in);
+    return fromCRegs(ext.perfmonStart(@as(u16, target), num_configs, configs.ptr, configs.len));
 }
 
 pub fn perfmonRead(target: u12) Regs {
-    return issueReg(.perfmon_read, 0, .{ .v1 = target });
+    return fromCRegs(ext.perfmonRead(@as(u16, target)));
 }
 
 pub fn perfmonStop(target: u12) Regs {
-    return issueReg(.perfmon_stop, 0, .{ .v1 = target });
+    return fromCRegs(ext.perfmonStop(@as(u16, target)));
 }
 
-// ---------------------------------------------------------------
 // 17..24: VAR ops
-// ---------------------------------------------------------------
 
 pub fn createVar(
     caps: u64,
@@ -323,391 +497,198 @@ pub fn createVar(
     preferred_base: u64,
     device_region: u64,
 ) Regs {
-    return issueReg(.create_var, 0, .{
-        .v1 = caps,
-        .v2 = props,
-        .v3 = pages,
-        .v4 = preferred_base,
-        .v5 = device_region,
-    });
+    return fromCRegs(ext.createVar(caps, props, pages, preferred_base, device_region));
 }
 
 pub fn mapPf(var_handle: u12, pairs: []const u64) Regs {
-    const n: u8 = @intCast(pairs.len / 2);
-    var in = Regs{ .v1 = var_handle };
-    if (pairs.len >= 1) in.v2 = pairs[0];
-    if (pairs.len >= 2) in.v3 = pairs[1];
-    if (pairs.len >= 3) in.v4 = pairs[2];
-    if (pairs.len >= 4) in.v5 = pairs[3];
-    if (pairs.len >= 5) in.v6 = pairs[4];
-    if (pairs.len >= 6) in.v7 = pairs[5];
-    if (pairs.len >= 7) in.v8 = pairs[6];
-    if (pairs.len >= 8) in.v9 = pairs[7];
-    if (pairs.len >= 9) in.v10 = pairs[8];
-    if (pairs.len >= 10) in.v11 = pairs[9];
-    if (pairs.len >= 11) in.v12 = pairs[10];
-    if (pairs.len >= 12) in.v13 = pairs[11];
-    const extra = extraCount(n);
-    if (pairs.len > 12) {
-        return issueStack(.map_pf, extra, in, pairs[12..]);
-    }
-    return issueReg(.map_pf, extra, in);
+    return fromCRegs(ext.mapPf(@as(u16, var_handle), pairs.ptr, pairs.len));
 }
 
 pub fn mapMmio(var_handle: u12, device_region: u12) Regs {
-    return issueReg(.map_mmio, 0, .{ .v1 = var_handle, .v2 = device_region });
+    return fromCRegs(ext.mapMmio(@as(u16, var_handle), @as(u16, device_region)));
 }
 
 pub fn unmap(var_handle: u12, selectors: []const u64) Regs {
-    const n: u8 = @intCast(selectors.len);
-    var in = Regs{ .v1 = var_handle };
-    if (selectors.len >= 1) in.v2 = selectors[0];
-    if (selectors.len >= 2) in.v3 = selectors[1];
-    if (selectors.len >= 3) in.v4 = selectors[2];
-    if (selectors.len >= 4) in.v5 = selectors[3];
-    if (selectors.len >= 5) in.v6 = selectors[4];
-    if (selectors.len >= 6) in.v7 = selectors[5];
-    if (selectors.len >= 7) in.v8 = selectors[6];
-    if (selectors.len >= 8) in.v9 = selectors[7];
-    if (selectors.len >= 9) in.v10 = selectors[8];
-    if (selectors.len >= 10) in.v11 = selectors[9];
-    if (selectors.len >= 11) in.v12 = selectors[10];
-    if (selectors.len >= 12) in.v13 = selectors[11];
-    const extra = extraCount(n);
-    if (selectors.len > 12) {
-        return issueStack(.unmap, extra, in, selectors[12..]);
-    }
-    return issueReg(.unmap, extra, in);
+    return fromCRegs(ext.unmap(@as(u16, var_handle), selectors.ptr, selectors.len));
 }
 
 pub fn remap(var_handle: u12, new_cur_rwx: u64) Regs {
-    return issueReg(.remap, 0, .{ .v1 = var_handle, .v2 = new_cur_rwx });
+    return fromCRegs(ext.remap(@as(u16, var_handle), new_cur_rwx));
 }
 
 pub fn snapshot(target_var: u12, source_var: u12) Regs {
-    return issueReg(.snapshot, 0, .{ .v1 = target_var, .v2 = source_var });
+    return fromCRegs(ext.snapshot(@as(u16, target_var), @as(u16, source_var)));
 }
 
 pub fn idcRead(var_handle: u12, offset: u64, count: u8) Regs {
-    return issueReg(.idc_read, extraCount(count), .{ .v1 = var_handle, .v2 = offset });
+    return fromCRegs(ext.idcRead(@as(u16, var_handle), offset, count));
 }
 
 pub fn idcWrite(var_handle: u12, offset: u64, qwords: []const u64) Regs {
-    const n: u8 = @intCast(qwords.len);
-    var in = Regs{ .v1 = var_handle, .v2 = offset };
-    if (qwords.len >= 1) in.v3 = qwords[0];
-    if (qwords.len >= 2) in.v4 = qwords[1];
-    if (qwords.len >= 3) in.v5 = qwords[2];
-    if (qwords.len >= 4) in.v6 = qwords[3];
-    if (qwords.len >= 5) in.v7 = qwords[4];
-    if (qwords.len >= 6) in.v8 = qwords[5];
-    if (qwords.len >= 7) in.v9 = qwords[6];
-    if (qwords.len >= 8) in.v10 = qwords[7];
-    if (qwords.len >= 9) in.v11 = qwords[8];
-    if (qwords.len >= 10) in.v12 = qwords[9];
-    if (qwords.len >= 11) in.v13 = qwords[10];
-    const extra = extraCount(n);
-    if (qwords.len > 11) {
-        return issueStack(.idc_write, extra, in, qwords[11..]);
-    }
-    return issueReg(.idc_write, extra, in);
+    return fromCRegs(ext.idcWrite(@as(u16, var_handle), offset, qwords.ptr, qwords.len));
 }
 
-// ---------------------------------------------------------------
 // 25: page frame
-// ---------------------------------------------------------------
 
 pub fn createPageFrame(caps: u64, props: u64, pages: u64) Regs {
-    return issueReg(.create_page_frame, 0, .{
-        .v1 = caps,
-        .v2 = props,
-        .v3 = pages,
-    });
+    return fromCRegs(ext.createPageFrame(caps, props, pages));
 }
 
-// ---------------------------------------------------------------
 // 26: device region
-// ---------------------------------------------------------------
 
 pub fn ack(device_region: u12) Regs {
-    return issueReg(.ack, 0, .{ .v1 = device_region });
+    return fromCRegs(ext.ack(@as(u16, device_region)));
 }
 
-// ---------------------------------------------------------------
 // 27..32: virtual machine
-// ---------------------------------------------------------------
 
 pub fn createVirtualMachine(caps: u64, policy_pf: u12) Regs {
-    return issueReg(.create_virtual_machine, 0, .{ .v1 = caps, .v2 = policy_pf });
+    return fromCRegs(ext.createVirtualMachine(caps, @as(u16, policy_pf)));
 }
 
 pub fn createVcpu(caps: u64, vm_handle: u12, affinity_mask: u64, exit_port: u12) Regs {
-    return issueReg(.create_vcpu, 0, .{
-        .v1 = caps,
-        .v2 = vm_handle,
-        .v3 = affinity_mask,
-        .v4 = exit_port,
-    });
+    return fromCRegs(ext.createVcpu(caps, @as(u16, vm_handle), affinity_mask, @as(u16, exit_port)));
 }
 
 pub fn mapGuest(vm_handle: u12, pairs: []const u64) Regs {
-    const n: u8 = @intCast(pairs.len / 2);
-    var in = Regs{ .v1 = vm_handle };
-    if (pairs.len >= 1) in.v2 = pairs[0];
-    if (pairs.len >= 2) in.v3 = pairs[1];
-    if (pairs.len >= 3) in.v4 = pairs[2];
-    if (pairs.len >= 4) in.v5 = pairs[3];
-    if (pairs.len >= 5) in.v6 = pairs[4];
-    if (pairs.len >= 6) in.v7 = pairs[5];
-    if (pairs.len >= 7) in.v8 = pairs[6];
-    if (pairs.len >= 8) in.v9 = pairs[7];
-    if (pairs.len >= 9) in.v10 = pairs[8];
-    if (pairs.len >= 10) in.v11 = pairs[9];
-    if (pairs.len >= 11) in.v12 = pairs[10];
-    if (pairs.len >= 12) in.v13 = pairs[11];
-    const extra = extraCount(n);
-    if (pairs.len > 12) {
-        return issueStack(.map_guest, extra, in, pairs[12..]);
-    }
-    return issueReg(.map_guest, extra, in);
+    return fromCRegs(ext.mapGuest(@as(u16, vm_handle), pairs.ptr, pairs.len));
 }
 
 pub fn unmapGuest(vm_handle: u12, page_frames: []const u64) Regs {
-    const n: u8 = @intCast(page_frames.len);
-    var in = Regs{ .v1 = vm_handle };
-    if (page_frames.len >= 1) in.v2 = page_frames[0];
-    if (page_frames.len >= 2) in.v3 = page_frames[1];
-    if (page_frames.len >= 3) in.v4 = page_frames[2];
-    if (page_frames.len >= 4) in.v5 = page_frames[3];
-    if (page_frames.len >= 5) in.v6 = page_frames[4];
-    if (page_frames.len >= 6) in.v7 = page_frames[5];
-    if (page_frames.len >= 7) in.v8 = page_frames[6];
-    if (page_frames.len >= 8) in.v9 = page_frames[7];
-    if (page_frames.len >= 9) in.v10 = page_frames[8];
-    if (page_frames.len >= 10) in.v11 = page_frames[9];
-    if (page_frames.len >= 11) in.v12 = page_frames[10];
-    if (page_frames.len >= 12) in.v13 = page_frames[11];
-    const extra = extraCount(n);
-    if (page_frames.len > 12) {
-        return issueStack(.unmap_guest, extra, in, page_frames[12..]);
-    }
-    return issueReg(.unmap_guest, extra, in);
+    return fromCRegs(ext.unmapGuest(@as(u16, vm_handle), page_frames.ptr, page_frames.len));
 }
 
 pub fn vmSetPolicy(vm_handle: u12, kind: u1, count: u8, entries: []const u64) Regs {
-    var in = Regs{ .v1 = vm_handle };
-    if (entries.len >= 1) in.v2 = entries[0];
-    if (entries.len >= 2) in.v3 = entries[1];
-    if (entries.len >= 3) in.v4 = entries[2];
-    if (entries.len >= 4) in.v5 = entries[3];
-    if (entries.len >= 5) in.v6 = entries[4];
-    if (entries.len >= 6) in.v7 = entries[5];
-    if (entries.len >= 7) in.v8 = entries[6];
-    if (entries.len >= 8) in.v9 = entries[7];
-    if (entries.len >= 9) in.v10 = entries[8];
-    if (entries.len >= 10) in.v11 = entries[9];
-    if (entries.len >= 11) in.v12 = entries[10];
-    if (entries.len >= 12) in.v13 = entries[11];
-    const extra = extraVmKind(kind, count);
-    if (entries.len > 12) {
-        return issueStack(.vm_set_policy, extra, in, entries[12..]);
-    }
-    return issueReg(.vm_set_policy, extra, in);
+    return fromCRegs(ext.vmSetPolicy(
+        @as(u16, vm_handle),
+        @as(u8, kind),
+        count,
+        entries.ptr,
+        entries.len,
+    ));
 }
 
 pub fn vmInjectIrq(vm_handle: u12, irq_num: u64, assert_word: u64) Regs {
-    return issueReg(.vm_inject_irq, 0, .{
-        .v1 = vm_handle,
-        .v2 = irq_num,
-        .v3 = assert_word,
-    });
+    return fromCRegs(ext.vmInjectIrq(@as(u16, vm_handle), irq_num, assert_word));
 }
 
-// ---------------------------------------------------------------
 // 33..39: port / IDC / event-route / reply
-// ---------------------------------------------------------------
 
 pub fn createPort(caps: u64) Regs {
-    return issueReg(.create_port, 0, .{ .v1 = caps });
+    return fromCRegs(ext.createPort(caps));
 }
 
 pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
-    const n: u8 = @intCast(attachments.len);
-    const extra = extraCount(n);
-    if (attachments.len == 0) {
-        return issueReg(.@"suspend", extra, .{ .v1 = target, .v2 = port });
-    }
-    // SPEC AMBIGUITY: §[handle_attachments] places pair entries at
-    // vregs [128-N..127] — the *high* end of the vreg space, not vregs
-    // 3..3+N-1. Implementing the high-vreg path needs a stack-pad
-    // sized analogously to replyTransfer; the runner v0 doesn't attach
-    // handles on suspend, so this branch is left as a stub.
-    @panic("suspend with attachments: high-vreg layout not yet wired");
+    return fromCRegs(ext.suspendEc(
+        @as(u16, target),
+        @as(u16, port),
+        attachments.ptr,
+        attachments.len,
+    ));
 }
 
 pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
-    const word = buildWord(.recv, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
+    return fromCRecvReturn(ext.recv(@as(u16, port), timeout_ns));
 }
 
 pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
-    return issueReg(.bind_event_route, 0, .{
-        .v1 = target,
-        .v2 = event_type,
-        .v3 = port,
-    });
+    return fromCRegs(ext.bindEventRoute(@as(u16, target), event_type, @as(u16, port)));
 }
 
 pub fn clearEventRoute(target: u12, event_type: u64) Regs {
-    return issueReg(.clear_event_route, 0, .{ .v1 = target, .v2 = event_type });
+    return fromCRegs(ext.clearEventRoute(@as(u16, target), event_type));
 }
 
 pub fn reply(reply_handle: u12) Regs {
-    // Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
-    // Pass empty regs — vregs 1..13 are receiver-side state mods that
-    // survive the syscall as-is when the receiver hasn't modified them.
-    return issueReg(.reply, extraReplyHandle(reply_handle), .{});
+    return fromCRegs(ext.reply(@as(u16, reply_handle)));
 }
 
 pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
-    // Spec §[handle_attachments]: pair entries occupy vregs `[128-N..127]`
-    // — the *high* end of the vreg space. The arch backend handles the
-    // platform-specific stack reservation and high-vreg slot layout
-    // (different on x86-64 vs aarch64 because their GPR-backed vreg
-    // bands differ in width). The reply handle id rides in syscall-word
-    // bits 20-31; N rides in bits 12-19; syscall_num in bits 0-11. See
-    // §[reply_transfer].
-    const n: u8 = @intCast(attachments.len);
-    if (n == 0 or n > 63) @panic("reply_transfer: N must be 1..63");
-    const word: u64 =
-        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
-        (@as(u64, n) << 12) |
-        (@as(u64, reply_handle) << 20);
-    return arch_impl.replyTransferAsm(word, attachments.ptr, @as(u64, n));
+    return fromCRegs(ext.replyTransfer(
+        @as(u16, reply_handle),
+        attachments.ptr,
+        attachments.len,
+    ));
 }
 
-// ---------------------------------------------------------------
 // 40..42: timer
-// ---------------------------------------------------------------
 
 pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) Regs {
-    return issueReg(.timer_arm, 0, .{ .v1 = caps, .v2 = deadline_ns, .v3 = flags });
+    return fromCRegs(ext.timerArm(caps, deadline_ns, flags));
 }
 
 pub fn timerRearm(timer_handle: u12, deadline_ns: u64, flags: u64) Regs {
-    return issueReg(.timer_rearm, 0, .{ .v1 = timer_handle, .v2 = deadline_ns, .v3 = flags });
+    return fromCRegs(ext.timerRearm(@as(u16, timer_handle), deadline_ns, flags));
 }
 
 pub fn timerCancel(timer_handle: u12) Regs {
-    return issueReg(.timer_cancel, 0, .{ .v1 = timer_handle });
+    return fromCRegs(ext.timerCancel(@as(u16, timer_handle)));
 }
 
-// ---------------------------------------------------------------
 // 43..45: futex
-// ---------------------------------------------------------------
 
 pub fn futexWaitVal(timeout_ns: u64, pairs: []const u64) Regs {
-    const n: u8 = @intCast(pairs.len / 2);
-    var in = Regs{ .v1 = timeout_ns };
-    if (pairs.len >= 1) in.v2 = pairs[0];
-    if (pairs.len >= 2) in.v3 = pairs[1];
-    if (pairs.len >= 3) in.v4 = pairs[2];
-    if (pairs.len >= 4) in.v5 = pairs[3];
-    if (pairs.len >= 5) in.v6 = pairs[4];
-    if (pairs.len >= 6) in.v7 = pairs[5];
-    if (pairs.len >= 7) in.v8 = pairs[6];
-    if (pairs.len >= 8) in.v9 = pairs[7];
-    if (pairs.len >= 9) in.v10 = pairs[8];
-    if (pairs.len >= 10) in.v11 = pairs[9];
-    if (pairs.len >= 11) in.v12 = pairs[10];
-    if (pairs.len >= 12) in.v13 = pairs[11];
-    const extra = extraCount(n);
-    if (pairs.len > 12) {
-        return issueStack(.futex_wait_val, extra, in, pairs[12..]);
-    }
-    return issueReg(.futex_wait_val, extra, in);
+    return fromCRegs(ext.futexWaitVal(timeout_ns, pairs.ptr, pairs.len));
 }
 
 pub fn futexWaitChange(timeout_ns: u64, pairs: []const u64) Regs {
-    const n: u8 = @intCast(pairs.len / 2);
-    var in = Regs{ .v1 = timeout_ns };
-    if (pairs.len >= 1) in.v2 = pairs[0];
-    if (pairs.len >= 2) in.v3 = pairs[1];
-    if (pairs.len >= 3) in.v4 = pairs[2];
-    if (pairs.len >= 4) in.v5 = pairs[3];
-    if (pairs.len >= 5) in.v6 = pairs[4];
-    if (pairs.len >= 6) in.v7 = pairs[5];
-    if (pairs.len >= 7) in.v8 = pairs[6];
-    if (pairs.len >= 8) in.v9 = pairs[7];
-    if (pairs.len >= 9) in.v10 = pairs[8];
-    if (pairs.len >= 10) in.v11 = pairs[9];
-    if (pairs.len >= 11) in.v12 = pairs[10];
-    if (pairs.len >= 12) in.v13 = pairs[11];
-    const extra = extraCount(n);
-    if (pairs.len > 12) {
-        return issueStack(.futex_wait_change, extra, in, pairs[12..]);
-    }
-    return issueReg(.futex_wait_change, extra, in);
+    return fromCRegs(ext.futexWaitChange(timeout_ns, pairs.ptr, pairs.len));
 }
 
 pub fn futexWake(addr: u64, count: u64) Regs {
-    return issueReg(.futex_wake, 0, .{ .v1 = addr, .v2 = count });
+    return fromCRegs(ext.futexWake(addr, count));
 }
 
-// ---------------------------------------------------------------
 // 46..51: time / rng / sysinfo
-// ---------------------------------------------------------------
 
 pub fn timeMonotonic() Regs {
-    return issueReg(.time_monotonic, 0, .{});
+    return fromCRegs(ext.timeMonotonic());
 }
 
 pub fn timeGetwall() Regs {
-    return issueReg(.time_getwall, 0, .{});
+    return fromCRegs(ext.timeGetwall());
 }
 
 pub fn timeSetwall(ns_since_epoch: u64) Regs {
-    return issueReg(.time_setwall, 0, .{ .v1 = ns_since_epoch });
+    return fromCRegs(ext.timeSetwall(ns_since_epoch));
 }
 
 pub fn random(count: u8) Regs {
-    return issueReg(.random, extraCount(count), .{});
+    return fromCRegs(ext.random(count));
 }
 
 pub fn infoSystem() Regs {
-    return issueReg(.info_system, 0, .{});
+    return fromCRegs(ext.infoSystem());
 }
 
 pub fn infoCores(core_id: u64) Regs {
-    return issueReg(.info_cores, 0, .{ .v1 = core_id });
+    return fromCRegs(ext.infoCores(core_id));
 }
 
-// ---------------------------------------------------------------
 // 52..57: power
-// ---------------------------------------------------------------
 
 pub fn powerShutdown() Regs {
-    return issueReg(.power_shutdown, 0, .{});
+    return fromCRegs(ext.powerShutdown());
 }
 
 pub fn powerReboot() Regs {
-    return issueReg(.power_reboot, 0, .{});
+    return fromCRegs(ext.powerReboot());
 }
 
 pub fn powerSleep(depth: u64) Regs {
-    return issueReg(.power_sleep, 0, .{ .v1 = depth });
+    return fromCRegs(ext.powerSleep(depth));
 }
 
 pub fn powerScreenOff() Regs {
-    return issueReg(.power_screen_off, 0, .{});
+    return fromCRegs(ext.powerScreenOff());
 }
 
 pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
-    return issueReg(.power_set_freq, 0, .{ .v1 = core_id, .v2 = hz });
+    return fromCRegs(ext.powerSetFreq(core_id, hz));
 }
 
 pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
-    return issueReg(.power_set_idle, 0, .{ .v1 = core_id, .v2 = policy });
+    return fromCRegs(ext.powerSetIdle(core_id, policy));
 }
 
 // Compile-time guard against accidentally reordering the SyscallNum

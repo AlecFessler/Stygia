@@ -490,74 +490,171 @@ const test_entries = [_]TestEntry{
     .{ .name = "yield_04", .path = "tests/yield_04.zig" },
 };
 
+// Build libz.elf — kernel-shipped userspace shared library. Test ELFs
+// `linkLibrary` against it and end up with DT_NEEDED libz.so +
+// JUMP_SLOT relocs that libz_loader.relocateSelf patches at runtime.
+// Zig refuses dynamic linkage on .freestanding, so we tag .linux/.none
+// — purely the gate; libz links zero Linux runtime and the kernel ELF
+// loader (not Linux ld.so) loads it. The C-ABI shape used internally
+// by libz/abi.zig is invisible to consumers — exported dynsym names
+// match the Zig-native API in libz/syscall.zig.
+fn addLibz(
+    b: *std.Build,
+    arch: std.Target.Cpu.Arch,
+) *std.Build.Step.Compile {
+    const cpu_features_sub: std.Target.Cpu.Feature.Set = blk: {
+        var s = std.Target.Cpu.Feature.Set.empty;
+        if (arch == .x86_64) {
+            const F = std.Target.x86.Feature;
+            s.addFeature(@intFromEnum(F.mmx));
+            s.addFeature(@intFromEnum(F.sse));
+            s.addFeature(@intFromEnum(F.sse2));
+            s.addFeature(@intFromEnum(F.avx));
+            s.addFeature(@intFromEnum(F.avx2));
+        }
+        break :blk s;
+    };
+    const cpu_features_add: std.Target.Cpu.Feature.Set = blk: {
+        var s = std.Target.Cpu.Feature.Set.empty;
+        if (arch == .x86_64) {
+            s.addFeature(@intFromEnum(std.Target.x86.Feature.soft_float));
+        }
+        break :blk s;
+    };
+    const linux_target = b.resolveTargetQuery(.{
+        .cpu_arch = arch,
+        .os_tag = .linux,
+        .abi = .none,
+        .ofmt = .elf,
+        .cpu_features_sub = cpu_features_sub,
+        .cpu_features_add = cpu_features_add,
+    });
+
+    // libz/abi.zig imports syscall.zig directly (same-dir), so no
+    // module-graph dep wiring is needed. The build module's source-
+    // file dir resolves @import("syscall.zig") relative to abi.zig,
+    // which lands on libz/syscall.zig as expected.
+    //
+    // .Debug is mandatory: ReleaseSmall / ReleaseFast / ReleaseSafe
+    // all trip LLVM's register allocator on the >13-output-operand
+    // inline asm in libz/syscall_x64.zig (replyTransferAsm and the
+    // capture-word path). LLVM can't satisfy the tied register
+    // constraints alongside its internal scratch needs at -O > 0.
+    // Building libz at .Debug is fine: it's a single shared object
+    // mapped once across all test ELFs, so size cost is paid once,
+    // and the inline-asm syscall wrappers are the entire .text body.
+    const abi_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../libz/abi.zig" },
+        .target = linux_target,
+        .optimize = .Debug,
+        .pic = true,
+        .single_threaded = true,
+    });
+
+    const libz = b.addLibrary(.{
+        .name = "z",
+        .linkage = .dynamic,
+        .root_module = abi_mod,
+    });
+    libz.root_module.red_zone = false;
+    libz.root_module.omit_frame_pointer = false;
+    libz.use_llvm = true;
+    libz.use_lld = true;
+
+    return libz;
+}
+
+const TestBuildCtx = struct {
+    target_freestanding: std.Build.ResolvedTarget,
+    target_dynlink: std.Build.ResolvedTarget,
+    libz: *std.Build.Step.Compile,
+    libz_loader_src: std.Build.LazyPath,
+};
+
 fn buildTestElf(
     b: *std.Build,
-    target: std.Build.ResolvedTarget,
+    ctx: TestBuildCtx,
     tag_wf: *std.Build.Step.WriteFile,
     name: []const u8,
     src_path: []const u8,
     tag: u16,
 ) std.Build.LazyPath {
-    // Per-test tag module. Each test ELF embeds its own immutable
-    // u16 tag at build time. The runner uses this tag to attribute
-    // suspend-event results back to a specific manifest entry without
-    // relying on completion order.
+    // Per-test tag module embedded into the test ELF so it can stamp
+    // its identity into every result event without depending on
+    // completion order in the runner.
     const tag_src = b.fmt("pub const TAG: u16 = {d};\n", .{tag});
     const tag_path = tag_wf.add(b.fmt("test_tag_{s}.zig", .{name}), tag_src);
     const tag_mod = b.createModule(.{
         .root_source_file = tag_path,
-        .target = target,
+        .target = ctx.target_dynlink,
         .optimize = .ReleaseSmall,
     });
 
-    // Per-test libz clone. Cloning is required so libz/testing.zig's
-    // `@import("test_tag")` resolves to the test-specific tag module
-    // rather than a single shared one. The clone keeps the same source
-    // files but wires its own test_tag import.
+    // Per-test libz clone. Required because libz/testing.zig statically
+    // imports test_tag and we need each test to see its own. The clone
+    // shares source with libz/lib.zig but rewires test_tag.
     const test_lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
-        .target = target,
+        .target = ctx.target_dynlink,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
+        .single_threaded = true,
     });
     test_lib_mod.addImport("lib", test_lib_mod);
     test_lib_mod.addImport("test_tag", tag_mod);
 
+    const libz_loader_mod = b.createModule(.{
+        .root_source_file = ctx.libz_loader_src,
+        .target = ctx.target_dynlink,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .single_threaded = true,
+    });
+
     const app_mod = b.createModule(.{
         .root_source_file = b.path(src_path),
-        .target = target,
+        .target = ctx.target_dynlink,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
+        .single_threaded = true,
     });
     app_mod.addImport("lib", test_lib_mod);
-    // Tests that need to construct their own suspend frame (rather
-    // than going through `lib.testing.report`) must include
-    // `test_tag.TAG` in vreg 5 so the runner attributes the result
-    // correctly. Wire the per-test tag module so `@import("test_tag")`
-    // resolves in the app source, mirroring its availability inside
-    // `libz/testing.zig`.
     app_mod.addImport("test_tag", tag_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
-        .target = target,
+        .target = ctx.target_dynlink,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
+        .single_threaded = true,
     });
     start_mod.addImport("lib", test_lib_mod);
     start_mod.addImport("app", app_mod);
+    start_mod.addImport("libz_loader", libz_loader_mod);
 
     const exe = b.addExecutable(.{
         .name = name,
         .root_module = start_mod,
-        .linkage = .static,
+        .linkage = .dynamic,
     });
     exe.pie = true;
     exe.entry = .{ .symbol_name = "_start" };
-    exe.setLinkerScript(b.path("linker.ld"));
+    // Drop the static linker.ld — dynamic test ELFs need .dynamic /
+    // .dynsym / .dynstr / .rela.dyn / .rela.plt preserved so
+    // libz_loader.relocateSelf finds them at runtime. The standard
+    // ld.lld layout (4-PT_LOAD per-perm split, contiguous .dyn*) is
+    // exactly what kernel/boot/userspace_init.zig expects for both
+    // test ELFs and the libz_c image.
+    exe.linkLibrary(ctx.libz);
+    // Force LLVM + LLD: same reason as libz_c — Zig 0.15's self-hosted
+    // x86_64 backend chokes on the inline-asm syscall wrappers in
+    // libz/syscall_x64.zig (replyTransferAsm "ran out of registers")
+    // and on naked-callconv functions pulled in transitively by .linux.
+    exe.use_llvm = true;
+    exe.use_lld = true;
 
     return exe.getEmittedBin();
 }
@@ -609,9 +706,17 @@ pub fn build(b: *std.Build) void {
         @panic("-Darch must be one of: x64, arm");
     };
 
-    const target = b.resolveTargetQuery(.{
+    const target_freestanding = b.resolveTargetQuery(.{
         .cpu_arch = cpu_arch,
         .os_tag = .freestanding,
+    });
+    // Test ELFs need .linux/.none so Zig allows `linkage = .dynamic`.
+    // Purely a linker gate — we don't actually link any Linux runtime.
+    const target_dynlink = b.resolveTargetQuery(.{
+        .cpu_arch = cpu_arch,
+        .os_tag = .linux,
+        .abi = .none,
+        .ofmt = .elf,
     });
 
     const tests_filter = b.option(
@@ -671,20 +776,43 @@ pub fn build(b: *std.Build) void {
     );
     const sentinel_tag_mod = b.createModule(.{
         .root_source_file = sentinel_tag_path,
-        .target = target,
+        .target = target_freestanding,
         .optimize = .ReleaseSmall,
     });
 
-    const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
-        .target = target,
+    // Runner libz: statically linked, wired to lib_static.zig — its
+    // `syscall` namespace points at the top-level libz/syscall.zig
+    // (full inline-asm bodies, no externs) via the `static_syscall`
+    // module dep. The runner is the framework's bootstrap layer and
+    // cannot itself depend on libz.elf — it's the one that stages
+    // libz.elf into a page_frame for children.
+    const static_syscall_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../libz/syscall.zig" },
+        .target = target_freestanding,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
     });
-    // self-reference so libz files can `@import("lib")`
+    const lib_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "libz/lib_static.zig" },
+        .target = target_freestanding,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
     lib_mod.addImport("lib", lib_mod);
     lib_mod.addImport("test_tag", sentinel_tag_mod);
+    lib_mod.addImport("static_syscall", static_syscall_mod);
+
+    const libz = addLibz(b, cpu_arch);
+    const libz_loader_src: std.Build.LazyPath = .{ .cwd_relative = "../../libz_loader/lib.zig" };
+
+    const ctx = TestBuildCtx{
+        .target_freestanding = target_freestanding,
+        .target_dynlink = target_dynlink,
+        .libz = libz,
+        .libz_loader_src = libz_loader_src,
+    };
 
     const embedded_wf = b.addWriteFiles();
     const tag_wf = b.addWriteFiles();
@@ -703,9 +831,14 @@ pub fn build(b: *std.Build) void {
     const tag_magic: u16 = 0x8000;
     for (selected_entries, 0..) |t, i| {
         const tag: u16 = @intCast(@as(u16, @intCast(i)) | tag_magic);
-        test_elfs[i] = buildTestElf(b, target, tag_wf, t.name, t.path, tag);
+        test_elfs[i] = buildTestElf(b, ctx, tag_wf, t.name, t.path, tag);
         _ = embedded_wf.addCopyFile(test_elfs[i], b.fmt("{s}.elf", .{t.name}));
     }
+
+    // Stage libz.elf into the runner's @embedFile namespace alongside
+    // the test ELFs. The runner @embedFile's it and stages it into a
+    // page_frame at startup via libz_loader.layoutAndPrelink.
+    _ = embedded_wf.addCopyFile(libz.getEmittedBin(), "libz.elf");
 
     // Generate a manifest module surfacing the embedded ELFs as a
     // slice the primary iterates. Manifest order = spawn order = tag
@@ -735,34 +868,51 @@ pub fn build(b: *std.Build) void {
             .{ t.name, t.name, manifest_tag },
         ) catch unreachable;
     }
-    manifest.appendSlice("};\n") catch unreachable;
+    manifest.appendSlice("};\n\n") catch unreachable;
+    // Surface libz.elf to the runner via the same @embedFile root.
+    manifest.appendSlice("pub const libz_elf = @embedFile(\"libz.elf\");\n") catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 
     const embedded_tests_mod = b.createModule(.{
         .root_source_file = manifest_src,
-        .target = target,
+        .target = target_freestanding,
         .optimize = .ReleaseSmall,
+    });
+
+    const runner_libz_loader_mod = b.createModule(.{
+        .root_source_file = libz_loader_src,
+        .target = target_freestanding,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .single_threaded = true,
     });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("runner/primary.zig"),
-        .target = target,
+        .target = target_freestanding,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
     });
     app_mod.addImport("lib", lib_mod);
     app_mod.addImport("embedded_tests", embedded_tests_mod);
+    app_mod.addImport("libz_loader", runner_libz_loader_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
-        .target = target,
+        .target = target_freestanding,
         .optimize = .ReleaseSmall,
         .pic = true,
         .omit_frame_pointer = true,
     });
     start_mod.addImport("lib", lib_mod);
     start_mod.addImport("app", app_mod);
+    // Runner's start.zig sees the same libz_loader module, but its
+    // bootstrap path is gated on a comptime check that's true only
+    // for the dynamic-test ELFs (linkage != .static at compile time
+    // is not directly observable, so libz/start.zig keys off whether
+    // app == primary; see that file's comment).
+    start_mod.addImport("libz_loader", runner_libz_loader_mod);
 
     const exe = b.addExecutable(.{
         .name = "root_service",
@@ -782,4 +932,6 @@ pub fn build(b: *std.Build) void {
         const inst = b.addInstallFile(test_elfs[i], path);
         b.getInstallStep().dependOn(&inst.step);
     }
+    const inst_libz = b.addInstallFile(libz.getEmittedBin(), "../bin/libz.elf");
+    b.getInstallStep().dependOn(&inst_libz.step);
 }
