@@ -1,57 +1,12 @@
 const std = @import("std");
 
-fn buildChild(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    lib_mod: *std.Build.Module,
-    prof_lib_mod: ?*std.Build.Module,
-    extra_imports: []const struct { name: []const u8, mod: *std.Build.Module },
-    comptime name: []const u8,
-    comptime src: []const u8,
-) std.Build.LazyPath {
-    const child_app_mod = b.createModule(.{
-        .root_source_file = b.path(src),
-        .target = target,
-        .optimize = .Debug,
-        .pic = true,
-    });
-    child_app_mod.addImport("lib", lib_mod);
-    if (prof_lib_mod) |pl| child_app_mod.addImport("prof_lib", pl);
-    for (extra_imports) |imp| child_app_mod.addImport(imp.name, imp.mod);
-
-    const child_start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../tests/libz/start.zig" },
-        .target = target,
-        .optimize = .Debug,
-        .pic = true,
-    });
-    child_start_mod.addImport("lib", lib_mod);
-    child_start_mod.addImport("app", child_app_mod);
-    const child_exe = b.addExecutable(.{
-        .name = name,
-        .root_module = child_start_mod,
-        .linkage = .static,
-    });
-    child_exe.pie = true;
-    child_exe.entry = .{ .symbol_name = "_start" };
-    child_exe.setLinkerScript(.{ .cwd_relative = "../tests/linker.ld" });
-    return child_exe.getEmittedBin();
-}
-
 pub fn build(b: *std.Build) void {
     const target_arch_str = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
-    const workload = b.option([]const u8, "workload", "kprof workload: yield, ipc, fault, spawn, shm_cycle, debugger, composed, fpu_mix (default: yield)") orelse "yield";
+    const workload = b.option([]const u8, "workload", "kprof workload (default: ipc_pp)") orelse "ipc_pp";
 
     const workload_src = blk: {
-        if (std.mem.eql(u8, workload, "yield")) break :blk "src/yield.zig";
-        if (std.mem.eql(u8, workload, "ipc")) break :blk "src/ipc.zig";
-        if (std.mem.eql(u8, workload, "fault")) break :blk "src/fault.zig";
-        if (std.mem.eql(u8, workload, "spawn")) break :blk "src/spawn.zig";
-        if (std.mem.eql(u8, workload, "shm_cycle")) break :blk "src/shm_cycle.zig";
-        if (std.mem.eql(u8, workload, "debugger")) break :blk "src/debugger.zig";
-        if (std.mem.eql(u8, workload, "composed")) break :blk "src/composed.zig";
-        if (std.mem.eql(u8, workload, "fpu_mix")) break :blk "src/fpu_mix.zig";
-        @panic("-Dworkload must be one of: yield, ipc, fault, spawn, shm_cycle, debugger, composed, fpu_mix");
+        if (std.mem.eql(u8, workload, "ipc_pp")) break :blk "src/ipc_pp.zig";
+        @panic("-Dworkload must be: ipc_pp");
     };
 
     const cpu_arch: std.Target.Cpu.Arch = blk: {
@@ -72,96 +27,70 @@ pub fn build(b: *std.Build) void {
         .cpu_model = cpu_model,
     });
 
+    // Static-libz path: lib_static.zig routes `syscall` to the
+    // top-level libz/syscall.zig (full inline-asm bodies). Mirrors
+    // the runner's setup in tests/tests/build.zig — the prof root
+    // service runs as the root CD with no libz pf to map, so the
+    // dynamic .so load path is unusable.
+    const static_syscall_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../libz/syscall.zig" },
+        .target = target,
+        .optimize = .ReleaseSmall,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
     const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../tests/libz/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "../tests/libz/lib_static.zig" },
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
-
-    // Prof-local libz: shared protocol / types between root and children.
-    const prof_lib_mod = b.createModule(.{
-        .root_source_file = b.path("libz/lib.zig"),
+    lib_mod.addImport("lib", lib_mod);
+    lib_mod.addImport("static_syscall", static_syscall_mod);
+    // lib_static.zig does not import test_tag, but testing.zig (also
+    // re-exported from lib_static.zig) does — even unused, the
+    // import must resolve at compile time.
+    const sentinel_tag_mod = b.createModule(.{
+        .root_source_file = b.addWriteFiles().add(
+            "test_tag.zig",
+            "pub const TAG: u16 = 0xFFFF;\n",
+        ),
         .target = target,
-        .optimize = .Debug,
-        .pic = true,
+        .optimize = .ReleaseSmall,
     });
-    prof_lib_mod.addImport("lib", lib_mod);
+    lib_mod.addImport("test_tag", sentinel_tag_mod);
 
-    // Children used by existing workloads.
-    const child_ipc_echo_bin = buildChild(b, target, lib_mod, null, &.{}, "child_ipc_echo", "src/children/child_ipc_echo.zig");
-    const child_exit_bin = buildChild(b, target, lib_mod, null, &.{}, "child_exit", "src/children/child_exit.zig");
-    const child_shm_cycle_bin = buildChild(b, target, lib_mod, null, &.{}, "child_shm_cycle", "src/children/child_shm_cycle.zig");
-
-    // Debugger scenario children. child_debuggee is a normal child with
-    // prof_lib access for protocol constants. child_debugger is the same
-    // but additionally carries an embedded copy of the debuggee ELF so
-    // it can (later) symbolize fault_addr via DWARF and so the build
-    // pipeline pulls the debuggee ELF into a single artifact.
-    const child_debuggee_bin = buildChild(b, target, lib_mod, prof_lib_mod, &.{}, "child_debuggee", "src/children/child_debuggee.zig");
-
-    const debuggee_embed_wf = b.addWriteFiles();
-    _ = debuggee_embed_wf.addCopyFile(child_debuggee_bin, "debuggee.elf");
-    const debuggee_embed_src = debuggee_embed_wf.add(
-        "debuggee_elf.zig",
-        "pub const bytes = @embedFile(\"debuggee.elf\");\n",
-    );
-    const debuggee_embed_mod = b.createModule(.{
-        .root_source_file = debuggee_embed_src,
+    // libz/start.zig imports libz_loader unconditionally; the
+    // RUNNER_STATIC gate only skips its bootstrap call site.
+    const libz_loader_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../libz/loader.zig" },
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
-    });
-
-    const child_debugger_bin = buildChild(
-        b,
-        target,
-        lib_mod,
-        prof_lib_mod,
-        &.{.{ .name = "debuggee_elf", .mod = debuggee_embed_mod }},
-        "child_debugger",
-        "src/children/child_debugger.zig",
-    );
-
-    const embedded_wf = b.addWriteFiles();
-    _ = embedded_wf.addCopyFile(child_ipc_echo_bin, "child_ipc_echo.elf");
-    _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
-    _ = embedded_wf.addCopyFile(child_shm_cycle_bin, "child_shm_cycle.elf");
-    _ = embedded_wf.addCopyFile(child_debuggee_bin, "child_debuggee.elf");
-    _ = embedded_wf.addCopyFile(child_debugger_bin, "child_debugger.elf");
-    const embed_src = embedded_wf.add("embedded_children.zig",
-        \\pub const child_ipc_echo = @embedFile("child_ipc_echo.elf");
-        \\pub const child_exit = @embedFile("child_exit.elf");
-        \\pub const child_shm_cycle = @embedFile("child_shm_cycle.elf");
-        \\pub const child_debuggee = @embedFile("child_debuggee.elf");
-        \\pub const child_debugger = @embedFile("child_debugger.elf");
-        \\
-    );
-    const embedded_children_mod = b.createModule(.{
-        .root_source_file = embed_src,
-        .target = target,
-        .optimize = .Debug,
-        .pic = true,
+        .single_threaded = true,
     });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path(workload_src),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     app_mod.addImport("lib", lib_mod);
-    app_mod.addImport("prof_lib", prof_lib_mod);
-    app_mod.addImport("embedded_children", embedded_children_mod);
+    app_mod.addImport("libz_loader", libz_loader_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../tests/libz/start.zig" },
         .target = target,
-        .optimize = .Debug,
+        .optimize = .ReleaseSmall,
         .pic = true,
+        .omit_frame_pointer = true,
     });
     start_mod.addImport("lib", lib_mod);
     start_mod.addImport("app", app_mod);
+    start_mod.addImport("libz_loader", libz_loader_mod);
 
     const exe = b.addExecutable(.{
         .name = "root_service",

@@ -10,9 +10,10 @@ const paging = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
 const sync_debug = zag.utils.sync.debug;
 
-const CapabilityDomain = zag.capdom.capability_domain.CapabilityDomain;
+const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
 const CapabilityType = zag.caps.capability.CapabilityType;
 const EcQueue = zag.sched.scheduler.EcQueue;
+const EcQueueLevel = @typeInfo(@FieldType(EcQueue, "levels")).array.child;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const InterruptHandler = idt.interruptHandler;
 const KernelHandle = zag.caps.capability.KernelHandle;
@@ -565,31 +566,39 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%rax, %%gs:72
         \\movq %%gs:56, %%rcx
         ++ std.fmt.comptimePrint(
-            "\nimulq ${d}, %%rbx, %%r11\n",
-            .{@sizeOf(KernelHandle)},
+            \\
+            \\imulq ${[kh_size]d}, %%rbx, %%r11
+            \\movq {[ref_gen_off]d}(%%rcx, %%r11), %%rax
+            \\movq {[ref_ptr_off]d}(%%rcx, %%r11), %%rcx
+            \\testq %%rcx, %%rcx
+            \\jz .Lsyscall_lock_fail
+            \\shlq $1, %%rax
+            \\lea 1(%%rax), %%r11
+            \\.Lacquire_port:
+            \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
+            \\je .Lport_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lsyscall_lock_fail
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lacquire_port
+            \\.Lport_acquired:
+            \\
+        ,
+            .{
+                .kh_size = @sizeOf(KernelHandle),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                .port_lock_off = @offsetOf(Port, "_gen_lock"),
+            },
         ) ++
-        \\movq 8(%%rcx, %%r11), %%rax
-        \\movq (%%rcx, %%r11), %%rcx
-        \\testq %%rcx, %%rcx
-        \\jz .Lsyscall_lock_fail
-        \\shlq $1, %%rax
-        \\lea 1(%%rax), %%r11
-        \\.Lacquire_port:
-        \\lock cmpxchgq %%r11, (%%rcx)
-        \\je .Lport_acquired
-        \\xorq %%r11, %%rax
-        \\testq $-2, %%rax
-        \\jnz .Lsyscall_lock_fail
-        \\pause
-        \\movq %%r11, %%rax
-        \\andq $-2, %%rax
-        \\jmp .Lacquire_port
-        \\.Lport_acquired:
 
     // ─── Step 5: peek port.waiter_kind. Lock held; if not .receivers,
     // bail via .Lsyscall_no_receiver (releases lock).
     // ────────────────────────────────────────────────────────────────
-        ++ std.fmt.comptimePrint(
+        std.fmt.comptimePrint(
             "\ncmpb ${d}, {d}(%%rcx)\njne .Lsyscall_no_receiver\n",
             .{ @intFromEnum(WaiterKind.receivers), @offsetOf(Port, "waiter_kind") },
         ) ++
@@ -601,16 +610,16 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
-            \\movq {[w3]d}(%%rcx), %%r11
+            \\movq {[w3_head]d}(%%rcx), %%r11
             \\testq %%r11, %%r11
             \\jnz .Lpop_3
-            \\movq {[w2]d}(%%rcx), %%r11
+            \\movq {[w2_head]d}(%%rcx), %%r11
             \\testq %%r11, %%r11
             \\jnz .Lpop_2
-            \\movq {[w1]d}(%%rcx), %%r11
+            \\movq {[w1_head]d}(%%rcx), %%r11
             \\testq %%r11, %%r11
             \\jnz .Lpop_1
-            \\movq {[w0]d}(%%rcx), %%r11
+            \\movq {[w0_head]d}(%%rcx), %%r11
             \\testq %%r11, %%r11
             \\jnz .Lpop_0
             \\ud2
@@ -628,20 +637,26 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\.Lpop_common:
             \\movq %%rcx, %%gs:80
             \\movq {[next_off]d}(%%r11), %%rcx
-            \\movq %%rcx, (%%rax)
+            \\movq %%rcx, {[head_off]d}(%%rax)
             \\testq %%rcx, %%rcx
             \\jnz .Ldequeue_keep_tail
-            \\movq $0, 8(%%rax)
+            \\movq $0, {[tail_off]d}(%%rax)
             \\.Ldequeue_keep_tail:
             \\movq $0, {[next_off]d}(%%r11)
             \\movq %%gs:80, %%rcx
             \\
         ,
             .{
-                .w0 = @offsetOf(Port, "waiters") + 0 * 16,
-                .w1 = @offsetOf(Port, "waiters") + 1 * 16,
-                .w2 = @offsetOf(Port, "waiters") + 2 * 16,
-                .w3 = @offsetOf(Port, "waiters") + 3 * 16,
+                .w0 = @offsetOf(Port, "waiters") + 0 * @sizeOf(EcQueueLevel),
+                .w1 = @offsetOf(Port, "waiters") + 1 * @sizeOf(EcQueueLevel),
+                .w2 = @offsetOf(Port, "waiters") + 2 * @sizeOf(EcQueueLevel),
+                .w3 = @offsetOf(Port, "waiters") + 3 * @sizeOf(EcQueueLevel),
+                .w0_head = @offsetOf(Port, "waiters") + 0 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w1_head = @offsetOf(Port, "waiters") + 1 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w2_head = @offsetOf(Port, "waiters") + 2 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w3_head = @offsetOf(Port, "waiters") + 3 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .head_off = @offsetOf(EcQueueLevel, "head"),
+                .tail_off = @offsetOf(EcQueueLevel, "tail"),
                 .next_off = @offsetOf(ExecutionContext, "next"),
             },
         ) ++
@@ -651,16 +666,16 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
-            \\movq {[w3]d}(%%rcx), %%rax
+            \\movq {[w3_head]d}(%%rcx), %%rax
             \\testq %%rax, %%rax
             \\jnz .Lwaiter_kind_done
-            \\movq {[w2]d}(%%rcx), %%rax
+            \\movq {[w2_head]d}(%%rcx), %%rax
             \\testq %%rax, %%rax
             \\jnz .Lwaiter_kind_done
-            \\movq {[w1]d}(%%rcx), %%rax
+            \\movq {[w1_head]d}(%%rcx), %%rax
             \\testq %%rax, %%rax
             \\jnz .Lwaiter_kind_done
-            \\movq {[w0]d}(%%rcx), %%rax
+            \\movq {[w0_head]d}(%%rcx), %%rax
             \\testq %%rax, %%rax
             \\jnz .Lwaiter_kind_done
             \\movb ${[wk_none]d}, {[wk_off]d}(%%rcx)
@@ -668,10 +683,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .w0 = @offsetOf(Port, "waiters") + 0 * 16,
-                .w1 = @offsetOf(Port, "waiters") + 1 * 16,
-                .w2 = @offsetOf(Port, "waiters") + 2 * 16,
-                .w3 = @offsetOf(Port, "waiters") + 3 * 16,
+                .w0_head = @offsetOf(Port, "waiters") + 0 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w1_head = @offsetOf(Port, "waiters") + 1 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w2_head = @offsetOf(Port, "waiters") + 2 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
+                .w3_head = @offsetOf(Port, "waiters") + 3 * @sizeOf(EcQueueLevel) + @offsetOf(EcQueueLevel, "head"),
                 .wk_none = @intFromEnum(WaiterKind.none),
                 .wk_off = @offsetOf(Port, "waiter_kind"),
             },
@@ -682,7 +697,10 @@ pub export fn syscallEntry() callconv(.naked) void {
     // word, no concurrent writer.
     // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%gs:120
-        \\andq $-2, (%%rcx)
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
+            .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
+        ) ++
 
     // ─── Step 9: acquire receiver's CD gen-lock. Spill receiver EC*
     // to gs:88 (persists through everything that follows). recv_cd
@@ -700,20 +718,26 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .gen_off = @offsetOf(ExecutionContext, "domain") + 8,
             },
         ) ++
-        \\shlq $1, %%r11
-        \\movq %%r11, %%rax
-        \\incq %%r11
-        \\.Lacquire_recv_cd:
-        \\lock cmpxchgq %%r11, (%%rcx)
-        \\je .Lrecv_cd_acquired
-        \\xorq %%r11, %%rax
-        \\testq $-2, %%rax
-        \\jnz .Lrecv_cd_fail
-        \\pause
-        \\movq %%r11, %%rax
-        \\andq $-2, %%rax
-        \\jmp .Lacquire_recv_cd
-        \\.Lrecv_cd_acquired:
+        std.fmt.comptimePrint(
+            \\
+            \\shlq $1, %%r11
+            \\movq %%r11, %%rax
+            \\incq %%r11
+            \\.Lacquire_recv_cd:
+            \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
+            \\je .Lrecv_cd_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lrecv_cd_fail
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lacquire_recv_cd
+            \\.Lrecv_cd_acquired:
+            \\
+        ,
+            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        ) ++
 
     // ─── Step 10: mint reply handle. recv_cd held by lock. Spill
     // recv_cd → gs:80 and recv_cd_gen → gs:104 for use after rcx/r11
@@ -753,23 +777,45 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq {[kt_off]d}(%%rcx), %%r11
             \\addq %%r11, %%rax
             \\movq %%gs:32, %%r11
-            \\movq %%r11, (%%rax)
-            \\movq (%%r11), %%rcx
+            \\movq %%r11, {[ref_ptr_off]d}(%%rax)
+            \\movq {[ec_gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
-            \\movq %%rcx, 8(%%rax)
-            \\movq $0, 16(%%rax)
-            \\movq $0, 24(%%rax)
-            \\movq $0, 32(%%rax)
-            \\movq $0, 40(%%rax)
-            \\movq $0, 48(%%rax)
-            \\movq $0, 56(%%rax)
-            \\movq $0, 64(%%rax)
-            \\movq $0, 72(%%rax)
-            \\movq $0, 80(%%rax)
+            \\movq %%rcx, {[ref_gen_off]d}(%%rax)
+            \\movq $0, {[par0]d}(%%rax)
+            \\movq $0, {[par1]d}(%%rax)
+            \\movq $0, {[par2]d}(%%rax)
+            \\movq $0, {[fc0]d}(%%rax)
+            \\movq $0, {[fc1]d}(%%rax)
+            \\movq $0, {[fc2]d}(%%rax)
+            \\movq $0, {[ns0]d}(%%rax)
+            \\movq $0, {[ns1]d}(%%rax)
+            \\movq $0, {[ns2]d}(%%rax)
             \\movq %%rax, %%gs:112
             \\
         ,
-            .{ .kt_off = @offsetOf(CapabilityDomain, "kernel_table") },
+            .{
+                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                // EC._gen_lock is NOT at offset 0: ExecutionContext is a
+                // plain (auto-reordered) struct and `fpu_state: [576]u8
+                // align(64)` lands first. Use the comptime offset so the
+                // mint reads the actual gen-lock word, not fpu_state[0..7].
+                .ec_gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                // KernelHandle.parent / first_child / next_sibling are
+                // each 24-byte HandleLinks (extern struct asserts in
+                // capability.zig pin the layout). Three quadword writes
+                // each, at offsets +0/+8/+16.
+                .par0 = @offsetOf(KernelHandle, "parent") + 0,
+                .par1 = @offsetOf(KernelHandle, "parent") + 8,
+                .par2 = @offsetOf(KernelHandle, "parent") + 16,
+                .fc0 = @offsetOf(KernelHandle, "first_child") + 0,
+                .fc1 = @offsetOf(KernelHandle, "first_child") + 8,
+                .fc2 = @offsetOf(KernelHandle, "first_child") + 16,
+                .ns0 = @offsetOf(KernelHandle, "next_sibling") + 0,
+                .ns1 = @offsetOf(KernelHandle, "next_sibling") + 8,
+                .ns2 = @offsetOf(KernelHandle, "next_sibling") + 16,
+            },
         ) ++
         std.fmt.comptimePrint(
             \\
@@ -779,14 +825,17 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\lea (%%rax, %%rax, 2), %%rax
             \\movabsq ${[w0_const]d}, %%rcx
             \\orq %%gs:96, %%rcx
-            \\movq %%rcx, (%%r11, %%rax, 8)
-            \\movq $0, 8(%%r11, %%rax, 8)
-            \\movq $0, 16(%%r11, %%rax, 8)
+            \\movq %%rcx, {[w0_off]d}(%%r11, %%rax, 8)
+            \\movq $0, {[f0_off]d}(%%r11, %%rax, 8)
+            \\movq $0, {[f1_off]d}(%%r11, %%rax, 8)
             \\
         ,
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .w0_const = (@as(u64, @as(u16, @bitCast(ReplyCaps{ .move = true, .xfer = true }))) << 48) | (@as(u64, @intFromEnum(CapabilityType.reply)) << 12),
+                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
+                .f0_off = @offsetOf(zag.caps.capability.Capability, "field0"),
+                .f1_off = @offsetOf(zag.caps.capability.Capability, "field1"),
             },
         ) ++
         std.fmt.comptimePrint(
@@ -814,7 +863,10 @@ pub export fn syscallEntry() callconv(.naked) void {
 
     // ─── Step 11: release recv_cd lock. ────────────────────────────
         \\movq %%gs:80, %%rcx
-        \\andq $-2, (%%rcx)
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        ) ++
 
     // ─── Step 12: park sender state (sender = current_ec = gs:32).
     // state=.suspended_on_port, event_type=.suspension, suspend_port
@@ -835,17 +887,17 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movb $0, {[on_cpu_off]d}(%%r11)
             \\movq %%gs:120, %%rax
             \\movq %%rax, {[susp_port_off]d}(%%r11)
-            \\movq (%%rax), %%rcx
+            \\movq {[port_lock_off]d}(%%rax), %%rcx
             \\shrq $1, %%rcx
             \\movq %%rcx, {[susp_port_gen_off]d}(%%r11)
             \\movb $1, {[susp_port_disc_off]d}(%%r11)
             \\movq {[ctx_off]d}(%%r11), %%rax
             \\movq %%gs:16, %%rcx
-            \\movq %%rcx, 136(%%rax)
+            \\movq %%rcx, {[ctx_rip_off]d}(%%rax)
             \\movq %%gs:24, %%rcx
-            \\movq %%rcx, 152(%%rax)
+            \\movq %%rcx, {[ctx_rflags_off]d}(%%rax)
             \\movq %%gs:8, %%rcx
-            \\movq %%rcx, 160(%%rax)
+            \\movq %%rcx, {[ctx_rsp_off]d}(%%rax)
             \\
         ,
             .{
@@ -862,6 +914,10 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .susp_port_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
                 .susp_port_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
                 .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+                .port_lock_off = @offsetOf(Port, "_gen_lock"),
+                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
             },
         ) ++
 
@@ -948,7 +1004,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%r11, %%gs:32
             \\movq %%gs:128, %%rax
             \\movq %%r11, {[cur_ec_off]d}(%%rax)
-            \\movq (%%r11), %%rcx
+            \\movq {[gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
             \\movb $1, {[cur_ec_disc_off]d}(%%rax)
@@ -990,6 +1046,10 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .cur_ec_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec"),
                 .cur_ec_gen_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 8,
                 .cur_ec_disc_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 16,
+                // Same EC._gen_lock-vs-offset-0 trap as the mint above:
+                // fpu_state pushes _gen_lock past offset 0; the comptime
+                // offset is the only safe way to read the gen-lock word.
+                .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
             },
         ) ++
 
@@ -1007,11 +1067,17 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         \\movq %%gs:88, %%r11
         ++ std.fmt.comptimePrint(
-            "\nmovq {d}(%%r11), %%rcx\n",
-            .{@offsetOf(ExecutionContext, "ctx")},
+            \\
+            \\movq {[ctx_off]d}(%%r11), %%rcx
+            \\movq %%rcx, %%gs:88
+            \\movq {[ctx_rsp_off]d}(%%rcx), %%rax
+            \\
+        ,
+            .{
+                .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+            },
         ) ++
-        \\movq %%rcx, %%gs:88
-        \\movq 160(%%rcx), %%rax
         \\movq %%gs:96, %%rcx
         \\shlq $32, %%rcx
         ++ std.fmt.comptimePrint(
@@ -1078,8 +1144,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%rcx, 8(%%rax)
         \\clac
         \\movq %%gs:88, %%rcx
-        \\movq 152(%%rcx), %%r11
-        \\movq 136(%%rcx), %%rcx
+        ++ std.fmt.comptimePrint(
+            \\
+            \\movq {[ctx_rflags_off]d}(%%rcx), %%r11
+            \\movq {[ctx_rip_off]d}(%%rcx), %%rcx
+            \\
+        ,
+            .{
+                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+            },
+        ) ++
         \\movq %%rax, %%rsp
         \\movq %%gs:72, %%rax
         \\swapgs
@@ -1088,12 +1163,18 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ─── Bail handlers ─────────────────────────────────────────────
         \\.Lcd_full:
         \\movq %%gs:80, %%rcx
-        \\andq $-2, (%%rcx)
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        ) ++
         \\ud2
         \\.Lrecv_cd_fail:
         \\ud2
         \\.Lsyscall_no_receiver:
-        \\andq $-2, (%%rcx)                   // release port lock (we hold it)
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
+            .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
+        ) ++
         \\.Lsyscall_lock_fail:
         \\movq %%gs:72, %%rax                 // restore target_id for slow path
         \\jmp .Lsyscall_slow_path
@@ -1139,7 +1220,7 @@ pub fn prepareThreadContext(
         // 16-byte struct copies) traps with #GP at the first
         // instruction. Mirrors the same fix applied to the initial
         // EC of a freshly-spawned capability domain in
-        // `capdom.capability_domain.patchInitialIretFrame`.
+        // `caps.capability_domain.patchInitialIretFrame`.
         ctx.rsp = ustack_top.?.addr - 8;
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
