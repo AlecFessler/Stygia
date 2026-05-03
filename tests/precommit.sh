@@ -169,6 +169,13 @@ stage_gen_lock_analyzer() {
         FAILURES+=("gen-lock analyzer build")
         return 1
     fi
+    # Self-tests for the analyzer first — a regression in the analyzer
+    # itself silently weakens every kernel finding it produces, so gate
+    # on the fixture suite before turning it loose on the real DB.
+    if ! bash "$ZAG_ROOT/tools/check_gen_lock/tests/run_tests.sh"; then
+        FAILURES+=("gen-lock analyzer self-tests")
+        return 1
+    fi
     ensure_callgraph_db || return 1
     local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
     if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --summary); then
