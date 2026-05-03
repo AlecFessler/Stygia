@@ -252,7 +252,19 @@ pub fn replyRecvAsm(word: u64) RecvReturn {
 
 // Reply + attachments + atomic recv-on-port. Combines the wide
 // attachment-write path with the post-syscall vreg-0 readback.
-// 928-byte pad covers vreg 0 + vregs 14..127.
+//
+// Input-register hazard: every kernel-return register is tied as an
+// output (rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12-r15 + rcx). The asm
+// body internally uses rax/rcx/rdx as scratch, so the compiler must
+// not pick any of those for the `[word]` / `[atts_ptr]` / `[n]` "r"
+// inputs — otherwise the source value is destroyed before the asm
+// consumes it. The previous formulation read `%[atts_ptr]` and
+// `%[n]` only AFTER the rcx-clobbering zero-loop, so a compiler that
+// picked rcx for any input produced a NULL deref (the bug behind
+// reply_26's MISS). Hoist all three inputs onto stack stashes via r11
+// (the only declared clobber, never allocated for an input) BEFORE
+// any internal scratch use; the asm body then sources every input
+// from those stashes, independent of register allocation.
 pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -269,31 +281,56 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ subq $928, %%rsp
-        \\ movq %%rsp, %%r11
-        \\ movq $116, %%rcx
+        // Reserve 944 bytes. vreg 0 lives at [rsp+16] (after the 16-
+        // byte input stash); vregs 14..127 at [rsp + 24..936]. We
+        // advance rsp by +16 just before syscall so the kernel sees
+        // vreg 0 at [rsp+0], then restore +928 after the syscall.
+        \\ subq $944, %%rsp
+        // Stash all three inputs IMMEDIATELY, before any scratch use.
+        // r11 is the only declared clobber, so the compiler never
+        // allocates it for an input — using r11 here is safe.
+        \\ movq %[word], %%r11
+        \\ movq %%r11, 0(%%rsp)
+        \\ movq %[atts_ptr], %%r11
+        \\ movq %%r11, 8(%%rsp)
+        \\ movq %[n], %%r11
+        \\ movq %%r11, 16(%%rsp)
+        // Zero-fill 115 * 8 = 920 bytes starting at [rsp+24]. The
+        // input stashes at [rsp+0..23] are preserved; we'll clear the
+        // [rsp+8] / [rsp+16] slots before syscall so the kernel doesn't
+        // see them as stray vregs.
+        \\ leaq 24(%%rsp), %%r11
+        \\ movq $115, %%rcx
         \\1: movq $0, (%%r11)
         \\ addq $8, %%r11
         \\ decq %%rcx
         \\ jnz 1b
-        \\ movq %[atts_ptr], %%r11
-        \\ movq %[n], %%rcx
+        // Compute the dst of the first pair entry. After we shift rsp
+        // by +16 below, the kernel sees vreg 0 at [rsp+0] and vreg
+        // (128-N) at [new_rsp + (115-N)*8] = [old_rsp + 16 + (115-N)*8].
+        \\ movq 16(%%rsp), %%rcx           /* rcx = n (loop counter) */
         \\ movq %%rcx, %%rax
         \\ negq %%rax
         \\ addq $115, %%rax
         \\ shlq $3, %%rax
-        \\ addq %%rsp, %%rax
+        \\ leaq 16(%%rsp,%%rax), %%rax     /* rax = first pair-slot dst */
+        \\ movq 8(%%rsp), %%r11            /* r11 = atts_ptr (src) */
         \\2: movq (%%r11), %%rdx
         \\ movq %%rdx, (%%rax)
         \\ addq $8, %%r11
         \\ addq $8, %%rax
         \\ decq %%rcx
         \\ jnz 2b
-        \\ movq %[word], %%rcx
-        \\ movq %%rcx, (%%rsp)
+        // Move the syscall_word from the stash at [rsp+0] to its
+        // post-adjust vreg-0 position at [rsp+16]. Clear the now-stale
+        // stash slot at [rsp+8].
+        \\ movq 0(%%rsp), %%r11            /* r11 = word (from stash) */
+        \\ movq %%r11, 16(%%rsp)           /* [rsp+16] = word (post-adjust vreg 0) */
+        \\ movq $0, 8(%%rsp)
+        \\ addq $16, %%rsp                 /* rsp now points at vreg 0 (word) */
         \\ syscall
         \\ movq (%%rsp), %%rcx
-        \\ addq $928, %%rsp
+        \\ addq $928, %%rsp                /* restore the vreg-window reservation */
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
