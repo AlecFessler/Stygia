@@ -320,7 +320,6 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
 pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     kprof.enter(.suspend_ec);
     defer kprof.exit(.suspend_ec);
-    arch.boot.printRaw("[dbg] suspendEc enter\n");
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -414,7 +413,6 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     kprof.enter(.recv);
     defer kprof.exit(.recv);
-    arch.boot.printRaw("[dbg] recv enter\n");
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
