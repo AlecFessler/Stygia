@@ -310,11 +310,12 @@ comptime {
 /// The caller treats the returned PAddr as an opaque handle; its
 /// numeric value is also the stage-2 root PA, which keeps
 /// `mapGuestPage` / `unmapGuestPage` / `invalidateStage2Ipa` unchanged.
-/// Return a mutable pointer to the `VmControlBlock` embedded in the
-/// 8 KiB arch structures allocation at `vm_structures + PAGE4K`.
-pub fn controlBlock(vm_structures: PAddr) *VmControlBlock {
-    const cb_pa = PAddr.fromInt(vm_structures.addr + paging.PAGE4K);
-    return @ptrFromInt(VAddr.fromPAddr(cb_pa, null).addr);
+/// Return a mutable pointer to a `VmControlBlock` page given its
+/// physical base. Spec-v3 PMM has no order-1 contiguous alloc, so the
+/// L2 root and the control block are two separate pages and callers
+/// pass the cb PA directly rather than deriving it from the L2 root.
+pub fn controlBlock(control_block_pa: PAddr) *VmControlBlock {
+    return @ptrFromInt(VAddr.fromPAddr(control_block_pa, null).addr);
 }
 
 /// Install a 4 KiB stage-2 mapping `guest_phys → host_phys` with the
@@ -577,14 +578,14 @@ fn classifySysreg(key: SysregKey) HcrTrapGroup {
 pub const SysregPassthroughError = error{SecurityCritical};
 
 pub fn sysregPassthrough(
-    vm_structures: PAddr,
+    control_block_pa: PAddr,
     sysreg_id: u32,
     allow_read: bool,
     allow_write: bool,
 ) SysregPassthroughError!void {
     if (isSecurityCriticalSysreg(sysreg_id)) return error.SecurityCritical;
 
-    const cb = controlBlock(vm_structures);
+    const cb = controlBlock(control_block_pa);
     const key = SysregKey.decode(sysreg_id);
     const group = classifySysreg(key);
     const any = allow_read or allow_write;

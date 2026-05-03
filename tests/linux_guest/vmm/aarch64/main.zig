@@ -211,15 +211,7 @@ fn setupVcpuState() void {
 fn exitLoop() void {
     const RECV_POLL_NS: u64 = 0; // block indefinitely
     while (true) {
-        log.print("recv...");
         const r = vm_exit.recvVmExit(exit_port, RECV_POLL_NS);
-        log.print(" et=");
-        log.dec(@as(u64, r.event_type));
-        log.print(" err=");
-        log.dec(r.err);
-        log.print(" subcode=");
-        log.dec(r.state.exit_subcode);
-        log.print("\n");
         if (r.event_type == 0) {
             if (r.err == @intFromEnum(errors.Error.E_TIMEOUT)) continue;
             return;

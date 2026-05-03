@@ -4,6 +4,7 @@ const zag = @import("zag");
 const hv = zag.arch.aarch64.hv;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const stage2_mod = zag.arch.aarch64.stage2;
 const vgic_mod = hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
@@ -61,12 +62,14 @@ pub fn initVmDevices(devices: *VmDevices) void {
 
 /// Per-VM control-state envelope returned from `allocVmArchState`.
 /// Page-sized + page-aligned to fit the PMM's `create`/`destroy`
-/// contract; the only payload today is a placeholder slot. Future
-/// per-VM EL2 state (VTTBR_EL2, VTCR_EL2, vGIC distributor state,
-/// HCR_EL2 bits, etc.) is the natural occupant of the rest of the page.
+/// contract. Holds the PA of the per-VM control block (allocated
+/// alongside as a separate PMM page; the old order-1 contiguous
+/// "vm_structures" allocation isn't available in spec-v3's PMM, so the
+/// stage-2 root and the control block are two separate pages and the
+/// run loop threads both PAddrs through `hyp.vmResume`).
 pub const CtrlStateCell = extern struct {
-    _placeholder: u64 align(paging.PAGE4K) = 0,
-    _pad: [paging.PAGE4K - @sizeOf(u64)]u8 = undefined,
+    control_block_pa: PAddr align(paging.PAGE4K) = .{ .addr = 0 },
+    _pad: [paging.PAGE4K - @sizeOf(PAddr)]u8 = undefined,
 };
 
 comptime {
@@ -93,33 +96,42 @@ pub fn freeStage2Root(vm: *VirtualMachine) void {
     vm.guest_pt_root = PAddr.fromInt(0);
 }
 
-/// Allocate per-VM control state. Mirrors the x64 dispatch so that
-/// `allocVm` ends with a non-null `vm.arch_state`. Real per-VM EL2
-/// programming (VTCR/HCR seed values, vGIC redistributor base, etc.)
-/// will populate the cell when the EL2 scaffolding returns.
+/// Allocate per-VM control state: a CtrlStateCell to pin the PA of
+/// the control block, plus a separate PMM page for the control block
+/// itself (zero-initialized → sysregPassthrough writes land in known
+/// zero-bit positions). `vm.guest_pt_root` was already populated by
+/// `allocStage2Root` earlier in `allocVm`, so the run loop has both
+/// pieces it needs by the time `enterGuest` first runs.
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     _ = vm;
     _ = policy_pf;
     const cell = pmm.global_pmm.?.create(CtrlStateCell) catch
         return error.OutOfMemory;
-    cell.* = .{};
+    const cb_page = pmm.global_pmm.?.create(paging.PageMem(.page4k)) catch {
+        pmm.global_pmm.?.destroy(cell);
+        return error.OutOfMemory;
+    };
+    cell.* = .{
+        .control_block_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(cb_page)), null),
+    };
     return @ptrCast(cell);
 }
 
 pub fn freeVmArchState(vm: *VirtualMachine) void {
     const erased = vm.arch_state orelse return;
     const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    if (cell.control_block_pa.addr != 0) {
+        const va = VAddr.fromPAddr(cell.control_block_pa, null);
+        const cb_page: *paging.PageMem(.page4k) = @ptrFromInt(va.addr);
+        pmm.global_pmm.?.destroy(cb_page);
+    }
     pmm.global_pmm.?.destroy(cell);
     vm.arch_state = null;
 }
 
-// Stage-2 map / unmap / shootdown primitives are no-ops on aarch64
-// today: there's no VTTBR_EL2 walker yet, but the spec tests for
-// `map_guest` / `unmap_guest` exercise the cross-cutting caps
-// bookkeeping (overlap checks, mapcnt accounting, error gates) rather
-// than actual guest execution. Returning success here lets the
-// bookkeeping run end-to-end; an actual stage-2 walk slots in once the
-// EL2 scaffolding is restored.
+// Stage-2 map / unmap / shootdown primitives wire `hv.virtual_machine`'s
+// portable map_guest / unmap_guest dispatch to the per-arch stage-2
+// walker (kernel/arch/aarch64/stage2.zig).
 pub fn stage2MapPage(
     vm: *VirtualMachine,
     guest_phys: u64,
@@ -127,17 +139,18 @@ pub fn stage2MapPage(
     sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
-    _ = vm;
-    _ = guest_phys;
-    _ = host_phys;
     _ = sz;
-    _ = perms;
+    if (!vm_hw.vmSupported()) return;
+    if (vm.guest_pt_root.addr == 0) return;
+    const rights: u8 = @bitCast(perms);
+    try stage2_mod.mapGuestPage(vm.guest_pt_root, guest_phys, host_phys, rights);
 }
 
 pub fn stage2UnmapPage(vm: *VirtualMachine, guest_phys: u64, sz: VmarPageSize) void {
-    _ = vm;
-    _ = guest_phys;
     _ = sz;
+    if (!vm_hw.vmSupported()) return;
+    if (vm.guest_pt_root.addr == 0) return;
+    stage2_mod.unmapGuestPage(vm.guest_pt_root, guest_phys);
 }
 
 pub fn invalidateStage2Range(
@@ -147,9 +160,13 @@ pub fn invalidateStage2Range(
     page_count: u32,
 ) void {
     _ = vm;
-    _ = guest_phys;
     _ = sz;
-    _ = page_count;
+    if (!vm_hw.vmSupported()) return;
+    var i: u32 = 0;
+    while (i < page_count) {
+        stage2_mod.invalidateStage2Ipa(guest_phys + @as(u64, i) * paging.PAGE4K);
+        i += 1;
+    }
 }
 
 /// Apply a typed slice of VM policy entries. The aarch64 vCPU run

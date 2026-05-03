@@ -58,13 +58,13 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
 
     const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return null;
 
+    if (!arch_state.started) return null;
+
     // Defer real `hvc_vcpu_run` until the VMM has supplied initial
     // guest state via reply. Otherwise we would ERET into a zeroed PC
     // and trip a stage-1 instruction-abort immediately. The synthetic-
     // exit fallback is the spec-test path before reply→GuestState
     // writeback is wired; once that lands, this guard flips on reply.
-    if (!arch_state.started) return null;
-
     const vm_ref = vcpu_ec.vm orelse return null;
     // caller-pinned: the vCPU EC holds a SlabRef on its VM for its lifetime;
     // the run loop is the only consumer that needs the live pointer.

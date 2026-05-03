@@ -446,11 +446,17 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
     //     as asm output operands.
     //   * Restore sp.
     asm volatile (
+    // Switch sp to vm_exit_buf, save user sp + host x29/x30 above the
+    // syscall window. The kernel's vm_exit writeback overwrites x29/x30
+    // in our iret frame with the suspended vCPU's GPRs; without the
+    // host pair we'd ret through guest x30 = 0 → PC=0 instr abort.
         \\ adrp x16, vm_exit_buf
         \\ add  x16, x16, :lo12:vm_exit_buf
         \\ mov  x17, sp
         \\ mov  sp, x16
         \\ str  x17, [sp, #(102 * 8)]
+        \\ str  x29, [sp, #(126 * 8)]
+        \\ str  x30, [sp, #(127 * 8)]
         \\ ldr  x16, [sp, #(100 * 8)]
         \\ ldr  x17, [sp, #(101 * 8)]
         \\ svc  #0
@@ -470,6 +476,8 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
         \\ str  x28, [sp, #(120 * 8)]
         \\ str  x29, [sp, #(121 * 8)]
         \\ str  x30, [sp, #(122 * 8)]
+        \\ ldr  x29, [sp, #(126 * 8)]
+        \\ ldr  x30, [sp, #(127 * 8)]
         \\ ldr  x16, [sp, #(102 * 8)]
         \\ mov  sp, x16
         : [v1] "={x0}" (ox0),
@@ -490,7 +498,8 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
         : [iv1] "{x0}" (@as(u64, port)),
           [iv2] "{x1}" (@as(u64, 0)),
           [iv3] "{x2}" (timeout_ns),
-        : .{ .x15 = true, .x18 = true, .x19 = true, .x20 = true,
+        : .{ .x15 = true, .x16 = true, .x17 = true,
+             .x18 = true, .x19 = true, .x20 = true,
              .x21 = true, .x22 = true, .x23 = true, .x24 = true,
              .x25 = true, .x26 = true, .x27 = true, .x28 = true,
              .x29 = true, .x30 = true, .memory = true });
@@ -558,9 +567,11 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
 
 /// Reply to a vm_exit event with `state` as the new guest state.
 pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
+    // Spec §[reply] entry: reply_handle_id rides in syscall-word
+    // bits 20-31. (recv-return places it at 32-43 instead.)
     const word: u64 =
         (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
-        (@as(u64, reply_handle_id) << 12);
+        (@as(u64, reply_handle_id) << 20);
 
     writeBufFrom(state);
     vm_exit_buf[0] = word;
@@ -586,11 +597,18 @@ pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
 
     var ox0: u64 = undefined;
     asm volatile (
+    // Switch sp to vm_exit_buf, save user sp + host x29/x30 above the
+    // syscall window so we can restore them after svc. Guest x29/x30
+    // are loaded fresh from buffer slots (state.x29/x30) before svc;
+    // without preserving the host pair the ret at function end branches
+    // through state.x30 = 0.
         \\ adrp x16, vm_exit_buf
         \\ add  x16, x16, :lo12:vm_exit_buf
         \\ mov  x17, sp
         \\ mov  sp, x16
         \\ str  x17, [sp, #(102 * 8)]
+        \\ str  x29, [sp, #(126 * 8)]
+        \\ str  x30, [sp, #(127 * 8)]
         \\ ldr  x18, [sp, #(110 * 8)]
         \\ ldr  x19, [sp, #(111 * 8)]
         \\ ldr  x20, [sp, #(112 * 8)]
@@ -607,6 +625,8 @@ pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
         \\ ldr  x16, [sp, #(100 * 8)]
         \\ ldr  x17, [sp, #(101 * 8)]
         \\ svc  #0
+        \\ ldr  x29, [sp, #(126 * 8)]
+        \\ ldr  x30, [sp, #(127 * 8)]
         \\ ldr  x16, [sp, #(102 * 8)]
         \\ mov  sp, x16
         : [v1] "={x0}" (ox0),
@@ -629,6 +649,7 @@ pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
         : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
              .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
              .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+             .x16 = true, .x17 = true,
              .x18 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true,
              .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true,
              .x28 = true, .x29 = true, .x30 = true, .memory = true });

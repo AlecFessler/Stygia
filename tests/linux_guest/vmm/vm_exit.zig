@@ -306,14 +306,15 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
 }
 
 /// Reply to a vm_exit event with `state` as the new guest state. Spec
-/// §[reply]: reply_handle_id rides in syscall-word bits 12-23. The
-/// receiver's vregs 1..73 are committed back to the vCPU's GuestState
-/// (gated by `originating_write_cap` on the vCPU EC handle). Returns
-/// the kernel's vreg 1 (`err` per §[error_codes]).
+/// §[reply] entry: reply_handle_id rides in syscall-word bits 20-31.
+/// (recv-return places it at 32-43 instead.) The receiver's vregs
+/// 1..73 are committed back to the vCPU's GuestState (gated by
+/// `originating_write_cap` on the vCPU EC handle). Returns the
+/// kernel's vreg 1 (`err` per §[error_codes]).
 pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
     const word: u64 =
         (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
-        (@as(u64, reply_handle_id) << 12);
+        (@as(u64, reply_handle_id) << 20);
 
     // Serialize stack-backed vregs (14..73) into vm_exit_buf.
     const buf = &vm_exit_buf;

@@ -379,6 +379,7 @@ pub fn vtcrEl2Value() u64 {
 pub fn vmResume(
     guest_state: *GuestState,
     vm_structures: PAddr,
+    control_block_pa: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
     arch_scratch: *align(16) ArchScratch,
 ) VmExitInfo {
@@ -387,12 +388,13 @@ pub fn vmResume(
     ctx.* = .{};
     host_save.* = .{};
 
-    // Per-VM state (vmid + HCR_EL2 overrides) live in the control
-    // block page immediately following the stage-2 root. Pulling
-    // them from `vm_structures` here keeps vmResume's interface down
-    // to the same four arguments x86's does (guest_state,
-    // vm_structures, guest_fxsave) plus the per-vCPU arch_scratch.
-    const cb = stage2.controlBlock(vm_structures);
+    // Per-VM control block (vmid + HCR_EL2 overrides) lives in its own
+    // PMM page — spec-v3 PMM has no order-1 contiguous alloc, so the L2
+    // root and the control block are two separate pages and the caller
+    // threads both PAddrs through. Remaining args mirror x86's
+    // (guest_state, stage-2 root, guest_fxsave) plus the per-vCPU
+    // arch_scratch.
+    const cb = stage2.controlBlock(control_block_pa);
 
     // EL2 runs with SCTLR_EL2.M=0 so the hyp stubs dereference these
     // pointers as raw PAs. The VCpu (and its embedded guest_state /

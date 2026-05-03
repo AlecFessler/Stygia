@@ -151,7 +151,7 @@ pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
 /// dispatch; the layouts are identical by design.
 pub const VmExitDelivery = switch (builtin.cpu.arch) {
     .x86_64 => x64.vm_runloop.VmExitDelivery,
-    .aarch64 => struct { subcode: u8, payload: [3]u64 },
+    .aarch64 => aarch64.vm_runloop.VmExitDelivery,
     else => unreachable,
 };
 
@@ -167,7 +167,7 @@ pub const VmExitDelivery = switch (builtin.cpu.arch) {
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm_runloop.enterGuest(vcpu_ec),
-        .aarch64 => null,
+        .aarch64 => aarch64.vm_runloop.enterGuest(vcpu_ec),
         else => unreachable,
     };
 }
@@ -265,7 +265,7 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
 /// layout — only the matching arch's apply path consumes it.
 pub const ReplyVregSnapshot = switch (builtin.cpu.arch) {
     .x86_64 => x64.vm_runloop.ReplyVregSnapshot,
-    .aarch64 => extern struct {}, // aarch64 KVM is not in the spec-v3 critical path
+    .aarch64 => aarch64.vm_runloop.ReplyVregSnapshot,
     else => unreachable,
 };
 
@@ -277,7 +277,7 @@ pub const ReplyVregSnapshot = switch (builtin.cpu.arch) {
 pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm_runloop.snapshotReplyVregs(receiver),
-        .aarch64 => .{},
+        .aarch64 => aarch64.vm_runloop.snapshotReplyVregs(receiver),
         else => unreachable,
     };
 }
@@ -290,7 +290,7 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(vcpu_ec, snap),
-        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        .aarch64 => aarch64.vm_runloop.applyReplyStateToVcpu(vcpu_ec, snap),
         else => unreachable,
     }
 }
@@ -306,7 +306,11 @@ pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
                 arch_state.last_exit_payload = payload;
             }
         },
-        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        .aarch64 => {
+            if (aarch64.hv.vcpu.archStateOf(ec)) |arch_state| {
+                arch_state.last_exit_payload = payload;
+            }
+        },
         else => unreachable,
     }
 }
@@ -325,7 +329,7 @@ pub fn populateVmExitVregsIfStarted(
 ) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm_runloop.populateVmExitVregsIfStarted(receiver, sender, subcode),
-        .aarch64 => {}, // aarch64 KVM is not in the spec-v3 critical path
+        .aarch64 => aarch64.vm_runloop.populateVmExitVregsIfStarted(receiver, sender, subcode),
         else => unreachable,
     }
 }
