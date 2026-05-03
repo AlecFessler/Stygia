@@ -451,12 +451,19 @@ pub export fn syscallEntry() callconv(.naked) void {
             "")
         ++ "\n"
         ++ (if (build_options.kernel_fastpath_reply)
+            // Fast path engages on:
+            //   syscall_num (bits 0-11)  == 52 (.reply)
+            //   pair_count  (bits 12-19) == 0  (no attachments)
+            //   reserved    (bits 44-63) == 0
+            // recv_port_handle_id (bits 32-43) is NOT gated — non-zero
+            // selects the atomic-recv-park branch in the fast-path
+            // body (caller parks on that port after the reply commits).
             \\movq %%rcx, %%r11
             \\andq $0xFFF, %%r11
             \\cmpq $52, %%r11
             \\jne  .Lsyscall_slow_path
             \\movq %%rcx, %%r11
-            \\shrq $32, %%r11
+            \\shrq $44, %%r11
             \\jnz  .Lsyscall_slow_path
             \\movq %%rcx, %%r11
             \\shrq $12, %%r11
@@ -694,6 +701,40 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
+    // ─── Step 6.5: snapshot receiver state under port lock for the
+    // recv_cd + receiver_ec acquire chain that follows port release.
+    // Port lock pins the receiver while held, so reads here are
+    // gen-coherent. Stash:
+    //   gs:104 = receiver_ec_gen   (snapshot for Step 9.5 lockWithGen)
+    //   gs:80  = recv_cd_ptr        (overwritten by recv_cd value at
+    //                                Step 10; we re-stash there)
+    //   gs:96  = recv_cd_gen        (overwritten at Step 10 line ~800
+    //                                with reply_slot id; we use it
+    //                                in Step 9 acquire then it's free)
+    //
+    // Capturing receiver.domain.ptr/.gen here moves the analyzer-
+    // flagged "receiver.domain via %r11: lock not held" read at
+    // (former) Step 9 line 752 into the port-locked window where the
+    // receiver is provably alive. Step 9 then uses cached values.
+    // ────────────────────────────────────────────────────────────────
+        std.fmt.comptimePrint(
+            \\
+            \\movq {[ec_lock_off]d}(%%r11), %%rax
+            \\shrq $1, %%rax
+            \\movq %%rax, %%gs:104
+            \\movq {[dom_ptr_off]d}(%%r11), %%rax
+            \\movq %%rax, %%gs:80
+            \\movq {[dom_gen_off]d}(%%r11), %%rax
+            \\movq %%rax, %%gs:96
+            \\
+        ,
+            .{
+                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .dom_ptr_off = @offsetOf(ExecutionContext, "domain"),
+                .dom_gen_off = @offsetOf(ExecutionContext, "domain") + 8,
+            },
+        ) ++
+
     // ─── Step 7: maintain port.waiter_kind. Scan all 4 levels — if
     // all heads null, set .none. Otherwise leave .receivers intact.
     // ────────────────────────────────────────────────────────────────
@@ -735,23 +776,16 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
         ) ++
 
-    // ─── Step 9: acquire receiver's CD gen-lock. Spill receiver EC*
-    // to gs:88 (persists through everything that follows). recv_cd
-    // ptr/gen come from receiver.domain (SlabRef field).
+    // ─── Step 9: acquire receiver's CD gen-lock from cached snapshot
+    // (Step 6.5: gs:80 = recv_cd_ptr, gs:96 = recv_cd_gen). Spill
+    // receiver EC* to gs:88 (persists through everything that follows).
+    // Lock order: recv_cd here is the ONLY lock held; we acquire
+    // receiver_ec at Step 9.5 — canonical CD → EC.
     // ────────────────────────────────────────────────────────────────
         \\movq %%r11, %%gs:88
+        \\movq %%gs:80, %%rcx
+        \\movq %%gs:96, %%r11
         ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[dom_off]d}(%%r11), %%rcx
-            \\movq {[gen_off]d}(%%r11), %%r11
-            \\
-        ,
-            .{
-                .dom_off = @offsetOf(ExecutionContext, "domain"),
-                .gen_off = @offsetOf(ExecutionContext, "domain") + 8,
-            },
-        ) ++
-        std.fmt.comptimePrint(
             \\
             \\shlq $1, %%r11
             \\movq %%r11, %%rax
@@ -772,18 +806,97 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
         ) ++
 
-    // ─── Step 10: mint reply handle. recv_cd held by lock. Spill
-    // recv_cd → gs:80 and recv_cd_gen → gs:104 for use after rcx/r11
-    // get repurposed. Pop free slot via cd.free_head + free-list link
-    // (kernel_table[slot].parent.slot at offset 32 within KernelHandle).
-    // Write user_table[slot] (word0=caps|type|slot, field0/field1=0)
-    // and kernel_table[slot] (ref={sender,sender_gen}, parent/
-    // first_child/next_sibling=0). Set sender backpointers
-    // pending_reply_holder/domain/slot. word0 caps for fast path:
+    // ─── Step 9.5: acquire receiver_ec gen-lock with snapshotted gen
+    // from Step 6.5. Holds recv_cd lock — canonical CD → EC order.
+    // Bail to .Lrecv_ec_destroyed (release recv_cd, jmp slow path) if
+    // gen rotated under us between Step 6.5 and now (concurrent
+    // destroy walked the receiver while we were between port release
+    // and recv_cd acquire). Receiver_ec held through Step 15 — covers
+    // every receiver field write (state, event_*, ctx) plus the
+    // kernel_stack.top read in Step 14.
+    //
+    // Register map mirrors Step 9 acquire: rcx = base reg for the
+    // cmpxchg memory operand, rax = expected (unlocked target),
+    // r11 = desired (locked target). After success rcx holds
+    // receiver_ec_ptr (was recv_cd_ptr coming in from Step 9) — Step
+    // 10's first instructions reload rcx = recv_cd_ptr from gs:80
+    // and r11 = recv_cd_gen from gs:96.
+    // ────────────────────────────────────────────────────────────────
+        \\movq %%gs:88, %%rcx
+        \\movq %%gs:104, %%rax
+        ++ std.fmt.comptimePrint(
+            \\
+            \\shlq $1, %%rax
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\.Lacquire_recv_ec:
+            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+            \\je .Lrecv_ec_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lrecv_ec_destroyed
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lacquire_recv_ec
+            \\.Lrecv_ec_acquired:
+            \\
+        ,
+            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+        ) ++
+
+    // ─── Step 9.7: acquire sender_ec gen-lock. Sender = current_ec
+    // (gs:32) — running on this core, can't be destroyed while running,
+    // so plain spin-acquire (no gen check needed). Held through Step
+    // 12 (last sender field write); released at Step 12.5.
+    //
+    // Same-class nesting with receiver_ec (held since Step 9.5).
+    // Discipline: in suspend fast path, receiver_ec is acquired
+    // BEFORE sender_ec. The reply fast path never holds both
+    // simultaneously, so no cross-path AB-BA. tools/check_gen_lock
+    // will flag the nesting; the documented invariant is that this
+    // is the only path that holds both ECs at once.
+    //
+    // Register map: rcx = sender_ec_ptr, rax/r11 = lock-word values.
+    // ────────────────────────────────────────────────────────────────
+        \\movq %%gs:32, %%rcx
+        ++ std.fmt.comptimePrint(
+            \\
+            \\.Lacquire_sender_ec_load:
+            \\movq {[ec_lock_off]d}(%%rcx), %%rax
+            \\testb $1, %%al
+            \\jnz .Lacquire_sender_ec_spin
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+            \\je .Lsender_ec_acquired
+            \\jmp .Lacquire_sender_ec_load
+            \\.Lacquire_sender_ec_spin:
+            \\pause
+            \\jmp .Lacquire_sender_ec_load
+            \\.Lsender_ec_acquired:
+            \\
+        ,
+            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+        ) ++
+
+    // ─── Step 10: mint reply handle. recv_cd held by lock; receiver_ec
+    // also held (Step 9.5). Reload rcx = recv_cd_ptr and r11 =
+    // recv_cd_gen from the Step 6.5 stash since Step 9.5 left rcx =
+    // receiver_ec_ptr. gs:104 still holds receiver_ec_gen from Step
+    // 6.5; we overwrite it here with recv_cd_gen — receiver_ec_gen
+    // is no longer needed (the lockWithGen acquire at Step 9.5
+    // committed the gen check).
+    // Pop free slot via cd.free_head + free-list link (kernel_table[slot]
+    // .parent.slot at offset 32 within KernelHandle). Write
+    // user_table[slot] (word0=caps|type|slot, field0/field1=0) and
+    // kernel_table[slot] (ref={sender,sender_gen}, parent/first_child/
+    // next_sibling=0). Set sender backpointers pending_reply_holder/
+    // domain/slot. word0 caps for fast path:
     // ReplyCaps{move=1,xfer=1}=0b101=5; tag=.reply=7.
     // ────────────────────────────────────────────────────────────────
-        \\movq %%rcx, %%gs:80
-        \\shrq $1, %%r11
+        \\movq %%gs:80, %%rcx
+        \\movq %%gs:96, %%r11
         \\movq %%r11, %%gs:104
         ++ std.fmt.comptimePrint(
             \\
@@ -932,6 +1045,12 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%gs:8, %%rcx
             \\movq %%rcx, {[ctx_rsp_off]d}(%%rax)
             \\
+            \\# Step 12.5: release sender_ec gen-lock (acquired Step 9.7).
+            \\# r11 still holds sender_ec_ptr from Step 12 entry. After
+            \\# this point only receiver_ec is held; the rest of the fast
+            \\# path (Steps 13-15) writes receiver fields under that lock.
+            \\andq $-2, {[ec_unlock_off]d}(%%r11)
+            \\
         ,
             .{
                 .state_susp = @intFromEnum(zag.sched.execution_context.State.suspended_on_port),
@@ -947,6 +1066,7 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .susp_port_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
                 .susp_port_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
                 .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .port_lock_off = @offsetOf(Port, "_gen_lock"),
                 .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
                 .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
@@ -1102,12 +1222,20 @@ pub export fn syscallEntry() callconv(.naked) void {
         ++ std.fmt.comptimePrint(
             \\
             \\movq {[ctx_off]d}(%%r11), %%rcx
+            \\
+            \\# Step 15.5: release receiver_ec gen-lock acquired at
+            \\# Step 9.5. This is the last receiver-EC field access in
+            \\# the suspend fast path; subsequent code only uses the
+            \\# *cpu.Context (`rcx` here) which is not a slab type.
+            \\andq $-2, {[ec_unlock_off]d}(%%r11)
+            \\
             \\movq %%rcx, %%gs:88
             \\movq {[ctx_rsp_off]d}(%%rcx), %%rax
             \\
         ,
             .{
                 .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
             },
         ) ++
@@ -1203,6 +1331,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\ud2
         \\.Lrecv_cd_fail:
         \\ud2
+        // .Lrecv_ec_destroyed: Step 9.5 lockWithGen detected receiver
+        // gen rotated under us (concurrent destroy walked receiver
+        // between Step 8 port release and Step 9.5 acquire). Release
+        // recv_cd and bail to slow path.
+        \\.Lrecv_ec_destroyed:
+        \\movq %%gs:80, %%rcx
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        ) ++
+        \\jmp .Lsyscall_lock_fail
         \\.Lsyscall_no_receiver:
         ++ std.fmt.comptimePrint(
             "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
@@ -1272,13 +1411,22 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         \\movq %%rax, %%gs:64
 
-    // ─── Step R2: extract reply_slot from rcx bits 20-31. Spill to
-    // gs:80 (read at slot-free time after cmpxchg has clobbered rcx).
+    // ─── Step R2: extract reply_slot from rcx bits 20-31 (gs:80) and
+    // recv_port_handle_id from rcx bits 32-43 (gs:112). recv_port == 0
+    // ⇒ bare reply (caller resumes after replyee). recv_port != 0 ⇒
+    // atomic-recv-mode reply (caller parks on the named port after
+    // the replyee resumes). gs:112 doubles as the branch flag at R13.
+    // R4b will overlay gs:112 with the packed (recv_port | xfer<<12 |
+    // port_gen<<32) once the recv_port handle has been validated.
     // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%rax
         \\shrq $20, %%rax
         \\andq $0xFFF, %%rax
         \\movq %%rax, %%gs:80
+        \\movq %%rcx, %%rax
+        \\shrq $32, %%rax
+        \\andq $0xFFF, %%rax
+        \\movq %%rax, %%gs:112
 
     // ─── Step R3: acquire receiver's CD gen-lock. CD ptr at gs:40.
     // CAS pattern matches suspend fast path Step 9.
@@ -1287,9 +1435,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
             \\movq %%gs:40, %%rcx
             \\movq {[cd_lock_off]d}(%%rcx), %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
+            \\andq $-2, %%rax
+            \\lea 1(%%rax), %%r11
             \\.Lreply_acquire_cd:
             \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
             \\je .Lreply_cd_acquired
@@ -1351,29 +1498,140 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step R5: read sender predicate fields. We hold the CD
-    // lock, so the slot snapshot (and therefore sender_ec_ptr) is
-    // pinned. The three fields we touch are race-immune for a
-    // parked sender:
-    //   - iret_frame: only ever written via the slab init path
-    //     (currently always null).
-    //   - vcpu_arch_state: set once at create_vcpu, immutable after.
-    //   - originating_write_cap: stamped at suspend, cleared by
-    //     resumeFromReply — for a parked sender it cannot change
-    //     until WE reply (we are the only sender-resumer).
-    // Bail to slow path on any predicate failure (slot still intact).
+    // ─── Step R4b: atomic-recv-mode validation. Only fires when
+    // gs:112 (recv_port_handle_id) is non-zero. Validates the named
+    // port handle while the CD lock is still held (user_table /
+    // kernel_table mutations are CD-protected). On any failure
+    // (E_BADCAP for bad slot/type, E_PERM for missing recv cap),
+    // bail to .Lreply_handle_invalid → slow path re-resolves and
+    // returns the right error code with the reply handle intact
+    // (spec §[reply] tests 22/23).
+    //
+    // Stashes after success:
+    //   gs:120 = port_ec_ptr
+    //   gs:112 = recv_port (bits 0-11) | xfer (bit 12) | port_gen (bits 32-63)
+    //
+    // After this block, rcx == receiver_cd (preserved for R6).
     // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
-            \\movq %%gs:72, %%r11
-            \\movq {[ir_off]d}(%%r11), %%rax
+            \\movq %%gs:112, %%rax
             \\testq %%rax, %%rax
-            \\jnz .Lreply_handle_invalid
-            \\movq {[vcpu_off]d}(%%r11), %%rax
-            \\testq %%rax, %%rax
-            \\jnz .Lreply_handle_invalid
-            \\cmpb $1, {[wcap_off]d}(%%r11)
+            \\jz .Lreply_skip_recv_validate
+            \\
+            \\movq {[ut_off]d}(%%rcx), %%r11
+            \\leaq (%%rax, %%rax, 2), %%rax
+            \\movq {[w0_off]d}(%%r11, %%rax, 8), %%rax
+            \\
+            \\movq %%rax, %%r11
+            \\shrq $12, %%r11
+            \\andq $0xF, %%r11
+            \\cmpq ${[type_port]d}, %%r11
             \\jne .Lreply_handle_invalid
+            \\
+            \\btq ${[recv_bit]d}, %%rax
+            \\jnc .Lreply_handle_invalid
+            \\
+            \\movq %%gs:112, %%r11
+            \\btq ${[xfer_bit]d}, %%rax
+            \\jnc .Lreply_skip_xfer_set
+            \\orq $0x1000, %%r11
+            \\.Lreply_skip_xfer_set:
+            \\movq %%r11, %%gs:112
+            \\
+            \\movq %%gs:112, %%rax
+            \\andq $0xFFF, %%rax
+            \\imulq ${[kh_size]d}, %%rax, %%rax
+            \\addq {[kt_off]d}(%%rcx), %%rax
+            \\movq {[ref_ptr_off]d}(%%rax), %%r11
+            \\testq %%r11, %%r11
+            \\jz .Lreply_handle_invalid
+            \\movq %%r11, %%gs:120
+            \\movl {[ref_gen_off]d}(%%rax), %%eax
+            \\shlq $32, %%rax
+            \\orq %%rax, %%gs:112
+            \\
+            \\.Lreply_skip_recv_validate:
+            \\movq %%gs:40, %%rcx
+            \\
+        ,
+            .{
+                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
+                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
+                .type_port = @intFromEnum(CapabilityType.port),
+                .recv_bit = 48 + 3,
+                .xfer_bit = 48 + 2,
+                .kh_size = @sizeOf(KernelHandle),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+            },
+        ) ++
+
+    // ─── Step R5a: acquire sender's gen-lock BEFORE reading sender
+    // fields. Mirrors slow-path's `sender_ref.lockIrqSave(@src())` in
+    // `port.reply` — every read of sender state happens under the
+    // sender's gen-lock so a concurrent destroy/realloc of the slab
+    // slot can't tear our predicate snapshot.
+    //
+    // Stash sender_cd_ptr (sender.domain.ptr) to gs:104 along the
+    // way — needed for the per-core switch + CR3 swap below.
+    //
+    // Lock order: CD (R3) → sender_ec (here). Released sender_ec
+    // (R10) → CD (R7). Acquire CD-then-EC matches port.recv ordering.
+    //
+    // Bails:
+    //   .Lreply_eterm_under_cd : sender gen mismatch (slot recycled
+    //                            since R4 snapshot). CD lock held,
+    //                            handle NOT yet cleared. Release CD,
+    //                            sysretq E_TERM to receiver.
+    // ────────────────────────────────────────────────────────────────
+        \\movq %%gs:72, %%rcx
+        ++ std.fmt.comptimePrint(
+            \\
+            \\movq %%gs:96, %%rax
+            \\shlq $1, %%rax
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\.Lreply_acquire_sender:
+            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+            \\je .Lreply_sender_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lreply_eterm_under_cd
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lreply_acquire_sender
+            \\.Lreply_sender_acquired:
+            \\movq {[dom_off]d}(%%rcx), %%r11
+            \\movq %%r11, %%gs:104
+            \\
+        ,
+            .{
+                .dom_off = @offsetOf(ExecutionContext, "domain"),
+                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            },
+        ) ++
+
+    // ─── Step R5b: read sender predicate fields under sender lock.
+    // rcx still holds sender_ec_ptr from R5a's cmpxchg target — keep
+    // using it so the genlock analyzer can prove the lock-acquired
+    // pointer and the field-access pointer are the same register.
+    // Bail to .Lreply_sender_field_fail: releases sender lock first
+    // (LIFO with R5a acquire), then falls into .Lreply_handle_invalid
+    // which releases CD lock and jumps slow path.
+    // ────────────────────────────────────────────────────────────────
+        std.fmt.comptimePrint(
+            \\
+            \\movq {[ir_off]d}(%%rcx), %%rax
+            \\testq %%rax, %%rax
+            \\jnz .Lreply_sender_field_fail
+            \\movq {[vcpu_off]d}(%%rcx), %%rax
+            \\testq %%rax, %%rax
+            \\jnz .Lreply_sender_field_fail
+            \\cmpb $1, {[wcap_off]d}(%%rcx)
+            \\jne .Lreply_sender_field_fail
             \\
         ,
             .{
@@ -1383,7 +1641,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step R6: clearAndFreeSlot inline. rcx = receiver_cd.
+    // ─── Step R6: clearAndFreeSlot inline. R5a left rcx = sender_ec_ptr,
+    // so reload rcx = receiver_cd from gs:40 first.
     //   user_table[slot] = {0, 0, 0}
     //   kernel_table[slot].ref = .{}                    (16 bytes)
     //   kernel_table[slot].parent = encodeFreeNext(cd.free_head)
@@ -1394,7 +1653,8 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   cd.free_head = slot
     //   cd.free_count += 1
     // ────────────────────────────────────────────────────────────────
-        std.fmt.comptimePrint(
+        \\movq %%gs:40, %%rcx
+        ++ std.fmt.comptimePrint(
             \\
             \\movq {[ut_off]d}(%%rcx), %%r11
             \\movq %%gs:80, %%rax
@@ -1448,41 +1708,12 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
         ) ++
 
-    // ─── Step R8: acquire sender's gen-lock. Past this point we have
-    // released the CD lock and freed the slot, so the only path to
-    // bail is .Lreply_eterm (inline E_TERM sysretq to receiver) —
-    // matching slow path's "free first, then try sender lock"
-    // ordering. Also stashes sender_cd_ptr (sender.domain.ptr) to
-    // gs:104 — needed for the per-core switch + CR3 swap below.
+    // ─── Step R8: (folded into R5a — sender's gen-lock is already
+    // held by the time we reach here. sender_cd_ptr was stashed to
+    // gs:104 in R5a. Just reload rcx = sender_ec_ptr for R9 below.)
     // ────────────────────────────────────────────────────────────────
         \\movq %%gs:72, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[dom_off]d}(%%rcx), %%r11
-            \\movq %%r11, %%gs:104
-            \\movq %%gs:96, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lreply_acquire_sender:
-            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
-            \\je .Lreply_sender_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_eterm
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acquire_sender
-            \\.Lreply_sender_acquired:
-            \\
-        ,
-            .{
-                // EC._gen_lock-vs-offset-0 trap as in suspend fast path.
-                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .dom_off = @offsetOf(ExecutionContext, "domain"),
-            },
-        ) ++
+        ++
 
     // ─── Step R9: resumeFromReply state writes on sender. Sender goes
     // straight to .running because we are about to switch this core
@@ -1527,6 +1758,47 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
         ) ++
 
+    // ─── Step R10.5: acquire caller (= receiver = current_ec) gen-lock
+    // before any receiver-EC field writes. R11..R13 mutate receiver.ctx
+    // (rip/rsp/rflags/rax/cs/ss), receiver.state, receiver.event_*,
+    // receiver.suspend_port, receiver.recv_port_xfer, receiver.next /
+    // priority — every one of those is also a write target for unrelated
+    // syscalls that other cores can issue against a handle to this same
+    // EC (priority, setRegisters, kill, etc.). Per the lock discipline:
+    // touching a slab-backed object's fields requires holding its
+    // _gen_lock. Caller is always live (we're it), so an unconditional
+    // spin-acquire is sufficient — no gen-mismatch bail.
+    //
+    // Lock order: nothing else held at this point (R7 dropped CD, R10
+    // dropped sender_ec). For the atomic-recv-park R13 branch the port
+    // lock will nest under this lock (receiver_ec → port). Tag the
+    // acquisition with ordered_group=2 (EC_NESTED_GROUP) so future asm
+    // additions that need same-class nesting (sender_ec + receiver_ec
+    // simultaneously, address-ordered) don't trip lockdep — though this
+    // particular path holds only one EC at a time.
+    // ────────────────────────────────────────────────────────────────
+        \\movq %%gs:32, %%rcx
+        ++ std.fmt.comptimePrint(
+            \\
+            \\.Lreply_acq_caller_load:
+            \\movq {[ec_lock_off]d}(%%rcx), %%rax
+            \\testb $1, %%al
+            \\jnz .Lreply_acq_caller_spin
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\.Lreply_acq_caller_cas:
+            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+            \\je .Lreply_caller_acquired
+            \\jmp .Lreply_acq_caller_load
+            \\.Lreply_acq_caller_spin:
+            \\pause
+            \\jmp .Lreply_acq_caller_load
+            \\.Lreply_caller_acquired:
+            \\
+        ,
+            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+        ) ++
+
     // ─── Step R11: patch receiver.ctx so its eventual re-dispatch
     // through `switchTo` iretq's into post-syscall user mode with
     // rax=0 (success). Only 4 fields touched: regs.rax, rip, rflags,
@@ -1549,6 +1821,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%r11, {[ctx_rflags_off]d}(%%rcx)
             \\movq %%gs:8, %%r11
             \\movq %%r11, {[ctx_rsp_off]d}(%%rcx)
+            \\movq $0x23, {[ctx_cs_off]d}(%%rcx)
+            \\movq $0x1b, {[ctx_ss_off]d}(%%rcx)
             \\
         ,
             .{
@@ -1557,6 +1831,8 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
                 .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
                 .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+                .ctx_cs_off = @offsetOf(cpu.Context, "cs"),
+                .ctx_ss_off = @offsetOf(cpu.Context, "ss"),
             },
         ) ++
 
@@ -1572,11 +1848,27 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         \\cli
 
-    // ─── Step R13: acquire core_locks[this_core] with a single xchgl
-    // (mirrors the timed_recv_lock acquire in suspend Step 13). Then
-    // mark receiver .ready and inline EcQueue.enqueue(receiver) on
-    // this core's run_queue — only rcx/r11 as scratch.
+    // ─── Step R13: park or enqueue the caller (= receiver of the
+    // original event). Branches on gs:112 != 0:
+    //
+    //   recv_port == 0 (bare reply): caller goes on this core's run
+    //   queue with state .ready. Existing path. Caller resumes via
+    //   switchTo when scheduler picks it up.
+    //
+    //   recv_port != 0 (atomic-recv-mode): caller parks on the named
+    //   port's wait queue with state .suspended_on_port, mirroring
+    //   what slow-path port.recv would do. Lock order: port lock only
+    //   (CD released at R7, sender released at R10). Acquires port's
+    //   gen-lock with snapshot port_gen (gs:112 bits 32-63); if gen
+    //   mismatch (port destroyed between R4b validation and now),
+    //   fall back to run-queue enqueue — caller's syscall returns OK
+    //   without parking. (Spec leaves this exact race undefined; the
+    //   port-recv-cap holder is the caller itself, so port destruction
+    //   from outside our domain is impossible here in practice.)
     // ────────────────────────────────────────────────────────────────
+        \\movq %%gs:112, %%rax
+        \\testq %%rax, %%rax
+        \\jnz .Lreply_atomic_recv_park
         ++ std.fmt.comptimePrint(
             \\
             \\movq %%gs:{[sc_core_lock]d}, %%rcx
@@ -1611,6 +1903,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
             \\movq %%gs:{[sc_core_lock]d}, %%rcx
             \\movl $0, {[lock_state_off]d}(%%rcx)
+            \\jmp .Lreply_R13_done
             \\
         ,
             .{
@@ -1624,6 +1917,210 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
                 .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
                 .ec_next_off = @offsetOf(ExecutionContext, "next"),
+            },
+        ) ++
+
+    // ─── Step R13 atomic-recv-park branch: caller parks on the
+    // recv_port wait queue. Acquires port's gen-lock with snapshot
+    // port_gen (gs:112 bits 32-63). port_ec_ptr in gs:120. Lock
+    // order: port lock only — no other locks held at this point
+    // (CD released R7, sender released R10). Mirrors slow-path
+    // port.recv's enqueueReceiver path.
+    //
+    // Receiver fields written (matches slow-path port.recv):
+    //   state            = .suspended_on_port
+    //   suspend_port     = SlabRef{port_ec_ptr, port_gen} + Some
+    //   event_type       = .none
+    //   event_subcode    = 0
+    //   event_addr       = 0
+    //   pending_reply_*  = null/0
+    //   recv_port_xfer   = bit 12 of packed gs:112
+    //   on_cpu           = false
+    //
+    // Port fields written:
+    //   waiters[priority]        — append receiver
+    //   waiter_kind              = .receivers
+    // ────────────────────────────────────────────────────────────────
+        \\.Lreply_atomic_recv_park:
+        ++ std.fmt.comptimePrint(
+            \\
+            \\movq %%gs:120, %%rcx
+            \\movq %%gs:112, %%rax
+            \\shrq $32, %%rax
+            \\shlq $1, %%rax
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\.Lreply_acq_port:
+            \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
+            \\je .Lreply_port_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lreply_atomic_recv_fallback
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lreply_acq_port
+            \\.Lreply_port_acquired:
+            \\
+            \\movq %%gs:32, %%r11
+            \\movzbq {[priority_off]d}(%%r11), %%rax
+            \\shlq $4, %%rax
+            \\movq %%gs:120, %%rcx
+            \\addq ${[waiters_off]d}, %%rcx
+            \\addq %%rax, %%rcx
+            \\
+            \\movq {[lvl_tail_off]d}(%%rcx), %%rax
+            \\testq %%rax, %%rax
+            \\jz .Lreply_port_q_empty
+            \\movq %%r11, {[ec_next_off]d}(%%rax)
+            \\jmp .Lreply_port_q_set_tail
+            \\.Lreply_port_q_empty:
+            \\movq %%r11, {[lvl_head_off]d}(%%rcx)
+            \\.Lreply_port_q_set_tail:
+            \\movq %%r11, {[lvl_tail_off]d}(%%rcx)
+            \\movq $0, {[ec_next_off]d}(%%r11)
+            \\
+            \\movq %%gs:120, %%rcx
+            \\movb ${[wk_recv]d}, {[waiter_kind_off]d}(%%rcx)
+            \\
+            \\movq %%gs:32, %%rcx
+            \\movb ${[event_none]d}, {[event_off]d}(%%rcx)
+            \\movb $0, {[event_subcode_off]d}(%%rcx)
+            \\movq $0, {[event_addr_off]d}(%%rcx)
+            \\movq $0, {[prh_off]d}(%%rcx)
+            \\movb $0, {[prd_disc_off]d}(%%rcx)
+            \\movw $0, {[prs_off]d}(%%rcx)
+            \\
+            \\movq %%gs:120, %%r11
+            \\movq %%r11, {[susp_value_ptr_off]d}(%%rcx)
+            \\movq %%gs:112, %%r11
+            \\shrq $32, %%r11
+            \\movl %%r11d, {[susp_value_gen_off]d}(%%rcx)
+            \\movb $1, {[susp_disc_off]d}(%%rcx)
+            \\
+            \\movq %%gs:112, %%r11
+            \\shrq $12, %%r11
+            \\andq $1, %%r11
+            \\movb %%r11b, {[recv_xfer_off]d}(%%rcx)
+            \\
+            \\movb ${[state_susp]d}, {[state_off]d}(%%rcx)
+            \\movb $0, {[on_cpu_off]d}(%%rcx)
+            \\
+            \\movq %%gs:120, %%rcx
+            \\andq $-2, {[port_lock_off]d}(%%rcx)
+            \\jmp .Lreply_R13_done
+            \\
+            \\.Lreply_atomic_recv_fallback:
+            \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
+            \\.Lreply_acq_core_fb:
+            \\movl $1, %%eax
+            \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
+            \\testl %%eax, %%eax
+            \\jz .Lreply_have_core_fb
+            \\pause
+            \\jmp .Lreply_acq_core_fb
+            \\.Lreply_have_core_fb:
+            \\movq %%gs:32, %%rcx
+            \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
+            \\movzbq {[priority_off]d}(%%rcx), %%r11
+            \\shlq $4, %%r11
+            \\movq %%gs:{[sc_per_core_late]d}, %%rax
+            \\addq ${[run_queue_off]d}, %%rax
+            \\addq %%r11, %%rax
+            \\movq {[lvl_tail_off]d}(%%rax), %%r11
+            \\testq %%r11, %%r11
+            \\jz .Lreply_q_empty_fb
+            \\movq %%rcx, {[ec_next_off]d}(%%r11)
+            \\jmp .Lreply_q_set_tail_fb
+            \\.Lreply_q_empty_fb:
+            \\movq %%rcx, {[lvl_head_off]d}(%%rax)
+            \\.Lreply_q_set_tail_fb:
+            \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
+            \\movq $0, {[ec_next_off]d}(%%rcx)
+            \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
+            \\movl $0, {[lock_state_off]d}(%%rcx)
+            \\
+            \\.Lreply_R13_done:
+            \\
+            \\# Step R13.5: release caller (= receiver) gen-lock paired
+            \\# with R10.5 acquire. After this point R14's per-core swap
+            \\# moves gs:32 from receiver to sender, so the receiver's
+            \\# lock window covers exactly the receiver-EC field writes
+            \\# in R11..R13. Plain `andq $-2` mirrors R7/R10.
+            \\movq %%gs:32, %%rcx
+            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+            \\
+            \\# Step R13.6: re-acquire sender (= replyee) gen-lock
+            \\# before R14's sender-EC field reads (kernel_stack.top at
+            \\# R14, ctx pointer at R16). Sender was unlocked at R10
+            \\# while we wrote the receiver, but R14 reads sender.
+            \\# kernel_stack.top and R16 reads sender.ctx — both EC
+            \\# fields whose race window opens whenever another core
+            \\# holds a sender-EC handle and mounts a syscall against
+            \\# it (priority/setRegisters/etc.). Spec §[reply] mandates
+            \\# the sender resumes coherent register state; without
+            \\# this lock-window, a concurrent setRegisters on another
+            \\# core could overwrite ctx mid-sysretq-prep.
+            \\#
+            \\# Uses the lockWithGen pattern (R5a-style) against the
+            \\# snapshotted sender_gen at gs:96: if a concurrent destroy
+            \\# fired between R10 release and here, the gen has rotated
+            \\# to even and our cmpxchg fails with bit-1+ set. We
+            \\# detect that via xorq+testq and bail to a UAF-panic — the
+            \\# fast path has already cleared the reply slot and parked
+            \\# the receiver, so there's no clean unwind; landing on a
+            \\# destroyed sender's ctx during sysretq is the worse
+            \\# alternative.
+            \\#
+            \\# Lock order: only sender_ec held at this point. caller_ec
+            \\# was just released (R13.5); CD released at R7. No nesting.
+            \\movq %%gs:72, %%rcx
+            \\movq %%gs:96, %%rax
+            \\shlq $1, %%rax
+            \\movq %%rax, %%r11
+            \\incq %%r11
+            \\.Lreply_acq_sender_r14:
+            \\lock cmpxchgq %%r11, {[ec_unlock_off]d}(%%rcx)
+            \\je .Lreply_sender_r14_acquired
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lreply_sender_destroyed
+            \\pause
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lreply_acq_sender_r14
+            \\.Lreply_sender_r14_acquired:
+            \\
+        ,
+            .{
+                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .port_lock_off = @offsetOf(zag.sched.port.Port, "_gen_lock"),
+                .waiters_off = @offsetOf(zag.sched.port.Port, "waiters"),
+                .waiter_kind_off = @offsetOf(zag.sched.port.Port, "waiter_kind"),
+                .wk_recv = @intFromEnum(zag.sched.port.WaiterKind.receivers),
+                .priority_off = @offsetOf(ExecutionContext, "priority"),
+                .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
+                .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
+                .ec_next_off = @offsetOf(ExecutionContext, "next"),
+                .state_off = @offsetOf(ExecutionContext, "state"),
+                .state_susp = @intFromEnum(zag.sched.execution_context.State.suspended_on_port),
+                .state_ready = @intFromEnum(zag.sched.execution_context.State.ready),
+                .event_off = @offsetOf(ExecutionContext, "event_type"),
+                .event_none = @intFromEnum(zag.sched.execution_context.EventType.none),
+                .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
+                .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
+                .prh_off = @offsetOf(ExecutionContext, "pending_reply_holder"),
+                .prd_disc_off = @offsetOf(ExecutionContext, "pending_reply_domain") + 16,
+                .prs_off = @offsetOf(ExecutionContext, "pending_reply_slot"),
+                .susp_value_ptr_off = @offsetOf(ExecutionContext, "suspend_port") + 0,
+                .susp_value_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
+                .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
+                .recv_xfer_off = @offsetOf(ExecutionContext, "recv_port_xfer"),
+                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
+                .lock_state_off = @offsetOf(zag.utils.sync.spin_lock.SpinLock, "state"),
+                .sc_core_lock_late = Offsets.sc_core_lock_ptr,
+                .sc_per_core_late = Offsets.sc_per_core_ptr,
+                .run_queue_off = @offsetOf(zag.sched.scheduler.PerCore, "run_queue"),
             },
         ) ++
 
@@ -1711,20 +2208,34 @@ pub export fn syscallEntry() callconv(.naked) void {
     // other live vregs (rbx, rdx, rbp, rsi, rdi, r8-r10, r12-r15)
     // were never touched and ride sysretq into sender's user mode
     // zero-copy.
+    //
+    // Lock discipline: sender_ec gen-lock (R13.6 acquire) is held
+    // across ALL three ctx reads (rflags/rsp/rip), released after the
+    // last ctx read but before sysretq. We stash user_rsp in gs:80
+    // (no longer needed by R16 — it held reply_slot, consumed at R6)
+    // so that we can read all three ctx fields under the lock without
+    // running out of scratch registers — sysretq needs rcx=rip,
+    // r11=rflags, rsp=user_rsp, rax=vreg1 simultaneously.
     // ────────────────────────────────────────────────────────────────
         ++ std.fmt.comptimePrint(
             \\
             \\movq %%gs:72, %%rcx
-            \\movq {[ec_ctx_off]d}(%%rcx), %%rcx
-            \\movq {[ctx_rflags_off]d}(%%rcx), %%r11
-            \\movq {[ctx_rsp_off]d}(%%rcx), %%rsp
-            \\movq {[ctx_rip_off]d}(%%rcx), %%rcx
+            \\movq {[ec_ctx_off]d}(%%rcx), %%rax
+            \\movq {[ctx_rflags_off]d}(%%rax), %%r11
+            \\movq {[ctx_rsp_off]d}(%%rax), %%rax
+            \\movq %%rax, %%gs:80
+            \\movq {[ec_ctx_off]d}(%%rcx), %%rax
+            \\movq {[ctx_rip_off]d}(%%rax), %%rax
+            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+            \\movq %%rax, %%rcx
+            \\movq %%gs:80, %%rsp
             \\movq %%gs:64, %%rax
             \\swapgs
             \\sysretq
             \\
         ,
             .{
+                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .ec_ctx_off = @offsetOf(ExecutionContext, "ctx"),
                 .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
                 .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
@@ -1734,14 +2245,19 @@ pub export fn syscallEntry() callconv(.naked) void {
 
     // ─── Reply-fast bail handlers ──────────────────────────────────
     //
-    // .Lreply_eterm: sender gen-lock acquire saw a stale gen — the
-    // sender was reaped between our CD-locked snapshot and our
-    // sender-lock attempt. Slot already freed (matches slow-path
-    // ordering). Receiver is still on this core, no per-core mutation
-    // happened — sysretq directly back to user mode with rax=E_TERM.
-    // The other live vregs are in-spec garbage per the libz contract.
-        \\.Lreply_eterm:
+    // .Lreply_eterm_under_cd: sender gen-lock acquire (R5a) saw a
+    // stale gen — sender slot recycled between our R4 snapshot and
+    // our CAS. Handle is NOT yet cleared (R6 not run); CD lock IS
+    // still held. Slow path's CD-locked re-resolve would also see
+    // the stale gen via SlabRef and return E_TERM — short-circuit
+    // it here: release CD, sysretq E_TERM.
+        \\.Lreply_eterm_under_cd:
+        \\movq %%gs:40, %%rcx
         ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        ) ++
+        std.fmt.comptimePrint(
             "\nmovq ${d}, %%rax\n",
             .{@as(u64, @bitCast(zag.syscall.errors.E_TERM))},
         ) ++
@@ -1750,6 +2266,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%gs:8, %%rsp
         \\swapgs
         \\sysretq
+
+    // .Lreply_sender_field_fail: sender field predicate (R5b) failed
+    // while we hold both sender's gen-lock and CD lock. Release sender
+    // lock first (LIFO with R5a acquire), then fall through to
+    // .Lreply_handle_invalid which releases CD and jumps slow path.
+        \\.Lreply_sender_field_fail:
+        \\movq %%gs:72, %%rcx
+        ++ std.fmt.comptimePrint(
+            "\nandq $-2, {[ec_lock_off]d}(%%rcx)\n",
+            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+        ) ++
 
     // .Lreply_handle_invalid: bail with CD lock held. Release lock,
     // restore receiver's rax from gs:64, jmp slow path.
@@ -1767,6 +2294,18 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\.Lreply_lock_fail:
         \\movq %%gs:64, %%rax
         \\jmp .Lsyscall_slow_path
+
+    // .Lreply_sender_destroyed: R13.6 lockWithGen detected sender's
+    // gen rotated under us — sender was destroyed between R10 release
+    // and the R13.6 re-acquire. By this point the reply slot has
+    // already been cleared (R6) and the receiver is parked or queued
+    // (R13). There's no clean unwind: we cannot context-switch into a
+    // destroyed sender, and we cannot un-park the receiver without
+    // re-entering the slow paths. Hard panic — this is a rare race
+    // (requires concurrent terminate on a .running EC) and an
+    // explicit stop is preferable to silent UAF on the next sysretq.
+        \\.Lreply_sender_destroyed:
+        \\ud2
     );
 }
 

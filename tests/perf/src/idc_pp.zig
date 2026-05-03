@@ -142,10 +142,16 @@ inline fn cycles() u64 {
 var g_port: u12 = 0;
 
 fn pongerLoop() noreturn {
+    // Bootstrap: bare recv to wait for the first ping. After that,
+    // collapse the recv→reply→recv loop into a single replyRecv per
+    // round so the round-trip stays in the L4 fast path: ponger's
+    // replyRecv parks ponger on the port directly (no run-queue
+    // detour), so the pinger's next suspend hits the suspend fast
+    // path predicate (port has a recv waiter) every round.
+    var rr = syscall.recv(g_port, 0);
     while (true) {
-        const rr = syscall.recv(g_port, 0);
         const reply_h: u12 = @truncate((rr.word >> REPLY_HANDLE_SHIFT) & REPLY_HANDLE_MASK);
-        _ = syscall.reply(reply_h);
+        rr = syscall.replyRecv(reply_h, g_port);
     }
 }
 

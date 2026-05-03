@@ -1388,6 +1388,19 @@ pub fn allocExecutionContext(
     ec.exit_port = if (exit_port) |p| SlabRef(Port).init(p, p._gen_lock.currentGen()) else null;
     ec.perfmon_state = null;
     ec.last_fpu_core = null;
+    // Slab does NOT zero on alloc — every field a live EC reads must
+    // be initialized here, else the new occupant inherits stale bytes
+    // from the previous owner of this slot.
+    ec.recv_port_xfer = false;
+    ec.recv_deadline_ns = 0;
+    ec.pending_event_word = 0;
+    ec.pending_event_word_valid = false;
+    ec.pending_event_rip = 0;
+    ec.pending_event_rip_valid = false;
+    ec.vcpu_arch_state = null;
+    ec.event_state_gprs = [_]u64{0} ** 13;
+    ec.event_rip = 0;
+    ec.futex_wait_vaddrs = null;
 
     arch.cpu.fpuStateInit(&ec.fpu_state);
     return ec;
