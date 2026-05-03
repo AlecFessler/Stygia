@@ -16,11 +16,13 @@
 //!     via the existing IDT wiring.
 //!
 //! Differences from Intel:
-//!   * No IA32_PERF_GLOBAL_CTRL / _STATUS / _OVF_CTRL. Each counter is
-//!     enabled independently by its own PerfEvtSel EN bit, and overflow
-//!     detection is implicit — any PMI on this core is attributed to the
-//!     currently running thread's PMU state (same stale-filter policy as
-//!     Intel, just without a status MSR to sanity-check against).
+//!   * Pre-PerfMonV2 AMD: each counter is enabled independently by its
+//!     own PerfEvtSel.EN bit. PerfMonV2 (CPUID Fn8000_0022 EAX bit 0,
+//!     present on Zen 4+) adds PerfCntrGlobalCtl (MSR 0xC000_0301), an
+//!     additional per-core gate — bit i must be set for PMC i to tick
+//!     even when PerfEvtSel.EN is set. We program GlobalCtl to the
+//!     all-PMCs-enabled mask once per core in `perCoreInit`, leaving
+//!     PerfEvtSel.EN as the per-counter gate as before.
 //!   * Counters are 48 bits wide on all supported AMD families.
 //!   * Event codes differ from Intel; we only encode the always-present
 //!     core events (cycles, retired instructions, branches, mispredicts).
@@ -67,6 +69,21 @@ const PERFEVTSEL_USR: u64 = 1 << 16;
 const PERFEVTSEL_INT: u64 = 1 << 20;
 const PERFEVTSEL_EN: u64 = 1 << 22;
 
+// ── PerfMonV2 (AMD APM Vol 2 §13.2.4) ──────────────────────────────────
+// CPUID Fn8000_0022 EAX bit 0 = PerfMonV2 supported. When present, every
+// PMC is gated by PerfCntrGlobalCtl in addition to its PerfEvtSel.EN bit
+// — bit i = enable PMC i. Without writing GlobalCtl the counter never
+// ticks even with EN set, which is what PMC0 returning 0 looks like on
+// Zen 4 KVM guests.
+//
+// MSR layout per Linux's `arch/x86/include/asm/msr-index.h`
+// (MSR_AMD64_PERF_CNTR_GLOBAL_*):
+//   0xC000_0300  PerfCntrGlobalStatus      (RO)
+//   0xC000_0301  PerfCntrGlobalCtl         (RW)
+//   0xC000_0302  PerfCntrGlobalStatusClr   (WO)
+const PERFMON_V2_LEAF: u32 = 0x8000_0022;
+const PERFCNTR_GLOBAL_CTL: u32 = 0xC000_0301;
+
 const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
 
 /// AMD counters are 48 bits wide across all supported families (K8+).
@@ -81,6 +98,10 @@ var cached_info: PmuInfo = .{
     .supported_events = 0,
     .overflow_support = false,
 };
+
+/// PerfMonV2 detected by `init` via CPUID Fn8000_0022 EAX bit 0. When
+/// true, `perCoreInit` programs PerfCntrGlobalCtl on each core.
+var has_perfmon_v2: bool = false;
 
 const EventEncoding = struct {
     /// Low 8 bits of the 12-bit event select. High 4 bits are zero for
@@ -144,6 +165,11 @@ pub fn init() void {
     const raw_counters: u8 = if (has_ext) 6 else 4;
     const counters = @min(raw_counters, MAX_COUNTERS);
 
+    const ext_max = cpu.cpuid(.ext_max, 0).eax;
+    if (ext_max >= PERFMON_V2_LEAF) {
+        has_perfmon_v2 = (cpu.cpuidRaw(PERFMON_V2_LEAF, 0).eax & 1) != 0;
+    }
+
     var supported_mask: u64 = 0;
     inline for (@typeInfo(PmuEvent).@"enum".fields) |field| {
         const variant: PmuEvent = @enumFromInt(field.value);
@@ -167,6 +193,17 @@ pub fn init() void {
         .ring_0,
         .interrupt_gate,
     );
+}
+
+/// Per-core PMU bring-up. On PerfMonV2 hardware the global enable mask
+/// gates every PMC; without this write PerfEvtSel.EN is necessary but
+/// not sufficient, so userspace `perfmon_start` and kprof trace counters
+/// silently read back zero. Pre-PerfMonV2 cores have no GlobalCtl — the
+/// PerfEvtSel.EN bit is the sole gate, so this is a no-op.
+pub fn perCoreInit() void {
+    if (!has_perfmon_v2) return;
+    const all_pmcs: u64 = (@as(u64, 1) << @intCast(cached_info.num_counters)) - 1;
+    cpu.wrmsr(PERFCNTR_GLOBAL_CTL, all_pmcs);
 }
 
 pub fn getInfo() PmuInfo {

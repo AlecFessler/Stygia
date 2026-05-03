@@ -83,6 +83,17 @@ pub fn pmuInit() void {
     }
 }
 
+/// Per-core PMU bring-up. Required on AMD PerfMonV2 (Zen 4+) to write
+/// PerfCntrGlobalCtl; no-op on Intel and pre-PerfMonV2 AMD where the
+/// per-counter PerfEvtSel.EN is the sole gate.
+pub fn pmuPerCoreInit() void {
+    switch (active_backend) {
+        .intel => {},
+        .amd => amd_pmu.perCoreInit(),
+        .none => {},
+    }
+}
+
 pub fn pmuGetInfo() PmuInfo {
     return switch (active_backend) {
         .intel => intel_pmu.getInfo(),

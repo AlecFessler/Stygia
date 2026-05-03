@@ -140,6 +140,12 @@ pub fn perCoreInit() void {
     // VMLAUNCH/VMRUN; safe no-op when the platform doesn't support
     // hardware virt.
     arch.vm.vmPerCoreInit();
+    // Per-core PMU enable. AMD PerfMonV2 (Zen 4+) requires writing
+    // PerfCntrGlobalCtl on each core or every PMC stays gated even
+    // with PerfEvtSel.EN set; on Intel and pre-PerfMonV2 AMD this is
+    // a no-op. Must precede kprofTraceCountersPerCoreInit so the trace
+    // counters tick on PerfMonV2 hardware.
+    arch.pmu.pmuPerCoreInit();
     // Program kprof trace counters (PMC0/1/2 = cycles / cache misses /
     // branch misses). No-op unless `-Dkernel_profile=trace`. Counters
     // free-run; tracepoints snapshot them into each emitted record so

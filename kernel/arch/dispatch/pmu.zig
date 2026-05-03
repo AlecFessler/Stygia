@@ -30,6 +30,16 @@ pub fn pmuInit() void {
     }
 }
 
+/// Per-core PMU bring-up. Required on AMD PerfMonV2 (Zen 4+) to enable
+/// PerfCntrGlobalCtl; no-op on Intel x86 and on aarch64.
+pub fn pmuPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuPerCoreInit(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 /// Called from the NMI handler. Returns true if PMC 0 overflowed and
 /// was rearmed with a fresh `period_cycles` preload — i.e. this NMI
 /// belongs to kprof. Returns false for any non-sampling NMI.
