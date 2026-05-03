@@ -180,7 +180,7 @@ fn loadGuestImages() bool {
         .ram_size = GUEST_RAM_SIZE,
         .initrd_start = initrd.start,
         .initrd_end = initrd.end,
-        .bootargs = "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 maxcpus=1 nokaslr lpj=5000000 keep_bootcon ignore_loglevel panic=-1",
+        .bootargs = "earlycon=pl011,mmio32,0x09000000 maxcpus=1 nokaslr lpj=5000000 keep_bootcon ignore_loglevel panic=-1",
         .gicd_base = GICD_BASE,
         .gicd_size = GICD_SIZE,
         .gicr_base = GICR_BASE,
@@ -286,26 +286,52 @@ fn handleStage2Fault(state: *VmExitState) bool {
         return pl011.handleFault(state, guest_phys);
     }
     if (guest_phys >= GICD_BASE and guest_phys < GICD_BASE + GICD_SIZE) {
-        // GIC distributor MMIO — emulated in-kernel via vGIC, but our
-        // VMM-side dispatch isn't wired to it yet. For now drop the
-        // access and advance PC so the guest progresses. Linux's GIC
-        // init path tolerates spurious zero reads on GICD probes.
+        // GIC distributor MMIO — minimal probe-only emulation. Returns
+        // the few read-only ID/TYPER values Linux's gic-v3 driver
+        // checks during of_irq_init; everything else reads as zero and
+        // writes are dropped. Enough for Linux to bind amba-pl011 (and
+        // therefore reach a working /dev/console).
+        const offset = guest_phys - GICD_BASE;
         const flags: u8 = @truncate(state.exit_payload[2] >> 24);
-        if ((flags & 0x02) == 0) {
-            // Read — write 0 into the destination register.
-            const access_size: u8 = @truncate(state.exit_payload[2]);
-            _ = access_size;
-            const srt: u8 = @truncate(state.exit_payload[2] >> 8);
-            writeGpr(state, srt, 0);
+        const srt: u8 = @truncate(state.exit_payload[2] >> 8);
+        const is_write = (flags & 0x02) != 0;
+        if (!is_write) {
+            const v: u64 = switch (offset) {
+                // GICD_PIDR2 — bits[7:4] = ArchRev (3 = GICv3). GICv3 §12.9.20.
+                0xFFE8 => 0x30,
+                // GICD_IIDR — JEP106 0x43B (ARM Limited). GICv3 §12.9.6.
+                0x0008 => 0x0000_043B,
+                // GICD_TYPER — minimal valid: ITLinesNumber=7
+                // (so SPI count = 32*(7+1) = 256 supported), CPUNumber=0,
+                // A3V=1 (AArch64 affinity). GICv3 §12.9.21.
+                0x0004 => (7 << 0) | (1 << 19),
+                else => 0,
+            };
+            writeGpr(state, srt, v);
         }
         advancePc(state);
         return false;
     }
     if (guest_phys >= GICR_BASE and guest_phys < GICR_BASE + GICR_SIZE) {
+        // GIC redistributor MMIO — minimal probe.
+        const offset = guest_phys - GICR_BASE;
         const flags: u8 = @truncate(state.exit_payload[2] >> 24);
-        if ((flags & 0x02) == 0) {
-            const srt: u8 = @truncate(state.exit_payload[2] >> 8);
-            writeGpr(state, srt, 0);
+        const srt: u8 = @truncate(state.exit_payload[2] >> 8);
+        const is_write = (flags & 0x02) != 0;
+        if (!is_write) {
+            const v: u64 = switch (offset) {
+                // GICR_PIDR2 — same encoding as GICD_PIDR2.
+                0xFFE8 => 0x30,
+                // GICR_TYPER — bits[63:32] = affinity (zero for cpu 0),
+                // bit 4 = Last (only redistributor). GICv3 §12.10.10.
+                0x0008 => (1 << 4),
+                // GICR_WAKER — Linux polls this with ProcessorSleep=0
+                // and waits for ChildrenAsleep=0 (bits 1 and 2). Return
+                // 0 so the wait completes immediately.
+                0x0014 => 0,
+                else => 0,
+            };
+            writeGpr(state, srt, v);
         }
         advancePc(state);
         return false;

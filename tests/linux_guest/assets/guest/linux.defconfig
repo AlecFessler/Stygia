@@ -11,8 +11,13 @@ CONFIG_ARM64=y
 CONFIG_ARCH_VIRT=y
 
 # Boot protocol: allow passing a command line and use one by default so
-# early-printk/console= work without a bootloader cmdline.
-CONFIG_CMDLINE="console=ttyAMA0 earlycon=pl011,0x9000000"
+# early-printk works without a bootloader cmdline. We deliberately omit
+# `console=ttyAMA0` so /dev/console resolves to the bootcon (earlycon)
+# until amba-pl011 binds; once that happens Linux auto-promotes ttyAMA0
+# to the system console. `keep_bootcon` keeps earlycon registered after
+# the bootcon-deregister phase, which prevents the brief window where
+# /init has neither console available.
+CONFIG_CMDLINE="earlycon=pl011,0x9000000 keep_bootcon ignore_loglevel"
 CONFIG_CMDLINE_FORCE=y
 
 # TTY + PL011 UART (both early and runtime driver).

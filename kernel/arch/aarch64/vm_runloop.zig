@@ -21,8 +21,9 @@ const serial = zag.arch.aarch64.serial;
 const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
-// Diagnostic counters — used to attribute boot stall to (a) enterGuest
-// not being called, (b) vmResume not returning, (c) specific exit types.
+// Diagnostic counters — used during bring-up to attribute boot stall
+// to (a) enterGuest not being called, (b) vmResume not returning,
+// (c) specific exit types.
 var dbg_eg_calls: u64 = 0;
 var dbg_resume_count: u64 = 0;
 var dbg_exit_count: u64 = 0;
@@ -72,7 +73,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     defer kprof.exit(.vm_enter);
 
     dbg_eg_calls += 1;
-    if (dbg_eg_calls <= 4 or dbg_eg_calls % 256 == 0) {
+    if (dbg_eg_calls <= 2) {
         serial.print("[hv] enterGuest #{d} resumes={d} exits={d}\n", .{
             dbg_eg_calls, dbg_resume_count, dbg_exit_count,
         });
@@ -141,23 +142,37 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         }
 
         dbg_resume_count += 1;
-        if (dbg_resume_count <= 4 or dbg_resume_count % 1024 == 0) {
+        if (dbg_resume_count <= 2) {
             serial.print("[hv] vmResume #{d} pc=0x{x}\n", .{
                 dbg_resume_count, arch_state.guest_state.pc,
             });
         }
+
+        // Pre-entry: flush vGIC list-registers + vtimer state via separate
+        // HVCs (kept distinct from `hvc_vcpu_run` so the world-switch path
+        // matches the f33af271 layout that booted Linux to busybox under
+        // TCG; the inlined variant deadlocks TCG when ICH_HCR_EL2 ops run
+        // while stage-2 is still active).
+        _ = vm_hw.hypCall(.vgic_prepare_entry, vgic_shadow_pa);
+        _ = vm_hw.hypCall(.vtimer_load_guest, vtimer_pa);
+
         const exit_info = hyp.vmResume(
             &arch_state.guest_state,
             stage2_root,
             cb_pa,
             &arch_state.guest_fpsimd,
             &arch_state.arch_scratch,
-            vgic_shadow_pa,
-            vtimer_pa,
         );
+
+        // Post-exit: snapshot vtimer, then vGIC. Order mirrors KVM's
+        // arch_timer.c timer_save_state / vgic_save_exit: timer first
+        // so a pending CNTV match doesn't fire into host EL1 while the
+        // vGIC restore runs.
+        _ = vm_hw.hypCall(.vtimer_save_guest, vtimer_pa);
+        _ = vm_hw.hypCall(.vgic_save_exit, vgic_shadow_pa);
         arch_state.last_exit = exit_info;
         dbg_exit_count += 1;
-        if (dbg_exit_count <= 16 or dbg_exit_count % 1024 == 0) {
+        if (dbg_exit_count <= 4) {
             const tag: []const u8 = switch (exit_info) {
                 .hvc => "hvc",
                 .smc => "smc",
