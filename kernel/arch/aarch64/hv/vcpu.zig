@@ -13,6 +13,7 @@ const zag = @import("zag");
 const hyp = zag.arch.aarch64.hyp;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -53,6 +54,17 @@ pub const VcpuArchState = struct {
     /// guest immediately. Flipped true by `applyReplyStateToVcpu` on the
     /// first non-`initial_state` reply.
     started: bool = false,
+    /// Per-vCPU GICv3 virtual CPU interface state. Loaded into
+    /// `ICH_*_EL2` before each `vmResume` via `hvc_vgic_prepare_entry`,
+    /// snapshotted back via `hvc_vgic_save_exit`. The run loop sets
+    /// `lrs[0]` to a pending PPI 27 (vtimer) when the guest's CNTV
+    /// would have fired, so Linux's arch_timer IRQ delivers correctly.
+    vgic_shadow: vgic.VcpuHwShadow align(16) = .{},
+    /// Per-vCPU virtual-timer state. Loaded via `hvc_vtimer_load_guest`
+    /// before each entry, saved via `hvc_vtimer_save_guest` after each
+    /// exit. CNTVOFF is seeded on first entry so guest CNTVCT starts
+    /// at 0.
+    vtimer: vgic.VtimerState align(16) = .{},
 };
 
 comptime {

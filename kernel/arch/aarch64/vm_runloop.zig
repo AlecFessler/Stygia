@@ -17,7 +17,17 @@ const hv_vm = zag.arch.aarch64.hv.vm;
 const hyp = zag.arch.aarch64.hyp;
 const kprof = zag.kprof.trace_id;
 const psci = zag.arch.aarch64.hv.psci;
+const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
+
+/// GICv3 PPI 27 = virtual timer (CNTV) interrupt. Linux's arm_arch_timer
+/// driver wires `arch_timer_handler_virt` to PPI 27 by default.
+const VTIMER_PPI: u32 = 27;
+
+/// CNTV_CTL_EL0 bit definitions (ARM ARM D13.11.17).
+const CNTV_CTL_ENABLE: u64 = 1 << 0;
+const CNTV_CTL_IMASK: u64 = 1 << 1;
+const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
@@ -76,10 +86,54 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     const cb_pa = cb_pa_opt orelse return null;
     if (stage2_root.addr == 0) return null;
 
+    // EL2 runs with SCTLR_EL2.M=0 — every pointer handed to a hyp stub
+    // is dereferenced as a raw PA. The vgic + vtimer shadows live in
+    // the slab/heap (kernel VA), so we walk the kernel page tables to
+    // resolve their PAs once and reuse for every iteration.
+    const vgic_shadow_pa = hyp.resolveKernelVaToPa(@intFromPtr(&arch_state.vgic_shadow));
+    const vtimer_pa = hyp.resolveKernelVaToPa(@intFromPtr(&arch_state.vtimer));
+
+    // Lazy-init num_lrs on first run via ICH_VTR_EL2 readback. The
+    // hyp stub `hvc_vgic_detect_lrs` reads `(ICH_VTR_EL2.ListRegs + 1)`
+    // and returns it in x0. Cortex-A72 TCG implements 4; the spec
+    // allows 1..16. We size the shadow to MAX_LRS so the same struct
+    // works across hosts; only `num_lrs` of them are actually
+    // load/saved by the prepare/save stubs.
+    if (arch_state.vgic_shadow.num_lrs == 0) {
+        arch_state.vgic_shadow.num_lrs = vm_hw.hypCall(.vgic_detect_lrs, 0);
+        // Force ICH_HCR_EL2.En = 1 so virtual interrupts in the LRs
+        // actually deliver. Other ICH_HCR bits left zero — Linux
+        // doesn't depend on maintenance-IRQ generation for vtimer.
+        arch_state.vgic_shadow.hcr = 1;
+    }
+
     // PSCI inline-handle loop: hvc with x0 ∈ PSCI range gets resolved
     // here without a vm_exit round-trip; every other exit reason
     // surfaces to the VMM. Mirrors x86's MMIO inline-handle path.
     while (true) {
+        // If the guest's virtual timer would have fired (ISTATUS=1
+        // observed at last save_exit), inject PPI 27 into LR0 so
+        // Linux's arch_timer driver runs its tick on the next entry.
+        // The injection arms IMASK=1 in the shadow CTL until Linux
+        // ACKs the IRQ and re-arms CVAL — at which point save_guest
+        // captures the new state and we'll only re-inject when
+        // ISTATUS becomes 1 again.
+        if ((arch_state.vtimer.cntv_ctl_el0 & CNTV_CTL_ENABLE) != 0 and
+            (arch_state.vtimer.cntv_ctl_el0 & CNTV_CTL_ISTATUS) != 0 and
+            (arch_state.vtimer.cntv_ctl_el0 & CNTV_CTL_IMASK) == 0)
+        {
+            arch_state.vgic_shadow.lrs[0] = vgic.lrPendingGroup1(VTIMER_PPI);
+            // Mask the timer so it doesn't keep firing while pending.
+            arch_state.vtimer.cntv_ctl_el0 |= CNTV_CTL_IMASK;
+        }
+
+        // Load per-vCPU virtual-timer + vGIC state into the EL2
+        // sysregs that the world switch will consume. Both calls are
+        // void-returning HVCs into the hyp stubs; they take a single
+        // pointer argument (PA — EL2 has SCTLR.M=0).
+        _ = vm_hw.hypCall(.vtimer_load_guest, vtimer_pa);
+        _ = vm_hw.hypCall(.vgic_prepare_entry, vgic_shadow_pa);
+
         const exit_info = hyp.vmResume(
             &arch_state.guest_state,
             stage2_root,
@@ -88,6 +142,14 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             &arch_state.arch_scratch,
         );
         arch_state.last_exit = exit_info;
+
+        // Snapshot vGIC + vtimer state back into the shadow before
+        // host code can touch them. Order matters — `vgic_save_exit`
+        // disables ICH_HCR_EL2 so a stale virtual interrupt can't
+        // deliver into the host context, then `vtimer_save_guest`
+        // captures CNTV_CTL/CVAL/CNTKCTL and masks the timer.
+        _ = vm_hw.hypCall(.vgic_save_exit, vgic_shadow_pa);
+        _ = vm_hw.hypCall(.vtimer_save_guest, vtimer_pa);
 
         switch (exit_info) {
             .hvc => |h| {

@@ -684,30 +684,18 @@ export fn __hyp_vectors() align(2048) linksection(".hyp_vectors") callconv(.nake
         // +0x480 irq lower A64 — physical IRQ while guest runs.
         // HCR_EL2.IMO=1 routes EL1 physical IRQs to EL2; without a
         // handler the kernel `b .`-loops on every host scheduler-tick.
-        //
-        // Currently routes through `guest_exit_entry`, which surfaces
-        // a stale ESR_EL2 to the run-loop / VMM and causes PC to
-        // advance by 4 per IRQ — Linux loses one instruction per host
-        // tick. This is the "fastest-forward" config: under TCG the
-        // skipped instructions are mostly safe to lose (head.S sets
-        // up state via repeated stores; missing one is harmless), and
-        // empirically it gets Linux furthest into boot — past GICv3
-        // detection, devtmpfs init, into PID 1 init.
-        //
-        // `irq_exit_entry` (defined below) is the principled fix that
-        // uses an `IRQ_EXIT_SENTINEL` ESR so the run-loop can recognise
-        // the async exit and re-enter without touching PC. Wire it
-        // here once virtual-timer injection (`ICH_LR0_EL2 = PPI 27 |
-        // pending | group 1`) lands so the guest can actually receive
-        // a scheduler tick — without injection, PC-preserving exits
-        // leave Linux waiting for an interrupt that never arrives.
-        \\        b       guest_exit_entry
+        // `irq_exit_entry` writes a sentinel ESR (`IRQ_EXIT_SENTINEL`)
+        // so the run loop's `.unknown` arm recognises the exit as
+        // async and re-enters without touching PC. Pairs with vtimer
+        // injection in `vm_runloop.enterGuest` so the guest receives
+        // PPI 27 when its CNTV would have fired.
+        \\        b       irq_exit_entry
         \\        .balign 0x80
         // +0x500 fiq lower A64 — same rationale, FMO=1 routes FIQs to EL2.
-        \\        b       guest_exit_entry
+        \\        b       irq_exit_entry
         \\        .balign 0x80
         // +0x580 serror lower A64 — AMO=1 routes SErrors to EL2.
-        \\        b       guest_exit_entry
+        \\        b       irq_exit_entry
         \\        .balign 0x80
         // +0x600..+0x780 lower AArch32 (unused)
         \\        b       .
