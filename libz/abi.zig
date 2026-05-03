@@ -313,6 +313,23 @@ pub fn replyTransfer(
     return toCRegs(syscall.replyTransfer(@truncate(reply_handle), attachments_ptr[0..attachments_len]));
 }
 
+pub fn replyRecv(reply_handle: u16, recv_port: u16) callconv(.c) c.RecvReturn {
+    return toCRecvReturn(syscall.replyRecv(@truncate(reply_handle), @truncate(recv_port)));
+}
+
+pub fn replyTransferRecv(
+    reply_handle: u16,
+    attachments_ptr: [*]const u64,
+    attachments_len: usize,
+    recv_port: u16,
+) callconv(.c) c.RecvReturn {
+    return toCRecvReturn(syscall.replyTransferRecv(
+        @truncate(reply_handle),
+        attachments_ptr[0..attachments_len],
+        @truncate(recv_port),
+    ));
+}
+
 pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) callconv(.c) c.Regs {
     return toCRegs(syscall.timerArm(caps, deadline_ns, flags));
 }
@@ -441,6 +458,8 @@ comptime {
     @export(&clearEventRoute, .{ .name = "clearEventRoute" });
     @export(&reply, .{ .name = "reply" });
     @export(&replyTransfer, .{ .name = "replyTransfer" });
+    @export(&replyRecv, .{ .name = "replyRecv" });
+    @export(&replyTransferRecv, .{ .name = "replyTransferRecv" });
     @export(&timerArm, .{ .name = "timerArm" });
     @export(&timerRearm, .{ .name = "timerRearm" });
     @export(&timerCancel, .{ .name = "timerCancel" });

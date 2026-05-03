@@ -66,7 +66,6 @@ pub const SyscallNum = enum(u64) {
     bind_event_route = 50,
     clear_event_route = 51,
     reply = 52,
-    reply_transfer = 53,
     timer_arm = 54,
     timer_rearm = 55,
     timer_cancel = 56,
@@ -262,24 +261,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .clear_event_route => event_route.clearEventRoute(caller, arg(args, 0), arg(args, 1)),
 
         .reply => reply.reply(caller, syscall_word),
-        .reply_transfer => blk: {
-            // Spec §[reply].reply_transfer: syscall word bits 12-19 carry
-            // `pair_count` `N`, bits 20-31 carry `reply_handle_id`. Spec
-            // §[handle_attachments] places the N pair entries at vregs
-            // [128-N..127] — the *high* end of the vreg space, which
-            // lives on the user stack at `[user_rsp + (M-13)*8]` for vreg
-            // M. The handler reads pair entries itself (under STAC/CLAC)
-            // so the dispatcher only forwards `n` and the syscall word.
-            //
-            // The handle id rides in the syscall word rather than vreg 1
-            // so the GPR-backed event-state vregs (1..13) survive the
-            // reply syscall — receivers handling vm_exits can keep
-            // modified guest GPRs in registers throughout the handler
-            // and on into the syscall, preserving the L4-style IPC fast
-            // path. See spec §[reply].
-            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            break :blk reply.replyTransfer(caller, syscall_word, n);
-        },
 
         .timer_arm => timer.timerArm(
             caller,

@@ -94,7 +94,6 @@ pub const SyscallNum = enum(u12) {
     bind_event_route = 50,
     clear_event_route = 51,
     reply = 52,
-    reply_transfer = 53,
     timer_arm = 54,
     timer_rearm = 55,
     timer_cancel = 56,
@@ -139,15 +138,16 @@ pub fn extraVmKind(kind: u1, count: u8) u64 {
     return (@as(u64, kind) << 12) | ((@as(u64, count) & 0xFF) << 13);
 }
 
-/// Spec §[reply]: reply_handle_id rides in syscall-word bits 12-23.
+/// Spec §[reply]: `reply_handle_id` at syscall-word bits 20-31
+/// (`pair_count` at 12-19, `recv_port_handle_id` at 32-43).
 pub fn extraReplyHandle(handle: u12) u64 {
-    return (@as(u64, handle) & 0xFFF) << 12;
+    return (@as(u64, handle) & 0xFFF) << 20;
 }
 
-/// Spec §[reply_transfer]: reply_handle_id rides in syscall-word bits
-/// 20-31 (with N at bits 12-19).
-pub fn extraReplyTransferHandle(handle: u12) u64 {
-    return (@as(u64, handle) & 0xFFF) << 20;
+/// Spec §[reply]: `recv_port_handle_id` at bits 32-43 enables the
+/// atomic reply-then-recv mode (seL4 ReplyRecv). 0 = no recv mode.
+pub fn extraReplyRecvPort(port: u12) u64 {
+    return (@as(u64, port) & 0xFFF) << 32;
 }
 
 // ── Raw issue primitives — statically compiled, no extern dispatch ──
@@ -359,6 +359,13 @@ const ext = struct {
         attachments_ptr: [*]const u64,
         attachments_len: usize,
     ) callconv(.c) c.Regs;
+    extern fn replyRecv(reply_handle: u16, recv_port: u16) callconv(.c) c.RecvReturn;
+    extern fn replyTransferRecv(
+        reply_handle: u16,
+        attachments_ptr: [*]const u64,
+        attachments_len: usize,
+        recv_port: u16,
+    ) callconv(.c) c.RecvReturn;
     extern fn timerArm(caps: u64, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
     extern fn timerRearm(timer_handle: u16, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
     extern fn timerCancel(timer_handle: u16) callconv(.c) c.Regs;
@@ -612,6 +619,23 @@ pub fn replyTransfer(reply_handle: u12, attachments: []const u64) Regs {
     ));
 }
 
+pub fn replyRecv(reply_handle: u12, recv_port: u12) RecvReturn {
+    return fromCRecvReturn(ext.replyRecv(@as(u16, reply_handle), @as(u16, recv_port)));
+}
+
+pub fn replyTransferRecv(
+    reply_handle: u12,
+    attachments: []const u64,
+    recv_port: u12,
+) RecvReturn {
+    return fromCRecvReturn(ext.replyTransferRecv(
+        @as(u16, reply_handle),
+        attachments.ptr,
+        attachments.len,
+        @as(u16, recv_port),
+    ));
+}
+
 /// Spec §[vm_exit_state] `initial_state` sub-code per arch — the
 /// "vCPU has not yet entered guest mode" sentinel. A receiver replying
 /// to a vm_exit with this sub-code keeps the vCPU not-started and the
@@ -630,19 +654,19 @@ pub const INITIAL_STATE_SUBCODE: u8 = switch (builtin.cpu.arch) {
 pub fn replyVmExit(reply_handle: u12, subcode: u8) Regs {
     const word: u64 =
         (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
-        (@as(u64, reply_handle) << 12);
+        (@as(u64, reply_handle) << 20);
     return arch_impl.replyVmExitAsm(word, @as(u64, subcode));
 }
 
-/// reply_transfer for vm_exit-typed reply handles. Same wide-window
-/// discipline as `replyVmExit`, plus N attached handles installed in
-/// vregs [128-N..127] per §[handle_attachments]. `attachments.len`
-/// must be in 1..63.
+/// `reply` with `pair_count > 0` for vm_exit-typed reply handles. Same
+/// wide-window discipline as `replyVmExit`, plus N attached handles
+/// installed in vregs [128-N..127] per §[handle_attachments].
+/// `attachments.len` must be in 1..63.
 pub fn replyTransferVmExit(reply_handle: u12, attachments: []const u64, subcode: u8) Regs {
     const n: u8 = @intCast(attachments.len);
     if (n == 0 or n > 63) @panic("replyTransferVmExit: N must be 1..63");
     const word: u64 =
-        (@as(u64, @intFromEnum(SyscallNum.reply_transfer)) & 0xFFF) |
+        (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
         (@as(u64, n) << 12) |
         (@as(u64, reply_handle) << 20);
     return arch_impl.replyTransferVmExitAsm(word, attachments.ptr, @as(u64, n), @as(u64, subcode));

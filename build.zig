@@ -11,21 +11,14 @@ const Profile = struct {
 
 const profiles = struct {
     const test_ = Profile{
-        .root_service = "tests/tests/bin/root_service.elf",
+        .root_service = "tests/suite/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
         .iommu = "intel",
     };
-    const hyprvos = Profile{
-        .root_service = "hyprvOS/bin/hyprvOS.elf",
-        .net = "none",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-    };
-    const prof = Profile{
-        .root_service = "tests/prof/bin/root_service.elf",
+    const linux_guest = Profile{
+        .root_service = "tests/linux_guest/bin/linux_guest.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
@@ -35,14 +28,13 @@ const profiles = struct {
 
 fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
-    if (std.mem.eql(u8, name, "hyprvos")) return profiles.hyprvos;
-    if (std.mem.eql(u8, name, "prof")) return profiles.prof;
+    if (std.mem.eql(u8, name, "linux_guest")) return profiles.linux_guest;
 
     return null;
 }
 
 pub fn build(b: *std.Build) void {
-    const profile_name = b.option([]const u8, "profile", "Build profile: test, hyprvos, prof (sets defaults for other flags)");
+    const profile_name = b.option([]const u8, "profile", "Build profile: test, linux_guest (sets defaults for other flags)");
     const profile = if (profile_name) |name| getProfile(name) else null;
 
     const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse
@@ -51,7 +43,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
-        if (profile) |p| p.root_service else "tests/tests/bin/root_service.elf";
+        if (profile) |p| p.root_service else "tests/suite/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
     const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
@@ -75,6 +67,8 @@ pub fn build(b: *std.Build) void {
     // syscall (including suspend) takes the slow Zig dispatch path —
     // exposes the slow-path baseline for A/B perf comparison.
     const kernel_fastpath = b.option(bool, "kernel_fastpath", "L4 IPC fast-path classifier (default: on)") orelse true;
+    const kernel_fastpath_suspend = b.option(bool, "kernel_fastpath_suspend", "L4 fast-path suspend arm (default: kernel_fastpath)") orelse kernel_fastpath;
+    const kernel_fastpath_reply = b.option(bool, "kernel_fastpath_reply", "L4 fast-path reply arm (default: kernel_fastpath)") orelse kernel_fastpath;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -159,6 +153,8 @@ pub fn build(b: *std.Build) void {
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
     build_opts.addOption(bool, "kernel_fastpath", kernel_fastpath);
+    build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
+    build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
@@ -317,11 +313,10 @@ pub fn build(b: *std.Build) void {
         const run_indexer = b.addSystemCommand(&.{
             "tools/indexer/zig-out/bin/indexer",
             "--kernel-root",      "kernel",
-            "--extra-source-root", "routerOS",
-            "--extra-source-root", "hyprvOS",
             "--extra-source-root", "bootloader",
             "--extra-source-root", "tools",
             "--extra-source-root", "tests",
+            "--extra-source-root", "libz",
             "--out",              db_out,
             "--arch",             @tagName(arch),
             "--commit-sha",       commit_sha,
@@ -377,7 +372,7 @@ pub fn build(b: *std.Build) void {
             "-device intel-iommu,intremap=off"
         else
             "-device amd-iommu";
-        const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "hyprvos"))
+        const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest"))
             b.fmt(
                 \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0 \
                 \\-device nvme,drive=nvme0,serial=zagdisk0
@@ -425,7 +420,7 @@ pub fn build(b: *std.Build) void {
     });
     qemu_cmd.step.dependOn(b.getInstallStep());
 
-    if (profile_name != null and std.mem.eql(u8, profile_name.?, "hyprvos")) {
+    if (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest")) {
         const create_nvme_img = b.addSystemCommand(&[_][]const u8{
             "sh", "-c", b.fmt(
                 "mkdir -p {s} && test -f {s}/nvme.img || dd if=/dev/zero of={s}/nvme.img bs=1M count=64 2>/dev/null",
