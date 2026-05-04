@@ -505,13 +505,20 @@ pub inline fn coreIsIdle(core: u8) bool {
 /// different zombie awaiting reap; the caller must spin until it
 /// drains rather than overwrite (clobbering would leak the prior
 /// zombie's kstack + slab slot).
-pub fn postZombie(core: u8, ec: *ExecutionContext) bool {
+/// `pre_bump_gen` is the EC's gen captured BEFORE `bumpDeadGenLocked`
+/// flipped it to even — the SlabRef would otherwise assert on
+/// `gen % 2 == 1` when constructed from the freed-parity gen. The
+/// reap-side never calls `lockWithGen` against this ref (it's a
+/// pointer-identity carrier; the slab is in its post-bump-pre-
+/// destroyAlreadyMarked freed state), so the carried gen is just a
+/// constructor-side parity placeholder.
+pub fn postZombie(core: u8, ec: *ExecutionContext, pre_bump_gen: u63) bool {
     const pc = &core_states[core];
     if (pc.pending_zombie) |existing| {
         if (existing.ptr != ec) return false;
         return true;
     }
-    pc.pending_zombie = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    pc.pending_zombie = SlabRef(ExecutionContext).init(ec, pre_bump_gen);
     return true;
 }
 

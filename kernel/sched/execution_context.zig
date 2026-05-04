@@ -732,7 +732,7 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // one more cycle if the target is *still* `current_ec` on that core.
     if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
         const core = ec.last_dispatched_core;
-        while (!scheduler.postZombie(core, ec)) std.atomic.spinLoopHint();
+        while (!scheduler.postZombie(core, ec, expected_gen)) std.atomic.spinLoopHint();
         // Wake the target core so it runs `switchTo` promptly and
         // drains the zombie. Without this, an idle target stays in
         // `arch.cpu.idle()` (sti+hlt) until the next preempt tick;
