@@ -484,14 +484,20 @@ stage_linux_guest_x86_boot() {
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
-    # Smoke test only — we look for the VMM banner ("=== linux_guest
-    # (spec-v3) ===") to confirm the kernel + bootloader + VMM root
-    # service all came up cleanly. Full Linux boot to a guest shell is
-    # blocked on aarch64 typed-reply parity and the in-flight reply
-    # debugging; promote this to a stronger marker once that lands.
+    # Smoke test only — we look for `VM handle=` (printed by the VMM
+    # immediately after `createVirtualMachine` succeeds) to confirm
+    # kernel + bootloader + VMM root service all came up cleanly.
+    # The earlier `=== linux_guest (spec-v3) ===` banner can interleave
+    # with concurrent `[ap N] entering sched.run` prints during AP
+    # bring-up and end up shredded on the wire — `VM handle=` fires
+    # once the VMM has been single-threadedly running long enough that
+    # the AP banners have already drained, so it survives intact. Full
+    # Linux boot to a guest shell is blocked on aarch64 typed-reply
+    # parity and the in-flight reply debugging; promote this to a
+    # stronger marker once that lands.
     local found=0
     for _ in $(seq 1 360); do
-        if grep -q "=== linux_guest (spec-v3) ===" "$qemu_log" 2>/dev/null; then
+        if grep -q "VM handle=" "$qemu_log" 2>/dev/null; then
             found=1
             break
         fi
@@ -507,7 +513,7 @@ stage_linux_guest_x86_boot() {
         rm -f "$qemu_log"
         return 0
     else
-        echo "[FAIL] linux_guest VMM did not print banner within 360s (x86-64)"
+        echo "[FAIL] linux_guest VMM did not print VM-handle marker within 360s (x86-64)"
         echo "--- last 30 lines of QEMU output ---"
         tail -30 "$qemu_log"
         echo "--- end ---"
