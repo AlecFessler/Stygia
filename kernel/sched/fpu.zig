@@ -68,6 +68,32 @@ pub fn handleTrap(current: *ExecutionContext) void {
     current.last_fpu_core = core_id;
 }
 
+/// Clear `ec` from any core's `last_fpu_owner` slot. Called from
+/// `terminate` / `destroyExecutionContextLocked` before the gen-bump
+/// + kstack-free, so the next FP trap on `ec.last_fpu_core` doesn't
+/// `fpuSave(&ec.fpu_state)` into a slab slot that's about to be
+/// freed (or already has been, with the slot reallocated to a
+/// different live EC). Mirrors the cancel-on-destroy pattern used
+/// for `futex_wait_nodes` / `timed_recv_waiters`.
+///
+/// Only the core named by `ec.last_fpu_core` could have the slot
+/// pointing at this EC (set/cleared atomically with the slot). If the
+/// EC is on the local core's FPU-owner slot, clear it directly; if
+/// remote, send a flush IPI (which is what `flushIpiHandler` is for).
+/// For now we just clear the slot directly via the per-core pointer
+/// — there's no concurrency concern because (a) the EC isn't running
+/// on the named core (either `terminate` is from another core, or
+/// the EC is parked / .exited), and (b) FPU traps on the named core
+/// for a different EC would re-evict and clear the slot anyway.
+pub fn clearFromLastFpuOwner(ec: *ExecutionContext) void {
+    const core = ec.last_fpu_core orelse return;
+    const per_core = &scheduler.core_states[core];
+    if (per_core.last_fpu_owner) |ref| {
+        if (ref.ptr == ec) per_core.last_fpu_owner = null;
+    }
+    ec.last_fpu_core = null;
+}
+
 /// IPI handler invoked on the source core when another core needs to
 /// take ownership of `ec`'s FPU state across a migration. Saves the
 /// regs (if this core still owns them) and clears `last_fpu_owner`

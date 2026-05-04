@@ -706,6 +706,12 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // transition that's still in one of the timer arrays).
     if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
 
+    // Clear any per-core `last_fpu_owner` slot still naming this EC —
+    // otherwise the next FP-disabled trap on that core would
+    // `fpuSave(&ec.fpu_state)` into a slab slot we're about to gen-
+    // bump and (eventually) recycle to another EC.
+    zag.sched.fpu.clearFromLastFpuOwner(ec);
+
     for (&ec.event_routes) |*slot_ptr| slot_ptr.* = null;
 
     if (ec.perfmon_state != null) releasePerfmonState(ec);
@@ -1676,6 +1682,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     }
 
     if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
+    zag.sched.fpu.clearFromLastFpuOwner(ec);
 
     for (&ec.event_routes) |*slot| slot.* = null;
 
