@@ -484,20 +484,24 @@ stage_linux_guest_x86_boot() {
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
-    # Smoke test only — we look for `VM handle=` (printed by the VMM
-    # immediately after `createVirtualMachine` succeeds) to confirm
-    # kernel + bootloader + VMM root service all came up cleanly.
-    # The earlier `=== linux_guest (spec-v3) ===` banner can interleave
-    # with concurrent `[ap N] entering sched.run` prints during AP
-    # bring-up and end up shredded on the wire — `VM handle=` fires
-    # once the VMM has been single-threadedly running long enough that
-    # the AP banners have already drained, so it survives intact. Full
-    # Linux boot to a guest shell is blocked on aarch64 typed-reply
-    # parity and the in-flight reply debugging; promote this to a
-    # stronger marker once that lands.
+    # Smoke test only — we look for `entering exit loop` (printed by the
+    # VMM right before it dispatches its first VMEXIT) to confirm kernel
+    # + bootloader + VMM root service + VM/vCPU/port creation + Linux
+    # configuration all came up cleanly. Earlier markers (`=== linux_guest
+    # (spec-v3) ===`, `VM handle=`) can interleave with concurrent
+    # `[ap N] entering sched.run` prints during AP bring-up — both the
+    # VMM (userspace, MMIO COM1 writes) and the kernel-side scheduler
+    # banner write the same UART without a shared lock, and on faster
+    # boots the VMM hits its first prints before AP3 has finished its
+    # banner. `entering exit loop` fires after createPort + createVcpu
+    # + ACPI/Linux setup — many ms of single-threaded VMM activity past
+    # the end of AP bring-up — so it survives intact. Full Linux boot
+    # to a guest shell is blocked on aarch64 typed-reply parity and the
+    # in-flight reply debugging; promote this to a stronger marker once
+    # that lands.
     local found=0
     for _ in $(seq 1 360); do
-        if grep -q "VM handle=" "$qemu_log" 2>/dev/null; then
+        if grep -q "entering exit loop" "$qemu_log" 2>/dev/null; then
             found=1
             break
         fi
@@ -513,7 +517,7 @@ stage_linux_guest_x86_boot() {
         rm -f "$qemu_log"
         return 0
     else
-        echo "[FAIL] linux_guest VMM did not print VM-handle marker within 360s (x86-64)"
+        echo "[FAIL] linux_guest VMM did not reach exit loop within 360s (x86-64)"
         echo "--- last 30 lines of QEMU output ---"
         tail -30 "$qemu_log"
         echo "--- end ---"
