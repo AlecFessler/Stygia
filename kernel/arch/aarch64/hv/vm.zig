@@ -95,8 +95,19 @@ comptime {
 /// this becomes VTTBR_EL2's translation-table base; for now allocate a
 /// zeroed 4 KiB page out of the PMM so `hv.virtual_machine.allocVm`
 /// has a valid PAddr to install. The page is freed by `freeStage2Root`.
+///
+/// Spec §[create_virtual_machine] test 03: surface `error.NoDevice`
+/// when EL2 is unreachable so `hv.virtual_machine.createVirtualMachine`
+/// can return E_NODEV. UEFI-booted aarch64 advertises EL2 in
+/// ID_AA64PFR0_EL1 but enters at EL1 with no way to install our
+/// `__hyp_vectors` table, leaving `hyp_stub_installed=false` —
+/// `vmSupported()` returns false, no world-switch is reachable, and
+/// any later `vcpu_run` would trap unhandled. Fail the create here so
+/// userspace observes E_NODEV up front rather than getting a handle
+/// it can never enter.
 pub fn allocStage2Root(vm: *VirtualMachine) !PAddr {
     _ = vm;
+    if (!vm_hw.vmSupported()) return error.NoDevice;
     const page = pmm.global_pmm.?.create(paging.PageMem(.page4k)) catch
         return error.OutOfMemory;
     return PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);

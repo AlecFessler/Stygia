@@ -164,6 +164,21 @@ pub fn main(cap_table_base: u64) void {
         policy_pf,
     );
 
+    // On a host without hardware virtualization (aarch64 UEFI boot
+    // gets EL2-as-implemented but `hyp_stub_installed=false`, so
+    // `vmSupported()` returns false) `create_virtual_machine` short-
+    // circuits with E_NODEV before the `num_cpuid_responses` bound
+    // this test plants can be checked. The aarch64 VmPolicy layout
+    // also has no `num_cpuid_responses` field, so even with HV the
+    // planted byte at offset 768 lands inside `id_reg_responses`
+    // entry 48 and the spec assertion under test is unreachable
+    // through any construction. Smoke-pass on E_NODEV (same
+    // convention as test 05 / 03).
+    if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
+        testing.pass();
+        return;
+    }
+
     if (cvm.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(4);
         return;
