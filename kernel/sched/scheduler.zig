@@ -132,7 +132,7 @@ pub var core_locks: [MAX_CORES]SpinLock = [_]SpinLock{.{ .class = "sched.core_lo
 /// Lockdep group tag for `core_locks`. Non-zero so that overlapping
 /// per-core lock holds (e.g. cross-core enqueue grabbing target while
 /// holding local) don't seed a phantom AB-BA cycle in the lock graph.
-const SCHED_CORE_GROUP: u32 = 0x5C00; // arbitrary non-zero tag
+pub const SCHED_CORE_GROUP: u32 = 0x5C00; // arbitrary non-zero tag
 
 /// Set true after `globalInit` returns. Read by the boot path before
 /// enqueueing the root service's initial EC.
@@ -514,12 +514,50 @@ pub inline fn coreIsIdle(core: u8) bool {
 /// constructor-side parity placeholder.
 pub fn postZombie(core: u8, ec: *ExecutionContext, pre_bump_gen: u63) bool {
     const pc = &core_states[core];
+    // core_locks[core] serializes the read-modify-write of `pending_zombie`
+    // against the target core's reap in arch.switchTo. Without this lock
+    // the SlabRef (16 bytes — tag + ptr + gen) is read non-atomically by
+    // the reader while another core writes it, producing torn reads:
+    // .ptr from the new post combined with the old null tag, or vice
+    // versa. The reaper would then `finalizeDestroyMarkedDead(garbage)`.
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    defer lock.unlockIrqRestore(irq);
     if (pc.pending_zombie) |existing| {
         if (existing.ptr != ec) return false;
         return true;
     }
     pc.pending_zombie = SlabRef(ExecutionContext).init(ec, pre_bump_gen);
     return true;
+}
+
+/// Self-help reaper: if THIS core has a pending zombie and we are not
+/// standing on its kstack, finalize it inline. Called from terminate
+/// before postZombie when target_core == self_core, to break the
+/// self-deadlock where terminate's spin waits for switchTo to drain
+/// the slot but switchTo never runs because terminate is spinning.
+///
+/// Returns the drained zombie's pointer for the caller to forward to
+/// `finalizeDestroyMarkedDead` outside the lock-held section, or null
+/// if nothing was reaped (slot empty, or rsp would have been on the
+/// zombie's own kstack).
+pub fn takeOwnPendingZombie() ?*ExecutionContext {
+    const cid: u8 = @truncate(arch.smp.coreID());
+    const lock = &core_locks[cid];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    defer lock.unlockIrqRestore(irq);
+    const slot = &(&core_states[cid]).pending_zombie;
+    const zr = slot.* orelse return null;
+    const z = zr.ptr;
+    const rsp_addr = asm volatile ("movq %%rsp, %[out]"
+        : [out] "=r" (-> u64),
+    );
+    const z_top = z.kernel_stack.top.addr;
+    const z_base = z.kernel_stack.base.addr;
+    const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
+    if (standing_on_zombie) return null;
+    slot.* = null;
+    return z;
 }
 
 // ── State transitions used by other subsystems ───────────────────────
