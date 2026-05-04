@@ -358,9 +358,7 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
     t.armed = true;
     t.periodic = periodic_flag;
     t.period_ns = deadline_ns;
-    t.deadline_ns = currentNs() +| deadline_ns;
     const timer_gen = t._gen_lock.currentGen();
-    const fire_deadline = t.deadline_ns;
     const counter = t.counter;
     const armed = t.armed;
     const periodic = t.periodic;
@@ -371,6 +369,23 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 
     propagateAndWake(t, timer_gen, 0);
     propagateField1(t, timer_gen, encodeField1(true, periodic_flag));
+
+    // §[timer_rearm] [test 05]: "the calling domain's copy of [1] has
+    // `field0 = 0` immediately on return". Userspace observes field0
+    // post-return, so the kernel must guarantee the first fire lands
+    // strictly after the syscall returns — i.e., at least `deadline_ns`
+    // after the rearm path's last write to the cap table. Compute the
+    // first-fire deadline AFTER propagateAndWake / propagateField1 so
+    // the propagation cost (O(MAX_DOMAINS × MAX_HANDLES_PER_DOMAIN))
+    // does not eat into the deadline. On TCG the propagation walk can
+    // exceed millisecond-scale deadlines; without this re-base the
+    // wheel inserts a timer whose deadline is already in the past and
+    // the very next wheel-expire ISR fires it before userspace can read
+    // field0.
+    const fire_deadline = currentNs() +| deadline_ns;
+    const tlr2 = lookup.timer_ref.lockIrqSave(@src()) catch return E_BADCAP;
+    tlr2.ptr.deadline_ns = fire_deadline;
+    lookup.timer_ref.unlockIrqRestore(tlr2.irq_state);
     wheelInsert(t, fire_deadline);
     return 0;
 }
