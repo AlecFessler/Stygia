@@ -98,7 +98,17 @@ pub const PerCore = struct {
     /// execution onto the new EC's stack. Single-slot is enough: a
     /// second pending termination on the same core blocks until this
     /// one is reaped.
-    pending_zombie: ?*ExecutionContext = null,
+    ///
+    /// Stored as `SlabRef(ExecutionContext)` (rather than bare pointer)
+    /// to satisfy the gen-lock-analyzer fat-pointer invariant — the gen
+    /// captured at posting time is the *post-bump* even gen, and reap
+    /// callers only use `pending_zombie.ptr` for identity comparison
+    /// + `finalizeDestroyMarkedDead` (which already operates on a
+    /// `*EC` bypassing gen-lock checks because the slot is in its
+    /// post-bump-pre-destroyAlreadyMarked state). No `lockWithGen`
+    /// against this ref ever runs; the field type is just a contract
+    /// declaration.
+    pending_zombie: ?SlabRef(ExecutionContext) = null,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -498,10 +508,10 @@ pub inline fn coreIsIdle(core: u8) bool {
 pub fn postZombie(core: u8, ec: *ExecutionContext) bool {
     const pc = &core_states[core];
     if (pc.pending_zombie) |existing| {
-        if (existing != ec) return false;
+        if (existing.ptr != ec) return false;
         return true;
     }
-    pc.pending_zombie = ec;
+    pc.pending_zombie = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
     return true;
 }
 

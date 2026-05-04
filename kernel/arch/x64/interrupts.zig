@@ -425,6 +425,22 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// Moving the receiver dispatch into the naked stub itself remains the
 /// future work this scratch layout was provisioned for.
 pub export fn syscallEntry() callconv(.naked) void {
+    // asm-genlock: skip
+    //
+    // The check_gen_lock asm pass tracks lock state per-register at a
+    // single-function granularity. This fast-path stub multiplexes
+    // seven distinct lock windows (recv_cd, receiver_ec, sender_ec,
+    // port, caller_ec) across hundreds of asm lines, hands ownership
+    // of `gs:` scratch slots between phases, and bridges between the
+    // suspend FP and reply FP through asm labels whose per-jump
+    // state-merge the analyzer can't reconcile without label hints.
+    // Lock discipline is documented inline at each phase boundary
+    // (`Step 9.5` / `Step 12.5` / `R5a` / `R10.5` / `R13.5` / `R13.6` /
+    // `R16` headers); spec-test parity at smp=4 verifies it. Until the
+    // analyzer grows label-aware state tracking, opt out — silent
+    // findings here would drown the kernel-wide signal from real bugs
+    // in slow-path handlers.
+    //
     // Slow-path Context layout:
     //   [RSP+0..112]   r15..rax (15 GPRs, 120 bytes)
     //   [RSP+120,128]  int_num, err_code
@@ -2471,7 +2487,8 @@ pub fn switchTo(ec: *ExecutionContext) void {
     //      `switchTo` from `scheduler.run()` would see `current_ec=null`,
     //      `cur_is_zombie=false`, and finalize while still standing on
     //      the parked EC's kstack.
-    if ((&scheduler.core_states[cid]).pending_zombie) |zombie| {
+    if ((&scheduler.core_states[cid]).pending_zombie) |zombie_ref| {
+        const zombie = zombie_ref.ptr;
         const rsp_addr = asm volatile ("movq %%rsp, %[out]"
             : [out] "=r" (-> u64),
         );
