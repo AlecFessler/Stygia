@@ -89,6 +89,16 @@ pub const PerCore = struct {
     /// Per-core idle EC. Allocated at perCoreInit; runs `hlt`/`wfi`
     /// when the run queue is empty. Pinned to this core via affinity.
     idle_ec: ?SlabRef(ExecutionContext) = null,
+
+    /// EC handed off to this core for deferred destroy. Set by a remote
+    /// `terminate` when the target was the running EC on this core —
+    /// freeing kstack pages + slab slot inline would race with this
+    /// core's still-in-flight syscall handler. The next `switchTo` on
+    /// this core finalizes the destroy after the kstack/CR3 swap moves
+    /// execution onto the new EC's stack. Single-slot is enough: a
+    /// second pending termination on the same core blocks until this
+    /// one is reaped.
+    pending_zombie: ?*ExecutionContext = null,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -323,7 +333,15 @@ fn dequeueOrIdle() ?*ExecutionContext {
 /// `core_locks[core]` with IRQs masked.
 fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
-    if (state.run_queue.dequeue()) |ec| return ec;
+    while (state.run_queue.dequeue()) |ec| {
+        // A cross-core terminate can flip an EC's state to .exited and
+        // bump its slab gen between `enqueue` and `dequeue`. Drop those:
+        // dispatching them would assert on the even gen in
+        // `setCurrentEc`'s `SlabRef.init`, and the EC is reaped via the
+        // pending_zombie path on its running core anyway.
+        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        return ec;
+    }
     if (state.idle_ec) |idle_ref| {
         // caller-pinned: per-core idle EC is allocated at perCoreInit and
         // never freed — it's the dispatch-of-last-resort target.
@@ -455,13 +473,36 @@ pub inline fn clearCurrentEc(core: u8) void {
 }
 
 /// Set this core's `current_ec` to `ec`, capturing the gen at write time.
+/// Also stamps `ec.last_dispatched_core` so cross-core `terminate` knows
+/// where to post the deferred-finalize zombie — see the field doc on
+/// `ExecutionContext.last_dispatched_core` for why this is necessary
+/// (`current_ec` updates ahead of the actual kstack handoff in both
+/// slow-path `switchTo` and FP step-14/R-14, so it can't be the
+/// authority for "which core has the EC's kstack as rsp").
 pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
     (&core_states[core]).current_ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    ec.last_dispatched_core = core;
 }
 
 /// True if this core's `current_ec` is null (idle).
 pub inline fn coreIsIdle(core: u8) bool {
     return (&core_states[core]).current_ec == null;
+}
+
+/// Hand off `ec` to `core`'s pending_zombie slot. The next `switchTo`
+/// on that core reaps it once the kstack swap moves execution off
+/// `ec.kernel_stack`. Returns false if the slot already holds a
+/// different zombie awaiting reap; the caller must spin until it
+/// drains rather than overwrite (clobbering would leak the prior
+/// zombie's kstack + slab slot).
+pub fn postZombie(core: u8, ec: *ExecutionContext) bool {
+    const pc = &core_states[core];
+    if (pc.pending_zombie) |existing| {
+        if (existing != ec) return false;
+        return true;
+    }
+    pc.pending_zombie = ec;
+    return true;
 }
 
 // ── State transitions used by other subsystems ───────────────────────

@@ -40,6 +40,12 @@ pub const MAX_FUTEX_ADDRS_PER_EC: usize = 63;
 /// Mirrors `syscall/port.zig::MAX_PAIR_COUNT`. Spec §[handle_attachments].
 pub const MAX_PAIR_ENTRIES_PER_EC: usize = 63;
 
+/// Sentinel for `ExecutionContext.last_dispatched_core` — never dispatched.
+/// `0xFF` is unreachable as a real core id (`scheduler.MAX_CORES` is 64,
+/// so valid ids occupy 0..63), giving a single byte that doubles as the
+/// "no core to defer-finalize to" signal.
+pub const LAST_DISPATCHED_NEVER: u8 = 0xFF;
+
 /// Decoded pair entry stashed on the suspending EC at `validatePairEntries`
 /// time and consumed at recv time in `port.deliverEvent`. Captures the
 /// kernel-side `ErasedSlabRef` to the source object (lock-validated at
@@ -209,6 +215,20 @@ pub const ExecutionContext = struct {
     /// fully saved. Remote cores attempting to migrate or destroy this
     /// EC spin on this until the saving core releases it.
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Core id of the most recent dispatch — set by `setCurrentEc` and by
+    /// the FP step-14 / R-14 swap. Sentinel `LAST_DISPATCHED_NEVER` (0xFF)
+    /// means the EC has never been dispatched. Cross-core `terminate` reads
+    /// this to decide where to post the deferred-finalize zombie: posting
+    /// to the last-dispatched core guarantees that core's NEXT `switchTo`
+    /// runs the reap, by which point its asm rsp swap has moved off the
+    /// EC's kstack — closing the kstack-still-in-use window that
+    /// `runningCoreOf(current_ec.ptr == ec)` would otherwise miss
+    /// (current_ec is updated BEFORE the asm rsp swap commits, so a
+    /// cross-core terminate sees a misleading "not running" state).
+    /// Never reset back to the sentinel — once dispatched, the kstack-in-
+    /// use risk is owned by the most recent core indefinitely.
+    last_dispatched_core: u8 = LAST_DISPATCHED_NEVER,
 
     // ── Futex wait state — meaningful iff state == .futex_wait ────────
 
@@ -645,11 +665,120 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         return errors.E_TERM;
     };
     worker_ref.unlockIrqRestore(wlr.irq_state);
-
     cd_ref.unlockIrqRestore(cd_irq_state);
 
-    destroyExecutionContext(worker_ref.ptr);
+    const ec = worker_ref.ptr;
+    const expected_gen: u63 = @intCast(worker_ref.gen);
+
+    // Prepare phase — runs WITHOUT the EC's gen lock held to avoid
+    // EC→CD lock-order inversion (abandonPendingReply takes the
+    // pending-reply holder's CD; CD→EC is the canonical order, so
+    // holding EC across CD acquire would seed an AB-BA cycle in
+    // lockdep). The fields touched here are stable for `.running`
+    // ECs (queue/port linkage is empty while running) and for parked
+    // ECs no other core is mutating them. Mirrors the pre-deferred-
+    // destroy invariants of the old `destroyExecutionContext`.
+    abandonPendingReply(ec);
+
+    if (ec.state == .ready) {
+        scheduler.removeFromQueue(ec);
+    } else if (ec.state == .suspended_on_port) {
+        if (ec.suspend_port) |port_ref| {
+            const portlr = port_ref.lockIrqSave(@src()) catch null;
+            if (portlr) |plr| {
+                const p = plr.ptr;
+                _ = p.waiters.remove(ec);
+                if (p.waiters.isEmpty()) p.waiter_kind = .none;
+                port_ref.unlockIrqRestore(plr.irq_state);
+            }
+        }
+    }
+
+    for (&ec.event_routes) |*slot_ptr| slot_ptr.* = null;
+
+    if (ec.perfmon_state != null) releasePerfmonState(ec);
+
+    if (ec.vm != null and ec.vcpu_arch_state != null) {
+        arch.vm.freeVcpuArchState(ec);
+    }
+
+    ec.state = .exited;
+
+    // Re-acquire the EC's gen-lock briefly to atomically rotate gen to
+    // the freed parity. After this point any concurrent handle
+    // resolution (`lockWithGen`) on this slot fails with stale-handle.
+    // The data bytes remain intact for the running core to keep
+    // dereferencing until the reap path zeros + freelists. If the
+    // re-acquire fails, another path already raced us through the
+    // bump — the destroy is in progress, return OK and let the
+    // winner finish.
+    const wlr2 = worker_ref.lockIrqSave(@src()) catch return errors.OK;
+    slab_instance.bumpDeadGenLocked(ec, expected_gen);
+    // bumpDeadGenLocked clears the lock bit as part of the gen flip,
+    // so we cannot use unlockIrqRestore (it would assert held). Just
+    // restore IRQs.
+    arch.cpu.restoreInterrupts(wlr2.irq_state);
+
+    // Defer the finalize to whichever core most recently dispatched the
+    // EC. The kstack-in-use window outlives `current_ec.ptr == ec` (slow-
+    // path `switchTo` writes `current_ec` BEFORE the asm rsp swap; FP
+    // step 14 / R-14 swap `current_ec` BEFORE sysretq) — so a
+    // `runningCoreOf(ec)` check that compares `current_ec.ptr` would miss
+    // the window and incorrectly inline-free the kstack while the running
+    // core is still executing on it. Posting to `last_dispatched_core`
+    // closes the window: that core's NEXT `switchTo` runs the reap, and
+    // by then its asm rsp swap has committed onto whatever EC came next.
+    // The existing `cur_is_zombie` skip in `switchTo` defers the reap
+    // one more cycle if the target is *still* `current_ec` on that core.
+    if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
+        const core = ec.last_dispatched_core;
+        while (!scheduler.postZombie(core, ec)) std.atomic.spinLoopHint();
+    } else {
+        // Never dispatched — kstack pages are mapped but no core's rsp
+        // has ever pointed at them. Safe to finalize inline.
+        finalizeDestroyMarkedDead(ec);
+    }
     return errors.OK;
+}
+
+/// Final teardown of an EC whose gen has already been rotated to its
+/// freed parity via `slab_instance.bumpDeadGenLocked` and whose
+/// prepare-phase cleanup was already done by `terminate`. Frees the
+/// kernel stack and pushes the slab slot back onto the freelist.
+/// Called from two sites: (1) `terminate` directly when the target
+/// was not dispatched anywhere; (2) the per-core reap point in
+/// `switchTo` for ECs that were running on this core when terminate
+/// fired.
+///
+/// Includes defensive port detach: if the running EC re-suspended on
+/// a port between terminate's prepare phase and the reap, it would
+/// otherwise leave a stale `*ec` on the port wait queue. The pop-side
+/// guards (`popHighestPriority{Sender,Receiver}`) reject the stale
+/// pointer via the even-gen test, but removing it explicitly here
+/// keeps the wait queue's count/size accurate.
+pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
+    if (ec.suspend_port) |port_ref| {
+        if (port_ref.lockIrqSave(@src())) |plr| {
+            const p = plr.ptr;
+            _ = p.waiters.remove(ec);
+            if (p.waiters.isEmpty()) p.waiter_kind = .none;
+            port_ref.unlockIrqRestore(plr.irq_state);
+        } else |_| {}
+    }
+
+    const dom_root = blk: {
+        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk null;
+        const d = dlr.ptr;
+        defer ec.domain.unlockIrqRestore(dlr.irq_state);
+        break :blk d.addr_space_root;
+    };
+
+    if (ec.user_stack) |us| {
+        _ = us;
+    }
+    if (dom_root) |root| stack.destroyKernel(ec.kernel_stack, root);
+
+    slab_instance.destroyAlreadyMarked(ec);
 }
 
 /// `yield` syscall handler. Spec §[execution_context].yield.
@@ -1368,6 +1497,7 @@ pub fn allocExecutionContext(
     ec.affinity = affinity;
     ec.state = .ready;
     ec.on_cpu = std.atomic.Value(bool).init(false);
+    ec.last_dispatched_core = LAST_DISPATCHED_NEVER;
     ec.futex_deadline_ns = 0;
     ec.futex_wake_index = 0;
     ec.futex_wait_nodes = null;

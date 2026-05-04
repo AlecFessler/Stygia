@@ -483,6 +483,53 @@ pub fn SecureSlab(
             self.destroyLockedInner(ptr, expected_gen);
         }
 
+        /// Bump the gen-lock from a held `expected_gen` to `expected_gen + 1`
+        /// (even = freed) without zeroing the slot or returning it to the
+        /// freelist. Used by deferred-destroy paths (cross-core terminate
+        /// of a still-running EC) that need handle resolution to start
+        /// failing immediately while leaving the slot's bytes intact for
+        /// the running core to keep dereferencing until its next dispatch.
+        ///
+        /// Caller must hold the slot's gen-lock at `expected_gen`. Pair
+        /// with `destroyAlreadyMarked(ptr)` from the running core's reap
+        /// path once the slot is safe to recycle.
+        pub fn bumpDeadGenLocked(self: *Self, ptr: *T, expected_gen: u63) void {
+            _ = self;
+            std.debug.assert(expected_gen % 2 == 1);
+            if (std.debug.runtime_safety) {
+                const word = ptr._gen_lock.word.load(.monotonic);
+                std.debug.assert(word == ((@as(u64, expected_gen) << 1) | 1));
+            }
+            // Same release-store the normal destroy path uses; matches
+            // `debug.release` so lockdep's per-core held stack stays
+            // balanced.
+            debug.release(&ptr._gen_lock);
+            ptr._gen_lock.setGenRelease(expected_gen + 1);
+        }
+
+        /// Finish the destroy of a slot previously rotated to its
+        /// freed-gen via `bumpDeadGenLocked`. Verifies the slot is at an
+        /// even gen (no concurrent re-allocation snuck in), zeroes T's
+        /// bytes (preserving `_gen_lock`), and pushes the slot back onto
+        /// the freelist. Pair with `bumpDeadGenLocked` only.
+        pub fn destroyAlreadyMarked(self: *Self, ptr: *T) void {
+            const word = ptr._gen_lock.word.load(.acquire);
+            std.debug.assert(word & 1 == 0);
+            std.debug.assert((word >> 1) % 2 == 0);
+
+            self.lock.lock(@src());
+            defer self.lock.unlock();
+
+            zeroExceptGenLock(ptr);
+
+            const idx = self.indexOf(ptr);
+            const draw_push = self.randStep();
+            const draw_pop = self.randStep();
+            self.linkInLocked(idx);
+            self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
+            self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
+        }
+
         /// Visit every currently-allocated slot. The visitor receives a
         /// `*T` and a `u63` gen for the live slot, then returns whether
         /// to continue iterating. Slots whose gen-lock parity is even

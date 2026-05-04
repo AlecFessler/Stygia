@@ -152,8 +152,26 @@ pub const SyscallScratch = extern struct {
     /// the live caller-saved vreg registers we are sysretq'ing zero-copy
     /// to the resumed sender).
     core_lock_ptr: u64,
+    /// Snapshot of `current_ec._gen_lock`'s current gen, taken by
+    /// `switchTo` alongside `current_ec`. Used by the IPC fast path's
+    /// `lockWithGen` acquires on `current_ec` (suspend FP step 9.7,
+    /// reply FP step R10.5) — both syscall-class lock-windows where
+    /// the EC being acquired is the very EC mid-syscall. Holding the
+    /// gen snapshot here lets those acquires bail on a concurrent
+    /// `terminate(self)` from another core (which would rotate the
+    /// gen between syscall entry and the acquire) instead of locking
+    /// a slab slot that has been freed and possibly reallocated to
+    /// a different EC. Stored as u64 because the asm reads it with
+    /// `movq`; the upper 32 bits are always zero.
+    current_ec_gen: u64,
+    /// This core's id — populated at `initSyscallScratch` time. Read by
+    /// the FP step-14 / R-14 `last_dispatched_core` stamp on the EC being
+    /// dispatched. Without it the asm would have to derive the core id
+    /// from `per_core_ptr` arithmetic against `core_states` base, which
+    /// is awkward without operand interpolation in the naked stub.
+    core_id: u8,
     /// Pad out to a full page.
-    _pad: [4096 - 176]u8,
+    _pad: [4096 - 185]u8,
 };
 
 comptime {
@@ -187,6 +205,8 @@ const Offsets = struct {
     const sc_timed_recv_waiters_ptr: usize = 152;
     const sc_timed_recv_lock_ptr: usize = 160;
     const sc_core_lock_ptr: usize = 168;
+    const sc_current_ec_gen: usize = 176;
+    const sc_core_id: usize = 184;
 
     // cpu.Context iret-frame field offsets — referenced by the slow-path
     // Context-build literals (136/152/160).
@@ -214,6 +234,8 @@ comptime {
     if (@offsetOf(SyscallScratch, "timed_recv_waiters_ptr") != Offsets.sc_timed_recv_waiters_ptr) @compileError("scratch.timed_recv_waiters_ptr drift");
     if (@offsetOf(SyscallScratch, "timed_recv_lock_ptr") != Offsets.sc_timed_recv_lock_ptr) @compileError("scratch.timed_recv_lock_ptr drift");
     if (@offsetOf(SyscallScratch, "core_lock_ptr") != Offsets.sc_core_lock_ptr) @compileError("scratch.core_lock_ptr drift");
+    if (@offsetOf(SyscallScratch, "current_ec_gen") != Offsets.sc_current_ec_gen) @compileError("scratch.current_ec_gen drift");
+    if (@offsetOf(SyscallScratch, "core_id") != Offsets.sc_core_id) @compileError("scratch.core_id drift");
     if (Offsets.ctx_rip != 136) @compileError("cpu.Context.rip not at 136");
     if (Offsets.ctx_rflags != 152) @compileError("cpu.Context.rflags not at 152");
     if (Offsets.ctx_rsp != 160) @compileError("cpu.Context.rsp not at 160");
@@ -259,6 +281,7 @@ pub fn initSyscallScratch(core_id: u64) void {
     scratch.timed_recv_waiters_ptr = @intFromPtr(&zag.sched.port.timed_recv_waiters);
     scratch.timed_recv_lock_ptr = @intFromPtr(&zag.sched.port.timed_recv_lock);
     scratch.core_lock_ptr = @intFromPtr(&scheduler.core_locks[core_id]);
+    scratch.core_id = @intCast(core_id);
     cpu.wrmsr(ia32_kernel_gs_base, @intFromPtr(scratch));
 }
 
@@ -846,9 +869,15 @@ pub export fn syscallEntry() callconv(.naked) void {
         ) ++
 
     // ─── Step 9.7: acquire sender_ec gen-lock. Sender = current_ec
-    // (gs:32) — running on this core, can't be destroyed while running,
-    // so plain spin-acquire (no gen check needed). Held through Step
-    // 12 (last sender field write); released at Step 12.5.
+    // (gs:32). Snap gen comes from `scratch.current_ec_gen` (gs:176),
+    // captured by `switchTo` and refreshed by every fast-path
+    // current-EC swap (Step 14 / R14). Per the lock discipline, every
+    // slab-field access uses lockWithGen against a snap — even when
+    // "we are this EC" — because terminate-from-another-core (some
+    // other EC holds a handle to us in its own CD) can fire between
+    // syscall entry and here, rotating the gen and possibly
+    // reallocating the slot to a different EC. Held through Step 12
+    // (last sender field write); released at Step 12.5.
     //
     // Same-class nesting with receiver_ec (held since Step 9.5).
     // Discipline: in suspend fast path, receiver_ec is acquired
@@ -857,27 +886,37 @@ pub export fn syscallEntry() callconv(.naked) void {
     // will flag the nesting; the documented invariant is that this
     // is the only path that holds both ECs at once.
     //
+    // Bail to .Lsender_ec_destroyed: hard panic. By this point recv_cd
+    // and recv_ec are both held — there's no clean unwind that doesn't
+    // race the destroyer, and "I shouldn't exist" is a hard invariant
+    // break. Mirrors `.Lreply_caller_destroyed` / `.Lreply_sender_destroyed`.
+    //
     // Register map: rcx = sender_ec_ptr, rax/r11 = lock-word values.
     // ────────────────────────────────────────────────────────────────
         \\movq %%gs:32, %%rcx
         ++ std.fmt.comptimePrint(
             \\
-            \\.Lacquire_sender_ec_load:
-            \\movq {[ec_lock_off]d}(%%rcx), %%rax
-            \\testb $1, %%al
-            \\jnz .Lacquire_sender_ec_spin
+            \\movq %%gs:{[sc_cur_gen]d}, %%rax
+            \\shlq $1, %%rax
             \\movq %%rax, %%r11
             \\incq %%r11
+            \\.Lacquire_sender_ec:
             \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
             \\je .Lsender_ec_acquired
-            \\jmp .Lacquire_sender_ec_load
-            \\.Lacquire_sender_ec_spin:
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lsender_ec_destroyed
             \\pause
-            \\jmp .Lacquire_sender_ec_load
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lacquire_sender_ec
             \\.Lsender_ec_acquired:
             \\
         ,
-            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+            .{
+                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .sc_cur_gen = Offsets.sc_current_ec_gen,
+            },
         ) ++
 
     // ─── Step 10: mint reply handle. recv_cd held by lock; receiver_ec
@@ -1161,6 +1200,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
             \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%rcx, %%gs:{[sc_cur_gen]d}
+            \\movb $1, {[on_cpu_off]d}(%%r11)
+            \\movzbl %%gs:{[sc_core_id]d}, %%ecx
+            \\movb %%cl, {[last_disp_off]d}(%%r11)
             \\movq %%gs:80, %%rax
             \\movq %%rax, %%gs:40
             \\movq {[ut_off]d}(%%rax), %%rcx
@@ -1203,6 +1246,10 @@ pub export fn syscallEntry() callconv(.naked) void {
                 // fpu_state pushes _gen_lock past offset 0; the comptime
                 // offset is the only safe way to read the gen-lock word.
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .sc_cur_gen = Offsets.sc_current_ec_gen,
+                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
+                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
@@ -1342,6 +1389,16 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
         ) ++
         \\jmp .Lsyscall_lock_fail
+
+        // .Lsender_ec_destroyed: Step 9.7 lockWithGen detected sender
+        // (= current_ec) gen rotated between syscall entry's snap
+        // (gs:176) and the acquire here — terminate-from-another-core
+        // fired against us. Hard panic: recv_cd / recv_ec are still
+        // held but the system invariant ("the EC running this syscall
+        // exists") is broken; any clean unwind would still race the
+        // destroyer. Mirror of `.Lreply_caller_destroyed`.
+        \\.Lsender_ec_destroyed:
+        \\ud2
         \\.Lsyscall_no_receiver:
         ++ std.fmt.comptimePrint(
             "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
@@ -1766,8 +1823,17 @@ pub export fn syscallEntry() callconv(.naked) void {
     // syscalls that other cores can issue against a handle to this same
     // EC (priority, setRegisters, kill, etc.). Per the lock discipline:
     // touching a slab-backed object's fields requires holding its
-    // _gen_lock. Caller is always live (we're it), so an unconditional
-    // spin-acquire is sufficient — no gen-mismatch bail.
+    // _gen_lock against a snapshotted gen.
+    //
+    // Snap is `scratch.current_ec_gen` (gs:176), captured by `switchTo`
+    // alongside `current_ec`. Between R7 (CD release) and here the
+    // caller_ec carries no held lock, so a concurrent terminate from
+    // another core that holds a handle to *us* could fire (locks
+    // caller_ec briefly, releases, then `destroyExecutionContext`
+    // rotates gen to even; a fresh allocation could rotate it again
+    // back to a different odd). A plain spin-acquire would lock the
+    // wrong slab generation; lockWithGen catches the mismatch and
+    // bails to `.Lreply_caller_destroyed`.
     //
     // Lock order: nothing else held at this point (R7 dropped CD, R10
     // dropped sender_ec). For the atomic-recv-park R13 branch the port
@@ -1780,23 +1846,27 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%gs:32, %%rcx
         ++ std.fmt.comptimePrint(
             \\
-            \\.Lreply_acq_caller_load:
-            \\movq {[ec_lock_off]d}(%%rcx), %%rax
-            \\testb $1, %%al
-            \\jnz .Lreply_acq_caller_spin
+            \\movq %%gs:{[sc_cur_gen]d}, %%rax
+            \\shlq $1, %%rax
             \\movq %%rax, %%r11
             \\incq %%r11
-            \\.Lreply_acq_caller_cas:
+            \\.Lreply_acq_caller:
             \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
             \\je .Lreply_caller_acquired
-            \\jmp .Lreply_acq_caller_load
-            \\.Lreply_acq_caller_spin:
+            \\xorq %%r11, %%rax
+            \\testq $-2, %%rax
+            \\jnz .Lreply_caller_destroyed
             \\pause
-            \\jmp .Lreply_acq_caller_load
+            \\movq %%r11, %%rax
+            \\andq $-2, %%rax
+            \\jmp .Lreply_acq_caller
             \\.Lreply_caller_acquired:
             \\
         ,
-            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+            .{
+                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .sc_cur_gen = Offsets.sc_current_ec_gen,
+            },
         ) ++
 
     // ─── Step R11: patch receiver.ctx so its eventual re-dispatch
@@ -2022,6 +2092,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\.Lreply_have_core_fb:
             \\movq %%gs:32, %%rcx
             \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
+            \\movb $0, {[on_cpu_off]d}(%%rcx)
             \\movzbq {[priority_off]d}(%%rcx), %%r11
             \\shlq $4, %%r11
             \\movq %%gs:{[sc_per_core_late]d}, %%rax
@@ -2139,6 +2210,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
             \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%rcx, %%gs:{[sc_cur_gen]d}
+            \\movb $1, {[on_cpu_off]d}(%%r11)
+            \\movzbl %%gs:{[sc_core_id]d}, %%ecx
+            \\movb %%cl, {[last_disp_off]d}(%%r11)
             \\movq %%gs:104, %%rax
             \\movq %%rax, %%gs:40
             \\movq {[ut_off]d}(%%rax), %%rcx
@@ -2178,6 +2253,10 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .cur_ec_gen_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 8,
                 .cur_ec_disc_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 16,
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
+                .sc_cur_gen = Offsets.sc_current_ec_gen,
+                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
+                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
@@ -2306,6 +2385,17 @@ pub export fn syscallEntry() callconv(.naked) void {
     // explicit stop is preferable to silent UAF on the next sysretq.
         \\.Lreply_sender_destroyed:
         \\ud2
+
+    // .Lreply_caller_destroyed: R10.5 lockWithGen detected caller (= our
+    // current_ec) was destroyed between syscall entry (gs:176 snap) and
+    // the caller-acquire here. Means another core called terminate(self)
+    // against a handle to us, freed the slab, and possibly the slot has
+    // been reallocated as a different EC. We cannot continue: any field
+    // write into the (foreign or freed) slab corrupts unrelated state.
+    // The reply slot has already been cleared (R6), so the receiver
+    // sees the reply commit even though we panic.
+        \\.Lreply_caller_destroyed:
+        \\ud2
     );
 }
 
@@ -2364,6 +2454,36 @@ pub fn prepareThreadContext(
 
 pub fn switchTo(ec: *ExecutionContext) void {
     const core_id = apic.coreID();
+    const cid: u8 = @truncate(core_id);
+
+    // Cross-core terminate may have stashed a zombie EC on this core.
+    // Decide whether it's safe to finalize: read live rsp via inline asm
+    // and check whether it falls within the zombie's kstack range.
+    //
+    // We use the rsp range, not `current_ec.ptr == zombie`, because the
+    // proxy is unreliable in two cases:
+    //   1. Slow-path `switchTo` updates `current_ec` via `setCurrentEc`
+    //      BEFORE arriving here. By the time we read `current_ec`, the
+    //      OUTGOING EC's identity is already gone from that slot — the
+    //      proxy would mis-classify "OUTGOING == zombie" as safe.
+    //   2. `parkSelfFaulted` clears `current_ec` to null while leaving
+    //      the EC's kstack as the active rsp on this core. Subsequent
+    //      `switchTo` from `scheduler.run()` would see `current_ec=null`,
+    //      `cur_is_zombie=false`, and finalize while still standing on
+    //      the parked EC's kstack.
+    if ((&scheduler.core_states[cid]).pending_zombie) |zombie| {
+        const rsp_addr = asm volatile ("movq %%rsp, %[out]"
+            : [out] "=r" (-> u64),
+        );
+        const z_top = zombie.kernel_stack.top.addr;
+        const z_base = zombie.kernel_stack.base.addr;
+        const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
+        if (!standing_on_zombie and ec != zombie) {
+            (&scheduler.core_states[cid]).pending_zombie = null;
+            zag.sched.execution_context.finalizeDestroyMarkedDead(zombie);
+        }
+    }
+
     const kstack = ec.kernel_stack.top.addr;
     gdt.coreTss(core_id).rsp0 = kstack;
     updateScratchKernelRsp(core_id, kstack);
@@ -2380,13 +2500,26 @@ pub fn switchTo(ec: *ExecutionContext) void {
         std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
 
-    const cid: u8 = @truncate(core_id);
+    // on_cpu transitions: clear the previous current_ec's flag (if any
+    // and distinct from `ec`) and raise it on the freshly-dispatched
+    // EC. Cross-core readers (`runningCoreOf`, terminate's defer-vs-
+    // -finalize decision) snapshot this together with `current_ec` —
+    // setting it here, after the kstack/CR3 work and before the asm
+    // jump, gives terminate from another core a stable window in which
+    // current_ec→ptr already names this EC.
+    if ((&scheduler.core_states[cid]).current_ec) |prev_ref| {
+        if (prev_ref.ptr != ec) {
+            prev_ref.ptr.on_cpu.store(false, .release);
+        }
+    }
     scheduler.setCurrentEc(cid, ec);
+    ec.on_cpu.store(true, .release);
     // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
     // Each direct `per_cpu_scratch[i].field` write would otherwise
     // memcpy the full 256 KiB array onto the dispatch stack frame.
     const scratch = &per_cpu_scratch[cid];
     scratch.current_ec = @intFromPtr(ec);
+    scratch.current_ec_gen = ec._gen_lock.currentGen();
     scratch.current_domain = @intFromPtr(dom);
     scratch.current_user_table = @intFromPtr(dom.user_table);
     scratch.current_kernel_table = @intFromPtr(dom.kernel_table);

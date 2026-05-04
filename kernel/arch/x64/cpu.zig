@@ -595,8 +595,15 @@ pub fn initPat() void {
 /// Intel SDM Vol 3B §5.8.8; AMD APM Vol 2 §6.1.1.
 ///
 /// STAR[47:32]  = kernel CS for SYSCALL entry (0x08).
-/// STAR[63:48]  = base for SYSRET segment arithmetic (0x10):
-///   SYSRET loads CS = base+16 = 0x20 (USER_CODE), SS = base+8 = 0x18 (USER_DATA).
+/// STAR[63:48]  = base for SYSRET segment arithmetic. Per AMD APM Vol 2
+///   §6.1.1 "the RPL bits 49–48 should be initialized to 11b" because
+///   AMD's SYSRET sets SS.Sel = field+8 *literally* (no RPL=3 force,
+///   unlike Intel SDM which OR's with 3 — a real divergence on Zen
+///   silicon). With base=0x13, SYSRET produces CS = base+16 = 0x23 and
+///   SS = base+8 = 0x1b (both with RPL=3). With the prior base=0x10
+///   user mode ran with SS=0x18 (RPL=0); the next IRQ-from-user pushed
+///   ss=0x18 into the saved Context, and the eventual iretq failed
+///   #GP(0x18) because cs.RPL=3 ≠ ss.RPL=0.
 /// LSTAR        = kernel entry point RIP (syscallEntry in interrupts.zig).
 /// FMASK        = RFLAGS bits cleared on SYSCALL: IF(9), DF(10), AC(18).
 /// EFER.SCE     = bit 0, enables SYSCALL/SYSRET instructions.
@@ -607,7 +614,7 @@ pub fn initSyscall(entry: u64) void {
     const ia32_efer: u32 = 0xC0000080;
 
     const kernel_cs: u64 = 0x08;
-    const sysret_base: u64 = 0x10;
+    const sysret_base: u64 = 0x13;
     wrmsr(ia32_star, (sysret_base << 48) | (kernel_cs << 32));
     wrmsr(ia32_lstar, entry);
     wrmsr(ia32_fmask, (1 << 9) | (1 << 10) | (1 << 18)); // IF | DF | AC

@@ -1139,15 +1139,23 @@ fn enqueueReceiver(p: *Port, receiver: *ExecutionContext) void {
 }
 fn popHighestPrioritySender(p: *Port) ?*ExecutionContext {
     if (p.waiter_kind != .senders) return null;
-    const ec = p.waiters.dequeue() orelse return null;
-    if (p.waiters.isEmpty()) p.waiter_kind = .none;
-    return ec;
+    while (p.waiters.dequeue()) |ec| {
+        if (p.waiters.isEmpty()) p.waiter_kind = .none;
+        // Cross-core terminate may have left a dead EC parked here;
+        // skip it so callers never resume an exited slot.
+        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        return ec;
+    }
+    return null;
 }
 fn popHighestPriorityReceiver(p: *Port) ?*ExecutionContext {
     if (p.waiter_kind != .receivers) return null;
-    const ec = p.waiters.dequeue() orelse return null;
-    if (p.waiters.isEmpty()) p.waiter_kind = .none;
-    return ec;
+    while (p.waiters.dequeue()) |ec| {
+        if (p.waiters.isEmpty()) p.waiter_kind = .none;
+        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        return ec;
+    }
+    return null;
 }
 
 /// Rendezvous + delivery — called once a (sender, receiver) pair is
