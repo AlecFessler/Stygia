@@ -679,6 +679,13 @@ pub fn enableSmapSmep() void {
 /// PCID, so the runtime check is required.
 pub var pcid_enabled: bool = false;
 
+/// Set when the local CPU supports the INVPCID instruction. Detected
+/// via CPUID.(EAX=07H,ECX=0H):EBX[10] (Intel SDM Vol 2A "INVPCID").
+/// Read by the TLB shootdown IPI handler in arch/x64/paging.zig to
+/// pick between INVPCID type 2 (preferred) and a CR4.PGE bounce
+/// fallback. Whole-system flag.
+pub var invpcid_supported: bool = false;
+
 /// Enable global pages (CR4.PGE) and, when the CPU supports it,
 /// process-context identifiers (CR4.PCIDE). PGE pins kernel-half TLB
 /// entries across CR3 writes; PCIDE lets us tag the user half with a
@@ -701,6 +708,15 @@ pub fn enablePcid() void {
     if ((feat.ecx & pcid_bit) != 0) {
         cr4 |= (1 << 17); // PCIDE
         pcid_enabled = true;
+    }
+
+    // INVPCID lives in CPUID.(EAX=07H,ECX=0H):EBX[10] (Intel SDM Vol 2A
+    // "INVPCID — Invalidate Process-Context Identifier"). Some AMD
+    // parts that lack the higher PCID feature still expose INVPCID.
+    const ext = cpuidRaw(0x7, 0);
+    const invpcid_bit: u32 = 1 << 10;
+    if ((ext.ebx & invpcid_bit) != 0) {
+        invpcid_supported = true;
     }
 
     asm volatile ("mov %[cr4], %%cr4"

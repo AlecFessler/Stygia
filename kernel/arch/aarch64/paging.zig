@@ -91,6 +91,12 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
             .attr_indx = mair_normal,
             .sh = 0b11,
         },
+        .kernel_data_local => .{
+            .user = false,
+            .not_global = true,
+            .attr_indx = mair_normal,
+            .sh = 0b11,
+        },
         .kernel_mmio => .{
             .user = false,
             .not_global = true,
