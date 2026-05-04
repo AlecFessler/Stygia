@@ -560,7 +560,23 @@ fn resolveOrSpawnRootEc(
 fn grantDevices(root_cd: *CapabilityDomain) void {
     switch (builtin.cpu.arch) {
         .x86_64 => grantCom1(root_cd),
-        .aarch64 => grantPl011(root_cd),
+        .aarch64 => {
+            // Mint both: the MMIO PL011 region (consumed by the
+            // linux_guest VMM's host log via `mapMmio` against the real
+            // 0x09000000 frame) AND the virtualized port_io@0x3F8
+            // region (consumed by the suite runner's serial sink, which
+            // expects the same dev_type=port_io / base_port=0x3F8 shape
+            // as x86_64). Byte writes against the port_io VMAR trap
+            // through `interceptPortIoFault` and are forwarded to the
+            // PL011 driver inline. The two regions are independent
+            // device_regions; nothing in either path conflicts with the
+            // other, so unconditionally minting both keeps the runner
+            // serial sink working for `-Dprofile=test` while preserving
+            // the linux_guest VMM's direct mapping for
+            // `-Dprofile=linux_guest`.
+            grantPl011(root_cd);
+            grantCom1(root_cd);
+        },
         else => {},
     }
 }
