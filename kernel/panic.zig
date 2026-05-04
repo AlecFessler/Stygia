@@ -26,9 +26,29 @@ const debug_info = zag.utils.debug_info;
 /// The output may interleave with other cores' serial bytes; that is
 /// acceptable in a panic — getting *something* out is more important
 /// than clean ordering.
+pub var panic_in_progress: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+/// Try to win the panic gate without claiming it irrevocably. Used by
+/// pre-panic diagnostic prints (e.g. fault-handler dumps) so they can
+/// race-test before splatting bytes onto the serial line. Returns true if
+/// this core is now the sole panicker; subsequent panic() will see flag=2
+/// and proceed without re-CASing.
+pub fn beginPrePanic() bool {
+    return panic_in_progress.cmpxchgStrong(0, 2, .seq_cst, .seq_cst) == null;
+}
+
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {
     @branchHint(.cold);
     _ = trace;
+
+    // First panicker wins; later cores halt silently so output isn't
+    // shredded by interleaved bytes. Cheap enough — at most one CAS per
+    // never-returns path.
+    //
+    // States: 0 = idle, 2 = pre-panic print holder (this core), 1 = panic
+    // committed. Pre-panic owners pass through directly to the prints.
+    const prev = panic_in_progress.swap(1, .seq_cst);
+    if (prev == 1) arch.cpu.halt();
 
     arch.boot.printRaw("KERNEL PANIC: ");
     arch.boot.printRaw(msg);
