@@ -509,9 +509,27 @@ pub fn SecureSlab(
 
         /// Finish the destroy of a slot previously rotated to its
         /// freed-gen via `bumpDeadGenLocked`. Verifies the slot is at an
-        /// even gen (no concurrent re-allocation snuck in), zeroes T's
-        /// bytes (preserving `_gen_lock`), and pushes the slot back onto
-        /// the freelist. Pair with `bumpDeadGenLocked` only.
+        /// even gen (no concurrent re-allocation snuck in) and pushes
+        /// the slot back onto the freelist. Pair with
+        /// `bumpDeadGenLocked` only.
+        ///
+        /// We deliberately do NOT zero T's bytes here: cross-core
+        /// readers (port `popHighest*` callers, futex wake spinners,
+        /// the IRQ-async timer-expiry path) may still hold a bare `*T`
+        /// to this slot from a snapshot taken before
+        /// `bumpDeadGenLocked` flipped the gen. Those readers haven't
+        /// done a `lockWithGen` against the slot since acquiring the
+        /// pointer, so the gen-bump alone doesn't stop their
+        /// dereferences. Zeroing T's bytes here would race with their
+        /// reads and surface as `kernel page fault on user VA with no
+        /// current EC` / `iretq #GP(garbage selector)` / wild lockdep
+        /// `held_stacks[]` corruption depending on which field they
+        /// hit first. Stale data is bounded — the slot stays on the
+        /// freelist until allocator pop, at which point
+        /// `T.alloc<...>` re-initializes every field a live observer
+        /// can read. Cross-EC capability data leakage to the slot's
+        /// next occupant is blocked by the per-field re-init in alloc,
+        /// not by this zero step.
         pub fn destroyAlreadyMarked(self: *Self, ptr: *T) void {
             const word = ptr._gen_lock.word.load(.acquire);
             std.debug.assert(word & 1 == 0);
@@ -519,8 +537,6 @@ pub fn SecureSlab(
 
             self.lock.lock(@src());
             defer self.lock.unlock();
-
-            zeroExceptGenLock(ptr);
 
             const idx = self.indexOf(ptr);
             const draw_push = self.randStep();
