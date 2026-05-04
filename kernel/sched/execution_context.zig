@@ -1521,54 +1521,22 @@ pub fn allocExecutionContext(
     const ustack_top: ?VAddr = if (ustack) |us| us.top else null;
     const ctx_ptr = arch.cpu.prepareEcContext(kstack.top, ustack_top, entry, 0);
 
-    // Field-by-field init rather than `ec.* = .{ ... }` so the slab's
-    // already-set `_gen_lock` (live, gen=odd, lock=clear) is not
-    // overwritten by an uninitialized GenLock default.
+    // Slab zeroes every byte except `_gen_lock` on free, so any
+    // field whose initial value is the zero-bit pattern (null, 0,
+    // false, .none, default-constructed bool atomic, etc.) is
+    // already correct on entry. Only set fields that need a non-
+    // zero starting value or carry caller-supplied data.
     ec.ctx = ctx_ptr;
-    ec.iret_frame = null;
     ec.kernel_stack = kstack;
     ec.user_stack = ustack;
     ec.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
-    ec.next = null;
-    ec.prev = null;
     ec.priority = priority;
     ec.affinity = affinity;
     ec.state = .ready;
-    ec.on_cpu = std.atomic.Value(bool).init(false);
     ec.last_dispatched_core = LAST_DISPATCHED_NEVER;
-    ec.futex_deadline_ns = 0;
-    ec.futex_wake_index = 0;
-    ec.futex_wait_nodes = null;
-    ec.futex_bucket_count = 0;
-    ec.event_type = .none;
-    ec.event_subcode = 0;
-    ec.event_addr = 0;
-    ec.suspend_port = null;
-    ec.pending_reply_holder = null;
-    ec.pending_reply_domain = null;
-    ec.pending_reply_slot = 0;
-    ec.originating_write_cap = false;
-    ec.pending_pair_count = 0;
-    ec.originating_read_cap = false;
-    ec.event_routes = .{ null, null, null, null };
     ec.entry_point = entry;
-    ec.vm = if (vm) |v| SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen()) else null;
-    ec.exit_port = if (exit_port) |p| SlabRef(Port).init(p, p._gen_lock.currentGen()) else null;
-    ec.perfmon_state = null;
-    ec.last_fpu_core = null;
-    // Slab does NOT zero on alloc — every field a live EC reads must
-    // be initialized here, else the new occupant inherits stale bytes
-    // from the previous owner of this slot.
-    ec.recv_port_xfer = false;
-    ec.recv_deadline_ns = 0;
-    ec.pending_event_word = 0;
-    ec.pending_event_word_valid = false;
-    ec.pending_event_rip = 0;
-    ec.pending_event_rip_valid = false;
-    ec.vcpu_arch_state = null;
-    ec.event_state_gprs = [_]u64{0} ** 13;
-    ec.event_rip = 0;
-    ec.futex_wait_vaddrs = null;
+    if (vm) |v| ec.vm = SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen());
+    if (exit_port) |p| ec.exit_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
 
     arch.cpu.fpuStateInit(&ec.fpu_state);
     _ = slab_instance.publish(pending);

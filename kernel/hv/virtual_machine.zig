@@ -464,10 +464,8 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
     const pending = try slab_instance.create();
     const new_vm = pending.ptr;
 
+    // Slab zero-on-free covers arch_state=null, policy_pf=null, policy=0.
     new_vm.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
-    new_vm.arch_state = null;
-    new_vm.policy_pf = null;
-    new_vm.policy = 0;
 
     new_vm.guest_pt_root = vm_dispatch.allocStage2Root(new_vm) catch |err| {
         slab_instance.destroyAlreadyMarked(new_vm);

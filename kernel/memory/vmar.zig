@@ -831,22 +831,15 @@ fn allocVmar(
 ) !*VMAR {
     const pending = try slab_instance.create();
     const v = pending.ptr;
+    // Slab zero-on-free covers map=.unmapped, device=null,
+    // snapshot_source=null, mapping_table=null, installed_pfs=all-empty.
     v.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
     v.base_vaddr = base;
     v.page_count = pages;
     v.sz = sz;
     v.cch = cch;
     v.cur_rwx = cur_rwx;
-    v.map = .unmapped;
-    v.device = if (device) |d|
-        SlabRef(DeviceRegion).init(d, d._gen_lock.currentGen())
-    else
-        null;
-    v.snapshot_source = null;
-    v.mapping_table = null;
-    for (&v.installed_pfs) |*entry| {
-        entry.* = .{};
-    }
+    if (device) |d| v.device = SlabRef(DeviceRegion).init(d, d._gen_lock.currentGen());
     _ = slab_instance.publish(pending);
     return v;
 }

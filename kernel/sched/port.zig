@@ -1052,14 +1052,11 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
 /// Allocate a Port. Initial counters are caps-driven by the caller.
 fn allocPort() !*Port {
     const pending = try slab_instance.create();
-    const p = pending.ptr;
-    p.send_refcount = 0;
-    p.recv_refcount = 0;
-    p.event_route_count = 0;
-    p.waiters = .{};
-    p.waiter_kind = .none;
+    // Slab zero-on-free leaves every field at its zero pattern, which
+    // matches Port's initial state (refcounts=0, waiters empty, kind
+    // .none).
     _ = slab_instance.publish(pending);
-    return p;
+    return pending.ptr;
 }
 
 /// Final teardown — caller observed all three counters at zero under

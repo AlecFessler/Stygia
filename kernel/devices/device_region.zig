@@ -143,7 +143,6 @@ pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
     dr.device_type = .mmio;
     dr.access = .{ .mmio = .{ .phys_base = base_paddr, .size = size } };
     dr.irq_source = IRQ_SOURCE_NONE;
-    dr.handle_list_head = null;
     _ = device_region_slab.publish(pending);
     return dr;
 }
@@ -158,7 +157,6 @@ pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
     dr.device_type = .port_io;
     dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
     dr.irq_source = IRQ_SOURCE_NONE;
-    dr.handle_list_head = null;
     _ = device_region_slab.publish(pending);
     return dr;
 }
