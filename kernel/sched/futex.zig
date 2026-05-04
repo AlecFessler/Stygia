@@ -120,6 +120,37 @@ fn removeTimedWaiter(ec: *ExecutionContext) void {
     }
 }
 
+/// Cancel any futex wait `ec` is currently parked in: remove every
+/// WaitNode owned by `ec` from its bucket queue(s) and drop the
+/// timed_waiters slot if registered. Called from `terminate` /
+/// `destroyExecutionContextLocked` when the dying EC is in
+/// `.futex_wait` — the WaitNodes live on `ec`'s kernel stack, and
+/// freeing the kstack later (via `stack.destroyKernel`) leaves the
+/// bucket queues holding pointers into unmapped pages, faulting the
+/// next `wake()` that walks the bucket.
+///
+/// Safe to call after `ec.state` is no longer `.futex_wait` — the loop
+/// is bounded by `futex_bucket_count` and the per-bucket `pq.remove`
+/// is idempotent on absent nodes.
+pub fn cancelWait(ec: *ExecutionContext) void {
+    const nodes = ec.futex_wait_nodes orelse return;
+    const count: usize = ec.futex_bucket_count;
+    var i: usize = 0;
+    while (i < count) {
+        const node = &nodes[i];
+        const bucket = &buckets[bucketIdx(node.paddr)];
+        const birq = bucket.lock.lockIrqSave(@src());
+        _ = bucket.pq.remove(node);
+        bucket.lock.unlockIrqRestore(birq);
+        i += 1;
+    }
+    if (ec.futex_deadline_ns != 0) removeTimedWaiter(ec);
+    ec.futex_bucket_count = 0;
+    ec.futex_wait_nodes = null;
+    ec.futex_wait_vaddrs = null;
+    ec.futex_deadline_ns = 0;
+}
+
 /// Remove every node owned by `ec` from its bucket(s), without
 /// touching the bucket whose lock the caller already holds (identified
 /// by `held_idx`; pass an out-of-range value if none is held). Same-

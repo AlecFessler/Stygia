@@ -81,6 +81,15 @@ fn addTimedRecvWaiter(ec: *ExecutionContext) bool {
     return false;
 }
 
+/// Public wrapper around `removeTimedRecvWaiter` for `terminate` /
+/// `destroyExecutionContextLocked` to drop a recv-timed slot that
+/// would otherwise be revisited by the per-core timer tick after the
+/// EC's gen has been bumped.
+pub fn cancelRecvDeadline(ec: *ExecutionContext) void {
+    removeTimedRecvWaiter(ec);
+    ec.recv_deadline_ns = 0;
+}
+
 fn removeTimedRecvWaiter(ec: *ExecutionContext) void {
     const irq = timed_recv_lock.lockIrqSave(@src());
     defer timed_recv_lock.unlockIrqRestore(irq);

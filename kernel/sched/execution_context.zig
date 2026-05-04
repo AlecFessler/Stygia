@@ -692,7 +692,19 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
                 port_ref.unlockIrqRestore(plr.irq_state);
             }
         }
+    } else if (ec.state == .futex_wait) {
+        // The EC's WaitNodes live on its kernel stack; later
+        // `finalizeDestroyMarkedDead` unmaps the kstack pages, which
+        // would leave the futex bucket queues holding pointers into
+        // unmapped memory and fault the next `wake()` walk. Cancel
+        // the wait now so the buckets are clean before the gen-bump.
+        zag.sched.futex.cancelWait(ec);
     }
+
+    // Defensive: also drop any timed_recv_waiters / timed_waiters
+    // entries the state above didn't cover (e.g. an EC mid-state-
+    // transition that's still in one of the timer arrays).
+    if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
 
     for (&ec.event_routes) |*slot_ptr| slot_ptr.* = null;
 
@@ -1659,7 +1671,11 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 port_ref.unlockIrqRestore(plr.irq_state);
             }
         }
+    } else if (ec.state == .futex_wait) {
+        zag.sched.futex.cancelWait(ec);
     }
+
+    if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
 
     for (&ec.event_routes) |*slot| slot.* = null;
 
