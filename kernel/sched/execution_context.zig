@@ -733,6 +733,14 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
         const core = ec.last_dispatched_core;
         while (!scheduler.postZombie(core, ec)) std.atomic.spinLoopHint();
+        // Wake the target core so it runs `switchTo` promptly and
+        // drains the zombie. Without this, an idle target stays in
+        // `arch.cpu.idle()` (sti+hlt) until the next preempt tick;
+        // with the wake IPI it preempts now and the reap fires within
+        // microseconds. Self-IPI is fine — a no-op when we are the
+        // target core (we'll naturally run switchTo on syscall return).
+        const self_core: u8 = @truncate(arch.smp.coreID());
+        if (core != self_core) arch.smp.sendWakeIpi(core);
     } else {
         // Never dispatched — kstack pages are mapped but no core's rsp
         // has ever pointed at them. Safe to finalize inline.
