@@ -42,8 +42,18 @@ pub fn build(b: *std.Build) void {
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse
         if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
+    // The linux_guest sub-project emits an arch-suffixed ELF
+    // (`linux_guest-arm.elf` for aarch64 vs. plain `linux_guest.elf` for
+    // x86_64). The profile struct can only hold one literal, so for
+    // `-Darch=arm -Dprofile=linux_guest` swap in the arm-suffixed path.
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
-        if (profile) |p| p.root_service else "tests/suite/bin/root_service.elf";
+        if (profile) |p|
+            (if (std.mem.eql(u8, target_arch, "arm") and std.mem.eql(u8, profile_name orelse "", "linux_guest"))
+                "tests/linux_guest/bin/linux_guest-arm.elf"
+            else
+                p.root_service)
+        else
+            "tests/suite/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
     const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
