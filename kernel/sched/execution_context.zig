@@ -1671,18 +1671,36 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
         arch.vm.freeVcpuArchState(ec);
     }
 
-    // Step-10 leak-budget tradeoff: kstack pages stay mapped (and the
-    // backing PMM pages stay live) for the full kernel run. A future
-    // patch can move kstack reclaim into a deferred per-core "to-free"
-    // queue drained by the scheduler from a stack the EC does not own;
-    // doing it inline here is racy with the EC's last cross-core
-    // dispatch and was observed to corrupt the buddy allocator (its
-    // last frame might still be in some other core's TLB / IRQ stack).
-    // The slab slot freed below is the dominant pressure: it's what
-    // gates a 256-test cumulative run, not the per-EC 48 KiB of stack.
     ec.state = .exited;
     const gen = ec._gen_lock.currentGen();
-    slab_instance.destroy(ec, gen) catch {};
+    if (gen % 2 == 0) return;
+
+    // Route the slab destroy through the deferred-finalize path
+    // (`bumpDeadGenLocked` + `postZombie` / `finalizeDestroyMarkedDead`)
+    // rather than the synchronous `slab_instance.destroy`. The
+    // synchronous variant goes through `destroyLockedInner` which
+    // zeroes T's bytes — at smp=4 that races with cross-core readers
+    // (port `popHighest*` callers, futex wake's on_cpu spinner,
+    // timer-async expiry path) that hold a bare `*EC` snapshot from
+    // before the gen-flip. Routing through the deferred path leaves
+    // those readers' dereferences valid (slab fields stay intact
+    // until the next allocator pop re-inits them), and the kstack
+    // unmap that `finalizeDestroyMarkedDead` does only fires once the
+    // EC's `last_dispatched_core` has done a `switchTo` — i.e. the
+    // running core is provably off the kstack.
+    const ec_ref = SlabRef(ExecutionContext).init(ec, @intCast(gen));
+    const wlr = ec_ref.lockIrqSave(@src()) catch return;
+    slab_instance.bumpDeadGenLocked(ec, @intCast(gen));
+    arch.cpu.restoreInterrupts(wlr.irq_state);
+
+    if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
+        const core = ec.last_dispatched_core;
+        while (!scheduler.postZombie(core, ec, @intCast(gen))) std.atomic.spinLoopHint();
+        const self_core: u8 = @truncate(arch.smp.coreID());
+        if (core != self_core) arch.smp.sendWakeIpi(core);
+    } else {
+        finalizeDestroyMarkedDead(ec);
+    }
 }
 
 /// Lazy-allocate `perfmon_state` on first perfmon_start.
