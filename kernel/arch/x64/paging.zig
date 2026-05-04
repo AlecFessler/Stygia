@@ -96,7 +96,8 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
     _ = shootdown_ack.fetchSub(1, .release);
 }
 
-/// Flush a virtual address from all cores' TLBs.
+/// Flush a virtual address from all cores' TLBs and wait for every
+/// remote core to acknowledge before returning.
 ///
 /// Intel SDM Vol 3A, Section 5.10.5 -- when a paging-structure entry is
 /// modified on one logical processor, software must propagate the
@@ -104,22 +105,21 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
 /// translation. This is done here by broadcasting an IPI that executes
 /// INVLPG on each remote core (Section 5.10.4.1).
 ///
-/// `synchronous=false` is fire-and-forget. Safe for user-half VAs because
-/// remote cores cannot touch the old mapping from userspace until after
-/// the IPI handler runs (pending IPIs fire on iret).
-///
-/// `synchronous=true` waits for every remote core to ACK the shootdown
-/// before returning. Required for KERNEL VAs (e.g. kstacks) because
-/// remote cores may dereference them from kernel mode — including from
-/// inside an IRQs-disabled spinlock window — where the IPI sits pending
-/// in the LAPIC IRR while the stale TLB entry still maps the freed
-/// physical page. The cross-core IRQ-frame corruption (`iretq` GP-fault
-/// with selector `0xcca0`) at smp=4 was exactly this race: a finalize
-/// running `destroyKernel(ec.kernel_stack, ...)` on one core would free
-/// the physical pages while another core still translated those VAs
-/// through its stale TLB entry, and the next allocator that received
-/// the recycled physical page would write into another EC's iretq frame.
-fn flushRemoteTlb(virt_addr: u64, synchronous: bool) void {
+/// Synchronous (every caller waits for ACKs) because the worst-case
+/// caller is the kstack-free path: remote cores access kernel-half VAs
+/// from kernel mode — including from inside IRQs-disabled spin windows
+/// (lockIrqSave + lock-spin, gen-lock CAS spin, fast-path asm) — and a
+/// fire-and-forget IPI sitting in the LAPIC IRR would let the stale TLB
+/// entry outlive the unmap. The PMM then hands the freed physical page
+/// out to a new allocation while the remote core continues translating
+/// the old VA through its stale entry, and writes from one core's new
+/// owner alias-stomp the other core's reads/writes — most visibly as a
+/// `iretq` #GP with selector `0xcca0` when an IRQ frame's CS/SS slot
+/// gets overwritten. Spinning here is fine: unmap is already a slow
+/// path, and serializing on the lock plus waiting for every handler to
+/// return guarantees that no late-arriving stale handler from a prior
+/// shootdown can decrement the next initiator's ACK counter.
+fn flushRemoteTlb(virt_addr: u64) void {
     const core_count = apic.coreCount();
     if (core_count <= 1) return;
 
@@ -130,7 +130,7 @@ fn flushRemoteTlb(virt_addr: u64, synchronous: bool) void {
     defer shootdown_lock.unlock();
 
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);
-    if (synchronous) shootdown_ack.store(remote_count, .release);
+    shootdown_ack.store(remote_count, .release);
 
     const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
     for (apic.lapics.?, 0..) |la, i| {
@@ -138,16 +138,10 @@ fn flushRemoteTlb(virt_addr: u64, synchronous: bool) void {
         apic.sendIpi(@intCast(la.apic_id), vec);
     }
 
-    if (!synchronous) return;
-
-    // Spin until every remote core has run the handler. We may be
-    // called with IRQs already disabled (kstack-free path), but every
-    // remote core's path eventually re-enables IRQs (slow-path syscalls
-    // re-enable around lock drops; fast paths never disable for long).
-    // No explicit `sti` here — the initiator typically arrives at this
-    // function from a context where it can wait without re-enabling
-    // its own IRQs, and re-enabling them mid-shootdown would invite
-    // unrelated work onto the initiator's stack while pinned waiting.
+    // Spin until every remote core has run the handler. Holding the
+    // lock across this wait is required: it serializes the per-IPI ACK
+    // counter so a late-arriving handler from a prior shootdown cannot
+    // decrement the next initiator's counter past zero.
     while (shootdown_ack.load(.acquire) != 0) std.atomic.spinLoopHint();
 }
 
@@ -544,7 +538,7 @@ pub fn unmapPage(
     // to translate the old VA through its stale entry — corrupting the
     // recycled page's contents. iretq would then pop garbage CS/SS off
     // the IRQ frame in another EC's kstack and #GP. Wait for ACKs.
-    flushRemoteTlb(virt.addr, true);
+    flushRemoteTlb(virt.addr);
 
     return phys;
 }
@@ -637,7 +631,7 @@ pub fn shootdownTlbRange(
     while (i < page_count) {
         const va = virt.addr + @as(u64, i) * paging.PAGE4K;
         cpu.invlpg(va);
-        flushRemoteTlb(va, true);
+        flushRemoteTlb(va);
         i += 1;
     }
 }
