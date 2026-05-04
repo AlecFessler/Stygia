@@ -443,7 +443,9 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
             const slot = &(&sched_mod.core_states[cid]).pending_zombie;
             const zr = slot.* orelse break :blk null;
             const z = zr.ptr;
-            const sp_addr = zag.arch.dispatch.cpu.currentSp();
+            const sp_addr = asm volatile ("mov %[out], sp"
+                : [out] "=r" (-> u64),
+            );
             const z_top = z.kernel_stack.top.addr;
             const z_base = z.kernel_stack.base.addr;
             const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;

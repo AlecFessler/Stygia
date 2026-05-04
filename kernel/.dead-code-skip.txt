@@ -684,4 +684,5 @@ libz/syscall_x64.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6c
 libz/syscall_x64.zig:249-249    sha256:2dbf3fddc5e6bcbe0af753e5783d8f22926db01059aee3cd550225ed79582c44
 libz/syscall_x64_extern.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
 libz/syscall_x64_extern.zig:394-394    sha256:2dbf3fddc5e6bcbe0af753e5783d8f22926db01059aee3cd550225ed79582c44
-sched/port.zig:988-988    sha256:3aabb8459d594f065a73cb7acf1eb5a90c99a002782ad62c7592fd19e9d0c139
+sched/port.zig:988-988    sha256:d2844eec6187ba2d24d163360bc00445a31bc2370facad7f2b2a4471075bc630
+sched/port.zig:1008-1013    sha256:49228ea4af93ed475d4d61946382aedbd64d8a22f9ae8ddce7485eab2b734d30
