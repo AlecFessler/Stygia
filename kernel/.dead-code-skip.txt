@@ -557,7 +557,7 @@ memory/vmar.zig:78-78    sha256:a288911c380720c587d59bb322fc8502fd9aa7fb0c98e767
 devices/device_region.zig:79-79    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
-sched/execution_context.zig:81-81    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
+sched/execution_context.zig:87-87    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
 syscall/errors.zig:32-32    sha256:2745d7e8f7ad434662cee5fca8244d0741daef88c2b2ebde686283526773f967
 sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
 arch/x64/exceptions.zig:43-43    sha256:6567179afdbc127a6c09287ab0cffbda8467127c98513783be98004d730bd314

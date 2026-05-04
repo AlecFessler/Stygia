@@ -1677,54 +1677,6 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     slab_instance.destroy(ec, gen) catch {};
 }
 
-/// Final teardown — remove from any queue, clear event_routes, mark
-/// outstanding reply as abandoned, release perfmon state, free stacks,
-/// release slab.
-pub fn destroyExecutionContext(ec: *ExecutionContext) void {
-    abandonPendingReply(ec);
-
-    if (ec.state == .ready) {
-        scheduler.removeFromQueue(ec);
-    } else if (ec.state == .suspended_on_port) {
-        if (ec.suspend_port) |port_ref| {
-            const portlr = port_ref.lockIrqSave(@src()) catch null;
-            if (portlr) |plr| {
-                const p = plr.ptr;
-                _ = p.waiters.remove(ec);
-                if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlockIrqRestore(plr.irq_state);
-            }
-        }
-    }
-
-    for (&ec.event_routes) |*slot| slot.* = null;
-
-    if (ec.perfmon_state != null) releasePerfmonState(ec);
-
-    if (ec.vm != null and ec.vcpu_arch_state != null) {
-        arch.vm.freeVcpuArchState(ec);
-    }
-
-    const dom_root = blk: {
-        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk null;
-        const d = dlr.ptr;
-        defer ec.domain.unlockIrqRestore(dlr.irq_state);
-        break :blk d.addr_space_root;
-    };
-
-    if (ec.user_stack) |us| {
-        // Free the user stack reservation back to the domain VMM.
-        // Real impl: stack.destroyUser(us, &domain.vmm). Awaits the
-        // per-domain VMM accessor.
-        _ = us;
-    }
-    if (dom_root) |root| stack.destroyKernel(ec.kernel_stack, root);
-
-    ec.state = .exited;
-    const gen = ec._gen_lock.currentGen();
-    slab_instance.destroy(ec, gen) catch {};
-}
-
 /// Lazy-allocate `perfmon_state` on first perfmon_start.
 fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
     if (ec.perfmon_state) |ref| {
