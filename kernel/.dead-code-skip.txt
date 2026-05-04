@@ -72,6 +72,9 @@
 #     rollback path lands).
 #   * memory/vmar.zig (CacheType.* / RestartPolicy.decommit) — VarRange
 #     attribute / restart-policy enums; spec-mandated value space.
+#   * memory/vmar.zig (mapping_table)                  — placeholder slot
+#     for the eventual sparse offset → page-frame walk that backs
+#     `map = page_frame` and `map = demand`; layout TBD.
 #   * devices/device_region.zig (_pad0)                — explicit pad slot
 #     in the DeviceRegion ABI struct.
 #
@@ -684,5 +687,7 @@ libz/syscall_x64.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6c
 libz/syscall_x64.zig:249-249    sha256:2dbf3fddc5e6bcbe0af753e5783d8f22926db01059aee3cd550225ed79582c44
 libz/syscall_x64_extern.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
 libz/syscall_x64_extern.zig:394-394    sha256:2dbf3fddc5e6bcbe0af753e5783d8f22926db01059aee3cd550225ed79582c44
-sched/port.zig:988-988    sha256:d2844eec6187ba2d24d163360bc00445a31bc2370facad7f2b2a4471075bc630
-sched/port.zig:1008-1013    sha256:49228ea4af93ed475d4d61946382aedbd64d8a22f9ae8ddce7485eab2b734d30
+sched/port.zig:988-988    sha256:d09a710eb9bbf0786d5fca41a31dec876bd8a6493ded490fe7e2800954e542a0
+sched/port.zig:1008-1013    sha256:5cb182faba4451cc2c3ce012bc209ce7a81728fcd5c7f795e4b763365fd988bd
+sched/port.zig:1017-1022    sha256:49228ea4af93ed475d4d61946382aedbd64d8a22f9ae8ddce7485eab2b734d30
+memory/vmar.zig:154-154    sha256:104afe2ff16d45b15efd44554aa8a38aa207e26b86f24093b7fc1f35eed819f2
