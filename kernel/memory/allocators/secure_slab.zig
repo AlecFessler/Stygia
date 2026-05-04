@@ -535,6 +535,28 @@ pub fn SecureSlab(
             std.debug.assert(word & 1 == 0);
             std.debug.assert((word >> 1) % 2 == 0);
 
+            // Wipe stale field bytes BEFORE returning the slot to the
+            // freelist. By the time this runs, every cross-core reader
+            // window the prior comment worried about has closed: the
+            // running-core's `switchTo` reaper drives this path and only
+            // calls in after its asm rsp swap has moved off the EC's
+            // kstack, and `terminate`'s prepare phase has already drained
+            // every other queue / per-core slot that held a raw `*T`.
+            //
+            // Without this zero, a slot reallocated via `create` carries
+            // the prior tenant's bytes through the brief window between
+            // `setGenRelease(new_gen)` (which publishes the slot as live)
+            // and the caller's per-field init. A concurrent visitor that
+            // grabs the slot via `forEachAlive` — or any path that takes
+            // a raw `*T` off a per-core/per-list snapshot — observes
+            // the OLD tenant's pointers wearing the NEW tenant's gen, and
+            // dereferences them as if they were valid for the new owner.
+            // (`project_specv3_slab_publishing_race`.) Zeroing here moves
+            // the visible-but-uninitialized window from "stale-T garbage"
+            // to "all zero," which the caller's per-field init then
+            // overlays cleanly.
+            zeroExceptGenLock(ptr);
+
             self.lock.lock(@src());
             defer self.lock.unlock();
 
