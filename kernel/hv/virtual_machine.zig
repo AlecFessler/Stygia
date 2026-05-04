@@ -461,9 +461,8 @@ pub const INITIAL_STATE_SUBCODE: u8 = switch (@import("builtin").cpu.arch) {
 /// from PMM, allocates arch control structure, retains a reference on
 /// `policy_pf`. Spec §[virtual_machine].create_virtual_machine.
 fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
-    const ref = try slab_instance.create();
-    const new_vm = ref.ptr;
-    const gen: u63 = @intCast(ref.gen);
+    const pending = try slab_instance.create();
+    const new_vm = pending.ptr;
 
     new_vm.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
     new_vm.arch_state = null;
@@ -471,13 +470,13 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
     new_vm.policy = 0;
 
     new_vm.guest_pt_root = vm_dispatch.allocStage2Root(new_vm) catch |err| {
-        slab_instance.destroy(new_vm, gen) catch {};
+        slab_instance.destroyAlreadyMarked(new_vm);
         return err;
     };
 
     new_vm.arch_state = vm_dispatch.allocVmArchState(new_vm, policy_pf) catch |err| {
         vm_dispatch.freeStage2Root(new_vm);
-        slab_instance.destroy(new_vm, gen) catch {};
+        slab_instance.destroyAlreadyMarked(new_vm);
         return err;
     };
 
@@ -489,6 +488,7 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
     incPageFrameRef(policy_pf);
     new_vm.policy_pf = SlabRef(PageFrame).init(policy_pf, policy_pf._gen_lock.currentGen());
 
+    _ = slab_instance.publish(pending);
     return new_vm;
 }
 

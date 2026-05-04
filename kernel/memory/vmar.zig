@@ -829,8 +829,8 @@ fn allocVmar(
     cur_rwx: u3,
     device: ?*DeviceRegion,
 ) !*VMAR {
-    const ref = try slab_instance.create();
-    const v = ref.ptr;
+    const pending = try slab_instance.create();
+    const v = pending.ptr;
     v.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
     v.base_vaddr = base;
     v.page_count = pages;
@@ -847,6 +847,7 @@ fn allocVmar(
     for (&v.installed_pfs) |*entry| {
         entry.* = .{};
     }
+    _ = slab_instance.publish(pending);
     return v;
 }
 

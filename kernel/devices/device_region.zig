@@ -127,10 +127,9 @@ pub fn initSlab(
     slab_initialized = true;
 }
 
-fn allocRegion() !*DeviceRegion {
+fn allocRegion() !DeviceRegionSlab.Pending {
     std.debug.assert(slab_initialized);
-    const ref = try device_region_slab.create();
-    return ref.ptr;
+    return try device_region_slab.create();
 }
 
 /// Allocate an MMIO device_region covering `[base_paddr, base_paddr +
@@ -138,12 +137,14 @@ fn allocRegion() !*DeviceRegion {
 /// initial reference — the boot-time device registry, or whichever
 /// kernel agent enumerated it. Spec §[device_region].
 pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
-    const dr = try allocRegion();
+    const pending = try allocRegion();
+    const dr = pending.ptr;
     dr.refcount = 1;
     dr.device_type = .mmio;
     dr.access = .{ .mmio = .{ .phys_base = base_paddr, .size = size } };
     dr.irq_source = IRQ_SOURCE_NONE;
     dr.handle_list_head = null;
+    _ = device_region_slab.publish(pending);
     return dr;
 }
 
@@ -151,12 +152,14 @@ pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
 /// port_count)`. x86-64 only by spec — callers on other arches must
 /// reject before reaching here. Spec §[port_io_virtualization].
 pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
-    const dr = try allocRegion();
+    const pending = try allocRegion();
+    const dr = pending.ptr;
     dr.refcount = 1;
     dr.device_type = .port_io;
     dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
     dr.irq_source = IRQ_SOURCE_NONE;
     dr.handle_list_head = null;
+    _ = device_region_slab.publish(pending);
     return dr;
 }
 

@@ -160,12 +160,12 @@ fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
     const block = pmm_mgr.allocBlock(total_bytes) orelse return error.OutOfMemory;
     errdefer pmm_mgr.freeBlock(block[0..total_bytes]);
 
-    const ref = slab_instance.create() catch return error.OutOfMemory;
+    const pending = slab_instance.create() catch return error.OutOfMemory;
 
-    // SecureSlab.create returns a zeroed slot with gen flipped to live.
-    // Caller is the sole observer until the handle is published, so
-    // direct field writes are safe (no lock/unlock bracketing needed).
-    const pf = ref.ptr;
+    // Slot is at even (freed) gen until `publish` below. Direct field
+    // writes are safe because no observer can `lockWithGen` against an
+    // even gen.
+    const pf = pending.ptr;
     pf.refcount = 1;
     pf.mapcnt = 0;
     // PMM allocBlock returns a physmap virtual pointer (the buddy
@@ -177,6 +177,7 @@ fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
     pf.page_count = page_count;
     pf.sz = sz;
 
+    _ = slab_instance.publish(pending);
     return pf;
 }
 

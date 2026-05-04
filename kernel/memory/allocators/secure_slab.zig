@@ -361,6 +361,20 @@ pub fn SecureSlab(
 
         pub const Ref = SlabRef(T);
 
+        /// Pending allocation handed back by `create`. The slot has been
+        /// removed from the freelist but is still at an even (freed)
+        /// gen — bare-pointer cross-core readers cannot `lockWithGen`
+        /// on it, and `forEachAlive` skips it. Caller writes T's
+        /// fields, then calls `publish` to flip the gen to odd and
+        /// receive the live `Ref`. This two-phase split closes the
+        /// publishing race that an "publish-then-init" sequence opens
+        /// for any reader holding a stale `*T` from a prior life of
+        /// the slot.
+        pub const Pending = struct {
+            ptr: *T,
+            pending_gen: u63,
+        };
+
         pub fn init(
             data_range: Range,
             ptrs_range: Range,
@@ -406,15 +420,15 @@ pub fn SecureSlab(
             };
         }
 
-        /// Allocate a fresh slot. Returns a `SlabRef(T)` — a fat
-        /// pointer pairing the slot pointer with its just-advanced
-        /// generation. The caller must initialize all non-`_gen_lock`
-        /// fields of T via `ref.ptr.field = …` before any concurrent
-        /// observer can see the ref; this path writes the gen-lock
-        /// word (live, unlocked) but nothing else. While no other
-        /// observer holds the ref, field access during init is
-        /// caller-pinned and does not need lock/unlock bracketing.
-        pub fn create(self: *Self) AllocError!Ref {
+        /// Pop a freed slot off the freelist. The slot is returned
+        /// at its post-destroy (even) gen — NOT yet live. Caller must
+        /// write every T field it cares about, then call `publish`
+        /// to flip the gen to its new odd value and receive the
+        /// matching `Ref`. Splitting alloc this way closes the
+        /// publish-before-init race a stale bare-pointer reader could
+        /// otherwise drive: while gen is even, `lockWithGen` rejects
+        /// the slot and `forEachAlive` skips it.
+        pub fn create(self: *Self) AllocError!Pending {
             self.lock.lock(@src());
             defer self.lock.unlock();
 
@@ -437,11 +451,21 @@ pub fn SecureSlab(
             const slot_ptr = self.ptrAt(popped);
             const prev_gen = slot_ptr._gen_lock.currentGen();
             std.debug.assert(prev_gen % 2 == 0); // was freed (gen even)
-            const new_gen: u63 = prev_gen + 1;
-            slot_ptr._gen_lock.setGenRelease(new_gen);
+            return .{
+                .ptr = slot_ptr,
+                .pending_gen = prev_gen + 1,
+            };
+        }
 
-            const ref = Ref.init(slot_ptr, new_gen);
-            return ref;
+        /// Companion of `create`: caller has finished initializing T's
+        /// fields; flip the slot's gen to its new odd value (live,
+        /// unlocked) and return the matching `Ref`. After this call
+        /// the slot is observable by any cross-core reader holding a
+        /// `*T` from a prior life — they will now see the fully-
+        /// initialized fields the caller just wrote.
+        pub fn publish(_: *Self, pending: Pending) Ref {
+            pending.ptr._gen_lock.setGenRelease(pending.pending_gen);
+            return Ref.init(pending.ptr, pending.pending_gen);
         }
 
         /// Atomically verify the caller's carried gen, acquire the
@@ -509,31 +533,24 @@ pub fn SecureSlab(
 
         /// Finish the destroy of a slot previously rotated to its
         /// freed-gen via `bumpDeadGenLocked`. Verifies the slot is at an
-        /// even gen (no concurrent re-allocation snuck in) and pushes
-        /// the slot back onto the freelist. Pair with
-        /// `bumpDeadGenLocked` only.
+        /// even gen (no concurrent re-allocation snuck in), zeros every
+        /// byte except `_gen_lock`, and pushes the slot back onto the
+        /// freelist. Pair with `bumpDeadGenLocked` only.
         ///
-        /// We deliberately do NOT zero T's bytes here: cross-core
-        /// readers (port `popHighest*` callers, futex wake spinners,
-        /// the IRQ-async timer-expiry path) may still hold a bare `*T`
-        /// to this slot from a snapshot taken before
-        /// `bumpDeadGenLocked` flipped the gen. Those readers haven't
-        /// done a `lockWithGen` against the slot since acquiring the
-        /// pointer, so the gen-bump alone doesn't stop their
-        /// dereferences. Zeroing T's bytes here would race with their
-        /// reads and surface as `kernel page fault on user VA with no
-        /// current EC` / `iretq #GP(garbage selector)` / wild lockdep
-        /// `held_stacks[]` corruption depending on which field they
-        /// hit first. Stale data is bounded — the slot stays on the
-        /// freelist until allocator pop, at which point
-        /// `T.alloc<...>` re-initializes every field a live observer
-        /// can read. Cross-EC capability data leakage to the slot's
-        /// next occupant is blocked by the per-field re-init in alloc,
-        /// not by this zero step.
+        /// Zero on free, not on alloc: matches `destroyLockedInner`'s
+        /// policy and removes the entire class of "stale-bits look like
+        /// a valid live field" races. The slot's gen has been even
+        /// (freed) since `bumpDeadGenLocked` ran; bare-pointer holders
+        /// must gate any field read on `lockWithGen`, which fails
+        /// against an even gen. Allocators in turn don't need to write
+        /// every default-zero field — the slot is guaranteed all-zero
+        /// when `create` pops it.
         pub fn destroyAlreadyMarked(self: *Self, ptr: *T) void {
             const word = ptr._gen_lock.word.load(.acquire);
             std.debug.assert(word & 1 == 0);
             std.debug.assert((word >> 1) % 2 == 0);
+
+            zeroExceptGenLock(ptr);
 
             self.lock.lock(@src());
             defer self.lock.unlock();

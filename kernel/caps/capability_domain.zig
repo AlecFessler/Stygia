@@ -736,9 +736,13 @@ pub fn allocCapabilityDomain(
 ) !*CapabilityDomain {
     _ = initial_entry;
 
-    const ref = try slab_instance.create();
-    const cd = ref.ptr;
-    errdefer slab_instance.destroy(cd, cd._gen_lock.currentGen()) catch {};
+    const pending = try slab_instance.create();
+    const cd = pending.ptr;
+    const cd_gen = pending.pending_gen;
+    // Pending slot is off the freelist but at even gen — return it
+    // via `destroyAlreadyMarked` (which expects even gen) on any
+    // initialization-time error before `publish`.
+    errdefer slab_instance.destroyAlreadyMarked(cd);
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
 
@@ -785,7 +789,7 @@ pub fn allocCapabilityDomain(
     user_table[0].field1 = field1_ceilings;
     kernel_table[0].ref = .{
         .ptr = cd,
-        .gen = @intCast(cd._gen_lock.currentGen()),
+        .gen = @intCast(cd_gen),
     };
 
     // Slot 1 — placeholder for the initial EC handle; populated by the
@@ -818,9 +822,10 @@ pub fn allocCapabilityDomain(
     user_table[2].field1 = 0;
     kernel_table[2].ref = .{
         .ptr = cd,
-        .gen = @intCast(cd._gen_lock.currentGen()),
+        .gen = @intCast(cd_gen),
     };
 
+    _ = slab_instance.publish(pending);
     return cd;
 }
 

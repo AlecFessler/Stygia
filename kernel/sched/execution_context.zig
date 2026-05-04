@@ -1440,8 +1440,8 @@ pub fn allocExecutionContext(
     vm: ?*VirtualMachine,
     exit_port: ?*Port,
 ) !*ExecutionContext {
-    const ref = try slab_instance.create();
-    const ec = ref.ptr;
+    const pending = try slab_instance.create();
+    const ec = pending.ptr;
 
     const kstack = try stack.createKernel();
     errdefer stack.destroyKernel(kstack, domain.addr_space_root);
@@ -1571,6 +1571,7 @@ pub fn allocExecutionContext(
     ec.futex_wait_vaddrs = null;
 
     arch.cpu.fpuStateInit(&ec.fpu_state);
+    _ = slab_instance.publish(pending);
     return ec;
 }
 
@@ -1677,22 +1678,20 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
         }
     }
 
-    if (ec.state == .ready) {
-        scheduler.removeFromQueue(ec);
-    } else if (ec.state == .suspended_on_port) {
-        if (ec.suspend_port) |port_ref| {
-            const portlr = port_ref.lockIrqSave(@src()) catch null;
-            if (portlr) |plr| {
-                const p = plr.ptr;
-                _ = p.waiters.remove(ec);
-                if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlockIrqRestore(plr.irq_state);
-            }
+    // Unconditional queue/waiter cleanup — see the matching block in
+    // `terminate` for the state-race rationale. Each cancel is a no-op
+    // when the EC isn't actually in the targeted queue.
+    scheduler.removeFromQueue(ec);
+    if (ec.suspend_port) |port_ref| {
+        const portlr = port_ref.lockIrqSave(@src()) catch null;
+        if (portlr) |plr| {
+            const p = plr.ptr;
+            _ = p.waiters.remove(ec);
+            if (p.waiters.isEmpty()) p.waiter_kind = .none;
+            port_ref.unlockIrqRestore(plr.irq_state);
         }
-    } else if (ec.state == .futex_wait) {
-        zag.sched.futex.cancelWait(ec);
     }
-
+    zag.sched.futex.cancelWait(ec);
     if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
     zag.sched.fpu.clearFromLastFpuOwner(ec);
 
@@ -1753,7 +1752,8 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
         ref.unlockIrqRestore(reflr.irq_state);
         return reflr.ptr;
     }
-    const ref = try perfmon_mod.slab_instance.create();
+    const pending = try perfmon_mod.slab_instance.create();
+    const ref = perfmon_mod.slab_instance.publish(pending);
     ec.perfmon_state = ref;
     return ref.ptr;
 }

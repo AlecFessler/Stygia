@@ -404,14 +404,15 @@ pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
 
 /// Allocate a Timer (refcount=1, counter=0, armed=true). Spec §[timer].
 fn allocTimer(periodic: bool, deadline_ns: u64) !*Timer {
-    const ref = try slab_instance.create();
-    const t = ref.ptr;
+    const pending = try slab_instance.create();
+    const t = pending.ptr;
     t.refcount = 1;
     t.counter = 0;
     t.armed = true;
     t.periodic = periodic;
     t.period_ns = deadline_ns;
     t.deadline_ns = currentNs() +| deadline_ns;
+    _ = slab_instance.publish(pending);
     return t;
 }
 

@@ -1051,13 +1051,14 @@ pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
 
 /// Allocate a Port. Initial counters are caps-driven by the caller.
 fn allocPort() !*Port {
-    const ref = try slab_instance.create();
-    const p = ref.ptr;
+    const pending = try slab_instance.create();
+    const p = pending.ptr;
     p.send_refcount = 0;
     p.recv_refcount = 0;
     p.event_route_count = 0;
     p.waiters = .{};
     p.waiter_kind = .none;
+    _ = slab_instance.publish(pending);
     return p;
 }
 
