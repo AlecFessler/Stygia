@@ -680,30 +680,30 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // destroy invariants of the old `destroyExecutionContext`.
     abandonPendingReply(ec);
 
-    if (ec.state == .ready) {
-        scheduler.removeFromQueue(ec);
-    } else if (ec.state == .suspended_on_port) {
-        if (ec.suspend_port) |port_ref| {
-            const portlr = port_ref.lockIrqSave(@src()) catch null;
-            if (portlr) |plr| {
-                const p = plr.ptr;
-                _ = p.waiters.remove(ec);
-                if (p.waiters.isEmpty()) p.waiter_kind = .none;
-                port_ref.unlockIrqRestore(plr.irq_state);
-            }
+    // Run all queue/waiter cleanups unconditionally rather than
+    // branching on `ec.state`. State transitions on this EC happen
+    // without holding the EC's gen-lock (e.g. `suspendOnPortLocked`
+    // mutates `ec.state` under the Port's lock, not the EC's), so a
+    // concurrent transition between the state-read and the matching
+    // cleanup would leave a stale `*ec` on whichever queue the EC
+    // moved into. Each cancel below is idempotent: a no-op when the
+    // EC isn't in the targeted queue. Doing all of them drains
+    // whichever the EC ends up in regardless of races.
+    scheduler.removeFromQueue(ec);
+    if (ec.suspend_port) |port_ref| {
+        const portlr = port_ref.lockIrqSave(@src()) catch null;
+        if (portlr) |plr| {
+            const p = plr.ptr;
+            _ = p.waiters.remove(ec);
+            if (p.waiters.isEmpty()) p.waiter_kind = .none;
+            port_ref.unlockIrqRestore(plr.irq_state);
         }
-    } else if (ec.state == .futex_wait) {
-        // The EC's WaitNodes live on its kernel stack; later
-        // `finalizeDestroyMarkedDead` unmaps the kstack pages, which
-        // would leave the futex bucket queues holding pointers into
-        // unmapped memory and fault the next `wake()` walk. Cancel
-        // the wait now so the buckets are clean before the gen-bump.
-        zag.sched.futex.cancelWait(ec);
     }
-
-    // Defensive: also drop any timed_recv_waiters / timed_waiters
-    // entries the state above didn't cover (e.g. an EC mid-state-
-    // transition that's still in one of the timer arrays).
+    // The EC's WaitNodes live on its kernel stack; later
+    // `finalizeDestroyMarkedDead` unmaps the kstack pages, which
+    // would leave the futex bucket queues holding pointers into
+    // unmapped memory and fault the next `wake()` walk.
+    zag.sched.futex.cancelWait(ec);
     if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
 
     // Clear any per-core `last_fpu_owner` slot still naming this EC —

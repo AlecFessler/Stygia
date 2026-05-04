@@ -505,9 +505,18 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         return errors.E_FULL;
     }
 
-    enqueueReceiver(p, caller);
-    caller.event_type = .none;
+    // suspend_port MUST be set before adding the caller to the port's
+    // waiter queue. A cross-core `terminate(caller)` reads suspend_port
+    // without holding the port lock to decide whether to run the port-
+    // queue cleanup arm; if it observed null while the caller was
+    // already enqueued here, it would skip cleanup, bump-and-free the
+    // EC, and leave a stale `*EC` in the port's waiter queue. The next
+    // `popHighest*` walk would then return that pointer (gen now odd
+    // again from reallocation, state=.ready from the new owner) as a
+    // phantom receiver.
     caller.suspend_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
+    caller.event_type = .none;
+    enqueueReceiver(p, caller);
     // Spec §[reply]: cache the recv'ing port's xfer cap so the
     // rendezvous-with-receiver wake path can mint the reply handle
     // with `xfer` derived from the recv'ing handle, not from
