@@ -2539,19 +2539,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // current_ec→ptr already names this EC.
     if ((&scheduler.core_states[cid]).current_ec) |prev_ref| {
         if (prev_ref.ptr != ec) {
-            // Validate via gen-lock before dereferencing — current_ec's
-            // referenced EC may have been terminated AND recycled to a
-            // different live EC since we set this slot, in which case
-            // a bare-pointer write to .on_cpu would clobber the new
-            // occupant's flag. lockWithGen verifies the slot is still
-            // the EC we set + at the gen we captured. Skip the clear
-            // if the slot has been recycled — the old EC is gone, no
-            // one is watching its flag, and the new EC's flag is being
-            // managed by its actual dispatcher.
-            if (prev_ref.lockIrqSave(@src())) |plr| {
-                plr.ptr.on_cpu.store(false, .release);
-                prev_ref.unlockIrqRestore(plr.irq_state);
-            } else |_| {}
+            prev_ref.ptr.on_cpu.store(false, .release);
         }
     }
     scheduler.setCurrentEc(cid, ec);
