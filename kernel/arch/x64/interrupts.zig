@@ -400,8 +400,85 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// Context frame on entry and restoring them on exit, so any handler
 /// (including suspend/recv/reply) that does not modify those slots
 /// returns to userspace with them unchanged — matching the contract
-/// the eventual L4-style IPC fast path is intended to preserve in
+/// the L4-style IPC fast path below relies on to preserve them in
 /// registers.
+///
+/// ═══════════════════════════════════════════════════════════════════
+/// L4 IPC fast path — what it is and what makes it fast
+/// ═══════════════════════════════════════════════════════════════════
+///
+/// The optimization is *not* doing the syscall faster in some clever
+/// way. The optimization is *not pushing/popping the GPR file at all*.
+/// The slow path's per-syscall cost is dominated by saving 15 GPRs
+/// into a kernel-stack Context on entry and restoring them on exit;
+/// the fast path skips that save/restore entirely and lets the
+/// receiver's user-mode register file flow zero-copy into the sender's
+/// user-mode register file across an IPC rendezvous.
+///
+/// Concretely, on a `suspend` (sender→receiver) or `reply`
+/// (receiver→sender) rendezvous the kernel does not own the IPC
+/// payload — userspace does, and it lives in the GPRs. The fast path
+/// performs all correctness gating (cap-table walks, gen-lock
+/// acquire/release, queue insertion, slot mints/frees, EC state
+/// writes) using *only* (rcx, r11, rax-with-spill, memory). It then
+/// stack-swaps to the receiver's kernel stack, swaps CR3 to the
+/// receiver's address space, and `sysretq`s. The 15 IPC payload
+/// registers were never touched, so on `sysretq` the receiver's
+/// vreg-1..13 + RSP + (sender-restored) RCX/R11 ARE the sender's
+/// resumption state.
+///
+/// Register discipline (HARD CONSTRAINT — violating it defeats the
+/// optimization, since any clobbered register would have to be
+/// spilled+reloaded, which is exactly what the slow path does):
+///
+///   rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15
+///       ── IPC payload (vregs 1-13). MUST pass through untouched.
+///          Whatever value is there at fast-path entry (= receiver's
+///          user-mode register on sysret-return-to-receiver, or
+///          sender's user-mode register on entry, depending on which
+///          direction) is the value the *next* user-mode resumption
+///          observes. Touching any of these means re-introducing the
+///          slow-path's spill+reload.
+///
+///   rcx, r11
+///       ── Free scratch. SYSCALL itself clobbered them on entry
+///          (rcx ← user RIP, r11 ← user RFLAGS, per Intel SDM Vol 2B
+///          "SYSCALL"), so userspace cannot put IPC payload in them
+///          even in principle. The fast path uses them as its main
+///          scratch for cap decoding, gen-lock CAS, port walks, etc.
+///
+///   rax
+///       ── Free scratch BUT with a spill+reload contract. Used
+///          unavoidably for `cmpxchg` on every gen-lock acquire. On
+///          entry, spill the user-mode rax to a `gs:` slot (the
+///          `SyscallScratch.fast_temp[0]` band) before the first
+///          cmpxchg, work freely, and reload the *correct* user-side
+///          value into rax just before sysretq — for suspend FP that's
+///          the freshly-minted reply handle; for reply FP that's
+///          either the receiver's spilled rax (zero-copy hand-off) or
+///          0/E_TERM depending on the resume target.
+///
+///   rsp, gs base
+///       ── Per-core kernel-mode state, swapped via ordinary
+///          stack-swap and `swapgs`. Touching them is part of the
+///          rendezvous, not a violation of the GPR contract.
+///
+/// Memory writes for kernel-side state (EC fields, gen-locks, queue
+/// links, port slots, cap-table entries, `last_dispatched_core`,
+/// `on_cpu`, etc.) are *fine* — they cost cycles but they are how
+/// kernel correctness is encoded. The fast path does many such writes
+/// per rendezvous. What's forbidden is *clobbering the 15 GPRs that
+/// hold the IPC payload*, because that is what the optimization buys.
+///
+/// When fixing bugs in the fast-path asm: every state mutation the
+/// slow path makes on the equivalent transition must have a
+/// corresponding asm write in the fast path. The slow path does its
+/// state machinery through Zig calls into `port.@"suspend"`,
+/// `port.recv`, `port.reply`, `execution_context.parkSelfFaulted`,
+/// etc. Any fast-path branch that skips one of those mutations is a
+/// latent bug — see e.g. R5's discovery that the bare-reply branch
+/// missed `receiver.on_cpu = 0` (commit log under
+/// `.Lreply_atomic_recv_park` / `_fallback`).
 ///
 /// L4 IPC fast path — fully inline asm rendezvous.
 /// `.Lsyscall_suspend_fast` (below) handles the suspend syscall when
