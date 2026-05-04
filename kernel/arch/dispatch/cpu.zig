@@ -102,6 +102,22 @@ pub inline fn cpuRelax() void {
     }
 }
 
+/// Read the current stack pointer. Used by the deferred-destroy reaper
+/// in scheduler.takeOwnPendingZombie / arch.switchTo to test whether
+/// the running rsp is still inside a zombie EC's kernel stack — if it
+/// is, finalize must defer to a later switch.
+pub inline fn currentSp() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("movq %%rsp, %[out]"
+            : [out] "=r" (-> u64),
+        ),
+        .aarch64 => asm volatile ("mov %[out], sp"
+            : [out] "=r" (-> u64),
+        ),
+        else => unreachable,
+    };
+}
+
 pub fn halt() noreturn {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.halt(),

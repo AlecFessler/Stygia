@@ -549,9 +549,7 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
     const slot = &(&core_states[cid]).pending_zombie;
     const zr = slot.* orelse return null;
     const z = zr.ptr;
-    const rsp_addr = asm volatile ("movq %%rsp, %[out]"
-        : [out] "=r" (-> u64),
-    );
+    const rsp_addr = arch.cpu.currentSp();
     const z_top = z.kernel_stack.top.addr;
     const z_base = z.kernel_stack.base.addr;
     const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;

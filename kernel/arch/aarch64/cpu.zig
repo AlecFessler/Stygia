@@ -428,6 +428,34 @@ export fn restoreContextAndEret() callconv(.naked) noreturn {
 /// DDI 0487 §D1.10.1 (ERET) restores PC from ELR_EL1 and PSTATE from
 /// SPSR_EL1, switching exception level per SPSR.M.
 pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+    // Drain a pending zombie if one is parked on this core and we are
+    // not standing on its kernel stack. Mirrors the x86 reaper in
+    // arch/x64/interrupts.zig switchTo. The per-core lock serializes
+    // the read-modify-write against remote postZombie writers; we drop
+    // the lock before finalize so its own locks aren't nested.
+    {
+        const cid: u8 = @truncate(zag.arch.aarch64.gic.coreID());
+        const sched_mod = zag.sched.scheduler;
+        const zombie_to_reap: ?*ExecutionContext = blk: {
+            const lock = &sched_mod.core_locks[cid];
+            const irq = lock.lockIrqSaveOrdered(@src(), sched_mod.SCHED_CORE_GROUP);
+            defer lock.unlockIrqRestore(irq);
+            const slot = &(&sched_mod.core_states[cid]).pending_zombie;
+            const zr = slot.* orelse break :blk null;
+            const z = zr.ptr;
+            const sp_addr = zag.arch.dispatch.cpu.currentSp();
+            const z_top = z.kernel_stack.top.addr;
+            const z_base = z.kernel_stack.base.addr;
+            const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;
+            if (standing_on_zombie or ec == z) break :blk null;
+            slot.* = null;
+            break :blk z;
+        };
+        if (zombie_to_reap) |z| {
+            zag.sched.execution_context.finalizeDestroyMarkedDead(z);
+        }
+    }
+
     // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half
     // translation walks the right tree. Kernel half lives in TTBR1 and
     // is shared, so no kernel-side TLBI is needed.
