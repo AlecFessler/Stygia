@@ -500,6 +500,18 @@ pub fn expireTimedWaiters() void {
         defer timed_lock.unlockIrqRestore(irq);
         for (&timed_waiters) |*slot| {
             const ec = slot.* orelse continue;
+            // Cross-core terminate may have rotated this EC's slab gen to
+            // even (freed) and left a stale entry here — `terminate` /
+            // `destroyExecutionContextLocked` don't reach into this list.
+            // Drop dead entries before SlabRef.init's `gen % 2 == 1`
+            // assertion fires (the polymorphic source of every smp=4
+            // panic in the futex_wait_change_* + futex_wake_* test
+            // batch).
+            const gen = ec._gen_lock.currentGen();
+            if (gen % 2 == 0) {
+                slot.* = null;
+                continue;
+            }
             if (ec.futex_deadline_ns == 0 or now_ns < ec.futex_deadline_ns) continue;
             // caller-pinned: `ec` is pinned by the `timed_waiters` slot we
             // just dequeued; capturing its current gen here gives the
@@ -507,7 +519,7 @@ pub fn expireTimedWaiters() void {
             // reallocated between phases. The deadline re-check after
             // re-locking still rejects re-registered ECs.
             expired[expired_count] = .{
-                .ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen()),
+                .ec = SlabRef(ExecutionContext).init(ec, gen),
                 .deadline = ec.futex_deadline_ns,
             };
             expired_count += 1;

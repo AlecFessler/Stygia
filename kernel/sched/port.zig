@@ -111,6 +111,17 @@ pub fn expireTimedRecvWaiters() void {
         defer timed_recv_lock.unlockIrqRestore(irq);
         for (&timed_recv_waiters) |*slot| {
             const ec = slot.* orelse continue;
+            // Cross-core terminate may have rotated this EC's slab gen
+            // to even (freed) and left a stale entry here — `terminate`
+            // / `destroyExecutionContextLocked` don't reach into this
+            // list. Drop dead entries before SlabRef.init's
+            // `gen % 2 == 1` assertion fires from the per-core timer
+            // tick.
+            const gen = ec._gen_lock.currentGen();
+            if (gen % 2 == 0) {
+                slot.* = null;
+                continue;
+            }
             if (now_ns < ec.recv_deadline_ns) continue;
             // caller-pinned: `ec` is pinned by the `timed_recv_waiters`
             // slot we just dequeued; capturing its current gen here
@@ -118,7 +129,7 @@ pub fn expireTimedRecvWaiters() void {
             // freed and reallocated between phases. The deadline
             // re-check below still catches the wake/re-wait race.
             expired[expired_count] = .{
-                .ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen()),
+                .ec = SlabRef(ExecutionContext).init(ec, gen),
                 .deadline = ec.recv_deadline_ns,
             };
             expired_count += 1;
