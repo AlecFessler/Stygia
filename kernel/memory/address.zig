@@ -319,6 +319,19 @@ pub const MemoryPerms = packed struct(u8) {
 ///   non-global, user-accessible.
 pub const MappingKind = enum {
     kernel_data,
+    /// Non-global kernel-data mapping, for kernel pages whose TLB
+    /// entries on remote cores MUST be evictable by an INVPCID type-2
+    /// IPI ("all-context invalidation, retaining globals", Intel SDM
+    /// Vol 2A). Required for kernel stacks: a zombie EC's kstack pages
+    /// are unmapped + freed back to PMM by the destroying core, but a
+    /// remote core that previously ran the EC keeps the kstack VA
+    /// cached in its TLB (CR4.PGE-tagged globals survive CR3 reload;
+    /// CR4.PCIDE preserve-TLB CR3 writes survive context switches even
+    /// for non-global PCID-tagged entries). Without `global=false`,
+    /// INVPCID type-2 retains those entries and the recycled physical
+    /// page can be silently scribbled across by the remote core's
+    /// stale translation when the page is reissued for an unrelated
+    /// kernel object.
     kernel_data_local,
     kernel_mmio,
     user_data,
