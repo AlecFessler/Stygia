@@ -762,7 +762,7 @@ pub fn SecureSlab(
             return @ptrFromInt(addr);
         }
 
-        fn ptrAt(self: *Self, idx: u32) *T {
+        pub fn ptrAt(self: *Self, idx: u32) *T {
             std.debug.assert(idx < self.count_total);
             const addr = self.ptrs_base + @as(u64, idx) * @sizeOf(*T);
             const cell: *const *T = @ptrFromInt(addr);
@@ -782,7 +782,7 @@ pub fn SecureSlab(
             }
         }
 
-        fn indexOf(self: *Self, ptr: *T) u32 {
+        pub fn indexOf(self: *Self, ptr: *T) u32 {
             // Slots are laid out at `data_base + i * slot_stride` by
             // growOne; the pointer's offset from data_base divides by
             // stride to give its index. O(1), no ptrs-array walk.

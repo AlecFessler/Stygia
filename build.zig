@@ -87,6 +87,14 @@ pub fn build(b: *std.Build) void {
     const kernel_fastpath = b.option(bool, "kernel_fastpath", "L4 IPC fast-path classifier (default: on)") orelse true;
     const kernel_fastpath_suspend = b.option(bool, "kernel_fastpath_suspend", "L4 fast-path suspend arm (default: kernel_fastpath)") orelse kernel_fastpath;
     const kernel_fastpath_reply = b.option(bool, "kernel_fastpath_reply", "L4 fast-path reply arm (default: kernel_fastpath)") orelse kernel_fastpath;
+    // Per-EC kstack-corruption snapshot ring with dump-on-panic. Off by
+    // default; CI runs with the flag absent. Each `mark` site captures
+    // tsc + ec.ctx {cs, ss, rsp, rip} into a 32-entry ring keyed by EC
+    // slab index; the panic path walks every EC ring and dumps the
+    // contents over serial. Used to debug the smp=4 iret-frame
+    // corruption that surfaces as #GP at iretq with kernel-pointer
+    // fragments in ctx.cs (offset 144 in cpu.Context).
+    const kernel_ctx_trace = b.option(bool, "ctx_trace", "Enable per-EC ctx-snapshot ring + dump-on-panic (default: off)") orelse false;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -173,6 +181,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_fastpath", kernel_fastpath);
     build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
     build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
+    build_opts.addOption(bool, "kernel_ctx_trace", kernel_ctx_trace);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 

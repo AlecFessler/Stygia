@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const ctx_trace = zag.utils.ctx_trace;
 const debug_info = zag.utils.debug_info;
 
 /// Kernel panic handler.
@@ -96,6 +97,8 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
         }
         if (pc == 0) break;
     }
+
+    ctx_trace.dumpAllRingsToSerial();
 
     arch.cpu.halt();
 }

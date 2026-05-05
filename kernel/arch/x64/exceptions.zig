@@ -1,6 +1,7 @@
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
+const ctx_trace = zag.utils.ctx_trace;
 const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -325,6 +326,10 @@ fn exceptionHandler(ctx: *cpu.Context) void {
 fn pageFaultHandler(ctx: *cpu.Context) void {
     kprof.enter(.page_fault);
     defer kprof.exit(.page_fault);
+
+    if (scheduler.currentEc()) |ec_for_trace| {
+        ctx_trace.mark(ec_for_trace, .pf_handler);
+    }
 
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {

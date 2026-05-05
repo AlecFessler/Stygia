@@ -4,6 +4,7 @@ const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
+const ctx_trace = zag.utils.ctx_trace;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const kprof = zag.kprof.trace_id;
@@ -318,6 +319,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
     cpu.clac();
     const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
+    ctx_trace.mark(caller, .slowpath_save);
 
     var args: [13]u64 = .{
         r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
@@ -375,6 +377,15 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // because switchTo's `loadEcContextAndReturn` is `noreturn`.
     if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
         scheduler.run();
+    }
+
+    // Last snapshot before the slow-path asm pops regs and iretq's.
+    // `caller` is still the live EC for this core (suspend handlers
+    // would have rerouted via `scheduler.run()` above and not returned
+    // here). Captures the iret frame slots that are about to be
+    // restored — most useful pre-iretq mark for the corruption hunt.
+    if (scheduler.coreCurrentIs(@truncate(apic.coreID()), caller)) {
+        ctx_trace.mark(caller, .slowpath_epilogue);
     }
 }
 
@@ -1204,7 +1215,11 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
                 .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
             },
-        ) ++
+        ) ++ (if (build_options.kernel_ctx_trace)
+            \\call ctxTraceMarkFromAsm_fp_suspend_step12
+            \\
+        else
+            "") ++
 
     // ─── Step 13: wake receiver state (gs:88). state=.running,
     // event_type=.none, suspend_port disc=null, recv_deadline_ns=0.
@@ -1997,7 +2012,11 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .ctx_cs_off = @offsetOf(cpu.Context, "cs"),
                 .ctx_ss_off = @offsetOf(cpu.Context, "ss"),
             },
-        ) ++
+        ) ++ (if (build_options.kernel_ctx_trace)
+            \\call ctxTraceMarkFromAsm_fp_reply_r11
+            \\
+        else
+            "") ++
 
     // ─── Step R12: enter the IRQ-disabled critical section. cli
     // covers the receiver-enqueue (`core_locks[i]` is taken from
@@ -2107,7 +2126,11 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   waiter_kind              = .receivers
     // ────────────────────────────────────────────────────────────────
         \\.Lreply_atomic_recv_park:
-        ++ std.fmt.comptimePrint(
+        ++ (if (build_options.kernel_ctx_trace)
+            \\call ctxTraceMarkFromAsm_recv_park
+            \\
+        else
+            "") ++ std.fmt.comptimePrint(
             \\
             \\movq %%gs:120, %%rcx
             \\movq %%gs:112, %%rax
@@ -2550,6 +2573,7 @@ pub fn prepareThreadContext(
 pub fn switchTo(ec: *ExecutionContext) void {
     const core_id = apic.coreID();
     const cid: u8 = @truncate(core_id);
+    ctx_trace.mark(ec, .switchto_entry);
 
     // Cross-core terminate may have stashed a zombie EC on this core.
     // Decide whether it's safe to finalize: read live rsp via inline asm
@@ -2686,6 +2710,12 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // IRQ-driven preemption produces a context switch. No-op when called
     // from non-IRQ paths (the depth is already zero there).
     sync_debug.resetIrqContextOnSwitch();
+
+    // Last snapshot before the asm trampoline swaps rsp = ec.ctx and
+    // jumps into interruptStubEpilogue's iretq. If ctx.cs has already
+    // been corrupted by this point, the corruption happened inside
+    // switchTo's body or before switchTo was even called.
+    ctx_trace.mark(ec, .switchto_resume);
 
     asm volatile (
         \\movq %[new_stack], %%rsp
