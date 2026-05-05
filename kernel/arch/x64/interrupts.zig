@@ -1308,6 +1308,20 @@ pub export fn syscallEntry() callconv(.naked) void {
     // if already in desired state (each MOV-CR0 is a vmexit under KVM).
     // migrateFlush is currently a no-op stub (scheduler.zig:466).
     // ────────────────────────────────────────────────────────────────
+        (if (build_options.kernel_ec_log)
+            // ec_log mark fires BEFORE the gs:32 write so the trampoline
+            // observes prev=gs:32 (still the outgoing sender) alongside
+            // next=gs:88 (= incoming receiver_ec_ptr). Like the
+            // ctx_trace trampolines above, FP rsp = kstack.top here so
+            // the `call` saved-RIP push and the trampoline's GPR
+            // preserves would otherwise stomp ec.ctx; subq $192 leaves
+            // the full 176 B Context intact plus 16 B alignment slack.
+            \\subq $192, %%rsp
+            \\call ecLogMarkFromAsm_FP_S14
+            \\addq $192, %%rsp
+            \\
+        else
+            "") ++
         std.fmt.comptimePrint(
             \\
             \\movq %%gs:88, %%r11
@@ -2336,6 +2350,17 @@ pub export fn syscallEntry() callconv(.naked) void {
     // from receiver → sender. Updates gs:32/40/48/56/0 + *(gs:136)
     // (TSS.RSP0) + PerCore.current_ec via gs:128.
     // ────────────────────────────────────────────────────────────────
+        (if (build_options.kernel_ec_log)
+            // ec_log mark fires BEFORE the gs:32 write so the trampoline
+            // observes prev=gs:32 (still the outgoing receiver) alongside
+            // next=gs:72 (= incoming sender_ec_ptr). See suspend Step 14
+            // mark above for the kstack-vs-ec.ctx overlap rationale.
+            \\subq $192, %%rsp
+            \\call ecLogMarkFromAsm_FP_R14
+            \\addq $192, %%rsp
+            \\
+        else
+            "") ++
         std.fmt.comptimePrint(
             \\
             \\movq %%gs:72, %%r11

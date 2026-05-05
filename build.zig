@@ -95,6 +95,14 @@ pub fn build(b: *std.Build) void {
     // corruption that surfaces as #GP at iretq with kernel-pointer
     // fragments in ctx.cs (offset 144 in cpu.Context).
     const kernel_ctx_trace = b.option(bool, "ctx_trace", "Enable per-EC ctx-snapshot ring + dump-on-panic (default: off)") orelse false;
+    // Per-core current_ec transition log + dump-on-panic. Records every
+    // setCurrentEc / clearCurrentEc and every IPC fast-path Step 14 / R14
+    // gs:32 write; panic-handler dumps each core's ring over serial. Used
+    // to debug the smp=4 race that surfaces as "kernel page fault on user
+    // VA with no current EC" in memory/fault.zig — distinguishes a
+    // missing-set-after-clear from a kernel-mode fault masquerading as
+    // user-mode.
+    const kernel_ec_log = b.option(bool, "ec_log", "Enable per-core current_ec transition log + dump-on-panic (default: off)") orelse false;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -182,6 +190,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
     build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
     build_opts.addOption(bool, "kernel_ctx_trace", kernel_ctx_trace);
+    build_opts.addOption(bool, "kernel_ec_log", kernel_ec_log);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
