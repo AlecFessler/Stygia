@@ -135,7 +135,11 @@ Kernel objects are grouped by the **ceiling** of their lifetime — the longest 
 
 ### restrict
 
-Reduces the caps on a handle in place. The new caps must be a subset of the current caps. No self-handle cap is required — reducing authority never requires authority.
+#### Summary
+
+Reduces the caps on a handle in place. The new caps must be a subset of the current caps.
+
+#### Declaration
 
 ```
 restrict([1] handle, [2] caps) -> void
@@ -147,7 +151,23 @@ restrict([1] handle, [2] caps) -> void
     bits 16-63: _reserved
 ```
 
+#### Description
+
 Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on EC handles (bits 8-9) and VMAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
+
+#### Capabilities
+
+None — reducing authority never requires authority.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid handle.
+
+**E_PERM** — `[2].caps` is not a subset of the handle's current caps (bitwise for most fields; numeric ≤ for `restart_policy` on EC/VMAR handles).
+
+**E_INVAL** — reserved bits set in `[1]` or `[2]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid handle.
 [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
@@ -159,7 +179,11 @@ Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also 
 
 ### delete
 
+#### Summary
+
 Releases a handle from the calling domain's handle table. Type-specific side effects apply.
+
+#### Declaration
 
 ```
 delete([1] handle) -> void
@@ -168,7 +192,9 @@ delete([1] handle) -> void
   [1] handle: handle in the caller's table (bits 0-11; upper bits _reserved)
 ```
 
-No self-handle cap required.
+#### Description
+
+Per-type observable behavior:
 
 | Handle type | Observable delete behavior |
 |---|---|
@@ -183,13 +209,29 @@ No self-handle cap required.
 | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
 | `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |
 
+#### Capabilities
+
+None.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid handle.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+#### Tests
+
 [test 01] returns E_BADCAP if [1] is not a valid handle.
 [test 02] returns E_INVAL if any reserved bits are set in [1].
 [test 03] on success, the handle is released and subsequent operations on it return E_BADCAP.
 
 ### revoke
 
+#### Summary
+
 Releases every handle transitively derived from the target via `copy`, across all capability domains. The target handle itself is not released — use `delete` for that.
+
+#### Declaration
 
 ```
 revoke([1] handle) -> void
@@ -198,11 +240,23 @@ revoke([1] handle) -> void
   [1] handle: handle in the caller's table (bits 0-11; upper bits _reserved)
 ```
 
-No self-handle cap required.
+#### Description
 
 A handle that was copied from the target and then subsequently moved is still a derivation of the target — moving a handle keeps it on the copy ancestry chain rather than orphaning it. A domain that has moved a handle elsewhere no longer holds it and cannot revoke it; whoever holds the copy ancestor still can, and the revoke will reach the moved descendant through the preserved chain.
 
 Each released descendant is processed with the type-specific behavior defined for `delete`.
+
+#### Capabilities
+
+None.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid handle.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid handle.
 [test 02] returns E_INVAL if any reserved bits are set in [1].
@@ -213,7 +267,11 @@ Each released descendant is processed with the type-specific behavior defined fo
 
 ### sync
 
+#### Summary
+
 Refreshes a handle's kernel-mutable field0/field1 snapshot. No-op for handles whose state does not drift.
+
+#### Declaration
 
 ```
 sync([1] handle) -> void
@@ -221,6 +279,18 @@ sync([1] handle) -> void
 
   [1] handle: handle in the caller's table
 ```
+
+#### Capabilities
+
+None.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid handle.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid handle.
 [test 02] returns E_INVAL if any reserved bits are set in [1].
@@ -374,7 +444,11 @@ cap (word 0, bits 48-63):
 
 ### create_capability_domain
 
+#### Summary
+
 Creates a new capability domain from an ELF image carried in a page frame. The caller receives back an IDC handle to the new domain.
+
+#### Declaration
 
 ```
 create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_ec_affinity, [6+] passed_handles)
@@ -442,13 +516,44 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
     bits 33-63: _reserved
 ```
 
-Self-handle cap required: `crcd`.
+#### Description
 
 The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial EC's entry point.
 
 The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-EC handle is minted with caps = the new domain's `ec_inner_ceiling` from [2].
 
-Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot for the returned IDC handle.
+#### Capabilities
+
+- Self-handle: `crcd`
+- `[1].self_caps` ⊆ caller's self-handle caps
+- `[2].ec_inner_ceiling` ⊆ caller's `ec_inner_ceiling`
+- `[2].vmar_inner_ceiling` ⊆ caller's `vmar_inner_ceiling`
+- `[2].cridc_ceiling` ⊆ caller's `cridc_ceiling`
+- `[2].pf_ceiling` ⊆ caller's `pf_ceiling`
+- `[2].vm_ceiling` ⊆ caller's `vm_ceiling`
+- `[2].port_ceiling` ⊆ caller's `port_ceiling`
+- `[3].ec_outer_ceiling` ⊆ caller's `ec_outer_ceiling`
+- `[3].vmar_outer_ceiling` ⊆ caller's `vmar_outer_ceiling`
+- `[3].restart_policy_ceiling.*` ≤ caller's corresponding fields
+- `[3].fut_wait_max` ≤ caller's `fut_wait_max`
+
+#### Return value
+
+`[1]`: IDC handle to the new domain with caps = caller's `cridc_ceiling`.
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `crcd`, or any cap/ceiling argument exceeds the corresponding ceiling on the caller.
+
+**E_BADCAP** — `[4]` is not a valid page frame handle, or any passed handle id in `[6+]` is not a valid handle in the caller's table.
+
+**E_INVAL** — ELF header malformed; ELF image not position-independent (no `PT_DYNAMIC`, or `e_type != ET_DYN`); `[4]` smaller than the declared ELF image size; reserved bits set in `[1]`, `[2]`, or any passed handle entry; two passed handles reference the same source; `[5]` has bits set outside the system's core count.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_FULL** — caller's handle table has no free slot for the returned IDC handle.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crcd`.
 [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
@@ -486,7 +591,11 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 ### acquire_ecs
 
+#### Summary
+
 Returns handles to all non-vCPU execution contexts bound to the target domain referenced by an IDC handle.
+
+#### Declaration
 
 ```
 acquire_ecs([1] target) -> [1..N] handles
@@ -497,11 +606,29 @@ acquire_ecs([1] target) -> [1..N] handles
   [1] target: IDC handle
 ```
 
-IDC cap required on [1]: `aqec`.
+#### Description
 
-Each returned handle has caps = `target.ec_outer_ceiling` ∩ `target.ec_cap_ceiling` of the IDC handle in [1]. The kernel sets the syscall word's count field to N, the number of handles returned, and writes them to vregs `[1..N]`.
+The kernel sets the syscall word's count field to N, the number of handles returned, and writes them to vregs `[1..N]`.
 
-Returns E_FULL if the caller's handle table cannot accommodate all returned handles.
+#### Capabilities
+
+- IDC handle `[1]`: `aqec`
+
+#### Return value
+
+`[1..N]`: EC handles, each with caps = `target.ec_outer_ceiling` ∩ `[1].ec_cap_ceiling`. The syscall word's count field is set to N.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid IDC handle.
+
+**E_PERM** — `[1]` does not have the `aqec` cap.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+**E_FULL** — caller's handle table cannot accommodate all returned handles.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
 [test 02] returns E_PERM if [1] does not have the `aqec` cap.
@@ -513,7 +640,11 @@ Returns E_FULL if the caller's handle table cannot accommodate all returned hand
 
 ### acquire_vmars
 
+#### Summary
+
 Returns handles to all `map=1` (pf) and `map=3` (demand) VMARs bound to the target domain referenced by an IDC handle. MMIO and DMA VMARs are excluded.
+
+#### Declaration
 
 ```
 acquire_vmars([1] target) -> [1..N] handles
@@ -524,9 +655,29 @@ acquire_vmars([1] target) -> [1..N] handles
   [1] target: IDC handle
 ```
 
-IDC cap required on [1]: `aqvr`.
+#### Description
 
-Each returned handle has caps = `target.vmar_outer_ceiling` ∩ the IDC's `vmar_cap_ceiling`. While in flight, all ECs in the target domain are paused — `acquire_vmars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
+While in flight, all ECs in the target domain are paused — `acquire_vmars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
+
+#### Capabilities
+
+- IDC handle `[1]`: `aqvr`
+
+#### Return value
+
+`[1..N]`: VMAR handles, each with caps = `target.vmar_outer_ceiling` ∩ `[1].vmar_cap_ceiling`. The syscall word's count field is set to N.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid IDC handle.
+
+**E_PERM** — `[1]` does not have the `aqvr` cap.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+**E_FULL** — caller's handle table cannot accommodate all returned handles.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
 [test 02] returns E_PERM if [1] does not have the `aqvr` cap.
@@ -629,7 +780,11 @@ cap (word 0, bits 48-63):
 
 ### create_execution_context
 
+#### Summary
+
 Creates a new execution context either in the caller's own domain or in a target domain referenced by an IDC handle.
+
+#### Declaration
 
 ```
 create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [6] affinity)
@@ -651,13 +806,37 @@ create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] v
                     0 = any core (kernel chooses)
 ```
 
-Caps required:
-- Caller's self-handle must always have `crec`.
-- If `[4] != 0`: the IDC handle in `[4]` must additionally have `crec`.
+#### Description
 
 The kernel allocates `[3]` pages of stack in the target's address space at a kernel-chosen randomized base in the ASLR zone (see §[address_space]), with unmapped guard pages above and below to catch overflow and underflow. The EC begins executing at `[2] entry` with the stack pointer set to the top of the allocated stack.
 
-Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's address space has insufficient contiguous space for the stack; returns E_FULL if the caller's handle table has no free slot, or if `[4]` is nonzero and the target domain's handle table is full.
+#### Capabilities
+
+- Self-handle: `crec`
+- IDC handle `[4]` (when nonzero): `crec`
+- `[1].caps` ⊆ self's `ec_inner_ceiling` (when `[4] = 0`) or target domain's `ec_outer_ceiling` (when `[4] != 0`)
+- `[1].target_caps` ⊆ target domain's `ec_inner_ceiling` (when `[4] != 0`)
+- `[1].priority` ≤ caller's priority ceiling
+
+#### Return value
+
+`[1]`: EC handle with caps = `[1].caps`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crec`; `[4]` lacks `crec` (when nonzero); any cap/priority argument exceeds the corresponding ceiling.
+
+**E_BADCAP** — `[4]` is nonzero and not a valid IDC handle.
+
+**E_INVAL** — `[3] stack_pages` is 0; `[5] affinity` has bits set outside the system's core count; reserved bits set in `[1]`.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_NOSPC** — target's address space has insufficient contiguous space for the stack.
+
+**E_FULL** — caller's handle table has no free slot, or the target domain's handle table is full when `[4]` is nonzero.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
 [test 02] returns E_PERM if [4] is nonzero and [4] lacks `crec`.
@@ -677,19 +856,41 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the target's a
 
 ### self
 
+#### Summary
+
 Returns the handle in the caller's table that references the calling execution context. Pure lookup — no handle is inserted, minted, or modified, and no authority is granted. By the at-most-one invariant, there is at most one such handle.
+
+#### Declaration
 
 ```
 self() -> [1] handle
   syscall_num = 23
 ```
 
+#### Capabilities
+
+None.
+
+#### Return value
+
+`[1]`: handle in the caller's table whose resolved capability references the calling EC.
+
+#### Errors
+
+**E_NOENT** — no handle in the caller's table references the calling EC.
+
+#### Tests
+
 [test 01] returns E_NOENT if no handle in the caller's table references the calling execution context.
 [test 02] on success, [1] is a handle in the caller's table whose resolved capability references the calling execution context.
 
 ### terminate
 
+#### Summary
+
 Terminates the target execution context.
+
+#### Declaration
 
 ```
 terminate([1] target) -> void
@@ -698,11 +899,25 @@ terminate([1] target) -> void
   [1] target: EC handle
 ```
 
-EC cap required: `term`.
+#### Description
 
 Termination atomically destroys the EC. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
 
 Termination also clears the kernel-held event routes bound to the EC (§[event_route]) and marks any reply handles whose suspended sender was the terminated EC such that subsequent operations on those reply handles return `E_ABANDONED`.
+
+#### Capabilities
+
+- EC handle `[1]`: `term`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_PERM** — `[1]` does not have the `term` cap.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_PERM if [1] does not have the `term` cap.
@@ -715,7 +930,11 @@ Termination also clears the kernel-held event routes bound to the EC (§[event_r
 
 ### yield
 
+#### Summary
+
 Yields the calling EC's timeslice. With `[1] = 0`, the scheduler selects the next EC to run. With `[1]` a valid handle to a runnable EC, that EC is scheduled next; if it is not runnable, the scheduler selects.
+
+#### Declaration
 
 ```
 yield([1] target) -> void
@@ -724,7 +943,17 @@ yield([1] target) -> void
   [1] target: 0 = yield to scheduler; else an EC handle to yield to
 ```
 
-No cap required.
+#### Capabilities
+
+None.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is nonzero and not a valid EC handle.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is nonzero and not a valid EC handle.
 [test 02] returns E_INVAL if any reserved bits are set in [1].
@@ -733,7 +962,11 @@ No cap required.
 
 ### priority
 
-Sets the target execution context's priority. The new priority applies to subsequent scheduling, port event delivery, and futex wake ordering. If the target is currently suspended on a port or waiting on a futex, the new priority takes effect immediately and reorders the target into the appropriate priority bucket (this is the mechanism priority inheritance is built on).
+#### Summary
+
+Sets the target execution context's priority.
+
+#### Declaration
 
 ```
 priority([1] target, [2] new_priority) -> void
@@ -743,7 +976,24 @@ priority([1] target, [2] new_priority) -> void
   [2] new_priority: 0..3
 ```
 
-EC cap required on [1]: `spri`. `[2]` must not exceed the caller's self-handle `pri`.
+#### Description
+
+The new priority applies to subsequent scheduling, port event delivery, and futex wake ordering. If the target is currently suspended on a port or waiting on a futex, the new priority takes effect immediately and reorders the target into the appropriate priority bucket (this is the mechanism priority inheritance is built on).
+
+#### Capabilities
+
+- EC handle `[1]`: `spri`
+- `[2]` ≤ caller's self-handle `pri`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_PERM** — `[1]` does not have the `spri` cap; `[2]` exceeds the caller's self-handle `pri`.
+
+**E_INVAL** — `[2]` is greater than 3; reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_PERM if [1] does not have the `spri` cap.
@@ -756,7 +1006,11 @@ EC cap required on [1]: `spri`. `[2]` must not exceed the caller's self-handle `
 
 ### affinity
 
+#### Summary
+
 Sets the target execution context's CPU affinity mask.
+
+#### Declaration
 
 ```
 affinity([1] target, [2] new_affinity) -> void
@@ -768,7 +1022,19 @@ affinity([1] target, [2] new_affinity) -> void
                     bit N must only be set for cores the system actually has.
 ```
 
-EC cap required on [1]: `saff`.
+#### Capabilities
+
+- EC handle `[1]`: `saff`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_PERM** — `[1]` does not have the `saff` cap.
+
+**E_INVAL** — any bit set in `[2]` corresponds to a core the system does not have; reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_PERM if [1] does not have the `saff` cap.
@@ -779,7 +1045,11 @@ EC cap required on [1]: `saff`.
 
 ### perfmon_info
 
+#### Summary
+
 Queries system PMU capabilities.
+
+#### Declaration
 
 ```
 perfmon_info() -> [1] caps_word, [2] supported_events
@@ -793,7 +1063,7 @@ perfmon_info() -> [1] caps_word, [2] supported_events
   [2] supported_events: u64 bitmask
 ```
 
-Self-handle cap required: `pmu`.
+#### Description
 
 Supported event bits:
 
@@ -809,6 +1079,20 @@ Supported event bits:
 | 7 | stalled_cycles_frontend |
 | 8 | stalled_cycles_backend |
 
+#### Capabilities
+
+- Self-handle: `pmu`
+
+#### Return value
+
+`[1]`: caps_word with num_counters and overflow_support. `[2]`: bitmask of supported events.
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `pmu`.
+
+#### Tests
+
 [test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
 [test 02] [1] bits 0-7 contain the number of available PMU counters.
 [test 03] [1] bit 8 is set when the hardware supports counter overflow events.
@@ -816,7 +1100,11 @@ Supported event bits:
 
 ### perfmon_start
 
+#### Summary
+
 Starts hardware performance counters on the target EC.
+
+#### Declaration
 
 ```
 perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] config_threshold) -> void
@@ -833,7 +1121,21 @@ perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] c
   for i in 0..N-1.
 ```
 
-Self-handle cap required: `pmu`.
+#### Capabilities
+
+- Self-handle: `pmu`
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `pmu`.
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_INVAL** — `[2]` is 0 or exceeds num_counters; any config's event is not in supported_events; any config has `has_threshold = 1` but the hardware does not support overflow; reserved bits set in any config_event.
+
+**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
 [test 02] returns E_BADCAP if [1] is not a valid EC handle.
@@ -847,7 +1149,11 @@ Self-handle cap required: `pmu`.
 
 ### perfmon_read
 
+#### Summary
+
 Reads the current counter values from the target EC.
+
+#### Declaration
 
 ```
 perfmon_read([1] target) -> [1..num_counters] counter_values, [num_counters + 1] timestamp
@@ -856,7 +1162,25 @@ perfmon_read([1] target) -> [1..num_counters] counter_values, [num_counters + 1]
   [1] target: EC handle
 ```
 
-Self-handle cap required: `pmu`.
+#### Capabilities
+
+- Self-handle: `pmu`
+
+#### Return value
+
+`[1..num_counters]`: current counter values. `[num_counters + 1]`: u64 nanosecond timestamp.
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `pmu`.
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_INVAL** — perfmon was not started on the target EC.
+
+**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
 [test 02] returns E_BADCAP if [1] is not a valid EC handle.
@@ -868,7 +1192,11 @@ Self-handle cap required: `pmu`.
 
 ### perfmon_stop
 
+#### Summary
+
 Stops counting on the target EC and releases PMU state.
+
+#### Declaration
 
 ```
 perfmon_stop([1] target) -> void
@@ -877,7 +1205,21 @@ perfmon_stop([1] target) -> void
   [1] target: EC handle
 ```
 
-Self-handle cap required: `pmu`.
+#### Capabilities
+
+- Self-handle: `pmu`
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `pmu`.
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_INVAL** — perfmon was not started on the target EC.
+
+**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
 [test 02] returns E_BADCAP if [1] is not a valid EC handle.
@@ -983,7 +1325,11 @@ cap (word 0, bits 48-63):
 
 ### create_vmar
 
+#### Summary
+
 Reserves a range of virtual address space bound to the caller's domain.
+
+#### Declaration
 
 ```
 create_vmar([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
@@ -1006,9 +1352,33 @@ create_vmar([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_regio
                       (required when caps.dma = 1; ignored otherwise)
 ```
 
-Self-handle cap required: `crvr`.
+#### Capabilities
 
-Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address space has no room for the requested range; returns E_FULL if the caller's handle table has no free slot.
+- Self-handle: `crvr`
+- `[1].caps` r/w/x ⊆ caller's `vmar_inner_ceiling` r/w/x
+- `[1].caps.max_sz` ≤ caller's `vmar_inner_ceiling.max_sz`
+- `[1].caps.mmio = 1` requires the caller's `vmar_inner_ceiling` to permit mmio
+- device_region `[5]` (when `caps.dma = 1`): `dma`
+
+#### Return value
+
+`[1]`: VMAR handle with caps = `[1].caps`. field0 contains the assigned base address; field1 contains props together with `[3]` pages.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crvr`; `[1].caps` r/w/x or max_sz exceeds `vmar_inner_ceiling`; `caps.mmio = 1` and ceiling does not permit mmio; `caps.dma = 1` and `[5]` lacks `dma`.
+
+**E_BADCAP** — `caps.dma = 1` and `[5]` is not a valid device_region handle.
+
+**E_INVAL** — `[3] pages = 0`; `[4]` nonzero and not aligned to `props.sz`; `[4]` nonzero and the requested range does not lie wholly within the static zone; `caps.max_sz = 3` (reserved); `caps.mmio = 1` and `props.sz != 0`; `props.sz = 3` (reserved); `props.sz` exceeds `caps.max_sz`; `caps.mmio = 1` and `caps.x` set; `caps.dma = 1` and `caps.x` set; `caps.mmio = 1` and `caps.dma = 1`; `props.cur_rwx` not a subset of `caps.r/w/x`; reserved bits set in `[1]` or `[2]`.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_NOSPC** — address space has no room for the requested range.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crvr`.
 [test 02] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `vmar_inner_ceiling`'s r/w/x bits.
@@ -1037,9 +1407,11 @@ Returns E_NOMEM if insufficient kernel memory; returns E_NOSPC if the address sp
 
 ### map_pf
 
-Installs page_frames into a regular or DMA-flagged VMAR. The kernel dispatches based on `caps.dma`:
-- Regular VMAR (`caps.dma = 0`): pages are mapped into the CPU's virtual address space at `VMAR.base + offset`.
-- DMA VMAR (`caps.dma = 1`): pages are mapped into the bound device's IOMMU page tables at `VMAR.base + offset` (an IOVA).
+#### Summary
+
+Installs page_frames into a regular or DMA-flagged VMAR.
+
+#### Declaration
 
 ```
 map_pf([1] vmar, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
@@ -1053,6 +1425,26 @@ map_pf([1] vmar, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
 
   for i in 0..N-1.
 ```
+
+#### Description
+
+The kernel dispatches based on `caps.dma`:
+- Regular VMAR (`caps.dma = 0`): pages are mapped into the CPU's virtual address space at `VMAR.base + offset`.
+- DMA VMAR (`caps.dma = 1`): pages are mapped into the bound device's IOMMU page tables at `VMAR.base + offset` (an IOVA).
+
+#### Capabilities
+
+None beyond holding the VMAR handle. `[1].caps` must not have `mmio` set (mmio VMARs accept only `map_mmio`).
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle; any `[2 + 2i + 1]` is not a valid page_frame handle.
+
+**E_PERM** — `[1].caps` has `mmio` set.
+
+**E_INVAL** — N is 0; any offset not aligned to the VMAR's `sz`; any page_frame's `sz` smaller than the VMAR's; any pair's range exceeds the VMAR's size; two pairs' ranges overlap; pair's range overlaps an existing mapping; `[1].field1.map` is 2 (mmio) or 3 (demand).
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
@@ -1071,7 +1463,11 @@ map_pf([1] vmar, [2 + 2i] offset, [2 + 2i + 1] page_frame) -> void
 
 ### map_mmio
 
+#### Summary
+
 Installs a device_region as an MMIO mapping into an MMIO-flagged VMAR.
+
+#### Declaration
 
 ```
 map_mmio([1] vmar, [2] device_region) -> void
@@ -1081,7 +1477,19 @@ map_mmio([1] vmar, [2] device_region) -> void
   [2] device_region: device_region handle
 ```
 
-VMAR cap required on [1]: `mmio`.
+#### Capabilities
+
+- VMAR handle `[1]`: `mmio`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle; `[2]` is not a valid device_region handle.
+
+**E_PERM** — `[1]` does not have the `mmio` cap.
+
+**E_INVAL** — `[1].field1.map` is not 0 (mmio mappings are atomic; the VMAR must be unmapped); `[2]`'s size does not equal `[1]`'s size.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_BADCAP if [2] is not a valid device_region handle.
@@ -1095,7 +1503,11 @@ VMAR cap required on [1]: `mmio`.
 
 ### unmap
 
-Removes mappings from a VMAR. Dispatches on the VMAR's `map` field. With `N = 0`, unmaps everything; with `N > 0`, the selectors specify which mappings to remove and depend on `map`.
+#### Summary
+
+Removes mappings from a VMAR.
+
+#### Declaration
 
 ```
 unmap([1] vmar, [2..N+1] selectors) -> void
@@ -1109,6 +1521,24 @@ unmap([1] vmar, [2..N+1] selectors) -> void
     - map = 3 (demand): byte offsets into the VMAR
     - map = 2 (mmio):   N must be 0
 ```
+
+#### Description
+
+Dispatches on the VMAR's `map` field. With `N = 0`, unmaps everything; with `N > 0`, the selectors specify which mappings to remove and depend on `map`.
+
+#### Capabilities
+
+None beyond holding the VMAR handle.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle; `[1].field1.map = 1` and any selector is not a valid page_frame handle.
+
+**E_INVAL** — `[1].field1.map = 0` (nothing to unmap); `[1].field1.map = 2` and `N > 0`; `[1].field1.map = 3` and any offset selector is not aligned to `[1].sz`.
+
+**E_NOENT** — `[1].field1.map = 1` and any page_frame selector is not currently installed; `[1].field1.map = 3` and no demand-allocated page exists at any offset selector.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_INVAL if [1].field1 `map` is 0 (nothing to unmap).
@@ -1125,7 +1555,11 @@ unmap([1] vmar, [2..N+1] selectors) -> void
 
 ### remap
 
+#### Summary
+
 Updates a VMAR's `cur_rwx`, changing the effective permissions on its currently-mapped pages. Applies to pf and demand mappings only.
+
+#### Declaration
 
 ```
 remap([1] vmar, [2] new_cur_rwx) -> void
@@ -1136,6 +1570,18 @@ remap([1] vmar, [2] new_cur_rwx) -> void
     bits 0-2: new r/w/x
     bits 3-63: _reserved
 ```
+
+#### Capabilities
+
+None beyond holding the VMAR handle.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle.
+
+**E_INVAL** — `[1].field1.map` is 0 or 2 (no pf or demand mapping to remap); `[2]` not a subset of `[1].caps.r/w/x`; `[1].field1.map = 1` and `[2]` not a subset of the intersection of all installed page_frames' r/w/x caps; `[1].caps.dma = 1` and `[2]` has `x` set; reserved bits set in `[2]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_INVAL if [1].field1 `map` is 0 or 2 (no pf or demand mapping to remap).
@@ -1149,7 +1595,11 @@ remap([1] vmar, [2] new_cur_rwx) -> void
 
 ### snapshot
 
+#### Summary
+
 Binds a source VMAR to a target VMAR. On the owning domain's restart, the kernel copies the source's contents into the target before the domain resumes. Used together with `restart_policy = snapshot` on the target VMAR — see §[restart_semantics].
+
+#### Declaration
 
 ```
 snapshot([1] target_vmar, [2] source_vmar) -> void
@@ -1159,6 +1609,8 @@ snapshot([1] target_vmar, [2] source_vmar) -> void
   [2] source_vmar: VMAR handle (must have `caps.restart_policy = preserve` (2))
 ```
 
+#### Description
+
 Calling `snapshot` again replaces any prior binding for `[1]`.
 
 At restart time, the source-to-target copy succeeds only if the source is stable:
@@ -1166,6 +1618,19 @@ At restart time, the source-to-target copy succeeds only if the source is stable
 - For `[2].field1.map = 3` (demand-paged): the source's `cur_rwx.w = 0`. Demand-paged pages are kernel-allocated and not exposed elsewhere, so `mapcnt = 1` is implicit.
 
 If the source's stability cannot be verified at restart, the restart fails and the domain is terminated.
+
+#### Capabilities
+
+- VMAR `[1]`: `restart_policy = snapshot` (3)
+- VMAR `[2]`: `restart_policy = preserve` (2)
+
+#### Errors
+
+**E_BADCAP** — `[1]` or `[2]` is not a valid VMAR handle.
+
+**E_INVAL** — `[1].caps.restart_policy != 3`; `[2].caps.restart_policy != 2`; sizes differ (`page_count × sz`); reserved bits set in `[1]` or `[2]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_BADCAP if [2] is not a valid VMAR handle.
@@ -1181,7 +1646,11 @@ If the source's stability cannot be verified at restart, the restart fails and t
 
 ### idc_read
 
-Reads qwords from a VMAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VMAR's contents). The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
+#### Summary
+
+Reads qwords from a VMAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VMAR's contents).
+
+#### Declaration
 
 ```
 idc_read([1] vmar, [2] offset) -> [3..2+count] qwords
@@ -1193,7 +1662,27 @@ idc_read([1] vmar, [2] offset) -> [3..2+count] qwords
   [2] offset: byte offset within the VMAR (must be 8-byte aligned)
 ```
 
-VMAR cap required on [1]: `r`.
+#### Description
+
+The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
+
+#### Capabilities
+
+- VMAR handle `[1]`: `r`
+
+#### Return value
+
+`[3..2+count]`: qwords read from the VMAR starting at `[2]`.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle.
+
+**E_PERM** — `[1]` does not have the `r` cap.
+
+**E_INVAL** — `[2]` not 8-byte aligned; count is 0 or > 125; `[2] + count*8` exceeds the VMAR's size; reserved bits set in `[1]` or `[2]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_PERM if [1] does not have the `r` cap.
@@ -1206,7 +1695,11 @@ VMAR cap required on [1]: `r`.
 
 ### idc_write
 
-Writes qwords from the caller's vregs into a VMAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VMAR's contents). The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
+#### Summary
+
+Writes qwords from the caller's vregs into a VMAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VMAR's contents).
+
+#### Declaration
 
 ```
 idc_write([1] vmar, [2] offset, [3..2+count] qwords) -> void
@@ -1219,7 +1712,23 @@ idc_write([1] vmar, [2] offset, [3..2+count] qwords) -> void
   [3..2+count] qwords: bytes to write into the VMAR
 ```
 
-VMAR cap required on [1]: `w`.
+#### Description
+
+The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
+
+#### Capabilities
+
+- VMAR handle `[1]`: `w`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VMAR handle.
+
+**E_PERM** — `[1]` does not have the `w` cap.
+
+**E_INVAL** — `[2]` not 8-byte aligned; count is 0 or > 125; `[2] + count*8` exceeds the VMAR's size; reserved bits set in `[1]` or `[2]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 [test 02] returns E_PERM if [1] does not have the `w` cap.
@@ -1287,7 +1796,11 @@ cap (word 0, bits 48-63):
 
 ### create_page_frame
 
+#### Summary
+
 Allocates physical memory and returns a page frame handle.
+
+#### Declaration
 
 ```
 create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
@@ -1304,9 +1817,27 @@ create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
   [3] pages: number of `sz` pages to allocate
 ```
 
-Self-handle cap required: `crpf`.
+#### Capabilities
 
-Returns E_NOMEM if insufficient physical memory; returns E_FULL if the caller's handle table has no free slot.
+- Self-handle: `crpf`
+- `[1].caps` r/w/x ⊆ caller's `pf_ceiling.max_rwx`
+- `[1].caps.max_sz` ≤ caller's `pf_ceiling.max_sz`
+
+#### Return value
+
+`[1]`: page frame handle with caps = `[1].caps`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crpf`; `caps.r/w/x` not a subset of `pf_ceiling.max_rwx`; `caps.max_sz` exceeds `pf_ceiling.max_sz`.
+
+**E_INVAL** — `[3] pages = 0`; `caps.max_sz = 3` (reserved); `props.sz = 3` (reserved); `props.sz` exceeds `caps.max_sz`; reserved bits set in `[1]` or `[2]`.
+
+**E_NOMEM** — insufficient physical memory.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crpf`.
 [test 02] returns E_PERM if caps' r/w/x bits are not a subset of the caller's `pf_ceiling.max_rwx`.
@@ -1413,7 +1944,11 @@ Userspace pairs the counter with `futex_wait_val(addr=&handle.field1, expected=l
 
 ### ack
 
+#### Summary
+
 Acknowledges accumulated IRQs from a device_region. Atomically reads the current IRQ counter, resets it to 0, and unmasks the IRQ line at the interrupt controller.
+
+#### Declaration
 
 ```
 ack([1] device_region) -> [1] prior_count
@@ -1422,7 +1957,23 @@ ack([1] device_region) -> [1] prior_count
   [1] device_region: device_region handle
 ```
 
-device_region cap required on [1]: `irq`.
+#### Capabilities
+
+- device_region handle `[1]`: `irq`
+
+#### Return value
+
+`[1]`: prior IRQ counter value (counter immediately before the call).
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid device_region handle.
+
+**E_PERM** — `[1]` does not have the `irq` cap.
+
+**E_INVAL** — the device_region has no IRQ delivery configured; reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid device_region handle.
 [test 02] returns E_PERM if [1] does not have the `irq` cap.
@@ -1476,7 +2027,11 @@ cap (word 0, bits 48-63):
 
 ### create_virtual_machine
 
+#### Summary
+
 Allocates a VM with its own guest physical address space and initializes kernel-emulated LAPIC/IOAPIC state. vCPUs are created separately via `create_vcpu`.
+
+#### Declaration
 
 ```
 create_virtual_machine([1] caps, [2] policy_page_frame) -> [1] handle
@@ -1492,11 +2047,34 @@ create_virtual_machine([1] caps, [2] policy_page_frame) -> [1] handle
                          §[vm_policy])
 ```
 
-Self-handle cap required: `crvm`.
+#### Description
 
 The kernel retains a reference on `policy_page_frame` for the lifetime of the VM.
 
-Returns E_NOMEM if insufficient kernel memory; returns E_NODEV if the platform does not support hardware virtualization; returns E_FULL if the caller's handle table has no free slot.
+#### Capabilities
+
+- Self-handle: `crvm`
+- `[1].caps` ⊆ caller's `vm_ceiling`
+
+#### Return value
+
+`[1]`: VM handle with caps = `[1].caps`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crvm`; `caps` not a subset of `vm_ceiling`.
+
+**E_BADCAP** — `[2]` is not a valid page frame handle.
+
+**E_INVAL** — `policy_page_frame` smaller than `sizeof(VmPolicy)`; `VmPolicy.num_cpuid_responses` exceeds `MAX_CPUID_POLICIES`; `VmPolicy.num_cr_policies` exceeds `MAX_CR_POLICIES`; reserved bits set in `[1]`.
+
+**E_NODEV** — platform does not support hardware virtualization.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crvm`.
 [test 02] returns E_PERM if caps is not a subset of the caller's `vm_ceiling`.
@@ -1594,7 +2172,11 @@ Semantics:
 
 ### create_vcpu
 
+#### Summary
+
 Creates a vCPU execution context bound to a VM. The vCPU is created suspended on its exit port with zeroed guest state; the creator installs initial guest state through the same mechanism used to handle vm exits — recv on the exit port, modify the vregs, reply with a resume action.
+
+#### Declaration
 
 ```
 create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
@@ -1611,11 +2193,33 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
   [4] exit_port:  port handle where vm_exit events for this vCPU are delivered
 ```
 
-Caps required: caller's self-handle must have `crec`. Holding the VM handle implies the authority to spawn vCPUs in it.
+#### Description
 
 The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events. Immediately upon creation, the kernel enqueues a vm_exit-style delivery on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
 
-Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
+#### Capabilities
+
+- Self-handle: `crec`. Holding the VM handle implies the authority to spawn vCPUs in it.
+- `[1].caps` ⊆ VM's owning domain's `ec_inner_ceiling`
+- `[1].priority` ≤ caller's priority ceiling
+
+#### Return value
+
+`[1]`: EC handle with caps = `[1].caps`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crec`; `caps` not a subset of the VM's owning domain's `ec_inner_ceiling`; `priority` exceeds the caller's priority ceiling.
+
+**E_BADCAP** — `[2]` is not a valid VM handle; `[4]` is not a valid port handle.
+
+**E_INVAL** — `[3]` affinity has bits set outside the system's core count; reserved bits set in `[1]`.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
 [test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
@@ -1632,7 +2236,11 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 ### map_guest
 
+#### Summary
+
 Installs page_frames into the VM's guest physical address space. Subsequent guest accesses to `guest_addr` translate via the second-stage page tables to the corresponding page_frame.
+
+#### Declaration
 
 ```
 map_guest([1] vm, [2 + 2i] guest_addr, [2 + 2i + 1] page_frame) -> void
@@ -1647,6 +2255,18 @@ map_guest([1] vm, [2 + 2i] guest_addr, [2 + 2i + 1] page_frame) -> void
   for i in 0..N-1.
 ```
 
+#### Capabilities
+
+None beyond holding the VM handle.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VM handle; any `[2 + 2i + 1]` is not a valid page_frame handle.
+
+**E_INVAL** — N is 0; any `guest_addr` not aligned to its paired page_frame's `sz`; any two pairs' ranges overlap; any pair's range overlaps an existing mapping.
+
+#### Tests
+
 [test 01] returns E_BADCAP if [1] is not a valid VM handle.
 [test 02] returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
 [test 03] returns E_INVAL if N is 0.
@@ -1657,7 +2277,11 @@ map_guest([1] vm, [2 + 2i] guest_addr, [2 + 2i + 1] page_frame) -> void
 
 ### unmap_guest
 
+#### Summary
+
 Removes page_frame mappings from a VM's guest physical address space.
+
+#### Declaration
 
 ```
 unmap_guest([1] vm, [2 + i] page_frame for i in 0..N-1) -> void
@@ -1669,6 +2293,20 @@ unmap_guest([1] vm, [2 + i] page_frame for i in 0..N-1) -> void
   [2 + i] page_frame: page_frame handle to unmap from the VM
 ```
 
+#### Capabilities
+
+None beyond holding the VM handle.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VM handle; any `[2 + i]` is not a valid page_frame handle.
+
+**E_INVAL** — N is 0.
+
+**E_NOENT** — any page_frame is not currently mapped in `[1]`.
+
+#### Tests
+
 [test 01] returns E_BADCAP if [1] is not a valid VM handle.
 [test 02] returns E_BADCAP if any [2 + i] is not a valid page_frame handle.
 [test 03] returns E_INVAL if N is 0.
@@ -1677,7 +2315,11 @@ unmap_guest([1] vm, [2 + i] page_frame for i in 0..N-1) -> void
 
 ### vm_set_policy
 
-Replaces a single VmPolicy table on the VM, atomically. Tables for other kinds are unchanged. The kind selector is overloaded across architectures; see the per-arch tables below.
+#### Summary
+
+Replaces a single VmPolicy table on the VM, atomically. Tables for other kinds are unchanged.
+
+#### Declaration
 
 ```
 vm_set_policy([1] vm, [2..] entries) -> void
@@ -1689,7 +2331,9 @@ vm_set_policy([1] vm, [2..] entries) -> void
   [1] vm: VM handle
 ```
 
-VM cap required on [1]: `policy`.
+#### Description
+
+The kind selector is overloaded across architectures; see the per-arch tables below.
 
 **x86-64**
 
@@ -1705,6 +2349,20 @@ VM cap required on [1]: `policy`.
 | 0 | replaces `id_reg_responses` | 2 | `[2+2i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`; `[2+2i+1]` = `value u64` |
 | 1 | replaces `sysreg_policies` | 3 | `[2+3i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`; `[2+3i+1]` = `read_value u64`; `[2+3i+2]` = `write_mask u64` |
 
+#### Capabilities
+
+- VM handle `[1]`: `policy`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VM handle.
+
+**E_PERM** — `[1]` does not have the `policy` cap.
+
+**E_INVAL** — count exceeds the active (kind, arch)'s `MAX_*` constant from §[vm_policy]; reserved bits set in `[1]` or any entry.
+
+#### Tests
+
 [test 01] returns E_BADCAP if [1] is not a valid VM handle.
 [test 02] returns E_PERM if [1] does not have the `policy` cap.
 [test 03] returns E_INVAL if count exceeds the active (kind, arch)'s MAX_* constant from §[vm_policy].
@@ -1717,7 +2375,11 @@ VM cap required on [1]: `policy`.
 
 ### vm_inject_irq
 
-Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt controller. Routing to vCPUs follows the guest's configured redirection (IOAPIC RTE on x86-64, GIC distributor on aarch64).
+#### Summary
+
+Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt controller.
+
+#### Declaration
 
 ```
 vm_inject_irq([1] vm, [2] irq_num, [3] assert) -> void
@@ -1730,7 +2392,21 @@ vm_inject_irq([1] vm, [2] irq_num, [3] assert) -> void
     bits 1-63: _reserved
 ```
 
-No cap required beyond holding [1].
+#### Description
+
+Routing to vCPUs follows the guest's configured redirection (IOAPIC RTE on x86-64, GIC distributor on aarch64).
+
+#### Capabilities
+
+None beyond holding `[1]`.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid VM handle.
+
+**E_INVAL** — `[2]` exceeds the maximum IRQ line supported by the VM's emulated interrupt controller; reserved bits set in `[1]` or `[3]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid VM handle.
 [test 02] returns E_INVAL if [2] exceeds the maximum IRQ line supported by the VM's emulated interrupt controller.
@@ -1785,7 +2461,11 @@ cap (word 0, bits 48-63):
 
 ### create_port
 
+#### Summary
+
 Allocates a port and returns a handle to it.
+
+#### Declaration
 
 ```
 create_port([1] caps) -> [1] handle
@@ -1796,9 +2476,26 @@ create_port([1] caps) -> [1] handle
     bits 16-63: _reserved
 ```
 
-Self-handle cap required: `crpt`.
+#### Capabilities
 
-Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
+- Self-handle: `crpt`
+- `[1].caps` ⊆ caller's `port_ceiling`
+
+#### Return value
+
+`[1]`: port handle with caps = `[1].caps`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `crpt`; `caps` not a subset of `port_ceiling`.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crpt`.
 [test 02] returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
@@ -1807,7 +2504,11 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 ### suspend
 
-Suspends the target execution context and delivers a suspension event to a port. The event exposes the EC's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the EC.
+#### Summary
+
+Suspends the target execution context and delivers a suspension event to a port.
+
+#### Declaration
 
 Suspend has two encodings on the wire — a fast variant for the L4-style IPC fast path (no handle attachments, payload entirely in GPR-backed vregs) and a general variant that supports handle attachments and the full payload range.
 
@@ -1841,14 +2542,30 @@ suspend([1] target, [2] port) -> void
   [2] port: port handle (suspension event delivery target)
 ```
 
-EC cap required on [1]: `susp`. Visibility and writability of the target's state in the suspension event are gated by [1]'s `read` and `write` caps.
-Port cap required on [2]: `bind`. Additionally `xfer` if any handles are attached in the syscall word's `pair_count`.
+#### Description
+
+The event exposes the EC's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the EC.
 
 `[1]` may reference the calling EC; the syscall returns after the calling EC is resumed.
 
 Handle attachments in the suspension event payload follow §[handle_attachments].
 
 The receiver only reads vregs 1..payload_count as event-state payload; vregs above payload_count are undefined. The sender is responsible for zeroing or otherwise preparing its own register state before issuing suspend — the kernel does not zero or restore unused vregs.
+
+#### Capabilities
+
+- EC handle `[1]`: `susp`. Visibility and writability of the target's state in the suspension event are gated by `[1]`'s `read` and `write` caps.
+- Port handle `[2]`: `bind`. Additionally `xfer` if any handles are attached.
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle; `[2]` is not a valid port handle.
+
+**E_PERM** — `[1]` lacks `susp`; `[2]` lacks `bind`.
+
+**E_INVAL** — reserved bits set; `[1]` references a vCPU; `[1]` is already suspended.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_BADCAP if [2] is not a valid port handle.
@@ -1865,7 +2582,11 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 ### recv
 
-Blocks waiting for an event on a port. On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended EC's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
+#### Summary
+
+Blocks waiting for an event on a port.
+
+#### Declaration
 
 ```
 recv([1] port, [2] timeout_ns) -> void
@@ -1885,13 +2606,31 @@ recv([1] port, [2] timeout_ns) -> void
                   many nanoseconds with E_TIMEOUT
 ```
 
-Port cap required on [1]: `recv`.
+#### Description
+
+On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended EC's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
 
 When multiple senders are queued on the port, the kernel selects the highest-priority sender; ties resolve FIFO. The chosen sender remains suspended until the reply handle is consumed: `reply` resumes them, `delete` on the reply handle resolves them with `E_ABANDONED`.
 
-Returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no events queued — the call returns immediately rather than blocking. If the port becomes terminally closed while a recv is blocked, the call returns E_CLOSED.
+#### Capabilities
 
-Returns E_FULL if the caller's handle table cannot accommodate the reply handle plus pair_count attached handles.
+- Port handle `[1]`: `recv`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid port handle.
+
+**E_PERM** — `[1]` does not have the `recv` cap.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+**E_CLOSED** — port has no bind-cap holders, no event_routes targeting it, and no queued events (call returns immediately rather than blocking); also raised if the port becomes terminally closed while a recv is blocked.
+
+**E_TIMEOUT** — `[2] timeout_ns` is nonzero, no sender queued, and none becomes queued within the deadline.
+
+**E_FULL** — caller's handle table cannot accommodate the reply handle plus `pair_count` attached handles.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid port handle.
 [test 02] returns E_PERM if [1] does not have the `recv` cap.
@@ -2144,7 +2883,11 @@ When an event of a registerable type fires for an EC and no route is bound for `
 
 ### bind_event_route
 
-Installs the kernel-held binding `(target, event_type) → port`. If a binding already exists for `(target, event_type)`, it is replaced atomically — there is no window during which the route falls back to the no-route handling.
+#### Summary
+
+Installs the kernel-held binding `(target, event_type) → port`.
+
+#### Declaration
 
 ```
 bind_event_route([1] target, [2] event_type, [3] port) -> void
@@ -2155,8 +2898,24 @@ bind_event_route([1] target, [2] event_type, [3] port) -> void
   [3] port:       port handle
 ```
 
-EC cap required on [1]: `bind` if no prior route exists for `(target, event_type)`; `rebind` if one does.
-Port cap required on [3]: `bind`.
+#### Description
+
+If a binding already exists for `(target, event_type)`, it is replaced atomically — there is no window during which the route falls back to the no-route handling.
+
+#### Capabilities
+
+- EC handle `[1]`: `bind` if no prior route exists for `(target, event_type)`; `rebind` if one does.
+- Port handle `[3]`: `bind`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle; `[3]` is not a valid port handle.
+
+**E_PERM** — `[3]` lacks `bind`; no prior route exists and `[1]` lacks `bind`; a prior route exists and `[1]` lacks `rebind`.
+
+**E_INVAL** — `[2]` is not a registerable event type (i.e., not in {1, 2, 3, 6}); reserved bits set in `[1]`, `[2]`, or `[3]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_BADCAP if [3] is not a valid port handle.
@@ -2171,7 +2930,11 @@ Port cap required on [3]: `bind`.
 
 ### clear_event_route
 
+#### Summary
+
 Removes the binding for `(target, event_type)`. Subsequent firings of that event type for the EC fall back to the no-route handling defined above.
+
+#### Declaration
 
 ```
 clear_event_route([1] target, [2] event_type) -> void
@@ -2181,7 +2944,21 @@ clear_event_route([1] target, [2] event_type) -> void
   [2] event_type: u64; must be a registerable event type
 ```
 
-EC cap required on [1]: `unbind`.
+#### Capabilities
+
+- EC handle `[1]`: `unbind`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid EC handle.
+
+**E_PERM** — `[1]` does not have the `unbind` cap.
+
+**E_INVAL** — `[2]` is not a registerable event type; reserved bits set in `[1]` or `[2]`.
+
+**E_NOENT** — no binding exists for `([1], [2])`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 [test 02] returns E_PERM if [1] does not have the `unbind` cap.
@@ -2237,20 +3014,11 @@ The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and 
 
 ### reply
 
-Consumes a reply handle and resumes the suspended EC. Optionally attaches up to 63 handles to the resumption (when `pair_count > 0`) and/or atomically blocks the caller on a port for the next event (when `recv_port_handle_id != 0`). State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
+#### Summary
 
-The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
+Consumes a reply handle and resumes the suspended EC. Optionally attaches up to 63 handles to the resumption (when `pair_count > 0`) and/or atomically blocks the caller on a port for the next event (when `recv_port_handle_id != 0`).
 
-The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
-
-- For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
-- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`, `pmu_overflow`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
-
-The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
-
-When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain). The `xfer` cap on the reply handle is required for any `pair_count > 0` call.
-
-When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another EC to interleave a syscall on the caller in between. The named port must have the `recv` cap. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended EC was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
+#### Declaration
 
 ```
 reply([128-N..127] pair_entries when pair_count > 0) -> void
@@ -2265,7 +3033,43 @@ reply([128-N..127] pair_entries when pair_count > 0) -> void
   vregs [128-pair_count..127]: pair entries packed per §[handle_attachments]
 ```
 
-No self-handle cap required — the reply handle itself authorizes the operation. The `xfer` cap on the reply handle is required when `pair_count > 0`. The `recv` cap on the port handle is required when `recv_port_handle_id != 0`.
+#### Description
+
+State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
+
+The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
+
+The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
+
+- For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
+- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`, `pmu_overflow`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
+
+The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
+
+When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain).
+
+When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another EC to interleave a syscall on the caller in between. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended EC was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
+
+#### Capabilities
+
+The reply handle itself authorizes the operation; no self-handle cap is required.
+
+- Reply handle: `xfer` (when `pair_count > 0`)
+- Port handle named by `recv_port_handle_id` (when nonzero): `recv`
+
+#### Errors
+
+**E_BADCAP** — `reply_handle_id` is not a valid reply handle; `recv_port_handle_id != 0` and that slot does not name a valid port handle (reply handle NOT consumed; caller does not park).
+
+**E_PERM** — `pair_count > 0` and the reply handle lacks `xfer`; any pair entry's caps not a subset of source's caps; pair entry with `move = 1` lacks the `move` cap; pair entry with `move = 0` lacks the `copy` cap; `recv_port_handle_id != 0` and the named port lacks `recv` (reply handle NOT consumed; caller does not park).
+
+**E_INVAL** — reserved bits set in the syscall word; `pair_count > 63`; reserved bits set in any pair entry; two pair entries reference the same source.
+
+**E_TERM** — suspended EC was terminated before reply could deliver; the reply handle is consumed; on `pair_count > 0` no handle transfer occurs; on `recv_port_handle_id != 0` the caller does NOT park.
+
+**E_FULL** — `pair_count > 0` and the resumed EC's domain handle table cannot accommodate N contiguous slots (reply handle NOT consumed; caller's table unchanged).
+
+#### Tests
 
 [test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
 [test 02] returns E_INVAL if any reserved bits are set in the syscall word.
@@ -2352,7 +3156,11 @@ cap (word 0, bits 48-63):
 
 ### timer_arm
 
+#### Summary
+
 Mints a new timer handle with its own counter and arms it. Each call yields an independent timer; previously-minted timers are unaffected.
+
+#### Declaration
 
 ```
 timer_arm([1] caps, [2] deadline_ns, [3] flags) -> [1] handle
@@ -2369,11 +3177,30 @@ timer_arm([1] caps, [2] deadline_ns, [3] flags) -> [1] handle
     bits 1-63: _reserved
 ```
 
-Self-handle cap required: `timer`.
+#### Description
 
 On each fire, the kernel atomically increments `field0` of every domain-local copy of the handle (saturating at `u64::MAX − 1`) and issues a futex wake on each copy's `field0` paddr. One-shot timers transition `field1.arm` to 0 after the single fire; periodic timers stay armed until `timer_cancel`.
 
-Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's handle table has no free slot.
+#### Capabilities
+
+- Self-handle: `timer`
+- `[1].caps.restart_policy` ≤ caller's `restart_policy_ceiling.tm_restart_max`
+
+#### Return value
+
+`[1]`: timer handle with caps = `[1].caps`. field0 = 0; field1.arm = 1; field1.pd = `[3].periodic`.
+
+#### Errors
+
+**E_PERM** — self-handle lacks `timer`; `caps.restart_policy = 1` and `restart_policy_ceiling.tm_restart_max = 0`.
+
+**E_INVAL** — `[2] deadline_ns = 0`; reserved bits set in `[1]` or `[3]`.
+
+**E_NOMEM** — insufficient kernel memory.
+
+**E_FULL** — caller's handle table has no free slot.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `timer`.
 [test 02] returns E_PERM if [1].caps.restart_policy = 1 and the caller's `restart_policy_ceiling.tm_restart_max = 0`.
@@ -2388,7 +3215,11 @@ Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the caller's ha
 
 ### timer_rearm
 
+#### Summary
+
 Reconfigures an existing timer. Resets `field0` to 0, sets `field1.arm = 1`, sets `field1.pd = [3].periodic`, and applies the new `deadline_ns`. Works regardless of whether the timer was armed or disarmed at call time.
+
+#### Declaration
 
 ```
 timer_rearm([1] timer, [2] deadline_ns, [3] flags) -> void
@@ -2401,7 +3232,19 @@ timer_rearm([1] timer, [2] deadline_ns, [3] flags) -> void
     bits 1-63: _reserved
 ```
 
-Timer cap required on [1]: `arm`.
+#### Capabilities
+
+- Timer handle `[1]`: `arm`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid timer handle.
+
+**E_PERM** — `[1]` does not have the `arm` cap.
+
+**E_INVAL** — `[2] deadline_ns = 0`; reserved bits set in `[1]` or `[3]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid timer handle.
 [test 02] returns E_PERM if [1] does not have the `arm` cap.
@@ -2416,7 +3259,11 @@ Timer cap required on [1]: `arm`.
 
 ### timer_cancel
 
-Disarms a timer. Returns an error if the timer is not currently armed (e.g., a one-shot that already fired, or one already cancelled). Sets `field0` to `u64::MAX` (the cancellation sentinel), sets `field1.arm = 0`, and wakes futex waiters.
+#### Summary
+
+Disarms a timer. Sets `field0` to `u64::MAX` (the cancellation sentinel), sets `field1.arm = 0`, and wakes futex waiters.
+
+#### Declaration
 
 ```
 timer_cancel([1] timer) -> void
@@ -2425,7 +3272,23 @@ timer_cancel([1] timer) -> void
   [1] timer: timer handle
 ```
 
-Timer cap required on [1]: `cancel`.
+#### Description
+
+Returns an error if the timer is not currently armed (e.g., a one-shot that already fired, or one already cancelled).
+
+#### Capabilities
+
+- Timer handle `[1]`: `cancel`
+
+#### Errors
+
+**E_BADCAP** — `[1]` is not a valid timer handle.
+
+**E_PERM** — `[1]` does not have the `cancel` cap.
+
+**E_INVAL** — `[1].field1.arm = 0`; reserved bits set in `[1]`.
+
+#### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid timer handle.
 [test 02] returns E_PERM if [1] does not have the `cancel` cap.
@@ -2449,7 +3312,11 @@ Both block until any of the per-pair conditions is met, until any thread calls `
 
 ### futex_wait_val
 
+#### Summary
+
 Blocks while every `(addr, expected)` pair satisfies `*addr == expected`. Returns when any pair has `*addr != expected` (either at call entry or after a wake), when any watched address is woken via `futex_wake`, or on timeout.
+
+#### Declaration
 
 ```
 futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
@@ -2464,7 +3331,25 @@ futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
   for i in 0..N-1.
 ```
 
-Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fut_wait_max`.
+#### Capabilities
+
+- Self-handle: `fut_wait_max >= 1`; the call's `N` must not exceed `fut_wait_max`.
+
+#### Return value
+
+`[1]`: address that triggered the wake (the addr whose pair's condition flipped, or that was passed to `futex_wake`).
+
+#### Errors
+
+**E_PERM** — caller's self-handle has `fut_wait_max = 0`.
+
+**E_INVAL** — N is 0 or > 63; N exceeds caller's self-handle `fut_wait_max`; any addr not 8-byte aligned.
+
+**E_BADADDR** — any addr is not a valid user address in the caller's domain.
+
+**E_TIMEOUT** — timeout expired before any pair's `addr != expected` condition was met and before any watched address was woken.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
 [test 02] returns E_INVAL if N is 0 or N > 63.
@@ -2477,7 +3362,11 @@ Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fu
 
 ### futex_wait_change
 
+#### Summary
+
 Blocks while every `(addr, target)` pair satisfies `*addr != target`. Returns when any pair has `*addr == target` (at call entry or after a wake), when any watched address is woken via `futex_wake`, or on timeout.
+
+#### Declaration
 
 ```
 futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] addr
@@ -2492,7 +3381,25 @@ futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] add
   for i in 0..N-1.
 ```
 
-Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fut_wait_max`.
+#### Capabilities
+
+- Self-handle: `fut_wait_max >= 1`; the call's `N` must not exceed `fut_wait_max`.
+
+#### Return value
+
+`[1]`: address that triggered the wake.
+
+#### Errors
+
+**E_PERM** — caller's self-handle has `fut_wait_max = 0`.
+
+**E_INVAL** — N is 0 or > 63; N exceeds caller's self-handle `fut_wait_max`; any addr not 8-byte aligned.
+
+**E_BADADDR** — any addr is not a valid user address in the caller's domain.
+
+**E_TIMEOUT** — timeout expired before any pair's `addr == target` condition was met and before any watched address was woken.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle has `fut_wait_max = 0`.
 [test 02] returns E_INVAL if N is 0 or N > 63.
@@ -2505,7 +3412,11 @@ Self-handle requirement: `fut_wait_max >= 1`. The call's `N` must not exceed `fu
 
 ### futex_wake
 
+#### Summary
+
 Wakes up to `count` ECs blocked in `futex_wait_val` or `futex_wait_change` on the given address. Wake order is priority-ordered.
+
+#### Declaration
 
 ```
 futex_wake([1] addr, [2] count) -> [1] woken
@@ -2515,7 +3426,23 @@ futex_wake([1] addr, [2] count) -> [1] woken
   [2] count: maximum number of ECs to wake
 ```
 
-Self-handle cap required: `fut_wake`.
+#### Capabilities
+
+- Self-handle: `fut_wake`
+
+#### Return value
+
+`[1]`: number of ECs actually woken (0..count).
+
+#### Errors
+
+**E_PERM** — caller's self-handle lacks `fut_wake`.
+
+**E_INVAL** — `[1]` addr is not 8-byte aligned.
+
+**E_BADADDR** — `[1]` addr is not a valid user address in the caller's domain.
+
+#### Tests
 
 [test 01] returns E_PERM if the caller's self-handle lacks `fut_wake`.
 [test 02] returns E_INVAL if [1] addr is not 8-byte aligned.
@@ -2528,33 +3455,47 @@ Self-handle cap required: `fut_wake`.
 
 #### time_monotonic
 
-Returns nanoseconds since boot.
+**Summary** — Returns nanoseconds since boot.
+
+**Declaration**
 
 ```
 time_monotonic() -> [1] ns
   syscall_num = 60
 ```
 
-No cap required.
+**Capabilities** — None.
+
+**Return value** — `[1]`: u64 nanoseconds since boot.
+
+**Tests**
 
 [test 01] on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
 
 #### time_getwall
 
-Returns wall-clock time as nanoseconds since the Unix epoch.
+**Summary** — Returns wall-clock time as nanoseconds since the Unix epoch.
+
+**Declaration**
 
 ```
 time_getwall() -> [1] ns_since_epoch
   syscall_num = 61
 ```
 
-No cap required.
+**Capabilities** — None.
+
+**Return value** — `[1]`: nanoseconds since the Unix epoch.
+
+**Tests**
 
 [test 02] after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
 
 #### time_setwall
 
-Sets the wall-clock time to the given nanoseconds-since-epoch.
+**Summary** — Sets the wall-clock time to the given nanoseconds-since-epoch.
+
+**Declaration**
 
 ```
 time_setwall([1] ns_since_epoch) -> void
@@ -2563,7 +3504,15 @@ time_setwall([1] ns_since_epoch) -> void
   [1] ns_since_epoch: new wall-clock value (nanoseconds since Unix epoch)
 ```
 
-Self-handle cap required: `setwall`.
+**Capabilities** — Self-handle: `setwall`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `setwall`.
+
+**E_INVAL** — reserved bits set in `[1]`.
+
+**Tests**
 
 [test 03] returns E_PERM if the caller's self-handle lacks `setwall`.
 [test 04] returns E_INVAL if any reserved bits are set in [1].
@@ -2573,7 +3522,9 @@ Self-handle cap required: `setwall`.
 
 #### random
 
-Fills the requested number of vregs with cryptographically random qwords.
+**Summary** — Fills the requested number of vregs with cryptographically random qwords.
+
+**Declaration**
 
 ```
 random() -> [1..count] qwords
@@ -2582,7 +3533,15 @@ random() -> [1..count] qwords
   syscall word bits 12-19: count (1..127)
 ```
 
-No cap required.
+**Capabilities** — None.
+
+**Return value** — `[1..count]`: cryptographically-random u64 qwords.
+
+**Errors**
+
+**E_INVAL** — count is 0 or > 127.
+
+**Tests**
 
 [test 01] returns E_INVAL if count is 0 or count > 127.
 [test 02] on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
@@ -2591,16 +3550,19 @@ No cap required.
 
 #### info_system
 
-Returns system-wide capacity and capability information.
+**Summary** — Returns system-wide capacity and capability information.
+
+**Declaration**
 
 ```
 info_system() -> [1] cores, [2] features, [3] total_phys_pages, [4] page_size_mask
   syscall_num = 64
 ```
 
-No cap required.
+**Capabilities** — None.
 
-Output:
+**Return value**
+
 - `[1]` cores: total online CPU core count
 - `[2]` features: bitmask
   - bit 0: hardware virtualization (Intel VMX or AMD SVM)
@@ -2615,13 +3577,17 @@ Output:
   - bit 2: 1 GiB
   - bits 3-63: _reserved
 
+**Tests**
+
 [test 01] on success, [1] equals the number of online CPU cores reported by the platform.
 [test 02] on success, [3] equals the platform's total RAM divided by 4 KiB.
 [test 03] on success, [4] bit 0 is set on every supported architecture.
 
 #### info_cores
 
-Returns information about a specific core.
+**Summary** — Returns information about a specific core.
+
+**Declaration**
 
 ```
 info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
@@ -2630,9 +3596,10 @@ info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
   [1] on input: core id
 ```
 
-No cap required.
+**Capabilities** — None.
 
-Output:
+**Return value**
+
 - `[1]` flags: bitmask
   - bit 0: online
   - bit 1: idle states supported
@@ -2640,6 +3607,12 @@ Output:
   - bits 3-63: _reserved
 - `[2]` freq_hz: current frequency in Hz, 0 if unreadable
 - `[3]` vendor_model: platform-defined packed identifier; layout follows the architecture vendor's encoding (e.g., x86 family/model/stepping, ARM IDR fields)
+
+**Errors**
+
+**E_INVAL** — `[1] core_id ≥ info_system().cores`; reserved bits set in `[1]`.
+
+**Tests**
 
 [test 04] returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
 [test 05] returns E_INVAL if any reserved bits are set in [1].
@@ -2651,29 +3624,51 @@ All `power_*` syscalls require `power` on the caller's self-handle.
 
 #### power_shutdown
 
-Performs an immediate orderly system poweroff. Does not return on success.
+**Summary** — Performs an immediate orderly system poweroff. Does not return on success.
+
+**Declaration**
 
 ```
 power_shutdown() -> void
   syscall_num = 66
 ```
 
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**Tests**
+
 [test 01] returns E_PERM if the caller's self-handle lacks `power`.
 
 #### power_reboot
 
-Performs a warm system reboot. Does not return on success.
+**Summary** — Performs a warm system reboot. Does not return on success.
+
+**Declaration**
 
 ```
 power_reboot() -> void
   syscall_num = 67
 ```
 
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**Tests**
+
 [test 02] returns E_PERM if the caller's self-handle lacks `power`.
 
 #### power_sleep
 
-Enters a system-wide low-power state at the requested depth. Returns when the system wakes.
+**Summary** — Enters a system-wide low-power state at the requested depth. Returns when the system wakes.
+
+**Declaration**
 
 ```
 power_sleep([1] depth) -> void
@@ -2682,24 +3677,48 @@ power_sleep([1] depth) -> void
   [1] depth: 1 = sleep (S1/S3-equivalent), 3 = deep sleep (S4-equivalent), 4 = hibernate (S5-equivalent)
 ```
 
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**E_INVAL** — `[1]` is not 1, 3, or 4.
+
+**E_NODEV** — platform does not support the requested sleep depth.
+
+**Tests**
+
 [test 03] returns E_PERM if the caller's self-handle lacks `power`.
 [test 04] returns E_INVAL if [1] is not 1, 3, or 4.
 [test 05] returns E_NODEV if the platform does not support the requested sleep depth.
 
 #### power_screen_off
 
-Turns the primary display off. Subsequent input wakes it.
+**Summary** — Turns the primary display off. Subsequent input wakes it.
+
+**Declaration**
 
 ```
 power_screen_off() -> void
   syscall_num = 69
 ```
 
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**Tests**
+
 [test 06] returns E_PERM if the caller's self-handle lacks `power`.
 
 #### power_set_freq
 
-Sets the target frequency for a specific core in Hz.
+**Summary** — Sets the target frequency for a specific core in Hz.
+
+**Declaration**
 
 ```
 power_set_freq([1] core_id, [2] hz) -> void
@@ -2709,6 +3728,18 @@ power_set_freq([1] core_id, [2] hz) -> void
   [2] hz: target frequency in Hz; 0 = let the kernel pick
 ```
 
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**E_INVAL** — `[1] ≥ info_system().cores`; `[2]` is nonzero and outside the platform's supported frequency range.
+
+**E_NODEV** — the queried core does not support frequency scaling (per `info_cores` flag bit 2).
+
+**Tests**
+
 [test 07] returns E_PERM if the caller's self-handle lacks `power`.
 [test 08] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
 [test 09] returns E_NODEV if the queried core does not support frequency scaling (per `info_cores` flag bit 2).
@@ -2717,7 +3748,9 @@ power_set_freq([1] core_id, [2] hz) -> void
 
 #### power_set_idle
 
-Sets the idle policy for a specific core.
+**Summary** — Sets the idle policy for a specific core.
+
+**Declaration**
 
 ```
 power_set_idle([1] core_id, [2] policy) -> void
@@ -2726,6 +3759,18 @@ power_set_idle([1] core_id, [2] policy) -> void
   [1] core_id: target core
   [2] policy: 0 = busy-poll (no idle entry), 1 = halt only (shallow), 2 = deepest available c-state
 ```
+
+**Capabilities** — Self-handle: `power`.
+
+**Errors**
+
+**E_PERM** — caller's self-handle lacks `power`.
+
+**E_INVAL** — `[1] ≥ info_system().cores`; `[2]` is greater than 2.
+
+**E_NODEV** — the queried core does not support idle states (per `info_cores` flag bit 1).
+
+**Tests**
 
 [test 12] returns E_PERM if the caller's self-handle lacks `power`.
 [test 13] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
