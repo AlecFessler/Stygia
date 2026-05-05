@@ -885,14 +885,16 @@ fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
 fn initIommuDevices() void {
     if (!iommu.isAvailable()) return;
 
-    // SPEC AMBIGUITY (spec-v3, §[device_region]): the spec-v3 device_region
-    // does not carry PCI BDF, but `iommu.setupDevice` populates root/context
-    // tables keyed on bus:dev.func. The boot-time path that walks enumerated
-    // devices and binds IOMMU context entries is not specified — resolving
-    // requires either extending device_region with BDF, or a separate
-    // kernel-internal PCI table the IOMMU consumes during boot. No-op here:
-    // the test runner does not use DMA, and per-device binding is invoked
-    // lazily on first DMA-cap exercise. See specv3.md §[device_region].
+    // Per-device root/context entries are installed lazily on first
+    // mapPage call (the IOMMU subsystem keys per-device state on
+    // *DeviceRegion). What we *do* need to do here is flip the global
+    // translation-enable bit so subsequent DMA actually walks the
+    // page tables. Enabling with empty per-device tables is the
+    // documented path (see vtd.enableTranslation / vi.enableTranslation
+    // comments) — until a driver maps something, transactions for that
+    // device hit "context entry not present" and fault, which is what
+    // we want.
+    iommu.enableTranslation();
 }
 
 const MAX_CORES = 64;
