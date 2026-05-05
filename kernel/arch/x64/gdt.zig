@@ -1,8 +1,16 @@
 const zag = @import("zag");
 
+const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
+const memory_init = zag.memory.init;
+const paging = zag.memory.paging;
+const pmm = zag.memory.pmm;
+const stack_mod = zag.memory.stack;
 
+const MemoryPerms = zag.memory.address.MemoryPerms;
+const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const VAddr = zag.memory.address.VAddr;
 
 /// Intel SDM Vol 3A §3.5.1 — GDTR holds base address and limit of the GDT.
 const GdtPtr = packed struct {
@@ -195,12 +203,69 @@ pub fn init() void {
 }
 
 pub fn initForCore(core_id: u64) void {
-    tss_entries[core_id] = .{};
+    // `tss_entries` is zero-initialized at module scope; do not reset
+    // here so that `initIst` (run after memory init) can populate the
+    // IST fields and have them survive a re-entry into `initForCore`
+    // from the smpInit per-core loop.
     writeTssDescriptor(core_id);
     // Pointer-index `per_core_gdt_ptrs[]` to avoid Debug-mode
     // codegen copying the array onto the per-core init stack frame.
     // See the matching note in sched.scheduler on `core_states[]`.
     (&per_core_gdt_ptrs[core_id]).base = @intFromPtr(&per_core_gdts[core_id]);
+}
+
+/// IST slot assignments (Intel SDM Vol 3A §7.14.5). Each non-IF-gated
+/// exception gets its own kernel stack so that the CPU's hardware stack
+/// switch cannot scribble onto another in-flight kernel routine's rsp
+/// window. Vector → IST index follows the Linux convention.
+pub const IST_DOUBLE_FAULT: u3 = 1;
+pub const IST_NMI: u3 = 2;
+pub const IST_MACHINE_CHECK: u3 = 3;
+pub const IST_PAGE_FAULT: u3 = 4;
+
+const IST_KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
+
+/// Allocate the four IST kernel stacks for `core_id` and write their
+/// tops into `tss_entries[core_id].ist1..ist4`. Must run after memory
+/// init (PMM + kernel address space) and before the gate's IST index
+/// is patched via `idt.setIst`.
+///
+/// The four stacks are allocated through `stack_mod.createKernel` so
+/// they share the kernel-stack guard-page discipline (`isKernelStackPage`
+/// detects overflow into the guard during fault handling).
+pub fn initIst(core_id: u64) !void {
+    const tss = &tss_entries[core_id];
+
+    // No partial cleanup on failure — at boot a `try` failure here is
+    // fatal and the caller propagates the error to `kMain`'s panic.
+    tss.ist1 = try mapIstStack();
+    tss.ist2 = try mapIstStack();
+    tss.ist3 = try mapIstStack();
+    tss.ist4 = try mapIstStack();
+}
+
+/// Allocate one kernel-stack slot, populate it with PMM-backed pages,
+/// and return the stack-top virtual address (suitable for direct
+/// assignment into a TSS IST field).
+fn mapIstStack() !u64 {
+    const stack = try stack_mod.createKernel();
+    const pmm_mgr = &pmm.global_pmm.?;
+
+    var page_addr = stack.base.addr;
+    while (page_addr < stack.top.addr) {
+        const kpage = try pmm_mgr.create(paging.PageMem(.page4k));
+        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
+        try arch_paging.mapPage(
+            memory_init.kernel_addr_space_root,
+            kphys,
+            VAddr.fromInt(page_addr),
+            IST_KERNEL_PERMS,
+            .kernel_data,
+        );
+        page_addr += paging.PAGE4K;
+    }
+
+    return stack.top.addr;
 }
 
 pub fn loadGdt(core_id: u64) void {

@@ -160,6 +160,30 @@ pub fn init() void {
     }
 }
 
+/// Patch the IDT gate descriptors for #DF, #NMI, #MC, and #PF to use
+/// the Interrupt Stack Table mechanism (Intel SDM Vol 3A §7.14.5).
+/// Must run after `gdt.initIst(core_id)` has populated `TSS.IST[N]`
+/// for every core that may take one of these exceptions — IST is per-
+/// CPU TSS state, but the IDT (and therefore the IST index in each
+/// gate) is global. Once patched, every exception of these vectors
+/// will hardware-switch RSP to the per-core IST stack regardless of
+/// the rsp value at the time of the fault.
+///
+/// Concretely this protects the L4 IPC fast path: that path runs with
+/// `rsp = ec.kstack.top` and stores the user iret frame at
+/// `ec.kstack.top - 40 .. ec.kstack.top - 8`, which exactly overlaps
+/// `ec.ctx`'s iret slots. Without IST, a #PF taken in the fast path
+/// would have the CPU push its own 5-word iret frame at `rsp - 40`,
+/// corrupting `ec.ctx`. With IST, the CPU loads RSP from
+/// `TSS.IST[IST_PAGE_FAULT]` first, so the in-flight `ec.ctx` window
+/// is untouched.
+pub fn wireIstGates() void {
+    idt.setIst(@intFromEnum(Exception.double_fault), gdt.IST_DOUBLE_FAULT);
+    idt.setIst(@intFromEnum(Exception.non_maskable_interrupt), gdt.IST_NMI);
+    idt.setIst(@intFromEnum(Exception.machine_check), gdt.IST_MACHINE_CHECK);
+    idt.setIst(@intFromEnum(Exception.page_fault), gdt.IST_PAGE_FAULT);
+}
+
 /// Event-route classification of an architectural exception. `null` for
 /// vectors handled out-of-band (lazy FPU trap, single-step, NMI, machine
 /// check, double fault).

@@ -6,6 +6,7 @@ const trampoline_code = @import("embedded_bins").trampoline;
 const apic = zag.arch.x64.apic;
 const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
+const exceptions = zag.arch.x64.exceptions;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -51,7 +52,23 @@ pub fn smpInit() !void {
 
     for (0..apic.coreCount()) |i| {
         gdt.initForCore(i);
+        // Allocate the per-core IST kernel stacks for #DF/#NMI/#MC/#PF
+        // and write the tops into TSS.IST[1..4]. The CPU re-reads
+        // these fields from TSS memory on every IST-using exception
+        // (Intel SDM Vol 3A §7.14.5), so writes are visible to the
+        // current core without an `ltr` reload — and to APs once they
+        // run `loadGdt`/`ltr` in `coreInit`. We must not patch any
+        // IDT gate to reference an IST slot until every core's TSS
+        // is populated, which is why `wireIstGates` runs after the
+        // loop completes.
+        try gdt.initIst(i);
     }
+
+    // Patch the IDT gate descriptors for #DF/#NMI/#MC/#PF so the CPU
+    // hardware-switches to the per-core IST stack on entry. From this
+    // point forward those exceptions cannot land on the L4 fast path's
+    // `rsp = ec.kstack.top` window and corrupt `ec.ctx`.
+    exceptions.wireIstGates();
 
     const trampoline_phys = PAddr.fromInt(TRAMPOLINE_PHYS);
     const trampoline_virt = VAddr.fromInt(TRAMPOLINE_PHYS);

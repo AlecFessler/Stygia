@@ -91,3 +91,16 @@ pub fn openInterruptGate(
         .isr_base_high = @truncate(addr >> 32),
     };
 }
+
+/// Patch the IST index on an existing gate descriptor. Intel SDM Vol 3A
+/// §7.14.5 — when the IST field is non-zero, the CPU unconditionally
+/// loads RSP from `TSS.IST[N]` before pushing the iret frame, regardless
+/// of the rsp value at the time of the exception. Used to give #PF, #NMI,
+/// #MC, and #DF private kernel stacks so they cannot scribble over an
+/// in-progress kernel routine's rsp window (e.g., the L4 IPC fast path
+/// running with rsp at ec.kstack.top, where ec.ctx is one frame below).
+pub fn setIst(int_num: u8, ist_index: u3) void {
+    std.debug.assert(int_num < num_idt_entries);
+    std.debug.assert(idt[int_num].present);
+    idt[int_num].ist = ist_index;
+}
