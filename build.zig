@@ -24,11 +24,19 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
+    const desktop = Profile{
+        .root_service = "desktopOS/bin/desktopOS.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
 };
 
 fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "linux_guest")) return profiles.linux_guest;
+    if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
 
     return null;
 }
@@ -347,6 +355,10 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_root_service.step);
 
     // ── QEMU ────────────────────────────────────────────────────────────
+    const wants_nvme = profile_name != null and
+        (std.mem.eql(u8, profile_name.?, "linux_guest") or
+            std.mem.eql(u8, profile_name.?, "desktop"));
+
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)
             "-enable-kvm -cpu host,pmu=on"
@@ -382,7 +394,7 @@ pub fn build(b: *std.Build) void {
             "-device intel-iommu,intremap=off"
         else
             "-device amd-iommu";
-        const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest"))
+        const qemu_nvme_args: []const u8 = if (wants_nvme)
             b.fmt(
                 \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0 \
                 \\-device nvme,drive=nvme0,serial=zagdisk0
@@ -430,7 +442,7 @@ pub fn build(b: *std.Build) void {
     });
     qemu_cmd.step.dependOn(b.getInstallStep());
 
-    if (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest")) {
+    if (wants_nvme) {
         const create_nvme_img = b.addSystemCommand(&[_][]const u8{
             "sh", "-c", b.fmt(
                 "mkdir -p {s} && test -f {s}/nvme.img || dd if=/dev/zero of={s}/nvme.img bs=1M count=64 2>/dev/null",
