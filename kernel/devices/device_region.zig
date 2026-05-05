@@ -34,6 +34,48 @@ pub const DeviceType = enum(u8) {
     port_io = 1,
 };
 
+/// Optional PCI requester identifier for an MMIO region. Set when the
+/// region was registered via `registerMmioPci`/`registerPortIoPci`
+/// during PCI enumeration; left zero with `valid=false` for non-PCI
+/// device regions (platform UARTs, IOAPICs, etc.). The IOMMU drivers
+/// (`arch/x64/intel/vtd.zig`, `arch/x64/amd/vi.zig`) read this when
+/// lazily provisioning a per-device translation domain on first
+/// `iommuMapPage`.
+pub const PciAddress = extern struct {
+    bus: u8 = 0,
+    /// Packed `dev[4:0] << 3 | func[2:0]` — the standard PCI devfn
+    /// encoding the IOMMU drivers index context tables / device tables
+    /// with.
+    devfn: u8 = 0,
+    valid: u8 = 0,
+    _pad: [5]u8 = [_]u8{0} ** 5,
+
+    pub fn make(b: u8, d: u5, f: u3) PciAddress {
+        return .{
+            .bus = b,
+            .devfn = (@as(u8, d) << 3) | @as(u8, f),
+            .valid = 1,
+        };
+    }
+
+    pub fn isValid(self: PciAddress) bool {
+        return self.valid != 0;
+    }
+
+    pub fn dev(self: PciAddress) u5 {
+        return @truncate(self.devfn >> 3);
+    }
+
+    pub fn func(self: PciAddress) u3 {
+        return @truncate(self.devfn & 0x7);
+    }
+
+    /// Standard 16-bit BDF requester ID.
+    pub fn bdf(self: PciAddress) u16 {
+        return (@as(u16, self.bus) << 8) | @as(u16, self.devfn);
+    }
+};
+
 /// Cap bits in `Capability.word0[48..63]` for device_region handles.
 /// Spec §[device_region] cap layout (table at bits 0-4).
 pub const DeviceRegionCaps = packed struct(u16) {
@@ -90,6 +132,24 @@ pub const DeviceRegion = extern struct {
     /// `field1.irq_count`. Stored type-erased to avoid a
     /// caps-module dependency cycle.
     handle_list_head: ?*HandleListNode = null,
+
+    /// PCI requester identifier (bus / dev / func). `valid=0` for
+    /// non-PCI regions. Populated by `registerMmioPci` /
+    /// `registerPortIoPci` from the ACPI PCI enumerator. The IOMMU
+    /// drivers consume `bdf()` / `bus`/`devfn` accessors when
+    /// provisioning a per-device translation domain.
+    pci: PciAddress = .{},
+
+    /// IOMMU per-device side-state opaque slot. The active arch
+    /// IOMMU driver allocates and stores its per-device translation
+    /// state (e.g. SL-PT root + domain id for VT-d, page-table root
+    /// for AMD-Vi) here on first `iommuMapPage`, and reuses it on
+    /// subsequent map/unmap/invalidate. Stored type-erased so the
+    /// devices module doesn't pull in arch-specific IOMMU types.
+    /// Lifetime is tied to the DeviceRegion: side-state is freed
+    /// when the IOMMU driver tears the region down (currently never
+    /// — DMA-bearing regions live for the boot lifetime).
+    iommu_state: ?*anyopaque = null,
 };
 
 pub const IRQ_SOURCE_NONE: u32 = std.math.maxInt(u32);
@@ -169,14 +229,25 @@ fn allocRegion() !DeviceRegionSlab.Pending {
 /// Allocate an MMIO device_region covering `[base_paddr, base_paddr +
 /// size)`. Returned with `refcount = 1` representing the caller's
 /// initial reference — the boot-time device registry, or whichever
-/// kernel agent enumerated it. Spec §[device_region].
+/// kernel agent enumerated it. Non-PCI regions (platform UARTs,
+/// IOAPIC, framebuffer) use this entry point; PCI BARs go through
+/// `registerMmioPci`. Spec §[device_region].
 pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
+    return registerMmioPci(base_paddr, size, .{});
+}
+
+/// PCI-aware variant: stamps the region's `pci` field with the
+/// device's BDF so IOMMU drivers can derive the requester ID without
+/// rescanning config space.
+pub fn registerMmioPci(base_paddr: PAddr, size: u64, pci: PciAddress) !*DeviceRegion {
     const pending = try allocRegion();
     const dr = pending.ptr;
     dr.refcount = 1;
     dr.device_type = .mmio;
     dr.access = .{ .mmio = .{ .phys_base = base_paddr, .size = size } };
     dr.irq_source = IRQ_SOURCE_NONE;
+    dr.pci = pci;
+    dr.iommu_state = null;
     _ = device_region_slab.publish(pending);
     return dr;
 }
@@ -185,12 +256,22 @@ pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
 /// port_count)`. x86-64 only by spec — callers on other arches must
 /// reject before reaching here. Spec §[port_io_virtualization].
 pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
+    return registerPortIoPci(base_port, port_count, .{});
+}
+
+/// PCI-aware variant for port-io BARs. Stamps the region's `pci`
+/// field with the requester BDF; IOMMU drivers ignore port-io
+/// regions today (no DMA), but the metadata stays consistent across
+/// region types.
+pub fn registerPortIoPci(base_port: u16, port_count: u16, pci: PciAddress) !*DeviceRegion {
     const pending = try allocRegion();
     const dr = pending.ptr;
     dr.refcount = 1;
     dr.device_type = .port_io;
     dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
     dr.irq_source = IRQ_SOURCE_NONE;
+    dr.pci = pci;
+    dr.iommu_state = null;
     _ = device_region_slab.publish(pending);
     return dr;
 }

@@ -582,7 +582,8 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                         }
                         const port_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        const dr = device_region.registerPortIo(port_base, port_count) catch {
+                        const pci_addr = device_region.PciAddress.make(@intCast(bus), @intCast(dev), @intCast(func));
+                        const dr = device_region.registerPortIoPci(port_base, port_count, pci_addr) catch {
                             bar_idx += 1;
                             continue;
                         };
@@ -612,9 +613,11 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                     else
                         paging.PAGE4K;
 
-                    const dr = device_region.registerMmio(
+                    const pci_addr = device_region.PciAddress.make(@intCast(bus), @intCast(dev), @intCast(func));
+                    const dr = device_region.registerMmioPci(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
+                        pci_addr,
                     ) catch {
                         bar_idx += 1;
                         continue;
@@ -730,7 +733,8 @@ fn enumeratePciLegacy() void {
                         }
                         const port_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        const dr = device_region.registerPortIo(port_base, port_count) catch {
+                        const pci_addr = device_region.PciAddress.make(@intCast(bus), @intCast(dev), @intCast(func));
+                        const dr = device_region.registerPortIoPci(port_base, port_count, pci_addr) catch {
                             bar_idx += 1;
                             continue;
                         };
@@ -751,9 +755,11 @@ fn enumeratePciLegacy() void {
                     else
                         paging.PAGE4K;
 
-                    const dr = device_region.registerMmio(
+                    const pci_addr = device_region.PciAddress.make(@intCast(bus), @intCast(dev), @intCast(func));
+                    const dr = device_region.registerMmioPci(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
+                        pci_addr,
                     ) catch {
                         bar_idx += 1;
                         continue;
