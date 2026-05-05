@@ -39,6 +39,7 @@ const syscall = lib.syscall;
 const HandleId = caps.HandleId;
 const vfs = sqlite.vfs;
 const files = @import("files.zig");
+const superblock = @import("superblock.zig");
 
 const PAGE_4K: u64 = 4096;
 const BLOCKDEV_SCRATCH_PAGES: u64 = 1;
@@ -87,6 +88,18 @@ pub fn main(cap_table_base: u64) void {
     log.hex64(io_scratch_va);
     log.print("\n");
 
+    // Probe LBA 0 for an fs superblock. Decides format-vs-mount before
+    // any SQLite call sees the volume.
+    const sb_state = readSuperblock(inv.blockdev_port.?, blockdev_scratch_va);
+    if (sb_state.valid) {
+        log.print("[fs] superblock found, mounting (logical_size=");
+        log.dec(sb_state.logical_size);
+        log.print(")\n");
+    } else {
+        log.print("[fs] no valid superblock; formatting fresh volume\n");
+        writeSuperblock(inv.blockdev_port.?, blockdev_scratch_va, superblock.Superblock.fresh());
+    }
+
     // Bring SQLite up.
     if (sqlite.configureHeap() != c.SQLITE_OK) {
         log.print("[fs] FATAL: configureHeap\n");
@@ -95,6 +108,9 @@ pub fn main(cap_table_base: u64) void {
     if (vfs.registerVfs(inv.blockdev_port.?, blockdev_scratch_va, BLOCKDEV_SCRATCH_PAGES) != c.SQLITE_OK) {
         log.print("[fs] FATAL: registerVfs\n");
         park();
+    }
+    if (sb_state.valid) {
+        vfs.setLogicalSize(sb_state.logical_size);
     }
     if (c.sqlite3_initialize() != c.SQLITE_OK) {
         log.print("[fs] FATAL: sqlite3_initialize\n");
@@ -126,7 +142,61 @@ pub fn main(cap_table_base: u64) void {
     };
 
     log.print("[fs] schema ready; entering serve loop\n");
-    serveLoop(db, inv.fs_port.?, io_scratch_va);
+    serveLoop(db, inv.fs_port.?, io_scratch_va, inv.blockdev_port.?, blockdev_scratch_va);
+}
+
+// ── superblock helpers ───────────────────────────────────────────
+
+const SbState = struct {
+    valid: bool,
+    logical_size: u64,
+};
+
+fn readSuperblock(port: HandleId, scratch_va: u64) SbState {
+    const status = blockdevSubmit(port, .read, 0, 1, 0);
+    if (status != .ok) return .{ .valid = false, .logical_size = 0 };
+    const scratch: *const superblock.Superblock = @ptrFromInt(scratch_va);
+    if (!scratch.isValid()) return .{ .valid = false, .logical_size = 0 };
+    return .{ .valid = true, .logical_size = scratch.logical_size };
+}
+
+fn writeSuperblock(port: HandleId, scratch_va: u64, sb: superblock.Superblock) void {
+    const dst: *superblock.Superblock = @ptrFromInt(scratch_va);
+    dst.* = sb;
+    _ = blockdevSubmit(port, .write, 0, 1, 0);
+}
+
+fn persistSuperblock(port: HandleId, scratch_va: u64) void {
+    const sb = superblock.Superblock{
+        .magic = superblock.MAGIC,
+        .version = superblock.VERSION,
+        ._reserved0 = 0,
+        .logical_size = vfs.getLogicalSize(),
+        ._reserved_tail = [_]u8{0} ** (superblock.SIZE_BYTES - 24),
+    };
+    writeSuperblock(port, scratch_va, sb);
+}
+
+fn blockdevSubmit(
+    port: HandleId,
+    op: blockdev.Op,
+    lba: u64,
+    count: u64,
+    buf_off: u64,
+) blockdev.Status {
+    const r = syscall.issueReg(
+        .@"suspend",
+        0,
+        .{
+            .v1 = @as(u64, caps.SLOT_INITIAL_EC),
+            .v2 = @as(u64, port),
+            .v3 = @intFromEnum(op),
+            .v4 = lba,
+            .v5 = count,
+            .v6 = buf_off,
+        },
+    );
+    return @enumFromInt(r.v1);
 }
 
 const Inbound = struct {
@@ -185,7 +255,13 @@ fn mapPfRw(pf_handle: HandleId, pages: u64) ?u64 {
 
 // ── serve loop ───────────────────────────────────────────────────
 
-fn serveLoop(db: *c.sqlite3, port: HandleId, io_scratch_va: u64) noreturn {
+fn serveLoop(
+    db: *c.sqlite3,
+    port: HandleId,
+    io_scratch_va: u64,
+    blockdev_port: HandleId,
+    blockdev_scratch_va: u64,
+) noreturn {
     const scratch: [*]u8 = @ptrFromInt(io_scratch_va);
     const scratch_slice: []u8 = scratch[0..fs_ops.SCRATCH_BYTES];
 
@@ -222,7 +298,15 @@ fn serveLoop(db: *c.sqlite3, port: HandleId, io_scratch_va: u64) noreturn {
             .symlink => handleSymlink(db, scratch_slice, got.regs, &rep_v1, &rep_v2),
             .readlink => handleReadlink(db, scratch_slice, got.regs, &rep_v1, &rep_v2),
             .readdir => handleReaddir(db, scratch_slice, got.regs, &rep_v1, &rep_v2, &rep_v3, &rep_v4, &rep_v5, &rep_v6),
-            .sync => rep_v1 = @intFromEnum(fs_ops.Status.ok),
+            .sync => {
+                // Force any dirty SQLite page-cache entries to xWrite,
+                // then commit our superblock. Without the cacheflush,
+                // recently-INSERTed rows can sit in the page cache
+                // indefinitely under journal_mode=MEMORY+sync=OFF.
+                _ = c.sqlite3_db_cacheflush(db);
+                persistSuperblock(blockdev_port, blockdev_scratch_va);
+                rep_v1 = @intFromEnum(fs_ops.Status.ok);
+            },
             else => rep_v1 = @intFromEnum(fs_ops.Status.bad_op),
         }
 

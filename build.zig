@@ -394,9 +394,15 @@ pub fn build(b: *std.Build) void {
             "-device intel-iommu,intremap=off"
         else
             "-device amd-iommu";
+        // cache=writethrough makes write completions wait until the
+        // host has flushed to nvme.img. Without it QEMU buffers writes
+        // in-process and a SIGTERM (e.g. from `timeout`) loses pages
+        // that haven't been written through. fs needs writes to
+        // survive QEMU exit so the LBA-0 superblock + SQLite pages
+        // both reach disk for the next boot.
         const qemu_nvme_args: []const u8 = if (wants_nvme)
             b.fmt(
-                \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0 \
+                \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0,cache=writethrough \
                 \\-device nvme,drive=nvme0,serial=zagdisk0
             , .{b.install_path})
         else

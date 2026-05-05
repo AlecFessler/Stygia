@@ -48,6 +48,8 @@ pub fn main(cap_table_base: u64) void {
     log.hex64(scratch_va);
     log.print("\n");
 
+    runPhase("persistence", testPersistence, port, scratch_va);
+    runPhase("cleanup", testCleanup, port, scratch_va);
     runPhase("dir-ops", testDirOps, port, scratch_va);
     runPhase("file-rw", testFileRw, port, scratch_va);
     runPhase("random-io", testRandomIo, port, scratch_va);
@@ -55,6 +57,7 @@ pub fn main(cap_table_base: u64) void {
     runPhase("symlink", testSymlink, port, scratch_va);
     runPhase("errors", testErrors, port, scratch_va);
     runPhase("readdir-walk", testReaddirWalk, port, scratch_va);
+    runPhase("sync", testSync, port, scratch_va);
 
     log.print("[verify_fs] DONE: ");
     log.dec(pass_count);
@@ -66,6 +69,64 @@ pub fn main(cap_table_base: u64) void {
 }
 
 // ── Test phases ──────────────────────────────────────────────────
+
+const PERSIST_MARKER = "/persist_marker";
+const PERSIST_PAYLOAD = "ZAGFS_PERSIST_OK";
+
+fn testPersistence(port: HandleId, scratch_va: u64) bool {
+    // Reading the marker: if present and matches, prior boot's data
+    // survived. If absent, this is first boot — we create it for the
+    // next boot to find.
+    if (fs_client.stat(port, scratch_va, PERSIST_MARKER)) |s| {
+        var buf: [64]u8 = undefined;
+        const n = fs_client.pread(port, scratch_va, PERSIST_MARKER, 0, buf[0..@intCast(s.size)]) catch return false;
+        if (!sliceEq(buf[0..n], PERSIST_PAYLOAD)) {
+            log.print("[verify_fs]   persistence marker corrupted: '");
+            log.print(buf[0..n]);
+            log.print("'\n");
+            return false;
+        }
+        log.print("[verify_fs]   persistence verified: marker survived reboot\n");
+        return true;
+    } else |e| {
+        if (e != fs_client.FsError.NotFound) {
+            log.print("[verify_fs]   stat marker err=");
+            log.dec(@intFromError(e));
+            log.print("\n");
+            return false;
+        }
+        if (!ok(fs_client.createFile(port, scratch_va, PERSIST_MARKER, 0o644), "createFile marker")) return false;
+        const w = fs_client.pwrite(port, scratch_va, PERSIST_MARKER, 0, PERSIST_PAYLOAD) catch return false;
+        if (w.written != PERSIST_PAYLOAD.len) return false;
+        log.print("[verify_fs]   first boot: marker created (sync at end persists it)\n");
+        return true;
+    }
+}
+
+fn testCleanup(port: HandleId, scratch_va: u64) bool {
+    // Best-effort sweep of fixtures from prior boots so the destructive
+    // phases below run against a known-empty tree. NotFound is fine.
+    const fixtures = [_][]const u8{
+        "/etc/motd-link",
+        "/etc/notes.txt",
+        "/etc/motd",
+        "/etc/bigfile",
+        "/etc/zag",
+        "/etc",
+        "/home/alec/notes.txt",
+        "/home/alec/note",
+        "/home/alec",
+        "/home",
+    };
+    for (fixtures) |p| {
+        const s = fs_client.stat(port, scratch_va, p) catch continue;
+        switch (s.kind) {
+            .dir => _ = fs_client.rmdir(port, scratch_va, p) catch {},
+            else => _ = fs_client.unlink(port, scratch_va, p) catch {},
+        }
+    }
+    return true;
+}
 
 fn testDirOps(port: HandleId, scratch_va: u64) bool {
     if (!ok(fs_client.mkdir(port, scratch_va, "/etc", 0o755), "mkdir /etc")) return false;
@@ -231,6 +292,10 @@ fn testErrors(port: HandleId, scratch_va: u64) bool {
     }
 
     return true;
+}
+
+fn testSync(port: HandleId, scratch_va: u64) bool {
+    return ok(fs_client.sync(port, scratch_va), "sync");
 }
 
 fn testReaddirWalk(port: HandleId, scratch_va: u64) bool {

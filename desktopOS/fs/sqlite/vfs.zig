@@ -3,10 +3,10 @@
 // `desktopOS/protocols/blockdev.zig`.
 //
 // Single-file VFS: every sqlite3_open_v2 returns the same physical
-// blob mapped at the start of the disk. Filename is ignored (we
-// only ever serve one DB). xFileSize tracks logical size in memory
-// — across reboots the database resets, which is fine for the
-// phase-2 demo. A persistent superblock at LBA 0 lands later.
+// blob, starting STORAGE_OFFSET_LBA sectors into the volume so LBA 0
+// can carry an fs superblock. Filename is ignored. xFileSize returns
+// `logical_size`, which fs/main.zig primes from the superblock at
+// boot (so SQLite sees the existing DB instead of an empty file).
 
 const std = @import("std");
 const lib = @import("lib");
@@ -23,12 +23,27 @@ const HandleId = caps.HandleId;
 const SECTOR_SIZE: i64 = @intCast(blockdev.BLOCK_SIZE);
 const PAGE_4K: u64 = 4096;
 
+/// LBA where the SQLite-managed region starts. LBA 0 is reserved for
+/// the fs superblock so we can recover logical_size on reboot.
+pub const STORAGE_OFFSET_LBA: u64 = 1;
+const STORAGE_OFFSET_BYTES: i64 = @as(i64, STORAGE_OFFSET_LBA) * SECTOR_SIZE;
+
 // Globals filled in at registerVfs time. The single-VFS / single-DB
 // model means no per-file state besides logical size.
 var g_port: HandleId = 0;
 var g_scratch_va: u64 = 0;
 var g_scratch_pages: u64 = 0;
 var logical_size: i64 = 0;
+
+/// Set by fs/main.zig after reading the superblock so SQLite's first
+/// xFileSize call sees the on-disk DB length instead of zero.
+pub fn setLogicalSize(size: u64) void {
+    logical_size = @intCast(size);
+}
+
+pub fn getLogicalSize() u64 {
+    return @intCast(logical_size);
+}
 
 const FileExt = extern struct {
     base: c.sqlite3_file,
@@ -58,8 +73,9 @@ fn ioRead(
     const dst: [*]u8 = @ptrCast(out.?);
     var done: usize = 0;
     while (done < want) {
-        const lba: u64 = @intCast(@divFloor(ofst + @as(c.sqlite3_int64, @intCast(done)), SECTOR_SIZE));
-        const lba_offset_bytes: usize = @intCast(@mod(ofst + @as(c.sqlite3_int64, @intCast(done)), SECTOR_SIZE));
+        const phys = ofst + STORAGE_OFFSET_BYTES + @as(c.sqlite3_int64, @intCast(done));
+        const lba: u64 = @intCast(@divFloor(phys, SECTOR_SIZE));
+        const lba_offset_bytes: usize = @intCast(@mod(phys, SECTOR_SIZE));
         const remaining = want - done;
         // Read one sector at a time into scratch, then copy out the
         // requested slice. Alignment-tolerant; later we batch contiguous
@@ -85,8 +101,9 @@ fn ioWrite(
     const src: [*]const u8 = @ptrCast(in.?);
     var done: usize = 0;
     while (done < want) {
-        const lba: u64 = @intCast(@divFloor(ofst + @as(c.sqlite3_int64, @intCast(done)), SECTOR_SIZE));
-        const lba_offset_bytes: usize = @intCast(@mod(ofst + @as(c.sqlite3_int64, @intCast(done)), SECTOR_SIZE));
+        const phys = ofst + STORAGE_OFFSET_BYTES + @as(c.sqlite3_int64, @intCast(done));
+        const lba: u64 = @intCast(@divFloor(phys, SECTOR_SIZE));
+        const lba_offset_bytes: usize = @intCast(@mod(phys, SECTOR_SIZE));
         const remaining = want - done;
         const take = @min(remaining, blockdev.BLOCK_SIZE - lba_offset_bytes);
         const scratch: [*]u8 = @ptrFromInt(g_scratch_va);
@@ -184,19 +201,40 @@ fn vfsOpen(
     return c.SQLITE_OK;
 }
 
-fn vfsDelete(_: [*c]c.sqlite3_vfs, _: [*c]const u8, _: c_int) callconv(.c) c_int {
-    logical_size = 0;
+fn vfsDelete(_: [*c]c.sqlite3_vfs, name: [*c]const u8, _: c_int) callconv(.c) c_int {
+    // Single-file VFS: the only "real" file is the main DB. SQLite
+    // asks us to delete journal/wal sidecars during recovery — those
+    // never had storage backing them, so it's a no-op. CRITICAL: do
+    // NOT zero logical_size here; SQLite will (correctly) call
+    // xDelete("db-journal") on every open after a clean close, and
+    // resetting size on that call masks the on-disk DB on reboot.
+    if (isMainDb(name)) logical_size = 0;
     return c.SQLITE_OK;
 }
 
 fn vfsAccess(
     _: [*c]c.sqlite3_vfs,
-    _: [*c]const u8,
+    name: [*c]const u8,
     _: c_int,
     out: [*c]c_int,
 ) callconv(.c) c_int {
-    out.* = if (logical_size > 0) 1 else 0;
+    // Only the main DB "exists". Journal sidecars never do — that
+    // tells SQLite there's no stale rollback journal to recover from.
+    out.* = if (isMainDb(name) and logical_size > 0) 1 else 0;
     return c.SQLITE_OK;
+}
+
+fn isMainDb(name: [*c]const u8) bool {
+    if (name == null) return false;
+    // The main DB is opened as "db" (see fs/main.zig sqlite.open).
+    // Anything ending in "-journal", "-wal", "-shm", or any other
+    // suffix is a sidecar this single-file VFS can't host.
+    var i: usize = 0;
+    var len: usize = 0;
+    while (name[i] != 0) : (i += 1) len += 1;
+    if (len < 2) return false;
+    if (name[len - 2] == 'd' and name[len - 1] == 'b') return true;
+    return false;
 }
 
 fn vfsFullPathname(
