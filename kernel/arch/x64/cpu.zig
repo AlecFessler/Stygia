@@ -2,7 +2,6 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const apic = zag.arch.x64.apic;
 const gdt = zag.arch.x64.gdt;
 const interrupts = zag.arch.x64.interrupts;
 
@@ -904,36 +903,8 @@ pub fn patchUserModeIretFrame(
 /// Halt the local core with interrupts enabled until the next IRQ.
 /// Spec §[execution_context] idle EC.
 pub fn idle() void {
-    // Park RSP onto this core's per-core park stack across the
-    // `sti+hlt` window. Without this, an IRQ that fires at `hlt`
-    // (kernel-mode CPL=0, no privilege transition, so TSS.RSP0 is
-    // NOT consulted) would push its iret-frame onto whatever RSP we
-    // entered idle with — and that RSP commonly sits inside a kstack
-    // belonging to an EC that was just descheduled here. Under heavy
-    // EC migration (the L4 reply fast path's normal mode) that EC
-    // can be running on another core simultaneously, with that core
-    // writing kernel locals to the same kstack — the idle core's
-    // pushed iret-frame gets stomped, and the next iretq pops
-    // garbage as (RIP, CS, RFLAGS, RSP, SS), tripping a #GP at
-    // iretq with a kernel-pointer-low-16 selector (`err=0xcca0` or
-    // a zeroed RIP that PFs at address 0). Park is allocated per
-    // core, never aliased.
-    //
-    // The save/restore of caller RSP is in scratch %rbx (caller-
-    // saved on the SysV AMD64 ABI Zig uses for non-naked exports;
-    // we don't span the asm with anything that cares). After the
-    // IRQ-handler iretq, RSP returns to `park_top` (the iret-frame's
-    // RSP slot was saved when the CPU pushed it onto the park stack);
-    // we then restore the caller's RSP from %rbx and return normally.
-    const core_id = apic.coreID();
-    const park_top = interrupts.parkKstackTop(core_id);
     asm volatile (
-        \\movq %%rsp, %%rbx
-        \\movq %[park_top], %%rsp
         \\sti
         \\hlt
-        \\movq %%rbx, %%rsp
-        :
-        : [park_top] "r" (park_top),
-        : .{ .rbx = true, .memory = true });
+    );
 }
