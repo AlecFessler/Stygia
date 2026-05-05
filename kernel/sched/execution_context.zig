@@ -1456,23 +1456,12 @@ pub fn allocExecutionContext(
         const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
         const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-        // `kernel_data_local` (non-global) so the cross-core TLB
-        // shootdown in `unmapPage` can actually evict stale kstack
-        // entries on remote cores: with PCIDE=1, kstack VAs cached
-        // under one PCID would otherwise survive every subsequent CR3
-        // reload because `swapAddrSpace` sets bit 63 (no-flush). After
-        // `terminate` recycles the kstack slot and the new occupant
-        // re-uses the same VA, a remote core that still translated
-        // the VA through its prior-PCID stale entry would route
-        // writes through the old (now freed-and-reallocated) physical
-        // page, scribbling on the new owner's iret frame and tripping
-        // an `iretq` #GP. Intel SDM Vol 3A §5.10.
         try arch.paging.mapPage(
             memory_init.kernel_addr_space_root,
             phys,
             VAddr.fromInt(page_addr),
             .{ .read = true, .write = true },
-            .kernel_data_local,
+            .kernel_data,
         );
         page_addr += paging_consts.PAGE4K;
     }

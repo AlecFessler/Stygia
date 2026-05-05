@@ -354,7 +354,7 @@ fn smpInitFull() !void {
                 break;
             };
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data_local) catch {
+            aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS, .kernel_data) catch {
                 pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;

@@ -44,13 +44,6 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
             .write_through = false,
             .write_combining = false,
         },
-        .kernel_data_local => .{
-            .user_accessible = false,
-            .global = false,
-            .not_cacheable = false,
-            .write_through = false,
-            .write_combining = false,
-        },
         .kernel_mmio => .{
             .user_accessible = false,
             .global = false,
@@ -75,142 +68,54 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
     };
 }
 
-/// TLB shootdown: serializes the broadcast and tracks per-core ACKs so
-/// the initiator can wait for every remote core to invalidate before
-/// the freed physical page is recycled.
+/// TLB shootdown: per-core pending invalidation addresses.
+/// Each core checks its slot before returning to userspace.
 ///
-/// Intel SDM Vol 3A §5.10.5 "Propagation of Paging-Structure Changes to
-/// Multiple Processors" requires software to broadcast invalidations;
-/// this is implemented via IPI + INVLPG on each remote core
-/// (§5.10.4.1). The wait is required for kernel-half VAs (kstacks):
-/// fire-and-forget would let a remote core's stale TLB entry outlive
-/// the unmap and route writes through the recycled physical page,
-/// which under §5.10 stays cached even across CR3 reloads (global
-/// pages, or with CR4.PCIDE=1 any non-global entry under a PCID
-/// re-entered via a no-flush CR3 load).
+/// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes to
+/// Multiple Processors" requires software to broadcast invalidations; this is
+/// implemented via IPI + INVLPG on each remote core.
 var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
+var shootdown_addr: u64 = 0;
 
-/// Monotonically increasing shootdown sequence number. Initiator
-/// fetches+1 under `shootdown_lock`; the remote IPI handler stores its
-/// own latest seen value into `shootdown_seen[core]`. Initiator spins
-/// on each remote core's `shootdown_seen[core] >= my_seq`. A coalesced
-/// IPI that runs the handler once for two enqueued shootdowns is fine:
-/// the handler invalidates everything any caller could have cared
-/// about (see `tlbShootdownHandler`) and the seen counter advances
-/// past both pending sequence numbers in one shot.
-var shootdown_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var shootdown_seen: [scheduler_max_cores]std.atomic.Value(u64) =
-    [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** scheduler_max_cores;
-
-/// Mirror of `sched.scheduler.MAX_CORES`. Re-declared here to dodge a
-/// circular import (sched.scheduler imports arch.dispatch which
-/// resolves to this file).
-const scheduler_max_cores: u8 = 64;
-
-/// Bracket value advertised to the IPI handler so it knows the latest
-/// global sequence number to acknowledge. Updated under
-/// `shootdown_lock` before each broadcast.
-var shootdown_pending_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-/// IPI handler for TLB shootdown. Runs on every remote core that
-/// receives the broadcast, invalidates the kernel-half non-global TLB
-/// entries that could be stale, and records the most-recent
-/// `shootdown_pending_seq` it has serviced into the local
-/// `shootdown_seen[core_id]` slot. The initiator polls that slot to
-/// wait for completion (see `flushRemoteTlb`).
+/// IPI handler for TLB shootdown: invalidate the requested address.
+/// endOfInterrupt is called by dispatchInterrupt for .external vectors.
 ///
-/// INVPCID type 2 ("all-context invalidation, retaining globals",
-/// Intel SDM Vol 2A "INVPCID") evicts every non-global TLB entry
-/// across every PCID, which is what's needed: a kstack VA cached
-/// under PCID=A on a remote core that's currently running with
-/// PCID=B would otherwise sit on the recycled physical page until
-/// PCID=A is next entered via a no-flush CR3 load. Falls back to a
-/// `mov %cr4, %cr4` PGE bounce on parts that lack INVPCID — same
-/// effect (flushes all non-global entries) at higher cost.
+/// Intel SDM Vol 3A, Section 5.10.4.1 -- INVLPG invalidates any TLB entries
+/// for the page containing the operand address, including global entries.
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     kprof.point(.tlb_shootdown, 0);
-
-    if (cpu.invpcid_supported) {
-        // INVPCID type 2: all-context invalidation, retaining globals.
-        const desc: [2]u64 align(16) = .{ 0, 0 };
-        asm volatile ("invpcid (%[desc]), %[type]"
-            :
-            : [desc] "r" (&desc),
-              [type] "r" (@as(u64, 2)),
-            : .{ .memory = true });
-    } else {
-        // CR4.PGE 1→0→1 bounces flush every TLB entry (Intel SDM Vol 3A
-        // §5.10.4.1 "Operations that Invalidate TLBs and Paging-
-        // Structure Caches" — "Software toggles CR4.PGE").
-        var cr4 = asm ("mov %%cr4, %[cr4]"
-            : [cr4] "=r" (-> u64),
-        );
-        const pge_bit: u64 = 1 << 7;
-        asm volatile ("mov %[cr4], %%cr4"
-            :
-            : [cr4] "r" (cr4 & ~pge_bit),
-        );
-        asm volatile ("mov %[cr4], %%cr4"
-            :
-            : [cr4] "r" (cr4 | pge_bit),
-        );
-        _ = &cr4;
-    }
-
-    const core_id: u8 = @truncate(apic.coreID());
-    const seq = shootdown_pending_seq.load(.acquire);
-    shootdown_seen[core_id].store(seq, .release);
+    cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
 }
 
-/// Flush a virtual address from all cores' TLBs and wait for every
-/// remote core to acknowledge before returning.
+/// Flush a virtual address from all cores' TLBs.
 ///
-/// Intel SDM Vol 3A §5.10.5: software must propagate paging-structure
-/// invalidations to every processor that may have cached the old
-/// translation. The wait is required because the caller (kstack free
-/// path) is about to release the backing physical page back to the
-/// PMM. If a remote core still cached the unmapped VA when PMM hands
-/// the page out to a new allocation, writes through the stale
-/// translation would scribble on the new owner.
+/// Intel SDM Vol 3A, Section 5.10.5 -- when a paging-structure entry is
+/// modified on one logical processor, software must propagate the
+/// invalidation to other processors that may have cached the old
+/// translation. This is done here by broadcasting an IPI that executes
+/// INVLPG on each remote core (Section 5.10.4.1).
 ///
-/// `shootdown_lock` is held only across the broadcast (sequence
-/// publish + sendIpi loop) and is dropped before the spin-wait. The
-/// previous synchronous attempt held the lock across the wait, which
-/// deadlocked when a remote core was spinning to acquire some
-/// unrelated lock with IRQs disabled while the lock owner was queued
-/// behind `shootdown_lock` to do its own shootdown — A waits for B's
-/// IPI ACK, B can't ACK because IRQs are off, IRQs stay off because B
-/// is waiting on a lock held by C, C is waiting for `shootdown_lock`,
-/// `shootdown_lock` is held by A. Releasing the lock before the wait
-/// breaks the cycle: the wait now only depends on remote cores
-/// eventually re-enabling IRQs, which they all do as their syscall /
-/// IRQ paths unwind.
-fn flushRemoteTlb() void {
+/// The IPI is fire-and-forget: remote cores may have interrupts disabled
+/// (e.g. mid-syscall), but the IPI will be delivered before any userspace
+/// instruction executes (the pending interrupt fires on iret).  This is
+/// safe because the physical page is only freed after this function
+/// returns, and the remote core cannot touch the old mapping from
+/// userspace until after the IPI handler runs.
+fn flushRemoteTlb(virt_addr: u64) void {
     const core_count = apic.coreCount();
     if (core_count <= 1) return;
 
     const self_id = apic.coreID();
 
     shootdown_lock.lock(@src());
+    defer shootdown_lock.unlock();
 
-    const my_seq = shootdown_seq.fetchAdd(1, .acq_rel) + 1;
-    shootdown_pending_seq.store(my_seq, .release);
+    @atomicStore(u64, &shootdown_addr, virt_addr, .release);
 
     const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
     for (apic.lapics.?, 0..) |la, i| {
         if (i == self_id) continue;
         apic.sendIpi(@intCast(la.apic_id), vec);
-    }
-
-    shootdown_lock.unlock();
-
-    // Wait without holding any lock. Each remote core's ack monotonically
-    // advances; once `shootdown_seen[i] >= my_seq`, that core has
-    // serviced an IPI whose handler ran AFTER our pending_seq publish,
-    // so its TLB no longer caches the unmapped VA.
-    for (apic.lapics.?, 0..) |_, i| {
-        if (i == self_id) continue;
-        while (shootdown_seen[i].load(.acquire) < my_seq) std.atomic.spinLoopHint();
     }
 }
 
@@ -597,11 +502,8 @@ pub fn unmapPage(
     //
     // Paying for a remote-TLB shootdown on every unmap is fine because
     // the kernel rarely unmaps pages outside of process teardown and
-    // stack destruction — both are already slow-path operations. The
-    // shootdown is synchronous: we don't return (and therefore don't
-    // free the physical page in `destroyKernel`) until every remote
-    // core has acknowledged the IPI. See `flushRemoteTlb`.
-    flushRemoteTlb();
+    // stack destruction — both are already slow-path operations.
+    flushRemoteTlb(virt.addr);
 
     return phys;
 }
@@ -694,7 +596,7 @@ pub fn shootdownTlbRange(
     while (i < page_count) {
         const va = virt.addr + @as(u64, i) * paging.PAGE4K;
         cpu.invlpg(va);
-        flushRemoteTlb();
+        flushRemoteTlb(va);
         i += 1;
     }
 }

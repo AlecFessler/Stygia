@@ -301,15 +301,8 @@ pub const MemoryPerms = packed struct(u8) {
 /// global, and privilege bits from the kind. Cache attributes follow
 /// the same defaults Linux applies to its analogous mappings.
 ///
-/// `kernel_data`: kernel RAM (heap, kernel ELF, physmap of free
+/// `kernel_data`: kernel RAM (heap, stacks, kernel ELF, physmap of free
 ///   memory). WB cache, global, supervisor-only.
-/// `kernel_data_local`: kernel RAM that may be unmapped and recycled
-///   during normal kernel operation (kernel stacks). Same as
-///   `kernel_data` but non-global so cross-core TLB shootdown via the
-///   IPI path can reliably invalidate stale entries; with PCIDE=1
-///   global entries survive every CR3 reload, and INVLPG + INVPCID
-///   type 2 must be free to evict them on remote cores.
-///   Intel SDM Vol 3A §5.10 (CR4.PGE / global pages).
 /// `kernel_mmio`: kernel-mapped device MMIO (IOMMU registers, ACPI
 ///   tables, LAPIC). UC cache, non-global, supervisor-only.
 /// `user_data`: VMAR-installed RAM exposed to userspace. Cache attribute
@@ -319,7 +312,6 @@ pub const MemoryPerms = packed struct(u8) {
 ///   non-global, user-accessible.
 pub const MappingKind = enum {
     kernel_data,
-    kernel_data_local,
     kernel_mmio,
     user_data,
     user_mmio,
