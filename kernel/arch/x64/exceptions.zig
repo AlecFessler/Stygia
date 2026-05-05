@@ -2,6 +2,7 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const ctx_trace = zag.utils.ctx_trace;
+const pf_log = zag.utils.pf_log;
 const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -333,9 +334,15 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {
+        if (comptime pf_log.enabled) {
+            pf_log.mark(scheduler.currentEc(), .RSVD_PANIC, cpu.readCr2(), @truncate(ctx.err_code));
+        }
         @panic("Page tables have reserved bits set (RSVD).");
     }
     const faulting_addr = cpu.readCr2();
+    if (comptime pf_log.enabled) {
+        pf_log.mark(scheduler.currentEc(), .ENTER, faulting_addr, @truncate(ctx.err_code));
+    }
     kprof.point(.page_fault_hw, faulting_addr);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
@@ -346,8 +353,12 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     // and the kernel decodes the MOV, performs the port I/O on behalf
     // of the EC, and advances RIP. Spec §[port_io_virtualization].
     if (from_user and !pf_err.present) {
-        const ec = scheduler.currentEc() orelse
+        const ec = scheduler.currentEc() orelse {
+            if (comptime pf_log.enabled) {
+                pf_log.mark(null, .USER_NO_EC, faulting_addr, @truncate(ctx.err_code));
+            }
             @panic("user page fault with no current EC");
+        };
         // caller-pinned: currentEc() runs on this core; its bound
         // capability domain is alive across this PF handler.
         const domain = ec.domain.ptr;
@@ -360,6 +371,10 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
             v._gen_lock.unlockIrqRestore(v_irq);
             if (is_port_io) {
                 emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
+                if (comptime pf_log.enabled) {
+                    pf_log.mark(ec, .USER_PORT_IO, faulting_addr, @truncate(ctx.err_code));
+                    pf_log.mark(ec, .RESUME, faulting_addr, @truncate(ctx.err_code));
+                }
                 return;
             }
         }
@@ -374,6 +389,15 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .user_ctx = if (from_user) ctx else null,
     };
     zag.memory.fault.handlePageFault(&pf_ctx);
+
+    // Resume snapshot. If `handlePageFault` yielded to another EC the
+    // resumed RIP is for THAT EC; if it returned to the faulter the
+    // RIP should advance past the faulting instruction OR the page
+    // mapping should now resolve. The smp=4 fault-loop bug shows up
+    // here as RESUME with rip == previous fault rip, repeatedly.
+    if (comptime pf_log.enabled) {
+        pf_log.mark(scheduler.currentEc(), .RESUME, faulting_addr, @truncate(ctx.err_code));
+    }
 }
 
 /// Emulate a port I/O access through a port-IO VMAR.

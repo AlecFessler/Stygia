@@ -7,6 +7,7 @@ const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const pf_log = zag.utils.pf_log;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
@@ -78,8 +79,15 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     if (is_kernel_privilege and is_user_va) {
         // Kernel touched a user VA via a syscall accessor — surface as a
         // memory_fault on the EC whose syscall triggered the access.
-        const ec = scheduler.currentEc() orelse
+        const ec = scheduler.currentEc() orelse {
+            if (comptime pf_log.enabled) {
+                pf_log.mark(null, .KERNEL_NO_EC, faulting_virt.addr, 0);
+            }
             @panic("kernel page fault on user VA with no current EC");
+        };
+        if (comptime pf_log.enabled) {
+            pf_log.mark(ec, .KERNEL_ON_USER_VA, faulting_virt.addr, 0);
+        }
         // Drain the per-core lockdep held-stack: the original syscall
         // (e.g. `reply` holds the sender EC's gen-lock across
         // `applyReplyStateToVcpu`'s SMAP-bracketed user-stack reads)
@@ -108,25 +116,43 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     if (is_kernel_privilege) {
         switch (stack_mod.isKernelStackPage(faulting_virt)) {
             .usable => {
+                if (comptime pf_log.enabled) {
+                    pf_log.mark(scheduler.currentEc(), .KERNEL_DEMAND, faulting_virt.addr, 0);
+                }
                 demandPageKernel(faulting_virt);
                 return;
             },
-            .guard => @panic("Kernel stack overflow"),
+            .guard => {
+                if (comptime pf_log.enabled) {
+                    pf_log.mark(scheduler.currentEc(), .KERNEL_STACK_OVERFLOW, faulting_virt.addr, 0);
+                }
+                @panic("Kernel stack overflow");
+            },
             .not_stack => {},
         }
 
         const ka = address.KernelVA.KernelAllocators.range;
         if (faulting_virt.addr >= ka.start and faulting_virt.addr < ka.end) {
+            if (comptime pf_log.enabled) {
+                pf_log.mark(scheduler.currentEc(), .KERNEL_DEMAND, faulting_virt.addr, 0);
+            }
             demandPageKernel(faulting_virt);
             return;
         }
 
+        if (comptime pf_log.enabled) {
+            pf_log.mark(scheduler.currentEc(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
+        }
         arch.boot.print("KERNEL PAGE FAULT at 0x{x} (write={} exec={})\n", .{ faulting_virt.addr, is_write, is_exec });
         @panic("unexpected kernel page fault");
     }
 
-    const ec = scheduler.currentEc() orelse
+    const ec = scheduler.currentEc() orelse {
+        if (comptime pf_log.enabled) {
+            pf_log.mark(null, .USER_NO_EC, faulting_virt.addr, 0);
+        }
         @panic("user page fault with no current EC");
+    };
 
     // Per-PF debug print intentionally elided. Every demand-page
     // operation hits this path; the in-kernel-parallel test runner
@@ -141,6 +167,9 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const dom_lr = dom_ref.lockIrqSave(@src()) catch {
         // Domain torn down between exception entry and here — fire
         // memory_fault so the no-route fallback retires the EC.
+        if (comptime pf_log.enabled) {
+            pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
+        }
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);
@@ -163,6 +192,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // bound port or applies the no-route fallback (restart or destroy
     // the owning domain) per spec §[event_route]. Either outcome leaves
     // this EC unrunnable, so yield the CPU after firing.
+    if (comptime pf_log.enabled) {
+        if (rc == 0) {
+            pf_log.mark(ec, .USER_RESOLVED, faulting_virt.addr, 0);
+        } else {
+            pf_log.mark(ec, .USER_INVALID, faulting_virt.addr, @bitCast(@as(i32, @truncate(rc))));
+        }
+    }
     if (rc != 0) {
         const subcode = if (rc == zag.syscall.errors.E_BADADDR)
             MemoryFaultSubcode.unmapped
