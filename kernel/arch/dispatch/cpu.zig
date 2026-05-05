@@ -126,6 +126,29 @@ pub fn halt() noreturn {
     }
 }
 
+/// Switch this core's user→kernel landing kstack onto a per-core park
+/// page. Called from `scheduler.clearCurrentEc` so an IRQ that fires
+/// while this core has no `current_ec` lands on a private page rather
+/// than on the kstack of whichever EC last ran here (which may now be
+/// dispatched on another core, with that core writing kernel locals to
+/// the kstack — cross-core kstack aliasing is the `GPF err=0xcca0`
+/// smp=4 corruption signature).
+///
+/// x86_64 → writes `TSS.RSP0` + `SyscallScratch.kernel_rsp`.
+/// aarch64 → not yet wired; same root-cause class needs the equivalent
+/// landing-pointer reset (SP_EL1 / per-core kstack pointer used by EL1
+/// entry). Track in BUG-1 follow-up.
+pub fn parkCpuKstack(core_id: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.parkCpuKstack(core_id),
+        // TODO(aarch64): mirror the x86 fix once the EL1 entry path's
+        // per-core kstack pointer is centralized in arch state we can
+        // reset here.
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 /// Send a kprof-dump IPI to every core except the caller. Invoked by
 /// the dumping core inside `kprof.dump.end()` to quiesce every other
 /// CPU before serial-dumping. Per-arch backend resolves the IPI vector

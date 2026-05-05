@@ -478,8 +478,20 @@ pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
 
 /// Clear this core's `current_ec` slot. Called by suspend / terminate /
 /// idle paths when the running EC stops being runnable.
+///
+/// Also parks this core's TSS.RSP0 / SyscallScratch.kernel_rsp onto a
+/// per-core park page so that an IRQ which fires while this core has no
+/// `current_ec` does NOT push its iret-frame onto the kstack of
+/// whichever EC last ran here. Without this, that EC could be (and
+/// frequently is, under the L4 reply fast-path's high migration rate)
+/// dispatched on another core by the time the IRQ fires — that core
+/// would be writing kernel locals to the same kstack, the iret-frame
+/// the idle core just pushed gets stomped, and the next iretq pops
+/// garbage CS/RIP/RSP/SS → GPF with the kernel-pointer-low-16 selector
+/// signature (`err=0xcca0`).
 pub inline fn clearCurrentEc(core: u8) void {
     (&core_states[core]).current_ec = null;
+    arch.cpu.parkCpuKstack(core);
 }
 
 /// Set this core's `current_ec` to `ec`, capturing the gen at write time.

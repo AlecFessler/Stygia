@@ -268,6 +268,48 @@ comptime {
 pub var per_cpu_scratch: [64]SyscallScratch align(4096) =
     [_]SyscallScratch{std.mem.zeroes(SyscallScratch)} ** 64;
 
+/// Per-core "park" kernel stacks. Used as the TSS.RSP0 / scratch.kernel_rsp
+/// landing zone whenever this core has no `current_ec` — i.e. between
+/// `clearCurrentEc` and the next `setCurrentEc`. Without this, an idle
+/// core would still have TSS.RSP0 / scratch.kernel_rsp pointing at the
+/// kstack of whichever EC last ran on it (stale state). Once that EC was
+/// dispatched elsewhere via core migration, an IRQ on the idle core
+/// would push its iret-frame onto a kstack that another core was
+/// actively writing kernel locals to — corrupting the iret-frame and
+/// trapping at the next iretq with a wild CS selector (`GPF err=0xcca0`).
+///
+/// One 4 KiB page per core is plenty: nothing on the park stack needs
+/// to survive (the IRQ epilogue iretq's away from this stack, returning
+/// to wherever the interrupted code was running). Also covers the
+/// kernel-mode IRQ-at-`hlt` case: `arch.cpu.idle()`'s `sti+hlt` runs in
+/// kernel mode, so an IRQ at `hlt` pushes onto current RSP — but if
+/// `idle()` first switches RSP onto the park stack, that's where the
+/// frame lands, not on a foreign EC's kstack.
+///
+/// Allocated statically so the BSP can park before any heap exists.
+pub var park_kstacks: [64][4096]u8 align(4096) =
+    [_][4096]u8{[_]u8{0} ** 4096} ** 64;
+
+/// Address one past the top of `core_id`'s park stack — safe to load
+/// into TSS.RSP0 / scratch.kernel_rsp / RSP. Stack grows down, so this
+/// is the empty-stack value.
+pub fn parkKstackTop(core_id: u64) u64 {
+    return @intFromPtr(&park_kstacks[core_id]) + park_kstacks[core_id].len;
+}
+
+/// Switch this core's TSS.RSP0 + scratch.kernel_rsp onto the park stack.
+/// Called by `clearCurrentEc` so any IRQ that fires on this core (at
+/// user-mode entry through TSS.RSP0, or via syscall scratch) lands on
+/// our private park page rather than on the EC that last ran here —
+/// which may now be dispatched on another core, with that core writing
+/// kernel locals to its kstack. Cross-core kstack aliasing is the
+/// `GPF err=0xcca0` smp=4 corruption signature.
+pub fn parkCpuKstack(core_id: u64) void {
+    const top = parkKstackTop(core_id);
+    gdt.coreTss(core_id).rsp0 = top;
+    (&per_cpu_scratch[core_id]).kernel_rsp = top;
+}
+
 /// Set KernelGsBase MSR for this core so SWAPGS can access per-CPU scratch.
 /// Must be called on each core during init, after APIC is available and
 /// after `cpu.enablePcid` has run (so the cached `pcid_enabled` flag is
