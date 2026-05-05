@@ -2046,6 +2046,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
             \\movq %%gs:32, %%rcx
             \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
+            \\movb $0, {[on_cpu_off]d}(%%rcx)
             \\
             \\movzbq {[priority_off]d}(%%rcx), %%r11
             \\shlq $4, %%r11
@@ -2075,6 +2076,7 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .lock_state_off = @offsetOf(zag.utils.sync.spin_lock.SpinLock, "state"),
                 .state_ready = @intFromEnum(zag.sched.execution_context.State.ready),
                 .state_off = @offsetOf(ExecutionContext, "state"),
+                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
                 .priority_off = @offsetOf(ExecutionContext, "priority"),
                 .run_queue_off = @offsetOf(zag.sched.scheduler.PerCore, "run_queue"),
                 .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
