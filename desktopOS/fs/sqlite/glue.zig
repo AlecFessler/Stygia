@@ -151,3 +151,58 @@ pub fn bindInt64(stmt: *Stmt, idx: c_int, v: i64) Error!void {
     const rc = c.sqlite3_bind_int64(stmt.raw, idx, v);
     if (rc != c.SQLITE_OK) return Error.SqliteBind;
 }
+
+// ── Incremental BLOB I/O ─────────────────────────────────────────
+//
+// For files that don't change size, sqlite3_blob_open + _read/_write
+// avoids ever materializing the whole row: SQLite walks the b-tree
+// to the BLOB's storage and copies just the requested byte range.
+// Used by files.pread / files.pwrite-within for O(len) transfers
+// instead of O(file_size).
+
+pub const Blob = struct {
+    raw: ?*c.sqlite3_blob,
+
+    pub fn close(self: *Blob) void {
+        if (self.raw) |b| _ = c.sqlite3_blob_close(b);
+        self.raw = null;
+    }
+
+    pub fn bytes(self: *Blob) usize {
+        return @intCast(c.sqlite3_blob_bytes(self.raw));
+    }
+
+    pub fn read(self: *Blob, dst: []u8, offset: u64) Error!void {
+        const rc = c.sqlite3_blob_read(
+            self.raw,
+            dst.ptr,
+            @intCast(dst.len),
+            @intCast(offset),
+        );
+        if (rc != c.SQLITE_OK) return Error.SqliteError;
+    }
+
+    pub fn write(self: *Blob, src: []const u8, offset: u64) Error!void {
+        const rc = c.sqlite3_blob_write(
+            self.raw,
+            src.ptr,
+            @intCast(src.len),
+            @intCast(offset),
+        );
+        if (rc != c.SQLITE_OK) return Error.SqliteError;
+    }
+};
+
+pub fn blobOpen(
+    db: *c.sqlite3,
+    table: [*:0]const u8,
+    column: [*:0]const u8,
+    rowid: i64,
+    rw: bool,
+) Error!Blob {
+    var raw: ?*c.sqlite3_blob = null;
+    const flags: c_int = if (rw) 1 else 0;
+    const rc = c.sqlite3_blob_open(db, "main", table, column, rowid, flags, &raw);
+    if (rc != c.SQLITE_OK) return Error.SqliteError;
+    return .{ .raw = raw };
+}

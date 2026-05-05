@@ -134,17 +134,15 @@ pub fn pread(db: *c.sqlite3, path: []const u8, offset: u64, dst: []u8) !usize {
     if (info.kind == .dir) return Error.IsADirectory;
     if (offset >= @as(u64, @intCast(info.size))) return 0;
 
-    var s = sqlite.prepare(db, "SELECT data FROM inodes WHERE inode = ?;") catch
+    var blob = sqlite.blobOpen(db, "inodes", "data", inode, false) catch
         return Error.SqliteError;
-    defer s.finalize();
-    sqlite.bindInt64(&s, 1, inode) catch return Error.SqliteError;
-    if (!s.step()) return Error.NotFound;
+    defer blob.close();
 
-    const blob = s.columnBlob(0);
-    if (offset >= blob.len) return 0;
-    const avail = blob.len - @as(usize, @intCast(offset));
+    const blob_size = blob.bytes();
+    if (offset >= blob_size) return 0;
+    const avail = blob_size - @as(usize, @intCast(offset));
     const n = @min(dst.len, avail);
-    @memcpy(dst[0..n], blob[@intCast(offset) .. @as(usize, @intCast(offset)) + n]);
+    blob.read(dst[0..n], offset) catch return Error.SqliteError;
     return n;
 }
 
@@ -153,6 +151,12 @@ pub const PwriteResult = struct {
     new_size: u64,
 };
 
+/// `scratch` is only used by the extending path (when offset+src.len
+/// exceeds current size). Within-size pwrites use sqlite3_blob_write
+/// and never touch the scratch buffer. The extend path materializes
+/// the existing prefix, zeroblob's the new size, then incrementally
+/// writes back the prefix and the new bytes — bounded by old_size,
+/// not by new_size.
 pub fn pwrite(
     db: *c.sqlite3,
     path: []const u8,
@@ -164,97 +168,135 @@ pub fn pwrite(
     const info = try statByInode(db, inode);
     if (info.kind == .dir) return Error.IsADirectory;
 
+    if (src.len == 0) return .{ .written = 0, .new_size = @intCast(info.size) };
+
     const new_end: u64 = offset + src.len;
-    const new_size: u64 = @max(@as(u64, @intCast(info.size)), new_end);
-    if (new_size > scratch.len) return Error.NoSpace;
+    const old_size: u64 = @intCast(info.size);
 
-    // Read-modify-write the whole blob through scratch. Phase 3 swaps
-    // this for sqlite3_blob_open / sqlite3_blob_write.
-    var rd = sqlite.prepare(db, "SELECT data FROM inodes WHERE inode = ?;") catch
-        return Error.SqliteError;
-    sqlite.bindInt64(&rd, 1, inode) catch {
-        rd.finalize();
-        return Error.SqliteError;
-    };
-    var have: usize = 0;
-    if (rd.step()) {
-        const blob = rd.columnBlob(0);
-        @memcpy(scratch[0..blob.len], blob);
-        have = blob.len;
+    if (new_end <= old_size) {
+        // Within-size write: incremental blob_write, no materialization.
+        var blob = sqlite.blobOpen(db, "inodes", "data", inode, true) catch
+            return Error.SqliteError;
+        defer blob.close();
+        blob.write(src, offset) catch return Error.SqliteError;
+
+        var up = sqlite.prepare(db, "UPDATE inodes SET mtime = ? WHERE inode = ?;") catch
+            return Error.SqliteError;
+        defer up.finalize();
+        sqlite.bindInt64(&up, 1, nowSeconds()) catch return Error.SqliteError;
+        sqlite.bindInt64(&up, 2, inode) catch return Error.SqliteError;
+        _ = up.step();
+        return .{ .written = src.len, .new_size = old_size };
     }
-    rd.finalize();
 
-    // Zero-fill any gap between EOF and offset.
-    if (offset > have) {
-        @memset(scratch[have..@intCast(offset)], 0);
+    // Extending write: bounded materialization of old data only.
+    if (old_size > scratch.len) return Error.NoSpace;
+    if (old_size > 0) {
+        var old_blob = sqlite.blobOpen(db, "inodes", "data", inode, false) catch
+            return Error.SqliteError;
+        old_blob.read(scratch[0..@intCast(old_size)], 0) catch {
+            old_blob.close();
+            return Error.SqliteError;
+        };
+        old_blob.close();
     }
-    @memcpy(scratch[@intCast(offset) .. @as(usize, @intCast(offset)) + src.len], src);
 
+    // Replace the row's data with a zeroblob of the new size, then
+    // splice prefix + src back in via incremental writes.
     var up = sqlite.prepare(
         db,
-        "UPDATE inodes SET data = ?, size = ?, mtime = ? WHERE inode = ?;",
+        "UPDATE inodes SET data = zeroblob(?), size = ?, mtime = ? WHERE inode = ?;",
     ) catch return Error.SqliteError;
-    defer up.finalize();
-    sqlite.bindBlob(&up, 1, scratch[0..@intCast(new_size)]) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 2, @intCast(new_size)) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 3, nowSeconds()) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 4, inode) catch return Error.SqliteError;
+    sqlite.bindInt64(&up, 1, @intCast(new_end)) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 2, @intCast(new_end)) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 3, nowSeconds()) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 4, inode) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
     _ = up.step();
+    up.finalize();
 
-    return .{ .written = src.len, .new_size = new_size };
+    var blob = sqlite.blobOpen(db, "inodes", "data", inode, true) catch
+        return Error.SqliteError;
+    defer blob.close();
+    if (old_size > 0) {
+        // Restore old prefix (only up to whichever comes first: old_size or offset).
+        const prefix_n: u64 = @min(old_size, offset);
+        if (prefix_n > 0) {
+            blob.write(scratch[0..@intCast(prefix_n)], 0) catch return Error.SqliteError;
+        }
+        // If src starts past old_size, the gap is already zero from zeroblob().
+        // If src starts within old_size, the bytes [offset..old_size] would have
+        // been overwritten — but we only restored up to `prefix_n = min(old_size, offset)`,
+        // so nothing to do.
+    }
+    blob.write(src, offset) catch return Error.SqliteError;
+
+    return .{ .written = src.len, .new_size = new_end };
 }
 
 pub fn truncate(db: *c.sqlite3, path: []const u8, new_size: u64, scratch: []u8) !void {
     const inode = try resolve(db, path);
     const info = try statByInode(db, inode);
     if (info.kind == .dir) return Error.IsADirectory;
-    if (new_size > scratch.len) return Error.NoSpace;
 
-    if (@as(i64, @intCast(new_size)) == info.size) return;
+    const old_size: u64 = @intCast(info.size);
+    if (new_size == old_size) return;
 
-    if (new_size > @as(u64, @intCast(info.size))) {
-        // Grow with zeros: pull old blob, pad, write back.
-        var rd = sqlite.prepare(db, "SELECT data FROM inodes WHERE inode = ?;") catch
+    // Bytes to preserve = min(old_size, new_size). Materialization is
+    // bounded by that, not by max(old_size, new_size).
+    const preserve: u64 = @min(old_size, new_size);
+    if (preserve > scratch.len) return Error.NoSpace;
+
+    if (preserve > 0) {
+        var old_blob = sqlite.blobOpen(db, "inodes", "data", inode, false) catch
             return Error.SqliteError;
-        sqlite.bindInt64(&rd, 1, inode) catch {
-            rd.finalize();
+        old_blob.read(scratch[0..@intCast(preserve)], 0) catch {
+            old_blob.close();
             return Error.SqliteError;
         };
-        var have: usize = 0;
-        if (rd.step()) {
-            const blob = rd.columnBlob(0);
-            @memcpy(scratch[0..blob.len], blob);
-            have = blob.len;
-        }
-        rd.finalize();
-        @memset(scratch[have..@intCast(new_size)], 0);
-    } else {
-        // Shrink: pull blob and crop. (For new_size==0 the SELECT can be skipped.)
-        if (new_size > 0) {
-            var rd = sqlite.prepare(db, "SELECT data FROM inodes WHERE inode = ?;") catch
-                return Error.SqliteError;
-            sqlite.bindInt64(&rd, 1, inode) catch {
-                rd.finalize();
-                return Error.SqliteError;
-            };
-            if (rd.step()) {
-                const blob = rd.columnBlob(0);
-                @memcpy(scratch[0..@intCast(new_size)], blob[0..@intCast(new_size)]);
-            }
-            rd.finalize();
-        }
+        old_blob.close();
     }
 
     var up = sqlite.prepare(
         db,
-        "UPDATE inodes SET data = ?, size = ?, mtime = ? WHERE inode = ?;",
+        "UPDATE inodes SET data = zeroblob(?), size = ?, mtime = ? WHERE inode = ?;",
     ) catch return Error.SqliteError;
-    defer up.finalize();
-    sqlite.bindBlob(&up, 1, scratch[0..@intCast(new_size)]) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 2, @intCast(new_size)) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 3, nowSeconds()) catch return Error.SqliteError;
-    sqlite.bindInt64(&up, 4, inode) catch return Error.SqliteError;
+    sqlite.bindInt64(&up, 1, @intCast(new_size)) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 2, @intCast(new_size)) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 3, nowSeconds()) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
+    sqlite.bindInt64(&up, 4, inode) catch {
+        up.finalize();
+        return Error.SqliteError;
+    };
     _ = up.step();
+    up.finalize();
+
+    if (preserve > 0) {
+        var blob = sqlite.blobOpen(db, "inodes", "data", inode, true) catch
+            return Error.SqliteError;
+        defer blob.close();
+        blob.write(scratch[0..@intCast(preserve)], 0) catch return Error.SqliteError;
+    }
 }
 
 pub fn createFile(db: *c.sqlite3, path: []const u8, mode: i64) !i64 {
