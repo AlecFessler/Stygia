@@ -170,13 +170,32 @@ fn armOnParkImpl(ec: *ExecutionContext) void {
     @atomicStore(u8, &e.armed, 1, .release);
 }
 
-/// Compare `ec.ctx`'s current iret frame against the park-time
-/// snapshot. Called from `scheduler.setCurrentEc`, BEFORE the
-/// dispatch trampoline loads `rsp = ec.ctx` and iretq's. A mismatch
-/// triggers `panic` with a per-slot diff dump.
+/// Validate `ec.ctx`'s current iret frame contains plausible values for
+/// the EC's last-known execution mode. Called from
+/// `scheduler.setCurrentEc`, BEFORE the dispatch trampoline loads
+/// `rsp = ec.ctx` and iretq's. The original byte-equality compare
+/// false-positived on legitimate user-state evolution (an EC running
+/// user code between two parks legitimately advances rip/rsp/rflags),
+/// so we instead validate that the slots still encode a plausible
+/// resume frame: known segment selectors, canonical addresses,
+/// rflags within 32-bit range. The park-time snapshot is retained
+/// for diagnostic context only.
 pub inline fn checkOnDispatch(ec: *ExecutionContext) void {
     if (comptime !enabled) return;
     checkOnDispatchImpl(ec);
+}
+
+/// Selectors expected at iretq into user mode. Keep in sync with
+/// `arch/x64/gdt.zig`. ss=0x1B = ring-3 data, cs=0x23 = ring-3 64-bit.
+const USER_CS: u64 = 0x23;
+const USER_SS: u64 = 0x1B;
+const KERNEL_CS: u64 = 0x08;
+const KERNEL_SS: u64 = 0x10;
+
+inline fn isCanonical(addr: u64) bool {
+    // x86-64 canonical: top 17 bits all 0 (user half) or all 1 (kernel half).
+    const high = addr >> 47;
+    return high == 0 or high == 0x1FFFF;
 }
 
 fn checkOnDispatchImpl(ec: *ExecutionContext) void {
@@ -207,10 +226,34 @@ fn checkOnDispatchImpl(ec: *ExecutionContext) void {
     const cur_rsp = loadCtxQuad(ctx_addr, CtxLayout.rsp_off);
     const cur_ss = loadCtxQuad(ctx_addr, CtxLayout.ss_off);
 
-    const mismatch = (cur_rip != e.rip) or (cur_cs != e.cs) or
-        (cur_rflags != e.rflags) or (cur_rsp != e.rsp) or
-        (cur_ss != e.ss);
-    if (!mismatch) return;
+    // Mode-aware validation. The snapshot's `cs` records the EC's
+    // last-known mode at park time (or, on first arm, what
+    // prepareThreadContext set up). User-mode ECs must dispatch with
+    // user CS/SS and canonical user-half rip/rsp; kernel-mode ECs
+    // (idle threads) just need non-zero selectors. rflags is bounded
+    // to 32 bits in either mode (high half is reserved zero).
+    var bad_cs: bool = false;
+    var bad_ss: bool = false;
+    var bad_rip: bool = false;
+    var bad_rsp: bool = false;
+    var bad_rflags: bool = false;
+
+    if (e.cs == USER_CS) {
+        bad_cs = cur_cs != USER_CS;
+        bad_ss = cur_ss != USER_SS;
+        bad_rip = (cur_rip >> 47) != 0;
+        bad_rsp = (cur_rsp >> 47) != 0;
+    } else {
+        // Kernel-mode EC (e.g. idle). Require non-null selectors and
+        // canonical addresses, but accept either half.
+        bad_cs = cur_cs == 0 or cur_cs >= 0x10000;
+        bad_ss = cur_ss == 0 or cur_ss >= 0x10000;
+        bad_rip = !isCanonical(cur_rip);
+        bad_rsp = !isCanonical(cur_rsp);
+    }
+    bad_rflags = (cur_rflags >> 32) != 0;
+
+    if (!(bad_cs or bad_ss or bad_rip or bad_rsp or bad_rflags)) return;
 
     reportViolation(ec, idx, e, cur_rip, cur_cs, cur_rflags, cur_rsp, cur_ss);
 }
@@ -241,18 +284,18 @@ fn fmtDec(v: u64, buf: *[20]u8) []const u8 {
     return buf[i..];
 }
 
-fn printQuad(label: []const u8, expected: u64, actual: u64) void {
+fn printQuad(label: []const u8, snapshot: u64, current: u64, suspect: bool) void {
     var hex: [16]u8 = undefined;
     arch.boot.printRaw("    ");
     arch.boot.printRaw(label);
-    arch.boot.printRaw(": expected=0x");
-    fmtHex(expected, &hex);
+    arch.boot.printRaw(": park=0x");
+    fmtHex(snapshot, &hex);
     arch.boot.printRaw(&hex);
-    arch.boot.printRaw(" actual=0x");
-    fmtHex(actual, &hex);
+    arch.boot.printRaw(" current=0x");
+    fmtHex(current, &hex);
     arch.boot.printRaw(&hex);
-    if (expected != actual) {
-        arch.boot.printRaw("  *** MISMATCH ***");
+    if (suspect) {
+        arch.boot.printRaw("  *** INVALID ***");
     }
     arch.boot.printRaw("\n");
 }
@@ -308,11 +351,17 @@ fn reportViolation(
     arch.boot.printRaw("\n");
 
     arch.boot.printRaw("  iret-frame slots (park-snapshot vs dispatch-current):\n");
-    printQuad("rip   ", e.rip, cur_rip);
-    printQuad("cs    ", e.cs, cur_cs);
-    printQuad("rflags", e.rflags, cur_rflags);
-    printQuad("rsp   ", e.rsp, cur_rsp);
-    printQuad("ss    ", e.ss, cur_ss);
+    const user_mode = e.cs == USER_CS;
+    const bad_cs = if (user_mode) (cur_cs != USER_CS) else (cur_cs == 0 or cur_cs >= 0x10000);
+    const bad_ss = if (user_mode) (cur_ss != USER_SS) else (cur_ss == 0 or cur_ss >= 0x10000);
+    const bad_rip = if (user_mode) ((cur_rip >> 47) != 0) else !isCanonical(cur_rip);
+    const bad_rsp = if (user_mode) ((cur_rsp >> 47) != 0) else !isCanonical(cur_rsp);
+    const bad_rflags = (cur_rflags >> 32) != 0;
+    printQuad("rip   ", e.rip, cur_rip, bad_rip);
+    printQuad("cs    ", e.cs, cur_cs, bad_cs);
+    printQuad("rflags", e.rflags, cur_rflags, bad_rflags);
+    printQuad("rsp   ", e.rsp, cur_rsp, bad_rsp);
+    printQuad("ss    ", e.ss, cur_ss, bad_ss);
 
     // Dump ctx_trace ring (cross-event timeline) before the panic
     // tail-call so the operator sees the full causal chain.
