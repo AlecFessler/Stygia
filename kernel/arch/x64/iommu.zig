@@ -37,6 +37,19 @@ pub fn addAmdAlias(source: u16, alias: u16) void {
     vi.addAlias(source, alias);
 }
 
+/// Call after the first wave of `iommuMapPage` to flip translation on.
+/// Both VT-d (TE) and AMD-Vi (IommuEn) defer master enable from init so
+/// provisioning runs against an inert IOMMU; once devices' page tables
+/// hold real mappings, this latches translation live. No-op if already
+/// enabled, or if no IOMMU was discovered.
+pub fn enableTranslation() void {
+    switch (active_type) {
+        .intel_vtd => vtd.enableTranslation(),
+        .amd_vi => vi.enableTranslation(),
+        .none => {},
+    }
+}
+
 pub fn isAvailable() bool {
     return active_type != .none;
 }
@@ -48,12 +61,11 @@ pub fn iommuMapPage(
     sz: VmarPageSize,
     perms: MemoryPerms,
 ) !void {
-    _ = device;
-    _ = iova;
-    _ = phys;
-    _ = sz;
-    _ = perms;
-    @panic("not implemented");
+    switch (active_type) {
+        .intel_vtd => return vtd.mapPage(device, iova, phys, sz, perms),
+        .amd_vi => return vi.mapPage(device, iova, phys, sz, perms),
+        .none => return,
+    }
 }
 
 pub fn iommuUnmapPage(
@@ -61,10 +73,11 @@ pub fn iommuUnmapPage(
     iova: u64,
     sz: VmarPageSize,
 ) ?PAddr {
-    _ = device;
-    _ = iova;
-    _ = sz;
-    @panic("not implemented");
+    switch (active_type) {
+        .intel_vtd => return vtd.unmapPage(device, iova, sz),
+        .amd_vi => return vi.unmapPage(device, iova, sz),
+        .none => return null,
+    }
 }
 
 pub fn invalidateIotlbRange(
@@ -73,9 +86,9 @@ pub fn invalidateIotlbRange(
     sz: VmarPageSize,
     page_count: u32,
 ) void {
-    _ = device;
-    _ = iova;
-    _ = sz;
-    _ = page_count;
-    @panic("not implemented");
+    switch (active_type) {
+        .intel_vtd => vtd.invalidatePageRange(device, iova, sz, page_count),
+        .amd_vi => vi.invalidatePageRange(device, iova, sz, page_count),
+        .none => {},
+    }
 }

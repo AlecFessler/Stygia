@@ -18,9 +18,13 @@
 #     HPFAR_EL2 etc.). Kept whole so future EL2 bring-up grabs bits without
 #     re-deriving from the ARM ARM.
 #   * arch/x64/intel/vmx.zig, arch/x64/amd/svm.zig,
-#     arch/x64/amd/vi.zig, arch/x64/intel/pmu.zig      — Intel/AMD MSR + VMCS /
-#     VMCB / IOMMU / PMU encoding sets. Same reasoning: arch reference set,
-#     kept whole.
+#     arch/x64/amd/vi.zig, arch/x64/intel/vtd.zig,
+#     arch/x64/intel/pmu.zig                            — Intel/AMD MSR /
+#     VMCS / VMCB / IOMMU / PMU encoding sets. Same reasoning: arch
+#     reference set, kept whole. The VT-d RootEntry / ContextEntry
+#     packed structs (vtd.zig) describe hardware-mandated 128-bit
+#     entries — reserved fields stay so the binary layout matches what
+#     the IOMMU walker expects on memory reads.
 #   * arch/x64/cpu.zig                                 — CPUID feature bits.
 #     A future feature probe should pick the bit from this enum, not redefine
 #     it; keep the spec-mandated value space.
@@ -316,11 +320,6 @@ arch/x64/amd/svm.zig:77-77    sha256:0756746af3d5c5c61412f525c2ad93b513b9712cdbc
 arch/x64/amd/svm.zig:83-83    sha256:7511783f09cecb565e01c132976d7a0e4d0e3de33ac0d0b0b68c0d34771f2f5c
 arch/x64/amd/svm.zig:132-132    sha256:213b00fb03a7fae04cbe34ab40dfd8217182293490d32b8438468c0cc79612b1
 arch/x64/amd/svm.zig:133-133    sha256:711dd8733ad9d012714d6cc9436389097b12438757690bdef5b1b0170fdc0528
-arch/x64/amd/vi.zig:76-76    sha256:fdd16eb1bf9c7f39e3679eadb421cf1c9350753c21c26fa9c35850f8a56514e2
-arch/x64/amd/vi.zig:81-81    sha256:4fd81e9dc83593f264cba209b1b8327fe170bd5388a7302549d0203747113c27
-arch/x64/amd/vi.zig:92-92    sha256:a36f058afe100f4b0996a0f04c84957049b6a71d906f8d2078c0be43c550abce
-arch/x64/amd/vi.zig:95-95    sha256:af59fa3e57aa235bb305ea86a8e13cc11dc2bff77ee64df41b24fa779c9f8f11
-arch/x64/amd/vi.zig:98-98    sha256:08bbb733c505b23e8522ea43ae829e763d50ea5f75d0b51aa8405aaa7f81e1c3
 arch/x64/apic.zig:16-16    sha256:e13024045be62f27640323ff8b9a16ba0397fab7865d157c7954240100f467b9
 arch/x64/apic.zig:17-17    sha256:49e7266791d08dc921dc4768e1627620ed4f12b3cb8ef6e2009bb21bfc969db0
 arch/x64/apic.zig:18-18    sha256:8450e5ea15f24cb48926b93a126224f11173dfabe21a18f9338044e3bc6bf139
@@ -474,6 +473,11 @@ arch/x64/idt.zig:14-14    sha256:10be409ce6568025ae7effe894c4399671709030d131e53
 arch/x64/idt.zig:25-25    sha256:c6341bffd0f387b32c05ec672cfdcad54684409c1b53034c09a525d090cea00e
 arch/x64/idt.zig:34-34    sha256:bfe90afa003ad45a672ca6da1fff5fcc25076047ae39177c662dfc3755f451c5
 arch/x64/intel/pmu.zig:57-57    sha256:cb9e29acb1faa46e5f2c8c242d098c4bb57e89f3c230ab528fecf0ecb9a0d4ad
+arch/x64/intel/vtd.zig:105-105    sha256:eacee4aee748d0a25b2de5c24dbedb7f7fa6fd1fd9d130b254b5b2e4375230b4
+arch/x64/intel/vtd.zig:131-131    sha256:98272adb96ff5d2a33f13ecbd46631f47321f9b349db7547dae4a590318a3a7c
+arch/x64/intel/vtd.zig:132-132    sha256:5bc9ef08a9c48023dda230406bf8405c079d8ac0d4ac670fb58cf3f1db89c984
+arch/x64/intel/vtd.zig:133-133    sha256:9c659111c0c9ee1a36ec3dd2b78c89998b27b27a46df7ce534c6c194782d5733
+arch/x64/intel/vtd.zig:135-135    sha256:442a34032d6b09f67b6eda1c3c4926a9bdddbbc8508f764a0ba7a42801ab87bc
 arch/x64/intel/vmx.zig:31-31    sha256:ea17dbb08d872f6c8da587b5637a7e180b6e4c5e49c4b52d9c65da62884ad2c4
 arch/x64/intel/vmx.zig:38-38    sha256:820e29d50f7ad591e316eec0117b19d810bd2ef4bd962d49480a1df36de28b03
 arch/x64/intel/vmx.zig:39-39    sha256:c8cf30814633090b3be850271ee0d326f7138407070cf14b8bb4a5fe4ff8b498
@@ -557,7 +561,7 @@ memory/vmar.zig:57-57    sha256:1a593cece0a5140d2b360ae4915a82ff8887ead91f3d1898
 memory/vmar.zig:58-58    sha256:a304e6dcb27904e7262b9cc402a3feacf1f5bab98544c7111e018daec11dccb4
 memory/vmar.zig:59-59    sha256:16cae723b1579c3d93559c9d2f0caff77d0e781127192aacbfd93ad314ee546c
 memory/vmar.zig:78-78    sha256:a288911c380720c587d59bb322fc8502fd9aa7fb0c98e76752bc2ef4cb93b44e
-devices/device_region.zig:79-79    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
+devices/device_region.zig:121-121    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
 sched/execution_context.zig:87-87    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
