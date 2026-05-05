@@ -227,7 +227,15 @@ fn asmMarkTrampolineFn(
             // pushfq we subq $8 to realign rsp to 16 before `call` —
             // accounting for that, the saved RIP sits at rsp+136
             // inside the call.
+            // Drop rsp 192 bytes below the kstack top before saving regs,
+            // mirroring ctxTraceMarkFromAsm_*'s guard. The FP body keeps
+            // rsp = ec.kstack_top throughout, and ec.ctx lives at
+            // [kstack_top - 176, kstack_top); without the guard the 17
+            // pushes below would stomp ec.ctx.{rip,cs,rflags,rsp,ss,...}
+            // — silently corrupting the very state we're trying to
+            // observe (and that the next dispatch will iretq into).
             asm volatile (std.fmt.comptimePrint(
+                    \\subq $192, %%rsp
                     \\pushq %%rax
                     \\pushq %%rcx
                     \\pushq %%rdx
@@ -248,7 +256,7 @@ fn asmMarkTrampolineFn(
                     \\movl ${[evt]d}, %%edi
                     \\movq %%gs:32, %%rsi
                     \\movq %%gs:{[next_off]d}, %%rdx
-                    \\movq 136(%%rsp), %%rcx
+                    \\movq 328(%%rsp), %%rcx
                     \\call ecLogMarkC
                     \\addq $8, %%rsp
                     \\popfq
@@ -267,6 +275,7 @@ fn asmMarkTrampolineFn(
                     \\popq %%rdx
                     \\popq %%rcx
                     \\popq %%rax
+                    \\addq $192, %%rsp
                     \\ret
                 ,
                     .{
