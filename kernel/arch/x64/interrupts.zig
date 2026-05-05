@@ -1216,7 +1216,17 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
             },
         ) ++ (if (build_options.kernel_ctx_trace)
+            // Move rsp below ec.ctx [kstack.top-176, kstack.top) before the
+            // `call` so the saved RIP and the trampoline's GPR pushes do
+            // not stomp the very iret-frame slots ctx_trace is here to
+            // observe. FP rsp = scratch.kernel_rsp = kstack.top throughout
+            // the path, so `call`'s RIP push lands at top-8 = ctx.ss
+            // and the first 5 pushes overwrite ctx.{ss,rsp,rflags,cs,rip}
+            // without this guard. 192 B leaves the full 176 B Context
+            // intact plus 16 B alignment slack; restored after ret.
+            \\subq $192, %%rsp
             \\call ctxTraceMarkFromAsm_fp_suspend_step12
+            \\addq $192, %%rsp
             \\
         else
             "") ++
@@ -2013,7 +2023,11 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .ctx_ss_off = @offsetOf(cpu.Context, "ss"),
             },
         ) ++ (if (build_options.kernel_ctx_trace)
+            // See suspend Step 12 mark above for the kstack-vs-ec.ctx
+            // overlap rationale.
+            \\subq $192, %%rsp
             \\call ctxTraceMarkFromAsm_fp_reply_r11
+            \\addq $192, %%rsp
             \\
         else
             "") ++
@@ -2127,7 +2141,11 @@ pub export fn syscallEntry() callconv(.naked) void {
     // ────────────────────────────────────────────────────────────────
         \\.Lreply_atomic_recv_park:
         ++ (if (build_options.kernel_ctx_trace)
+            // See suspend Step 12 mark above for the kstack-vs-ec.ctx
+            // overlap rationale.
+            \\subq $192, %%rsp
             \\call ctxTraceMarkFromAsm_recv_park
+            \\addq $192, %%rsp
             \\
         else
             "") ++ std.fmt.comptimePrint(
