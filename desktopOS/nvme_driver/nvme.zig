@@ -117,15 +117,14 @@ pub const Controller = struct {
 
     /// Map BAR0 as MMIO + allocate DMA-capable VMAR + run controller init.
     pub fn initFromHandle(self: *Controller, device_handle: HandleId, mmio_size: u64) InitError {
+        // ── BAR0 MMIO mapping ────────────────────────────────────
         const mmio_pages = (mmio_size + 4095) / 4096;
         const mmio_var_caps = caps.VmarCap{
             .r = true,
             .w = true,
             .mmio = true,
         };
-        const mmio_props: u64 = (1 << 5) | // cch=1 (uc)
-            (0 << 3) | // sz=0 (4 KiB)
-            0b011; // cur_rwx=r|w
+        const mmio_props: u64 = (1 << 5) | (0 << 3) | 0b011; // cch=uc, sz=4K, r|w
         const mmio_cvar = syscall.createVmar(
             @as(u64, mmio_var_caps.toU16()),
             mmio_props,
@@ -133,56 +132,47 @@ pub const Controller = struct {
             0,
             0,
         );
-        if (mmio_cvar.v1 < 16) {
-            log.print("nvme: createVmar(mmio) err=");
-            log.dec(mmio_cvar.v1);
-            log.print("\n");
-            return .mmio_vmar_create;
-        }
+        if (mmio_cvar.v1 < 16) return .mmio_vmar_create;
         const mmio_vmar_handle: HandleId = @truncate(mmio_cvar.v1 & 0xFFF);
         self.mmio_base = mmio_cvar.v2;
-        log.print("nvme: mmio vmar base=0x");
-        log.hex64(self.mmio_base);
-        log.print("\n");
+        if (syscall.mapMmio(mmio_vmar_handle, device_handle).v1 != 0) return .mmio_map;
 
-        const mm = syscall.mapMmio(mmio_vmar_handle, device_handle);
-        if (mm.v1 != 0) {
-            log.print("nvme: mapMmio err=");
-            log.dec(mm.v1);
-            log.print("\n");
-            return .mmio_map;
-        }
-        log.print("nvme: mapMmio ok, reading CAP\n");
-
-        // ── Allocate DMA-capable VMAR bound to this device ──────────
-        // caps.dma=1 + [5] device_region binds the IOMMU mapping
-        // atomically. dma_virt and dma_phys end up identical.
-        const dma_pf_caps = caps.PfCap{
-            .move = false,
-            .r = true,
-            .w = true,
-        };
-        const dma_pf = syscall.createPageFrame(
-            @as(u64, dma_pf_caps.toU16()),
-            0,
-            DMA_PAGES,
-        );
-        if (dma_pf.v1 < 16) {
-            log.print("nvme: createPageFrame(dma) err=");
-            log.dec(dma_pf.v1);
-            log.print("\n");
-            return .dma_pf_create;
-        }
+        // ── DMA buffer: page_frame mapped TWICE ──────────────────
+        // Spec §[map_pf]: a DMA VMAR (caps.dma=1) only installs IOMMU
+        // page-table entries — no CPU mapping. To poke the DMA buffer
+        // from userspace AND have the device DMA against it, we map
+        // the same page_frame into:
+        //   1. a regular VMAR — CPU sees `dma_virt`
+        //   2. a DMA VMAR bound to the NVMe device_region — IOMMU
+        //      translates `dma_phys + offset` to the page_frame's
+        //      physical bytes for the device.
+        // CPU writes via dma_virt are visible to the device's DMA
+        // reads through dma_phys (both alias the same page_frame).
+        const dma_pf_caps = caps.PfCap{ .r = true, .w = true };
+        const dma_pf = syscall.createPageFrame(@as(u64, dma_pf_caps.toU16()), 0, DMA_PAGES);
+        if (dma_pf.v1 < 16) return .dma_pf_create;
         const dma_pf_handle: HandleId = @truncate(dma_pf.v1 & 0xFFF);
 
-        const dma_var_caps = caps.VmarCap{
-            .r = true,
-            .w = true,
-            .dma = true,
-        };
-        const dma_props: u64 = (0 << 5) | // cch=0 (wb)
-            (0 << 3) | // sz=0 (4 KiB)
-            0b011; // cur_rwx=r|w
+        // (1) Regular VMAR for CPU access.
+        const cpu_var_caps = caps.VmarCap{ .r = true, .w = true };
+        const cpu_props: u64 = (0 << 5) | (0 << 3) | 0b011; // cch=wb, sz=4K, r|w
+        const cpu_cvar = syscall.createVmar(
+            @as(u64, cpu_var_caps.toU16()),
+            cpu_props,
+            DMA_PAGES,
+            0,
+            0,
+        );
+        if (cpu_cvar.v1 < 16) return .dma_vmar_create;
+        const cpu_vmar_handle: HandleId = @truncate(cpu_cvar.v1 & 0xFFF);
+        self.dma_virt = cpu_cvar.v2;
+
+        const cpu_pairs = [_]u64{ 0, dma_pf_handle };
+        if (syscall.mapPf(cpu_vmar_handle, cpu_pairs[0..]).v1 != 0) return .dma_map;
+
+        // (2) DMA VMAR bound to the device for IOMMU translation.
+        const dma_var_caps = caps.VmarCap{ .r = true, .w = true, .dma = true };
+        const dma_props: u64 = (0 << 5) | (0 << 3) | 0b011; // cch=wb, sz=4K, r|w
         const dma_cvar = syscall.createVmar(
             @as(u64, dma_var_caps.toU16()),
             dma_props,
@@ -190,32 +180,12 @@ pub const Controller = struct {
             0,
             device_handle,
         );
-        if (dma_cvar.v1 < 16) {
-            log.print("nvme: createVmar(dma) err=");
-            log.dec(dma_cvar.v1);
-            log.print("\n");
-            return .dma_vmar_create;
-        }
+        if (dma_cvar.v1 < 16) return .dma_vmar_create;
         const dma_vmar_handle: HandleId = @truncate(dma_cvar.v1 & 0xFFF);
-        self.dma_virt = dma_cvar.v2;
         self.dma_phys = dma_cvar.v2;
-        log.print("nvme: dma vmar base=0x");
-        log.hex64(self.dma_virt);
-        log.print("\n");
 
-        // Spec §[map_pf] pair order: (offset_bytes, page_frame_handle).
-        const map_pairs = [_]u64{ 0, dma_pf_handle };
-        log.print("nvme: dma mapPf calling, vmar=");
-        log.dec(dma_vmar_handle);
-        log.print(" pf=");
-        log.dec(dma_pf_handle);
-        log.print("\n");
-        const mp = syscall.mapPf(dma_vmar_handle, map_pairs[0..]);
-        log.print("nvme: dma mapPf returned v1=");
-        log.dec(mp.v1);
-        log.print("\n");
-        if (mp.v1 != 0) return .dma_map;
-        log.print("nvme: dma mapPf ok, zeroing\n");
+        const dma_pairs = [_]u64{ 0, dma_pf_handle };
+        if (syscall.mapPf(dma_vmar_handle, dma_pairs[0..]).v1 != 0) return .dma_map;
 
         // Zero all DMA memory — phase tags must start at 0 for new CQEs.
         const dma_buf: [*]u8 = @ptrFromInt(self.dma_virt);

@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
     });
     nvme_app_mod.addImport("lib", lib_mod);
     nvme_app_mod.addImport("log", log_mod);
+    nvme_app_mod.addImport("blockdev", blockdev_mod);
 
     const nvme_start_mod = b.createModule(.{
         .root_source_file = start_src,
@@ -246,10 +247,12 @@ pub fn build(b: *std.Build) void {
 
     // ── Embedded services for root_service ──────────────────────────
     const services_wf = b.addWriteFiles();
+    _ = services_wf.addCopyFile(nvme_exe.getEmittedBin(), "nvme_driver.elf");
     _ = services_wf.addCopyFile(blkdev_exe.getEmittedBin(), "block_device.elf");
     _ = services_wf.addCopyFile(fs_exe.getEmittedBin(), "fs.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
+        \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
         \\pub const block_device_elf = @embedFile("block_device.elf");
         \\pub const fs_elf = @embedFile("fs.elf");
         \\

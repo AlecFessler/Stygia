@@ -30,8 +30,7 @@ const HandleId = caps.HandleId;
 
 const PAGE_4K: u64 = 4096;
 const SCRATCH_PAGES: u64 = 1;
-const DISK_PAGES: u64 = 4096; // 16 MiB
-const MAX_PASSED: usize = 16;
+const MAX_PASSED: usize = 32;
 
 pub fn main(cap_table_base: u64) void {
     log.init(cap_table_base);
@@ -60,20 +59,16 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: HandleId = @truncate(cp.v1 & 0xFFF);
 
     // Allocate the shared scratch buffer (block transfer area).
+    // Same lifetime + r+w semantics as before — the underlying
+    // storage flips from a sibling page_frame to real NVMe.
     const scratch_pf = createPf(SCRATCH_PAGES) orelse {
         log.print("[desktopOS] FATAL: scratch_pf alloc failed\n");
         powerShutdown();
     };
 
-    // Allocate the block_device's "disk" backing.
-    const disk_pf = createPf(DISK_PAGES) orelse {
-        log.print("[desktopOS] FATAL: disk_pf alloc failed\n");
-        powerShutdown();
-    };
-
     // Stage child ELFs.
-    const block_device_pf = stageElfPageFrame(services.block_device_elf) orelse {
-        log.print("[desktopOS] FATAL: stage(block_device.elf) failed\n");
+    const nvme_driver_pf = stageElfPageFrame(services.nvme_driver_elf) orelse {
+        log.print("[desktopOS] FATAL: stage(nvme_driver.elf) failed\n");
         powerShutdown();
     };
     const fs_pf = stageElfPageFrame(services.fs_elf) orelse {
@@ -81,27 +76,40 @@ pub fn main(cap_table_base: u64) void {
         powerShutdown();
     };
 
-    // Spawn block_device.
+    // Collect MMIO device_regions to forward to the NVMe driver. It
+    // probes each (read VS at offset 0x08; NVMe reports MJR=1) to
+    // pick its controller's BAR0.
+    var mmio_devs: [16]HandleId = undefined;
+    const mmio_count = collectMmioDeviceRegions(cap_table_base, &mmio_devs);
+    log.print("[desktopOS] forwarding ");
+    log.dec(mmio_count);
+    log.print(" MMIO device_region(s) to nvme_driver\n");
+
+    // Spawn nvme_driver. Passed handles in order:
+    //   COM1, port (recv), scratch_pf (r+w), then each MMIO device_region.
     _ = spawnService(
-        "block_device",
-        block_device_pf,
+        "nvme_driver",
+        nvme_driver_pf,
         com1,
         port_handle,
         true, // recv side
-        &.{ scratch_pf, disk_pf },
+        scratch_pf,
+        mmio_devs[0..mmio_count],
     ) orelse powerShutdown();
 
-    // Spawn fs.
+    // Spawn fs. Same shape as before; doesn't know whether the storage
+    // backend is a real NVMe driver or the page_frame interim.
     _ = spawnService(
         "fs",
         fs_pf,
         com1,
         port_handle,
         false, // xfer side
-        &.{scratch_pf},
+        scratch_pf,
+        &.{},
     ) orelse powerShutdown();
 
-    log.print("[desktopOS] both services spawned; root parking\n");
+    log.print("[desktopOS] services spawned; root parking\n");
 
     while (true) {
         switch (builtin.cpu.arch) {
@@ -110,6 +118,22 @@ pub fn main(cap_table_base: u64) void {
             else => {},
         }
     }
+}
+
+fn collectMmioDeviceRegions(cap_table_base: u64, out: []HandleId) usize {
+    var n: usize = 0;
+    var slot: u32 = caps.SLOT_FIRST_PASSED;
+    while (slot < caps.HANDLE_TABLE_MAX and n < out.len) : (slot += 1) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() != .device_region) continue;
+        const dev_type: u4 = @truncate(c.field0 & 0xF);
+        if (dev_type != 0) continue; // not MMIO
+        const size_pages: u64 = (c.field0 >> 52) & 0xFFF;
+        if (size_pages == 0) continue;
+        out[n] = @truncate(slot);
+        n += 1;
+    }
+    return n;
 }
 
 fn findCom1(cap_table_base: u64) ?HandleId {
@@ -137,16 +161,18 @@ fn createPf(pages: u64) ?HandleId {
     return @truncate(c.v1 & 0xFFF);
 }
 
-/// Spawn a child capability domain running `elf_pf`. Passes COM1 by
-/// copy, the IPC port (with caps tailored to recv vs xfer side),
-/// then any extra page_frame handles.
+/// Spawn a child capability domain running `elf_pf`. Passes COM1, the
+/// IPC port (recv for server, xfer for client), the shared scratch
+/// page_frame, and any extra device_region handles (used to forward
+/// PCI MMIO regions the NVMe driver probes for its controller).
 fn spawnService(
     name: []const u8,
     elf_pf: HandleId,
     com1: HandleId,
     port_handle: HandleId,
     is_recv_side: bool,
-    extra_pfs: []const HandleId,
+    scratch_pf: HandleId,
+    extra_devs: []const HandleId,
 ) ?HandleId {
     var passed: [MAX_PASSED]u64 = undefined;
     var n: usize = 0;
@@ -173,13 +199,27 @@ fn spawnService(
     }).toU64();
     n += 1;
 
-    // [2..] page_frames (r+w; recipient maps them into its own VMARs)
+    // [2] scratch page_frame (r+w; recipient maps it into its own VMAR)
     const pf_passed_caps = caps.PfCap{ .r = true, .w = true };
+    passed[n] = (caps.PassedHandle{
+        .id = scratch_pf,
+        .caps = pf_passed_caps.toU16(),
+        .move = false,
+    }).toU64();
+    n += 1;
+
+    // [3..] extra device_region handles. Forward dma + irq caps so
+    // a driver-side child can use them with createVmar(caps.dma=1)
+    // and bind_event_route.
+    const dr_passed_caps = caps.DeviceCap{
+        .dma = true,
+        .irq = true,
+    };
     var i: usize = 0;
-    while (i < extra_pfs.len and n < MAX_PASSED) : (i += 1) {
+    while (i < extra_devs.len and n < MAX_PASSED) : (i += 1) {
         passed[n] = (caps.PassedHandle{
-            .id = extra_pfs[i],
-            .caps = pf_passed_caps.toU16(),
+            .id = extra_devs[i],
+            .caps = dr_passed_caps.toU16(),
             .move = false,
         }).toU64();
         n += 1;
