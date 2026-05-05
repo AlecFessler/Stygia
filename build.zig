@@ -95,12 +95,6 @@ pub fn build(b: *std.Build) void {
     // corruption that surfaces as #GP at iretq with kernel-pointer
     // fragments in ctx.cs (offset 144 in cpu.Context).
     const kernel_ctx_trace = b.option(bool, "ctx_trace", "Enable per-EC ctx-snapshot ring + dump-on-panic (default: off)") orelse false;
-    // Per-EC ctx iret-frame guard. Snapshots ec.ctx's iret-frame quads
-    // (rip/cs/rflags/rsp/ss) at park time and re-checks them at the
-    // next dispatch; a mismatch means a stale writer mutated the
-    // parked EC's ec.ctx off-CPU. Companion to ctx_trace; see
-    // kernel/utils/ctx_guard.zig.
-    const kernel_ctx_guard = b.option(bool, "ctx_guard", "Enable per-EC ctx iret-frame guard (default: off)") orelse false;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -188,7 +182,6 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
     build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
     build_opts.addOption(bool, "kernel_ctx_trace", kernel_ctx_trace);
-    build_opts.addOption(bool, "kernel_ctx_guard", kernel_ctx_guard);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
