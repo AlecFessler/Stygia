@@ -13,6 +13,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const ctx_guard = zag.utils.ctx_guard;
 const kprof = zag.kprof.trace_id;
 const port_mod = zag.sched.port;
 
@@ -479,6 +480,11 @@ pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
 /// Clear this core's `current_ec` slot. Called by suspend / terminate /
 /// idle paths when the running EC stops being runnable.
 pub inline fn clearCurrentEc(core: u8) void {
+    if (comptime ctx_guard.enabled) {
+        if ((&core_states[core]).current_ec) |ref| {
+            ctx_guard.armOnPark(ref.ptr);
+        }
+    }
     (&core_states[core]).current_ec = null;
 }
 
@@ -490,6 +496,7 @@ pub inline fn clearCurrentEc(core: u8) void {
 /// slow-path `switchTo` and FP step-14/R-14, so it can't be the
 /// authority for "which core has the EC's kstack as rsp").
 pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
+    ctx_guard.checkOnDispatch(ec);
     (&core_states[core]).current_ec = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
     ec.last_dispatched_core = core;
 }
