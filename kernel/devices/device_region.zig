@@ -118,6 +118,40 @@ var slab_initialized: bool = false;
 var irq_table: [MAX_IRQ_SOURCES]?*DeviceRegion = [_]?*DeviceRegion{null} ** MAX_IRQ_SOURCES;
 var irq_table_lock: SpinLock = .{ .class = "device_region.irq_table" };
 
+/// Boot-time list of DeviceRegions that platform enumerators (PCI scan,
+/// serial port probe, GIC/IOAPIC) wanted minted into the root capability
+/// domain's handle table. The enumerators run during ACPI parse —
+/// before the root domain exists — so they stage refs here and
+/// `userspace_init.grantDevices` drains the list after allocating the
+/// root domain. Each entry transfers the registerXxx caller-ref onto
+/// the minted root_cd handle (no incRef needed; refcount stays 1 and
+/// is owned by the handle slot). Spec §[device_region].
+var boot_grant_list: [MAX_DEVICE_REGIONS]?*DeviceRegion = [_]?*DeviceRegion{null} ** MAX_DEVICE_REGIONS;
+var boot_grant_count: usize = 0;
+var boot_grant_lock: SpinLock = .{ .class = "device_region.boot_grant_list" };
+
+pub fn appendBootGrant(dr: *DeviceRegion) void {
+    const irq_state = boot_grant_lock.lockIrqSave(@src());
+    defer boot_grant_lock.unlockIrqRestore(irq_state);
+    if (boot_grant_count >= boot_grant_list.len) return;
+    boot_grant_list[boot_grant_count] = dr;
+    boot_grant_count += 1;
+}
+
+pub fn forEachBootGrant(
+    ctx: anytype,
+    comptime visit: fn (@TypeOf(ctx), *DeviceRegion) void,
+) void {
+    const irq_state = boot_grant_lock.lockIrqSave(@src());
+    const n = boot_grant_count;
+    boot_grant_lock.unlockIrqRestore(irq_state);
+    var i: usize = 0;
+    while (i < n) {
+        if (boot_grant_list[i]) |dr| visit(ctx, dr);
+        i += 1;
+    }
+}
+
 pub fn initSlab(
     data_range: zag.utils.range.Range,
     ptrs_range: zag.utils.range.Range,

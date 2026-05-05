@@ -586,17 +586,26 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             defer ref.unlockIrqRestore(lr.irq_state);
             const dr = lr.ptr;
             // Spec §[device_region] handle ABI: field0 packs immutable
-            // dev_type (bits 0-3) and, for port_io, base_port (bits 4-19)
-            // and port_count (bits 20-35). field1 = irq_count, owned by
-            // the IRQ handler — it propagates increments directly to each
-            // copy's `field1` paddr via `propagateIrqAndWake`. Refresh
-            // must NOT clobber it (would race with concurrent IRQs and
-            // erase coalesced counts not yet ack'd by userspace).
+            // dev_type (bits 0-3) plus the type-specific addressing
+            // fields — port_io: base_port (4-19), port_count (20-35);
+            // mmio: base_paddr>>12 (4-51), size_pages (52-63). field1
+            // = irq_count, owned by the IRQ handler — it propagates
+            // increments directly to each copy's `field1` paddr via
+            // `propagateIrqAndWake`. Refresh must NOT clobber it (would
+            // race with concurrent IRQs and erase coalesced counts not
+            // yet ack'd by userspace).
             var field0: u64 = @intFromEnum(dr.device_type);
-            if (dr.device_type == .port_io) {
-                const pio = dr.access.port_io;
-                field0 |= (@as(u64, pio.base_port) << 4) |
-                    (@as(u64, pio.port_count) << 20);
+            switch (dr.device_type) {
+                .mmio => {
+                    const m = dr.access.mmio;
+                    field0 |= ((m.phys_base.addr >> 12) << 4) |
+                        ((m.size >> 12) << 52);
+                },
+                .port_io => {
+                    const pio = dr.access.port_io;
+                    field0 |= (@as(u64, pio.base_port) << 4) |
+                        (@as(u64, pio.port_count) << 20);
+                },
             }
             user_entry.field0 = field0;
         },

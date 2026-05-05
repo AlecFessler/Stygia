@@ -582,10 +582,11 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                         }
                         const port_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_region.registerPortIo(port_base, port_count) catch {
+                        const dr = device_region.registerPortIo(port_base, port_count) catch {
                             bar_idx += 1;
                             continue;
                         };
+                        device_region.appendBootGrant(dr);
                         enumerated_device_count += 1;
                         bar_idx += 1;
                         continue;
@@ -611,13 +612,14 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                     else
                         paging.PAGE4K;
 
-                    _ = device_region.registerMmio(
+                    const dr = device_region.registerMmio(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
                     ) catch {
                         bar_idx += 1;
                         continue;
                     };
+                    device_region.appendBootGrant(dr);
                     enumerated_device_count += 1;
 
                     // Only register the first MMIO BAR per PCI function.
@@ -728,10 +730,11 @@ fn enumeratePciLegacy() void {
                         }
                         const port_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_region.registerPortIo(port_base, port_count) catch {
+                        const dr = device_region.registerPortIo(port_base, port_count) catch {
                             bar_idx += 1;
                             continue;
                         };
+                        device_region.appendBootGrant(dr);
                         enumerated_device_count += 1;
                         bar_idx += 1;
                         continue;
@@ -748,13 +751,14 @@ fn enumeratePciLegacy() void {
                     else
                         paging.PAGE4K;
 
-                    _ = device_region.registerMmio(
+                    const dr = device_region.registerMmio(
                         PAddr.fromInt(phys_addr),
                         aligned_size,
                     ) catch {
                         bar_idx += 1;
                         continue;
                     };
+                    device_region.appendBootGrant(dr);
                     enumerated_device_count += 1;
 
                     // Only register the first MMIO BAR per PCI function.
@@ -775,7 +779,8 @@ fn probeSerialPorts() void {
         const readback = cpu.inb(port + 7);
         if (readback == 0xA5) {
             cpu.outb(0x00, port + 7);
-            _ = device_region.registerPortIo(port, 8) catch continue;
+            const dr = device_region.registerPortIo(port, 8) catch continue;
+            device_region.appendBootGrant(dr);
             enumerated_device_count += 1;
         }
     }

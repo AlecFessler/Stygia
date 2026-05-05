@@ -559,26 +559,69 @@ fn resolveOrSpawnRootEc(
 
 fn grantDevices(root_cd: *CapabilityDomain) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => grantCom1(root_cd),
+        .x86_64 => {
+            // x86 enumerators (`enumeratePci`, `probeSerialPorts`) stage
+            // every discovered device_region onto `device_region`'s boot
+            // grant list. Drain it here so the root service's cap table
+            // is the single source of truth for platform hardware —
+            // COM1 included.
+            grantBootDevices(root_cd);
+        },
         .aarch64 => {
-            // Mint both: the MMIO PL011 region (consumed by the
-            // linux_guest VMM's host log via `mapMmio` against the real
-            // 0x09000000 frame) AND the virtualized port_io@0x3F8
-            // region (consumed by the suite runner's serial sink, which
-            // expects the same dev_type=port_io / base_port=0x3F8 shape
-            // as x86_64). Byte writes against the port_io VMAR trap
-            // through `interceptPortIoFault` and are forwarded to the
-            // PL011 driver inline. The two regions are independent
-            // device_regions; nothing in either path conflicts with the
-            // other, so unconditionally minting both keeps the runner
-            // serial sink working for `-Dprofile=test` while preserving
-            // the linux_guest VMM's direct mapping for
-            // `-Dprofile=linux_guest`.
+            // aarch64 has no PCI enumerator yet. Mint the platform
+            // devices the runner / linux_guest VMM expect: the MMIO
+            // PL011 region (0x09000000) and the virtualized port_io
+            // 0x3F8 the runner serial sink scans for.
             grantPl011(root_cd);
             grantCom1(root_cd);
         },
         else => {},
     }
+}
+
+fn grantBootDevices(root_cd: *CapabilityDomain) void {
+    zag.devices.device_region.forEachBootGrant(root_cd, mintBootDevice);
+}
+
+fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.DeviceRegion) void {
+    // field0 layout per spec §[device_region]:
+    //   port_io: bits 0-3 dev_type=1, bits 4-19 base_port, bits 20-35 port_count
+    //   mmio:    bits 0-3 dev_type=0, bits 4-51 paddr>>12, bits 52-63 size_pages
+    var field0: u64 = @intFromEnum(dr.device_type);
+    switch (dr.device_type) {
+        .mmio => {
+            const m = dr.access.mmio;
+            field0 |= ((m.phys_base.addr >> 12) << 4) |
+                ((m.size >> 12) << 52);
+        },
+        .port_io => {
+            const p = dr.access.port_io;
+            field0 |= (@as(u64, p.base_port) << 4) |
+                (@as(u64, p.port_count) << 20);
+        },
+    }
+    // Grant move/copy/dma/irq so the root service can delegate freely
+    // to drivers and create DMA VMARs for them.
+    const dr_caps = zag.devices.device_region.DeviceRegionCaps{
+        .move = true,
+        .copy = true,
+        .dma = true,
+        .irq = true,
+    };
+    const erased: ErasedSlabRef = .{
+        .ptr = @ptrCast(dr),
+        .gen = @intCast(dr._gen_lock.currentGen()),
+    };
+    _ = capdom.mintHandle(
+        root_cd,
+        erased,
+        zag.caps.capability.CapabilityType.device_region,
+        @bitCast(dr_caps),
+        field0,
+        0,
+    ) catch {
+        arch.boot.print("[boot] WARNING: device_region grant failed (boot list overflow)\n", .{});
+    };
 }
 
 fn grantCom1(root_cd: *CapabilityDomain) void {
