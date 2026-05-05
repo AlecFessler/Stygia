@@ -65,6 +65,24 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = true,
     });
 
+    const fs_ops_mod = b.createModule(.{
+        .root_source_file = b.path("protocols/fs_ops.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+
+    const fs_client_mod = b.createModule(.{
+        .root_source_file = b.path("fs_client/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    fs_client_mod.addImport("lib", lib_mod);
+    fs_client_mod.addImport("fs_ops", fs_ops_mod);
+
     const start_src: std.Build.LazyPath = b.path("start.zig");
 
     // Helper wrapper closure isn't possible in build.zig at top level,
@@ -149,6 +167,7 @@ pub fn build(b: *std.Build) void {
     fs_app_mod.addImport("lib", lib_mod);
     fs_app_mod.addImport("log", log_mod);
     fs_app_mod.addImport("blockdev", blockdev_mod);
+    fs_app_mod.addImport("fs_ops", fs_ops_mod);
 
     const libc_shim_mod = b.createModule(.{
         .root_source_file = b.path("fs/sqlite/libc_shim.zig"),
@@ -245,16 +264,53 @@ pub fn build(b: *std.Build) void {
     const fs_install = b.addInstallFile(fs_exe.getEmittedBin(), "../bin/fs.elf");
     b.getInstallStep().dependOn(&fs_install.step);
 
+    // ── verify_fs.elf (smoke harness) ───────────────────────────────
+    const verify_app_mod = b.createModule(.{
+        .root_source_file = b.path("verify_fs/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    verify_app_mod.addImport("lib", lib_mod);
+    verify_app_mod.addImport("log", log_mod);
+    verify_app_mod.addImport("fs_client", fs_client_mod);
+    verify_app_mod.addImport("fs_ops", fs_ops_mod);
+
+    const verify_start_mod = b.createModule(.{
+        .root_source_file = start_src,
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    verify_start_mod.addImport("lib", lib_mod);
+    verify_start_mod.addImport("app", verify_app_mod);
+
+    const verify_exe = b.addExecutable(.{
+        .name = "verify_fs",
+        .root_module = verify_start_mod,
+        .linkage = .static,
+    });
+    verify_exe.pie = true;
+    verify_exe.entry = .{ .symbol_name = "_start" };
+    verify_exe.root_module.strip = false;
+
+    const verify_install = b.addInstallFile(verify_exe.getEmittedBin(), "../bin/verify_fs.elf");
+    b.getInstallStep().dependOn(&verify_install.step);
+
     // ── Embedded services for root_service ──────────────────────────
     const services_wf = b.addWriteFiles();
     _ = services_wf.addCopyFile(nvme_exe.getEmittedBin(), "nvme_driver.elf");
     _ = services_wf.addCopyFile(blkdev_exe.getEmittedBin(), "block_device.elf");
     _ = services_wf.addCopyFile(fs_exe.getEmittedBin(), "fs.elf");
+    _ = services_wf.addCopyFile(verify_exe.getEmittedBin(), "verify_fs.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
         \\pub const block_device_elf = @embedFile("block_device.elf");
         \\pub const fs_elf = @embedFile("fs.elf");
+        \\pub const verify_fs_elf = @embedFile("verify_fs.elf");
         \\
     );
     const services_mod = b.createModule(.{

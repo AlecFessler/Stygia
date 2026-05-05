@@ -1,21 +1,20 @@
 // desktopOS root service.
 //
-// Phase-1 boot path:
+// Boot path:
 //   1. log.init via the kernel-issued COM1 device_region.
 //   2. Discover device_regions in the cap table (boot grant list).
-//   3. createPort + createPageFrame for the shared block scratch.
-//   4. createPageFrame for the block_device's "disk" backing.
-//   5. Stage block_device.elf and fs.elf into page_frames.
-//   6. Spawn block_device with passed handles =
-//        [COM1, port (recv), scratch_pf (r+w), disk_pf (r+w)]
-//   7. Spawn fs with passed handles =
-//        [COM1, port (xfer), scratch_pf (r+w)]
-//   8. Park.
-//
-// Once the IOMMU restoration agent lands and the real NVMe driver
-// is functional, the disk_pf gets replaced by an NVMe device_region
-// passed to a third service that speaks the same blockdev wire
-// protocol — fs is the same code in either case.
+//   3. Mint two ports — `blockdev_port` (fs ↔ nvme_driver) and
+//      `fs_port` (verify_fs/anything ↔ fs).
+//   4. Allocate two page_frames — `blockdev_scratch` (1 page; shared
+//      between fs and nvme_driver) and `io_scratch` (fs_ops.SCRATCH_PAGES;
+//      shared between fs and FS clients).
+//   5. Stage nvme_driver.elf, fs.elf, verify_fs.elf into page_frames.
+//   6. Spawn nvme_driver with [COM1, blockdev_port (recv|bind),
+//        blockdev_scratch (r+w), <each MMIO device_region>].
+//   7. Spawn fs with [COM1, blockdev_port (xfer|bind), blockdev_scratch (r+w),
+//        fs_port (recv|bind), io_scratch (r+w)].
+//   8. Spawn verify_fs with [COM1, fs_port (xfer|bind), io_scratch (r+w)].
+//   9. Park.
 
 const lib = @import("lib");
 const log = @import("log");
@@ -29,7 +28,8 @@ const syscall = lib.syscall;
 const HandleId = caps.HandleId;
 
 const PAGE_4K: u64 = 4096;
-const SCRATCH_PAGES: u64 = 1;
+const BLOCKDEV_SCRATCH_PAGES: u64 = 1;
+const IO_SCRATCH_PAGES: u64 = 16; // fs_ops.SCRATCH_PAGES; kept literal to avoid module dep.
 const MAX_PASSED: usize = 32;
 
 pub fn main(cap_table_base: u64) void {
@@ -41,76 +41,77 @@ pub fn main(cap_table_base: u64) void {
         powerShutdown();
     };
 
-    // Mint the IPC port that fs and block_device share.
-    const port_caps = caps.PortCap{
+    // Mint the two ports. Both come up with full caps so we can pass
+    // restricted views down to each child.
+    const port_full = caps.PortCap{
         .move = true,
         .copy = true,
         .xfer = true,
         .recv = true,
         .bind = true,
     };
-    const cp = syscall.createPort(@as(u64, port_caps.toU16()));
-    if (cp.v1 < 16) {
-        log.print("[desktopOS] FATAL: createPort err=");
-        log.dec(cp.v1);
-        log.print("\n");
-        powerShutdown();
-    }
-    const port_handle: HandleId = @truncate(cp.v1 & 0xFFF);
+    const blockdev_port = createPort(port_full) orelse powerShutdown();
+    const fs_port = createPort(port_full) orelse powerShutdown();
 
-    // Allocate the shared scratch buffer (block transfer area).
-    // Same lifetime + r+w semantics as before — the underlying
-    // storage flips from a sibling page_frame to real NVMe.
-    const scratch_pf = createPf(SCRATCH_PAGES) orelse {
-        log.print("[desktopOS] FATAL: scratch_pf alloc failed\n");
+    // Shared page_frames.
+    const blockdev_scratch = createPf(BLOCKDEV_SCRATCH_PAGES) orelse {
+        log.print("[desktopOS] FATAL: blockdev_scratch alloc failed\n");
+        powerShutdown();
+    };
+    const io_scratch = createPf(IO_SCRATCH_PAGES) orelse {
+        log.print("[desktopOS] FATAL: io_scratch alloc failed\n");
         powerShutdown();
     };
 
     // Stage child ELFs.
-    const nvme_driver_pf = stageElfPageFrame(services.nvme_driver_elf) orelse {
-        log.print("[desktopOS] FATAL: stage(nvme_driver.elf) failed\n");
-        powerShutdown();
-    };
-    const fs_pf = stageElfPageFrame(services.fs_elf) orelse {
-        log.print("[desktopOS] FATAL: stage(fs.elf) failed\n");
-        powerShutdown();
-    };
+    const nvme_driver_pf = stageElfPageFrame(services.nvme_driver_elf) orelse powerShutdown();
+    const fs_pf = stageElfPageFrame(services.fs_elf) orelse powerShutdown();
+    const verify_pf = stageElfPageFrame(services.verify_fs_elf) orelse powerShutdown();
 
-    // Collect MMIO device_regions to forward to the NVMe driver. It
-    // probes each (read VS at offset 0x08; NVMe reports MJR=1) to
-    // pick its controller's BAR0.
+    // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
     const mmio_count = collectMmioDeviceRegions(cap_table_base, &mmio_devs);
     log.print("[desktopOS] forwarding ");
     log.dec(mmio_count);
     log.print(" MMIO device_region(s) to nvme_driver\n");
 
-    // Spawn nvme_driver. Passed handles in order:
-    //   COM1, port (recv), scratch_pf (r+w), then each MMIO device_region.
-    _ = spawnService(
-        "nvme_driver",
-        nvme_driver_pf,
-        com1,
-        port_handle,
-        true, // recv side
-        scratch_pf,
-        mmio_devs[0..mmio_count],
-    ) orelse powerShutdown();
+    // ── Spawn nvme_driver ───────────────────────────────────────────
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{}); // COM1 (caps don't gate map_mmio)
+        appendPort(&passed, &n, blockdev_port, .{ .recv = true, .bind = true });
+        appendPf(&passed, &n, blockdev_scratch, .{ .r = true, .w = true });
+        var i: usize = 0;
+        while (i < mmio_count) : (i += 1) {
+            appendDevice(&passed, &n, mmio_devs[i], .{ .dma = true, .irq = true });
+        }
+        _ = spawnService("nvme_driver", nvme_driver_pf, passed[0..n]) orelse powerShutdown();
+    }
 
-    // Spawn fs. Same shape as before; doesn't know whether the storage
-    // backend is a real NVMe driver or the page_frame interim.
-    _ = spawnService(
-        "fs",
-        fs_pf,
-        com1,
-        port_handle,
-        false, // xfer side
-        scratch_pf,
-        &.{},
-    ) orelse powerShutdown();
+    // ── Spawn fs ────────────────────────────────────────────────────
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{});
+        appendPort(&passed, &n, blockdev_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, blockdev_scratch, .{ .r = true, .w = true });
+        appendPort(&passed, &n, fs_port, .{ .recv = true, .bind = true });
+        appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
+        _ = spawnService("fs", fs_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn verify_fs ─────────────────────────────────────────────
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{});
+        appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
+        _ = spawnService("verify_fs", verify_pf, passed[0..n]) orelse powerShutdown();
+    }
 
     log.print("[desktopOS] services spawned; root parking\n");
-
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
@@ -118,6 +119,35 @@ pub fn main(cap_table_base: u64) void {
             else => {},
         }
     }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+fn appendPort(buf: []u64, n: *usize, handle: HandleId, port_caps: caps.PortCap) void {
+    buf[n.*] = (caps.PassedHandle{
+        .id = handle,
+        .caps = port_caps.toU16(),
+        .move = false,
+    }).toU64();
+    n.* += 1;
+}
+
+fn appendPf(buf: []u64, n: *usize, handle: HandleId, pf_caps: caps.PfCap) void {
+    buf[n.*] = (caps.PassedHandle{
+        .id = handle,
+        .caps = pf_caps.toU16(),
+        .move = false,
+    }).toU64();
+    n.* += 1;
+}
+
+fn appendDevice(buf: []u64, n: *usize, handle: HandleId, dev_caps: caps.DeviceCap) void {
+    buf[n.*] = (caps.PassedHandle{
+        .id = handle,
+        .caps = dev_caps.toU16(),
+        .move = false,
+    }).toU64();
+    n.* += 1;
 }
 
 fn collectMmioDeviceRegions(cap_table_base: u64, out: []HandleId) usize {
@@ -149,82 +179,20 @@ fn findCom1(cap_table_base: u64) ?HandleId {
     return null;
 }
 
+fn createPort(port_caps: caps.PortCap) ?HandleId {
+    const cp = syscall.createPort(@as(u64, port_caps.toU16()));
+    if (cp.v1 < 16) return null;
+    return @truncate(cp.v1 & 0xFFF);
+}
+
 fn createPf(pages: u64) ?HandleId {
-    const pf_caps = caps.PfCap{
-        .move = true,
-        .copy = true,
-        .r = true,
-        .w = true,
-    };
+    const pf_caps = caps.PfCap{ .move = true, .copy = true, .r = true, .w = true };
     const c = syscall.createPageFrame(@as(u64, pf_caps.toU16()), 0, pages);
     if (c.v1 < 16) return null;
     return @truncate(c.v1 & 0xFFF);
 }
 
-/// Spawn a child capability domain running `elf_pf`. Passes COM1, the
-/// IPC port (recv for server, xfer for client), the shared scratch
-/// page_frame, and any extra device_region handles (used to forward
-/// PCI MMIO regions the NVMe driver probes for its controller).
-fn spawnService(
-    name: []const u8,
-    elf_pf: HandleId,
-    com1: HandleId,
-    port_handle: HandleId,
-    is_recv_side: bool,
-    scratch_pf: HandleId,
-    extra_devs: []const HandleId,
-) ?HandleId {
-    var passed: [MAX_PASSED]u64 = undefined;
-    var n: usize = 0;
-
-    // [0] COM1 (port_io device_region; map_mmio doesn't gate on caps)
-    passed[n] = (caps.PassedHandle{
-        .id = com1,
-        .caps = 0,
-        .move = false,
-    }).toU64();
-    n += 1;
-
-    // [1] port — recv for server, xfer for client.
-    // Both sides also get `bind` — suspend's perm check on the port
-    // handle requires it (matches the runner's port-grant pattern).
-    const port_passed_caps = if (is_recv_side)
-        caps.PortCap{ .recv = true, .bind = true }
-    else
-        caps.PortCap{ .xfer = true, .bind = true };
-    passed[n] = (caps.PassedHandle{
-        .id = port_handle,
-        .caps = port_passed_caps.toU16(),
-        .move = false,
-    }).toU64();
-    n += 1;
-
-    // [2] scratch page_frame (r+w; recipient maps it into its own VMAR)
-    const pf_passed_caps = caps.PfCap{ .r = true, .w = true };
-    passed[n] = (caps.PassedHandle{
-        .id = scratch_pf,
-        .caps = pf_passed_caps.toU16(),
-        .move = false,
-    }).toU64();
-    n += 1;
-
-    // [3..] extra device_region handles. Forward dma + irq caps so
-    // a driver-side child can use them with createVmar(caps.dma=1)
-    // and bind_event_route.
-    const dr_passed_caps = caps.DeviceCap{
-        .dma = true,
-        .irq = true,
-    };
-    var i: usize = 0;
-    while (i < extra_devs.len and n < MAX_PASSED) : (i += 1) {
-        passed[n] = (caps.PassedHandle{
-            .id = extra_devs[i],
-            .caps = dr_passed_caps.toU16(),
-            .move = false,
-        }).toU64();
-        n += 1;
-    }
-
+fn spawnService(name: []const u8, elf_pf: HandleId, passed: []const u64) ?HandleId {
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0x01FF) << 8) |
@@ -250,7 +218,7 @@ fn spawnService(
         ceilings_outer,
         elf_pf,
         0,
-        passed[0..n],
+        passed,
     );
     if (r.v1 < 16) {
         log.print("[desktopOS] FATAL: createCapabilityDomain(");
@@ -266,21 +234,14 @@ fn spawnService(
     log.print(" (idc=");
     log.dec(idc);
     log.print(", passed=");
-    log.dec(n);
+    log.dec(passed.len);
     log.print(")\n");
     return idc;
 }
 
-/// Allocate a page_frame, map R+W locally, copy `elf_bytes` in,
-/// drop the temp VMAR. Returns the page_frame handle id.
 fn stageElfPageFrame(elf_bytes: []const u8) ?HandleId {
     const pages = (elf_bytes.len + PAGE_4K - 1) / PAGE_4K;
-    const pf_caps = caps.PfCap{
-        .move = true,
-        .r = true,
-        .w = true,
-        .x = true,
-    };
+    const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true, .x = true };
     const cpf = syscall.createPageFrame(@as(u64, pf_caps.toU16()), 0, pages);
     if (cpf.v1 < 16) return null;
     const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
@@ -298,7 +259,6 @@ fn stageElfPageFrame(elf_bytes: []const u8) ?HandleId {
     const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
     const vmar_base: u64 = cvar.v2;
 
-    // Spec §[map_pf] pair order: (offset_bytes, page_frame_handle).
     const pairs = [_]u64{ 0, pf_handle };
     const mp = syscall.mapPf(vmar_handle, pairs[0..]);
     if (mp.v1 != 0) return null;
