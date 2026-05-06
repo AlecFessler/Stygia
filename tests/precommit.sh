@@ -233,58 +233,48 @@ stage_x86_kernel_tests() {
         return 1
     fi
 
-    # Need 3 PASS reps. Allow up to 6 total attempts to absorb the
-    # known-residual smp=4 lost-wakeup flake (see
-    # `project_smp4_residual_race.md`): the L4 IPC fast-path hits a
-    # ~3-15% per-rep silent-hang at smp=4 with both FP arms on. The
-    # underlying race is being chipped at incrementally; until it's
-    # closed, retry-twice gives the gauntlet >99% reliability while
-    # still surfacing genuinely-broken builds. A real-FAIL/MISS
-    # outcome (runner reported it but tests failed) returns
-    # immediately — only timeouts / silent hangs consume retry budget.
-    local pass_count=0
-    local attempt=0
-    local max_attempts=6
-    while [[ $pass_count -lt 3 && $attempt -lt $max_attempts ]]; do
-        attempt=$((attempt + 1))
-        echo "Boot attempt ${attempt} (pass ${pass_count}/3 so far)..."
+    # Three boots in a row, fail the whole stage on the first miss/fail.
+    # Catches flakes that a single run wouldn't surface.
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under QEMU+KVM..."
         local qemu_log
         qemu_log=$(mktemp)
         if ! (cd "$ZAG_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
-            echo "[FLAKE] attempt ${attempt}: qemu timeout/error — retrying"
+            echo "[FAIL] qemu run ${rep}/3 failed or timed out"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$qemu_log"
+            echo "--- end ---"
             rm -f "$qemu_log"
-            continue
+            FAILURES+=("x86 kernel runner timeout/qemu error (rep ${rep}/3)")
+            return 1
         fi
 
         local total
         total=$(grep -E '^\[runner\] [0-9]+ total' "$qemu_log" | tail -1)
         if [[ -z "$total" ]]; then
-            echo "[FLAKE] attempt ${attempt}: no [runner] total (silent hang) — retrying"
-            tail -10 "$qemu_log"
+            echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
+            echo "--- last 30 lines of QEMU output ---"
+            tail -30 "$qemu_log"
+            echo "--- end ---"
             rm -f "$qemu_log"
-            continue
-        fi
-
-        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
-            echo "[FAIL] attempt ${attempt}: $total"
-            grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
-            rm -f "$qemu_log"
-            FAILURES+=("x86 kernel tests attempt ${attempt}: ${total#'[runner] '}")
+            FAILURES+=("x86 kernel tests (no [runner] total, rep ${rep}/3)")
             return 1
         fi
 
-        pass_count=$((pass_count + 1))
-        echo "[OK]   attempt ${attempt}: ${total#'[runner] '} (pass ${pass_count}/3)"
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3: $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
+            rm -f "$qemu_log"
+            FAILURES+=("x86 kernel tests rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
         rm -f "$qemu_log"
     done
 
-    if [[ $pass_count -lt 3 ]]; then
-        echo "[FAIL] x86 kernel tests: only ${pass_count}/3 passes in ${max_attempts} attempts (residual smp=4 flake)"
-        FAILURES+=("x86 kernel tests: ${pass_count}/3 in ${max_attempts} attempts")
-        return 1
-    fi
-
-    echo "[PASS] x86 kernel tests — 3 green / ${attempt} attempts"
+    echo "[PASS] x86 kernel tests — 3/3 green"
     return 0
 }
 
@@ -435,57 +425,48 @@ stage_aarch64_kernel_tests_pi() {
         return 1
     fi
 
-    # Need 3 PASS reps. Allow up to 6 total attempts to absorb the
-    # same residual smp=4 lost-wakeup flake the x86 path hits — see
-    # `project_smp4_residual_race.md`. The Pi 5 KVM exhibits the same
-    # silent-hang signature (kernel emits `[runner] spawned 4/4` then
-    # stops with no panic / no progress), confirming the race is in
-    # arch-portable scheduler / FP code, not x86-specific. Real
-    # FAIL/MISS runner output bails immediately; only timeouts and
-    # silent hangs consume retry budget.
-    local pi_pass_count=0
-    local pi_attempt=0
-    local pi_max_attempts=6
-    while [[ $pi_pass_count -lt 3 && $pi_attempt -lt $pi_max_attempts ]]; do
-        pi_attempt=$((pi_attempt + 1))
-        echo "Boot attempt ${pi_attempt} (pass ${pi_pass_count}/3 so far)..."
+    # Three boots in a row, fail the whole stage on the first miss/fail.
+    # Catches flakes that a single run wouldn't surface.
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under qemu-system-aarch64 + KVM on Pi..."
         local pi_log
         pi_log=$(mktemp)
         if ! ssh "$PI_HOST" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rm -rf \$wd" > "$pi_log" 2>&1; then
-            echo "[FLAKE] attempt ${pi_attempt}: Pi qemu timeout/error — retrying"
+            echo "[FAIL] Pi qemu run ${rep}/3 failed or timed out"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
             rm -f "$pi_log"
-            continue
+            FAILURES+=("aarch64 kernel runner timeout/qemu error (rep ${rep}/3)")
+            return 1
         fi
 
         local total
         total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
         if [[ -z "$total" ]]; then
-            echo "[FLAKE] attempt ${pi_attempt}: no [runner] total (silent hang) — retrying"
-            tail -10 "$pi_log"
+            echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
             rm -f "$pi_log"
-            continue
-        fi
-
-        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
-            echo "[FAIL] attempt ${pi_attempt}: $total"
-            grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
-            rm -f "$pi_log"
-            FAILURES+=("aarch64 kernel tests attempt ${pi_attempt}: ${total#'[runner] '}")
+            FAILURES+=("aarch64 kernel tests (no [runner] total, rep ${rep}/3)")
             return 1
         fi
 
-        pi_pass_count=$((pi_pass_count + 1))
-        echo "[OK]   attempt ${pi_attempt}: ${total#'[runner] '} (pass ${pi_pass_count}/3)"
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3: $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 kernel tests rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
         rm -f "$pi_log"
     done
 
-    if [[ $pi_pass_count -lt 3 ]]; then
-        echo "[FAIL] aarch64 kernel tests: only ${pi_pass_count}/3 passes in ${pi_max_attempts} attempts"
-        FAILURES+=("aarch64 kernel tests: ${pi_pass_count}/3 in ${pi_max_attempts} attempts")
-        return 1
-    fi
-
-    echo "[PASS] aarch64 kernel tests — 3 green / ${pi_attempt} attempts"
+    echo "[PASS] aarch64 kernel tests — 3/3 green"
     return 0
 }
 

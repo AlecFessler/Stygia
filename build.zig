@@ -86,7 +86,15 @@ pub fn build(b: *std.Build) void {
     // exposes the slow-path baseline for A/B perf comparison.
     const kernel_fastpath = b.option(bool, "kernel_fastpath", "L4 IPC fast-path classifier (default: on)") orelse true;
     const kernel_fastpath_suspend = b.option(bool, "kernel_fastpath_suspend", "L4 fast-path suspend arm (default: kernel_fastpath)") orelse kernel_fastpath;
-    const kernel_fastpath_reply = b.option(bool, "kernel_fastpath_reply", "L4 fast-path reply arm (default: kernel_fastpath)") orelse kernel_fastpath;
+    // Reply FP defaults OFF until the smp=4 lost-wakeup race is closed.
+    // A/B isolation: `-Dkernel_fastpath=false` and
+    // `-Dkernel_fastpath_reply=false, suspend on` both pass 30/30 reps
+    // deterministically; only BOTH arms together produce the residual
+    // ~10-15% per-rep silent-hang flake. Suspend FP alone retains the
+    // bulk of the perf gain; reply FP can be re-enabled with
+    // `-Dkernel_fastpath_reply=true` once the race is closed (see
+    // `project_smp4_residual_race.md`).
+    const kernel_fastpath_reply = b.option(bool, "kernel_fastpath_reply", "L4 fast-path reply arm (default: false until smp=4 race fixed)") orelse false;
     // Per-EC kstack-corruption snapshot ring with dump-on-panic. Off by
     // default; CI runs with the flag absent. Each `mark` site captures
     // tsc + ec.ctx {cs, ss, rsp, rip} into a 32-entry ring keyed by EC
