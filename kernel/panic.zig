@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -42,6 +43,7 @@ pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OW
 /// the call was reached.
 pub fn debugSentinel(byte: u8) void {
     @setRuntimeSafety(false);
+    if (builtin.cpu.arch != .x86_64) return;
     const port: u16 = 0x3f8;
     var i: u8 = 0;
     while (i < 4) {
