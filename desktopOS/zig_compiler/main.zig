@@ -530,6 +530,9 @@ const INNER_SENTINEL: u64 = 0xCAFEBABE_19E70001;
 // The compiler computes this from the parsed values and patches it,
 // so the spawned binary can verify the patch chain end-to-end.
 const CHECKSUM_SENTINEL: u64 = 0xCAFEBABE_C5E60001;
+// Compiler-computed array product target — wrapping product of every
+// parsed values_buf entry (1 if no array values).
+const ARRAY_PRODUCT_SENTINEL: u64 = 0xCAFEBABE_AB10D001;
 
 // Per-element sentinels for the source-defined u64 array (must
 // match zig_hello2/main.zig values_arr initializers exactly).
@@ -773,6 +776,18 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] computed checksum=", checksum);
         const h = patchU64Sentinel(elf_buf[0..out.bytes_read], CHECKSUM_SENTINEL, checksum);
         printNum("[zig_compiler] patched checksum hits=", h);
+    }
+    // Compile-time product over parsed array values — wrapping multiply,
+    // identity 1. Spawned binary recomputes the same reduction.
+    {
+        var product: u64 = 1;
+        var pi: usize = 0;
+        while (pi < values_count) : (pi += 1) {
+            product *%= values_buf[pi];
+        }
+        printNum("[zig_compiler] computed array_product=", product);
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], ARRAY_PRODUCT_SENTINEL, product);
+        printNum("[zig_compiler] patched array_product hits=", h);
     }
     // Always patch the array length (even if 0) so the spawned binary
     // doesn't iterate against the raw sentinel.

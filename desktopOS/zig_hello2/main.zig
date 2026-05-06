@@ -194,6 +194,7 @@ var step_value: u64 = 0xCAFEBABE_57E90001;
 var skip_value: u64 = 0xCAFEBABE_5C1A0001;
 var inner_value: u64 = 0xCAFEBABE_19E70001;
 var checksum_value: u64 = 0xCAFEBABE_C5E60001;
+var array_product_value: u64 = 0xCAFEBABE_AB10D001;
 
 // Source-defined u64 array — first variable-length structured data.
 // values_len = how many slots zig_compiler patched; values_arr =
@@ -320,18 +321,37 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     var k: u64 = 0;
     var sum: u64 = 0;
     var max: u64 = 0;
+    var product: u64 = 1;
     while (k < arr_cap) {
         const elem_ptr: *volatile u64 = &values_arr[k];
         const v = elem_ptr.*;
         printArrayLine(k, v);
         sum +%= v;
         if (v > max) max = v;
+        product *%= v;
         k += 1;
     }
     // Reduction over the source array — proves the values drive
     // actual computation, not just per-element display.
     printLine("[runtime] sum=", sum);
     printLine("[runtime] max=", max);
+    printLine("[runtime] product=", product);
+
+    // Compile-time array product check: the compiler multiplies the
+    // parsed source values into ARRAY_PRODUCT_SENTINEL; we recompute
+    // the same here from the live array and report match. Phase 4e:
+    // compiler stored 100*200*300 = 6,000,000, runtime sees same → OK.
+    // Phase 4a/4d: stored is the raw sentinel and product is raw
+    // sentinels multiplied, no relation → MISMATCH.
+    const ap_ptr: *volatile u64 = &array_product_value;
+    const v_ap = ap_ptr.*;
+    printLine("[runtime] array_product_stored=", v_ap);
+    printLine("[runtime] array_product_computed=", product);
+    if (v_ap == product) {
+        print("[runtime] array_product match=OK\n");
+    } else {
+        print("[runtime] array_product match=MISMATCH\n");
+    }
     // Combined value: base result + sum so the source array also
     // shifts the per-iter `result` summary printed below.
     const combined: u64 = result +% sum;
