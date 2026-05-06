@@ -294,11 +294,24 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const arr_cap: u64 = if (v_values_len > values_arr.len) values_arr.len else v_values_len;
     printLine("[runtime] array len=", v_values_len);
     var k: u64 = 0;
+    var sum: u64 = 0;
+    var max: u64 = 0;
     while (k < arr_cap) {
         const elem_ptr: *volatile u64 = &values_arr[k];
-        printArrayLine(k, elem_ptr.*);
+        const v = elem_ptr.*;
+        printArrayLine(k, v);
+        sum +%= v;
+        if (v > max) max = v;
         k += 1;
     }
+    // Reduction over the source array — proves the values drive
+    // actual computation, not just per-element display.
+    printLine("[runtime] sum=", sum);
+    printLine("[runtime] max=", max);
+    // Combined value: base result + sum so the source array also
+    // shifts the per-iter `result` summary printed below.
+    const combined: u64 = result +% sum;
+    printLine("[runtime] result+sum=", combined);
 
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
