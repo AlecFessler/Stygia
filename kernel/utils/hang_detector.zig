@@ -19,7 +19,6 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const scheduler = zag.sched.scheduler;
-const port = zag.sched.port;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const State = zag.sched.execution_context.State;
 
