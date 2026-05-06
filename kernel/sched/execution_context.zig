@@ -12,6 +12,7 @@ const paging_consts = zag.memory.paging;
 const perfmon_mod = zag.sched.perfmon;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
+const spin_diag = zag.utils.sync.spin_diag;
 const stack = zag.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
@@ -763,7 +764,11 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        while (!scheduler.postZombie(core, ec, expected_gen)) std.atomic.spinLoopHint();
+        var post_spin: u64 = 0;
+        while (!scheduler.postZombie(core, ec, expected_gen)) {
+            std.atomic.spinLoopHint();
+            spin_diag.tick(&post_spin, @src(), "postZombie-terminate");
+        }
         // Wake the target core so it runs `switchTo` promptly and
         // drains the zombie. Without this, an idle target stays in
         // `arch.cpu.idle()` (sti+hlt) until the next preempt tick;
@@ -1706,7 +1711,11 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        while (!scheduler.postZombie(core, ec, @intCast(gen))) std.atomic.spinLoopHint();
+        var post_spin: u64 = 0;
+        while (!scheduler.postZombie(core, ec, @intCast(gen))) {
+            std.atomic.spinLoopHint();
+            spin_diag.tick(&post_spin, @src(), "postZombie-destroyLocked");
+        }
         if (core != self_core) arch.smp.sendWakeIpi(core);
     } else {
         finalizeDestroyMarkedDead(ec);

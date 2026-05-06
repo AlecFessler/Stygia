@@ -4,6 +4,7 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const bump = zag.memory.allocators.bump;
 const debug = zag.utils.sync.debug;
+const spin_diag = zag.utils.sync.spin_diag;
 
 const Range = zag.utils.range.Range;
 const SpinLock = zag.utils.sync.SpinLock;
@@ -60,12 +61,14 @@ pub const GenLock = extern struct {
     /// escape hides real AB-BA deadlocks.
     pub fn lockOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) void {
         debug.acquire(self, self.class, ordered_group, src);
+        var spin_count: u64 = 0;
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
                 if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) return;
             }
             std.atomic.spinLoopHint();
+            spin_diag.tick(&spin_count, src, "GenLock");
         }
     }
 
@@ -173,6 +176,7 @@ pub const GenLock = extern struct {
         debug.acquire(self, self.class, ordered_group, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
+        var spin_count: u64 = 0;
         while (true) {
             if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
             const cur = self.word.load(.monotonic);
@@ -181,6 +185,7 @@ pub const GenLock = extern struct {
                 return error.StaleHandle;
             }
             std.atomic.spinLoopHint();
+            spin_diag.tick(&spin_count, src, "GenLock-withgen");
         }
     }
 

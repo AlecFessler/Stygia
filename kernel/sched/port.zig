@@ -22,6 +22,7 @@ const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
 const kprof = zag.kprof.trace_id;
 const scheduler = zag.sched.scheduler;
+const spin_diag = zag.utils.sync.spin_diag;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const EcCaps = execution_context.EcCaps;
@@ -170,7 +171,11 @@ pub fn expireTimedRecvWaiters() void {
         if (!removed) continue;
 
         // EC has been removed from the wait queue; safe to wake.
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        var on_cpu_spin: u64 = 0;
+        while (ec.on_cpu.load(.acquire)) {
+            std.atomic.spinLoopHint();
+            spin_diag.tick(&on_cpu_spin, @src(), "on_cpu-port");
+        }
         ec.recv_deadline_ns = 0;
         ec.suspend_port = null;
         ec.event_type = .none;
