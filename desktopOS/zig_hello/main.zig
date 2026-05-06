@@ -915,7 +915,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "pub const step = 7;\n" ++
         "pub const skip_idx = 2;\n" ++
         "pub const inner = 3;\n" ++
-        "pub const values = [_]u64{ 100, 200, 300 };\n";
+        "pub const values = [_]u64{ seed, mult, 300 };\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
     if (cs.status != 0) {

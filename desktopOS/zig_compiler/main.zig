@@ -502,6 +502,40 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
         var ints_found: u8 = 0;
         while (j < src_len) {
             const c = src[j];
+            // Once all 7 scalars are bound, the remaining numeric tokens
+            // and identifier names belong to the values array. Try to
+            // resolve identifiers (alpha or underscore start) here.
+            const is_alpha_start = (c >= 'a' and c <= 'z') or
+                (c >= 'A' and c <= 'Z') or c == '_';
+            if (is_alpha_start and ints_found >= 7 and values_count < VALUES_MAX) {
+                if (j > 0) {
+                    const prev = src[j - 1];
+                    const is_ident_char = (prev >= 'a' and prev <= 'z') or
+                        (prev >= 'A' and prev <= 'Z') or
+                        (prev >= '0' and prev <= '9') or
+                        prev == '_';
+                    if (is_ident_char) {
+                        // Skip rest of mid-identifier; not a name boundary.
+                        j += 1;
+                        continue;
+                    }
+                }
+                const id_start = j;
+                while (j < src_len) : (j += 1) {
+                    const d = src[j];
+                    const is_id = (d >= 'a' and d <= 'z') or
+                        (d >= 'A' and d <= 'Z') or
+                        (d >= '0' and d <= '9') or
+                        d == '_';
+                    if (!is_id) break;
+                }
+                const id_slice = src[id_start..j];
+                if (resolveIdent(id_slice)) |val| {
+                    values_buf[values_count] = val;
+                    values_count += 1;
+                }
+                continue;
+            }
             if (c < '0' or c > '9') {
                 j += 1;
                 continue;
@@ -575,6 +609,21 @@ fn opNameToInt(name: []const u8) ?u64 {
     if (eqStr(name, "add")) return 1;
     if (eqStr(name, "sub")) return 2;
     if (eqStr(name, "xor")) return 3;
+    return null;
+}
+
+// Resolve a named constant identifier against the compiler's
+// symbol table (the parsed scalar source ints). Returns null if
+// the name doesn't refer to a known parsed scalar. Used in array
+// literal context to allow `[_]u64{ seed, mult, 300 }`.
+fn resolveIdent(id: []const u8) ?u64 {
+    if (seed_found and eqStr(id, "seed")) return seed_int;
+    if (mult_found and eqStr(id, "mult")) return mult_int;
+    if (repeat_found and eqStr(id, "repeat")) return repeat_int;
+    if (op_found and eqStr(id, "op")) return op_int;
+    if (step_found and eqStr(id, "step")) return step_int;
+    if (skip_found and eqStr(id, "skip_idx")) return skip_int;
+    if (inner_found and eqStr(id, "inner")) return inner_int;
     return null;
 }
 
