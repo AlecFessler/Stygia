@@ -126,7 +126,13 @@ pub fn main(cap_table_base: u64) void {
 
     serial.print("[runner] starting ");
     serial.printU64(embedded_tests.manifest.len);
-    serial.print(" tests\n");
+    if (embedded_tests.repeat > 1) {
+        serial.print(" tests x ");
+        serial.printU64(embedded_tests.repeat);
+        serial.print(" runs\n");
+    } else {
+        serial.print(" tests\n");
+    }
 
     // Phase 1+2 interleaved. Spawn `BATCH` tests, then drain `BATCH`
     // results before spawning the next batch. Bounded in-flight test
@@ -149,6 +155,24 @@ pub fn main(cap_table_base: u64) void {
     // is correct on its own merits but does NOT lift the BATCH=16
     // wall.
     const BATCH: usize = 4;
+    // Aggregate counters across all repeats — used by the final
+    // multi-run summary at end. Per-run summaries print after each.
+    var agg_pass: usize = 0;
+    var agg_fail: usize = 0;
+    var agg_miss: usize = 0;
+    var run_idx: u32 = 0;
+    while (run_idx < embedded_tests.repeat) : (run_idx += 1) {
+        if (embedded_tests.repeat > 1) {
+            serial.print("[runner] === run ");
+            serial.printU64(run_idx + 1);
+            serial.print("/");
+            serial.printU64(embedded_tests.repeat);
+            serial.print(" ===\n");
+            // Reset the per-tag table so the next run's MISS / FAIL /
+            // PASS reflects only that run.
+            for (&results) |*r| r.* = .{ .code = .not_run, .assertion_id = 0 };
+        }
+
     var successful_spawns: usize = 0;
     var collected: usize = 0;
     var batch_idx: usize = 0;
@@ -251,7 +275,23 @@ pub fn main(cap_table_base: u64) void {
         batch_idx = batch_end;
     }
 
-    summarize();
+        const counts = summarize();
+        agg_pass += counts.pass;
+        agg_fail += counts.fail;
+        agg_miss += counts.miss;
+    }
+
+    if (embedded_tests.repeat > 1) {
+        serial.print("[runner] === aggregate over ");
+        serial.printU64(embedded_tests.repeat);
+        serial.print(" runs: ");
+        serial.printU64(agg_pass);
+        serial.print(" pass / ");
+        serial.printU64(agg_fail);
+        serial.print(" fail / ");
+        serial.printU64(agg_miss);
+        serial.print(" miss ===\n");
+    }
 
     // Drain the kernel kprof log to serial after every test has
     // reported but before tearing down child CDs in shutdown. Children
@@ -512,7 +552,9 @@ fn record(tag: u64, r: TestResult) void {
     results[@intCast(index)] = r;
 }
 
-fn summarize() void {
+const RunCounts = struct { pass: usize, fail: usize, miss: usize };
+
+fn summarize() RunCounts {
     var passed: usize = 0;
     var failed: usize = 0;
     var not_run: usize = 0;
@@ -557,4 +599,5 @@ fn summarize() void {
     serial.print(" fail / ");
     serial.printU64(not_run);
     serial.print(" miss\n");
+    return .{ .pass = passed, .fail = failed, .miss = not_run };
 }

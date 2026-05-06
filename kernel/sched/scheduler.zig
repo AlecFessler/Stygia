@@ -18,11 +18,13 @@ const execution_context = zag.sched.execution_context;
 const kprof = zag.kprof.trace_id;
 const port_mod = zag.sched.port;
 const stack_mod = zag.memory.stack;
+const wake_diag = zag.utils.sync.wake_diag;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Priority = zag.sched.execution_context.Priority;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
+const SrcLoc = std.builtin.SourceLocation;
 const Stack = zag.memory.stack.Stack;
 const VAddr = zag.memory.address.VAddr;
 
@@ -527,7 +529,8 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
 ///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
 ///     and a context-switch via `loadEcContextAndReturn` would strand
 ///     it.
-pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
+pub fn enqueueOnCore(core: u8, ec: *ExecutionContext, src: SrcLoc) void {
+    wake_diag.note(@intFromPtr(ec), stateByte(ec.state), "enqueueOnCore", src);
     ec.state = .ready;
 
     const lock = &core_locks[core];
@@ -575,8 +578,8 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
 }
 
 /// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
-pub fn enqueue(ec: *ExecutionContext) void {
-    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+pub fn enqueue(ec: *ExecutionContext, src: SrcLoc) void {
+    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec, src);
 }
 
 /// Remove `ec` from whichever queue it currently occupies. Used by
@@ -722,9 +725,23 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
 
 /// Transition `ec` to ready and enqueue. Used by event delivery
 /// resumes (reply, futex wake, timer fire, recv→ready, etc.).
-pub fn markReady(ec: *ExecutionContext) void {
+pub fn markReady(ec: *ExecutionContext, src: SrcLoc) void {
     ec.state = .ready;
-    enqueue(ec);
+    enqueue(ec, src);
+}
+
+/// One-character label of an `ExecutionContext.State` for the wake-diag
+/// trail. Matches the letters used by `hang_detector.dump` for SUSP /
+/// IDLE / EXIT, with lowercase for `running` and `R` for `ready`.
+fn stateByte(s: execution_context.State) u8 {
+    return switch (s) {
+        .ready => 'R',
+        .running => 'r',
+        .suspended_on_port => 'S',
+        .futex_wait => 'F',
+        .idle_wait => 'I',
+        .exited => 'X',
+    };
 }
 
 /// Pick the right core for `ec` based on its affinity mask.

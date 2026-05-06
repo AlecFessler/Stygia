@@ -259,7 +259,7 @@ pub fn init(root_service_elf: []const u8) !void {
 
     arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
 
-    sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec);
+    sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec, @src());
 }
 
 /// Walk PT_LOAD headers in `elf_bytes`, allocate user pages from PMM,

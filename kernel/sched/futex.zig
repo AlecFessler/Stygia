@@ -259,7 +259,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         ec.futex_wait_nodes = null;
         ec.futex_wait_vaddrs = null;
         ec.state = .ready;
-        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
+        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec, @src());
         woken += 1;
     }
 
@@ -606,7 +606,7 @@ pub fn expireTimedWaiters() void {
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.state = .ready;
-            sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
+            sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec, @src());
         }
     }
 }

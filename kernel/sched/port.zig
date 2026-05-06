@@ -183,7 +183,7 @@ pub fn expireTimedRecvWaiters() void {
         // resume path restores the syscall-return register on iretq.
         arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
         ec.state = .ready;
-        scheduler.markReady(ec);
+        scheduler.markReady(ec, @src());
     }
 }
 
@@ -1418,7 +1418,7 @@ pub fn rendezvousWithReceiver(
         receiver.recv_port_xfer,
     );
     receiver.state = .ready;
-    scheduler.markReady(receiver);
+    scheduler.markReady(receiver, @src());
     return true;
 }
 
@@ -1532,7 +1532,7 @@ fn propagateClosedToReceivers(p: *Port) void {
         }
         waiter.suspend_port = null;
         waiter.state = .ready;
-        scheduler.markReady(waiter);
+        scheduler.markReady(waiter, @src());
     }
     p.waiter_kind = .none;
 }
@@ -1553,7 +1553,7 @@ fn propagateClosedToSenders(p: *Port) void {
         sender.event_addr = 0;
         sender.originating_write_cap = false;
         sender.state = .ready;
-        scheduler.markReady(sender);
+        scheduler.markReady(sender, @src());
     }
     p.waiter_kind = .none;
 }

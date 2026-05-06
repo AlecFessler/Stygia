@@ -735,6 +735,14 @@ pub fn build(b: *std.Build) void {
         "Comma-separated list of test names or glob-style patterns (e.g. recv_01,recv_*) to embed in the runner manifest. Omit to embed all tests.",
     );
 
+    // Number of times the runner replays the embedded test list per
+    // boot. With N>1 the runner iterates the manifest N times back-
+    // to-back, clearing its result table between runs and printing a
+    // per-run summary plus a final aggregate (`pass / fail / miss`
+    // totals across runs). Used to flush out flaky tests at high
+    // iteration counts without paying kernel-build / boot cost per rep.
+    const repeat = b.option(u32, "repeat", "Number of times to replay the test manifest per boot (default 1)") orelse 1;
+
     // Build the filtered list of test entries up front. The same
     // selection drives both per-test ELF builds and the manifest the
     // primary runner iterates.
@@ -928,6 +936,11 @@ pub fn build(b: *std.Build) void {
     manifest.appendSlice("};\n\n") catch unreachable;
     // Surface libz.elf to the runner via the same @embedFile root.
     manifest.appendSlice("pub const libz_elf = @embedFile(\"libz.elf\");\n") catch unreachable;
+    // Comptime repeat count. Runner reads this to wrap its batch loop.
+    manifest.writer().print(
+        "pub const repeat: u32 = {d};\n",
+        .{repeat},
+    ) catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 
     const embedded_tests_mod = b.createModule(.{

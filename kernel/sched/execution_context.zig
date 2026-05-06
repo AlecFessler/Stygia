@@ -1390,7 +1390,7 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.pending_pair_count = 0;
     ec.originating_read_cap = false;
     ec.state = .ready;
-    scheduler.markReady(ec);
+    scheduler.markReady(ec, @src());
 }
 
 /// Mark a pending reply against `ec` as abandoned — invoked when
