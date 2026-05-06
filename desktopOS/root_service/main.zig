@@ -100,6 +100,9 @@ pub fn main(cap_table_base: u64) void {
     // Phase 4a: stage zig_hello2.elf so zig_hello can spawn it via
     // createCapabilityDomain at runtime.
     const zig_hello2_pf = stageElfPageFrame(services.zig_hello2_elf) orelse powerShutdown();
+    // Phase 4b: stage zig_hello_std.elf — first Zag-target binary that
+    // imports std and prints via std.io.
+    const zig_hello_std_pf = stageElfPageFrame(services.zig_hello_std_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -195,6 +198,17 @@ pub fn main(cap_table_base: u64) void {
         appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
         appendPf(&passed, &n, zig_hello2_pf, .{ .move = true, .r = true, .x = true });
         _ = spawnUserApp("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn zig_hello_std ─────────────────────────────────────────
+    // Phase 4b: a Zag-target binary that imports std and prints via
+    // std.io. Routes through std.os.zag.write → zag_write_console
+    // (defined inside the binary as inline asm to COM1).
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{});
+        _ = spawnService("zig_hello_std", zig_hello_std_pf, passed[0..n]) orelse powerShutdown();
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────

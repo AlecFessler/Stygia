@@ -231,6 +231,17 @@ pub fn build(b: *std.Build) void {
     hello_run.addFileArg(b.path("zig_hello/main.zig"));
     const hello_elf = hello_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello.elf");
 
+    // ── zig_hello_std.elf — Phase 4b: imports `std` and prints via
+    //    std.io.getStdErr().writeAll. Routes through std.os.zag's
+    //    extern bridges (zag_write_console / zag_exit / fs/mmap stubs).
+    //    First Zag-target binary that ACTUALLY uses the std-on-Zag
+    //    layer instead of inlining its own syscall asm.
+    const hello_std_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    hello_std_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    hello_std_run.addArgs(&zag_args);
+    hello_std_run.addFileArg(b.path("zig_hello_std/main.zig"));
+    const hello_std_elf = hello_std_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello_std.elf");
+
     // ── usb_driver.elf ──────────────────────────────────────────────
     const usb_app_mod = b.createModule(.{
         .root_source_file = b.path("usb_driver/main.zig"),
@@ -571,6 +582,7 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(doom_exe.getEmittedBin(), "doom.elf");
     _ = services_wf.addCopyFile(hello_elf, "zig_hello.elf");
     _ = services_wf.addCopyFile(hello2_elf, "zig_hello2.elf");
+    _ = services_wf.addCopyFile(hello_std_elf, "zig_hello_std.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -582,6 +594,7 @@ pub fn build(b: *std.Build) void {
         \\pub const doom_elf = @embedFile("doom.elf");
         \\pub const zig_hello_elf = @embedFile("zig_hello.elf");
         \\pub const zig_hello2_elf = @embedFile("zig_hello2.elf");
+        \\pub const zig_hello_std_elf = @embedFile("zig_hello_std.elf");
         \\
     );
     const services_mod = b.createModule(.{
