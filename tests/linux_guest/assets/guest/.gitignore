@@ -1,2 +1,4 @@
-out/
+out/*
+!out/linux-arm64-Image
+!out/rootfs.cpio.gz
 src/
