@@ -294,7 +294,32 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // The exit dispatch above may have rendezvoused with a parked
         // VMM receiver, putting it in this core's run queue. Pull it
         // (or anything else ready) and dispatch.
-        const next = dequeueOrIdle() orelse return;
+        const next = dequeueOrIdle() orelse {
+            // Empty queue, no idle EC. Returning here unwinds to
+            // run() (→ parkAndAwaitIRQ updates caches) or to yieldTo
+            // (→ iretq back to the caller's user mode from the
+            // current kstack). In either case `current_ec` is null
+            // but the per-core caches (gs:0 kernel_rsp, TSS.RSP0,
+            // gs:32/40/48/56/176 EC-identity slots) still name the
+            // most-recently-dispatched EC's kstack. A peer-core
+            // terminate of that EC can free its kstack at any time
+            // after we drop the run-queue lock — the very next ring-3
+            // → ring-0 entry on this core (timer IRQ, syscall, fault)
+            // would push its iret frame onto freed memory, surfacing
+            // as a silent triple-fault inside iret-frame setup OR a
+            // re-entrant exception with `ctx` pointing into freed
+            // slab (the XXXXFFFFXXXXX signature). Mirror yieldTo's
+            // empty-queue cache park so any FUTURE entry uses this
+            // core's park kstack. We do NOT swap rsp here — we still
+            // need the current frame to return through the caller's
+            // dispatch tail; the caller (run() or yieldTo) is on a
+            // kstack that stays valid for the duration of its return.
+            const park_top = (&core_states[core]).park_stack.top.addr;
+            if (park_top != 0) {
+                arch.cpu.parkPerCoreCaches(core, park_top);
+            }
+            return;
+        };
         current = next;
     }
 
