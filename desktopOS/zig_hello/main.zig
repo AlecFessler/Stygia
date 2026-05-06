@@ -121,7 +121,6 @@ fn issueRaw(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
     var ov3: u64 = undefined;
-    var ov4: u64 = undefined;
     var ov5: u64 = undefined;
     var ov6: u64 = undefined;
     var ov7: u64 = undefined;
@@ -133,24 +132,28 @@ fn issueRaw(word: u64, in: Regs) Regs {
     var ov13: u64 = undefined;
     // Spec §[syscall_abi] x86-64 maps vreg 4 onto %rbp. The patched
     // no-LLVM Zig backend ignores `-fomit-frame-pointer` and keeps %rbp
-    // as the frame pointer for the surrounding function; using it as a
-    // register-backed asm output clobbers that frame across the
-    // `syscall` instruction and the function's epilogue then walks a
-    // garbage stack pointer. Push/pop %rbp around the syscall and pass
-    // vreg 4 through memory so the surrounding frame survives.
+    // as a frame pointer regardless. Inside the asm we save the caller's
+    // frame pointer to a stack slot the compiler picks (rsp-relative,
+    // STABLE because we do NOT touch rsp before the save), load iv4 into
+    // %rbp, run the syscall, save the output v4 to a separate slot, then
+    // restore the original %rbp from the save slot. Crucially: subq/addq
+    // around the syscall cancel exactly, so all compiler-chosen offsets
+    // (rbp_save, iv4_mem, ov4_mem) are valid throughout the asm.
+    var rbp_save: u64 = undefined;
+    const iv4_mem: u64 = in.v4;
+    var ov4_mem: u64 = undefined;
     asm volatile (
-        \\ pushq %%rbp
+        \\ movq %%rbp, %[rbp_save]
         \\ movq %[iv4_mem], %%rbp
         \\ subq $16, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
         \\ addq $16, %%rsp
         \\ movq %%rbp, %[ov4_mem]
-        \\ popq %%rbp
+        \\ movq %[rbp_save], %%rbp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
-          [ov4_mem] "=m" (ov4),
           [v5] "={rsi}" (ov5),
           [v6] "={rdi}" (ov6),
           [v7] "={r8}" (ov7),
@@ -160,11 +163,13 @@ fn issueRaw(word: u64, in: Regs) Regs {
           [v11] "={r13}" (ov11),
           [v12] "={r14}" (ov12),
           [v13] "={r15}" (ov13),
+          [rbp_save] "+m" (rbp_save),
+          [ov4_mem] "=m" (ov4_mem),
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (in.v1),
           [iv2] "{rbx}" (in.v2),
           [iv3] "{rdx}" (in.v3),
-          [iv4_mem] "m" (in.v4),
+          [iv4_mem] "m" (iv4_mem),
           [iv5] "{rsi}" (in.v5),
           [iv6] "{rdi}" (in.v6),
           [iv7] "{r8}" (in.v7),
@@ -174,12 +179,12 @@ fn issueRaw(word: u64, in: Regs) Regs {
           [iv11] "{r13}" (in.v11),
           [iv12] "{r14}" (in.v12),
           [iv13] "{r15}" (in.v13),
-        : .{ .rcx = true, .rbp = true, .r11 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .memory = true });
     return .{
         .v1 = ov1,
         .v2 = ov2,
         .v3 = ov3,
-        .v4 = ov4,
+        .v4 = ov4_mem,
         .v5 = ov5,
         .v6 = ov6,
         .v7 = ov7,
