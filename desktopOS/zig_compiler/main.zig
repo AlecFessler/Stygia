@@ -369,6 +369,34 @@ fn zagExit() noreturn {
 // blow the per-EC kernel stack (default ~64 KiB).
 var elf_buf: [60 * 1024]u8 = undefined;
 
+// Comment-stripped source buffer. Lives in .bss for the same reason.
+// Comments (`//` to end of line) are removed before parsing so decoy
+// strings/ints inside comments don't leak into the parsed values.
+var clean_buf: [4096]u8 = undefined;
+
+// Strip `//` line comments from `src[0..src_len]` into `out`, preserving
+// newlines for structure. Returns the cleaned byte count. Inside quoted
+// strings we don't recognize `//` so a string like `"http://..."` is safe.
+fn stripComments(src: [*]const u8, src_len: usize, out: []u8) usize {
+    var w: usize = 0;
+    var in_str = false;
+    var i: usize = 0;
+    while (i < src_len) {
+        const c = src[i];
+        if (!in_str and i + 1 < src_len and c == '/' and src[i + 1] == '/') {
+            while (i < src_len and src[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '"') in_str = !in_str;
+        if (w < out.len) {
+            out[w] = c;
+            w += 1;
+        }
+        i += 1;
+    }
+    return w;
+}
+
 // Banner the prebaked output ELF (zig_hello2) prints. Each occurrence
 // in the file gets overwritten with `[<tag>] <banner> <pad> \n`.
 const BANNER_PREFIX = "[zig_hello2]";
@@ -706,7 +734,11 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     }
     printNum("[zig_compiler] read /hello.zig bytes=", src.bytes_read);
     const src_ptr: [*]const u8 = @ptrFromInt(fs_va + src.data_off);
-    const found = extractSourceFields(src_ptr, @intCast(src.bytes_read));
+    // Strip `//` comments before parsing so decoy strings/ints inside
+    // comments don't leak into parsed source values.
+    const clean_len = stripComments(src_ptr, @intCast(src.bytes_read), &clean_buf);
+    printNum("[zig_compiler] post-strip bytes=", clean_len);
+    const found = extractSourceFields(@ptrCast(&clean_buf), clean_len);
     if (found < 2) {
         printNum("[zig_compiler] need 2 quoted strings, found=", found);
         zagExit();

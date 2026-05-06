@@ -898,10 +898,16 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     //    loops `repeat` times skipping iter `skip_idx` and printing
     //    "[runtime] iter=N result=base+N*step", then prints values
     //    array + sum/max reduction.
+    // Source includes // line comments with DECOY values that would
+    // hijack the parser without comment handling: a fake `op_name =
+    // "mul"` ahead of the real "xor", and decoy ints (999, 888) that
+    // would shift every scalar by two slots.
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
+        "// pub const op_name = \"mul\"; // decoy — must be skipped\n" ++
         "pub const op_name = \"xor\";\n" ++
+        "// distractor ints: 999 888 — must NOT become seed/mult\n" ++
         "pub const seed = 1337;\n" ++
         "pub const mult = 9;\n" ++
         "pub const repeat = 4;\n" ++
