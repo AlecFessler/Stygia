@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
+const hang_detector = zag.utils.hang_detector;
 const sync = zag.utils.sync;
 
 /// Standard ISA I/O base addresses for COM1-COM4.
@@ -61,6 +62,7 @@ var print_lock = sync.SpinLock{ .class = "serial.print_lock" };
 
 pub fn printRaw(s: []const u8) void {
     for (s) |b| writeByte(b, g_port);
+    hang_detector.noteProgress();
 }
 
 pub fn print(
@@ -82,6 +84,7 @@ pub fn print(
     for (s) |b| {
         writeByte(b, g_port);
     }
+    hang_detector.noteProgress();
 }
 
 /// Polls LSR bit 5 (Transmitter Holding Register Empty) before writing.

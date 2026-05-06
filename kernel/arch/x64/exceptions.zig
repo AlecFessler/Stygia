@@ -2,6 +2,7 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const ctx_trace = zag.utils.ctx_trace;
+const hang_detector = zag.utils.hang_detector;
 const pf_log = zag.utils.pf_log;
 const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
@@ -238,6 +239,12 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     // 'D' double-fault, 'U' unhandled, 'P' from @panic) narrow further.
     panic_mod.debugSentinel('X');
 
+    // Lost-wakeup hang detector — piggy-back on every exception entry
+    // so the dump still fires even when the LAPIC scheduler timer
+    // tick stalls (the smp=4 hang signature on this branch). Cheap
+    // fast path when no hang is in progress.
+    hang_detector.tickCheck();
+
     kprof.enter(.exception);
     defer kprof.exit(.exception);
 
@@ -389,6 +396,11 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     // emitting structured output.
     if (!from_user) panic_mod.debugSentinel('F');
 
+    // Lost-wakeup hang detector — piggy-back on the PF stream because
+    // the #PF rate stays high even when the LAPIC timer tick stalls
+    // (the smp=4 hang signature). Cheap fast path when no hang.
+    hang_detector.tickCheck();
+
     // Intercept port-IO virtual_bar faults from userspace before the
     // generic handler. A VMAR mapped via `map_mmio` to a port-IO
     // device_region intentionally has no PTEs — every CPU access faults
@@ -535,6 +547,16 @@ fn emulateVirtualBar(
             op.value
         else
             @truncate(readContextGpr(ctx, op.reg));
+
+        // Userspace COM1 writes — same lost-wakeup heartbeat as
+        // serial.printRaw. We stamp on the `\n` only: in the smp=4
+        // hang case the runner intermittently completes ONE byte of a
+        // `[runner] PASS …` line and re-stalls for tens of seconds,
+        // and counting that single byte as progress kept the threshold
+        // from ever tripping. A full line is the unit we want.
+        if (io_port == 0x3F8 and op.size == 1) {
+            hang_detector.noteProgressOnNewline(@truncate(value));
+        }
 
         switch (op.size) {
             1 => cpu.outb(@truncate(value), io_port),

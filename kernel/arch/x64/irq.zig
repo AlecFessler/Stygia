@@ -7,6 +7,7 @@ const exceptions = zag.arch.x64.exceptions;
 const fpu = zag.sched.fpu;
 const futex = zag.sched.futex;
 const gdt = zag.arch.x64.gdt;
+const hang_detector = zag.utils.hang_detector;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
@@ -217,6 +218,9 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     if (kprof_log.terminate_requested != 0) {
         kprof_dump.end(.log_full);
     }
+    // Lost-wakeup hang detector — bumps once per tick. Cheap fast-path
+    // when no hang in progress; emits a one-shot per-core dump on detect.
+    hang_detector.tickCheck();
     timers.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
     // Drive any deadline-based wakeups for recv-with-timeout and
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.
