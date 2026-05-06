@@ -192,6 +192,7 @@ var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
 var op_value: u64 = 0xCAFEBABE_05E1EC70;
 var step_value: u64 = 0xCAFEBABE_57E90001;
 var skip_value: u64 = 0xCAFEBABE_5C1A0001;
+var inner_value: u64 = 0xCAFEBABE_19E70001;
 
 // Source-defined u64 array — first variable-length structured data.
 // values_len = how many slots zig_compiler patched; values_arr =
@@ -241,12 +242,14 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const op_ptr: *volatile u64 = &op_value;
     const step_ptr: *volatile u64 = &step_value;
     const skip_ptr: *volatile u64 = &skip_value;
+    const inner_ptr: *volatile u64 = &inner_value;
     const v_seed = seed_ptr.*;
     const v_mult = mult_ptr.*;
     const v_repeat = repeat_ptr.*;
     const v_op = op_ptr.*;
     const v_step = step_ptr.*;
     const v_skip = skip_ptr.*;
+    const v_inner = inner_ptr.*;
 
     // Source-selectable operation: 0=mul, 1=add, 2=sub, 3=xor; anything
     // else (including the unpatched sentinel) → mul (default).
@@ -274,6 +277,7 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     print("\n");
     printLine("[runtime] step=", v_step);
     printLine("[runtime] skip_idx=", v_skip);
+    printLine("[runtime] inner=", v_inner);
 
     // Source-driven control flow: loop iteration count comes from a
     // source-file constant that flows through the compiler into a
@@ -284,6 +288,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     // skip_idx (the unpatched sentinel doesn't match any iter index
     // 0..7 so all iters print under raw conditions).
     const cap: u64 = if (v_repeat > 8) 8 else v_repeat;
+    // Inner-loop cap: 4 max, so an unpatched sentinel (huge raw value)
+    // doesn't blow up boot output to repeat*4 = 32 lines per spawn.
+    const inner_cap: u64 = if (v_inner > 4) 4 else v_inner;
     var i: u64 = 0;
     while (i < cap) {
         if (i == v_skip) {
@@ -292,8 +299,13 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         }
         // Per-iter unique value: source-driven `step` interacts with
         // the loop counter so each iter prints a distinct number.
-        const per_iter: u64 = result +% (i *% v_step);
-        printIterLine(i, per_iter);
+        // Nested inner loop: source-driven count per outer iter.
+        var j: u64 = 0;
+        while (j < inner_cap) {
+            const nested: u64 = result +% (i *% v_step) +% j;
+            printNestedLine(i, j, nested);
+            j += 1;
+        }
         i += 1;
     }
 
@@ -326,6 +338,47 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
 
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
+}
+
+fn printNestedLine(outer: u64, inner: u64, val: u64) void {
+    var ob: [16]u8 = undefined;
+    const os = formatU64(&ob, outer);
+    var ib: [16]u8 = undefined;
+    const is = formatU64(&ib, inner);
+    var vb: [32]u8 = undefined;
+    const vs = formatU64(&vb, val);
+    var line: [96]u8 = undefined;
+    var w: usize = 0;
+    const a = "[runtime] iter=";
+    for (a) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (os) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    const b1 = " inner=";
+    for (b1) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (is) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    const c = " result=";
+    for (c) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (vs) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    line[w] = '\n';
+    w += 1;
+    print(line[0..w]);
 }
 
 fn printArrayLine(idx: u64, val: u64) void {

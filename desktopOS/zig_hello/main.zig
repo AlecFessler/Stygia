@@ -888,6 +888,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     //      op       → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
     //      step     → fifth decimal int — added to result per iteration
     //      skip_idx → sixth decimal int — iter loop skips i==skip_idx
+    //      inner    → seventh decimal int — inner loop count per outer iter
     //      values   → remaining decimal ints (up to 4) become a u64 array
     //    Output banner: "[<tag>] <banner> seed=<n>".
     //    Spawned binary BRANCHES on op_value to compute base, then
@@ -903,6 +904,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "pub const op = 1;\n" ++
         "pub const step = 7;\n" ++
         "pub const skip_idx = 2;\n" ++
+        "pub const inner = 3;\n" ++
         "pub const values = [_]u64{ 100, 200, 300 };\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);

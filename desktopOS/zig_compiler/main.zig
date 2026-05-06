@@ -398,6 +398,8 @@ var step_int: u64 = 0;
 var step_found: bool = false;
 var skip_int: u64 = 0;
 var skip_found: bool = false;
+var inner_int: u64 = 0;
+var inner_found: bool = false;
 // Source u64 array (after the 6 scalar consts). Up to 4 entries.
 const VALUES_MAX: usize = 4;
 var values_buf: [VALUES_MAX]u64 = .{ 0, 0, 0, 0 };
@@ -500,6 +502,10 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 skip_int = v;
                 skip_found = true;
                 ints_found = 6;
+            } else if (ints_found == 6) {
+                inner_int = v;
+                inner_found = true;
+                ints_found = 7;
             } else if (values_count < VALUES_MAX) {
                 values_buf[values_count] = v;
                 values_count += 1;
@@ -519,6 +525,7 @@ const REPEAT_SENTINEL: u64 = 0xCAFEBABE_C0FFEE01;
 const OP_SENTINEL: u64 = 0xCAFEBABE_05E1EC70;
 const STEP_SENTINEL: u64 = 0xCAFEBABE_57E90001;
 const SKIP_SENTINEL: u64 = 0xCAFEBABE_5C1A0001;
+const INNER_SENTINEL: u64 = 0xCAFEBABE_19E70001;
 
 // Per-element sentinels for the source-defined u64 array (must
 // match zig_hello2/main.zig values_arr initializers exactly).
@@ -677,6 +684,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (skip_found) {
         printNum("[zig_compiler] extracted skip_idx=", skip_int);
     }
+    if (inner_found) {
+        printNum("[zig_compiler] extracted inner=", inner_int);
+    }
     if (values_count > 0) {
         printNum("[zig_compiler] extracted values count=", values_count);
         var vi: usize = 0;
@@ -743,6 +753,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched skip sentinel hits=", h);
     } else {
         print("[zig_compiler] no sixth int (skip_idx) in source\n");
+    }
+    if (inner_found) {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], INNER_SENTINEL, inner_int);
+        printNum("[zig_compiler] patched inner sentinel hits=", h);
+    } else {
+        print("[zig_compiler] no seventh int (inner) in source\n");
     }
     // Always patch the array length (even if 0) so the spawned binary
     // doesn't iterate against the raw sentinel.
