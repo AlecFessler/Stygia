@@ -591,3 +591,12 @@ pub fn idle() void {
         \\wfi
         ::: .{ .memory = true });
 }
+
+/// aarch64 stub for the cross-arch `parkPerCoreCaches` contract. The
+/// scheduler's park path is currently x86-64-only (no analogous TSS or
+/// SyscallScratch caches on aarch64). When aarch64 grows equivalent
+/// per-core scratch, fill this in.
+pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
+    _ = core_id;
+    _ = park_top;
+}

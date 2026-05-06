@@ -892,3 +892,24 @@ pub fn idle() void {
         \\hlt
     );
 }
+
+/// Update per-core caches to "no EC dispatched" state ahead of an idle
+/// park. Sets `kernel_rsp` and `TSS.RSP0` to the supplied per-core park
+/// kstack top so subsequent kernel-mode IRQs / future syscall entries
+/// land on a stack dedicated to this core (rather than on a shared
+/// stale gs:0 pointing at a previously-suspended EC's kstack — see
+/// `sched.scheduler.parkAndAwaitIRQ`). Clears the EC-identity caches
+/// (gs:32 current_ec, gs:176 current_ec_gen, gs:40/48/56 domain ptrs)
+/// to null so any FP path on this core would bail to slow path; in
+/// practice no FP entry fires while this core is parked because no
+/// userspace runs on it without a `switchTo` first.
+pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
+    const sc = &interrupts.per_cpu_scratch[core_id];
+    sc.kernel_rsp = park_top;
+    sc.current_ec = 0;
+    sc.current_ec_gen = 0;
+    sc.current_domain = 0;
+    sc.current_user_table = 0;
+    sc.current_kernel_table = 0;
+    gdt.coreTss(core_id).rsp0 = park_top;
+}

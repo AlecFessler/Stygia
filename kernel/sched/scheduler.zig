@@ -16,11 +16,14 @@ const arch = zag.arch.dispatch;
 const ec_log = zag.utils.ec_log;
 const kprof = zag.kprof.trace_id;
 const port_mod = zag.sched.port;
+const stack_mod = zag.memory.stack;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const Priority = zag.sched.execution_context.Priority;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
+const Stack = zag.memory.stack.Stack;
+const VAddr = zag.memory.address.VAddr;
 
 /// Intrusive priority queue of ECs, linked through the EC's `next`
 /// field and ordered by `priority`. Shared by per-core run queues and
@@ -110,6 +113,25 @@ pub const PerCore = struct {
     /// against this ref ever runs; the field type is just a contract
     /// declaration.
     pending_zombie: ?SlabRef(ExecutionContext) = null,
+
+    /// Per-core "park" kstack — the kstack this core uses while no real
+    /// EC is dispatched. Allocated at `perCoreInit`; sized like any
+    /// other kernel stack (KERNEL_STACK_PAGES). When `run()` empties the
+    /// queue and falls through the dispatch arm, `parkAndAwaitIRQ`
+    /// swaps gs:0 / TSS.RSP0 / rsp to `park_stack.top` so subsequent
+    /// kernel-mode IRQs and any future syscall entries land here
+    /// instead of on the previously-suspended EC's kstack. Without
+    /// this, multiple idle cores can hold stale `gs:0` pointing at the
+    /// same suspended EC's kstack and concurrently push IRQ frames
+    /// onto it from kernel mode — silent cross-core stack corruption
+    /// that surfaces as iretq #GP / NO-EC PF when the corrupted slot
+    /// is later popped.
+    park_stack: Stack = .{
+        .top = .{ .addr = 0 },
+        .base = .{ .addr = 0 },
+        .guard = .{ .addr = 0 },
+        .slot = std.math.maxInt(u64),
+    },
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -155,6 +177,27 @@ pub fn globalInit() !void {
 /// timer interrupt ever fires and a CPU-bound EC runs forever until
 /// it voluntarily yields.
 pub fn perCoreInit() void {
+    // Allocate this core's park kstack. Used while the run queue is
+    // empty AND no EC is dispatched — see `PerCore.park_stack` doc and
+    // `parkAndAwaitIRQ`.
+    const core: u8 = @truncate(arch.smp.coreID());
+    const park = stack_mod.createKernel() catch @panic("park kstack alloc failed");
+    var page_addr: u64 = park.base.addr;
+    while (page_addr < park.top.addr) {
+        const pmm_mgr = if (zag.memory.pmm.global_pmm) |*p| p else @panic("park kstack: pmm not ready");
+        const page = pmm_mgr.create(zag.memory.paging.PageMem(.page4k)) catch @panic("park kstack: pmm OOM");
+        const phys = zag.memory.address.PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+        arch.paging.mapPage(
+            zag.memory.init.kernel_addr_space_root,
+            phys,
+            VAddr.fromInt(page_addr),
+            .{ .read = true, .write = true },
+            .kernel_data,
+        ) catch @panic("park kstack: map failed");
+        page_addr += zag.memory.paging.PAGE4K;
+    }
+    (&core_states[core]).park_stack = park;
+
     arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
     // Enable hardware virtualization on this core (VMXON / EFER.SVME +
     // host save area). Required before any vCPU on this core can
@@ -319,13 +362,58 @@ pub fn run() noreturn {
         if (dequeueOrIdle()) |next| {
             switchTo(next);
         }
-        // Either `dequeueOrIdle` found nothing and no idle EC was set
-        // up for this core, or `switchTo` returned (it's `noreturn` on
-        // the dispatch path, so this is the empty-queue case). Sleep
-        // with interrupts enabled so a wake IPI breaks us out and the
-        // loop re-runs `dequeueOrIdle`.
-        arch.cpu.idle();
+        // Run queue empty and no idle_ec set up. Park this core on its
+        // dedicated park kstack and sti+hlt until an IRQ wakes us.
+        // `parkAndAwaitIRQ` swaps rsp / gs:0 / TSS.RSP0 / per-core
+        // caches to park-state and tail-jumps back into `run()` on
+        // wake — the outer call frame on the previously-dispatched
+        // EC's kstack is abandoned. This eliminates the cross-core
+        // kstack-sharing bug where multiple idle cores held stale
+        // gs:0 pointing at the same suspended EC's kstack and
+        // concurrently pushed IRQ frames onto it from kernel mode,
+        // silently stomping each other's saved state and surfacing
+        // as iretq #GP or NO-EC PF when the corrupted iret slot was
+        // later popped.
+        parkAndAwaitIRQ();
     }
+}
+
+/// Park this core on its per-core park kstack and idle until an IRQ
+/// arrives. Updates the per-core caches (gs:0/32/40/48/56/176, TSS.RSP0,
+/// PerCore.current_ec) to "no EC dispatched" state, swaps rsp to the
+/// park kstack top, then sti+hlt. On IRQ-driven wake jumps back into
+/// `run()` via the exported entry symbol — the original caller's call
+/// frame is abandoned (we are noreturn). See `PerCore.park_stack`.
+fn parkAndAwaitIRQ() noreturn {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const park_top = (&core_states[core]).park_stack.top.addr;
+    if (park_top == 0) @panic("parkAndAwaitIRQ: park_stack not initialized");
+
+    // Update per-core caches FIRST while still on the caller's stack.
+    // After the rsp swap below, locals on this stack frame go
+    // unreferenced; the outer noreturn semantics make abandonment
+    // safe.
+    arch.cpu.parkPerCoreCaches(core, park_top);
+    (&core_states[core]).current_ec = null;
+
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\sti
+        \\hlt
+        \\cli
+        \\jmp scheduler_run_after_park
+        :
+        : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
+}
+
+/// Asm landing pad after `parkAndAwaitIRQ`'s wake: rsp is on the park
+/// kstack, IRQs are masked. Re-enter `run()` to re-check the queue.
+/// `run()` is noreturn so the call never returns; the pushed return
+/// address sits unused on the park stack.
+export fn scheduler_run_after_park() callconv(.c) noreturn {
+    run();
 }
 
 /// Internal helper — dequeues the highest-priority EC, or returns the

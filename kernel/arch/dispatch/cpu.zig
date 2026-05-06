@@ -493,3 +493,15 @@ pub fn idle() void {
         else => unreachable,
     }
 }
+
+/// Update per-core caches (per-CPU scratch + TSS.RSP0 equivalent) to
+/// "no EC dispatched" / park-state. Called by the scheduler before
+/// swapping rsp to the per-core park kstack and idling. See arch impls
+/// for what fields get cleared / pointed at the park kstack top.
+pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.parkPerCoreCaches(core_id, park_top),
+        .aarch64 => aarch64.cpu.parkPerCoreCaches(core_id, park_top),
+        else => unreachable,
+    }
+}
