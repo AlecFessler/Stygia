@@ -306,6 +306,123 @@ pub fn build(b: *std.Build) void {
     const fs_install = b.addInstallFile(fs_exe.getEmittedBin(), "../bin/fs.elf");
     b.getInstallStep().dependOn(&fs_install.step);
 
+    // ── doom.elf ────────────────────────────────────────────────────
+    //
+    // Vendored doomgeneric Doom port (87 .c files in doom/src) compiled
+    // against the freestanding libc surface in doom/libc_shim.zig and
+    // linked with a tiny C platform shim (doom/dg_platform.c) that
+    // forwards the DG_* hooks to Zig externs in doom/main.zig. The
+    // shareware WAD is @embedFile-d directly into the ELF.
+    const doom_app_mod = b.createModule(.{
+        .root_source_file = b.path("doom/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    doom_app_mod.addImport("lib", lib_mod);
+    doom_app_mod.addImport("log", log_mod);
+    doom_app_mod.addImport("usb_input", usb_input_mod);
+
+    const doom_libc_mod = b.createModule(.{
+        .root_source_file = b.path("doom/libc_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    doom_libc_mod.addImport("lib", lib_mod);
+    doom_libc_mod.addImport("log", log_mod);
+    doom_app_mod.addImport("libc_shim", doom_libc_mod);
+
+    const doom_start_mod = b.createModule(.{
+        .root_source_file = start_src,
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    doom_start_mod.addImport("lib", lib_mod);
+    doom_start_mod.addImport("app", doom_app_mod);
+
+    const doom_exe = b.addExecutable(.{
+        .name = "doom",
+        .root_module = doom_start_mod,
+        .linkage = .static,
+    });
+    doom_exe.pie = true;
+    doom_exe.entry = .{ .symbol_name = "_start" };
+    doom_exe.root_module.strip = false;
+
+    const doom_c_flags = [_][]const u8{
+        "-std=gnu99",
+        "-fno-stack-protector",
+        "-fno-builtin",
+        "-fno-strict-aliasing",
+        "-fno-pic",
+        "-fPIE",
+        "-DDOOMGENERIC",
+        "-DNORMALUNIX",
+        "-DLINUX", // toggles the unix-y ifdef paths we want over the win32 ones
+        "-DNO_SCREENSHOT",
+        "-Wno-implicit-function-declaration",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-pointer-sign",
+        "-Wno-unused-result",
+        "-Wno-format",
+        "-Wno-deprecated-non-prototype",
+        "-Wno-int-conversion",
+        "-Wno-unused-but-set-variable",
+        "-Wno-parentheses",
+    };
+
+    // Enumerate every .c file in doom/src/ at configure time, skipping
+    // a small set of source files that hard-depend on host audio /
+    // graphics SDKs we don't have (SDL, allegro). Doom can run silent
+    // and headless audio-wise; only the rendering path matters.
+    const doom_skip_sources = [_][]const u8{
+        "i_sdlmusic.c",
+        "i_sdlsound.c",
+        "i_allegromusic.c",
+        "i_allegrosound.c",
+    };
+
+    var doom_src_dir = std.fs.cwd().openDir("doom/src", .{ .iterate = true }) catch unreachable;
+    defer doom_src_dir.close();
+    var iter = doom_src_dir.iterate();
+    while (iter.next() catch unreachable) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".c")) continue;
+        var skip = false;
+        for (doom_skip_sources) |s| {
+            if (std.mem.eql(u8, entry.name, s)) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+        const path = b.fmt("doom/src/{s}", .{entry.name});
+        doom_exe.addCSourceFile(.{
+            .file = b.path(path),
+            .flags = &doom_c_flags,
+        });
+    }
+
+    // The tiny platform shim that forwards DG_* into Zig externs.
+    doom_exe.addCSourceFile(.{
+        .file = b.path("doom/dg_platform.c"),
+        .flags = &doom_c_flags,
+    });
+
+    // Custom freestanding headers (ctype, stdio, stdlib, string, …) at
+    // the front of the include list shadow any system ones.
+    doom_exe.addIncludePath(b.path("doom/include"));
+    doom_exe.addIncludePath(b.path("doom/src"));
+    doom_exe.addIncludePath(b.path("doom"));
+
+    const doom_install = b.addInstallFile(doom_exe.getEmittedBin(), "../bin/doom.elf");
+    b.getInstallStep().dependOn(&doom_install.step);
+
     // ── verify_fs.elf (smoke harness) ───────────────────────────────
     const verify_app_mod = b.createModule(.{
         .root_source_file = b.path("verify_fs/main.zig"),
@@ -348,6 +465,7 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(blkdev_exe.getEmittedBin(), "block_device.elf");
     _ = services_wf.addCopyFile(fs_exe.getEmittedBin(), "fs.elf");
     _ = services_wf.addCopyFile(verify_exe.getEmittedBin(), "verify_fs.elf");
+    _ = services_wf.addCopyFile(doom_exe.getEmittedBin(), "doom.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -355,6 +473,7 @@ pub fn build(b: *std.Build) void {
         \\pub const block_device_elf = @embedFile("block_device.elf");
         \\pub const fs_elf = @embedFile("fs.elf");
         \\pub const verify_fs_elf = @embedFile("verify_fs.elf");
+        \\pub const doom_elf = @embedFile("doom.elf");
         \\
     );
     const services_mod = b.createModule(.{
