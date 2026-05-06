@@ -32,4 +32,13 @@ comptime {
     _ = @import("cxxabi.zig");
     _ = @import("pthread.zig");
     _ = @import("stdlib.zig");
+    _ = @import("math.zig");
+    _ = @import("locale.zig");
+    _ = @import("signal.zig");
+    _ = @import("dl.zig");
+    _ = @import("network.zig");
+    _ = @import("wide.zig");
+    _ = @import("process.zig");
+    _ = @import("strings_extra.zig");
+    _ = @import("fortify.zig");
 }
