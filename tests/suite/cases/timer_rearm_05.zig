@@ -90,19 +90,18 @@ const testing = lib.testing;
 // post-arm spin is running.
 const ARM_DEADLINE_NS: u64 = 1_000_000;
 
-// 50 ms rearm period. The rearm post-condition checked below is
+// 500 ms rearm period. The rearm post-condition checked below is
 // "field0 = 0 immediately on return" — a periodic fire that lands
 // between the rearm syscall returning and the next user-mode
 // `readCap` would race the post-condition observation. On the
 // aarch64 Pi 5 KVM runner the per-syscall return path includes a
 // kernel-side propagation walk plus user-mode mode switch that can
-// span well over 1 ms; a 1 ms rearm period therefore raced and tripped
-// assertion 3. 50 ms keeps the rearm observable well before the next
-// fire while still being a distinct period from the arm path so a
-// kernel that reused the prior configuration verbatim would be
-// observable elsewhere. Spec §[timer_rearm] pins the reset semantics,
-// not the absolute period.
-const REARM_DEADLINE_NS: u64 = 50_000_000;
+// span well over 1 ms; smaller rearm periods race and trip
+// assertion 3. 500 ms gives ~10× safety margin while still
+// exercising the periodic flag's distinct-from-arm-period side.
+// Spec §[timer_rearm] pins the reset-to-zero semantics, not the
+// absolute period.
+const REARM_DEADLINE_NS: u64 = 500_000_000;
 
 // Bound on the post-arm spin. If field0 has not advanced in this
 // many iterations, fall back to exercising the "field0 = 0 on rearm
