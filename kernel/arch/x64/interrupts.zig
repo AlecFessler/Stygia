@@ -1955,6 +1955,29 @@ pub export fn syscallEntry() callconv(.naked) void {
     // straight to .running because we are about to switch this core
     // to it (no runqueue insertion for sender — direct dispatch).
     // Mirrors execution_context.resumeFromReply field-for-field.
+    //
+    // ALSO: stamp `sender.last_dispatched_core = core_id` here, while
+    // sender's gen-lock is still held (acquired R5a, released R10).
+    // The previous stamp site at R14 fires AFTER R10, leaving a
+    // window where a concurrent terminate(sender) acquires sender's
+    // gen-lock (briefly), reads a STALE `last_dispatched_core` (the
+    // core that ran sender pre-suspend, possibly idle now), and posts
+    // sender's zombie to that wrong core. That core's next switchTo
+    // sees `standing_on_zombie = false` (it's not on sender's kstack
+    // — sender's kstack is unused in user-mode park), reaps sender,
+    // and `finalizeDestroyMarkedDead` unmaps sender's kstack pages +
+    // zeroes the slab. Then THIS core's R14 reads
+    // `ec.kernel_stack.top` from the just-zeroed slab → writes 0 to
+    // gs:0 / TSS.RSP0. The next ring-3 → ring-0 entry pushes its
+    // iret-frame at virt 0 → #PF (no IST) → #DF → triple-fault, with
+    // no panic text emitted. Stamping under sender's gen-lock here
+    // forces terminate to wait until R10 releases, by which point
+    // `last_dispatched_core` correctly names this core; the resulting
+    // postZombie + wake IPI then routes to us, and our next switchTo
+    // (already off sender's kstack via sysretq's user-mode return)
+    // reaps cleanly. Same race exists architecturally on the suspend
+    // FP step 14, but there the stamp is already inside the receiver
+    // gen-lock window (Step 9.5 → Step 15.5).
     // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
@@ -1969,6 +1992,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movb $0, {[orig_write_off]d}(%%rcx)
             \\movb $0, {[orig_read_off]d}(%%rcx)
             \\movb $0, {[ppc_off]d}(%%rcx)
+            \\movzbl %%gs:{[sc_core_id]d}, %%eax
+            \\movb %%al, {[last_disp_off]d}(%%rcx)
             \\
         ,
             .{
@@ -1985,6 +2010,8 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .orig_write_off = @offsetOf(ExecutionContext, "originating_write_cap"),
                 .orig_read_off = @offsetOf(ExecutionContext, "originating_read_cap"),
                 .ppc_off = @offsetOf(ExecutionContext, "pending_pair_count"),
+                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
