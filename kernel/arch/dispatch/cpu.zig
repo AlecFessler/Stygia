@@ -505,3 +505,14 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
         else => unreachable,
     }
 }
+
+/// Swap to the per-core park kstack and idle (sti+hlt / wfi) until an
+/// IRQ arrives, then re-enter the scheduler via the exported
+/// `scheduler_run_after_park` landing pad. Caller's frame is abandoned.
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.parkAndAwaitIRQ(park_top),
+        .aarch64 => aarch64.cpu.parkAndAwaitIRQ(park_top),
+        else => unreachable,
+    }
+}

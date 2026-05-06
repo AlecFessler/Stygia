@@ -396,16 +396,7 @@ fn parkAndAwaitIRQ() noreturn {
     arch.cpu.parkPerCoreCaches(core, park_top);
     (&core_states[core]).current_ec = null;
 
-    asm volatile (
-        \\movq %[top], %%rsp
-        \\sti
-        \\hlt
-        \\cli
-        \\jmp scheduler_run_after_park
-        :
-        : [top] "r" (park_top),
-        : .{ .memory = true });
-    unreachable;
+    arch.cpu.parkAndAwaitIRQ(park_top);
 }
 
 /// Asm landing pad after `parkAndAwaitIRQ`'s wake: rsp is on the park

@@ -600,3 +600,20 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     _ = core_id;
     _ = park_top;
 }
+
+/// aarch64 has no shared per-core scratch analogous to x86 gs:0, so the
+/// kstack-abandon trick from `sched.scheduler.parkAndAwaitIRQ` isn't
+/// strictly needed — but to keep the contract symmetric we still
+/// branch into `scheduler_run_after_park` after wake. Frames pushed
+/// onto the caller's kstack are leaked (caller is noreturn).
+/// ARM ARM DDI 0487 §C5.2.4 WFI.
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    _ = park_top;
+    asm volatile (
+        \\msr daifclr, #2
+        \\wfi
+        \\msr daifset, #2
+        \\b scheduler_run_after_park
+        ::: .{ .memory = true });
+    unreachable;
+}

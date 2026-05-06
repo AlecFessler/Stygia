@@ -913,3 +913,21 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     sc.current_kernel_table = 0;
     gdt.coreTss(core_id).rsp0 = park_top;
 }
+
+/// Swap rsp to the per-core park kstack top, sti+hlt until an IRQ
+/// arrives, then jump to the exported `scheduler_run_after_park`
+/// landing pad (which re-enters the scheduler `run()` loop on the new
+/// stack). The caller's frame is abandoned — see
+/// `sched.scheduler.parkAndAwaitIRQ` for why this is safe.
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\sti
+        \\hlt
+        \\cli
+        \\jmp scheduler_run_after_park
+        :
+        : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
+}
