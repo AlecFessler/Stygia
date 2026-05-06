@@ -908,7 +908,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "// pub const op_name = \"mul\"; // decoy — must be skipped\n" ++
         "pub const op_name = \"xor\";\n" ++
         "// distractor ints: 999 888 — must NOT become seed/mult\n" ++
-        "pub const seed = 1300 + 12 * 3 + 2;\n" ++
+        "pub const seed = 5 * (200 + 70) - 12;\n" ++
         "pub const mult = seed - 1300;\n" ++
         "pub const repeat = 4;\n" ++
         "pub const op = 1;\n" ++

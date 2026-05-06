@@ -572,6 +572,68 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
     return found;
 }
 
+// Parse a single term: digit literal, identifier (resolved against
+// the symbol table), or `(` expression `)`. Mutually recursive with
+// parseExpr through parenthesized terms.
+fn parseTerm(src: [*]const u8, src_len: usize, j_p: *usize) ?u64 {
+    var j = j_p.*;
+    while (j < src_len and src[j] == ' ') j += 1;
+    if (j >= src_len) {
+        j_p.* = j;
+        return null;
+    }
+    const c = src[j];
+    if (c == '(') {
+        j_p.* = j + 1;
+        const v = parseExpr(src, src_len, j_p) orelse return null;
+        var k = j_p.*;
+        while (k < src_len and src[k] == ' ') k += 1;
+        if (k >= src_len or src[k] != ')') {
+            j_p.* = k;
+            return null;
+        }
+        j_p.* = k + 1;
+        return v;
+    }
+    if (c >= '0' and c <= '9') {
+        var v: u64 = 0;
+        while (j < src_len) : (j += 1) {
+            const d = src[j];
+            if (d < '0' or d > '9') break;
+            v = v * 10 + (@as(u64, d) - '0');
+        }
+        j_p.* = j;
+        return v;
+    }
+    if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_') {
+        const id_start = j;
+        while (j < src_len) : (j += 1) {
+            const d = src[j];
+            const is_id = (d >= 'a' and d <= 'z') or
+                (d >= 'A' and d <= 'Z') or
+                (d >= '0' and d <= '9') or d == '_';
+            if (!is_id) break;
+        }
+        const id_slice = src[id_start..j];
+        const v = resolveIdent(id_slice) orelse {
+            j_p.* = j;
+            return null;
+        };
+        j_p.* = j;
+        return v;
+    }
+    j_p.* = j;
+    return null;
+}
+
+// Parse a full expression (term followed by op/term continuations
+// with `*` precedence over `+`/`-`). Returns null only if the very
+// first term can't be read.
+fn parseExpr(src: [*]const u8, src_len: usize, j_p: *usize) ?u64 {
+    const v = parseTerm(src, src_len, j_p) orelse return null;
+    return applyExprContinuation(src, src_len, j_p, v);
+}
+
 // Two-pass expression continuation with operator precedence:
 // 1. Collect (op, value) pairs after the LHS (terms are digits or
 //    resolvable identifiers).
@@ -592,30 +654,9 @@ fn applyExprContinuation(src: [*]const u8, src_len: usize, j_p: *usize, v_in: u6
         const op = src[p];
         if (op != '+' and op != '-' and op != '*') break;
         var q: usize = p + 1;
-        while (q < src_len and src[q] == ' ') q += 1;
-        if (q >= src_len) break;
-        const c2 = src[q];
-        var rhs: u64 = 0;
-        if (c2 >= '0' and c2 <= '9') {
-            while (q < src_len) : (q += 1) {
-                const d = src[q];
-                if (d < '0' or d > '9') break;
-                rhs = rhs * 10 + (@as(u64, d) - '0');
-            }
-        } else if ((c2 >= 'a' and c2 <= 'z') or (c2 >= 'A' and c2 <= 'Z') or c2 == '_') {
-            const id_start = q;
-            while (q < src_len) : (q += 1) {
-                const d = src[q];
-                const is_id = (d >= 'a' and d <= 'z') or
-                    (d >= 'A' and d <= 'Z') or
-                    (d >= '0' and d <= '9') or d == '_';
-                if (!is_id) break;
-            }
-            const id_slice = src[id_start..q];
-            if (resolveIdent(id_slice)) |val| {
-                rhs = val;
-            } else break; // unresolved RHS — abort accumulation
-        } else break;
+        // RHS uses parseTerm so it accepts parenthesized sub-exprs,
+        // identifier refs, and bare digit literals uniformly.
+        const rhs = parseTerm(src, src_len, &q) orelse break;
         ops[n] = op;
         vals[n + 1] = rhs;
         n += 1;
