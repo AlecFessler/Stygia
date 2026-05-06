@@ -609,6 +609,20 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\.Lsyscall_slow_path:
         \\movq %%gs:16, %%rcx                 // restore user_rip
         \\movq %%gs:24, %%r11                 // restore user_rflags
+        // FP bails enter here with rsp = kstack.top - 192 (the suspend
+        // and reply FP entries pre-decrement rsp by 192 so any non-IST
+        // kernel-mode exception's iret-frame push lands clear of
+        // ec.ctx). The classifier-direct entry has rsp = kstack.top.
+        // Reset rsp from gs:0 unconditionally so the slow-path Context
+        // buffer always lands at kstack.top - 176 = ec.ctx_addr (the
+        // canonical pointer ec.ctx was given at EC create time).
+        // Without this, FP bails would build the saved iret frame at
+        // kstack.top - 368 and leave ec.ctx pointing elsewhere; later
+        // setSyscallReturn(ec.ctx, ...) — e.g. a delete on a reply
+        // handle resolving the suspended sender with E_ABANDONED —
+        // writes to stale ec.ctx storage and the wake target resumes
+        // with garbage rip/cs/ss/rsp.
+        \\movq %%gs:0, %%rsp
         \\subq $176, %%rsp
         \\movq %%rbp, 80(%%rsp)
         \\movq %%gs:8, %%rbp
@@ -681,6 +695,26 @@ pub export fn syscallEntry() callconv(.naked) void {
     // arg-reading contract.
     // ═══════════════════════════════════════════════════════════════
         \\.Lsyscall_suspend_fast:
+
+    // ─── Step 0: drop rsp below ec.ctx so any non-IST kernel-mode
+    // exception's hardware iret-frame push lands clear of the saved
+    // context. PHASE 1 left rsp = ec.kstack.top; ec.ctx lives at
+    // kstack.top - 176 with its iret-frame fields ending at
+    // kstack.top - 8. A 5-qword push at rsp - 40 would otherwise
+    // overlap ec.ctx.{rip,cs,rflags,rsp,ss} byte-for-byte and
+    // silently poison the EC's saved frame. Slow path's `subq $176`
+    // accomplishes the same — this mirrors that invariant for the
+    // fast path. 192 = 176 ec.ctx + 16-byte alignment slack, matching
+    // the buffer R12.5 (reply FP) reserves below sender.kstack.top.
+    //
+    // Bail-to-slow-path edges (.Lsyscall_lock_fail / .Lsyscall_no_receiver
+    // / .Lreply_handle_invalid / .Lreply_lock_fail) inherit this rsp
+    // delta; the slow-path entry resets rsp from gs:0 before doing its
+    // own subq $176 so the Context buffer it builds always lands at
+    // kstack.top - 176 = ec.ctx_addr regardless of which arm we came
+    // from.
+    // ────────────────────────────────────────────────────────────────
+        \\subq $192, %%rsp
 
     // ─── Step 1: port handle bounds check (rbx = port_id). ─────────
         \\cmpq $0xFFF, %%rbx
@@ -1592,6 +1626,19 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   gs:120 fast_temp[7]  (unused)
     // ═══════════════════════════════════════════════════════════════
         \\.Lsyscall_reply_fast:
+
+    // ─── Step R0: drop rsp below ec.ctx. Same rationale as the
+    // matching Step 0 above `.Lsyscall_suspend_fast` — non-IST
+    // kernel-mode exceptions push their hardware iret frame onto the
+    // current rsp, and ec.ctx.{rip,cs,rflags,rsp,ss} live at
+    // kstack.top - 40 .. kstack.top - 8. 192 = 176 ec.ctx + 16-byte
+    // alignment slack. Bail edges (.Lreply_handle_invalid /
+    // .Lreply_lock_fail / .Lreply_sender_field_fail) inherit this
+    // rsp delta; the slow-path entry resets rsp from gs:0 before its
+    // own subq $176, so the Context buffer always lands at
+    // kstack.top - 176 = ec.ctx_addr.
+    // ────────────────────────────────────────────────────────────────
+        \\subq $192, %%rsp
 
     // ─── Step R1: spill receiver's rax (vreg 1) to gs:64. cmpxchg
     // loops below clobber rax; we restore the original value by
