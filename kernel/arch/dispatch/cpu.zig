@@ -17,6 +17,48 @@ pub const ArchCpuContext = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
+/// Byte offset within the EC's saved-context buffer of the program
+/// counter slot (x86 `rip`, aarch64 `elr_el1`). Used by debug
+/// instrumentation that snapshots a fault-time PC without dereferencing
+/// the typed struct (lets `kernel/utils/` stay arch-agnostic).
+pub const ctx_pc_offset: usize = switch (builtin.cpu.arch) {
+    .x86_64 => @offsetOf(x64.cpu.Context, "rip"),
+    .aarch64 => @offsetOf(aarch64.interrupts.ArchCpuContext, "elr_el1"),
+    else => unreachable,
+};
+
+/// Byte offset within the EC's saved-context buffer of the user stack
+/// pointer slot (x86 `rsp`, aarch64 `sp_el0`).
+pub const ctx_sp_offset: usize = switch (builtin.cpu.arch) {
+    .x86_64 => @offsetOf(x64.cpu.Context, "rsp"),
+    .aarch64 => @offsetOf(aarch64.interrupts.ArchCpuContext, "sp_el0"),
+    else => unreachable,
+};
+
+/// Byte offset within the EC's saved-context buffer of the code segment
+/// selector slot (x86 `cs`). aarch64 has no per-frame CS — return 0.
+pub const ctx_cs_offset: usize = switch (builtin.cpu.arch) {
+    .x86_64 => @offsetOf(x64.cpu.Context, "cs"),
+    .aarch64 => 0,
+    else => unreachable,
+};
+
+/// Byte offset within the EC's saved-context buffer of the flags
+/// register slot (x86 `rflags`, aarch64 `spsr_el1`).
+pub const ctx_flags_offset: usize = switch (builtin.cpu.arch) {
+    .x86_64 => @offsetOf(x64.cpu.Context, "rflags"),
+    .aarch64 => @offsetOf(aarch64.interrupts.ArchCpuContext, "spsr_el1"),
+    else => unreachable,
+};
+
+/// Byte offset within the EC's saved-context buffer of the stack
+/// segment selector slot (x86 `ss`). aarch64 has no per-frame SS.
+pub const ctx_ss_offset: usize = switch (builtin.cpu.arch) {
+    .x86_64 => @offsetOf(x64.cpu.Context, "ss"),
+    .aarch64 => 0,
+    else => unreachable,
+};
+
 pub const PageFaultContext = switch (builtin.cpu.arch) {
     .x86_64 => x64.interrupts.PageFaultContext,
     .aarch64 => aarch64.interrupts.PageFaultContext,

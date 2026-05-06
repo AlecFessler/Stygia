@@ -99,16 +99,9 @@ var ring: [if (enabled) RING_LEN else 0]Record = if (enabled)
 else
     [_]Record{};
 
-/// `mark` reads `ec.ctx + rip_off / + rsp_off` if ec is non-null.
-/// Verified at comptime against the actual `cpu.Context` layout.
-const CtxLayout = struct {
-    const cpu = if (builtin.cpu.arch == .x86_64)
-        zag.arch.x64.cpu
-    else
-        zag.arch.aarch64.cpu;
-    const rip_off = @offsetOf(cpu.Context, "rip");
-    const rsp_off = @offsetOf(cpu.Context, "rsp");
-};
+/// `mark` reads the program counter and user stack pointer from
+/// `ec.ctx + ctx_pc_offset / + ctx_sp_offset`. Offsets resolve at
+/// comptime through `arch.dispatch.cpu` so this file stays arch-agnostic.
 
 inline fn rdtsc() u64 {
     if (builtin.cpu.arch == .x86_64) {
@@ -164,8 +157,8 @@ fn markImpl(
     var rsp: u64 = 0;
     if (ec) |ec_p| {
         const ctx_addr = @intFromPtr(ec_p.ctx);
-        const rip_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.rip_off);
-        const rsp_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.rsp_off);
+        const rip_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_pc_offset);
+        const rsp_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_sp_offset);
         rip = @atomicLoad(u64, rip_p, .monotonic);
         rsp = @atomicLoad(u64, rsp_p, .monotonic);
     }

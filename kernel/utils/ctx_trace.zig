@@ -124,29 +124,14 @@ var rings_storage: [if (enabled) MAX_ECS else 0]Ring = if (enabled)
 else
     [_]Ring{};
 
-/// `mark` reads `ec.ctx + 144 / + 152 / + 160 / + 168` for the iret
-/// frame — those offsets must match `cpu.Context`'s field layout.
-/// Verified at comptime against the actual struct.
-const CtxLayout = struct {
-    const cpu = if (builtin.cpu.arch == .x86_64)
-        zag.arch.x64.cpu
-    else
-        zag.arch.aarch64.cpu;
-    const rip_off = @offsetOf(cpu.Context, "rip");
-    const cs_off = @offsetOf(cpu.Context, "cs");
-    const rflags_off = @offsetOf(cpu.Context, "rflags");
-    const rsp_off = @offsetOf(cpu.Context, "rsp");
-    const ss_off = if (builtin.cpu.arch == .x86_64)
-        @offsetOf(cpu.Context, "ss")
-    else
-        // aarch64 has no SS slot; reuse pstate or just zero. We
-        // gate this on x86_64 in practice (the bug is x86 only).
-        rsp_off;
-};
+// `mark` reads `ec.ctx + ctx_pc_offset / cs / flags / sp / ss` for the
+// iret frame. Offsets resolve at comptime through `arch.dispatch.cpu`
+// so this file stays arch-agnostic. aarch64 has no per-frame
+// CS/SS slots; the dispatch returns 0 there.
 
 comptime {
     if (enabled and builtin.cpu.arch == .x86_64) {
-        // cpu.Context layout (kernel/arch/x64/cpu.zig):
+        // x86 cpu.Context layout (kernel/arch/x64/cpu.zig):
         //   regs:     [0..120)   — 15 GPRs × 8 B
         //   int_num:  [120..128)
         //   err_code: [128..136)
@@ -155,11 +140,11 @@ comptime {
         //   rflags:   [152..160)
         //   rsp:      [160..168)
         //   ss:       [168..176)
-        std.debug.assert(CtxLayout.rip_off == 136);
-        std.debug.assert(CtxLayout.cs_off == 144);
-        std.debug.assert(CtxLayout.rflags_off == 152);
-        std.debug.assert(CtxLayout.rsp_off == 160);
-        std.debug.assert(CtxLayout.ss_off == 168);
+        std.debug.assert(arch.cpu.ctx_pc_offset == 136);
+        std.debug.assert(arch.cpu.ctx_cs_offset == 144);
+        std.debug.assert(arch.cpu.ctx_flags_offset == 152);
+        std.debug.assert(arch.cpu.ctx_sp_offset == 160);
+        std.debug.assert(arch.cpu.ctx_ss_offset == 168);
     }
 }
 
@@ -207,10 +192,10 @@ fn markImpl(ec: *ExecutionContext, event: Event) void {
     const slot = &ring.slots[seq & (RING_LEN - 1)];
 
     const ctx_addr = @intFromPtr(ec.ctx);
-    const rip_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.rip_off);
-    const cs_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.cs_off);
-    const rsp_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.rsp_off);
-    const ss_p: *const u64 = @ptrFromInt(ctx_addr + CtxLayout.ss_off);
+    const rip_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_pc_offset);
+    const cs_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_cs_offset);
+    const rsp_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_sp_offset);
+    const ss_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_ss_offset);
 
     slot.tsc = rdtsc();
     slot.ctx_rip = @atomicLoad(u64, rip_p, .monotonic);
