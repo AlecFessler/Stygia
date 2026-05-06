@@ -24,3 +24,4 @@ tests/prof/current/
 .zig-cache/
 **/zig-out/
 zig-out/
+desktopOS/libc_smoke/libc_smoke
