@@ -40,6 +40,9 @@ const SERIAL_SCRATCH_BYTES: u64 = 4096;
 // FS protocol (mirrors desktopOS/protocols/fs_ops.zig).
 const FS_OP_LOOKUP: u64 = 1;
 const FS_OP_PREAD: u64 = 3;
+const FS_OP_PWRITE: u64 = 4;
+const FS_OP_CREATE_FILE: u64 = 6;
+const FS_OP_UNLINK: u64 = 7;
 const FS_SCRATCH_PAGES: u64 = 16;
 const FS_SCRATCH_BYTES: u64 = FS_SCRATCH_PAGES * 4096;
 
@@ -328,6 +331,67 @@ fn fsPread(
     };
 }
 
+const FsCreateResult = struct { status: u64, inode: u64 };
+
+fn fsCreateFile(port: u12, scratch_va: u64, path: []const u8, mode: u64) FsCreateResult {
+    const buf: [*]u8 = @ptrFromInt(scratch_va);
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) buf[i] = path[i];
+    const r = issueRaw(buildWord(SYS_SUSPEND, 0), .{
+        .v1 = @as(u64, SLOT_INITIAL_EC),
+        .v2 = @as(u64, port),
+        .v3 = FS_OP_CREATE_FILE,
+        .v4 = path.len,
+        .v5 = mode,
+    });
+    return .{ .status = r.v1, .inode = r.v2 };
+}
+
+const FsWriteResult = struct { status: u64, bytes_written: u64, new_size: u64 };
+
+fn fsPwrite(
+    port: u12,
+    scratch_va: u64,
+    path: []const u8,
+    offset: u64,
+    data: []const u8,
+) FsWriteResult {
+    const buf: [*]u8 = @ptrFromInt(scratch_va);
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) buf[i] = path[i];
+    // data at scratch[path_len..path_len+data_len]
+    const data_off = path.len;
+    var j: usize = 0;
+    while (j < data.len) : (j += 1) buf[data_off + j] = data[j];
+    const r = issueRaw(buildWord(SYS_SUSPEND, 0), .{
+        .v1 = @as(u64, SLOT_INITIAL_EC),
+        .v2 = @as(u64, port),
+        .v3 = FS_OP_PWRITE,
+        .v4 = path.len,
+        .v5 = offset,
+        .v6 = data_off,
+        .v7 = data.len,
+    });
+    return .{
+        .status = r.v1,
+        .bytes_written = r.v2,
+        .new_size = r.v3,
+    };
+}
+
+fn fsUnlink(port: u12, scratch_va: u64, path: []const u8) u64 {
+    const buf: [*]u8 = @ptrFromInt(scratch_va);
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) buf[i] = path[i];
+    const r = issueRaw(buildWord(SYS_SUSPEND, 0), .{
+        .v1 = @as(u64, SLOT_INITIAL_EC),
+        .v2 = @as(u64, port),
+        .v3 = FS_OP_UNLINK,
+        .v4 = path.len,
+    });
+    return r.v1;
+}
+
 fn zagExit() noreturn {
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
@@ -589,5 +653,112 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         zagExit();
     }
     serialPrint(inv.serial_port, serial_va, "[zig_hello] heap test passed\n");
+
+    // ── Phase 3: file write round-trip. Create a fresh file, write a
+    //    known string, read it back, verify it matches, unlink.
+    //
+    // io_scratch is shared with verify_fs's harness; our 3-op sequence
+    // (create_file, pwrite, pread, unlink) is racey with verify_fs's
+    // concurrent writes. Yield enough times for verify_fs to retire all
+    // 10 phases before we touch the scratch. ~50000 yields is overkill
+    // but cheap; verify_fs typically finishes in <10ms.
+    const SYS_YIELD: u12 = 25;
+    var yield_n: u64 = 0;
+    while (yield_n < 50000) : (yield_n += 1) {
+        _ = issueRaw(buildWord(SYS_YIELD, 0), .{});
+    }
+    debugPrint("[zig_hello] phase 3: file write test\n");
+    const test_path = "/zh_phase3";
+    const cr = fsCreateFile(inv.fs_port, fs_va, test_path, 0o644);
+    if (cr.status != 0) {
+        var st_buf: [32]u8 = undefined;
+        const st_str = formatU64(&st_buf, cr.status);
+        var msg: [96]u8 = undefined;
+        const lead3 = "[zig_hello] create_file status=";
+        var w3: usize = 0;
+        for (lead3) |b| {
+            msg[w3] = b;
+            w3 += 1;
+        }
+        for (st_str) |b| {
+            msg[w3] = b;
+            w3 += 1;
+        }
+        msg[w3] = '\n';
+        w3 += 1;
+        serialPrint(inv.serial_port, serial_va, msg[0..w3]);
+        zagExit();
+    }
+    debugPrint("[zig_hello] phase 3: created\n");
+
+    const content = "Hello from Zag userspace!";
+    const wr = fsPwrite(inv.fs_port, fs_va, test_path, 0, content);
+    if (wr.status != 0 or wr.bytes_written != content.len) {
+        var sb1: [32]u8 = undefined;
+        var sb2: [32]u8 = undefined;
+        const ss1 = formatU64(&sb1, wr.status);
+        const ss2 = formatU64(&sb2, wr.bytes_written);
+        var msgw: [128]u8 = undefined;
+        const lw = "[zig_hello] phase 3 pwrite status=";
+        var ww: usize = 0;
+        for (lw) |b| {
+            msgw[ww] = b;
+            ww += 1;
+        }
+        for (ss1) |b| {
+            msgw[ww] = b;
+            ww += 1;
+        }
+        const lwb = " bytes=";
+        for (lwb) |b| {
+            msgw[ww] = b;
+            ww += 1;
+        }
+        for (ss2) |b| {
+            msgw[ww] = b;
+            ww += 1;
+        }
+        msgw[ww] = '\n';
+        ww += 1;
+        serialPrint(inv.serial_port, serial_va, msgw[0..ww]);
+        zagExit();
+    }
+    debugPrint("[zig_hello] phase 3: pwrite ok\n");
+
+    // Read back to verify
+    const rb = fsPread(inv.fs_port, fs_va, test_path, 0, 64);
+    if (rb.status != 0) {
+        serialPrint(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] phase 3: pread back failed\n",
+        );
+        zagExit();
+    }
+    var p3_line: [128]u8 = undefined;
+    var p3_w: usize = 0;
+    const p3_lead = "[zig_hello] phase 3 read = ";
+    for (p3_lead) |b| {
+        p3_line[p3_w] = b;
+        p3_w += 1;
+    }
+    const data_back: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
+    var n3: u64 = 0;
+    while (n3 < rb.bytes_read and p3_w < p3_line.len - 1) : (n3 += 1) {
+        p3_line[p3_w] = data_back[n3];
+        p3_w += 1;
+    }
+    p3_line[p3_w] = '\n';
+    p3_w += 1;
+    serialPrint(inv.serial_port, serial_va, p3_line[0..p3_w]);
+
+    // Cleanup so the next boot starts clean.
+    const ul_status = fsUnlink(inv.fs_port, fs_va, test_path);
+    if (ul_status == 0) {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlinked, test passed\n");
+    } else {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlink failed\n");
+    }
+
     zagExit();
 }
