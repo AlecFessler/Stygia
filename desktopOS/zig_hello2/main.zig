@@ -192,6 +192,19 @@ var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
 var op_value: u64 = 0xCAFEBABE_05E1EC70;
 var step_value: u64 = 0xCAFEBABE_57E90001;
 
+// Source-defined u64 array — first variable-length structured data.
+// values_len = how many slots zig_compiler patched; values_arr =
+// fixed [4]u64 with each slot pre-seeded with a unique sentinel
+// (low byte = slot index) so the compiler can byte-search-and-patch
+// each slot independently.
+var values_len: u64 = 0xCAFEBABE_A8B70042;
+var values_arr: [4]u64 = .{
+    0xCAFEBABE_A8B70000,
+    0xCAFEBABE_A8B70001,
+    0xCAFEBABE_A8B70002,
+    0xCAFEBABE_A8B70003,
+};
+
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
         buf[0] = '0';
@@ -273,8 +286,52 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         i += 1;
     }
 
+    // Source-defined array: load length via volatile, cap to physical
+    // slot count, then print each element via volatile pointer so the
+    // compiler can't fold the static initializer.
+    const len_ptr: *volatile u64 = &values_len;
+    const v_values_len = len_ptr.*;
+    const arr_cap: u64 = if (v_values_len > values_arr.len) values_arr.len else v_values_len;
+    printLine("[runtime] array len=", v_values_len);
+    var k: u64 = 0;
+    while (k < arr_cap) {
+        const elem_ptr: *volatile u64 = &values_arr[k];
+        printArrayLine(k, elem_ptr.*);
+        k += 1;
+    }
+
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
+}
+
+fn printArrayLine(idx: u64, val: u64) void {
+    var ib: [32]u8 = undefined;
+    const is = formatU64(&ib, idx);
+    var vb: [32]u8 = undefined;
+    const vs = formatU64(&vb, val);
+    var line: [80]u8 = undefined;
+    var w: usize = 0;
+    const prefix = "[runtime] values[";
+    for (prefix) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (is) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    const mid = "]=";
+    for (mid) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (vs) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    line[w] = '\n';
+    w += 1;
+    print(line[0..w]);
 }
 
 fn printIterLine(iter: u64, result: u64) void {

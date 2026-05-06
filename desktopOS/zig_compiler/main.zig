@@ -396,6 +396,10 @@ var op_int: u64 = 0;
 var op_found: bool = false;
 var step_int: u64 = 0;
 var step_found: bool = false;
+// Source u64 array (after the 5 scalar consts). Up to 4 entries.
+const VALUES_MAX: usize = 4;
+var values_buf: [VALUES_MAX]u64 = .{ 0, 0, 0, 0 };
+var values_count: usize = 0;
 
 // Extract up to two quoted-string literals from `src[0..src_len]` and
 // the first decimal integer that appears after the second quoted
@@ -434,7 +438,10 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             break;
         }
     }
-    // Scan for the first four decimal ints after the second quoted string.
+    // Scan for decimal int literals after the second quoted string.
+    // Skips digits that are part of an identifier (e.g. "u64" type
+    // suffix) by requiring the preceding char to NOT be alphanumeric
+    // or underscore.
     if (after_second) |start| {
         var j: usize = start;
         var ints_found: u8 = 0;
@@ -443,6 +450,23 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             if (c < '0' or c > '9') {
                 j += 1;
                 continue;
+            }
+            // Reject digits that follow an identifier char — those
+            // are part of "u64", "i32", "x123" etc. rather than int literals.
+            if (j > 0) {
+                const prev = src[j - 1];
+                const is_ident_char = (prev >= 'a' and prev <= 'z') or
+                    (prev >= 'A' and prev <= 'Z') or
+                    (prev >= '0' and prev <= '9') or
+                    prev == '_';
+                if (is_ident_char) {
+                    // Skip the rest of this identifier-attached digit run.
+                    while (j < src_len) : (j += 1) {
+                        const d = src[j];
+                        if (d < '0' or d > '9') break;
+                    }
+                    continue;
+                }
             }
             var v: u64 = 0;
             while (j < src_len) : (j += 1) {
@@ -466,9 +490,14 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 op_int = v;
                 op_found = true;
                 ints_found = 4;
-            } else {
+            } else if (ints_found == 4) {
                 step_int = v;
                 step_found = true;
+                ints_found = 5;
+            } else if (values_count < VALUES_MAX) {
+                values_buf[values_count] = v;
+                values_count += 1;
+            } else {
                 break;
             }
         }
@@ -483,6 +512,16 @@ const MULT_SENTINEL: u64 = 0xCAFEBABE_FACE0001;
 const REPEAT_SENTINEL: u64 = 0xCAFEBABE_C0FFEE01;
 const OP_SENTINEL: u64 = 0xCAFEBABE_05E1EC70;
 const STEP_SENTINEL: u64 = 0xCAFEBABE_57E90001;
+
+// Per-element sentinels for the source-defined u64 array (must
+// match zig_hello2/main.zig values_arr initializers exactly).
+const VALUES_LEN_SENTINEL: u64 = 0xCAFEBABE_A8B70042;
+const VALUES_ELEM_SENTINELS = [_]u64{
+    0xCAFEBABE_A8B70000,
+    0xCAFEBABE_A8B70001,
+    0xCAFEBABE_A8B70002,
+    0xCAFEBABE_A8B70003,
+};
 
 fn patchU64Sentinel(buf: []u8, sentinel: u64, value: u64) usize {
     var hits: usize = 0;
@@ -628,6 +667,13 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (step_found) {
         printNum("[zig_compiler] extracted step=", step_int);
     }
+    if (values_count > 0) {
+        printNum("[zig_compiler] extracted values count=", values_count);
+        var vi: usize = 0;
+        while (vi < values_count) : (vi += 1) {
+            printNum("[zig_compiler]   values[i]=", values_buf[vi]);
+        }
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -681,6 +727,19 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched step sentinel hits=", h);
     } else {
         print("[zig_compiler] no fifth int (step) in source\n");
+    }
+    // Always patch the array length (even if 0) so the spawned binary
+    // doesn't iterate against the raw sentinel.
+    {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], VALUES_LEN_SENTINEL, values_count);
+        printNum("[zig_compiler] patched values_len hits=", h);
+    }
+    {
+        var vi: usize = 0;
+        while (vi < values_count and vi < VALUES_ELEM_SENTINELS.len) : (vi += 1) {
+            const h = patchU64Sentinel(elf_buf[0..out.bytes_read], VALUES_ELEM_SENTINELS[vi], values_buf[vi]);
+            printNum("[zig_compiler]   patched values_arr slot hits=", h);
+        }
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).

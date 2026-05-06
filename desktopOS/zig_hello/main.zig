@@ -887,10 +887,11 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     //      repeat → third decimal int after the second string
     //      op     → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
     //      step   → fifth decimal int — added to result per iteration
+    //      values → remaining decimal ints (up to 4) become a u64 array
     //    Output banner: "[<tag>] <banner> seed=<n>".
     //    Spawned binary BRANCHES on op_value to compute base, then
-    //    loops `repeat` times printing "[runtime] iter=N result=base+N*step"
-    //    so each iteration prints a UNIQUE value driven by source.
+    //    loops `repeat` times printing "[runtime] iter=N result=base+N*step",
+    //    then prints "[runtime] values[i]=v" for each source array slot.
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
@@ -898,7 +899,8 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "pub const mult = 9;\n" ++
         "pub const repeat = 4;\n" ++
         "pub const op = 1;\n" ++
-        "pub const step = 7;\n";
+        "pub const step = 7;\n" ++
+        "pub const values = [_]u64{ 100, 200, 300 };\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
     if (cs.status != 0) {
