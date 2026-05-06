@@ -33,6 +33,7 @@ const HandleId = caps.HandleId;
 const PAGE_4K: u64 = 4096;
 const BLOCKDEV_SCRATCH_PAGES: u64 = 1;
 const IO_SCRATCH_PAGES: u64 = 16; // fs_ops.SCRATCH_PAGES; kept literal to avoid module dep.
+const SERIAL_SCRATCH_PAGES: u64 = 1; // serial.SCRATCH_PAGES; kept literal.
 const MAX_PASSED: usize = 32;
 
 pub fn main(cap_table_base: u64) void {
@@ -73,6 +74,7 @@ pub fn main(cap_table_base: u64) void {
     const blockdev_port = createPort(port_full) orelse powerShutdown();
     const fs_port = createPort(port_full) orelse powerShutdown();
     const usb_port = createPort(port_full) orelse powerShutdown();
+    const serial_port = createPort(port_full) orelse powerShutdown();
 
     // Shared page_frames.
     const blockdev_scratch = createPf(BLOCKDEV_SCRATCH_PAGES) orelse {
@@ -83,12 +85,18 @@ pub fn main(cap_table_base: u64) void {
         log.print("[desktopOS] FATAL: io_scratch alloc failed\n");
         powerShutdown();
     };
+    const serial_scratch = createPf(SERIAL_SCRATCH_PAGES) orelse {
+        log.print("[desktopOS] FATAL: serial_scratch alloc failed\n");
+        powerShutdown();
+    };
 
     // Stage child ELFs.
     const nvme_driver_pf = stageElfPageFrame(services.nvme_driver_elf) orelse powerShutdown();
     const usb_driver_pf = stageElfPageFrame(services.usb_driver_elf) orelse powerShutdown();
+    const serial_server_pf = stageElfPageFrame(services.serial_server_elf) orelse powerShutdown();
     const fs_pf = stageElfPageFrame(services.fs_elf) orelse powerShutdown();
     const verify_pf = stageElfPageFrame(services.verify_fs_elf) orelse powerShutdown();
+    const zig_hello_pf = stageElfPageFrame(services.zig_hello_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -96,6 +104,18 @@ pub fn main(cap_table_base: u64) void {
     log.print("[desktopOS] forwarding ");
     log.dec(mmio_count);
     log.print(" MMIO device_region(s) to nvme_driver\n");
+
+    // ── Spawn serial_server ─────────────────────────────────────────
+    // Spawn first so it's listening on serial_port before any client
+    // tries to print over IPC.
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{}); // COM1 (port_io; caps unused)
+        appendPort(&passed, &n, serial_port, .{ .recv = true, .bind = true });
+        appendPf(&passed, &n, serial_scratch, .{ .r = true, .w = true });
+        _ = spawnService("serial_server", serial_server_pf, passed[0..n]) orelse powerShutdown();
+    }
 
     // ── Spawn nvme_driver ───────────────────────────────────────────
     {
@@ -144,6 +164,19 @@ pub fn main(cap_table_base: u64) void {
             appendDevice(&passed, &n, mmio_devs[i], .{ .dma = true, .irq = true });
         }
         _ = spawnService("usb_driver", usb_driver_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn zig_hello ─────────────────────────────────────────────
+    // Phase-0 demo: prints "[zig_hello] hello from zig on zag" via
+    // serial_server IPC. Carries COM1 as a debug fallback while
+    // bringing the IPC path up.
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendPort(&passed, &n, serial_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, serial_scratch, .{ .r = true, .w = true });
+        appendDevice(&passed, &n, com1, .{});
+        _ = spawnService("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────

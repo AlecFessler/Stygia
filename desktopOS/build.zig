@@ -91,6 +91,24 @@ pub fn build(b: *std.Build) void {
     fs_client_mod.addImport("lib", lib_mod);
     fs_client_mod.addImport("fs_ops", fs_ops_mod);
 
+    const serial_mod = b.createModule(.{
+        .root_source_file = b.path("protocols/serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+
+    const serial_client_mod = b.createModule(.{
+        .root_source_file = b.path("serial_client/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    serial_client_mod.addImport("lib", lib_mod);
+    serial_client_mod.addImport("serial", serial_mod);
+
     const start_src: std.Build.LazyPath = b.path("start.zig");
 
     // Helper wrapper closure isn't possible in build.zig at top level,
@@ -129,6 +147,80 @@ pub fn build(b: *std.Build) void {
 
     const nvme_install = b.addInstallFile(nvme_exe.getEmittedBin(), "../bin/nvme_driver.elf");
     b.getInstallStep().dependOn(&nvme_install.step);
+
+    // ── serial_server.elf ───────────────────────────────────────────
+    const serial_app_mod = b.createModule(.{
+        .root_source_file = b.path("serial_server/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    serial_app_mod.addImport("lib", lib_mod);
+    serial_app_mod.addImport("log", log_mod);
+    serial_app_mod.addImport("serial", serial_mod);
+
+    const serial_start_mod = b.createModule(.{
+        .root_source_file = start_src,
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    serial_start_mod.addImport("lib", lib_mod);
+    serial_start_mod.addImport("app", serial_app_mod);
+
+    const serial_exe = b.addExecutable(.{
+        .name = "serial_server",
+        .root_module = serial_start_mod,
+        .linkage = .static,
+    });
+    serial_exe.pie = true;
+    serial_exe.entry = .{ .symbol_name = "_start" };
+    serial_exe.root_module.strip = false;
+
+    const serial_install = b.addInstallFile(serial_exe.getEmittedBin(), "../bin/serial_server.elf");
+    b.getInstallStep().dependOn(&serial_install.step);
+
+    // ── zig_hello.elf — built by the patched no-LLVM Zig compiler ───
+    //
+    // Phase-0 demo: a Zig program targeting `x86_64-zag-none` (the .zag
+    // Os.Tag we added to the patched stdlib at
+    // ~/.local/zag-toolchains/zig-0.15.2-src). The patched compiler is
+    // invoked as a subprocess; addPrefixedOutputFileArg captures the
+    // emitted binary as a build-graph LazyPath we can embed below.
+    const zag_zig = b.option(
+        []const u8,
+        "zag-zig",
+        "Patched zig compiler with .zag target (default: ~/.local/zag-toolchains/zig-0.15.2-src/zig-out/bin/zig)",
+    ) orelse "/home/alec/.local/zag-toolchains/zig-0.15.2-src/zig-out/bin/zig";
+    const zag_zig_lib = b.option(
+        []const u8,
+        "zag-zig-lib",
+        "Path to the patched zig std lib (default: ~/.local/zag-toolchains/zig-0.15.2-src/lib)",
+    ) orelse "/home/alec/.local/zag-toolchains/zig-0.15.2-src/lib";
+
+    const hello_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    hello_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    hello_run.addArgs(&.{
+        "-target",         "x86_64-zag-none",
+        "-fno-llvm",       "-fno-lld",
+        "-fsingle-threaded",
+        "-fstrip",         "-OReleaseSmall",
+        "-fPIC",           "-fPIE",
+        // CRITICAL: the spec-v3 syscall ABI uses %rbp as the register
+        // backing vreg 4 (see libz/syscall_x64.zig). Without
+        // -fomit-frame-pointer the patched no-LLVM backend keeps %rbp
+        // as a frame pointer; the asm volatile clobbers it across
+        // the `syscall` instruction; the function epilogue then does
+        // `lea -0x28(%rbp), %rsp` and dereferences a garbage stack
+        // pointer (we hit 0xffff…fd8 in practice). All existing
+        // desktopOS services pass `omit_frame_pointer=true` for the
+        // same reason.
+        "-fomit-frame-pointer",
+    });
+    hello_run.addFileArg(b.path("zig_hello/main.zig"));
+    const hello_elf = hello_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello.elf");
 
     // ── usb_driver.elf ──────────────────────────────────────────────
     const usb_app_mod = b.createModule(.{
@@ -462,18 +554,22 @@ pub fn build(b: *std.Build) void {
     const services_wf = b.addWriteFiles();
     _ = services_wf.addCopyFile(nvme_exe.getEmittedBin(), "nvme_driver.elf");
     _ = services_wf.addCopyFile(usb_exe.getEmittedBin(), "usb_driver.elf");
+    _ = services_wf.addCopyFile(serial_exe.getEmittedBin(), "serial_server.elf");
     _ = services_wf.addCopyFile(blkdev_exe.getEmittedBin(), "block_device.elf");
     _ = services_wf.addCopyFile(fs_exe.getEmittedBin(), "fs.elf");
     _ = services_wf.addCopyFile(verify_exe.getEmittedBin(), "verify_fs.elf");
     _ = services_wf.addCopyFile(doom_exe.getEmittedBin(), "doom.elf");
+    _ = services_wf.addCopyFile(hello_elf, "zig_hello.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
         \\pub const usb_driver_elf = @embedFile("usb_driver.elf");
+        \\pub const serial_server_elf = @embedFile("serial_server.elf");
         \\pub const block_device_elf = @embedFile("block_device.elf");
         \\pub const fs_elf = @embedFile("fs.elf");
         \\pub const verify_fs_elf = @embedFile("verify_fs.elf");
         \\pub const doom_elf = @embedFile("doom.elf");
+        \\pub const zig_hello_elf = @embedFile("zig_hello.elf");
         \\
     );
     const services_mod = b.createModule(.{
