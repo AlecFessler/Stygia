@@ -126,6 +126,18 @@ pub fn halt() noreturn {
     }
 }
 
+/// Swap rsp/sp to `park_top`, unmask IRQs, halt until any IRQ wakes us,
+/// then jmp to `scheduler_run_after_park` exported by `sched.scheduler`.
+/// noreturn because the original caller's stack frame is abandoned by
+/// the rsp swap.
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.parkAndAwaitIRQ(park_top),
+        .aarch64 => aarch64.cpu.parkAndAwaitIRQ(park_top),
+        else => unreachable,
+    }
+}
+
 /// Send a kprof-dump IPI to every core except the caller. Invoked by
 /// the dumping core inside `kprof.dump.end()` to quiesce every other
 /// CPU before serial-dumping. Per-arch backend resolves the IPI vector

@@ -600,3 +600,14 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     _ = core_id;
     _ = park_top;
 }
+
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    _ = park_top;
+    asm volatile (
+        \\msr daifclr, #2
+        \\wfi
+        \\msr daifset, #2
+        \\b scheduler_run_after_park
+        ::: .{ .memory = true });
+    unreachable;
+}

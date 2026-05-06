@@ -913,3 +913,16 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     sc.current_kernel_table = 0;
     gdt.coreTss(core_id).rsp0 = park_top;
 }
+
+pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\sti
+        \\hlt
+        \\cli
+        \\jmp scheduler_run_after_park
+        :
+        : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
+}
