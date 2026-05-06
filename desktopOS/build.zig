@@ -73,6 +73,14 @@ pub fn build(b: *std.Build) void {
         .omit_frame_pointer = true,
     });
 
+    const usb_input_mod = b.createModule(.{
+        .root_source_file = b.path("protocols/usb_input.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+
     const fs_client_mod = b.createModule(.{
         .root_source_file = b.path("fs_client/lib.zig"),
         .target = target,
@@ -121,6 +129,40 @@ pub fn build(b: *std.Build) void {
 
     const nvme_install = b.addInstallFile(nvme_exe.getEmittedBin(), "../bin/nvme_driver.elf");
     b.getInstallStep().dependOn(&nvme_install.step);
+
+    // ── usb_driver.elf ──────────────────────────────────────────────
+    const usb_app_mod = b.createModule(.{
+        .root_source_file = b.path("usb_driver/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    usb_app_mod.addImport("lib", lib_mod);
+    usb_app_mod.addImport("log", log_mod);
+    usb_app_mod.addImport("usb_input", usb_input_mod);
+
+    const usb_start_mod = b.createModule(.{
+        .root_source_file = start_src,
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .omit_frame_pointer = true,
+    });
+    usb_start_mod.addImport("lib", lib_mod);
+    usb_start_mod.addImport("app", usb_app_mod);
+
+    const usb_exe = b.addExecutable(.{
+        .name = "usb_driver",
+        .root_module = usb_start_mod,
+        .linkage = .static,
+    });
+    usb_exe.pie = true;
+    usb_exe.entry = .{ .symbol_name = "_start" };
+    usb_exe.root_module.strip = false;
+
+    const usb_install = b.addInstallFile(usb_exe.getEmittedBin(), "../bin/usb_driver.elf");
+    b.getInstallStep().dependOn(&usb_install.step);
 
     // ── block_device.elf ────────────────────────────────────────────
     const blkdev_app_mod = b.createModule(.{
@@ -302,12 +344,14 @@ pub fn build(b: *std.Build) void {
     // ── Embedded services for root_service ──────────────────────────
     const services_wf = b.addWriteFiles();
     _ = services_wf.addCopyFile(nvme_exe.getEmittedBin(), "nvme_driver.elf");
+    _ = services_wf.addCopyFile(usb_exe.getEmittedBin(), "usb_driver.elf");
     _ = services_wf.addCopyFile(blkdev_exe.getEmittedBin(), "block_device.elf");
     _ = services_wf.addCopyFile(fs_exe.getEmittedBin(), "fs.elf");
     _ = services_wf.addCopyFile(verify_exe.getEmittedBin(), "verify_fs.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
+        \\pub const usb_driver_elf = @embedFile("usb_driver.elf");
         \\pub const block_device_elf = @embedFile("block_device.elf");
         \\pub const fs_elf = @embedFile("fs.elf");
         \\pub const verify_fs_elf = @embedFile("verify_fs.elf");

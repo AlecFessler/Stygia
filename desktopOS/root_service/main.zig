@@ -8,13 +8,16 @@
 //   4. Allocate two page_frames — `blockdev_scratch` (1 page; shared
 //      between fs and nvme_driver) and `io_scratch` (fs_ops.SCRATCH_PAGES;
 //      shared between fs and FS clients).
-//   5. Stage nvme_driver.elf, fs.elf, verify_fs.elf into page_frames.
+//   5. Stage nvme_driver.elf, usb_driver.elf, fs.elf, verify_fs.elf
+//      into page_frames.
 //   6. Spawn nvme_driver with [COM1, blockdev_port (recv|bind),
 //        blockdev_scratch (r+w), <each MMIO device_region>].
 //   7. Spawn fs with [COM1, blockdev_port (xfer|bind), blockdev_scratch (r+w),
 //        fs_port (recv|bind), io_scratch (r+w)].
 //   8. Spawn verify_fs with [COM1, fs_port (xfer|bind), io_scratch (r+w)].
-//   9. Park.
+//   9. Spawn usb_driver with [COM1, usb_port (recv|bind),
+//        <each MMIO device_region>].
+//  10. Park.
 
 const lib = @import("lib");
 const log = @import("log");
@@ -69,6 +72,7 @@ pub fn main(cap_table_base: u64) void {
     };
     const blockdev_port = createPort(port_full) orelse powerShutdown();
     const fs_port = createPort(port_full) orelse powerShutdown();
+    const usb_port = createPort(port_full) orelse powerShutdown();
 
     // Shared page_frames.
     const blockdev_scratch = createPf(BLOCKDEV_SCRATCH_PAGES) orelse {
@@ -82,6 +86,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Stage child ELFs.
     const nvme_driver_pf = stageElfPageFrame(services.nvme_driver_elf) orelse powerShutdown();
+    const usb_driver_pf = stageElfPageFrame(services.usb_driver_elf) orelse powerShutdown();
     const fs_pf = stageElfPageFrame(services.fs_elf) orelse powerShutdown();
     const verify_pf = stageElfPageFrame(services.verify_fs_elf) orelse powerShutdown();
 
@@ -126,6 +131,19 @@ pub fn main(cap_table_base: u64) void {
         appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
         appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
         _ = spawnService("verify_fs", verify_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn usb_driver ────────────────────────────────────────────
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendDevice(&passed, &n, com1, .{});
+        appendPort(&passed, &n, usb_port, .{ .recv = true, .bind = true });
+        var i: usize = 0;
+        while (i < mmio_count) : (i += 1) {
+            appendDevice(&passed, &n, mmio_devs[i], .{ .dma = true, .irq = true });
+        }
+        _ = spawnService("usb_driver", usb_driver_pf, passed[0..n]) orelse powerShutdown();
     }
 
     log.print("[desktopOS] services spawned; root parking\n");
