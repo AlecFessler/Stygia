@@ -14,6 +14,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const ec_log = zag.utils.ec_log;
+const execution_context = zag.sched.execution_context;
 const kprof = zag.kprof.trace_id;
 const port_mod = zag.sched.port;
 const stack_mod = zag.memory.stack;
@@ -384,6 +385,20 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         arch.cpu.parkPerCoreCaches(core, park_top);
     }
     clearCurrentEc(core);
+
+    // Drain any pending_zombie before returning — same rationale as
+    // parkAndAwaitIRQ. yieldTo's empty branch returns through
+    // dispatchInterrupt → iretq without going through `run()` /
+    // `parkAndAwaitIRQ`, so without this drain a peer-core terminate
+    // posting to this slot has no other reaper. takeOwnPendingZombie
+    // skips when standing on the zombie's kstack so a same-EC pending
+    // zombie is correctly deferred. Called from IRQ context (preempt
+    // path); finalize takes port + CD locks via lockIrqSave which is
+    // safe — both classes are already classified as IRQ-acquired by
+    // expireTimedRecvWaiters.
+    if (takeOwnPendingZombie()) |z| {
+        execution_context.finalizeDestroyMarkedDead(z);
+    }
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
@@ -428,6 +443,21 @@ fn parkAndAwaitIRQ() noreturn {
     const core: u8 = @truncate(arch.smp.coreID());
     const park_top = (&core_states[core]).park_stack.top.addr;
     if (park_top == 0) @panic("parkAndAwaitIRQ: park_stack not initialized");
+
+    // Drain pending_zombie before parking: a peer-core terminate posted
+    // a zombie to this core's slot expecting our next switchTo to reap.
+    // But if our run_queue is empty we never enter switchTo — we go
+    // straight from here to sti+hlt, leaving the zombie pinned forever.
+    // A second peer-core terminate against the same target then spins
+    // in postZombie waiting for us to drain, but we never will. With
+    // reply FP enabled this scenario fires on smp=4 batches that
+    // saturate the destroy machinery (terminate_05..08, yield_04, etc.).
+    // takeOwnPendingZombie skips when standing-on-zombie (still on the
+    // caller's kstack here, before the asm rsp swap), so a same-EC
+    // pending zombie is correctly deferred to the next iteration.
+    if (takeOwnPendingZombie()) |z| {
+        execution_context.finalizeDestroyMarkedDead(z);
+    }
 
     // Update per-core caches FIRST while still on the caller's stack.
     // After the rsp swap below, locals on this stack frame go
