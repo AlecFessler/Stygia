@@ -294,32 +294,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // The exit dispatch above may have rendezvoused with a parked
         // VMM receiver, putting it in this core's run queue. Pull it
         // (or anything else ready) and dispatch.
-        const next = dequeueOrIdle() orelse {
-            // Empty queue, no idle EC. Returning here unwinds to
-            // run() (→ parkAndAwaitIRQ updates caches) or to yieldTo
-            // (→ iretq back to the caller's user mode from the
-            // current kstack). In either case `current_ec` is null
-            // but the per-core caches (gs:0 kernel_rsp, TSS.RSP0,
-            // gs:32/40/48/56/176 EC-identity slots) still name the
-            // most-recently-dispatched EC's kstack. A peer-core
-            // terminate of that EC can free its kstack at any time
-            // after we drop the run-queue lock — the very next ring-3
-            // → ring-0 entry on this core (timer IRQ, syscall, fault)
-            // would push its iret frame onto freed memory, surfacing
-            // as a silent triple-fault inside iret-frame setup OR a
-            // re-entrant exception with `ctx` pointing into freed
-            // slab (the XXXXFFFFXXXXX signature). Mirror yieldTo's
-            // empty-queue cache park so any FUTURE entry uses this
-            // core's park kstack. We do NOT swap rsp here — we still
-            // need the current frame to return through the caller's
-            // dispatch tail; the caller (run() or yieldTo) is on a
-            // kstack that stays valid for the duration of its return.
-            const park_top = (&core_states[core]).park_stack.top.addr;
-            if (park_top != 0) {
-                arch.cpu.parkPerCoreCaches(core, park_top);
-            }
-            return;
-        };
+        const next = dequeueOrIdle() orelse return;
         current = next;
     }
 
@@ -359,30 +334,15 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         return;
     }
 
-    // Empty queue and no idle EC. Clear `current_ec` and re-point the
-    // per-core caches (gs:0 kernel_rsp, TSS.RSP0) at this core's park
-    // kstack BEFORE returning. Without this re-point, the caches still
-    // name the previously-dispatched EC's kstack — and a peer-core
-    // terminate of that EC can free its kstack at any time after we
-    // unlock. The next ring-3→ring-0 entry on THIS core (timer IRQ /
-    // syscall / fault) would then push its iret frame onto freed memory,
-    // surfacing as a silent triple-fault inside iret-frame setup OR
-    // re-entrant exception with `ctx` pointing into freed slab.
-    //
-    // We DO NOT swap rsp to the park kstack here — we still need the
-    // current frame to return through `dispatchInterrupt`'s EOI + iretq
-    // epilogue. The cache-only update is sufficient: rsp is preserved
-    // for the in-flight return, and any FUTURE entry uses the park
-    // kstack (or whatever EC subsequently dispatches on this core,
-    // which `setCurrentEc` re-points at).
-    //
-    // Halting *here* would leave the IRQ never EOI'd — any subsequent
-    // same-priority LAPIC tick would be blocked, wedging the scheduler
-    // tick on this core.
-    const park_top = (&core_states[core]).park_stack.top.addr;
-    if (park_top != 0) {
-        arch.cpu.parkPerCoreCaches(core, park_top);
-    }
+    // Empty queue and no idle EC. Clear `current_ec` and return to the
+    // caller — `dispatchInterrupt` then sends EOI and iretq's back to
+    // the interrupted context. If that context was a halted
+    // `scheduler.run`, control resumes past `hlt`, the loop iterates,
+    // and `run` itself enters the top-level idle (outside any IRQ
+    // handler) where halting won't strand the LAPIC's in-service
+    // bit. Halting *here* would leave the timer IRQ never EOI'd —
+    // any subsequent same-priority LAPIC tick would be blocked,
+    // wedging the scheduler tick on this core.
     clearCurrentEc(core);
 }
 
@@ -436,7 +396,16 @@ fn parkAndAwaitIRQ() noreturn {
     arch.cpu.parkPerCoreCaches(core, park_top);
     (&core_states[core]).current_ec = null;
 
-    arch.cpu.parkAndAwaitIRQ(park_top);
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\sti
+        \\hlt
+        \\cli
+        \\jmp scheduler_run_after_park
+        :
+        : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
 }
 
 /// Asm landing pad after `parkAndAwaitIRQ`'s wake: rsp is on the park

@@ -188,6 +188,7 @@ fn print(s: []const u8) void {
 // sentinel is unique enough to locate via byte-search in the ELF.
 var seed_value: u64 = 0xCAFEBABE_DEADBEEF;
 var mult_value: u64 = 0xCAFEBABE_FACE0001;
+var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
 
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
@@ -220,16 +221,60 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     // fold the sentinel initializers at compile time.
     const seed_ptr: *volatile u64 = &seed_value;
     const mult_ptr: *volatile u64 = &mult_value;
+    const repeat_ptr: *volatile u64 = &repeat_value;
     const v_seed = seed_ptr.*;
     const v_mult = mult_ptr.*;
+    const v_repeat = repeat_ptr.*;
     const product: u64 = v_seed *% v_mult;
 
     printLine("[runtime] seed=", v_seed);
     printLine("[runtime] mult=", v_mult);
-    printLine("[runtime] seed * mult = ", product);
+    printLine("[runtime] repeat=", v_repeat);
+
+    // Source-driven control flow: loop iteration count comes from a
+    // source-file constant that flows through the compiler into a
+    // patched .data sentinel and out through a volatile load. Cap to
+    // 8 so an unpatched sentinel (Phase 4a/4d) caps at a reasonable
+    // value rather than spamming the serial log.
+    const cap: u64 = if (v_repeat > 8) 8 else v_repeat;
+    var i: u64 = 0;
+    while (i < cap) {
+        printIterLine(i, product);
+        i += 1;
+    }
 
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
+}
+
+fn printIterLine(iter: u64, product: u64) void {
+    var ib: [32]u8 = undefined;
+    const is = formatU64(&ib, iter);
+    var pb: [32]u8 = undefined;
+    const ps = formatU64(&pb, product);
+    var line: [80]u8 = undefined;
+    var w: usize = 0;
+    const prefix = "[runtime] iter=";
+    for (prefix) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (is) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    const mid = " product=";
+    for (mid) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (ps) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    line[w] = '\n';
+    w += 1;
+    print(line[0..w]);
 }
 
 fn printLine(prefix: []const u8, n: u64) void {

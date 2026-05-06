@@ -233,54 +233,14 @@ pub fn main(cap_table_base: u64) void {
         i += 1;
     }
 
-    // Compute summary stats in-userspace and print a compact line.
-    //
-    // Rationale: every byte written to COM1 goes through port-IO virtual_bar
-    // emulation in `pageFaultHandler` (the MMIO mapping has no PTE — every
-    // access faults; spec §[port_io_virtualization]). With kprof trace mode
-    // each fault emits ~5 records, so a per-sample print storm of 5000 ×
-    // ~30-byte lines = ~750K kprof records overflows the 16 MiB log buffer
-    // and triggers a premature `log_full` end-of-session dump well before
-    // the loop has a chance to retire all 5000 rounds inside the precommit
-    // 60s budget. parse_kprof.py only consumes `[KPROF]` records, so the
-    // per-sample diagnostic lines were never on the gating path; print min /
-    // median / p99 / max only and let the kprof scope deltas drive the
-    // regression check.
-    // Insertion sort in place on `samples` — O(N²) but N=5000 finishes in
-    // milliseconds even under kprof trace, and avoids a 40 KiB second copy
-    // on top of an already-tight 64 KiB user stack.
-    var ii: usize = 1;
-    while (ii < N_ROUNDS) {
-        const key = samples[ii];
-        var jj: usize = ii;
-        while (jj > 0 and samples[jj - 1] > key) {
-            samples[jj] = samples[jj - 1];
-            jj -= 1;
-        }
-        samples[jj] = key;
-        ii += 1;
+    var k: usize = 0;
+    while (k < N_ROUNDS) {
+        ser.print("[idc_pp] sample ");
+        ser.printU64(k);
+        ser.print(" ");
+        ser.printU64(samples[k]);
+        ser.print("\n");
+        k += 1;
     }
-    const p50 = samples[N_ROUNDS / 2];
-    const p99_idx: usize = (N_ROUNDS * 99) / 100;
-    const p99 = samples[p99_idx];
-    ser.print("[idc_pp] stats N=");
-    ser.printU64(N_ROUNDS);
-    ser.print(" min=");
-    ser.printU64(samples[0]);
-    ser.print(" p50=");
-    ser.printU64(p50);
-    ser.print(" p99=");
-    ser.printU64(p99);
-    ser.print(" max=");
-    ser.printU64(samples[N_ROUNDS - 1]);
-    ser.print("\n");
     ser.print("[idc_pp] done\n");
-
-    // Trigger kprof's stop-the-world serial dump explicitly. Without this
-    // the workload returns through `_start`, deletes the self handle, and
-    // the per-core idle loop spins until the precommit `timeout 60` kills
-    // qemu — by which time the kprof log is still resident in BSS and
-    // never reaches the host. `kprof_dump` IPIs every core to park, drains
-    // in-flight emits, dumps every CPU log in core-id order, then halts.
-    syscall.kprofDump();
 }

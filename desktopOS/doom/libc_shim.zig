@@ -763,10 +763,11 @@ fn formatVa(out: []u8, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) usize {
             's' => {
                 const sv: ?[*:0]const u8 = @cVaArg(ap_in, ?[*:0]const u8);
                 if (sv) |s| {
+                    // Cap the strlen scan: doom hands us pointers that are
+                    // sometimes garbage in non-spec format strings.
+                    const max_scan: usize = precision orelse PRINTF_BUF_BYTES;
                     var k: usize = 0;
-                    while (s[k] != 0) : (k += 1) {
-                        if (precision) |p| if (k >= p) break;
-                    }
+                    while (k < max_scan and s[k] != 0) : (k += 1) {}
                     idx = padCopy(out, idx, s[0..k], width, flag_left);
                 } else {
                     idx = padCopy(out, idx, "(null)", width, flag_left);
@@ -785,7 +786,7 @@ fn formatVa(out: []u8, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) usize {
                 else
                     @cVaArg(ap_in, i64);
                 tmp_used = formatInt(&tmp, v, 10, false, false, flag_plus, flag_space);
-                idx = padNumeric(out, idx, tmp[0..tmp_used], width, flag_left, flag_zero);
+                idx = padNumericPrec(out, idx, tmp[0..tmp_used], width, precision, flag_left, flag_zero, v < 0);
             },
             'u' => {
                 const v: u64 = if (len_long == 0)
@@ -795,7 +796,7 @@ fn formatVa(out: []u8, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) usize {
                 else
                     @cVaArg(ap_in, u64);
                 tmp_used = formatUint(&tmp, v, 10, false, false);
-                idx = padNumeric(out, idx, tmp[0..tmp_used], width, flag_left, flag_zero);
+                idx = padNumericPrec(out, idx, tmp[0..tmp_used], width, precision, flag_left, flag_zero, false);
             },
             'x' => {
                 const v: u64 = if (len_long == 0)
@@ -805,7 +806,7 @@ fn formatVa(out: []u8, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) usize {
                 else
                     @cVaArg(ap_in, u64);
                 tmp_used = formatUint(&tmp, v, 16, false, flag_alt);
-                idx = padNumeric(out, idx, tmp[0..tmp_used], width, flag_left, flag_zero);
+                idx = padNumericPrec(out, idx, tmp[0..tmp_used], width, precision, flag_left, flag_zero, false);
             },
             'X' => {
                 const v: u64 = if (len_long == 0)
@@ -815,7 +816,7 @@ fn formatVa(out: []u8, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) usize {
                 else
                     @cVaArg(ap_in, u64);
                 tmp_used = formatUint(&tmp, v, 16, true, flag_alt);
-                idx = padNumeric(out, idx, tmp[0..tmp_used], width, flag_left, flag_zero);
+                idx = padNumericPrec(out, idx, tmp[0..tmp_used], width, precision, flag_left, flag_zero, false);
             },
             'p' => {
                 const pv: ?*const anyopaque = @cVaArg(ap_in, ?*const anyopaque);
@@ -887,6 +888,89 @@ fn padNumeric(out: []u8, idx0: usize, src: []const u8, width: usize, left: bool,
         idx = appendBytes(out, idx, src);
         var i: usize = 0;
         while (i < pad_n and idx < out.len) : (i += 1) {
+            out[idx] = ' ';
+            idx += 1;
+        }
+    }
+    return idx;
+}
+
+// Numeric formatter that honours C's separate `precision` (minimum digit
+// count, zero-padded after any sign) and `width` (total field width).
+// `src` is `formatInt`/`formatUint`'s output, including any leading sign
+// from formatInt — we skip past that sign when zero-padding to precision
+// so "STCFN%.3d" / 33 → "STCFN033", not "STCFN0033".
+fn padNumericPrec(
+    out: []u8,
+    idx0: usize,
+    src: []const u8,
+    width: usize,
+    precision: ?usize,
+    left: bool,
+    zero: bool,
+    has_sign: bool,
+) usize {
+    var idx = idx0;
+    const sign_len: usize = if (has_sign and src.len > 0 and (src[0] == '-' or src[0] == '+' or src[0] == ' ')) 1 else 0;
+    const digit_len = src.len - sign_len;
+
+    var prec_pad: usize = 0;
+    if (precision) |p| {
+        if (p > digit_len) prec_pad = p - digit_len;
+    }
+    const total = src.len + prec_pad;
+
+    if (total >= width) {
+        if (sign_len == 1) {
+            out[idx] = src[0];
+            idx += 1;
+        }
+        var i: usize = 0;
+        while (i < prec_pad and idx < out.len) : (i += 1) {
+            out[idx] = '0';
+            idx += 1;
+        }
+        return appendBytes(out, idx, src[sign_len..]);
+    }
+
+    const space_pad = width - total;
+    // Zero-padding only applies when there's no precision specifier
+    // (per C semantics: precision turns off zero-padding).
+    const left_pad: u8 = if (zero and !left and precision == null) '0' else ' ';
+
+    if (!left) {
+        if (left_pad == '0' and sign_len == 1) {
+            out[idx] = src[0];
+            idx += 1;
+        }
+        var i: usize = 0;
+        while (i < space_pad and idx < out.len) : (i += 1) {
+            out[idx] = left_pad;
+            idx += 1;
+        }
+        if (left_pad != '0' and sign_len == 1) {
+            out[idx] = src[0];
+            idx += 1;
+        }
+        var j: usize = 0;
+        while (j < prec_pad and idx < out.len) : (j += 1) {
+            out[idx] = '0';
+            idx += 1;
+        }
+        idx = appendBytes(out, idx, src[sign_len..]);
+    } else {
+        if (sign_len == 1) {
+            out[idx] = src[0];
+            idx += 1;
+        }
+        var j: usize = 0;
+        while (j < prec_pad and idx < out.len) : (j += 1) {
+            out[idx] = '0';
+            idx += 1;
+        }
+        idx = appendBytes(out, idx, src[sign_len..]);
+        var i: usize = 0;
+        while (i < space_pad and idx < out.len) : (i += 1) {
             out[idx] = ' ';
             idx += 1;
         }
@@ -1036,9 +1120,12 @@ export fn fprintf(stream: ?*FILE, fmt_z: [*:0]const u8, ...) callconv(.c) c_int 
     return @intCast(n);
 }
 
-export fn vfprintf(stream: ?*FILE, fmt_z: [*:0]const u8, ap_in: std.builtin.VaList) callconv(.c) c_int {
+// On x86-64 SysV the C `va_list` is `__va_list_tag[1]`, which decays to a
+// pointer when passed across function boundaries. Take it by pointer so
+// our shim sees the same memory the caller's va_start populated.
+export fn vfprintf(stream: ?*FILE, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) callconv(.c) c_int {
     _ = stream;
-    var ap = @cVaCopy(@constCast(&ap_in));
+    var ap = @cVaCopy(ap_in);
     defer @cVaEnd(&ap);
     var buf: [PRINTF_BUF_BYTES]u8 = undefined;
     const n = vformatToBuf(&buf, fmt_z, &ap);
@@ -1046,8 +1133,8 @@ export fn vfprintf(stream: ?*FILE, fmt_z: [*:0]const u8, ap_in: std.builtin.VaLi
     return @intCast(n);
 }
 
-export fn vprintf(fmt_z: [*:0]const u8, ap_in: std.builtin.VaList) callconv(.c) c_int {
-    var ap = @cVaCopy(@constCast(&ap_in));
+export fn vprintf(fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) callconv(.c) c_int {
+    var ap = @cVaCopy(ap_in);
     defer @cVaEnd(&ap);
     var buf: [PRINTF_BUF_BYTES]u8 = undefined;
     const n = vformatToBuf(&buf, fmt_z, &ap);
@@ -1065,8 +1152,8 @@ export fn snprintf(dst: [*]u8, n: usize, fmt_z: [*:0]const u8, ...) callconv(.c)
     return @intCast(written);
 }
 
-export fn vsnprintf(dst: [*]u8, n: usize, fmt_z: [*:0]const u8, ap_in: std.builtin.VaList) callconv(.c) c_int {
-    var ap = @cVaCopy(@constCast(&ap_in));
+export fn vsnprintf(dst: [*]u8, n: usize, fmt_z: [*:0]const u8, ap_in: *std.builtin.VaList) callconv(.c) c_int {
+    var ap = @cVaCopy(ap_in);
     defer @cVaEnd(&ap);
     if (n == 0) return 0;
     const out = dst[0 .. n - 1];

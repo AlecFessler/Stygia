@@ -117,15 +117,6 @@ ensure_callgraph_db() {
         need_rebuild=1
     fi
     if [[ $need_rebuild -eq 1 ]]; then
-        # Kernel build pulls in tests/suite/bin/root_service.elf as the
-        # `-Dprofile=test` root service; build that first on a clean tree.
-        if [[ ! -f "$SCRIPT_DIR/suite/bin/root_service.elf" ]]; then
-            echo "  building tests/suite root_service (needed by kernel install)"
-            if ! (cd "$SCRIPT_DIR/suite" && zig build 2>&1); then
-                FAILURES+=("tests/suite root_service build for IR/ELF")
-                return 1
-            fi
-        fi
         echo "  building kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
         if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
             FAILURES+=("kernel build for IR/ELF")

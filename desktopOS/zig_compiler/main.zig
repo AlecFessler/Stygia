@@ -381,14 +381,17 @@ var tag_len: usize = 0;
 var banner_buf: [128]u8 = undefined;
 var banner_len: usize = 0;
 
-// Integers extracted from /hello.zig — first two decimal literals
+// Integers extracted from /hello.zig — first three decimal literals
 // after the second quoted string. seed → " seed=<n>" suffix in the
 // banner string AND patched into the binary's seed_value sentinel;
-// mult → patched into the mult_value sentinel.
+// mult → patched into the mult_value sentinel; repeat → patched into
+// the repeat_value sentinel (drives spawned binary's runtime loop count).
 var seed_int: u64 = 0;
 var seed_found: bool = false;
 var mult_int: u64 = 0;
 var mult_found: bool = false;
+var repeat_int: u64 = 0;
+var repeat_found: bool = false;
 
 // Extract up to two quoted-string literals from `src[0..src_len]` and
 // the first decimal integer that appears after the second quoted
@@ -427,7 +430,7 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             break;
         }
     }
-    // Scan for the first two decimal ints after the second quoted string.
+    // Scan for the first three decimal ints after the second quoted string.
     if (after_second) |start| {
         var j: usize = start;
         var ints_found: u8 = 0;
@@ -447,9 +450,13 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 seed_int = v;
                 seed_found = true;
                 ints_found = 1;
-            } else {
+            } else if (ints_found == 1) {
                 mult_int = v;
                 mult_found = true;
+                ints_found = 2;
+            } else {
+                repeat_int = v;
+                repeat_found = true;
                 break;
             }
         }
@@ -461,6 +468,7 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
 // replace it with `value` as little-endian u64. Returns hit count.
 const SEED_SENTINEL: u64 = 0xCAFEBABE_DEADBEEF;
 const MULT_SENTINEL: u64 = 0xCAFEBABE_FACE0001;
+const REPEAT_SENTINEL: u64 = 0xCAFEBABE_C0FFEE01;
 
 fn patchU64Sentinel(buf: []u8, sentinel: u64, value: u64) usize {
     var hits: usize = 0;
@@ -597,6 +605,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (mult_found) {
         printNum("[zig_compiler] extracted mult=", mult_int);
     }
+    if (repeat_found) {
+        printNum("[zig_compiler] extracted repeat=", repeat_int);
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -632,6 +643,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched mult sentinel hits=", h);
     } else {
         print("[zig_compiler] no second int (mult) in source\n");
+    }
+    if (repeat_found) {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], REPEAT_SENTINEL, repeat_int);
+        printNum("[zig_compiler] patched repeat sentinel hits=", h);
+    } else {
+        print("[zig_compiler] no third int (repeat) in source\n");
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).

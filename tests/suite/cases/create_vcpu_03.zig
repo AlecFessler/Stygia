@@ -156,12 +156,6 @@ pub fn main(cap_table_base: u64) void {
     //    `vm_ceiling` regardless of the domain's vm_ceiling field, so
     //    test 02 (E_PERM caps not subset) cannot fire.
     const cvm = syscall.createVirtualMachine(0, policy_pf);
-    if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
-        // Platforms without hardware virtualization can't make a VM;
-        // skip-as-pass per §[create_virtual_machine] E_NODEV contract.
-        testing.pass();
-        return;
-    }
     if (testing.isHandleError(cvm.v1)) {
         testing.fail(5);
         return;

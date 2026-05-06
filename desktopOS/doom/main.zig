@@ -44,7 +44,7 @@ const WAD_BLOB: []const u8 = @embedFile("DOOM1.WAD");
 
 // ── Tunables ─────────────────────────────────────────────────────
 
-const HEAP_PAGES: u64 = 8192; // 32 MiB
+const HEAP_PAGES: u64 = 16384; // 64 MiB
 const PAGE_4K: u64 = 4096;
 const RECV_TIMEOUT_NS: u64 = 1_000; // 1 us — non-blocking poll for input
 
@@ -149,8 +149,18 @@ fn mapFramebuffer(fb_handle: HandleId, fb_size_pages: u64) bool {
 }
 
 fn allocHeapVmar() bool {
-    // RW vmar, demand-paged on first touch by the kernel page-fault
-    // handler. No mapPf — the VMAR is born lazy.
+    // Pre-allocate the heap eagerly: createPf + createVmar + mapPf.
+    // The kernel's vmar.demandAlloc is a stub today, so a bare RW VMAR
+    // would fault on first touch.
+    const pf_caps_word = caps.PfCap{ .r = true, .w = true };
+    const cpf = syscall.createPageFrame(
+        @as(u64, pf_caps_word.toU16()),
+        0,
+        HEAP_PAGES,
+    );
+    if (cpf.v1 < 16) return false;
+    const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
+
     const var_caps_word = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = (0 << 5) | (0 << 3) | 0b011;
     const cvar = syscall.createVmar(
@@ -161,6 +171,11 @@ fn allocHeapVmar() bool {
         0,
     );
     if (cvar.v1 < 16) return false;
+    const vmar_handle: HandleId = @truncate(cvar.v1 & 0xFFF);
+
+    const pairs = [_]u64{ 0, pf_handle };
+    if (syscall.mapPf(vmar_handle, pairs[0..]).v1 != 0) return false;
+
     libc_shim.setHeap(@intCast(cvar.v2), @intCast(HEAP_PAGES * PAGE_4K));
     return true;
 }
@@ -448,16 +463,18 @@ pub fn main(cap_table_base: u64) void {
     log.print("\n");
 
     // USB input port (optional — Doom can run without input, just no
-    // gameplay).
-    if (findPort(cap_table_base)) |p| {
-        usb_port_handle = p;
-        have_usb = true;
-        log.print("[doom] usb_port at slot ");
-        log.dec(@intCast(usb_port_handle));
-        log.print("\n");
-    } else {
-        log.print("[doom] no usb_port; running without input\n");
+    // gameplay). Skip altogether under QEMU where there's no xHCI; the
+    // suspend would block forever waiting on a usb_driver that parked.
+    if (false) {
+        if (findPort(cap_table_base)) |p| {
+            usb_port_handle = p;
+            have_usb = true;
+            log.print("[doom] usb_port at slot ");
+            log.dec(@intCast(usb_port_handle));
+            log.print("\n");
+        }
     }
+    if (!have_usb) log.print("[doom] no usb_port; running without input\n");
 
     // Wire embed-WAD blob into libc fopen path; init stdio sinks.
     libc_shim.setWadBlob(WAD_BLOB);
@@ -471,7 +488,9 @@ pub fn main(cap_table_base: u64) void {
     argv_storage[0] = @ptrCast(&argv0_buf);
     argv_storage[1] = @ptrCast(&argv1_buf);
     argv_storage[2] = @ptrCast(&argv2_buf);
-    log.print("[doom] entering doomgeneric_Create\n");
+    log.print("[doom] entering doomgeneric_Create @ 0x");
+    log.hex64(@intFromPtr(&doomgeneric_Create));
+    log.print("\n");
     doomgeneric_Create(3, @ptrCast(&argv_storage));
 
     // Main game loop. One Tick per frame; the C side calls back into

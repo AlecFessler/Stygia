@@ -96,10 +96,6 @@ fn kMain(boot_info: *BootInfo) !void {
     // tick (§2.2.34), and a HPET vm-exit there blows the wake-to-pinned
     // budget by orders of magnitude.
     arch.time.initMonotonicClock();
-    // Hang detector — start ticking once the monotonic clock is up. Until
-    // armed, every detector hook is a no-op so the very-early boot path
-    // doesn't trip the threshold.
-    zag.utils.hang_detector.arm();
     arch.vm.vmInit();
     arch.vm.bspBootHandoff(boot_info.arrived_at_el2 != 0);
     arch.pmu.pmuInit();

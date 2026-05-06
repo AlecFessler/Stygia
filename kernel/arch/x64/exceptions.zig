@@ -2,7 +2,6 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const ctx_trace = zag.utils.ctx_trace;
-const hang_detector = zag.utils.hang_detector;
 const pf_log = zag.utils.pf_log;
 const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
@@ -13,7 +12,6 @@ const kprof = zag.kprof.trace_id;
 const kprof_sample = zag.kprof.sample;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const paging_mod = zag.arch.x64.paging;
-const panic_mod = zag.panic;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
@@ -233,18 +231,6 @@ fn isUserHltAt(rip: u64) bool {
 }
 
 fn exceptionHandler(ctx: *cpu.Context) void {
-    // Sentinel BEFORE any other work — proves whether the exception
-    // path ran at all on smp=4 silent-failure reps. 'X' = entered
-    // exceptionHandler; subsequent path-specific bytes ('G' GPF,
-    // 'D' double-fault, 'U' unhandled, 'P' from @panic) narrow further.
-    panic_mod.debugSentinel('X');
-
-    // Lost-wakeup hang detector — piggy-back on every exception entry
-    // so the dump still fires even when the LAPIC scheduler timer
-    // tick stalls (the smp=4 hang signature on this branch). Cheap
-    // fast path when no hang is in progress.
-    hang_detector.tickCheck();
-
     kprof.enter(.exception);
     defer kprof.exit(.exception);
 
@@ -323,10 +309,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     }
 
     switch (exception) {
-        .double_fault => {
-            panic_mod.debugSentinel('D');
-            @panic("Double fault");
-        },
+        .double_fault => @panic("Double fault"),
         .machine_check => @panic("Machine check exception"),
         .non_maskable_interrupt => {
             // lockdep blindspot: NMI is NOT wired into sync_debug.enterIrqContext.
@@ -349,13 +332,11 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             @panic("NMI");
         },
         .general_protection_fault => {
-            panic_mod.debugSentinel('G');
             serial.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
             @panic("General protection fault");
         },
         .page_fault => unreachable,
         else => {
-            panic_mod.debugSentinel('U');
             serial.print("Exception {d} at rip=0x{x} err=0x{x}\n", .{
                 vector, ctx.rip, ctx.err_code,
             });
@@ -389,17 +370,6 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     kprof.point(.page_fault_hw, faulting_addr);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
-
-    // Sentinel for kernel-mode #PF only (user-mode PFs are normal demand
-    // paging — flooding 'F' would drown the diagnostic signal). 'F' on
-    // a silent failing log => kernel-mode page fault that died before
-    // emitting structured output.
-    if (!from_user) panic_mod.debugSentinel('F');
-
-    // Lost-wakeup hang detector — piggy-back on the PF stream because
-    // the #PF rate stays high even when the LAPIC timer tick stalls
-    // (the smp=4 hang signature). Cheap fast path when no hang.
-    hang_detector.tickCheck();
 
     // Intercept port-IO virtual_bar faults from userspace before the
     // generic handler. A VMAR mapped via `map_mmio` to a port-IO
@@ -485,12 +455,11 @@ fn emulateVirtualBar(
     v._gen_lock.unlockIrqRestore(v_irq);
 
     // Fetch instruction bytes from user RIP via the domain's page tables.
+    // x86-64 instructions are at most 15 bytes and may straddle a page
+    // boundary; gather from up to two consecutive user pages.
     const rip = ctx.rip;
     const page_off = rip & 0xFFF;
-    // max_bytes is always >= 1 since page_off is in [0, 4095].
-    // An instruction whose encoding straddles the page boundary will be
-    // truncated here; decodeBytes returns IncompleteDecode if it runs short.
-    const max_bytes: u8 = @intCast(@min(15, 4096 - page_off));
+    const first_page_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
@@ -511,10 +480,25 @@ fn emulateVirtualBar(
     const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
     const insn_ptr: [*]const u8 = @ptrFromInt(physmap_base);
     var buf: [15]u8 = undefined;
-    @memcpy(buf[0..max_bytes], insn_ptr[0..max_bytes]);
+    @memcpy(buf[0..first_page_bytes], insn_ptr[0..first_page_bytes]);
+
+    // Top up across the page boundary if the instruction may extend
+    // beyond this page. If the next page isn't mapped, hand decodeBytes
+    // what we have — it will report IncompleteDecode and we'll fault.
+    var fetched: u8 = first_page_bytes;
+    if (first_page_bytes < 15) {
+        const next_page = VAddr.fromInt((rip & ~@as(u64, 0xFFF)) + 0x1000);
+        if (paging_mod.resolveVaddr(domain.addr_space_root, next_page)) |next_phys| {
+            const next_base = VAddr.fromPAddr(next_phys, null).addr;
+            const next_ptr: [*]const u8 = @ptrFromInt(next_base);
+            const need: u8 = 15 - first_page_bytes;
+            @memcpy(buf[first_page_bytes..15], next_ptr[0..need]);
+            fetched = 15;
+        }
+    }
 
     // Decode the instruction
-    const op = mmio_decode.decodeBytes(buf[0..max_bytes]) catch {
+    const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
         cpu.enableInterrupts();
         scheduler.yieldTo(null);
@@ -547,16 +531,6 @@ fn emulateVirtualBar(
             op.value
         else
             @truncate(readContextGpr(ctx, op.reg));
-
-        // Userspace COM1 writes — same lost-wakeup heartbeat as
-        // serial.printRaw. We stamp on the `\n` only: in the smp=4
-        // hang case the runner intermittently completes ONE byte of a
-        // `[runner] PASS …` line and re-stalls for tens of seconds,
-        // and counting that single byte as progress kept the threshold
-        // from ever tripping. A full line is the unit we want.
-        if (io_port == 0x3F8 and op.size == 1) {
-            hang_detector.noteProgressOnNewline(@truncate(value));
-        }
 
         switch (op.size) {
             1 => cpu.outb(@truncate(value), io_port),

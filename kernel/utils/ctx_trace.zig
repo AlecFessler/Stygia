@@ -128,13 +128,16 @@ else
 /// frame — those offsets must match `cpu.Context`'s field layout.
 /// Verified at comptime against the actual struct.
 const CtxLayout = struct {
-    const Ctx = arch.cpu.ArchCpuContext;
-    const rip_off = @offsetOf(Ctx, "rip");
-    const cs_off = @offsetOf(Ctx, "cs");
-    const rflags_off = @offsetOf(Ctx, "rflags");
-    const rsp_off = @offsetOf(Ctx, "rsp");
+    const cpu = if (builtin.cpu.arch == .x86_64)
+        zag.arch.x64.cpu
+    else
+        zag.arch.aarch64.cpu;
+    const rip_off = @offsetOf(cpu.Context, "rip");
+    const cs_off = @offsetOf(cpu.Context, "cs");
+    const rflags_off = @offsetOf(cpu.Context, "rflags");
+    const rsp_off = @offsetOf(cpu.Context, "rsp");
     const ss_off = if (builtin.cpu.arch == .x86_64)
-        @offsetOf(Ctx, "ss")
+        @offsetOf(cpu.Context, "ss")
     else
         // aarch64 has no SS slot; reuse pstate or just zero. We
         // gate this on x86_64 in practice (the bug is x86 only).

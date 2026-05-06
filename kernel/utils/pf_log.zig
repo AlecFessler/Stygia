@@ -102,9 +102,12 @@ else
 /// `mark` reads `ec.ctx + rip_off / + rsp_off` if ec is non-null.
 /// Verified at comptime against the actual `cpu.Context` layout.
 const CtxLayout = struct {
-    const Ctx = arch.cpu.ArchCpuContext;
-    const rip_off = @offsetOf(Ctx, "rip");
-    const rsp_off = @offsetOf(Ctx, "rsp");
+    const cpu = if (builtin.cpu.arch == .x86_64)
+        zag.arch.x64.cpu
+    else
+        zag.arch.aarch64.cpu;
+    const rip_off = @offsetOf(cpu.Context, "rip");
+    const rsp_off = @offsetOf(cpu.Context, "rsp");
 };
 
 inline fn rdtsc() u64 {
