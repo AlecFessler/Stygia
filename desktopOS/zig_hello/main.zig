@@ -1171,96 +1171,56 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         _ = issueRaw(buildWord(SYS_YIELD, 0), .{});
     }
     debugPrint("[zig_hello] phase 3: file write test\n");
-    const test_path = "/zh_phase3";
-    const cr = fsCreateFile(inv.fs_port, fs_va, test_path, 0o644);
-    if (cr.status != 0) {
-        var st_buf: [32]u8 = undefined;
-        const st_str = formatU64(&st_buf, cr.status);
-        var msg: [96]u8 = undefined;
-        const lead3 = "[zig_hello] create_file status=";
-        var w3: usize = 0;
-        for (lead3) |b| {
-            msg[w3] = b;
-            w3 += 1;
+    phase3: {
+        const test_path = "/zh_phase3";
+        // Idempotent: clear any leftover entry from a previous boot or
+        // from verify_fs's overlapping phases (which can leave stale
+        // names). Fresh-disk runs always have nothing here, so unlink's
+        // not_found return is fine.
+        _ = fsUnlink(inv.fs_port, fs_va, test_path);
+        const cr = fsCreateFile(inv.fs_port, fs_va, test_path, 0o644);
+        if (cr.status != 0) {
+            printNumLine(inv.serial_port, serial_va, "[zig_hello] phase 3 create status=", cr.status);
+            break :phase3;
         }
-        for (st_str) |b| {
-            msg[w3] = b;
-            w3 += 1;
-        }
-        msg[w3] = '\n';
-        w3 += 1;
-        serialPrint(inv.serial_port, serial_va, msg[0..w3]);
-        zagExit();
-    }
-    debugPrint("[zig_hello] phase 3: created\n");
+        debugPrint("[zig_hello] phase 3: created\n");
 
-    const content = "Hello from Zag userspace!";
-    const wr = fsPwrite(inv.fs_port, fs_va, test_path, 0, content);
-    if (wr.status != 0 or wr.bytes_written != content.len) {
-        var sb1: [32]u8 = undefined;
-        var sb2: [32]u8 = undefined;
-        const ss1 = formatU64(&sb1, wr.status);
-        const ss2 = formatU64(&sb2, wr.bytes_written);
-        var msgw: [128]u8 = undefined;
-        const lw = "[zig_hello] phase 3 pwrite status=";
-        var ww: usize = 0;
-        for (lw) |b| {
-            msgw[ww] = b;
-            ww += 1;
+        const content = "Hello from Zag userspace!";
+        const wr = fsPwrite(inv.fs_port, fs_va, test_path, 0, content);
+        if (wr.status != 0 or wr.bytes_written != content.len) {
+            print2NumLine(inv.serial_port, serial_va, "[zig_hello] phase 3 pwrite status=", wr.status, " bytes=", wr.bytes_written);
+            break :phase3;
         }
-        for (ss1) |b| {
-            msgw[ww] = b;
-            ww += 1;
-        }
-        const lwb = " bytes=";
-        for (lwb) |b| {
-            msgw[ww] = b;
-            ww += 1;
-        }
-        for (ss2) |b| {
-            msgw[ww] = b;
-            ww += 1;
-        }
-        msgw[ww] = '\n';
-        ww += 1;
-        serialPrint(inv.serial_port, serial_va, msgw[0..ww]);
-        zagExit();
-    }
-    debugPrint("[zig_hello] phase 3: pwrite ok\n");
+        debugPrint("[zig_hello] phase 3: pwrite ok\n");
 
-    // Read back to verify
-    const rb = fsPread(inv.fs_port, fs_va, test_path, 0, 64);
-    if (rb.status != 0) {
-        serialPrint(
-            inv.serial_port,
-            serial_va,
-            "[zig_hello] phase 3: pread back failed\n",
-        );
-        zagExit();
-    }
-    var p3_line: [128]u8 = undefined;
-    var p3_w: usize = 0;
-    const p3_lead = "[zig_hello] phase 3 read = ";
-    for (p3_lead) |b| {
-        p3_line[p3_w] = b;
+        const rb = fsPread(inv.fs_port, fs_va, test_path, 0, 64);
+        if (rb.status != 0) {
+            printNumLine(inv.serial_port, serial_va, "[zig_hello] phase 3 pread status=", rb.status);
+            break :phase3;
+        }
+        var p3_line: [128]u8 = undefined;
+        var p3_w: usize = 0;
+        const p3_lead = "[zig_hello] phase 3 read = ";
+        for (p3_lead) |b| {
+            p3_line[p3_w] = b;
+            p3_w += 1;
+        }
+        const data_back: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
+        var n3: u64 = 0;
+        while (n3 < rb.bytes_read and p3_w < p3_line.len - 1) : (n3 += 1) {
+            p3_line[p3_w] = data_back[n3];
+            p3_w += 1;
+        }
+        p3_line[p3_w] = '\n';
         p3_w += 1;
-    }
-    const data_back: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
-    var n3: u64 = 0;
-    while (n3 < rb.bytes_read and p3_w < p3_line.len - 1) : (n3 += 1) {
-        p3_line[p3_w] = data_back[n3];
-        p3_w += 1;
-    }
-    p3_line[p3_w] = '\n';
-    p3_w += 1;
-    serialPrint(inv.serial_port, serial_va, p3_line[0..p3_w]);
+        serialPrint(inv.serial_port, serial_va, p3_line[0..p3_w]);
 
-    // Cleanup so the next boot starts clean.
-    const ul_status = fsUnlink(inv.fs_port, fs_va, test_path);
-    if (ul_status == 0) {
-        serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlinked, test passed\n");
-    } else {
-        serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlink failed\n");
+        const ul_status = fsUnlink(inv.fs_port, fs_va, test_path);
+        if (ul_status == 0) {
+            serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlinked, test passed\n");
+        } else {
+            serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlink failed\n");
+        }
     }
 
     // ── Phase 4a: spawn a child capability domain from the staged

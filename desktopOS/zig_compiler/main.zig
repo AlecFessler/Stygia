@@ -444,6 +444,33 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
     return found;
 }
 
+// Find every occurrence of the 8-byte sentinel (little-endian) and
+// replace it with `value` as little-endian u64. Returns hit count.
+const SEED_SENTINEL: u64 = 0xCAFEBABE_DEADBEEF;
+
+fn patchSeedSentinel(buf: []u8, value: u64) usize {
+    var hits: usize = 0;
+    if (buf.len < 8) return 0;
+    const limit = buf.len - 8;
+    var i: usize = 0;
+    while (i <= limit) : (i += 1) {
+        // Little-endian compare against SEED_SENTINEL.
+        var got: u64 = 0;
+        var k: u6 = 0;
+        while (k < 8) : (k += 1) {
+            got |= @as(u64, buf[i + k]) << (k * 8);
+        }
+        if (got != SEED_SENTINEL) continue;
+        var w: u6 = 0;
+        while (w < 8) : (w += 1) {
+            buf[i + w] = @truncate((value >> (w * 8)) & 0xFF);
+        }
+        hits += 1;
+        i += 7; // skip past this match (loop's +=1 makes total 8)
+    }
+    return hits;
+}
+
 fn patchBanner(buf: []u8) usize {
     var hits: usize = 0;
     if (buf.len < BANNER_LEN) return 0;
@@ -574,6 +601,15 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (hits == 0) {
         print("[zig_compiler] FAILED: no banner found to patch\n");
         zagExit();
+    }
+
+    // Patch the runtime seed sentinel — a u64 in the binary that
+    // gets read via volatile load and printed at runtime by the
+    // spawned binary. This is "real" codegen: source value drives
+    // a runtime constant, not just a static string.
+    if (seed_found) {
+        const seed_hits = patchSeedSentinel(elf_buf[0..out.bytes_read], seed_int);
+        printNum("[zig_compiler] patched seed sentinel hits=", seed_hits);
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).

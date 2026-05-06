@@ -182,9 +182,61 @@ fn print(s: []const u8) void {
     while (i < s.len) : (i += 1) p[0] = s[i];
 }
 
+// Sentinel u64 patched by zig_compiler before spawn. The volatile load
+// in _start defeats constant-folding, forcing a real memory read so
+// the patched value is what the binary observes at runtime. The bytes
+// 0xCAFEBABE_DEADBEEF are unique enough that the compiler can locate
+// them via byte-search in the ELF file.
+var seed_value: u64 = 0xCAFEBABE_DEADBEEF;
+
+fn formatU64(buf: []u8, n: u64) []u8 {
+    if (n == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var v = n;
+    var i: usize = 0;
+    while (v != 0) : (i += 1) {
+        buf[i] = @intCast('0' + (v % 10));
+        v /= 10;
+    }
+    var lo: usize = 0;
+    var hi: usize = i - 1;
+    while (lo < hi) {
+        const t = buf[lo];
+        buf[lo] = buf[hi];
+        buf[hi] = t;
+        lo += 1;
+        hi -= 1;
+    }
+    return buf[0..i];
+}
+
 export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     initSink(cap_table_base);
     print("[zig_hello2] hello from a Zag-target ELF spawned by another Zag-target ELF\n");
+
+    // Volatile load forces a real memory read so the compiler can't
+    // fold seed_value back to its sentinel initializer at compile time.
+    const seed_ptr: *volatile u64 = &seed_value;
+    const v = seed_ptr.*;
+    var sb: [32]u8 = undefined;
+    const ss = formatU64(&sb, v);
+    var line: [64]u8 = undefined;
+    const lead = "[runtime] seed=";
+    var w: usize = 0;
+    for (lead) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    for (ss) |b| {
+        line[w] = b;
+        w += 1;
+    }
+    line[w] = '\n';
+    w += 1;
+    print(line[0..w]);
+
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
 }
