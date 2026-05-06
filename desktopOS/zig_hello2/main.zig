@@ -190,6 +190,7 @@ var seed_value: u64 = 0xCAFEBABE_DEADBEEF;
 var mult_value: u64 = 0xCAFEBABE_FACE0001;
 var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
 var op_value: u64 = 0xCAFEBABE_05E1EC70;
+var step_value: u64 = 0xCAFEBABE_57E90001;
 
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
@@ -224,10 +225,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const mult_ptr: *volatile u64 = &mult_value;
     const repeat_ptr: *volatile u64 = &repeat_value;
     const op_ptr: *volatile u64 = &op_value;
+    const step_ptr: *volatile u64 = &step_value;
     const v_seed = seed_ptr.*;
     const v_mult = mult_ptr.*;
     const v_repeat = repeat_ptr.*;
     const v_op = op_ptr.*;
+    const v_step = step_ptr.*;
 
     // Source-selectable operation: 0=mul, 1=add, 2=sub, 3=xor; anything
     // else (including the unpatched sentinel) → mul (default).
@@ -253,6 +256,7 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     print("[runtime] op-label=");
     print(op_label);
     print("\n");
+    printLine("[runtime] step=", v_step);
 
     // Source-driven control flow: loop iteration count comes from a
     // source-file constant that flows through the compiler into a
@@ -262,7 +266,10 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const cap: u64 = if (v_repeat > 8) 8 else v_repeat;
     var i: u64 = 0;
     while (i < cap) {
-        printIterLine(i, result);
+        // Per-iter unique value: source-driven `step` interacts with
+        // the loop counter so each iter prints a distinct number.
+        const per_iter: u64 = result +% (i *% v_step);
+        printIterLine(i, per_iter);
         i += 1;
     }
 

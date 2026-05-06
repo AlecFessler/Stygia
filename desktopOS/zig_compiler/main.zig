@@ -394,6 +394,8 @@ var repeat_int: u64 = 0;
 var repeat_found: bool = false;
 var op_int: u64 = 0;
 var op_found: bool = false;
+var step_int: u64 = 0;
+var step_found: bool = false;
 
 // Extract up to two quoted-string literals from `src[0..src_len]` and
 // the first decimal integer that appears after the second quoted
@@ -460,9 +462,13 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 repeat_int = v;
                 repeat_found = true;
                 ints_found = 3;
-            } else {
+            } else if (ints_found == 3) {
                 op_int = v;
                 op_found = true;
+                ints_found = 4;
+            } else {
+                step_int = v;
+                step_found = true;
                 break;
             }
         }
@@ -476,6 +482,7 @@ const SEED_SENTINEL: u64 = 0xCAFEBABE_DEADBEEF;
 const MULT_SENTINEL: u64 = 0xCAFEBABE_FACE0001;
 const REPEAT_SENTINEL: u64 = 0xCAFEBABE_C0FFEE01;
 const OP_SENTINEL: u64 = 0xCAFEBABE_05E1EC70;
+const STEP_SENTINEL: u64 = 0xCAFEBABE_57E90001;
 
 fn patchU64Sentinel(buf: []u8, sentinel: u64, value: u64) usize {
     var hits: usize = 0;
@@ -618,6 +625,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (op_found) {
         printNum("[zig_compiler] extracted op=", op_int);
     }
+    if (step_found) {
+        printNum("[zig_compiler] extracted step=", step_int);
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -665,6 +675,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched op sentinel hits=", h);
     } else {
         print("[zig_compiler] no fourth int (op) in source\n");
+    }
+    if (step_found) {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], STEP_SENTINEL, step_int);
+        printNum("[zig_compiler] patched step sentinel hits=", h);
+    } else {
+        print("[zig_compiler] no fifth int (step) in source\n");
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).
