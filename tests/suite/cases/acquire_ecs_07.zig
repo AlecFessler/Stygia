@@ -139,6 +139,15 @@ pub fn main(cap_table_base: u64) void {
     //    call vm_set_policy from this test) sidesteps any VmCap
     //    bit-set / restart_policy questions.
     const cvm = syscall.createVirtualMachine(0, policy_pf);
+
+    // E_NODEV degrade: platforms without hardware virtualization
+    // (e.g. aarch64 booted at EL1 with no hyp-stub) can't run this
+    // test's vCPU-bound setup. Skip-as-pass per the §[create_virtual_machine]
+    // E_NODEV contract.
+    if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
+        testing.pass();
+        return;
+    }
     if (testing.isHandleError(cvm.v1)) {
         testing.fail(4);
         return;

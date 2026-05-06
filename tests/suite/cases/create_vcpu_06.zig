@@ -120,6 +120,12 @@ pub fn main(cap_table_base: u64) void {
     // 4. Create the VM. caps = 0 keeps the call within vm_ceiling
     //    regardless of the runner's grant.
     const cvm = syscall.createVirtualMachine(0, policy_pf);
+    if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
+        // Platforms without hardware virtualization can't make a VM;
+        // skip-as-pass per §[create_virtual_machine] E_NODEV contract.
+        testing.pass();
+        return;
+    }
     if (testing.isHandleError(cvm.v1)) {
         testing.fail(4);
         return;

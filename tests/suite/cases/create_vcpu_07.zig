@@ -97,6 +97,12 @@ pub fn main(cap_table_base: u64) void {
     // ceiling and leaves all reserved bits clear, so test 02 / test 08
     // of create_virtual_machine cannot fire ahead of us.
     const cvm = syscall.createVirtualMachine(0, policy_pf);
+    if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
+        // Platforms without hardware virtualization can't make a VM;
+        // skip-as-pass per §[create_virtual_machine] E_NODEV contract.
+        testing.pass();
+        return;
+    }
     if (testing.isHandleError(cvm.v1)) {
         testing.fail(2);
         return;
