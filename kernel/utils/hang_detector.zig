@@ -132,55 +132,12 @@ pub fn tickCheck() void {
         return;
     }
 
-    // All-cores-idle detector. Tripped from the HPET-NMI watchdog
-    // when every core's per-core slot has `current_ec=null` AND every
-    // run queue is empty. That's the canonical lost-wakeup signature
-    // on the smp=4 reply-FP failure path: KVM observes all vcpus
-    // halted with no possible wake source and exits cleanly within
-    // milliseconds. We require a few consecutive observations so a
-    // transient all-idle (every core happens to be between syscalls)
-    // doesn't trip, AND a minimum elapsed-since-arm so very-early
-    // boot before the runner enqueues anything doesn't false-positive.
-    const ARM_GRACE_NS: u64 = 100_000_000; // 100 ms
-    const armed_at = armed_ns.load(.acquire);
-    const since_arm = now -% armed_at;
-    if (since_arm < ARM_GRACE_NS) return;
-    // Also require at least one userspace newline emit since arm so
-    // we don't trip during boot/before the runner has actually started.
-    // last_progress_ns gets stamped on every \n the runner emits via
-    // emulateVirtualBar; if it hasn't moved past armed_at, we haven't
-    // observed runner progress yet and "all cores idle" just means
-    // we're early.
-    if (last <= armed_at) return;
-    if (allCoresIdle()) {
-        const c = consecutive_idle.fetchAdd(1, .monotonic);
-        if (c == 0) {
-            // First all-idle observation. Snapshot last_progress_ns
-            // so subsequent ticks can verify we're not just chaining
-            // through transient between-batch all-idle windows.
-            idle_last_progress.store(last, .monotonic);
-        } else {
-            // Re-observed all-idle. If `last_progress_ns` advanced
-            // since the first observation, userspace IS still making
-            // progress through transient idle states; reset.
-            const start = idle_last_progress.load(.monotonic);
-            if (last != start) {
-                consecutive_idle.store(0, .monotonic);
-                return;
-            }
-        }
-        // 5 consecutive HPET-NMI ticks @ 100 ms = 500 ms of confirmed
-        // all-cores-idle WITH NO userspace newline progress in the
-        // window. This is the canonical lost-wakeup signature.
-        if (c + 1 >= 5) {
-            if (dump_fired.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
-            emitHeartbeatByte('@');
-            dump(delta);
-            return;
-        }
-    } else {
-        consecutive_idle.store(0, .monotonic);
-    }
+    // All-cores-idle detector disabled: false-positives between batches
+    // when every test EC exits and the next batch hasn't been spawned
+    // yet trip the 5-consecutive-tick threshold. The 2 s newline-progress
+    // threshold above is the reliable signal — a real lost-wakeup hang
+    // never emits more newlines.
+    _ = &allCoresIdle;
 }
 
 /// Snapshot of `last_progress_ns` at the moment the watchdog first

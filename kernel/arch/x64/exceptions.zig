@@ -553,7 +553,10 @@ fn emulateVirtualBar(
             @truncate(readContextGpr(ctx, op.reg));
 
         switch (op.size) {
-            1 => cpu.outb(@truncate(value), io_port),
+            1 => {
+                cpu.outb(@truncate(value), io_port);
+                hang_detector.noteProgressOnNewline(@truncate(value));
+            },
             2 => cpu.outw(@truncate(value), io_port),
             4 => cpu.outd(value, io_port),
             else => {
