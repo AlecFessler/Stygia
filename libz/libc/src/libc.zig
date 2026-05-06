@@ -41,4 +41,9 @@ comptime {
     _ = @import("process.zig");
     _ = @import("strings_extra.zig");
     _ = @import("fortify.zig");
+    _ = @import("mman.zig");
+    _ = @import("malloc.zig");
+    _ = @import("time.zig");
+    _ = @import("posix_io.zig");
+    _ = @import("stdio.zig");
 }
