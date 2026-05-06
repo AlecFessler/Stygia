@@ -502,12 +502,13 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
         var ints_found: u8 = 0;
         while (j < src_len) {
             const c = src[j];
-            // Once all 7 scalars are bound, the remaining numeric tokens
-            // and identifier names belong to the values array. Try to
-            // resolve identifiers (alpha or underscore start) here.
+            // Identifiers — usable both as standalone array elements
+            // and as the first term of a scalar expression like
+            // `mult = seed - 1300`. The expression continuation
+            // (applyExprContinuation) handles op + RHS accumulation.
             const is_alpha_start = (c >= 'a' and c <= 'z') or
                 (c >= 'A' and c <= 'Z') or c == '_';
-            if (is_alpha_start and ints_found >= 7 and values_count < VALUES_MAX) {
+            if (is_alpha_start) {
                 if (j > 0) {
                     const prev = src[j - 1];
                     const is_ident_char = (prev >= 'a' and prev <= 'z') or
@@ -531,8 +532,9 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 }
                 const id_slice = src[id_start..j];
                 if (resolveIdent(id_slice)) |val| {
-                    values_buf[values_count] = val;
-                    values_count += 1;
+                    var v = val;
+                    v = applyExprContinuation(src, src_len, &j, v);
+                    storeValue(v, &ints_found);
                 }
                 continue;
             }
@@ -563,70 +565,57 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 if (d < '0' or d > '9') break;
                 v = v * 10 + (@as(u64, d) - '0');
             }
-            // Expression continuation: while the next non-space char is
-            // a binary op (`+`, `-`, `*`) followed by another digit run,
-            // accumulate left-to-right. No precedence: 1+2*3 evaluates
-            // to (1+2)*3 = 9. Wrapping arithmetic. Identifiers are not
-            // yet allowed inside expressions — only literals.
-            while (j < src_len) {
-                var p: usize = j;
-                while (p < src_len and src[p] == ' ') p += 1;
-                if (p >= src_len) break;
-                const op = src[p];
-                if (op != '+' and op != '-' and op != '*') break;
-                var q: usize = p + 1;
-                while (q < src_len and src[q] == ' ') q += 1;
-                if (q >= src_len) break;
-                const c2 = src[q];
-                if (c2 < '0' or c2 > '9') break;
-                var rhs: u64 = 0;
-                while (q < src_len) : (q += 1) {
-                    const d = src[q];
-                    if (d < '0' or d > '9') break;
-                    rhs = rhs * 10 + (@as(u64, d) - '0');
-                }
-                if (op == '+') v +%= rhs;
-                if (op == '-') v -%= rhs;
-                if (op == '*') v *%= rhs;
-                j = q;
-            }
-            if (ints_found == 0) {
-                seed_int = v;
-                seed_found = true;
-                ints_found = 1;
-            } else if (ints_found == 1) {
-                mult_int = v;
-                mult_found = true;
-                ints_found = 2;
-            } else if (ints_found == 2) {
-                repeat_int = v;
-                repeat_found = true;
-                ints_found = 3;
-            } else if (ints_found == 3) {
-                op_int = v;
-                op_found = true;
-                ints_found = 4;
-            } else if (ints_found == 4) {
-                step_int = v;
-                step_found = true;
-                ints_found = 5;
-            } else if (ints_found == 5) {
-                skip_int = v;
-                skip_found = true;
-                ints_found = 6;
-            } else if (ints_found == 6) {
-                inner_int = v;
-                inner_found = true;
-                ints_found = 7;
-            } else if (values_count < VALUES_MAX) {
-                values_buf[values_count] = v;
-                values_count += 1;
-            } else {
-                break;
-            }
+            v = applyExprContinuation(src, src_len, &j, v);
+            storeValue(v, &ints_found);
         }
     }
     return found;
+}
+
+// Try to consume an `<op> <term>` continuation starting at j (skipping
+// spaces). RHS terms can be digit literals OR resolvable identifiers.
+// Returns the accumulated value and advances j past consumed input.
+fn applyExprContinuation(src: [*]const u8, src_len: usize, j_p: *usize, v_in: u64) u64 {
+    var v = v_in;
+    var j = j_p.*;
+    while (j < src_len) {
+        var p: usize = j;
+        while (p < src_len and src[p] == ' ') p += 1;
+        if (p >= src_len) break;
+        const op = src[p];
+        if (op != '+' and op != '-' and op != '*') break;
+        var q: usize = p + 1;
+        while (q < src_len and src[q] == ' ') q += 1;
+        if (q >= src_len) break;
+        const c2 = src[q];
+        var rhs: u64 = 0;
+        if (c2 >= '0' and c2 <= '9') {
+            while (q < src_len) : (q += 1) {
+                const d = src[q];
+                if (d < '0' or d > '9') break;
+                rhs = rhs * 10 + (@as(u64, d) - '0');
+            }
+        } else if ((c2 >= 'a' and c2 <= 'z') or (c2 >= 'A' and c2 <= 'Z') or c2 == '_') {
+            const id_start = q;
+            while (q < src_len) : (q += 1) {
+                const d = src[q];
+                const is_id = (d >= 'a' and d <= 'z') or
+                    (d >= 'A' and d <= 'Z') or
+                    (d >= '0' and d <= '9') or d == '_';
+                if (!is_id) break;
+            }
+            const id_slice = src[id_start..q];
+            if (resolveIdent(id_slice)) |val| {
+                rhs = val;
+            } else break; // unresolved RHS — abort accumulation
+        } else break;
+        if (op == '+') v +%= rhs;
+        if (op == '-') v -%= rhs;
+        if (op == '*') v *%= rhs;
+        j = q;
+    }
+    j_p.* = j;
+    return v;
 }
 
 // Map a parsed source op_name string to an op int.
@@ -641,8 +630,9 @@ fn opNameToInt(name: []const u8) ?u64 {
 
 // Resolve a named constant identifier against the compiler's
 // symbol table (the parsed scalar source ints). Returns null if
-// the name doesn't refer to a known parsed scalar. Used in array
-// literal context to allow `[_]u64{ seed, mult, 300 }`.
+// the name doesn't refer to a known parsed scalar. Used both as a
+// first-class term in scalar expressions (`mult = seed - 1300`) and
+// as a standalone array element (`values = [_]u64{ seed, ... }`).
 fn resolveIdent(id: []const u8) ?u64 {
     if (seed_found and eqStr(id, "seed")) return seed_int;
     if (mult_found and eqStr(id, "mult")) return mult_int;
@@ -652,6 +642,55 @@ fn resolveIdent(id: []const u8) ?u64 {
     if (skip_found and eqStr(id, "skip_idx")) return skip_int;
     if (inner_found and eqStr(id, "inner")) return inner_int;
     return null;
+}
+
+// Common dispatch: route a parsed value v (from a digit run or a
+// resolved identifier) into the next scalar slot or values_buf entry.
+// Bumps ints_found / values_count as appropriate.
+fn storeValue(v: u64, ints_found_p: *u8) void {
+    switch (ints_found_p.*) {
+        0 => {
+            seed_int = v;
+            seed_found = true;
+            ints_found_p.* = 1;
+        },
+        1 => {
+            mult_int = v;
+            mult_found = true;
+            ints_found_p.* = 2;
+        },
+        2 => {
+            repeat_int = v;
+            repeat_found = true;
+            ints_found_p.* = 3;
+        },
+        3 => {
+            op_int = v;
+            op_found = true;
+            ints_found_p.* = 4;
+        },
+        4 => {
+            step_int = v;
+            step_found = true;
+            ints_found_p.* = 5;
+        },
+        5 => {
+            skip_int = v;
+            skip_found = true;
+            ints_found_p.* = 6;
+        },
+        6 => {
+            inner_int = v;
+            inner_found = true;
+            ints_found_p.* = 7;
+        },
+        else => {
+            if (values_count < VALUES_MAX) {
+                values_buf[values_count] = v;
+                values_count += 1;
+            }
+        },
+    }
 }
 
 fn eqStr(a: []const u8, b: []const u8) bool {

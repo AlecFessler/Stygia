@@ -909,7 +909,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "pub const op_name = \"xor\";\n" ++
         "// distractor ints: 999 888 — must NOT become seed/mult\n" ++
         "pub const seed = 100 * 13 + 38;\n" ++
-        "pub const mult = 9;\n" ++
+        "pub const mult = seed - 1300;\n" ++
         "pub const repeat = 4;\n" ++
         "pub const op = 1;\n" ++
         "pub const step = 7;\n" ++
