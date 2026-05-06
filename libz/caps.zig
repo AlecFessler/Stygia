@@ -111,12 +111,6 @@ pub fn framebufferFields(c: Cap) FramebufferFields {
     };
 }
 
-// The 12-bit handle id is the only field a syscall ever takes. Upper
-// bits of the syscall word slot are _reserved.
-pub fn handleArg(slot: HandleId) u64 {
-    return @as(u64, slot);
-}
-
 // §[capability_domain] self-handle cap bits.
 pub const SelfCap = packed struct(u16) {
     crcd: bool = false,
