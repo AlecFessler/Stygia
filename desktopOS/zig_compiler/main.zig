@@ -526,6 +526,10 @@ const OP_SENTINEL: u64 = 0xCAFEBABE_05E1EC70;
 const STEP_SENTINEL: u64 = 0xCAFEBABE_57E90001;
 const SKIP_SENTINEL: u64 = 0xCAFEBABE_5C1A0001;
 const INNER_SENTINEL: u64 = 0xCAFEBABE_19E70001;
+// Compiler-computed checksum target — XOR of every scalar source int.
+// The compiler computes this from the parsed values and patches it,
+// so the spawned binary can verify the patch chain end-to-end.
+const CHECKSUM_SENTINEL: u64 = 0xCAFEBABE_C5E60001;
 
 // Per-element sentinels for the source-defined u64 array (must
 // match zig_hello2/main.zig values_arr initializers exactly).
@@ -759,6 +763,16 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched inner sentinel hits=", h);
     } else {
         print("[zig_compiler] no seventh int (inner) in source\n");
+    }
+    // Compute checksum from parsed source ints — XOR of every scalar.
+    // Always patch (even if some ints missing — those contribute 0).
+    {
+        const checksum: u64 =
+            seed_int ^ mult_int ^ repeat_int ^ op_int ^
+            step_int ^ skip_int ^ inner_int;
+        printNum("[zig_compiler] computed checksum=", checksum);
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], CHECKSUM_SENTINEL, checksum);
+        printNum("[zig_compiler] patched checksum hits=", h);
     }
     // Always patch the array length (even if 0) so the spawned binary
     // doesn't iterate against the raw sentinel.

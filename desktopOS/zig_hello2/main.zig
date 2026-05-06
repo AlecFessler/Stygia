@@ -193,6 +193,7 @@ var op_value: u64 = 0xCAFEBABE_05E1EC70;
 var step_value: u64 = 0xCAFEBABE_57E90001;
 var skip_value: u64 = 0xCAFEBABE_5C1A0001;
 var inner_value: u64 = 0xCAFEBABE_19E70001;
+var checksum_value: u64 = 0xCAFEBABE_C5E60001;
 
 // Source-defined u64 array — first variable-length structured data.
 // values_len = how many slots zig_compiler patched; values_arr =
@@ -335,6 +336,26 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     // shifts the per-iter `result` summary printed below.
     const combined: u64 = result +% sum;
     printLine("[runtime] result+sum=", combined);
+
+    // Compiler-computed checksum: XOR of every scalar source int.
+    // The compiler computes this AT COMPILE TIME and patches the
+    // value into checksum_value. The spawned binary recomputes it
+    // independently from its loaded sentinels and reports whether
+    // the two agree. Phase 4e (patched) → OK; Phase 4a/4d (raw
+    // sentinels in both stored and inputs) → MISMATCH because the
+    // CHECKSUM_SENTINEL is unrelated to the XOR of the other raw
+    // sentinels.
+    const checksum_ptr: *volatile u64 = &checksum_value;
+    const v_checksum = checksum_ptr.*;
+    const recomputed: u64 =
+        v_seed ^ v_mult ^ v_repeat ^ v_op ^ v_step ^ v_skip ^ v_inner;
+    printLine("[runtime] checksum_stored=", v_checksum);
+    printLine("[runtime] checksum_computed=", recomputed);
+    if (v_checksum == recomputed) {
+        print("[runtime] checksum match=OK\n");
+    } else {
+        print("[runtime] checksum match=MISMATCH\n");
+    }
 
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
