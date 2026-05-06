@@ -885,7 +885,10 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     //      seed     → first decimal int after the second string
     //      mult     → second decimal int after the second string
     //      repeat   → third decimal int after the second string
+    //      op_name  → third quoted string ("mul"|"add"|"sub"|"xor")
+    //                 — compiler maps this to op int and OVERRIDES op
     //      op       → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
+    //                 — used as fallback if op_name unknown/missing
     //      step     → fifth decimal int — added to result per iteration
     //      skip_idx → sixth decimal int — iter loop skips i==skip_idx
     //      inner    → seventh decimal int — inner loop count per outer iter
@@ -898,6 +901,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
+        "pub const op_name = \"xor\";\n" ++
         "pub const seed = 1337;\n" ++
         "pub const mult = 9;\n" ++
         "pub const repeat = 4;\n" ++

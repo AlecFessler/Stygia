@@ -374,12 +374,15 @@ var elf_buf: [60 * 1024]u8 = undefined;
 const BANNER_PREFIX = "[zig_hello2]";
 const BANNER_LEN: usize = 76; // total chars including trailing '\n'
 
-// Strings extracted from /hello.zig — the first two quoted literals.
-// First → tag (becomes the bracketed prefix), second → banner body.
+// Strings extracted from /hello.zig — the first three quoted literals.
+// First → tag (becomes the bracketed prefix), second → banner body,
+// third → op_name (mapped to an op_int via opNameToInt).
 var tag_buf: [32]u8 = undefined;
 var tag_len: usize = 0;
 var banner_buf: [128]u8 = undefined;
 var banner_len: usize = 0;
+var op_name_buf: [16]u8 = undefined;
+var op_name_len: usize = 0;
 
 // Integers extracted from /hello.zig — first three decimal literals
 // after the second quoted string. seed → " seed=<n>" suffix in the
@@ -405,10 +408,9 @@ const VALUES_MAX: usize = 4;
 var values_buf: [VALUES_MAX]u64 = .{ 0, 0, 0, 0 };
 var values_count: usize = 0;
 
-// Extract up to two quoted-string literals from `src[0..src_len]` and
-// the first decimal integer that appears after the second quoted
-// string. Returns the number of strings found (0, 1, or 2). The int
-// is reported via `seed_found` / `seed_int`.
+// Extract up to three quoted-string literals from `src[0..src_len]`:
+//   1st → tag, 2nd → banner, 3rd → op_name.
+// Then scans for decimal int literals after the third quoted string.
 fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
     var found: usize = 0;
     var in_str = false;
@@ -438,8 +440,29 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             while (k < cap) : (k += 1) banner_buf[k] = src[str_start + 1 + k];
             banner_len = cap;
             found = 2;
+        } else if (found == 2) {
+            const cap = if (n > op_name_buf.len) op_name_buf.len else n;
+            var k: usize = 0;
+            while (k < cap) : (k += 1) op_name_buf[k] = src[str_start + 1 + k];
+            op_name_len = cap;
+            found = 3;
             after_second = end + 1;
             break;
+        }
+    }
+    // Fallback: if only 2 strings present, start int scan after the 2nd.
+    if (after_second == null and found == 2) {
+        // Re-scan to find the position right after the 2nd closing quote.
+        var qcount: usize = 0;
+        var p: usize = 0;
+        while (p < src_len) : (p += 1) {
+            if (src[p] == '"') {
+                qcount += 1;
+                if (qcount == 4) {
+                    after_second = p + 1;
+                    break;
+                }
+            }
         }
     }
     // Scan for decimal int literals after the second quoted string.
@@ -515,6 +538,25 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
         }
     }
     return found;
+}
+
+// Map a parsed source op_name string to an op int.
+// Returns null if the name doesn't match any known op.
+fn opNameToInt(name: []const u8) ?u64 {
+    if (eqStr(name, "mul")) return 0;
+    if (eqStr(name, "add")) return 1;
+    if (eqStr(name, "sub")) return 2;
+    if (eqStr(name, "xor")) return 3;
+    return null;
+}
+
+fn eqStr(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
 }
 
 // Find every occurrence of the 8-byte sentinel (little-endian) and
@@ -671,6 +713,19 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     }
     printNum("[zig_compiler] extracted tag len=", tag_len);
     printNum("[zig_compiler] extracted banner len=", banner_len);
+    if (op_name_len > 0) {
+        printNum("[zig_compiler] extracted op_name len=", op_name_len);
+        const original = op_int;
+        if (opNameToInt(op_name_buf[0..op_name_len])) |mapped| {
+            op_int = mapped;
+            op_found = true;
+            print("[zig_compiler] op_name mapped to int (overrides op_int)\n");
+            printNum("[zig_compiler] op_name_mapped=", mapped);
+            printNum("[zig_compiler] previous_op_int=", original);
+        } else {
+            print("[zig_compiler] op_name unknown, keeping op_int as-is\n");
+        }
+    }
     if (seed_found) {
         printNum("[zig_compiler] extracted seed=", seed_int);
     } else {
