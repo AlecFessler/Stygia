@@ -97,25 +97,31 @@ pub const PerCore = struct {
     /// when the run queue is empty. Pinned to this core via affinity.
     idle_ec: ?SlabRef(ExecutionContext) = null,
 
-    /// EC handed off to this core for deferred destroy. Set by a remote
-    /// `terminate` when the target was the running EC on this core —
-    /// freeing kstack pages + slab slot inline would race with this
-    /// core's still-in-flight syscall handler. The next `switchTo` on
-    /// this core finalizes the destroy after the kstack/CR3 swap moves
-    /// execution onto the new EC's stack. Single-slot is enough: a
-    /// second pending termination on the same core blocks until this
-    /// one is reaped.
+    /// ECs handed off to this core for deferred destroy, indexed by
+    /// POSTING core id. Each `terminate` on core P targeting an EC
+    /// last-dispatched on core T writes `pending_zombie[P]` on core T's
+    /// slab; the next `switchTo` / `parkAndAwaitIRQ` / `yieldTo`-empty
+    /// on T walks all `MAX_CORES` columns and finalizes every non-null
+    /// entry whose kstack isn't currently `rsp`.
+    ///
+    /// Per-poster slots eliminate the contention spin that the prior
+    /// single-slot design hit when multiple cores simultaneously
+    /// terminated ECs targeting the same core: each poster owns its
+    /// column, so the only collision is same-poster-back-to-back which
+    /// is rare in practice (terminate is single-syscall) and resolves
+    /// in the next reap cycle.
     ///
     /// Stored as `SlabRef(ExecutionContext)` (rather than bare pointer)
     /// to satisfy the gen-lock-analyzer fat-pointer invariant — the gen
     /// captured at posting time is the *post-bump* even gen, and reap
-    /// callers only use `pending_zombie.ptr` for identity comparison
-    /// + `finalizeDestroyMarkedDead` (which already operates on a
-    /// `*EC` bypassing gen-lock checks because the slot is in its
+    /// callers only use the `.ptr` for identity comparison +
+    /// `finalizeDestroyMarkedDead` (which already operates on a `*EC`
+    /// bypassing gen-lock checks because the slot is in its
     /// post-bump-pre-destroyAlreadyMarked state). No `lockWithGen`
-    /// against this ref ever runs; the field type is just a contract
-    /// declaration.
-    pending_zombie: ?SlabRef(ExecutionContext) = null,
+    /// against these refs ever runs; the field type is a contract
+    /// declaration only.
+    pending_zombie: [MAX_CORES]?SlabRef(ExecutionContext) =
+        [_]?SlabRef(ExecutionContext){null} ** MAX_CORES,
 
     /// Per-core "park" kstack — the kstack this core uses while no real
     /// EC is dispatched. Allocated at `perCoreInit`; sized like any
@@ -398,7 +404,7 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // path); finalize takes port + CD locks via lockIrqSave which is
     // safe — both classes are already classified as IRQ-acquired by
     // expireTimedRecvWaiters.
-    if (takeOwnPendingZombie()) |z| {
+    while (takeOwnPendingZombie()) |z| {
         execution_context.finalizeDestroyMarkedDead(z);
     }
 }
@@ -457,7 +463,7 @@ fn parkAndAwaitIRQ() noreturn {
     // takeOwnPendingZombie skips when standing-on-zombie (still on the
     // caller's kstack here, before the asm rsp swap), so a same-EC
     // pending zombie is correctly deferred to the next iteration.
-    if (takeOwnPendingZombie()) |z| {
+    while (takeOwnPendingZombie()) |z| {
         execution_context.finalizeDestroyMarkedDead(z);
     }
 
@@ -662,12 +668,12 @@ pub inline fn coreIsIdle(core: u8) bool {
     return (&core_states[core]).current_ec == null;
 }
 
-/// Hand off `ec` to `core`'s pending_zombie slot. The next `switchTo`
-/// on that core reaps it once the kstack swap moves execution off
-/// `ec.kernel_stack`. Returns false if the slot already holds a
-/// different zombie awaiting reap; the caller must spin until it
-/// drains rather than overwrite (clobbering would leak the prior
-/// zombie's kstack + slab slot).
+/// Hand off `ec` to `core`'s pending_zombie array, in this poster's
+/// own column. Reap on `core` walks the whole array each cycle and
+/// finalizes every non-null entry whose kstack isn't currently `rsp`.
+/// Returns false only on same-poster-back-to-back contention (this
+/// poster's previous zombie hasn't been reaped on `core` yet);
+/// caller spins until that drains rather than clobber.
 /// `pre_bump_gen` is the EC's gen captured BEFORE `bumpDeadGenLocked`
 /// flipped it to even — the SlabRef would otherwise assert on
 /// `gen % 2 == 1` when constructed from the freed-parity gen. The
@@ -676,21 +682,25 @@ pub inline fn coreIsIdle(core: u8) bool {
 /// destroyAlreadyMarked freed state), so the carried gen is just a
 /// constructor-side parity placeholder.
 pub fn postZombie(core: u8, ec: *ExecutionContext, pre_bump_gen: u63) bool {
+    const self_core: u8 = @truncate(arch.smp.coreID());
     const pc = &core_states[core];
-    // core_locks[core] serializes the read-modify-write of `pending_zombie`
-    // against the target core's reap in arch.switchTo. Without this lock
-    // the SlabRef (16 bytes — tag + ptr + gen) is read non-atomically by
-    // the reader while another core writes it, producing torn reads:
-    // .ptr from the new post combined with the old null tag, or vice
-    // versa. The reaper would then `finalizeDestroyMarkedDead(garbage)`.
+    // core_locks[core] serializes the read-modify-write of one
+    // pending_zombie column against the target core's reap walk in
+    // arch.switchTo. Without this lock the SlabRef (16 bytes — tag +
+    // ptr + gen) is read non-atomically by the reader while another
+    // core writes it, producing torn reads: .ptr from the new post
+    // combined with the old null tag, or vice versa. The reaper would
+    // then `finalizeDestroyMarkedDead(garbage)`. The lock is per-target
+    // (not per-poster column) because the reaper walks all columns.
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     defer lock.unlockIrqRestore(irq);
-    if (pc.pending_zombie) |existing| {
-        if (existing.ptr != ec) return false;
-        return true;
+    const slot = &pc.pending_zombie[self_core];
+    if (slot.*) |existing| {
+        if (existing.ptr == ec) return true;
+        return false;
     }
-    pc.pending_zombie = SlabRef(ExecutionContext).init(ec, pre_bump_gen);
+    slot.* = SlabRef(ExecutionContext).init(ec, pre_bump_gen);
     return true;
 }
 
@@ -709,16 +719,20 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
     const lock = &core_locks[cid];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     defer lock.unlockIrqRestore(irq);
-    const slot = &(&core_states[cid]).pending_zombie;
-    const zr = slot.* orelse return null;
-    const z = zr.ptr;
+    const slots = &(&core_states[cid]).pending_zombie;
     const rsp_addr = arch.cpu.currentSp();
-    const z_top = z.kernel_stack.top.addr;
-    const z_base = z.kernel_stack.base.addr;
-    const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
-    if (standing_on_zombie) return null;
-    slot.* = null;
-    return z;
+    var i: u8 = 0;
+    while (i < MAX_CORES) : (i += 1) {
+        const zr = slots[i] orelse continue;
+        const z = zr.ptr;
+        const z_top = z.kernel_stack.top.addr;
+        const z_base = z.kernel_stack.base.addr;
+        const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
+        if (standing_on_zombie) continue;
+        slots[i] = null;
+        return z;
+    }
+    return null;
 }
 
 // ── State transitions used by other subsystems ───────────────────────

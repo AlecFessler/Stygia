@@ -2712,24 +2712,32 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // remote postZombie writer. Drop the lock before
         // finalizeDestroyMarkedDead so the unmap path doesn't run with
         // a per-core spinlock held — finalize takes its own locks.
-        const zombie_to_reap: ?*ExecutionContext = blk: {
-            const lock = &scheduler.core_locks[cid];
-            const irq = lock.lockIrqSaveOrdered(@src(), scheduler.SCHED_CORE_GROUP);
-            defer lock.unlockIrqRestore(irq);
-            const slot = &(&scheduler.core_states[cid]).pending_zombie;
-            const zr = slot.* orelse break :blk null;
-            const z = zr.ptr;
-            const rsp_addr = asm volatile ("movq %%rsp, %[out]"
-                : [out] "=r" (-> u64),
-            );
-            const z_top = z.kernel_stack.top.addr;
-            const z_base = z.kernel_stack.base.addr;
-            const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
-            if (standing_on_zombie or ec == z) break :blk null;
-            slot.* = null;
-            break :blk z;
-        };
-        if (zombie_to_reap) |z| {
+        // Walk all per-poster columns; under cross-core load multiple
+        // peers can have queued zombies on this core's slab, and
+        // single-take here would let the backlog grow unbounded.
+        while (true) {
+            const zombie_to_reap: ?*ExecutionContext = blk: {
+                const lock = &scheduler.core_locks[cid];
+                const irq = lock.lockIrqSaveOrdered(@src(), scheduler.SCHED_CORE_GROUP);
+                defer lock.unlockIrqRestore(irq);
+                const slots = &(&scheduler.core_states[cid]).pending_zombie;
+                const rsp_addr = asm volatile ("movq %%rsp, %[out]"
+                    : [out] "=r" (-> u64),
+                );
+                var i: u8 = 0;
+                while (i < scheduler.MAX_CORES) : (i += 1) {
+                    const zr = slots[i] orelse continue;
+                    const z = zr.ptr;
+                    const z_top = z.kernel_stack.top.addr;
+                    const z_base = z.kernel_stack.base.addr;
+                    const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
+                    if (standing_on_zombie or ec == z) continue;
+                    slots[i] = null;
+                    break :blk z;
+                }
+                break :blk null;
+            };
+            const z = zombie_to_reap orelse break;
             zag.sched.execution_context.finalizeDestroyMarkedDead(z);
         }
     }

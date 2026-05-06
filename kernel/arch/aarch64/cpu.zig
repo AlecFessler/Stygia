@@ -428,32 +428,39 @@ export fn restoreContextAndEret() callconv(.naked) noreturn {
 /// DDI 0487 §D1.10.1 (ERET) restores PC from ELR_EL1 and PSTATE from
 /// SPSR_EL1, switching exception level per SPSR.M.
 pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
-    // Drain a pending zombie if one is parked on this core and we are
-    // not standing on its kernel stack. Mirrors the x86 reaper in
+    // Drain pending zombies parked on this core's slab. Walks all
+    // per-poster columns; under cross-core load multiple peers can
+    // queue zombies here simultaneously and single-take would let the
+    // backlog grow unbounded. Mirrors the x86 reaper in
     // arch/x64/interrupts.zig switchTo. The per-core lock serializes
     // the read-modify-write against remote postZombie writers; we drop
     // the lock before finalize so its own locks aren't nested.
     {
         const cid: u8 = @truncate(zag.arch.aarch64.gic.coreID());
         const sched_mod = zag.sched.scheduler;
-        const zombie_to_reap: ?*ExecutionContext = blk: {
-            const lock = &sched_mod.core_locks[cid];
-            const irq = lock.lockIrqSaveOrdered(@src(), sched_mod.SCHED_CORE_GROUP);
-            defer lock.unlockIrqRestore(irq);
-            const slot = &(&sched_mod.core_states[cid]).pending_zombie;
-            const zr = slot.* orelse break :blk null;
-            const z = zr.ptr;
-            const sp_addr = asm volatile ("mov %[out], sp"
-                : [out] "=r" (-> u64),
-            );
-            const z_top = z.kernel_stack.top.addr;
-            const z_base = z.kernel_stack.base.addr;
-            const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;
-            if (standing_on_zombie or ec == z) break :blk null;
-            slot.* = null;
-            break :blk z;
-        };
-        if (zombie_to_reap) |z| {
+        while (true) {
+            const zombie_to_reap: ?*ExecutionContext = blk: {
+                const lock = &sched_mod.core_locks[cid];
+                const irq = lock.lockIrqSaveOrdered(@src(), sched_mod.SCHED_CORE_GROUP);
+                defer lock.unlockIrqRestore(irq);
+                const slots = &(&sched_mod.core_states[cid]).pending_zombie;
+                const sp_addr = asm volatile ("mov %[out], sp"
+                    : [out] "=r" (-> u64),
+                );
+                var i: u8 = 0;
+                while (i < sched_mod.MAX_CORES) : (i += 1) {
+                    const zr = slots[i] orelse continue;
+                    const z = zr.ptr;
+                    const z_top = z.kernel_stack.top.addr;
+                    const z_base = z.kernel_stack.base.addr;
+                    const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;
+                    if (standing_on_zombie or ec == z) continue;
+                    slots[i] = null;
+                    break :blk z;
+                }
+                break :blk null;
+            };
+            const z = zombie_to_reap orelse break;
             zag.sched.execution_context.finalizeDestroyMarkedDead(z);
         }
     }

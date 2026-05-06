@@ -760,7 +760,7 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         // caller-EC's kstack, and this terminate target is a different
         // EC). Without this self-help, the spin deadlocks the core.
         if (core == self_core) {
-            if (scheduler.takeOwnPendingZombie()) |z| {
+            while (scheduler.takeOwnPendingZombie()) |z| {
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
@@ -1707,7 +1707,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
         // there for why the spin would otherwise deadlock when
         // self == target.
         if (core == self_core) {
-            if (scheduler.takeOwnPendingZombie()) |z| {
+            while (scheduler.takeOwnPendingZombie()) |z| {
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }

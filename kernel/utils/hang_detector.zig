@@ -257,9 +257,16 @@ fn dumpCore(core_id: u8) void {
         rawWrite(" current_ec=null");
     }
 
-    if (pc.pending_zombie) |zref| {
-        rawWrite(" pending_zombie=");
-        printHex(@intFromPtr(zref.ptr));
+    {
+        var pending_count: usize = 0;
+        var i: usize = 0;
+        while (i < pc.pending_zombie.len) : (i += 1) {
+            if (pc.pending_zombie[i] != null) pending_count += 1;
+        }
+        if (pending_count != 0) {
+            rawWrite(" pending_zombies=");
+            printDecimal(pending_count);
+        }
     }
 
     rawWrite("\n");
