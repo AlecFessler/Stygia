@@ -79,20 +79,11 @@ pub fn arm() void {
     emitHeartbeatByte('A'); // confirm arm() ran (use 'A' not '@' — '@' is the all-idle dump trigger)
 }
 
-/// Bump progress timestamp. Inlined into the printRaw hot path so the
-/// per-byte cost is one TSC-read + one atomic store. (No byte filter —
-/// any kernel-side serial output is "real progress".)
-pub fn noteProgress() void {
-    if (builtin.cpu.arch != .x86_64) return;
-    if (!armed.load(.acquire)) return;
-    last_progress_ns.store(arch.time.currentMonotonicNs(), .release);
-}
-
-/// Like `noteProgress` but only stamps progress on a `\n`. Used in the
-/// userspace COM1 emulation path: a partial line emitted between long
-/// stalls (the smp=4 hang signature in this branch — runner intermittently
-/// completes one PASS, prints `[`, then re-stalls for tens of seconds) is
-/// not progress. A full line worth of bytes is.
+/// Stamps progress on a `\n` byte. Used in the userspace COM1 emulation
+/// path: a partial line emitted between long stalls (the smp=4 hang
+/// signature in this branch — runner intermittently completes one PASS,
+/// prints `[`, then re-stalls for tens of seconds) is not progress. A
+/// full line worth of bytes is.
 pub fn noteProgressOnNewline(b: u8) void {
     if (builtin.cpu.arch != .x86_64) return;
     if (b != '\n') return;
@@ -132,43 +123,10 @@ pub fn tickCheck() void {
         return;
     }
 
-    // All-cores-idle detector disabled: false-positives between batches
-    // when every test EC exits and the next batch hasn't been spawned
-    // yet trip the 5-consecutive-tick threshold. The 2 s newline-progress
-    // threshold above is the reliable signal — a real lost-wakeup hang
-    // never emits more newlines.
-    _ = &allCoresIdle;
-}
-
-/// Snapshot of `last_progress_ns` at the moment the watchdog first
-/// observes `allCoresIdle()`. Used to reject transient all-idle
-/// states where userspace IS still emitting newlines through the
-/// idle window (between-batch dispatch transitions).
-var idle_last_progress: std.atomic.Value(u64) =
-    std.atomic.Value(u64).init(0);
-
-var consecutive_idle: std.atomic.Value(u32) =
-    std.atomic.Value(u32).init(0);
-
-/// Read every initialized per-core state and return true iff every
-/// core's `current_ec` is null AND every run queue is empty across
-/// every level. Inlined so the watchdog NMI path doesn't pay a call
-/// frame; the loops are tiny (4 cores × 8 levels in current configs).
-fn allCoresIdle() bool {
-    @setRuntimeSafety(false);
-    const num_cores = arch.smp.coreCount();
-    var i: u8 = 0;
-    while (i < num_cores) {
-        const pc = &scheduler.core_states[i];
-        if (pc.current_ec != null) return false;
-        var lvl: usize = 0;
-        while (lvl < pc.run_queue.levels.len) {
-            if (pc.run_queue.levels[lvl].head != null) return false;
-            lvl += 1;
-        }
-        i += 1;
-    }
-    return true;
+    // The original all-cores-idle detector tripped on transient between-
+    // batch all-idle windows. The 2 s newline-progress threshold above
+    // is the reliable signal — a real lost-wakeup hang never emits more
+    // newlines.
 }
 
 fn emitHeartbeatByte(b: u8) void {
