@@ -236,6 +236,26 @@ pub fn main() !void {
     // Now via std.fs.File.writeAll — uses writev internally but skips
     // the buffered std.io.Writer / seek/lseek dance.
     try std.fs.File.stderr().writeAll("[zig_hello_std] hello via std.fs.File.writeAll\n");
+
+    // Now exercise the buffered Writer (fs.File.Writer + Io.Writer
+    // interface). Requires lseek-on-stderr to return ESPIPE so the
+    // Writer treats it as non-seekable.
+    {
+        const m = "[zig_hello_std] before buffered Writer\n";
+        _ = std.posix.write(2, m) catch {};
+    }
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.writeAll("[zig_hello_std] hello via buffered std.io.Writer\n") catch {
+        _ = std.posix.write(2, "[zig_hello_std] buffered writeAll WriteFailed\n") catch {};
+    };
+    w.interface.flush() catch {
+        _ = std.posix.write(2, "[zig_hello_std] buffered flush WriteFailed\n") catch {};
+    };
+    {
+        const m = "[zig_hello_std] after buffered Writer\n";
+        _ = std.posix.write(2, m) catch {};
+    }
 }
 
 export fn _start(cap_table_base: u64) callconv(.c) noreturn {
