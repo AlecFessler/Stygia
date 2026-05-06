@@ -880,18 +880,20 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 4e: compile + spawn from disk\n");
 
     // 1. Stage /hello.zig source bytes. The compiler extracts:
-    //      tag    → first quoted string  (bracketed prefix)
-    //      banner → second quoted string (body)
-    //      seed   → first decimal int after the second string
-    //      mult   → second decimal int after the second string
-    //      repeat → third decimal int after the second string
-    //      op     → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
-    //      step   → fifth decimal int — added to result per iteration
-    //      values → remaining decimal ints (up to 4) become a u64 array
+    //      tag      → first quoted string  (bracketed prefix)
+    //      banner   → second quoted string (body)
+    //      seed     → first decimal int after the second string
+    //      mult     → second decimal int after the second string
+    //      repeat   → third decimal int after the second string
+    //      op       → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
+    //      step     → fifth decimal int — added to result per iteration
+    //      skip_idx → sixth decimal int — iter loop skips i==skip_idx
+    //      values   → remaining decimal ints (up to 4) become a u64 array
     //    Output banner: "[<tag>] <banner> seed=<n>".
     //    Spawned binary BRANCHES on op_value to compute base, then
-    //    loops `repeat` times printing "[runtime] iter=N result=base+N*step",
-    //    then prints "[runtime] values[i]=v" for each source array slot.
+    //    loops `repeat` times skipping iter `skip_idx` and printing
+    //    "[runtime] iter=N result=base+N*step", then prints values
+    //    array + sum/max reduction.
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
@@ -900,6 +902,7 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
         "pub const repeat = 4;\n" ++
         "pub const op = 1;\n" ++
         "pub const step = 7;\n" ++
+        "pub const skip_idx = 2;\n" ++
         "pub const values = [_]u64{ 100, 200, 300 };\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);

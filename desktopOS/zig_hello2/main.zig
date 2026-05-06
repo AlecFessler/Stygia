@@ -191,6 +191,7 @@ var mult_value: u64 = 0xCAFEBABE_FACE0001;
 var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
 var op_value: u64 = 0xCAFEBABE_05E1EC70;
 var step_value: u64 = 0xCAFEBABE_57E90001;
+var skip_value: u64 = 0xCAFEBABE_5C1A0001;
 
 // Source-defined u64 array — first variable-length structured data.
 // values_len = how many slots zig_compiler patched; values_arr =
@@ -239,11 +240,13 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const repeat_ptr: *volatile u64 = &repeat_value;
     const op_ptr: *volatile u64 = &op_value;
     const step_ptr: *volatile u64 = &step_value;
+    const skip_ptr: *volatile u64 = &skip_value;
     const v_seed = seed_ptr.*;
     const v_mult = mult_ptr.*;
     const v_repeat = repeat_ptr.*;
     const v_op = op_ptr.*;
     const v_step = step_ptr.*;
+    const v_skip = skip_ptr.*;
 
     // Source-selectable operation: 0=mul, 1=add, 2=sub, 3=xor; anything
     // else (including the unpatched sentinel) → mul (default).
@@ -270,15 +273,23 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     print(op_label);
     print("\n");
     printLine("[runtime] step=", v_step);
+    printLine("[runtime] skip_idx=", v_skip);
 
     // Source-driven control flow: loop iteration count comes from a
     // source-file constant that flows through the compiler into a
     // patched .data sentinel and out through a volatile load. Cap to
     // 8 so an unpatched sentinel (Phase 4a/4d) caps at a reasonable
-    // value rather than spamming the serial log.
+    // value rather than spamming the serial log. Per-iteration
+    // conditional: also source-driven — skip the iter where i ==
+    // skip_idx (the unpatched sentinel doesn't match any iter index
+    // 0..7 so all iters print under raw conditions).
     const cap: u64 = if (v_repeat > 8) 8 else v_repeat;
     var i: u64 = 0;
     while (i < cap) {
+        if (i == v_skip) {
+            i += 1;
+            continue;
+        }
         // Per-iter unique value: source-driven `step` interacts with
         // the loop counter so each iter prints a distinct number.
         const per_iter: u64 = result +% (i *% v_step);
