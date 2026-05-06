@@ -218,20 +218,21 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────
-    // doom needs: COM1 (logging), framebuffer device_region, usb_port
-    // (xfer|bind for fast-suspend input polling). The WAD is embedded
-    // in doom.elf — no fs port required.
-    if (findFramebuffer(cap_table_base)) |fb_slot| {
-        const doom_pf = stageElfPageFrame(services.doom_elf) orelse powerShutdown();
-        var passed: [MAX_PASSED]u64 = undefined;
-        var n: usize = 0;
-        appendDevice(&passed, &n, com1, .{});
-        appendDevice(&passed, &n, fb_slot, .{});
-        appendPort(&passed, &n, usb_port, .{ .xfer = true, .bind = true });
-        _ = spawnService("doom", doom_pf, passed[0..n]) orelse powerShutdown();
-    } else {
-        log.print("[desktopOS] no framebuffer; skipping doom spawn\n");
-    }
+    // Temporarily disabled while iterating on Phase 4 — doom's tick
+    // loop hogs CPU and its WAD startup spam interleaves with the
+    // compiler/spawn output we want to verify. Re-enable when the
+    // Phase 4 demo runs against a stable kernel.
+    // if (findFramebuffer(cap_table_base)) |fb_slot| {
+    //     const doom_pf = stageElfPageFrame(services.doom_elf) orelse powerShutdown();
+    //     var passed: [MAX_PASSED]u64 = undefined;
+    //     var n: usize = 0;
+    //     appendDevice(&passed, &n, com1, .{});
+    //     appendDevice(&passed, &n, fb_slot, .{});
+    //     appendPort(&passed, &n, usb_port, .{ .xfer = true, .bind = true });
+    //     _ = spawnService("doom", doom_pf, passed[0..n]) orelse powerShutdown();
+    // } else {
+    //     log.print("[desktopOS] no framebuffer; skipping doom spawn\n");
+    // }
 
     log.print("[desktopOS] services spawned; root parking\n");
     while (true) {

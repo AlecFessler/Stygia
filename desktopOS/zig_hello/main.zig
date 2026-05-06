@@ -751,11 +751,21 @@ fn roundtripPfThroughDisk(
         printNumLine(inv.serial_port, serial_va, "[zig_hello] roundtrip: create status=", cr.status);
         return null;
     }
-    const elf_slice = src[0..elf_size];
-    const wr = fsPwrite(inv.fs_port, fs_va, dst_path, 0, elf_slice);
-    if (wr.status != 0 or wr.bytes_written != elf_size) {
-        print2NumLine(inv.serial_port, serial_va, "[zig_hello] roundtrip: pwrite status=", wr.status, " bytes=", wr.bytes_written);
-        return null;
+    // io_scratch (16 pages = 64 KiB) limits each pwrite/pread to
+    // scratch_size - path_len bytes. Chunk so binaries > ~60 KiB
+    // (e.g. zig_compiler.elf) round-trip via multiple IPCs.
+    const CHUNK: u64 = 32 * 1024;
+    var off: u64 = 0;
+    while (off < elf_size) {
+        const remaining: u64 = elf_size - off;
+        const this_chunk: u64 = if (remaining > CHUNK) CHUNK else remaining;
+        const elf_slice = src[off .. off + this_chunk];
+        const wr = fsPwrite(inv.fs_port, fs_va, dst_path, off, elf_slice);
+        if (wr.status != 0 or wr.bytes_written != this_chunk) {
+            print2NumLine(inv.serial_port, serial_va, "[zig_hello] roundtrip: pwrite status=", wr.status, " bytes=", wr.bytes_written);
+            return null;
+        }
+        off += this_chunk;
     }
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, src_map.vmar) });
 
@@ -772,12 +782,10 @@ fn readDiskFileToFreshPf(
     path: []const u8,
     max_bytes: u64,
 ) ?u12 {
-    const rb = fsPread(inv.fs_port, fs_va, path, 0, max_bytes);
-    if (rb.status != 0) {
-        printNumLine(inv.serial_port, serial_va, "[zig_hello] readDisk: pread status=", rb.status);
-        return null;
-    }
-    const dst_pages: u64 = (rb.bytes_read + 4095) / 4096;
+    // Chunked pread — io_scratch is 64 KiB; each pread is capped at
+    // 32 KiB so even with overhead the path + data slot fits.
+    const CHUNK: u64 = 32 * 1024;
+    const dst_pages: u64 = (max_bytes + 4095) / 4096;
     if (dst_pages == 0) return null;
     const pf_caps_rwx: u64 = (1 << 2) | (1 << 3) | (1 << 4);
     const cpf = issueRaw(buildWord(SYS_CREATE_PAGE_FRAME, 0), .{
@@ -795,10 +803,27 @@ fn readDiskFileToFreshPf(
         return null;
     };
     const dst: [*]u8 = @ptrFromInt(dst_map.va);
-    const back_src: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
-    var k: u64 = 0;
-    while (k < rb.bytes_read) : (k += 1) dst[k] = back_src[k];
+
+    var off: u64 = 0;
+    var got_any: bool = false;
+    while (off < max_bytes) {
+        const remaining: u64 = max_bytes - off;
+        const want: u64 = if (remaining > CHUNK) CHUNK else remaining;
+        const rb = fsPread(inv.fs_port, fs_va, path, off, want);
+        if (rb.status != 0) {
+            printNumLine(inv.serial_port, serial_va, "[zig_hello] readDisk: pread status=", rb.status);
+            return null;
+        }
+        if (rb.bytes_read == 0) break;
+        const back_src: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
+        var k: u64 = 0;
+        while (k < rb.bytes_read) : (k += 1) dst[off + k] = back_src[k];
+        off += rb.bytes_read;
+        got_any = true;
+        if (rb.bytes_read < want) break; // short read — EOF
+    }
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, dst_map.vmar) });
+    if (!got_any) return null;
     return new_pf;
 }
 
