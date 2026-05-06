@@ -200,25 +200,34 @@ pub fn build(b: *std.Build) void {
         "Path to the patched zig std lib (default: ~/.local/zag-toolchains/zig-0.15.2-src/lib)",
     ) orelse "/home/alec/.local/zag-toolchains/zig-0.15.2-src/lib";
 
-    const hello_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
-    hello_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
-    hello_run.addArgs(&.{
+    // Common build flags for any Zag-target ELF compiled by the
+    // patched no-LLVM Zig compiler.
+    const zag_args = [_][]const u8{
         "-target",         "x86_64-zag-none",
         "-fno-llvm",       "-fno-lld",
         "-fsingle-threaded",
         "-fstrip",         "-OReleaseSmall",
         "-fPIC",           "-fPIE",
-        // CRITICAL: the spec-v3 syscall ABI uses %rbp as the register
-        // backing vreg 4 (see libz/syscall_x64.zig). Without
-        // -fomit-frame-pointer the patched no-LLVM backend keeps %rbp
-        // as a frame pointer; the asm volatile clobbers it across
-        // the `syscall` instruction; the function epilogue then does
-        // `lea -0x28(%rbp), %rsp` and dereferences a garbage stack
-        // pointer (we hit 0xffff…fd8 in practice). All existing
-        // desktopOS services pass `omit_frame_pointer=true` for the
-        // same reason.
+        // spec-v3 syscall ABI uses %rbp as vreg 4; the no-LLVM backend
+        // currently ignores -fomit-frame-pointer, so each Zag-target
+        // binary's syscall asm must use the stack-resident scratch-slot
+        // pattern (see zig_hello/main.zig issueRaw) regardless.
         "-fomit-frame-pointer",
-    });
+    };
+
+    // ── zig_hello2.elf — Phase 4a spawn target. Built like zig_hello
+    //    via the patched compiler; embedded into root_service.elf
+    //    alongside the other services and written to disk on first
+    //    boot so zig_hello can load + spawn it from /hello2.elf.
+    const hello2_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    hello2_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    hello2_run.addArgs(&zag_args);
+    hello2_run.addFileArg(b.path("zig_hello2/main.zig"));
+    const hello2_elf = hello2_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello2.elf");
+
+    const hello_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    hello_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    hello_run.addArgs(&zag_args);
     hello_run.addFileArg(b.path("zig_hello/main.zig"));
     const hello_elf = hello_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello.elf");
 
@@ -451,6 +460,7 @@ pub fn build(b: *std.Build) void {
         "-fno-stack-protector",
         "-fno-builtin",
         "-fno-strict-aliasing",
+        "-fno-sanitize=undefined", // doom predates UBSan-clean expectations
         "-fno-pic",
         "-fPIE",
         "-DDOOMGENERIC",
@@ -560,6 +570,7 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(verify_exe.getEmittedBin(), "verify_fs.elf");
     _ = services_wf.addCopyFile(doom_exe.getEmittedBin(), "doom.elf");
     _ = services_wf.addCopyFile(hello_elf, "zig_hello.elf");
+    _ = services_wf.addCopyFile(hello2_elf, "zig_hello2.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -570,6 +581,7 @@ pub fn build(b: *std.Build) void {
         \\pub const verify_fs_elf = @embedFile("verify_fs.elf");
         \\pub const doom_elf = @embedFile("doom.elf");
         \\pub const zig_hello_elf = @embedFile("zig_hello.elf");
+        \\pub const zig_hello2_elf = @embedFile("zig_hello2.elf");
         \\
     );
     const services_mod = b.createModule(.{

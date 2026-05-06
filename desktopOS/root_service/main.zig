@@ -97,6 +97,9 @@ pub fn main(cap_table_base: u64) void {
     const fs_pf = stageElfPageFrame(services.fs_elf) orelse powerShutdown();
     const verify_pf = stageElfPageFrame(services.verify_fs_elf) orelse powerShutdown();
     const zig_hello_pf = stageElfPageFrame(services.zig_hello_elf) orelse powerShutdown();
+    // Phase 4a: stage zig_hello2.elf so zig_hello can spawn it via
+    // createCapabilityDomain at runtime.
+    const zig_hello2_pf = stageElfPageFrame(services.zig_hello2_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -167,31 +170,31 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // ── Spawn zig_hello ─────────────────────────────────────────────
-    // Phase-0 demo: prints "[zig_hello] hello from zig on zag" via
-    // serial_server IPC. Carries COM1 as a debug fallback while
-    // bringing the IPC path up.
+    // Phase 0–3 demos run inside zig_hello's _start: serial_server IPC,
+    // fs read of /persist_marker, anon mmap, file write round-trip.
     //
-    // Phase-1 demo: also reads `/persist_marker` from the SQL FS via
-    // fs_port + io_scratch, prints the contents through serial_server.
-    // io_scratch is shared with verify_fs — that's a known race risk
-    // but fine for the demo (verify_fs finishes its pass before
-    // zig_hello issues its own fs ops in practice).
+    // Phase 4a: zig_hello receives a pre-staged zig_hello2.elf
+    // page_frame and calls createCapabilityDomain on it at runtime.
+    // The spawn requires `crcd` on zig_hello's self-cap (granted via
+    // spawnUserApp below).
     //
     // Cap-table layout (in zig_hello's domain, slot SLOT_FIRST_PASSED+):
     //   [3] serial_port (xfer|bind)
     //   [4] serial_scratch (r+w, 1 page)
-    //   [5] COM1 device_region (debug fallback)
+    //   [5] COM1 device_region (debug + passable to spawned children)
     //   [6] fs_port (xfer|bind)
     //   [7] io_scratch (r+w, fs_ops.SCRATCH_PAGES)
+    //   [8] zig_hello2_pf page_frame (r+x; the spawn target)
     {
         var passed: [MAX_PASSED]u64 = undefined;
         var n: usize = 0;
         appendPort(&passed, &n, serial_port, .{ .xfer = true, .bind = true });
         appendPf(&passed, &n, serial_scratch, .{ .r = true, .w = true });
-        appendDevice(&passed, &n, com1, .{});
+        appendDevice(&passed, &n, com1, .{ .move = true, .copy = true });
         appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
         appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
-        _ = spawnService("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
+        appendPf(&passed, &n, zig_hello2_pf, .{ .move = true, .r = true, .x = true });
+        _ = spawnUserApp("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────
@@ -303,7 +306,12 @@ fn createPf(pages: u64) ?HandleId {
     return @truncate(c.v1 & 0xFFF);
 }
 
-fn spawnService(name: []const u8, elf_pf: HandleId, passed: []const u64) ?HandleId {
+fn spawnImpl(
+    name: []const u8,
+    elf_pf: HandleId,
+    passed: []const u64,
+    child_self: caps.SelfCap,
+) ?HandleId {
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0x01FF) << 8) |
@@ -312,16 +320,6 @@ fn spawnService(name: []const u8, elf_pf: HandleId, passed: []const u64) ?Handle
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x1C) << 48);
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
-
-    const child_self = caps.SelfCap{
-        .crec = true,
-        .crvr = true,
-        .crpf = true,
-        .crpt = true,
-        .fut_wake = true,
-        .timer = true,
-        .pri = 2,
-    };
 
     const r = syscall.createCapabilityDomain(
         @as(u64, child_self.toU16()),
@@ -348,6 +346,37 @@ fn spawnService(name: []const u8, elf_pf: HandleId, passed: []const u64) ?Handle
     log.dec(passed.len);
     log.print(")\n");
     return idc;
+}
+
+// Default service spawn: no `crcd` (services don't spawn children).
+fn spawnService(name: []const u8, elf_pf: HandleId, passed: []const u64) ?HandleId {
+    const child_self = caps.SelfCap{
+        .crec = true,
+        .crvr = true,
+        .crpf = true,
+        .crpt = true,
+        .fut_wake = true,
+        .timer = true,
+        .pri = 2,
+    };
+    return spawnImpl(name, elf_pf, passed, child_self);
+}
+
+// "User app" spawn: same as a service plus `crcd` (so the spawned
+// domain can call createCapabilityDomain itself — Phase 4a / Phase 4
+// when zig_hello loads + spawns ELFs at runtime).
+fn spawnUserApp(name: []const u8, elf_pf: HandleId, passed: []const u64) ?HandleId {
+    const child_self = caps.SelfCap{
+        .crcd = true,
+        .crec = true,
+        .crvr = true,
+        .crpf = true,
+        .crpt = true,
+        .fut_wake = true,
+        .timer = true,
+        .pri = 2,
+    };
+    return spawnImpl(name, elf_pf, passed, child_self);
 }
 
 fn stageElfPageFrame(elf_bytes: []const u8) ?HandleId {

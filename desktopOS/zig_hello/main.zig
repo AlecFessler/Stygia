@@ -49,6 +49,7 @@ const FS_SCRATCH_BYTES: u64 = FS_SCRATCH_PAGES * 4096;
 // ── Syscall ABI ─────────────────────────────────────────────────────
 const SYS_SUSPEND: u12 = 14;
 const SYS_DELETE: u12 = 16;
+const SYS_CREATE_CAPABILITY_DOMAIN: u12 = 19;
 const SYS_CREATE_VMAR: u12 = 32;
 const SYS_MAP_PF: u12 = 33;
 const SYS_MAP_MMIO: u12 = 34;
@@ -216,16 +217,21 @@ fn issueRaw(word: u64, in: Regs) Regs {
 const Inbound = struct {
     serial_port: u12 = 0,
     serial_scratch: u12 = 0,
+    com1: u12 = 0,
     fs_port: u12 = 0,
     fs_scratch: u12 = 0,
+    spawn_elf_pf: u12 = 0,
     have_serial: bool = false,
     have_fs: bool = false,
+    have_spawn: bool = false,
+    have_com1: bool = false,
 };
 
-// Walk the cap table, collecting serial_port + serial_scratch (first
-// port/page_frame pair) and fs_port + io_scratch (second). Order assumes
-// root_service passes them as: [3]=serial_port, [4]=serial_scratch,
-// [5]=COM1, [6]=fs_port, [7]=io_scratch.
+// Walk the cap table. Convention from root_service spawn order:
+//   [3] serial_port, [4] serial_scratch, [5] COM1 device_region,
+//   [6] fs_port,     [7] io_scratch,     [8] zig_hello2 elf page_frame.
+// Identify by handle-type sequence: ports[0]=serial, ports[1]=fs;
+// page_frames[0]=serial_scratch, [1]=io_scratch, [2]=spawn_elf_pf.
 fn findInbound(cap_table_base: u64) Inbound {
     var inv: Inbound = .{};
     var got_ports: u8 = 0;
@@ -248,15 +254,24 @@ fn findInbound(cap_table_base: u64) Inbound {
                     inv.serial_scratch = @truncate(slot);
                 } else if (got_pfs == 1) {
                     inv.fs_scratch = @truncate(slot);
+                } else if (got_pfs == 2) {
+                    inv.spawn_elf_pf = @truncate(slot);
                 }
                 got_pfs += 1;
             },
+            .device_region => {
+                if (capDevType(c) == .port_io and capDevPort(c) == COM1_BASE_PORT) {
+                    inv.com1 = @truncate(slot);
+                    inv.have_com1 = true;
+                }
+            },
             else => {},
         }
-        if (got_ports >= 2 and got_pfs >= 2) break;
+        if (got_ports >= 2 and got_pfs >= 3 and inv.have_com1) break;
     }
     inv.have_serial = (got_ports >= 1 and got_pfs >= 1);
     inv.have_fs = (got_ports >= 2 and got_pfs >= 2);
+    inv.have_spawn = (got_pfs >= 3);
     return inv;
 }
 
@@ -395,6 +410,75 @@ fn fsUnlink(port: u12, scratch_va: u64, path: []const u8) u64 {
 fn zagExit() noreturn {
     _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
     while (true) asm volatile ("hlt");
+}
+
+// PassedHandle encoding for createCapabilityDomain (mirrors
+// libz/caps.zig PassedHandle):
+//   bits 0-11   = handle id
+//   bits 12-15  = reserved (zero)
+//   bits 16-31  = caps word
+//   bit  32     = move flag
+//   bits 33-63  = reserved (zero)
+fn passedHandle(id: u12, cap_word: u16, move: bool) u64 {
+    return @as(u64, id) |
+        (@as(u64, cap_word) << 16) |
+        (@as(u64, @intFromBool(move)) << 32);
+}
+
+// SelfCap encoding (mirrors libz/caps.zig SelfCap):
+//   crcd, crec, crvr, crpf, crvm, crpt, pmu, setwall, power, restart,
+//   reply_policy, fut_wake, timer (bool bits), pri (u2 at top).
+const CRCD: u16 = 1 << 0;
+const CREC: u16 = 1 << 1;
+const CRVR: u16 = 1 << 2;
+const CRPF: u16 = 1 << 3;
+const CRPT: u16 = 1 << 5;
+const FUT_WAKE: u16 = 1 << 11;
+const TIMER: u16 = 1 << 12;
+
+// DeviceCap encoding: move, copy, dma, irq, restart_policy.
+const DEV_MOVE: u16 = 1 << 0;
+const DEV_COPY: u16 = 1 << 1;
+
+// Spawn a child capability domain from a staged ELF page_frame and a
+// list of pre-encoded passed handles. Returns the IDC handle of the
+// new domain on success, 0 on failure.
+fn spawnDomain(elf_pf: u12, passed: []const u64) u64 {
+    // child SelfCap: minimum needed for our spawned hello binary —
+    // crvr (createVmar for COM1 mapping) + crpt (timer). No crcd —
+    // hello2 doesn't need to spawn further children.
+    const child_self: u64 = CREC | CRVR | CRPF | CRPT;
+    // Permissive ceilings; the kernel intersects with our domain's
+    // existing ceilings, so we can't actually exceed our own.
+    const ceilings_inner: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0x01FF) << 8) |
+        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x1F) << 32) |
+        (@as(u64, 0x01) << 40) |
+        (@as(u64, 0x1C) << 48);
+    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+
+    // createCapabilityDomain takes (caps, ceil_in, ceil_out, elf_pf,
+    // affinity, passed[]). Vregs v1..v5 + passed handles starting at
+    // v6. Up to 8 passed handles fit in registers (v6..v13).
+    var regs = Regs{
+        .v1 = child_self,
+        .v2 = ceilings_inner,
+        .v3 = ceilings_outer,
+        .v4 = @as(u64, elf_pf),
+        .v5 = 0, // affinity = 0 (any core)
+    };
+    if (passed.len >= 1) regs.v6 = passed[0];
+    if (passed.len >= 2) regs.v7 = passed[1];
+    if (passed.len >= 3) regs.v8 = passed[2];
+    if (passed.len >= 4) regs.v9 = passed[3];
+    if (passed.len >= 5) regs.v10 = passed[4];
+    if (passed.len >= 6) regs.v11 = passed[5];
+    if (passed.len >= 7) regs.v12 = passed[6];
+    if (passed.len >= 8) regs.v13 = passed[7];
+    const r = issueRaw(buildWord(SYS_CREATE_CAPABILITY_DOMAIN, 0), regs);
+    return r.v1;
 }
 
 // ── Phase 2 anon-mmap bridge — backs std.os.zag.mmap(MAP_ANONYMOUS) ──
@@ -759,6 +843,58 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     } else {
         serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 3: unlink failed\n");
     }
+
+    // ── Phase 4a: spawn a child capability domain from the staged
+    //    zig_hello2 ELF page_frame. Passes the COM1 device cap so the
+    //    spawned domain can print on its own.
+    if (!inv.have_spawn or !inv.have_com1) {
+        serialPrint(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] phase 4a: missing spawn handles; skipping\n",
+        );
+        zagExit();
+    }
+    debugPrint("[zig_hello] phase 4a: spawning child domain\n");
+
+    var passed: [4]u64 = undefined;
+    passed[0] = passedHandle(inv.com1, DEV_MOVE | DEV_COPY, false);
+    const idc = spawnDomain(inv.spawn_elf_pf, passed[0..1]);
+    if (idc < 16) {
+        var sb: [32]u8 = undefined;
+        const ss = formatU64(&sb, idc);
+        var msg: [96]u8 = undefined;
+        const lead4 = "[zig_hello] phase 4a: createCapabilityDomain err=";
+        var w4: usize = 0;
+        for (lead4) |b| {
+            msg[w4] = b;
+            w4 += 1;
+        }
+        for (ss) |b| {
+            msg[w4] = b;
+            w4 += 1;
+        }
+        msg[w4] = '\n';
+        w4 += 1;
+        serialPrint(inv.serial_port, serial_va, msg[0..w4]);
+        zagExit();
+    }
+    var idc_buf: [32]u8 = undefined;
+    const idc_str = formatU64(&idc_buf, idc & 0xFFF);
+    var p4_line: [96]u8 = undefined;
+    var p4_w: usize = 0;
+    const p4_lead = "[zig_hello] phase 4a: spawned hello2 idc=";
+    for (p4_lead) |b| {
+        p4_line[p4_w] = b;
+        p4_w += 1;
+    }
+    for (idc_str) |b| {
+        p4_line[p4_w] = b;
+        p4_w += 1;
+    }
+    p4_line[p4_w] = '\n';
+    p4_w += 1;
+    serialPrint(inv.serial_port, serial_va, p4_line[0..p4_w]);
 
     zagExit();
 }
