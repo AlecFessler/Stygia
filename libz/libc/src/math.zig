@@ -169,6 +169,12 @@ export fn hypot(x: f64, y: f64) callconv(.c) f64 {
 export fn hypotf(x: f32, y: f32) callconv(.c) f32 {
     return std.math.hypot(x, y);
 }
+export fn fma(x: f64, y: f64, z: f64) callconv(.c) f64 {
+    return @mulAdd(f64, x, y, z);
+}
+export fn fmaf(x: f32, y: f32, z: f32) callconv(.c) f32 {
+    return @mulAdd(f32, x, y, z);
+}
 export fn log1p(x: f64) callconv(.c) f64 {
     return std.math.log1p(x);
 }

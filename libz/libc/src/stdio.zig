@@ -550,6 +550,12 @@ export fn __vsnprintf_chk(buf: ?[*]u8, max: usize, flag: c_int, buflen: usize, f
     return vsnprintf(buf, max, fmt, ap);
 }
 
+export fn puts(s: [*:0]const u8) callconv(.c) c_int {
+    if (fputs(s, stdout) < 0) return -1;
+    if (fputc('\n', stdout) < 0) return -1;
+    return 0;
+}
+
 export fn perror(msg: ?[*:0]const u8) callconv(.c) void {
     if (msg) |m| {
         _ = fputs(m, stderr);
