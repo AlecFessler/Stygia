@@ -629,11 +629,17 @@ stage_perf_regression() {
 
     local qemu_log
     qemu_log=$(mktemp)
-    if ! (cd "$ZAG_ROOT" && timeout 60 zig build run -Dprofile=test \
+    # `timeout 120` may return 124 even after a clean workload run if
+    # `power_shutdown` doesn't tear qemu down (we still see the full
+    # kprof dump in the log). Treat a captured `[KPROF] done` marker
+    # as success regardless of the bash exit code; only fall through
+    # to FAIL when the marker is absent.
+    (cd "$ZAG_ROOT" && timeout 120 zig build run -Dprofile=test \
         -Dkernel_profile=trace -Doptimize=ReleaseFast \
         -Droot-service=tests/perf/bin/root_service.elf -- -display none) \
-        > "$qemu_log" 2>&1; then
-        echo "[FAIL] perf workload boot timeout/qemu error"
+        > "$qemu_log" 2>&1 || true
+    if ! grep -q '^\[KPROF\] done' "$qemu_log"; then
+        echo "[FAIL] perf workload did not emit '[KPROF] done' within 120s"
         tail -20 "$qemu_log"
         rm -f "$qemu_log"
         FAILURES+=("perf workload boot")

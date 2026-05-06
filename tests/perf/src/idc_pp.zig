@@ -155,7 +155,12 @@ fn pongerLoop() noreturn {
     }
 }
 
-const N_ROUNDS: usize = 5_000;
+// 500 rounds is enough for a stable per-scope median in
+// `compare_baseline.py` and keeps the precommit perf stage under its
+// 120s budget when running with `-Dkernel_profile=trace` (which emits
+// a [KPROF] record per kernel scope entry/exit and slows the workload
+// to ~45 rounds/sec on serial-bottlenecked output).
+const N_ROUNDS: usize = 500;
 var samples: [N_ROUNDS]u64 = .{0} ** N_ROUNDS;
 
 pub fn main(cap_table_base: u64) void {
@@ -243,4 +248,11 @@ pub fn main(cap_table_base: u64) void {
         k += 1;
     }
     ser.print("[idc_pp] done\n");
+
+    // Flush the kprof ring to serial and stop qemu so the precommit
+    // perf stage gets a clean exit code instead of timing out at
+    // SIGTERM. powerShutdown requires the `power` cap on the
+    // self-handle, which the perf root service holds by construction.
+    syscall.kprofDump();
+    _ = syscall.powerShutdown();
 }
