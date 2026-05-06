@@ -138,6 +138,17 @@ pub fn end(reason: EndReason) void {
     arch.boot.print("[KPROF] done\n", .{});
 
     @atomicStore(u32, &log_mod.dump_done, 1, .release);
+
+    // root_exit is the userspace-driven session end (kprof_dump syscall),
+    // by definition the workload has produced its data and there is no
+    // further work for the system to do. Power-off so the host sees a
+    // clean qemu exit; otherwise the bare `halt` here forces the precommit
+    // perf stage to wait for its 60s `timeout` to fire and interpret a
+    // killed qemu as a boot timeout. log_full and oneshot keep the legacy
+    // halt — neither is reached from a userspace shutdown intent.
+    if (reason == .root_exit) {
+        _ = arch.cpu.powerAction(.shutdown);
+    }
     arch.cpu.halt();
 }
 
