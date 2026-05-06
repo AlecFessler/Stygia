@@ -572,13 +572,20 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
     return found;
 }
 
-// Try to consume an `<op> <term>` continuation starting at j (skipping
-// spaces). RHS terms can be digit literals OR resolvable identifiers.
-// Returns the accumulated value and advances j past consumed input.
+// Two-pass expression continuation with operator precedence:
+// 1. Collect (op, value) pairs after the LHS (terms are digits or
+//    resolvable identifiers).
+// 2. Collapse all `*` ops first (multiplicative precedence).
+// 3. Apply remaining `+`/`-` left-to-right.
+// Wrapping arithmetic throughout. No parentheses yet.
+const EXPR_MAX_OPS: usize = 16;
 fn applyExprContinuation(src: [*]const u8, src_len: usize, j_p: *usize, v_in: u64) u64 {
-    var v = v_in;
+    var ops: [EXPR_MAX_OPS]u8 = undefined;
+    var vals: [EXPR_MAX_OPS + 1]u64 = undefined;
+    vals[0] = v_in;
+    var n: usize = 0;
     var j = j_p.*;
-    while (j < src_len) {
+    while (j < src_len and n < EXPR_MAX_OPS) {
         var p: usize = j;
         while (p < src_len and src[p] == ' ') p += 1;
         if (p >= src_len) break;
@@ -609,12 +616,37 @@ fn applyExprContinuation(src: [*]const u8, src_len: usize, j_p: *usize, v_in: u6
                 rhs = val;
             } else break; // unresolved RHS — abort accumulation
         } else break;
-        if (op == '+') v +%= rhs;
-        if (op == '-') v -%= rhs;
-        if (op == '*') v *%= rhs;
+        ops[n] = op;
+        vals[n + 1] = rhs;
+        n += 1;
         j = q;
     }
     j_p.* = j;
+
+    // Pass 1: fold every `*` into its left operand, shifting remaining
+    // ops/vals down. n shrinks as we collapse.
+    var i: usize = 0;
+    while (i < n) {
+        if (ops[i] == '*') {
+            vals[i] *%= vals[i + 1];
+            var k: usize = i + 1;
+            while (k < n) : (k += 1) {
+                ops[k - 1] = ops[k];
+                vals[k] = vals[k + 1];
+            }
+            n -= 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Pass 2: left-to-right `+`/`-` over what remains.
+    var v = vals[0];
+    var m: usize = 0;
+    while (m < n) : (m += 1) {
+        if (ops[m] == '+') v +%= vals[m + 1];
+        if (ops[m] == '-') v -%= vals[m + 1];
+    }
     return v;
 }
 
