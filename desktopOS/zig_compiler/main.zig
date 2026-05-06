@@ -369,37 +369,55 @@ fn zagExit() noreturn {
 // blow the per-EC kernel stack (default ~64 KiB).
 var elf_buf: [60 * 1024]u8 = undefined;
 
-// Extracted message from /hello.zig — the first quoted string literal.
-var msg_buf: [128]u8 = undefined;
-var msg_len: usize = 0;
-
 // Banner the prebaked output ELF (zig_hello2) prints. Each occurrence
-// in the file gets overwritten with `[compiled] <msg>...\n`.
+// in the file gets overwritten with `[<tag>] <banner> <pad> \n`.
 const BANNER_PREFIX = "[zig_hello2]";
 const BANNER_LEN: usize = 76; // total chars including trailing '\n'
-const NEW_PREFIX = "[compiled] ";
 
-fn extractFirstQuoted(src: [*]const u8, src_len: usize) usize {
-    var start: ?usize = null;
+// Strings extracted from /hello.zig — the first two quoted literals.
+// First → tag (becomes the bracketed prefix), second → banner body.
+var tag_buf: [32]u8 = undefined;
+var tag_len: usize = 0;
+var banner_buf: [128]u8 = undefined;
+var banner_len: usize = 0;
+
+// Extract up to two quoted-string literals from `src[0..src_len]`.
+// Returns the number of strings found (0, 1, or 2).
+fn extractTwoQuoted(src: [*]const u8, src_len: usize) usize {
+    var found: usize = 0;
+    var in_str = false;
+    var str_start: usize = 0;
     var i: usize = 0;
     while (i < src_len) : (i += 1) {
-        if (src[i] == '"') {
-            if (start) |s| {
-                const end = i;
-                if (end <= s + 1) return 0;
-                const n = end - s - 1;
-                const copy_n = if (n > msg_buf.len) msg_buf.len else n;
-                var k: usize = 0;
-                while (k < copy_n) : (k += 1) msg_buf[k] = src[s + 1 + k];
-                return copy_n;
-            }
-            start = i;
+        if (src[i] != '"') continue;
+        if (!in_str) {
+            in_str = true;
+            str_start = i;
+            continue;
+        }
+        in_str = false;
+        const end = i;
+        if (end <= str_start + 1) continue;
+        const n = end - str_start - 1;
+        if (found == 0) {
+            const cap = if (n > tag_buf.len) tag_buf.len else n;
+            var k: usize = 0;
+            while (k < cap) : (k += 1) tag_buf[k] = src[str_start + 1 + k];
+            tag_len = cap;
+            found = 1;
+        } else if (found == 1) {
+            const cap = if (n > banner_buf.len) banner_buf.len else n;
+            var k: usize = 0;
+            while (k < cap) : (k += 1) banner_buf[k] = src[str_start + 1 + k];
+            banner_len = cap;
+            found = 2;
+            return 2;
         }
     }
-    return 0;
+    return found;
 }
 
-fn patchBanner(buf: []u8, msg_n: usize) usize {
+fn patchBanner(buf: []u8) usize {
     var hits: usize = 0;
     if (buf.len < BANNER_LEN) return 0;
     const limit = buf.len - BANNER_LEN;
@@ -415,15 +433,33 @@ fn patchBanner(buf: []u8, msg_n: usize) usize {
         }
         if (!ok) continue;
 
+        // Layout: '[' <tag> ']' ' ' <banner> <space-pad> '\n'
+        // Total = BANNER_LEN bytes. Truncate either field as needed.
         var w: usize = 0;
-        while (w < NEW_PREFIX.len) : (w += 1) buf[i + w] = NEW_PREFIX[w];
-        const msg_room: usize = BANNER_LEN - NEW_PREFIX.len - 1;
-        const cap = if (msg_n < msg_room) msg_n else msg_room;
+        buf[i + w] = '[';
+        w += 1;
+        const tag_room: usize = BANNER_LEN -% 4; // 4 = ']' + ' ' + <body min 1> + '\n'
+        const tag_cap = if (tag_len > tag_room) tag_room else tag_len;
         var j: usize = 0;
-        while (j < cap) : (j += 1) buf[i + NEW_PREFIX.len + j] = msg_buf[j];
-        var s: usize = NEW_PREFIX.len + cap;
-        while (s < BANNER_LEN - 1) : (s += 1) buf[i + s] = ' ';
-        buf[i + BANNER_LEN - 1] = '\n';
+        while (j < tag_cap) : (j += 1) {
+            buf[i + w] = tag_buf[j];
+            w += 1;
+        }
+        buf[i + w] = ']';
+        w += 1;
+        buf[i + w] = ' ';
+        w += 1;
+
+        // Remaining room for banner body = BANNER_LEN - w - 1 (for \n).
+        const body_room: usize = BANNER_LEN - w - 1;
+        const body_cap = if (banner_len > body_room) body_room else banner_len;
+        j = 0;
+        while (j < body_cap) : (j += 1) {
+            buf[i + w] = banner_buf[j];
+            w += 1;
+        }
+        while (w < BANNER_LEN - 1) : (w += 1) buf[i + w] = ' ';
+        buf[i + w] = '\n';
         hits += 1;
     }
     return hits;
@@ -454,12 +490,13 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     }
     printNum("[zig_compiler] read /hello.zig bytes=", src.bytes_read);
     const src_ptr: [*]const u8 = @ptrFromInt(fs_va + src.data_off);
-    msg_len = extractFirstQuoted(src_ptr, @intCast(src.bytes_read));
-    if (msg_len == 0) {
-        print("[zig_compiler] no quoted string in /hello.zig\n");
+    const found = extractTwoQuoted(src_ptr, @intCast(src.bytes_read));
+    if (found < 2) {
+        printNum("[zig_compiler] need 2 quoted strings, found=", found);
         zagExit();
     }
-    printNum("[zig_compiler] extracted message len=", msg_len);
+    printNum("[zig_compiler] extracted tag len=", tag_len);
+    printNum("[zig_compiler] extracted banner len=", banner_len);
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -475,7 +512,7 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     while (k < out.bytes_read) : (k += 1) elf_buf[k] = out_src[k];
 
     // Patch every banner instance in the buffer.
-    const hits = patchBanner(elf_buf[0..out.bytes_read], msg_len);
+    const hits = patchBanner(elf_buf[0..out.bytes_read]);
     printNum("[zig_compiler] patched banner instances=", hits);
     if (hits == 0) {
         print("[zig_compiler] FAILED: no banner found to patch\n");
