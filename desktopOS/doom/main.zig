@@ -462,19 +462,15 @@ pub fn main(cap_table_base: u64) void {
     log.dec(@intCast(blit_scale));
     log.print("\n");
 
-    // USB input port (optional — Doom can run without input, just no
-    // gameplay). Skip altogether under QEMU where there's no xHCI; the
-    // suspend would block forever waiting on a usb_driver that parked.
-    if (false) {
-        if (findPort(cap_table_base)) |p| {
-            usb_port_handle = p;
-            have_usb = true;
-            log.print("[doom] usb_port at slot ");
-            log.dec(@intCast(usb_port_handle));
-            log.print("\n");
-        }
+    if (findPort(cap_table_base)) |p| {
+        usb_port_handle = p;
+        have_usb = true;
+        log.print("[doom] usb_port at slot ");
+        log.dec(@intCast(usb_port_handle));
+        log.print("\n");
+    } else {
+        log.print("[doom] no usb_port; running without input\n");
     }
-    if (!have_usb) log.print("[doom] no usb_port; running without input\n");
 
     // Wire embed-WAD blob into libc fopen path; init stdio sinks.
     libc_shim.setWadBlob(WAD_BLOB);

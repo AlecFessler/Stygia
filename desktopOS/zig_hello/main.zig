@@ -860,16 +860,18 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     //      seed   → first decimal int after the second string
     //      mult   → second decimal int after the second string
     //      repeat → third decimal int after the second string
+    //      op     → fourth decimal int (0=mul, 1=add, 2=sub, 3=xor)
     //    Output banner: "[<tag>] <banner> seed=<n>".
-    //    Spawned binary computes p = seed*mult from patched sentinels
-    //    and loops `repeat` times printing "[runtime] iter=N product=p"
-    //    — source-driven CONTROL FLOW (loop bound), not just data.
+    //    Spawned binary BRANCHES on op_value to compute result, then
+    //    loops `repeat` times printing "[runtime] iter=N result=r" —
+    //    source-driven branch selection on top of source-driven loop.
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
         "pub const seed = 1337;\n" ++
         "pub const mult = 9;\n" ++
-        "pub const repeat = 4;\n";
+        "pub const repeat = 4;\n" ++
+        "pub const op = 1;\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
     if (cs.status != 0) {

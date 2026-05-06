@@ -383,6 +383,11 @@ pub fn build(b: *std.Build) void {
     const wants_nvme = profile_name != null and
         (std.mem.eql(u8, profile_name.?, "linux_guest") or
             std.mem.eql(u8, profile_name.?, "desktop"));
+    // qemu-xhci + usb-kbd/usb-mouse so the guest's usb_driver has a
+    // controller to enumerate and a HID device to bind. Desktop only —
+    // the test/linux_guest profiles don't need user input.
+    const wants_usb = profile_name != null and
+        std.mem.eql(u8, profile_name.?, "desktop");
 
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)
@@ -432,6 +437,12 @@ pub fn build(b: *std.Build) void {
             , .{b.install_path})
         else
             "";
+        const qemu_usb_args: []const u8 = if (wants_usb)
+            \\-device qemu-xhci,id=xhci0 \
+            \\-device usb-kbd,bus=xhci0.0 \
+            \\-device usb-mouse,bus=xhci0.0
+        else
+            "";
         const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
             \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
             \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
@@ -464,8 +475,9 @@ pub fn build(b: *std.Build) void {
             \\ {s} \
             \\ {s} \
             \\ {s} \
+            \\ {s} \
             \\ -smp cores=4
-        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_nvme_args });
+        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_nvme_args, qemu_usb_args });
     };
 
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{

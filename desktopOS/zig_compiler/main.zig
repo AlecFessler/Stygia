@@ -392,6 +392,8 @@ var mult_int: u64 = 0;
 var mult_found: bool = false;
 var repeat_int: u64 = 0;
 var repeat_found: bool = false;
+var op_int: u64 = 0;
+var op_found: bool = false;
 
 // Extract up to two quoted-string literals from `src[0..src_len]` and
 // the first decimal integer that appears after the second quoted
@@ -430,7 +432,7 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             break;
         }
     }
-    // Scan for the first three decimal ints after the second quoted string.
+    // Scan for the first four decimal ints after the second quoted string.
     if (after_second) |start| {
         var j: usize = start;
         var ints_found: u8 = 0;
@@ -454,9 +456,13 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 mult_int = v;
                 mult_found = true;
                 ints_found = 2;
-            } else {
+            } else if (ints_found == 2) {
                 repeat_int = v;
                 repeat_found = true;
+                ints_found = 3;
+            } else {
+                op_int = v;
+                op_found = true;
                 break;
             }
         }
@@ -469,6 +475,7 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
 const SEED_SENTINEL: u64 = 0xCAFEBABE_DEADBEEF;
 const MULT_SENTINEL: u64 = 0xCAFEBABE_FACE0001;
 const REPEAT_SENTINEL: u64 = 0xCAFEBABE_C0FFEE01;
+const OP_SENTINEL: u64 = 0xCAFEBABE_05E1EC70;
 
 fn patchU64Sentinel(buf: []u8, sentinel: u64, value: u64) usize {
     var hits: usize = 0;
@@ -608,6 +615,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     if (repeat_found) {
         printNum("[zig_compiler] extracted repeat=", repeat_int);
     }
+    if (op_found) {
+        printNum("[zig_compiler] extracted op=", op_int);
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -649,6 +659,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         printNum("[zig_compiler] patched repeat sentinel hits=", h);
     } else {
         print("[zig_compiler] no third int (repeat) in source\n");
+    }
+    if (op_found) {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], OP_SENTINEL, op_int);
+        printNum("[zig_compiler] patched op sentinel hits=", h);
+    } else {
+        print("[zig_compiler] no fourth int (op) in source\n");
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).

@@ -189,6 +189,7 @@ fn print(s: []const u8) void {
 var seed_value: u64 = 0xCAFEBABE_DEADBEEF;
 var mult_value: u64 = 0xCAFEBABE_FACE0001;
 var repeat_value: u64 = 0xCAFEBABE_C0FFEE01;
+var op_value: u64 = 0xCAFEBABE_05E1EC70;
 
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
@@ -222,14 +223,36 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const seed_ptr: *volatile u64 = &seed_value;
     const mult_ptr: *volatile u64 = &mult_value;
     const repeat_ptr: *volatile u64 = &repeat_value;
+    const op_ptr: *volatile u64 = &op_value;
     const v_seed = seed_ptr.*;
     const v_mult = mult_ptr.*;
     const v_repeat = repeat_ptr.*;
-    const product: u64 = v_seed *% v_mult;
+    const v_op = op_ptr.*;
+
+    // Source-selectable operation: 0=mul, 1=add, 2=sub, 3=xor; anything
+    // else (including the unpatched sentinel) → mul (default).
+    const result: u64 = switch (v_op) {
+        0 => v_seed *% v_mult,
+        1 => v_seed +% v_mult,
+        2 => v_seed -% v_mult,
+        3 => v_seed ^ v_mult,
+        else => v_seed *% v_mult,
+    };
+    const op_label: []const u8 = switch (v_op) {
+        0 => "mul",
+        1 => "add",
+        2 => "sub",
+        3 => "xor",
+        else => "default(mul)",
+    };
 
     printLine("[runtime] seed=", v_seed);
     printLine("[runtime] mult=", v_mult);
     printLine("[runtime] repeat=", v_repeat);
+    printLine("[runtime] op=", v_op);
+    print("[runtime] op-label=");
+    print(op_label);
+    print("\n");
 
     // Source-driven control flow: loop iteration count comes from a
     // source-file constant that flows through the compiler into a
@@ -239,7 +262,7 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const cap: u64 = if (v_repeat > 8) 8 else v_repeat;
     var i: u64 = 0;
     while (i < cap) {
-        printIterLine(i, product);
+        printIterLine(i, result);
         i += 1;
     }
 
@@ -247,11 +270,11 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     while (true) asm volatile ("hlt");
 }
 
-fn printIterLine(iter: u64, product: u64) void {
+fn printIterLine(iter: u64, result: u64) void {
     var ib: [32]u8 = undefined;
     const is = formatU64(&ib, iter);
     var pb: [32]u8 = undefined;
-    const ps = formatU64(&pb, product);
+    const ps = formatU64(&pb, result);
     var line: [80]u8 = undefined;
     var w: usize = 0;
     const prefix = "[runtime] iter=";
@@ -263,7 +286,7 @@ fn printIterLine(iter: u64, product: u64) void {
         line[w] = b;
         w += 1;
     }
-    const mid = " product=";
+    const mid = " result=";
     for (mid) |b| {
         line[w] = b;
         w += 1;
