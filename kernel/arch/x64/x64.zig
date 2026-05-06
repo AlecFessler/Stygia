@@ -4,6 +4,7 @@ pub const apic = @import("apic.zig");
 pub const cpu = @import("cpu.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const gdt = @import("gdt.zig");
+pub const hpet_watchdog = @import("hpet_watchdog.zig");
 pub const idt = @import("idt.zig");
 pub const init = @import("init.zig");
 pub const intel = @import("intel/intel.zig");

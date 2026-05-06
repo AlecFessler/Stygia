@@ -372,7 +372,23 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                         lapics_array[lapics_count] = la;
                         lapics_count += 1;
                     },
-                    .ioapic => |_| {},
+                    .ioapic => |io| {
+                        // Map IOAPIC MMIO and stash its virtual base for
+                        // any subsequent IOAPIC redirection programming
+                        // (currently used by the HPET-NMI hang watchdog
+                        // when FSB delivery isn't available).
+                        const ioapic_phys = PAddr.fromInt(std.mem.alignBackward(u64, io.ioapic_addr, paging.PAGE4K));
+                        const ioapic_virt = VAddr.fromPAddr(ioapic_phys, null);
+                        const ioapic_perms: MemoryPerms = .{ .read = true, .write = true };
+                        try arch_paging.mapPage(
+                            memory_init.kernel_addr_space_root,
+                            ioapic_phys,
+                            ioapic_virt,
+                            ioapic_perms,
+                            .kernel_mmio,
+                        );
+                        zag.arch.x64.irq.setIoapicBase(ioapic_virt.addr);
+                    },
                     .int_src_override => |_| {},
                     .lapic_nmi => |_| {},
                     .lapic_addr_override => |x| {

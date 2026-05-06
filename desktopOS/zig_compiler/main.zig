@@ -563,6 +563,33 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
                 if (d < '0' or d > '9') break;
                 v = v * 10 + (@as(u64, d) - '0');
             }
+            // Expression continuation: while the next non-space char is
+            // a binary op (`+`, `-`, `*`) followed by another digit run,
+            // accumulate left-to-right. No precedence: 1+2*3 evaluates
+            // to (1+2)*3 = 9. Wrapping arithmetic. Identifiers are not
+            // yet allowed inside expressions — only literals.
+            while (j < src_len) {
+                var p: usize = j;
+                while (p < src_len and src[p] == ' ') p += 1;
+                if (p >= src_len) break;
+                const op = src[p];
+                if (op != '+' and op != '-' and op != '*') break;
+                var q: usize = p + 1;
+                while (q < src_len and src[q] == ' ') q += 1;
+                if (q >= src_len) break;
+                const c2 = src[q];
+                if (c2 < '0' or c2 > '9') break;
+                var rhs: u64 = 0;
+                while (q < src_len) : (q += 1) {
+                    const d = src[q];
+                    if (d < '0' or d > '9') break;
+                    rhs = rhs * 10 + (@as(u64, d) - '0');
+                }
+                if (op == '+') v +%= rhs;
+                if (op == '-') v -%= rhs;
+                if (op == '*') v *%= rhs;
+                j = q;
+            }
             if (ints_found == 0) {
                 seed_int = v;
                 seed_found = true;

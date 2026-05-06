@@ -2,6 +2,8 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const ctx_trace = zag.utils.ctx_trace;
+const hang_detector = zag.utils.hang_detector;
+const hpet_watchdog = zag.arch.x64.hpet_watchdog;
 const pf_log = zag.utils.pf_log;
 const execution_context = zag.sched.execution_context;
 const fpu = zag.sched.fpu;
@@ -328,6 +330,24 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // "lockIrqSave / safe") instead of state 1 (async-IRQ-handler
             // context), and a class taken in both NMI and plain process
             // context will deadlock without warning.
+            // HPET-NMI hang watchdog: when armed, every NMI is one of
+            // ours. Drive `hang_detector.tickCheck()` from here so the
+            // dump still fires when the LAPIC tick + every other periodic
+            // kernel-side IRQ source has stalled. Same lock-free
+            // discipline as kprof_sample.onNmi (atomic loads + a single
+            // raw COM1 emit on detect).
+            if (hpet_watchdog.isArmed()) {
+                hang_detector.tickCheck();
+                return;
+            }
+            // Watchdog build-enabled but HPET trigger path didn't arm
+            // (e.g., QEMU HPET advertises neither FSB nor IOAPIC routing
+            // we can hijack). Treat any NMI as an externally-injected
+            // dump request — qemu monitor `nmi` is the operator hook.
+            if (hpet_watchdog.enabled) {
+                hang_detector.forceDump();
+                return;
+            }
             if (kprof_sample.onNmi(ctx.rip, ctx.regs.rbp)) return;
             @panic("NMI");
         },

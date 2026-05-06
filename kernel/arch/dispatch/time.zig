@@ -55,6 +55,20 @@ pub inline fn initMonotonicClock() void {
     }
 }
 
+/// Optional HPET-NMI hang watchdog. On x86-64, when build option
+/// `kernel_hang_watchdog` is set, programs HPET timer 0 in periodic
+/// FSB-NMI mode so `utils.hang_detector.tickCheck()` runs even when
+/// every core is parked in a user-mode idle hlt loop with the LAPIC
+/// tick disarmed. On aarch64 the hang signature this is built for
+/// hasn't been observed; this is a no-op.
+pub inline fn initHangWatchdog() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.hpet_watchdog.init(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 // ── Spec v3 time primitives ──────────────────────────────────────────
 
 /// Write the platform RTC to `unix_ns` since the Unix epoch. Returns 0

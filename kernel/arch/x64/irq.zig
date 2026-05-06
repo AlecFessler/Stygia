@@ -203,6 +203,18 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     kprof.enter(.sched_tick);
     defer kprof.exit(.sched_tick);
 
+    // Drive hang_detector.tickCheck from every per-core scheduler tick.
+    // The threshold-based detector here is meant for the case where SOME
+    // core is still ticking but the system as a whole is wedged
+    // (e.g. runner parked + children deadlocked). The HPET-NMI watchdog
+    // is the all-cores-idle backstop, but QEMU's HPET doesn't advertise
+    // FSB delivery so the NMI tick never fires under the dev testbed —
+    // making this in-band hook the only reliable trigger. Cheap fast
+    // path: 1 atomic load + 1 TSC read + 1 compare when nothing is
+    // wrong. NB: the all-cores-idle path is intentionally not reached
+    // from here (current_ec != null inside any tick).
+    zag.utils.hang_detector.tickCheck();
+
     // No periodic debug print here. The runner emits its own per-batch
     // heartbeat over COM1, and any kernel-side periodic `serial.print`
     // races against the runner's user-side port-IO trap path
@@ -228,6 +240,38 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // empty). Spec §[timer].
     timer_wheel.wheelExpireDue();
     sched.preempt();
+}
+
+/// One-shot setter for the IOAPIC MMIO base. Called from ACPI MADT parsing.
+/// No-op for repeat calls (only the first IOAPIC entry is honored — multi-
+/// IOAPIC platforms would need a richer API but the testbed has one).
+pub fn setIoapicBase(addr: u64) void {
+    if (ioapic_base == 0) ioapic_base = addr;
+}
+
+/// Program an IOAPIC redirection entry to deliver as NMI on the BSP. Used by
+/// the HPET-NMI hang watchdog when FSB delivery isn't available (QEMU's
+/// HPET advertises only legacy IOAPIC routing). Sets delivery_mode = 100b
+/// (NMI), destination_mode = 0 (physical), polarity = 0 (active high),
+/// trigger_mode = 0 (edge), mask = 0 (unmasked), vector = 0x02 (cosmetic
+/// — ignored for NMI). Destination = BSP APIC ID.
+///
+/// 82093AA IOAPIC Datasheet §3.2.4 "I/O Redirection Table Registers".
+pub fn programIoapicNmi(gsi: u32, bsp_apic_id: u32) bool {
+    if (ioapic_base == 0) return false;
+    const reg_lo = 0x10 + gsi * 2;
+    const reg_hi = reg_lo + 1;
+    // Low dword: vector | (delivery_mode << 8) | (dest_mode << 11)
+    //          | (polarity << 13) | (trigger << 15) | (mask << 16)
+    const dm_nmi: u32 = 0b100;
+    const lo: u32 = 0x02 | (dm_nmi << 8);
+    // High dword: bits 24-31 are physical destination APIC ID
+    const hi: u32 = bsp_apic_id << 24;
+    const irq_state = ioapic_lock.lockIrqSave(@src());
+    ioapicWrite(reg_hi, hi);
+    ioapicWrite(reg_lo, lo);
+    ioapic_lock.unlockIrqRestore(irq_state);
+    return true;
 }
 
 /// Mask an IRQ line by setting bit 16 (interrupt mask) of the low dword of

@@ -109,6 +109,14 @@ pub fn build(b: *std.Build) void {
     // Used to debug the smp=4 PF-loop bug where a fault repeatedly
     // re-fires after the handler claims success.
     const kernel_pf_log = b.option(bool, "pf_log", "Enable per-PF outcome ring + dump-on-panic (default: off)") orelse false;
+    // HPET-driven NMI hang watchdog. Off by default. When enabled the BSP
+    // programs HPET timer 0 in periodic FSB-deliver mode → NMI (~500ms
+    // period) targeting all cores; the NMI handler calls
+    // `hang_detector.tickCheck()` so the dump still fires when the LAPIC
+    // scheduler tick + every other periodic kernel-side IRQ source has
+    // stalled (the smp=4 lost-wakeup signature: all cores idle hlt with
+    // current_ec=null and run-queues empty).
+    const kernel_hang_watchdog = b.option(bool, "kernel_hang_watchdog", "Enable HPET-NMI hang watchdog (default: off)") orelse false;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -198,6 +206,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_ctx_trace", kernel_ctx_trace);
     build_opts.addOption(bool, "kernel_ec_log", kernel_ec_log);
     build_opts.addOption(bool, "kernel_pf_log", kernel_pf_log);
+    build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
