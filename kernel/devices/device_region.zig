@@ -32,6 +32,19 @@ pub const MAX_IRQ_SOURCES: usize = 1024;
 pub const DeviceType = enum(u8) {
     mmio = 0,
     port_io = 1,
+    framebuffer = 2,
+};
+
+/// Pixel layout for a `framebuffer` device_region. Mirrors the
+/// `boot_protocol.PixelFormat` the UEFI bootloader hands the kernel —
+/// kept verbatim across the cap so userspace doesn't have to import
+/// boot-protocol types just to interpret a pixel.
+pub const PixelFormat = enum(u8) {
+    bgr8 = 0,
+    rgb8 = 1,
+    bitmask = 2,
+    blt_only = 3,
+    none = 0xFF,
 };
 
 /// Optional PCI requester identifier for an MMIO region. Set when the
@@ -98,9 +111,26 @@ pub const PortIo = extern struct {
     _pad: [12]u8 = [_]u8{0} ** 12,
 };
 
+/// Linear UEFI GOP framebuffer surfaced to userspace through a
+/// device_region cap. `phys_base`/`size` cover the pixel buffer in
+/// physical address space; `width`/`height`/`stride` describe the
+/// pixel grid (`stride` is in pixels, not bytes — matches GOP's
+/// `pixels_per_scan_line`). `pixel_format` selects the byte layout
+/// userspace shaders should write.
+pub const Framebuffer = extern struct {
+    phys_base: PAddr,
+    size: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+};
+
 pub const Access = extern union {
     mmio: Mmio,
     port_io: PortIo,
+    framebuffer: Framebuffer,
 };
 
 /// Refcount-lifetime kernel object. Every holder of a SlabRef
@@ -257,6 +287,40 @@ pub fn registerMmioPci(base_paddr: PAddr, size: u64, pci: PciAddress) !*DeviceRe
 /// reject before reaching here. Spec §[port_io_virtualization].
 pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
     return registerPortIoPci(base_port, port_count, .{});
+}
+
+/// Allocate a framebuffer device_region. Returned with `refcount = 1`
+/// owned by the boot enumerator that called us; the typical pattern
+/// is to immediately `appendBootGrant(dr)` so userspace_init mints it
+/// into the root capability domain. The geometry fields ride the cap
+/// itself (encoded into `Capability.field1` by `mintBootDevice`) so
+/// userspace doesn't need a side-channel page_frame to discover the
+/// resolution.
+pub fn registerFramebuffer(
+    phys_base: PAddr,
+    size: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
+) !*DeviceRegion {
+    const pending = try allocRegion();
+    const dr = pending.ptr;
+    dr.refcount = 1;
+    dr.device_type = .framebuffer;
+    dr.access = .{ .framebuffer = .{
+        .phys_base = phys_base,
+        .size = size,
+        .width = width,
+        .height = height,
+        .stride = stride,
+        .pixel_format = pixel_format,
+    } };
+    dr.irq_source = IRQ_SOURCE_NONE;
+    dr.pci = .{};
+    dr.iommu_state = null;
+    _ = device_region_slab.publish(pending);
+    return dr;
 }
 
 /// PCI-aware variant for port-io BARs. Stamps the region's `pci`

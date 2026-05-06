@@ -574,6 +574,10 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
             // 0x3F8 the runner serial sink scans for.
             grantPl011(root_cd);
             grantCom1(root_cd);
+            // Plus anything kMain staged on the boot grant list
+            // (currently the framebuffer; future arch-portable
+            // platform devices will land here too).
+            grantBootDevices(root_cd);
         },
         else => {},
     }
@@ -585,9 +589,12 @@ fn grantBootDevices(root_cd: *CapabilityDomain) void {
 
 fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.DeviceRegion) void {
     // field0 layout per spec §[device_region]:
-    //   port_io: bits 0-3 dev_type=1, bits 4-19 base_port, bits 20-35 port_count
-    //   mmio:    bits 0-3 dev_type=0, bits 4-51 paddr>>12, bits 52-63 size_pages
+    //   port_io:     bits 0-3 dev_type=1, bits 4-19 base_port, bits 20-35 port_count
+    //   mmio:        bits 0-3 dev_type=0, bits 4-51 paddr>>12, bits 52-63 size_pages
+    //   framebuffer: bits 0-3 dev_type=2, bits 4-51 paddr>>12, bits 52-63 size_pages
+    //                field1: width(16) | height(16) | stride(16) | pixel_format(8) | reserved(8)
     var field0: u64 = @intFromEnum(dr.device_type);
+    var field1: u64 = 0;
     switch (dr.device_type) {
         .mmio => {
             const m = dr.access.mmio;
@@ -598,6 +605,16 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.Dev
             const p = dr.access.port_io;
             field0 |= (@as(u64, p.base_port) << 4) |
                 (@as(u64, p.port_count) << 20);
+        },
+        .framebuffer => {
+            const fb = dr.access.framebuffer;
+            field0 |= ((fb.phys_base.addr >> 12) << 4) |
+                ((fb.size >> 12) << 52);
+            field1 =
+                @as(u64, fb.width) |
+                (@as(u64, fb.height) << 16) |
+                (@as(u64, fb.stride) << 32) |
+                (@as(u64, @intFromEnum(fb.pixel_format)) << 48);
         },
     }
     // Grant move/copy/dma/irq so the root service can delegate freely
@@ -618,7 +635,7 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.Dev
         zag.caps.capability.CapabilityType.device_region,
         @bitCast(dr_caps),
         field0,
-        0,
+        field1,
     ) catch {
         arch.boot.print("[boot] WARNING: device_region grant failed (boot list overflow)\n", .{});
     };

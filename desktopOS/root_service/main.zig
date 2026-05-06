@@ -41,6 +41,23 @@ pub fn main(cap_table_base: u64) void {
         powerShutdown();
     };
 
+    if (findFramebuffer(cap_table_base)) |fb_slot| {
+        const fb = caps.framebufferFields(caps.readCap(cap_table_base, fb_slot));
+        log.print("[desktopOS] framebuffer slot=");
+        log.dec(fb_slot);
+        log.print(" ");
+        log.dec(fb.width);
+        log.print("x");
+        log.dec(fb.height);
+        log.print(" stride=");
+        log.dec(fb.stride);
+        log.print(" fmt=");
+        log.dec(@intFromEnum(fb.pixel_format));
+        log.print("\n");
+    } else {
+        log.print("[desktopOS] no framebuffer in cap table\n");
+    }
+
     // Mint the two ports. Both come up with full caps so we can pass
     // restricted views down to each child.
     const port_full = caps.PortCap{
@@ -164,6 +181,18 @@ fn collectMmioDeviceRegions(cap_table_base: u64, out: []HandleId) usize {
         n += 1;
     }
     return n;
+}
+
+fn findFramebuffer(cap_table_base: u64) ?HandleId {
+    var slot: u32 = caps.SLOT_FIRST_PASSED;
+    while (slot < caps.HANDLE_TABLE_MAX) : (slot += 1) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() != .device_region) continue;
+        const dev_type: u4 = @truncate(c.field0 & 0xF);
+        if (dev_type != @intFromEnum(caps.DevType.framebuffer)) continue;
+        return @truncate(slot);
+    }
+    return null;
 }
 
 fn findCom1(cap_table_base: u64) ?HandleId {

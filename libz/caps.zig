@@ -53,11 +53,16 @@ pub fn readCap(cap_table_base: u64, slot: u32) Cap {
 }
 
 // §[device_region] field0 layout. dev_type at bits 0-3 distinguishes
-// mmio (0) vs port_io (1). For port_io, base_port at bits 4-19 and
-// port_count at bits 20-35 carry the x86-64 I/O port range.
+// mmio (0), port_io (1), framebuffer (2). For port_io, base_port at
+// bits 4-19 and port_count at bits 20-35 carry the x86-64 I/O port
+// range. For mmio and framebuffer, paddr>>12 occupies bits 4-51 and
+// size_pages occupies bits 52-63. Framebuffers additionally carry
+// pixel geometry in field1: width(16) | height(16) | stride(16) |
+// pixel_format(8) | reserved(8).
 pub const DevType = enum(u4) {
     mmio = 0,
     port_io = 1,
+    framebuffer = 2,
     _,
 };
 
@@ -72,6 +77,37 @@ pub fn deviceRegionFields(c: Cap) DeviceRegionFields {
         .dev_type = @enumFromInt(@as(u4, @truncate(c.field0 & 0xF))),
         .base_port = @truncate((c.field0 >> 4) & 0xFFFF),
         .port_count = @truncate((c.field0 >> 20) & 0xFFFF),
+    };
+}
+
+pub const PixelFormat = enum(u8) {
+    bgr8 = 0,
+    rgb8 = 1,
+    bitmask = 2,
+    blt_only = 3,
+    none = 0xFF,
+    _,
+};
+
+pub const FramebufferFields = struct {
+    phys_base: u64,
+    size: u64,
+    width: u16,
+    height: u16,
+    stride: u16,
+    pixel_format: PixelFormat,
+};
+
+pub fn framebufferFields(c: Cap) FramebufferFields {
+    const paddr_pages: u64 = (c.field0 >> 4) & ((@as(u64, 1) << 48) - 1);
+    const size_pages: u64 = (c.field0 >> 52) & 0xFFF;
+    return .{
+        .phys_base = paddr_pages << 12,
+        .size = size_pages << 12,
+        .width = @truncate(c.field1 & 0xFFFF),
+        .height = @truncate((c.field1 >> 16) & 0xFFFF),
+        .stride = @truncate((c.field1 >> 32) & 0xFFFF),
+        .pixel_format = @enumFromInt(@as(u8, @truncate((c.field1 >> 48) & 0xFF))),
     };
 }
 

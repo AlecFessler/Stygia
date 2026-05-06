@@ -606,6 +606,20 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
                     field0 |= (@as(u64, pio.base_port) << 4) |
                         (@as(u64, pio.port_count) << 20);
                 },
+                .framebuffer => {
+                    const fb = dr.access.framebuffer;
+                    field0 |= ((fb.phys_base.addr >> 12) << 4) |
+                        ((fb.size >> 12) << 52);
+                    // Framebuffers carry no IRQ, so the IRQ handler
+                    // never touches field1 — stamp the geometry here
+                    // and let it ride. Layout: width(16) | height(16)
+                    // | stride(16) | pixel_format(8) | reserved(8).
+                    user_entry.field1 =
+                        @as(u64, fb.width) |
+                        (@as(u64, fb.height) << 16) |
+                        (@as(u64, fb.stride) << 32) |
+                        (@as(u64, @intFromEnum(fb.pixel_format)) << 48);
+                },
             }
             user_entry.field0 = field0;
         },

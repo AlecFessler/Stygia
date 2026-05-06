@@ -68,6 +68,22 @@ export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
     unreachable;
 }
 
+fn grantBootFramebuffer(fb: zag.boot.protocol.Framebuffer) void {
+    if (fb.size == 0) return;
+    const dr = zag.devices.device_region.registerFramebuffer(
+        fb.base,
+        fb.size,
+        fb.width,
+        fb.height,
+        fb.stride,
+        @enumFromInt(@intFromEnum(fb.pixel_format)),
+    ) catch {
+        arch.boot.print("[boot] WARNING: framebuffer registerFramebuffer failed\n", .{});
+        return;
+    };
+    zag.devices.device_region.appendBootGrant(dr);
+}
+
 fn kMain(boot_info: *BootInfo) !void {
     arch.boot.init();
     try memory.init(boot_info.mmap);
@@ -86,10 +102,7 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.cpu.sysInfoInit();
     // TODO(spec-v3): wall-clock is now read directly via arch.time.readRtc()
     // in syscall/system.zig; no kernel-side wall_offset state remains.
-    // TODO(spec-v3): zag.devices.registry / registerDisplayDevice was
-    // removed; framebuffer hand-off needs a new spec-v3 home (boot
-    // protocol → root service?).
-    _ = boot_info.framebuffer;
+    grantBootFramebuffer(boot_info.framebuffer);
     try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);

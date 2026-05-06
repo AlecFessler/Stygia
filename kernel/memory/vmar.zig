@@ -21,6 +21,7 @@ const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = secure_slab.GenLock;
 const KernelHandle = zag.caps.capability.KernelHandle;
 const MemoryPerms = zag.memory.address.MemoryPerms;
+const PAddr = zag.memory.address.PAddr;
 const PageFrame = zag.memory.page_frame.PageFrame;
 const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
 const SecureSlab = secure_slab.SecureSlab;
@@ -441,14 +442,19 @@ pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) 
     switch (dr.device_type) {
         .mmio => if (dr.access.mmio.size != var_size) return errors.E_INVAL,
         .port_io => if (var_size < dr.access.port_io.port_count) return errors.E_INVAL,
+        .framebuffer => if (dr.access.framebuffer.size != var_size) return errors.E_INVAL,
     }
 
     // Port-IO regions install with no PTEs — every CPU access faults
-    // and is decoded by the port-io fault handler. Plain MMIO installs
-    // PTEs covering [base_vaddr, base_vaddr + var_size).
-    // Spec §[port_io_virtualization].
-    if (dr.device_type == .mmio) {
-        const phys_base = dr.access.mmio.phys_base;
+    // and is decoded by the port-io fault handler. Plain MMIO and
+    // framebuffer regions install PTEs covering [base_vaddr,
+    // base_vaddr + var_size). Spec §[port_io_virtualization].
+    const phys_base_opt: ?PAddr = switch (dr.device_type) {
+        .mmio => dr.access.mmio.phys_base,
+        .framebuffer => dr.access.framebuffer.phys_base,
+        .port_io => null,
+    };
+    if (phys_base_opt) |phys_base| {
         var off: u64 = 0;
         while (off < var_size) {
             dispatch.paging.mapPageSized(
