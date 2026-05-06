@@ -132,19 +132,28 @@ The 444 includes Arch Linux *system-package* deps that the upstream **static** Z
 
 Upstream tarball at `https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz` (~47 MB) downloading to `work/`. Once extracted, `nm -D --undefined-only` against the *fully static* binary will give the closed surface — no `.so` cluster math needed. If musl-static, expect ~150 syms (musl resolves most internally). If glibc-static, expect ~500 (glibc has more interface-level imports). The bucketing above won't change shape, it just shrinks list Z and confirms the rest.
 
+## Strategy decision: single-threaded first (added 2026-05-06)
+
+Zag has no userspace primitive to set FS_BASE — the only FS_BASE references in the kernel are inside VMX/SVM for guest save/restore on VM entry/exit. Three options:
+
+- (i) Add a kernel syscall `set_tls(addr)` (≈10 lines of kernel work)
+- (ii) Enable CR4.FSGSBASE and use `wrfsbase` from userspace
+- (iii) **Cross-compile Zig+LLVM with `-fsingle-threaded`** — sidestep TLS entirely
+
+We pick **(iii)** for the first cut. errno becomes a global var, pthread mutex/cond/rwlock become no-ops, pthread_key_create maps to a tiny static slot table, pthread_create stubs `EAGAIN`. This collapses three of the original 10 foundation steps. Threading is a follow-up — once the real compiler runs on Zag we can graduate to (i) or (ii). LLVM/Zig compile will be slower, fine for first proof.
+
 ## Foundation order (Phase 4c.2 sub-steps)
 
-These have to land before parallel fan-out:
+Pre-fan-out, post the single-threaded simplification:
 
-1. **Static-TLS in `_start`** — parse PHDR `PT_TLS`, alloc `tdata+tbss` block, write FS-base via Zag syscall. Each child EC needs its own block.
-2. **`__errno_location` over TLS** — single line once 1 lands.
-3. **fs_client wrappers** — `open close read write lseek stat fstat unlink` over the IPC we already have. Other I/O syscalls fan out from here.
-4. **mmap/munmap/mprotect** over VMAR + page_frame caps.
+1. **`libz/libc/` build scaffold** — Zig static library targeting `x86_64-zag-none` with `-fsingle-threaded`, output `libc.a`. The cross-compile in 4c.4 links against this `.a` plus the LLVM/clang object cluster.
+2. **errno** as a global `c_int`. `__errno_location` returns `&errno`.
+3. **fs_client wrappers** (open/close/read/write/lseek/stat/fstat/unlink) over the existing fs IPC. Patched stdlib's `os/zag.zig` already does most of this — we add C-ABI exports on top.
+4. **mmap/munmap/mprotect** — already shaped in `os/zag.zig` via `zag_mmap_anon`/`zag_munmap`. Add C-ABI exports.
 5. **`__cxa_atexit` table + `_start` running `.init_array`/`.fini_array`**.
-6. **malloc front-end** — `std.heap.PageAllocator`-backed; gives every libc impl a working allocator.
-7. **`FILE` struct + `fwrite`/`fputc`** — minimal stdio so we can `fprintf(stderr, …)`.
-8. **`stdout`/`stderr` globals + minimal `fprintf`/`vfprintf`** — wire `std.fmt.format` to C format spec.
-9. **futex-backed `pthread_mutex` + `pthread_cond` + `pthread_once`** — once these work, the rest of pthread is straightforward.
-10. **TLS-keyed `pthread_getspecific`/`setspecific`/`pthread_key_create`** — needs (1) and a small key table.
+6. **malloc front-end** — wrap `std.heap.PageAllocator`; the patched stdlib already wires PageAllocator over VMAR+page_frame.
+7. **`FILE` struct + `fread`/`fwrite`/`fputc`/`fputs`** — minimal stdio.
+8. **`stdout`/`stderr` globals + `fprintf`/`vfprintf`** — wire `std.fmt.format` to C format spec.
+9. **pthread no-op layer** (single-threaded): mutex/cond/rwlock/once succeed without doing anything; pthread_create/join return `EAGAIN`; pthread_self returns 1; pthread_key/get/setspecific over a fixed-size static slot table.
 
-Phase 4c.3 fans out the rest of the buckets to parallel agents.
+Phase 4c.3 fans out the rest of the buckets (string, ctype, math, locale, wide, signals/setjmp, dl_*, env) to parallel agents.
