@@ -49,6 +49,7 @@ const SYS_DELETE: u12 = 16;
 const SYS_CREATE_VMAR: u12 = 32;
 const SYS_MAP_PF: u12 = 33;
 const SYS_MAP_MMIO: u12 = 34;
+const SYS_UNMAP: u12 = 35;
 const COM1_BASE_PORT: u16 = 0x3F8;
 const COM1_PORT_COUNT: u16 = 8;
 
@@ -332,6 +333,109 @@ fn zagExit() noreturn {
     while (true) asm volatile ("hlt");
 }
 
+// ── Phase 2 anon-mmap bridge — backs std.os.zag.mmap(MAP_ANONYMOUS) ──
+//
+// Spec §[var] documents demand-paged VMARs as the canonical "anon
+// mmap" path: kernel allocates a zero page on first touch. As of
+// 2026-05-06 the kernel's `demandAlloc` (kernel/memory/vmar.zig:1079)
+// is still a stub that returns E_NOMEM, so we instead allocate a
+// page_frame eagerly and `map_pf` it into a fresh VMAR. Switch to
+// the demand-paged path once the kernel implementation lands —
+// then this bridge becomes just createVmar.
+
+const HEAP_TABLE_LEN: usize = 16;
+const HeapEntry = struct {
+    base: u64,
+    vmar: u12,
+    pf: u12,
+};
+var heap_table: [HEAP_TABLE_LEN]HeapEntry = .{HeapEntry{ .base = 0, .vmar = 0, .pf = 0 }} ** HEAP_TABLE_LEN;
+
+fn heapTablePush(base: u64, vmar: u12, pf: u12) bool {
+    var i: usize = 0;
+    while (i < HEAP_TABLE_LEN) : (i += 1) {
+        if (heap_table[i].base == 0) {
+            heap_table[i] = .{ .base = base, .vmar = vmar, .pf = pf };
+            return true;
+        }
+    }
+    return false;
+}
+
+const HeapTake = struct { vmar: u12, pf: u12 };
+
+fn heapTableTake(base: u64) ?HeapTake {
+    var i: usize = 0;
+    while (i < HEAP_TABLE_LEN) : (i += 1) {
+        if (heap_table[i].base == base) {
+            const e = heap_table[i];
+            heap_table[i] = .{ .base = 0, .vmar = 0, .pf = 0 };
+            return .{ .vmar = e.vmar, .pf = e.pf };
+        }
+    }
+    return null;
+}
+
+const SYS_CREATE_PAGE_FRAME: u12 = 40;
+
+export fn zag_mmap_anon(pages: usize) callconv(.c) u64 {
+    if (pages == 0) return 0;
+    // PfCap{ r=1, w=1 } — bits 2,3 in libz/caps.zig PfCap layout
+    const pf_caps: u64 = (1 << 2) | (1 << 3);
+    const cpf = issueRaw(buildWord(SYS_CREATE_PAGE_FRAME, 0), .{
+        .v1 = pf_caps,
+        .v2 = 0,
+        .v3 = pages,
+    });
+    if (cpf.v1 < 16) return 0;
+    const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
+
+    // VmarCap{ r=1, w=1 } — bits 2,3
+    const vmar_caps: u64 = (1 << 2) | (1 << 3);
+    // props: cur_rwx=0b011 (r|w), sz=0 (4 KiB), cch=0 (writeback)
+    const props: u64 = 0b011;
+    const cv = issueRaw(buildWord(SYS_CREATE_VMAR, 0), .{
+        .v1 = vmar_caps,
+        .v2 = props,
+        .v3 = pages,
+    });
+    if (cv.v1 < 16) {
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, pf_handle) });
+        return 0;
+    }
+    const vmar_handle: u12 = @truncate(cv.v1 & 0xFFF);
+    const base = cv.v2;
+
+    // map_pf at offset 0: install the freshly-allocated page_frame
+    // across the entire VMAR range. (1 << 12) = N=1 in bits 12-19.
+    const mp = issueRaw(buildWord(SYS_MAP_PF, (1 << 12)), .{
+        .v1 = vmar_handle,
+        .v2 = 0,
+        .v3 = pf_handle,
+    });
+    if (mp.v1 != 0) {
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, vmar_handle) });
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, pf_handle) });
+        return 0;
+    }
+
+    if (!heapTablePush(base, vmar_handle, pf_handle)) {
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, vmar_handle) });
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, pf_handle) });
+        return 0;
+    }
+    return base;
+}
+
+export fn zag_munmap(addr: u64, pages: usize) callconv(.c) i32 {
+    _ = pages;
+    const t = heapTableTake(addr) orelse return -1;
+    // Drop VMAR first (releases address space) then page_frame (frees pages).
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, t.vmar) });
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, t.pf) });
+    return 0;
+}
+
 // Format an unsigned int into a buffer; returns slice over the digits.
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
@@ -435,5 +539,55 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     w += 1;
     serialPrint(inv.serial_port, serial_va, line[0..w]);
     debugPrint("[zig_hello] after fs IPC\n");
+
+    // ── Phase 2: anon-mmap demo. Allocate 1 page, write a sentinel
+    //    pattern at offset 0, read it back, munmap.
+    debugPrint("[zig_hello] before mmap_anon\n");
+    const heap_base = zag_mmap_anon(1);
+    if (heap_base == 0) {
+        serialPrint(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] zag_mmap_anon(1) failed\n",
+        );
+        zagExit();
+    }
+    debugPrint("[zig_hello] mmap_anon returned\n");
+
+    const heap: [*]u8 = @ptrFromInt(heap_base);
+    debugPrint("[zig_hello] before heap[0] = 'X'\n");
+    heap[0] = 'X';
+    debugPrint("[zig_hello] after heap[0] = 'X'\n");
+    heap[1] = 'Y';
+    heap[2] = 'Z';
+    heap[3] = 0;
+    debugPrint("[zig_hello] heap writes done\n");
+
+    var line2: [64]u8 = undefined;
+    var w2: usize = 0;
+    const lead2 = "[zig_hello] heap[0..3] = ";
+    for (lead2) |b| {
+        line2[w2] = b;
+        w2 += 1;
+    }
+    line2[w2] = heap[0];
+    w2 += 1;
+    line2[w2] = heap[1];
+    w2 += 1;
+    line2[w2] = heap[2];
+    w2 += 1;
+    line2[w2] = '\n';
+    w2 += 1;
+    serialPrint(inv.serial_port, serial_va, line2[0..w2]);
+
+    if (zag_munmap(heap_base, 1) != 0) {
+        serialPrint(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] zag_munmap failed\n",
+        );
+        zagExit();
+    }
+    serialPrint(inv.serial_port, serial_va, "[zig_hello] heap test passed\n");
     zagExit();
 }
