@@ -394,7 +394,7 @@ pub const VmPolicy = extern struct {
     num_sysreg_policies: u32 = 0,
     _pad1: u32 = 0,
 
-    pub const MAX_ID_REG_RESPONSES = 64;
+    pub const MAX_ID_REG_RESPONSES = 62;
     pub const MAX_SYSREG_POLICIES = 32;
 
     /// One entry in the ID_AA64* response table. Op0/Op1/CRn/CRm/Op2

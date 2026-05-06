@@ -296,8 +296,15 @@ run_aarch64_tcg_3reps() {
         echo "Boot ${rep}/3 under qemu-system-aarch64 + TCG (${label})..."
         local tcg_log
         tcg_log=$(mktemp)
+        # virtualization=on so qemu exposes EL2; required by the VM-
+        # related spec tests (acquire_ecs_07, create_vcpu_03/06/07,
+        # create_virtual_machine_*) which would otherwise hit
+        # `vmSupported() == false` and surface E_NODEV from
+        # create_virtual_machine. Pi 5 KVM cannot host these tests
+        # (no nested virt + GICv2 only) so the TCG fallback is the
+        # canonical aarch64 path for the VM-touching subset.
         if ! timeout 600 qemu-system-aarch64 \
-            -M virt,gic-version=3 -m 2G \
+            -M virt,gic-version=3,virtualization=on -m 2G \
             -bios /usr/share/AAVMF/AAVMF_CODE.fd \
             -serial stdio -display none -no-reboot \
             -machine accel=tcg -cpu cortex-a72,pmu=on \
