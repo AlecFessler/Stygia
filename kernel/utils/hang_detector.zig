@@ -22,12 +22,12 @@ const scheduler = zag.sched.scheduler;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const State = zag.sched.execution_context.State;
 
-/// 8s of no-newline-progress = hang. Smaller and we false-positive on
+/// 4s of no-newline-progress = hang. Smaller and we false-positive on
 /// slow tests (some PMU/futex tests take 2-3s alone). Larger and we
-/// don't catch the 30s repro window. Combined with `noteProgressOnNewline`
+/// don't catch the 90s repro window. Combined with `noteProgressOnNewline`
 /// this triggers when a `[runner] PASS …` line stalls partway through —
 /// the canonical Type B signature on this branch.
-pub const HANG_THRESHOLD_NS: u64 = 8_000_000_000;
+pub const HANG_THRESHOLD_NS: u64 = 4_000_000_000;
 
 /// Last monotonic-ns timestamp anything emitted on the serial path. Bumped
 /// from `arch.x64.serial.printRaw`. Read from the scheduler tick.
@@ -87,9 +87,6 @@ var tick_counter: std.atomic.Value(u64) =
 /// one subtraction.
 pub fn tickCheck() void {
     if (builtin.cpu.arch != .x86_64) return;
-    // Heartbeat — emit a raw '~' every 1024 ticks (~2s at 2ms per tick on
-    // x86-64) so the failure logs prove whether the tick is being
-    // invoked at all.
     // Pre-armed-check counter so we can distinguish "tickCheck never
     // called" from "called but armed gate keeps it silent".
     const t = tick_counter.fetchAdd(1, .monotonic);
@@ -99,12 +96,13 @@ pub fn tickCheck() void {
     const last = last_progress_ns.load(.acquire);
     const now = arch.time.currentMonotonicNs();
     if (now < last) return; // clock skew safety
-    if (now - last < HANG_THRESHOLD_NS) return;
+    const delta = now - last;
+    if (delta < HANG_THRESHOLD_NS) return;
     // CAS so only one core emits the dump.
     if (dump_fired.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
     // Stamp '!' to make the trigger boundary visible in serial.
     emitHeartbeatByte('!');
-    dump(now - last);
+    dump(delta);
 }
 
 fn emitHeartbeatByte(b: u8) void {

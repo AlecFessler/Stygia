@@ -30,7 +30,7 @@ QEMULOG=/tmp/qemu_run_${RUN}.log
 SERIAL=/tmp/zag_run_${RUN}.log
 rm -f "$QEMULOG" "$SERIAL"
 
-timeout 30 qemu-system-x86_64 \
+timeout 90 qemu-system-x86_64 \
   -m 4G \
   -bios /usr/share/ovmf/x64/OVMF.4m.fd \
   -drive file=fat:rw:${INSTALL}/img,format=raw \
