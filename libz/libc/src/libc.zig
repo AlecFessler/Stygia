@@ -7,6 +7,10 @@
 // Sub-module layout:
 //   errno.zig   — errno (global; single-threaded first cut)
 //   string.zig  — memcpy/memmove/memset/memcmp/memchr + str*
+//   ctype.zig   — isalpha/isdigit/etc + glibc __ctype_*_loc tables
+//   cxxabi.zig  — __cxa_atexit/finalize/pure_virtual/guard_*
+//   pthread.zig — single-threaded no-op pthread surface
+//   stdlib.zig  — exit/abort/abs/getenv/strto*/qsort/rand
 //
 // Submodules will be added incrementally as Phase 4c.2 lands.
 // PORT_CHECKLIST.md tracks what's left.
@@ -24,4 +28,8 @@ const std = @import("std");
 comptime {
     _ = @import("errno.zig");
     _ = @import("string.zig");
+    _ = @import("ctype.zig");
+    _ = @import("cxxabi.zig");
+    _ = @import("pthread.zig");
+    _ = @import("stdlib.zig");
 }
