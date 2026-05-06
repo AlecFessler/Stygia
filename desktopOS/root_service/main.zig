@@ -103,6 +103,10 @@ pub fn main(cap_table_base: u64) void {
     // Phase 4b: stage zig_hello_std.elf — first Zag-target binary that
     // imports std and prints via std.io.
     const zig_hello_std_pf = stageElfPageFrame(services.zig_hello_std_elf) orelse powerShutdown();
+    // Phase 4e: stage zig_compiler.elf — Zag-target ELF that reads
+    // /hello.zig and writes /hello.elf. zig_hello receives this pf,
+    // round-trips it through disk, and spawns it.
+    const zig_compiler_pf = stageElfPageFrame(services.zig_compiler_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -187,7 +191,8 @@ pub fn main(cap_table_base: u64) void {
     //   [5] COM1 device_region (debug + passable to spawned children)
     //   [6] fs_port (xfer|bind)
     //   [7] io_scratch (r+w, fs_ops.SCRATCH_PAGES)
-    //   [8] zig_hello2_pf page_frame (r+x; the spawn target)
+    //   [8] zig_hello2_pf page_frame (r+x; Phase 4a spawn target)
+    //   [9] zig_compiler_pf page_frame (r+x; Phase 4e compiler ELF)
     {
         var passed: [MAX_PASSED]u64 = undefined;
         var n: usize = 0;
@@ -197,6 +202,7 @@ pub fn main(cap_table_base: u64) void {
         appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
         appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
         appendPf(&passed, &n, zig_hello2_pf, .{ .move = true, .r = true, .x = true });
+        appendPf(&passed, &n, zig_compiler_pf, .{ .move = true, .r = true, .x = true });
         _ = spawnUserApp("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
     }
 

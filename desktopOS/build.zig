@@ -242,6 +242,18 @@ pub fn build(b: *std.Build) void {
     hello_std_run.addFileArg(b.path("zig_hello_std/main.zig"));
     const hello_std_elf = hello_std_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello_std.elf");
 
+    // ── zig_compiler.elf — Phase 4e: a Zag-target ELF that reads
+    //    /hello.zig and writes /hello.elf, demonstrating compiler-on-Zag
+    //    in the "process loads from disk → compiles → writes to disk →
+    //    another process loads from disk + spawns" pipeline. Codegen is
+    //    a hardcoded byte copy of /hello2.elf for now (real codegen
+    //    blocked on the no-LLVM compiler self-build, Phase 4c).
+    const compiler_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    compiler_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    compiler_run.addArgs(&zag_args);
+    compiler_run.addFileArg(b.path("zig_compiler/main.zig"));
+    const compiler_elf = compiler_run.addPrefixedOutputFileArg("-femit-bin=", "zig_compiler.elf");
+
     // ── usb_driver.elf ──────────────────────────────────────────────
     const usb_app_mod = b.createModule(.{
         .root_source_file = b.path("usb_driver/main.zig"),
@@ -583,6 +595,7 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(hello_elf, "zig_hello.elf");
     _ = services_wf.addCopyFile(hello2_elf, "zig_hello2.elf");
     _ = services_wf.addCopyFile(hello_std_elf, "zig_hello_std.elf");
+    _ = services_wf.addCopyFile(compiler_elf, "zig_compiler.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -595,6 +608,7 @@ pub fn build(b: *std.Build) void {
         \\pub const zig_hello_elf = @embedFile("zig_hello.elf");
         \\pub const zig_hello2_elf = @embedFile("zig_hello2.elf");
         \\pub const zig_hello_std_elf = @embedFile("zig_hello_std.elf");
+        \\pub const zig_compiler_elf = @embedFile("zig_compiler.elf");
         \\
     );
     const services_mod = b.createModule(.{

@@ -221,17 +221,21 @@ const Inbound = struct {
     fs_port: u12 = 0,
     fs_scratch: u12 = 0,
     spawn_elf_pf: u12 = 0,
+    compiler_elf_pf: u12 = 0,
     have_serial: bool = false,
     have_fs: bool = false,
     have_spawn: bool = false,
+    have_compiler: bool = false,
     have_com1: bool = false,
 };
 
 // Walk the cap table. Convention from root_service spawn order:
 //   [3] serial_port, [4] serial_scratch, [5] COM1 device_region,
-//   [6] fs_port,     [7] io_scratch,     [8] zig_hello2 elf page_frame.
+//   [6] fs_port,     [7] io_scratch,     [8] zig_hello2 elf page_frame,
+//   [9] zig_compiler elf page_frame.
 // Identify by handle-type sequence: ports[0]=serial, ports[1]=fs;
-// page_frames[0]=serial_scratch, [1]=io_scratch, [2]=spawn_elf_pf.
+// page_frames[0]=serial_scratch, [1]=io_scratch, [2]=spawn_elf_pf,
+// [3]=compiler_elf_pf.
 fn findInbound(cap_table_base: u64) Inbound {
     var inv: Inbound = .{};
     var got_ports: u8 = 0;
@@ -256,6 +260,8 @@ fn findInbound(cap_table_base: u64) Inbound {
                     inv.fs_scratch = @truncate(slot);
                 } else if (got_pfs == 2) {
                     inv.spawn_elf_pf = @truncate(slot);
+                } else if (got_pfs == 3) {
+                    inv.compiler_elf_pf = @truncate(slot);
                 }
                 got_pfs += 1;
             },
@@ -267,11 +273,12 @@ fn findInbound(cap_table_base: u64) Inbound {
             },
             else => {},
         }
-        if (got_ports >= 2 and got_pfs >= 3 and inv.have_com1) break;
+        if (got_ports >= 2 and got_pfs >= 4 and inv.have_com1) break;
     }
     inv.have_serial = (got_ports >= 1 and got_pfs >= 1);
     inv.have_fs = (got_ports >= 2 and got_pfs >= 2);
     inv.have_spawn = (got_pfs >= 3);
+    inv.have_compiler = (got_pfs >= 4);
     return inv;
 }
 
@@ -703,6 +710,220 @@ fn print2NumLine(
     serialPrint(port, scratch_va, msg[0..i]);
 }
 
+// Round-trip the bytes of `src_pf` through the SQL FS at `dst_path`,
+// then allocate a fresh page_frame and copy the read-back bytes into
+// it. Returns the new pf handle (caps r+w+x) on success.
+fn roundtripPfThroughDisk(
+    inv: Inbound,
+    serial_va: u64,
+    fs_va: u64,
+    src_pf: u12,
+    dst_path: []const u8,
+) ?u12 {
+    const SRC_MAX_PAGES: u64 = 32;
+    const src_map = mapPfWithHandle(src_pf, SRC_MAX_PAGES, 0b001) orelse {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] roundtrip: map src failed\n");
+        return null;
+    };
+    const src: [*]const u8 = @ptrFromInt(src_map.va);
+
+    const e_phoff: u64 = readU64Le(src + 0x20);
+    const e_phentsize: u64 = readU16Le(src + 0x36);
+    const e_phnum: u64 = readU16Le(src + 0x38);
+    const e_shoff: u64 = readU64Le(src + 0x28);
+    const e_shentsize: u64 = readU16Le(src + 0x3a);
+    const e_shnum: u64 = readU16Le(src + 0x3c);
+    var max_end: u64 = e_shoff + e_shentsize * e_shnum;
+    var pi: u64 = 0;
+    while (pi < e_phnum) : (pi += 1) {
+        const ph_base: u64 = src_map.va + e_phoff + pi * e_phentsize;
+        const ph: [*]const u8 = @ptrFromInt(ph_base);
+        const p_offset: u64 = readU64Le(ph + 8);
+        const p_filesz: u64 = readU64Le(ph + 32);
+        const end: u64 = p_offset + p_filesz;
+        if (end > max_end) max_end = end;
+    }
+    const elf_size: u64 = (max_end + 4095) & ~@as(u64, 4095);
+
+    _ = fsUnlink(inv.fs_port, fs_va, dst_path);
+    const cr = fsCreateFile(inv.fs_port, fs_va, dst_path, 0o644);
+    if (cr.status != 0) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] roundtrip: create status=", cr.status);
+        return null;
+    }
+    const elf_slice = src[0..elf_size];
+    const wr = fsPwrite(inv.fs_port, fs_va, dst_path, 0, elf_slice);
+    if (wr.status != 0 or wr.bytes_written != elf_size) {
+        print2NumLine(inv.serial_port, serial_va, "[zig_hello] roundtrip: pwrite status=", wr.status, " bytes=", wr.bytes_written);
+        return null;
+    }
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, src_map.vmar) });
+
+    return readDiskFileToFreshPf(inv, serial_va, fs_va, dst_path, elf_size);
+}
+
+// Read `path` from disk into a freshly-allocated page_frame (caps
+// r+w+x). `max_bytes` caps the read length and determines the pf size.
+// Returns the new pf handle on success.
+fn readDiskFileToFreshPf(
+    inv: Inbound,
+    serial_va: u64,
+    fs_va: u64,
+    path: []const u8,
+    max_bytes: u64,
+) ?u12 {
+    const rb = fsPread(inv.fs_port, fs_va, path, 0, max_bytes);
+    if (rb.status != 0) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] readDisk: pread status=", rb.status);
+        return null;
+    }
+    const dst_pages: u64 = (rb.bytes_read + 4095) / 4096;
+    if (dst_pages == 0) return null;
+    const pf_caps_rwx: u64 = (1 << 2) | (1 << 3) | (1 << 4);
+    const cpf = issueRaw(buildWord(SYS_CREATE_PAGE_FRAME, 0), .{
+        .v1 = pf_caps_rwx,
+        .v2 = 0,
+        .v3 = dst_pages,
+    });
+    if (cpf.v1 < 16) {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] readDisk: createPageFrame failed\n");
+        return null;
+    }
+    const new_pf: u12 = @truncate(cpf.v1 & 0xFFF);
+    const dst_map = mapPfWithHandle(new_pf, dst_pages, 0b011) orelse {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] readDisk: map dst failed\n");
+        return null;
+    };
+    const dst: [*]u8 = @ptrFromInt(dst_map.va);
+    const back_src: [*]const u8 = @ptrFromInt(fs_va + rb.data_off);
+    var k: u64 = 0;
+    while (k < rb.bytes_read) : (k += 1) dst[k] = back_src[k];
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, dst_map.vmar) });
+    return new_pf;
+}
+
+// PortCap bits (mirrors libz/caps.zig PortCap): move(0), copy(1),
+// recv(2), xfer(3), bind(4).
+const PORT_COPY: u16 = 1 << 1;
+const PORT_XFER: u16 = 1 << 3;
+const PORT_BIND: u16 = 1 << 4;
+// PfCap bits: move(0), copy(1), r(2), w(3), x(4).
+const PF_COPY: u16 = 1 << 1;
+const PF_R: u16 = 1 << 2;
+const PF_W: u16 = 1 << 3;
+
+// Spawn the zig_compiler with the caps it needs to print, do fs IPC,
+// and run. Returns the IDC handle on success.
+fn spawnCompilerDomain(inv: Inbound, compiler_pf: u12) u64 {
+    const child_self: u64 = CREC | CRVR | CRPF | CRPT;
+    const ceilings_inner: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0x01FF) << 8) |
+        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x1F) << 32) |
+        (@as(u64, 0x01) << 40) |
+        (@as(u64, 0x1C) << 48);
+    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+
+    var passed: [4]u64 = undefined;
+    passed[0] = passedHandle(inv.com1, DEV_MOVE | DEV_COPY, false);
+    passed[1] = passedHandle(inv.fs_port, PORT_COPY | PORT_XFER | PORT_BIND, false);
+    passed[2] = passedHandle(inv.fs_scratch, PF_COPY | PF_R | PF_W, false);
+
+    const regs = Regs{
+        .v1 = child_self,
+        .v2 = ceilings_inner,
+        .v3 = ceilings_outer,
+        .v4 = @as(u64, compiler_pf),
+        .v5 = 0,
+        .v6 = passed[0],
+        .v7 = passed[1],
+        .v8 = passed[2],
+    };
+    const r = issueRaw(buildWord(SYS_CREATE_CAPABILITY_DOMAIN, 0), regs);
+    return r.v1;
+}
+
+// ── Phase 4e: stage compiler+source on disk, spawn the compiler from
+//    disk, let it produce /hello.elf, then load and spawn /hello.elf.
+//    The full "compiler-on-Zag → ELF-on-disk → spawn-from-disk" loop.
+fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
+    if (!inv.have_compiler) {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] 4e: no compiler pf; skip\n");
+        return;
+    }
+    serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 4e: compile + spawn from disk\n");
+
+    // 1. Stage /hello.zig source bytes (placeholder content; the
+    //    compiler currently ignores them).
+    const src_bytes = "// Phase 4e source placeholder.\npub fn main() void { }\n";
+    _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
+    const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
+    if (cs.status != 0) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4e: hello.zig create=", cs.status);
+        return;
+    }
+    const ws = fsPwrite(inv.fs_port, fs_va, "/hello.zig", 0, src_bytes);
+    if (ws.status != 0) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4e: hello.zig pwrite=", ws.status);
+        return;
+    }
+
+    // 2. Round-trip zig_compiler.elf to /zig_compiler.elf and get a
+    //    fresh pf populated with the disk-read bytes.
+    const compiler_pf = roundtripPfThroughDisk(
+        inv,
+        serial_va,
+        fs_va,
+        inv.compiler_elf_pf,
+        "/zig_compiler.elf",
+    ) orelse return;
+
+    // 3. Spawn zig_compiler with COM1 + fs_port + io_scratch (shared
+    //    scratch is OK because we yield before touching fs again).
+    const idc_c = spawnCompilerDomain(inv, compiler_pf);
+    if (idc_c < 16) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4e: spawn compiler err=", idc_c);
+        return;
+    }
+    printNumLine(inv.serial_port, serial_va, "[zig_hello] 4e: spawned compiler idc=", idc_c & 0xFFF);
+
+    // 4. Yield enough to let zig_compiler retire its 4 fs IPCs and
+    //    produce /hello.elf. fs IPC is fast; 200k yields is gross
+    //    overkill but guarantees we don't race the scratch buffer.
+    const SYS_YIELD: u12 = 25;
+    var y: u64 = 0;
+    while (y < 200000) : (y += 1) {
+        _ = issueRaw(buildWord(SYS_YIELD, 0), .{});
+    }
+
+    // 5. Read /hello.elf from disk into a fresh pf and spawn it. The
+    //    output ELF was written by zig_compiler in this very boot.
+    const hello_pf = readDiskFileToFreshPf(
+        inv,
+        serial_va,
+        fs_va,
+        "/hello.elf",
+        60 * 1024,
+    ) orelse {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] 4e: load /hello.elf failed\n");
+        return;
+    };
+
+    var passed_out: [4]u64 = undefined;
+    passed_out[0] = passedHandle(inv.com1, DEV_MOVE | DEV_COPY, false);
+    const idc_h = spawnDomain(hello_pf, passed_out[0..1]);
+    if (idc_h < 16) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4e: spawn /hello.elf err=", idc_h);
+        return;
+    }
+    serialPrint(
+        inv.serial_port,
+        serial_va,
+        "[zig_hello] phase 4e: full pipeline ok (compiler-on-Zag wrote /hello.elf, we spawned it)\n",
+    );
+}
+
 // ── Phase 4d: round-trip zig_hello2 through disk and spawn it. ──────
 fn runPhase4d(inv: Inbound, serial_va: u64, fs_va: u64) void {
     debugPrint("[zig_hello] phase 4d: disk round-trip\n");
@@ -1092,6 +1313,12 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     //    the disk-read bytes. This is the core "load ELF from disk and
     //    run" primitive that the Zig-compiler-on-Zag demo needs.
     runPhase4d(inv, serial_va, fs_va);
+
+    // ── Phase 4e: full compile+spawn pipeline through disk. Builds on
+    //    Phase 4d's primitive but adds the chain: zig_compiler runs as
+    //    a child capability domain, writes /hello.elf, and we then
+    //    load+spawn /hello.elf from disk.
+    runPhase4e(inv, serial_va, fs_va);
 
     zagExit();
 }
