@@ -12,6 +12,7 @@ const kprof = zag.kprof.trace_id;
 const kprof_sample = zag.kprof.sample;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const paging_mod = zag.arch.x64.paging;
+const panic_mod = zag.panic;
 const port = zag.sched.port;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.x64.serial;
@@ -231,6 +232,12 @@ fn isUserHltAt(rip: u64) bool {
 }
 
 fn exceptionHandler(ctx: *cpu.Context) void {
+    // Sentinel BEFORE any other work — proves whether the exception
+    // path ran at all on smp=4 silent-failure reps. 'X' = entered
+    // exceptionHandler; subsequent path-specific bytes ('G' GPF,
+    // 'D' double-fault, 'U' unhandled, 'P' from @panic) narrow further.
+    panic_mod.debugSentinel('X');
+
     kprof.enter(.exception);
     defer kprof.exit(.exception);
 
@@ -309,7 +316,10 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     }
 
     switch (exception) {
-        .double_fault => @panic("Double fault"),
+        .double_fault => {
+            panic_mod.debugSentinel('D');
+            @panic("Double fault");
+        },
         .machine_check => @panic("Machine check exception"),
         .non_maskable_interrupt => {
             // lockdep blindspot: NMI is NOT wired into sync_debug.enterIrqContext.
@@ -332,11 +342,13 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             @panic("NMI");
         },
         .general_protection_fault => {
+            panic_mod.debugSentinel('G');
             serial.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
             @panic("General protection fault");
         },
         .page_fault => unreachable,
         else => {
+            panic_mod.debugSentinel('U');
             serial.print("Exception {d} at rip=0x{x} err=0x{x}\n", .{
                 vector, ctx.rip, ctx.err_code,
             });
@@ -370,6 +382,12 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     kprof.point(.page_fault_hw, faulting_addr);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
+
+    // Sentinel for kernel-mode #PF only (user-mode PFs are normal demand
+    // paging — flooding 'F' would drown the diagnostic signal). 'F' on
+    // a silent failing log => kernel-mode page fault that died before
+    // emitting structured output.
+    if (!from_user) panic_mod.debugSentinel('F');
 
     // Intercept port-IO virtual_bar faults from userspace before the
     // generic handler. A VMAR mapped via `map_mmio` to a port-IO

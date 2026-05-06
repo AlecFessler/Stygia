@@ -34,6 +34,27 @@ pub const PANIC_OWNER_NONE: u32 = 0xff;
 
 pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OWNER_NONE);
 
+/// Emit a single byte to COM1 via raw outb, no LSR poll, no locks, no
+/// other code paths. Hammers the same byte 4× in a row so the THR has
+/// multiple opportunities to latch it even if a previous write is still
+/// in flight. Used to prove how far the kernel got before a silent
+/// failure: if the byte appears in serial output, the path containing
+/// the call was reached.
+pub fn debugSentinel(byte: u8) void {
+    @setRuntimeSafety(false);
+    const port: u16 = 0x3f8;
+    var i: u8 = 0;
+    while (i < 4) {
+        asm volatile (
+            \\outb %[b], %[p]
+            :
+            : [b] "{al}" (byte),
+              [p] "{dx}" (port),
+            : .{ .memory = true });
+        i += 1;
+    }
+}
+
 /// Try to claim the panic gate. Used both by pre-panic diagnostic prints
 /// (e.g. fault-handler dumps) and by `panic()` itself. The winning core
 /// is the only one allowed to print; loser cores halt silently.
@@ -56,6 +77,12 @@ pub fn claimPanic() bool {
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {
     @branchHint(.cold);
     _ = trace;
+
+    // Sentinel BEFORE claimPanic + structured dump. Any @panic-reaching
+    // crash should stamp 'P' on COM1 even if claimPanic loses, the
+    // structured dump faults, or a serial print recurses. Smp=4 silent
+    // failure investigation — see project_l4_smp4_kstack_lifetime.md.
+    debugSentinel('P');
 
     if (!claimPanic()) arch.cpu.halt();
 
