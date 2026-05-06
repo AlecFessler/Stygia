@@ -857,12 +857,17 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     // 1. Stage /hello.zig source bytes. The compiler extracts:
     //      tag    → first quoted string  (bracketed prefix)
     //      banner → second quoted string (body)
-    //      seed   → first decimal int after the second string (suffix)
+    //      seed   → first decimal int after the second string
+    //      mult   → second decimal int after the second string
     //    Output banner: "[<tag>] <banner> seed=<n>".
+    //    Spawned binary additionally prints "[runtime] seed * mult = <p>"
+    //    where p = seed*mult is computed at runtime from patched
+    //    binary sentinels.
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
         "pub const banner = \"hello from Zag userspace,\";\n" ++
-        "pub const seed = 1337;\n";
+        "pub const seed = 1337;\n" ++
+        "pub const mult = 9;\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
     if (cs.status != 0) {
@@ -1160,14 +1165,15 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     // ── Phase 3: file write round-trip. Create a fresh file, write a
     //    known string, read it back, verify it matches, unlink.
     //
-    // io_scratch is shared with verify_fs's harness; our 3-op sequence
-    // (create_file, pwrite, pread, unlink) is racey with verify_fs's
-    // concurrent writes. Yield enough times for verify_fs to retire all
-    // 10 phases before we touch the scratch. ~50000 yields is overkill
-    // but cheap; verify_fs typically finishes in <10ms.
+    // io_scratch is shared with verify_fs's harness; our fs-touching
+    // phases (3, 4d, 4e) all race with verify_fs's concurrent writes.
+    // Yield enough times for verify_fs to retire all 10 phases before
+    // we touch the scratch. The yield budget needs to span Phase 3 +
+    // 4d + 4e because each does its own fs IPC chain — under load
+    // verify_fs can stretch well past 100ms.
     const SYS_YIELD: u12 = 25;
     var yield_n: u64 = 0;
-    while (yield_n < 50000) : (yield_n += 1) {
+    while (yield_n < 500000) : (yield_n += 1) {
         _ = issueRaw(buildWord(SYS_YIELD, 0), .{});
     }
     debugPrint("[zig_hello] phase 3: file write test\n");

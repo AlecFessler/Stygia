@@ -182,12 +182,12 @@ fn print(s: []const u8) void {
     while (i < s.len) : (i += 1) p[0] = s[i];
 }
 
-// Sentinel u64 patched by zig_compiler before spawn. The volatile load
-// in _start defeats constant-folding, forcing a real memory read so
-// the patched value is what the binary observes at runtime. The bytes
-// 0xCAFEBABE_DEADBEEF are unique enough that the compiler can locate
-// them via byte-search in the ELF file.
+// Sentinel u64s patched by zig_compiler before spawn. Volatile loads
+// in _start defeat constant-folding, forcing real memory reads so the
+// patched values are what the binary observes at runtime. Each
+// sentinel is unique enough to locate via byte-search in the ELF.
 var seed_value: u64 = 0xCAFEBABE_DEADBEEF;
+var mult_value: u64 = 0xCAFEBABE_FACE0001;
 
 fn formatU64(buf: []u8, n: u64) []u8 {
     if (n == 0) {
@@ -216,16 +216,28 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     initSink(cap_table_base);
     print("[zig_hello2] hello from a Zag-target ELF spawned by another Zag-target ELF\n");
 
-    // Volatile load forces a real memory read so the compiler can't
-    // fold seed_value back to its sentinel initializer at compile time.
+    // Volatile loads force real memory reads so the compiler can't
+    // fold the sentinel initializers at compile time.
     const seed_ptr: *volatile u64 = &seed_value;
-    const v = seed_ptr.*;
+    const mult_ptr: *volatile u64 = &mult_value;
+    const v_seed = seed_ptr.*;
+    const v_mult = mult_ptr.*;
+    const product: u64 = v_seed *% v_mult;
+
+    printLine("[runtime] seed=", v_seed);
+    printLine("[runtime] mult=", v_mult);
+    printLine("[runtime] seed * mult = ", product);
+
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
+    while (true) asm volatile ("hlt");
+}
+
+fn printLine(prefix: []const u8, n: u64) void {
     var sb: [32]u8 = undefined;
-    const ss = formatU64(&sb, v);
-    var line: [64]u8 = undefined;
-    const lead = "[runtime] seed=";
+    const ss = formatU64(&sb, n);
+    var line: [80]u8 = undefined;
     var w: usize = 0;
-    for (lead) |b| {
+    for (prefix) |b| {
         line[w] = b;
         w += 1;
     }
@@ -236,7 +248,4 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     line[w] = '\n';
     w += 1;
     print(line[0..w]);
-
-    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
-    while (true) asm volatile ("hlt");
 }

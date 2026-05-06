@@ -381,11 +381,14 @@ var tag_len: usize = 0;
 var banner_buf: [128]u8 = undefined;
 var banner_len: usize = 0;
 
-// Integer extracted from /hello.zig — the first decimal literal that
-// appears after the second quoted string. Composed into the banner
-// as ASCII (e.g. " repeat=7").
+// Integers extracted from /hello.zig — first two decimal literals
+// after the second quoted string. seed → " seed=<n>" suffix in the
+// banner string AND patched into the binary's seed_value sentinel;
+// mult → patched into the mult_value sentinel.
 var seed_int: u64 = 0;
 var seed_found: bool = false;
+var mult_int: u64 = 0;
+var mult_found: bool = false;
 
 // Extract up to two quoted-string literals from `src[0..src_len]` and
 // the first decimal integer that appears after the second quoted
@@ -424,21 +427,31 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
             break;
         }
     }
-    // Scan for the first decimal int after the second quoted string.
+    // Scan for the first two decimal ints after the second quoted string.
     if (after_second) |start| {
         var j: usize = start;
-        while (j < src_len) : (j += 1) {
+        var ints_found: u8 = 0;
+        while (j < src_len) {
             const c = src[j];
-            if (c < '0' or c > '9') continue;
+            if (c < '0' or c > '9') {
+                j += 1;
+                continue;
+            }
             var v: u64 = 0;
             while (j < src_len) : (j += 1) {
                 const d = src[j];
                 if (d < '0' or d > '9') break;
                 v = v * 10 + (@as(u64, d) - '0');
             }
-            seed_int = v;
-            seed_found = true;
-            break;
+            if (ints_found == 0) {
+                seed_int = v;
+                seed_found = true;
+                ints_found = 1;
+            } else {
+                mult_int = v;
+                mult_found = true;
+                break;
+            }
         }
     }
     return found;
@@ -447,26 +460,26 @@ fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
 // Find every occurrence of the 8-byte sentinel (little-endian) and
 // replace it with `value` as little-endian u64. Returns hit count.
 const SEED_SENTINEL: u64 = 0xCAFEBABE_DEADBEEF;
+const MULT_SENTINEL: u64 = 0xCAFEBABE_FACE0001;
 
-fn patchSeedSentinel(buf: []u8, value: u64) usize {
+fn patchU64Sentinel(buf: []u8, sentinel: u64, value: u64) usize {
     var hits: usize = 0;
     if (buf.len < 8) return 0;
     const limit = buf.len - 8;
     var i: usize = 0;
     while (i <= limit) : (i += 1) {
-        // Little-endian compare against SEED_SENTINEL.
         var got: u64 = 0;
         var k: u6 = 0;
         while (k < 8) : (k += 1) {
             got |= @as(u64, buf[i + k]) << (k * 8);
         }
-        if (got != SEED_SENTINEL) continue;
+        if (got != sentinel) continue;
         var w: u6 = 0;
         while (w < 8) : (w += 1) {
             buf[i + w] = @truncate((value >> (w * 8)) & 0xFF);
         }
         hits += 1;
-        i += 7; // skip past this match (loop's +=1 makes total 8)
+        i += 7;
     }
     return hits;
 }
@@ -581,6 +594,9 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     } else {
         print("[zig_compiler] no seed int in source\n");
     }
+    if (mult_found) {
+        printNum("[zig_compiler] extracted mult=", mult_int);
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
@@ -603,13 +619,19 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         zagExit();
     }
 
-    // Patch the runtime seed sentinel — a u64 in the binary that
-    // gets read via volatile load and printed at runtime by the
-    // spawned binary. This is "real" codegen: source value drives
-    // a runtime constant, not just a static string.
+    // Patch the runtime sentinels — u64s in the binary read via
+    // volatile loads at runtime. Source values drive real memory
+    // contents, not just text. The spawned binary multiplies the
+    // two patched values and prints the product.
     if (seed_found) {
-        const seed_hits = patchSeedSentinel(elf_buf[0..out.bytes_read], seed_int);
-        printNum("[zig_compiler] patched seed sentinel hits=", seed_hits);
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], SEED_SENTINEL, seed_int);
+        printNum("[zig_compiler] patched seed sentinel hits=", h);
+    }
+    if (mult_found) {
+        const h = patchU64Sentinel(elf_buf[0..out.bytes_read], MULT_SENTINEL, mult_int);
+        printNum("[zig_compiler] patched mult sentinel hits=", h);
+    } else {
+        print("[zig_compiler] no second int (mult) in source\n");
     }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).
