@@ -242,6 +242,42 @@ pub fn build(b: *std.Build) void {
     hello_std_run.addFileArg(b.path("zig_hello_std/main.zig"));
     const hello_std_elf = hello_std_run.addPrefixedOutputFileArg("-femit-bin=", "zig_hello_std.elf");
 
+    // ── fs_smoke.elf — exercises the libc.a → runtime.o → fs IPC chain.
+    //    The patched no-LLVM zig can't take two source files in a single
+    //    build-exe, so build each as build-obj, then link with libc.a.
+    //
+    //    libc.a is pre-built at libz/libc/zig-out/lib/libc.a — see
+    //    libz/libc/PORT_CHECKLIST.md. Rebuilt manually after edits to
+    //    libz/libc/src/.
+    const libc_a = b.option(
+        []const u8,
+        "libc-a",
+        "Path to libz/libc.a (default: ../libz/libc/zig-out/lib/libc.a)",
+    ) orelse "/home/alec/Zag/libz/libc/zig-out/lib/libc.a";
+
+    const fs_smoke_obj_run = b.addSystemCommand(&.{ zag_zig, "build-obj" });
+    fs_smoke_obj_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    fs_smoke_obj_run.addArgs(&zag_args);
+    fs_smoke_obj_run.addArgs(&.{ "--name", "fs_smoke" });
+    fs_smoke_obj_run.addFileArg(b.path("libc_smoke/fs_smoke.zig"));
+    const fs_smoke_obj = fs_smoke_obj_run.addPrefixedOutputFileArg("-femit-bin=", "fs_smoke.o");
+
+    const runtime_obj_run = b.addSystemCommand(&.{ zag_zig, "build-obj" });
+    runtime_obj_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    runtime_obj_run.addArgs(&zag_args);
+    runtime_obj_run.addArgs(&.{ "--name", "runtime" });
+    runtime_obj_run.addFileArg(b.path("libc_smoke/runtime.zig"));
+    const runtime_obj = runtime_obj_run.addPrefixedOutputFileArg("-femit-bin=", "runtime.o");
+
+    const fs_smoke_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    fs_smoke_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    fs_smoke_run.addArgs(&zag_args);
+    fs_smoke_run.addArgs(&.{ "--name", "fs_smoke" });
+    fs_smoke_run.addFileArg(fs_smoke_obj);
+    fs_smoke_run.addFileArg(runtime_obj);
+    fs_smoke_run.addArg(libc_a);
+    const fs_smoke_elf = fs_smoke_run.addPrefixedOutputFileArg("-femit-bin=", "fs_smoke.elf");
+
     // ── usb_driver.elf ──────────────────────────────────────────────
     const usb_app_mod = b.createModule(.{
         .root_source_file = b.path("usb_driver/main.zig"),
@@ -583,6 +619,7 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(hello_elf, "zig_hello.elf");
     _ = services_wf.addCopyFile(hello2_elf, "zig_hello2.elf");
     _ = services_wf.addCopyFile(hello_std_elf, "zig_hello_std.elf");
+    _ = services_wf.addCopyFile(fs_smoke_elf, "fs_smoke.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -595,6 +632,7 @@ pub fn build(b: *std.Build) void {
         \\pub const zig_hello_elf = @embedFile("zig_hello.elf");
         \\pub const zig_hello2_elf = @embedFile("zig_hello2.elf");
         \\pub const zig_hello_std_elf = @embedFile("zig_hello_std.elf");
+        \\pub const fs_smoke_elf = @embedFile("fs_smoke.elf");
         \\
     );
     const services_mod = b.createModule(.{

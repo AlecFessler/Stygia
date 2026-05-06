@@ -103,6 +103,8 @@ pub fn main(cap_table_base: u64) void {
     // Phase 4b: stage zig_hello_std.elf — first Zag-target binary that
     // imports std and prints via std.io.
     const zig_hello_std_pf = stageElfPageFrame(services.zig_hello_std_elf) orelse powerShutdown();
+    // libc_smoke fs_smoke: exercises libc.a → runtime.o → fs IPC chain.
+    const fs_smoke_pf = stageElfPageFrame(services.fs_smoke_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -209,6 +211,27 @@ pub fn main(cap_table_base: u64) void {
         var n: usize = 0;
         appendDevice(&passed, &n, com1, .{});
         _ = spawnService("zig_hello_std", zig_hello_std_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn fs_smoke ──────────────────────────────────────────────
+    // Phase 4c smoke test: a Zag-target binary that links libc.a +
+    // runtime.o and exercises fopen/fwrite/fread/unlink/stat against
+    // the SQL FS. The runtime walks its cap table to find:
+    //   port[0]              → fs_port
+    //   page_frame[0]        → fs_scratch
+    //   device_region COM1   → COM1 sink for printf
+    //
+    // Cap-table layout we pass:
+    //   [3] fs_port (xfer|bind)
+    //   [4] io_scratch (r+w, FS_SCRATCH_PAGES)
+    //   [5] COM1 device_region (port_io)
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
+        appendDevice(&passed, &n, com1, .{});
+        _ = spawnService("fs_smoke", fs_smoke_pf, passed[0..n]) orelse powerShutdown();
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────

@@ -20,6 +20,8 @@ extern fn zag_fs_stat(path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaq
 extern fn zag_fs_unlink(path_ptr: [*]const u8, path_len: usize) callconv(.c) i32;
 extern fn zag_fs_lseek(fd: i32, offset: i64, whence: c_int) callconv(.c) i64;
 extern fn zag_fs_mkdir(path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) i32;
+extern fn zag_fs_truncate(path_ptr: [*]const u8, path_len: usize, size: i64) callconv(.c) i32;
+extern fn zag_fs_ftruncate(fd: i32, size: i64) callconv(.c) i32;
 
 extern fn zag_write_console(buf: [*]const u8, count: usize) callconv(.c) usize;
 
@@ -107,11 +109,13 @@ pub fn writeAt(fd: c_int, buf: [*]const u8, n: usize, offset: i64) isize {
     return @intCast(rc);
 }
 
+// offset = -1 → use the runtime's per-fd current position (advance it).
+// offset >= 0 → explicit (pread/pwrite); do not advance the position.
 export fn read(fd: c_int, buf: [*]u8, n: usize) callconv(.c) isize {
-    return readAt(fd, buf, n, 0);
+    return readAt(fd, buf, n, -1);
 }
 export fn write(fd: c_int, buf: [*]const u8, n: usize) callconv(.c) isize {
-    return writeAt(fd, buf, n, 0);
+    return writeAt(fd, buf, n, -1);
 }
 export fn pread(fd: c_int, buf: [*]u8, n: usize, offset: i64) callconv(.c) isize {
     return readAt(fd, buf, n, offset);
@@ -126,7 +130,7 @@ export fn readv(fd: c_int, iov: [*]const Iovec, count: c_int) callconv(.c) isize
     var total: isize = 0;
     var i: c_int = 0;
     while (i < count) : (i += 1) {
-        const r = readAt(fd, iov[@intCast(i)].base, iov[@intCast(i)].len, 0);
+        const r = readAt(fd, iov[@intCast(i)].base, iov[@intCast(i)].len, -1);
         if (r < 0) return r;
         total += r;
         if (@as(usize, @intCast(r)) < iov[@intCast(i)].len) return total;
@@ -137,7 +141,7 @@ export fn writev(fd: c_int, iov: [*]const IovecConst, count: c_int) callconv(.c)
     var total: isize = 0;
     var i: c_int = 0;
     while (i < count) : (i += 1) {
-        const r = writeAt(fd, iov[@intCast(i)].base, iov[@intCast(i)].len, 0);
+        const r = writeAt(fd, iov[@intCast(i)].base, iov[@intCast(i)].len, -1);
         if (r < 0) return r;
         total += r;
     }
@@ -234,12 +238,10 @@ export fn fchown(fd: c_int, uid: c_uint, gid: c_uint) callconv(.c) c_int {
     return 0;
 }
 export fn truncate(path: [*:0]const u8, size: i64) callconv(.c) c_int {
-    _ = .{ path, size };
-    return fail(ENOSYS);
+    return zag_fs_truncate(path, pathLen(path), size);
 }
 export fn ftruncate(fd: c_int, size: i64) callconv(.c) c_int {
-    _ = .{ fd, size };
-    return 0;
+    return zag_fs_ftruncate(fd, size);
 }
 export fn ftruncate64(fd: c_int, size: i64) callconv(.c) c_int {
     return ftruncate(fd, size);

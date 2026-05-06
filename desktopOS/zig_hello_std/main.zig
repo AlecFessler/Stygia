@@ -228,7 +228,10 @@ export fn zag_munmap(addr: u64, pages: usize) callconv(.c) i32 {
     return 0;
 }
 
-pub fn main() !void {
+// Renamed from `main` so std's start.zig doesn't auto-export
+// `_start`=zag_start when this file already provides its own legacy
+// `_start`. Auto-export only triggers on `pub fn main`.
+fn appMain() !void {
     // First confirm the bare posix path works.
     const msg1 = "[zig_hello_std] hello via std.posix.write\n";
     _ = try std.posix.write(2, msg1);
@@ -267,7 +270,7 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         var i: usize = 0;
         while (i < banner.len) : (i += 1) p[0] = banner[i];
     }
-    main() catch {};
+    appMain() catch {};
     if (sink) |p| {
         const banner = "[zig_hello_std] main returned\n";
         var i: usize = 0;
