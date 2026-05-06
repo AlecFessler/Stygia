@@ -565,9 +565,39 @@ sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193
 #
 # Libz ABI-load-bearing entries (paths shown as `libz/...` though they live
 # above `kernel/`; analyzer's view prefixes "kernel/" cosmetically):
-#   * libz/errors.zig (E_REFUSED) — spec-mandated error code 13 (§[error_codes]).
-#   * libz/caps.zig (PassedHandle/PairEntry._reserved_lo/_hi)
-#     — packed-struct padding load-bearing for the spec-defined u64 bit layout.
+#   * libz/errors.zig (E_REFUSED, fromRaw) — spec-mandated error code 13
+#     (§[error_codes]) and the public raw→Error helper.
+#   * libz/caps.zig (framebufferFields, handleArg, ReplyCap,
+#     PassedHandle/PairEntry._reserved_lo/_hi) — public capability
+#     decoder helpers + packed-struct padding load-bearing for the
+#     spec-defined u64 bit layout.
+#   * libz/syscall.zig + libz/syscall_extern.zig (extraReplyRecvPort)
+#     — public helper for spec §[reply] recv_port_handle_id at bits
+#     32-43 (atomic ReplyRecv).
+#   * libz/syscall_{x64,aarch64}{,_extern}.zig (replyRecvAsm) — public
+#     L4-style reply+recv asm shim consumed by typed-reply userspace
+#     clients; symmetric across both arches and both extern variants.
+#
+# Libz/libc surface (Phase 4c port) — public C-ABI symbols compiled into
+# the libc.a static archive that the cross-compiled Zig+LLVM links
+# against. Reported "unused" because nothing inside the kernel build
+# graph calls them; the C/C++ consumer lives outside the analyzer's
+# scope. Kept because the libc surface IS the contract.
+#   * libz/libc/src/libc.zig (panic) — std.debug.no_panic override so
+#     debug-mode safety checks compile cleanly without dragging in
+#     Zig's stack-trace machinery (selfExePath et al. don't exist on
+#     Zag).
+#   * libz/libc/src/malloc.zig (MallInfo2 fields) — glibc-shaped
+#     mallinfo2() return struct; layout-bearing for ABI compat even
+#     though we always return zeros.
+#   * libz/libc/src/posix_io.zig (Stat._padding) — opaque stat-buffer
+#     padding sized to glibc layout; the kernel writes the meaningful
+#     bytes via `zag_fs_stat`.
+#   * libz/libc/src/process.zig (Rusage._padding) — opaque rusage
+#     padding sized to glibc layout for getrusage() ABI compat.
+#   * libz/libc/src/signal.zig (SIG_IGN, SIG_ERR) — POSIX-defined
+#     sentinels exposed for signal-handler registration even though
+#     Zag never delivers signals.
 #
 arch/aarch64/exceptions.zig:83-83    sha256:00f74004fe5d6c96c4716a834c046dd0a9ea15dbfd77faa570ccbd8e0bd865d6
 arch/aarch64/exceptions.zig:85-85    sha256:915bb4d3f09477295e9a515b896a7996b6e9e9df97e6595e4b29f3d221074b0a
@@ -693,3 +723,31 @@ devices/device_region.zig:43-43    sha256:01f561e97b9ac7d0802015a5b721f2e94410cf
 devices/device_region.zig:44-44    sha256:cca70345ac5a6f6e5d388654418ad96ee720dc627a714e78a87ce4ffacb731d5
 devices/device_region.zig:45-45    sha256:babdfb64d377b9405de3e462e4f865d64313f6d38180e370ef7405d78c68754a
 devices/device_region.zig:46-46    sha256:3c56e02a7a3f77a0a70f67ea0860eff6a969783fe5675699994b5350f07aa3e5
+libz/caps.zig:101-112    sha256:1834055d80547e8b24cc020fbad3ef2b6fab858cd49aa6acb057b62a112fba23
+libz/caps.zig:116-118    sha256:44c288061c54000001b2cc313bbee2137417d728b050a1903961894035f5de27
+libz/caps.zig:243-252    sha256:cb9be335c0801a844ba31a5b9bdff73546b505a56e1f241a50581df3aa1bbbb3
+libz/caps.zig:282-282    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
+libz/caps.zig:285-285    sha256:e10cc8c94ad99bbf67176d548b57d10d8074e08acf528b24830fd7e9b8cf98b9
+libz/caps.zig:295-295    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
+libz/caps.zig:298-298    sha256:e10cc8c94ad99bbf67176d548b57d10d8074e08acf528b24830fd7e9b8cf98b9
+libz/errors.zig:19-19    sha256:c39f1cc906475be7923d0b66d2978a89000bcda0177631962211600880904022
+libz/errors.zig:25-27    sha256:d9741cb38c019649fe81d737ef9ded037d045e69f3f2cec719bd22631b1663c4
+libz/syscall.zig:141-143    sha256:2ae069e135d9e72e10b1763ac38519f4d72ab3deb1ca16d8418839ead9cb9c5b
+libz/syscall_extern.zig:149-151    sha256:2ae069e135d9e72e10b1763ac38519f4d72ab3deb1ca16d8418839ead9cb9c5b
+libz/syscall_aarch64.zig:240-242    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
+libz/syscall_aarch64_extern.zig:382-384    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
+libz/syscall_x64.zig:249-251    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
+libz/syscall_x64_extern.zig:394-396    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
+libz/libc/src/libc.zig:24-24    sha256:fd0971f2123fcf99d37b9644f6029abeb5f0d34f66fd51e04a9875428b136bfb
+libz/libc/src/malloc.zig:124-135    sha256:6ea5cfc6811262d484c6646648e8953655ba6af231f83a80218c05495dfab905
+libz/libc/src/posix_io.zig:175-175    sha256:28e66f44c5c2d4b97f85387decc565a73fe806c475290aa89fb2b246257d9efd
+libz/libc/src/process.zig:156-156    sha256:b9dee8acb9420236152a13848534037d8291d9f903d4f3360f93b49988d7e2e0
+libz/libc/src/signal.zig:13-14    sha256:ff65becaaac9d0ab65dbfafc39c3b708c53699fa5feb79d6b9ea3ccb758fd60d
+libz/libc/src/dl.zig:12-12    sha256:eb243683b7bee6c46b14d50748ed68b04b7296a7bd53623c58e4749d45aedd30
+libz/libc/src/fortify.zig:36-36    sha256:1cf545c6d0ec5c7ae82c8b41057c127c89c7f3c45cb33bb09e2c14d875ce5a8b
+libz/libc/src/malloc.zig:27-27    sha256:0249cda3d9738e8ffef372dbbd2c923e47733c47ff037e3ad3732a22cefd90b8
+libz/libc/src/process.zig:12-12    sha256:73a24cd9d90f69fc6df37d46e681ee6c51e59ebefbd0b7769d42c928ccdc987b
+libz/syscall_aarch64.zig:37-37    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
+libz/syscall_aarch64_extern.zig:37-37    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
+libz/syscall_x64.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
+libz/syscall_x64_extern.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
