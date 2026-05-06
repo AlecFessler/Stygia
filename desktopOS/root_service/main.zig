@@ -170,12 +170,27 @@ pub fn main(cap_table_base: u64) void {
     // Phase-0 demo: prints "[zig_hello] hello from zig on zag" via
     // serial_server IPC. Carries COM1 as a debug fallback while
     // bringing the IPC path up.
+    //
+    // Phase-1 demo: also reads `/persist_marker` from the SQL FS via
+    // fs_port + io_scratch, prints the contents through serial_server.
+    // io_scratch is shared with verify_fs — that's a known race risk
+    // but fine for the demo (verify_fs finishes its pass before
+    // zig_hello issues its own fs ops in practice).
+    //
+    // Cap-table layout (in zig_hello's domain, slot SLOT_FIRST_PASSED+):
+    //   [3] serial_port (xfer|bind)
+    //   [4] serial_scratch (r+w, 1 page)
+    //   [5] COM1 device_region (debug fallback)
+    //   [6] fs_port (xfer|bind)
+    //   [7] io_scratch (r+w, fs_ops.SCRATCH_PAGES)
     {
         var passed: [MAX_PASSED]u64 = undefined;
         var n: usize = 0;
         appendPort(&passed, &n, serial_port, .{ .xfer = true, .bind = true });
         appendPf(&passed, &n, serial_scratch, .{ .r = true, .w = true });
         appendDevice(&passed, &n, com1, .{});
+        appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
         _ = spawnService("zig_hello", zig_hello_pf, passed[0..n]) orelse powerShutdown();
     }
 
