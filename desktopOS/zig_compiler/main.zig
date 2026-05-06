@@ -381,12 +381,21 @@ var tag_len: usize = 0;
 var banner_buf: [128]u8 = undefined;
 var banner_len: usize = 0;
 
-// Extract up to two quoted-string literals from `src[0..src_len]`.
-// Returns the number of strings found (0, 1, or 2).
-fn extractTwoQuoted(src: [*]const u8, src_len: usize) usize {
+// Integer extracted from /hello.zig — the first decimal literal that
+// appears after the second quoted string. Composed into the banner
+// as ASCII (e.g. " repeat=7").
+var seed_int: u64 = 0;
+var seed_found: bool = false;
+
+// Extract up to two quoted-string literals from `src[0..src_len]` and
+// the first decimal integer that appears after the second quoted
+// string. Returns the number of strings found (0, 1, or 2). The int
+// is reported via `seed_found` / `seed_int`.
+fn extractSourceFields(src: [*]const u8, src_len: usize) usize {
     var found: usize = 0;
     var in_str = false;
     var str_start: usize = 0;
+    var after_second: ?usize = null;
     var i: usize = 0;
     while (i < src_len) : (i += 1) {
         if (src[i] != '"') continue;
@@ -411,7 +420,25 @@ fn extractTwoQuoted(src: [*]const u8, src_len: usize) usize {
             while (k < cap) : (k += 1) banner_buf[k] = src[str_start + 1 + k];
             banner_len = cap;
             found = 2;
-            return 2;
+            after_second = end + 1;
+            break;
+        }
+    }
+    // Scan for the first decimal int after the second quoted string.
+    if (after_second) |start| {
+        var j: usize = start;
+        while (j < src_len) : (j += 1) {
+            const c = src[j];
+            if (c < '0' or c > '9') continue;
+            var v: u64 = 0;
+            while (j < src_len) : (j += 1) {
+                const d = src[j];
+                if (d < '0' or d > '9') break;
+                v = v * 10 + (@as(u64, d) - '0');
+            }
+            seed_int = v;
+            seed_found = true;
+            break;
         }
     }
     return found;
@@ -433,13 +460,11 @@ fn patchBanner(buf: []u8) usize {
         }
         if (!ok) continue;
 
-        // Layout: '[' <tag> ']' ' ' <banner> <space-pad> '\n'
-        // Total = BANNER_LEN bytes. Truncate either field as needed.
+        // Layout: '[' <tag> ']' ' ' <banner> [' seed=' <int>] <pad> '\n'
         var w: usize = 0;
         buf[i + w] = '[';
         w += 1;
-        const tag_room: usize = BANNER_LEN -% 4; // 4 = ']' + ' ' + <body min 1> + '\n'
-        const tag_cap = if (tag_len > tag_room) tag_room else tag_len;
+        const tag_cap = if (tag_len > 30) 30 else tag_len;
         var j: usize = 0;
         while (j < tag_cap) : (j += 1) {
             buf[i + w] = tag_buf[j];
@@ -450,12 +475,39 @@ fn patchBanner(buf: []u8) usize {
         buf[i + w] = ' ';
         w += 1;
 
-        // Remaining room for banner body = BANNER_LEN - w - 1 (for \n).
-        const body_room: usize = BANNER_LEN - w - 1;
+        // Banner body — leave room for seed suffix + trailing '\n'.
+        var seed_str_buf: [24]u8 = undefined;
+        var seed_str: []const u8 = &.{};
+        if (seed_found) {
+            const tail = formatU64(&seed_str_buf, seed_int);
+            const seed_pre = " seed=";
+            // Build " seed=<int>" in seed_str_buf in two passes (we
+            // already have the int at the start of the buf; shift it).
+            var combined: [24]u8 = undefined;
+            var ci: usize = 0;
+            while (ci < seed_pre.len) : (ci += 1) combined[ci] = seed_pre[ci];
+            var ti: usize = 0;
+            while (ti < tail.len and ci < combined.len) : (ti += 1) {
+                combined[ci] = tail[ti];
+                ci += 1;
+            }
+            // Re-pack into seed_str_buf for slice safety.
+            var pi: usize = 0;
+            while (pi < ci) : (pi += 1) seed_str_buf[pi] = combined[pi];
+            seed_str = seed_str_buf[0..ci];
+        }
+
+        const reserved_tail: usize = seed_str.len + 1; // +1 for '\n'
+        const body_room: usize = if (BANNER_LEN > w + reserved_tail) BANNER_LEN - w - reserved_tail else 0;
         const body_cap = if (banner_len > body_room) body_room else banner_len;
         j = 0;
         while (j < body_cap) : (j += 1) {
             buf[i + w] = banner_buf[j];
+            w += 1;
+        }
+        var s: usize = 0;
+        while (s < seed_str.len and w < BANNER_LEN - 1) : (s += 1) {
+            buf[i + w] = seed_str[s];
             w += 1;
         }
         while (w < BANNER_LEN - 1) : (w += 1) buf[i + w] = ' ';
@@ -490,13 +542,18 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     }
     printNum("[zig_compiler] read /hello.zig bytes=", src.bytes_read);
     const src_ptr: [*]const u8 = @ptrFromInt(fs_va + src.data_off);
-    const found = extractTwoQuoted(src_ptr, @intCast(src.bytes_read));
+    const found = extractSourceFields(src_ptr, @intCast(src.bytes_read));
     if (found < 2) {
         printNum("[zig_compiler] need 2 quoted strings, found=", found);
         zagExit();
     }
     printNum("[zig_compiler] extracted tag len=", tag_len);
     printNum("[zig_compiler] extracted banner len=", banner_len);
+    if (seed_found) {
+        printNum("[zig_compiler] extracted seed=", seed_int);
+    } else {
+        print("[zig_compiler] no seed int in source\n");
+    }
 
     // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);

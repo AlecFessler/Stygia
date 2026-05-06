@@ -854,13 +854,15 @@ fn runPhase4e(inv: Inbound, serial_va: u64, fs_va: u64) void {
     }
     serialPrint(inv.serial_port, serial_va, "[zig_hello] phase 4e: compile + spawn from disk\n");
 
-    // 1. Stage /hello.zig source bytes. The compiler extracts the first
-    //    two quoted strings: tag → bracketed prefix, banner → body.
-    //    The output ELF's banner becomes "[<tag>] <banner>", controlled
-    //    entirely by these source-level decls.
+    // 1. Stage /hello.zig source bytes. The compiler extracts:
+    //      tag    → first quoted string  (bracketed prefix)
+    //      banner → second quoted string (body)
+    //      seed   → first decimal int after the second string (suffix)
+    //    Output banner: "[<tag>] <banner> seed=<n>".
     const src_bytes =
         "pub const tag = \"compiled-on-zag\";\n" ++
-        "pub const banner = \"hello compiled inside Zag userspace!\";\n";
+        "pub const banner = \"hello from Zag userspace,\";\n" ++
+        "pub const seed = 1337;\n";
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.zig");
     const cs = fsCreateFile(inv.fs_port, fs_va, "/hello.zig", 0o644);
     if (cs.status != 0) {
