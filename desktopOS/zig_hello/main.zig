@@ -300,6 +300,31 @@ fn mapPfRw(pf_handle: u12, pages: u64) ?u64 {
     return vmar_base;
 }
 
+// Like mapPfRw but returns the vmar handle so the caller can drop the
+// VMAR after copying bytes (keeping the PF alive for spawn).
+const MapResult = struct { va: u64, vmar: u12 };
+
+fn mapPfWithHandle(pf_handle: u12, pages: u64, props: u64) ?MapResult {
+    const vmar_caps: u64 = (1 << 2) | (1 << 3);
+    const cv = issueRaw(buildWord(SYS_CREATE_VMAR, 0), .{
+        .v1 = vmar_caps,
+        .v2 = props,
+        .v3 = pages,
+    });
+    if (cv.v1 < 16) return null;
+    const vmar_handle: u12 = @truncate(cv.v1 & 0xFFF);
+    const mp = issueRaw(buildWord(SYS_MAP_PF, (1 << 12)), .{
+        .v1 = vmar_handle,
+        .v2 = 0,
+        .v3 = pf_handle,
+    });
+    if (mp.v1 != 0) {
+        _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, vmar_handle) });
+        return null;
+    }
+    return .{ .va = cv.v2, .vmar = vmar_handle };
+}
+
 fn serialPrint(port: u12, scratch_va: u64, bytes: []const u8) void {
     if (bytes.len > SERIAL_SCRATCH_BYTES) return;
     const dst: [*]u8 = @ptrFromInt(scratch_va);
@@ -609,6 +634,192 @@ fn formatU64(buf: []u8, n: u64) []u8 {
     return buf[0..i];
 }
 
+fn readU16Le(p: [*]const u8) u64 {
+    return @as(u64, p[0]) | (@as(u64, p[1]) << 8);
+}
+
+fn readU64Le(p: [*]const u8) u64 {
+    var v: u64 = 0;
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) {
+        v |= (@as(u64, p[i]) << (i * 8));
+    }
+    return v;
+}
+
+// ── Print helpers used by Phase 4d (kept as fns to dodge Zig's outer-
+// scope shadow checks; main collected too many `var w` / `var msg`
+// names in _start for further inline error sites). ───────────────────
+fn printNumLine(port: u12, scratch_va: u64, prefix: []const u8, n: u64) void {
+    var sb: [32]u8 = undefined;
+    const ss = formatU64(&sb, n);
+    var msg: [128]u8 = undefined;
+    var i: usize = 0;
+    for (prefix) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    for (ss) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    msg[i] = '\n';
+    i += 1;
+    serialPrint(port, scratch_va, msg[0..i]);
+}
+
+fn print2NumLine(
+    port: u12,
+    scratch_va: u64,
+    prefix1: []const u8,
+    n1: u64,
+    prefix2: []const u8,
+    n2: u64,
+) void {
+    var sb1: [32]u8 = undefined;
+    var sb2: [32]u8 = undefined;
+    const ss1 = formatU64(&sb1, n1);
+    const ss2 = formatU64(&sb2, n2);
+    var msg: [192]u8 = undefined;
+    var i: usize = 0;
+    for (prefix1) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    for (ss1) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    for (prefix2) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    for (ss2) |b| {
+        msg[i] = b;
+        i += 1;
+    }
+    msg[i] = '\n';
+    i += 1;
+    serialPrint(port, scratch_va, msg[0..i]);
+}
+
+// ── Phase 4d: round-trip zig_hello2 through disk and spawn it. ──────
+fn runPhase4d(inv: Inbound, serial_va: u64, fs_va: u64) void {
+    debugPrint("[zig_hello] phase 4d: disk round-trip\n");
+
+    const ELF2_MAX_PAGES: u64 = 16;
+    const src_map = mapPfWithHandle(inv.spawn_elf_pf, ELF2_MAX_PAGES, 0b001) orelse {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] 4d: map src failed\n");
+        return;
+    };
+    const src: [*]const u8 = @ptrFromInt(src_map.va);
+
+    // Parse ELF64 to determine total file size. Section headers can sit
+    // mid-file with LOAD content following them, so walk both PHDRs and
+    // SHDRs and take the max ending offset, then round up to a page.
+    const e_phoff: u64 = readU64Le(src + 0x20);
+    const e_phentsize: u64 = readU16Le(src + 0x36);
+    const e_phnum: u64 = readU16Le(src + 0x38);
+    const e_shoff: u64 = readU64Le(src + 0x28);
+    const e_shentsize: u64 = readU16Le(src + 0x3a);
+    const e_shnum: u64 = readU16Le(src + 0x3c);
+    var max_end: u64 = e_shoff + e_shentsize * e_shnum;
+    var pi: u64 = 0;
+    while (pi < e_phnum) : (pi += 1) {
+        const ph_base: u64 = src_map.va + e_phoff + pi * e_phentsize;
+        const ph: [*]const u8 = @ptrFromInt(ph_base);
+        const p_offset: u64 = readU64Le(ph + 8);
+        const p_filesz: u64 = readU64Le(ph + 32);
+        const end: u64 = p_offset + p_filesz;
+        if (end > max_end) max_end = end;
+    }
+    const elf_size: u64 = (max_end + 4095) & ~@as(u64, 4095);
+    printNumLine(inv.serial_port, serial_va, "[zig_hello] 4d: elf_size=", elf_size);
+
+    // Write ELF to disk. fs scratch = 64 KiB; current ELF ~20 KiB so a
+    // single pwrite suffices. Unlink first to be idempotent.
+    const dpath = "/hello2.elf";
+    _ = fsUnlink(inv.fs_port, fs_va, dpath);
+    const cr2 = fsCreateFile(inv.fs_port, fs_va, dpath, 0o644);
+    if (cr2.status != 0) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4d: create_file status=", cr2.status);
+        return;
+    }
+
+    const elf_slice = src[0..elf_size];
+    const wr2 = fsPwrite(inv.fs_port, fs_va, dpath, 0, elf_slice);
+    if (wr2.status != 0 or wr2.bytes_written != elf_size) {
+        print2NumLine(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] 4d: pwrite status=",
+            wr2.status,
+            " bytes=",
+            wr2.bytes_written,
+        );
+        return;
+    }
+
+    // Drop the source mapping; the underlying pf still belongs to us.
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, src_map.vmar) });
+
+    // Read back from disk into io_scratch.
+    const rb2 = fsPread(inv.fs_port, fs_va, dpath, 0, elf_size);
+    if (rb2.status != 0 or rb2.bytes_read != elf_size) {
+        print2NumLine(
+            inv.serial_port,
+            serial_va,
+            "[zig_hello] 4d: pread back status=",
+            rb2.status,
+            " bytes=",
+            rb2.bytes_read,
+        );
+        return;
+    }
+
+    // Allocate a fresh page_frame, sized to fit the read-back ELF, with
+    // r+w+x caps so the kernel can map text r-x and data r-w from it
+    // during createCapabilityDomain.
+    const dst_pages: u64 = (rb2.bytes_read + 4095) / 4096;
+    const pf_caps_rwx: u64 = (1 << 2) | (1 << 3) | (1 << 4);
+    const cpf2 = issueRaw(buildWord(SYS_CREATE_PAGE_FRAME, 0), .{
+        .v1 = pf_caps_rwx,
+        .v2 = 0,
+        .v3 = dst_pages,
+    });
+    if (cpf2.v1 < 16) {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] 4d: createPageFrame failed\n");
+        return;
+    }
+    const new_pf: u12 = @truncate(cpf2.v1 & 0xFFF);
+
+    // Map fresh pf RW, copy bytes from io_scratch into it, drop VMAR.
+    const dst_map = mapPfWithHandle(new_pf, dst_pages, 0b011) orelse {
+        serialPrint(inv.serial_port, serial_va, "[zig_hello] 4d: map dst failed\n");
+        return;
+    };
+    const dst: [*]u8 = @ptrFromInt(dst_map.va);
+    const back_src: [*]const u8 = @ptrFromInt(fs_va + rb2.data_off);
+    var ck: u64 = 0;
+    while (ck < rb2.bytes_read) : (ck += 1) dst[ck] = back_src[ck];
+    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = @as(u64, dst_map.vmar) });
+
+    // Spawn child capability domain from the disk-loaded pf, passing a
+    // fresh COM1 cap (copy not move — we kept it across Phase 4a).
+    var p4d_passed: [4]u64 = undefined;
+    p4d_passed[0] = passedHandle(inv.com1, DEV_MOVE | DEV_COPY, false);
+    const idc2 = spawnDomain(new_pf, p4d_passed[0..1]);
+    if (idc2 < 16) {
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] 4d: spawn err=", idc2);
+        return;
+    }
+    serialPrint(
+        inv.serial_port,
+        serial_va,
+        "[zig_hello] phase 4d: disk-load spawn ok\n",
+    );
+}
+
 // ── Entry: kernel calls _start(cap_table_base) per §[caps] ──────────
 export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     initDebugSink(cap_table_base);
@@ -646,46 +857,27 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     const path = "/persist_marker";
     const r = fsPread(inv.fs_port, fs_va, path, 0, 64);
     if (r.status != 0) {
-        var st_buf: [32]u8 = undefined;
-        const st_str = formatU64(&st_buf, r.status);
-        // Quick path: announce the failure on serial.
-        // 64 bytes is well below SERIAL_SCRATCH_BYTES.
-        var msg: [96]u8 = undefined;
-        const prefix = "[zig_hello] /persist_marker pread status=";
-        var off: usize = 0;
-        for (prefix) |b| {
-            msg[off] = b;
-            off += 1;
+        // First-boot race: verify_fs hasn't created the marker yet. We
+        // don't gate Phase 4 on Phase 1; just announce and skip.
+        printNumLine(inv.serial_port, serial_va, "[zig_hello] /persist_marker pread (skipped) status=", r.status);
+    } else {
+        const data_src: [*]const u8 = @ptrFromInt(fs_va + r.data_off);
+        var line: [256]u8 = undefined;
+        var w: usize = 0;
+        const lead = "[zig_hello] /persist_marker = ";
+        for (lead) |b| {
+            line[w] = b;
+            w += 1;
         }
-        for (st_str) |b| {
-            msg[off] = b;
-            off += 1;
+        var k: u64 = 0;
+        while (k < r.bytes_read and w < line.len - 1) : (k += 1) {
+            line[w] = data_src[k];
+            w += 1;
         }
-        msg[off] = '\n';
-        off += 1;
-        serialPrint(inv.serial_port, serial_va, msg[0..off]);
-        zagExit();
-    }
-
-    // Read the bytes the FS server placed into io_scratch and re-send
-    // them as a serial line. Cap at the serial scratch size minus the
-    // prefix we prepend.
-    const data_src: [*]const u8 = @ptrFromInt(fs_va + r.data_off);
-    var line: [256]u8 = undefined;
-    var w: usize = 0;
-    const lead = "[zig_hello] /persist_marker = ";
-    for (lead) |b| {
-        line[w] = b;
+        line[w] = '\n';
         w += 1;
+        serialPrint(inv.serial_port, serial_va, line[0..w]);
     }
-    var k: u64 = 0;
-    while (k < r.bytes_read and w < line.len - 1) : (k += 1) {
-        line[w] = data_src[k];
-        w += 1;
-    }
-    line[w] = '\n';
-    w += 1;
-    serialPrint(inv.serial_port, serial_va, line[0..w]);
     debugPrint("[zig_hello] after fs IPC\n");
 
     // ── Phase 2: anon-mmap demo. Allocate 1 page, write a sentinel
@@ -895,6 +1087,11 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     p4_line[p4_w] = '\n';
     p4_w += 1;
     serialPrint(inv.serial_port, serial_va, p4_line[0..p4_w]);
+
+    // ── Phase 4d: round-trip the same ELF through disk, then spawn from
+    //    the disk-read bytes. This is the core "load ELF from disk and
+    //    run" primitive that the Zig-compiler-on-Zag demo needs.
+    runPhase4d(inv, serial_va, fs_va);
 
     zagExit();
 }
