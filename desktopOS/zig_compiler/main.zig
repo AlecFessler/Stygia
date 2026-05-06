@@ -369,6 +369,66 @@ fn zagExit() noreturn {
 // blow the per-EC kernel stack (default ~64 KiB).
 var elf_buf: [60 * 1024]u8 = undefined;
 
+// Extracted message from /hello.zig — the first quoted string literal.
+var msg_buf: [128]u8 = undefined;
+var msg_len: usize = 0;
+
+// Banner the prebaked output ELF (zig_hello2) prints. Each occurrence
+// in the file gets overwritten with `[compiled] <msg>...\n`.
+const BANNER_PREFIX = "[zig_hello2]";
+const BANNER_LEN: usize = 76; // total chars including trailing '\n'
+const NEW_PREFIX = "[compiled] ";
+
+fn extractFirstQuoted(src: [*]const u8, src_len: usize) usize {
+    var start: ?usize = null;
+    var i: usize = 0;
+    while (i < src_len) : (i += 1) {
+        if (src[i] == '"') {
+            if (start) |s| {
+                const end = i;
+                if (end <= s + 1) return 0;
+                const n = end - s - 1;
+                const copy_n = if (n > msg_buf.len) msg_buf.len else n;
+                var k: usize = 0;
+                while (k < copy_n) : (k += 1) msg_buf[k] = src[s + 1 + k];
+                return copy_n;
+            }
+            start = i;
+        }
+    }
+    return 0;
+}
+
+fn patchBanner(buf: []u8, msg_n: usize) usize {
+    var hits: usize = 0;
+    if (buf.len < BANNER_LEN) return 0;
+    const limit = buf.len - BANNER_LEN;
+    var i: usize = 0;
+    while (i <= limit) : (i += 1) {
+        var k: usize = 0;
+        var ok = true;
+        while (k < BANNER_PREFIX.len) : (k += 1) {
+            if (buf[i + k] != BANNER_PREFIX[k]) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        var w: usize = 0;
+        while (w < NEW_PREFIX.len) : (w += 1) buf[i + w] = NEW_PREFIX[w];
+        const msg_room: usize = BANNER_LEN - NEW_PREFIX.len - 1;
+        const cap = if (msg_n < msg_room) msg_n else msg_room;
+        var j: usize = 0;
+        while (j < cap) : (j += 1) buf[i + NEW_PREFIX.len + j] = msg_buf[j];
+        var s: usize = NEW_PREFIX.len + cap;
+        while (s < BANNER_LEN - 1) : (s += 1) buf[i + s] = ' ';
+        buf[i + BANNER_LEN - 1] = '\n';
+        hits += 1;
+    }
+    return hits;
+}
+
 export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     initSink(cap_table_base);
     print("[zig_compiler] alive\n");
@@ -384,17 +444,24 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
         zagExit();
     };
 
-    // Read /hello.zig — proves the compiler ingested source from disk.
-    // Bytes are ignored (the "codegen" below is hardcoded).
+    // Read /hello.zig and pull the first quoted string out of it. That
+    // becomes the banner of the spawned binary — i.e. the source
+    // controls the output's printed message.
     const src = fsPread(inv.fs_port, fs_va, "/hello.zig", 0, 60 * 1024);
     if (src.status != 0) {
         printNum("[zig_compiler] /hello.zig pread status=", src.status);
         zagExit();
     }
     printNum("[zig_compiler] read /hello.zig bytes=", src.bytes_read);
+    const src_ptr: [*]const u8 = @ptrFromInt(fs_va + src.data_off);
+    msg_len = extractFirstQuoted(src_ptr, @intCast(src.bytes_read));
+    if (msg_len == 0) {
+        print("[zig_compiler] no quoted string in /hello.zig\n");
+        zagExit();
+    }
+    printNum("[zig_compiler] extracted message len=", msg_len);
 
-    // Read /hello2.elf — the prebaked "compiled output" written by
-    // zig_hello during Phase 4d. We use this as our hardcoded codegen.
+    // Read /hello2.elf — template binary; we'll patch its banner.
     const out = fsPread(inv.fs_port, fs_va, "/hello2.elf", 0, 60 * 1024);
     if (out.status != 0) {
         printNum("[zig_compiler] /hello2.elf pread status=", out.status);
@@ -402,12 +469,18 @@ export fn _start(cap_table_base: u64) callconv(.c) noreturn {
     }
     printNum("[zig_compiler] template /hello2.elf bytes=", out.bytes_read);
 
-    // Copy out the bytes from io_scratch (server overwrites scratch on
-    // each call), since we're about to issue a fresh pwrite that reuses
-    // the same scratch region.
+    // Copy out from io_scratch — next fsPwrite reuses the same region.
     const out_src: [*]const u8 = @ptrFromInt(fs_va + out.data_off);
     var k: u64 = 0;
     while (k < out.bytes_read) : (k += 1) elf_buf[k] = out_src[k];
+
+    // Patch every banner instance in the buffer.
+    const hits = patchBanner(elf_buf[0..out.bytes_read], msg_len);
+    printNum("[zig_compiler] patched banner instances=", hits);
+    if (hits == 0) {
+        print("[zig_compiler] FAILED: no banner found to patch\n");
+        zagExit();
+    }
 
     // Write /hello.elf (idempotent — unlink any prior, then create+write).
     _ = fsUnlink(inv.fs_port, fs_va, "/hello.elf");
