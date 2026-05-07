@@ -10,7 +10,10 @@
 
 extern fn __errno_location() callconv(.c) *c_int;
 
-extern fn zag_fs_openat(path_ptr: [*]const u8, path_len: usize, flags: u32, mode: u32) callconv(.c) i64;
+extern fn zag_fs_openat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, flags: u32, mode: u32) callconv(.c) i64;
+extern fn zag_fs_mkdirat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) c_int;
+extern fn zag_fs_unlinkat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize) callconv(.c) c_int;
+extern fn zag_fs_statat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaque) callconv(.c) c_int;
 extern fn zag_fs_read(fd: i32, buf_ptr: [*]u8, buf_len: usize, offset: i64) callconv(.c) i64;
 extern fn zag_fs_close(fd: i32) callconv(.c) i32;
 extern fn zag_fs_fstat(fd: i32, stat_out: *anyopaque) callconv(.c) i32;
@@ -43,8 +46,12 @@ fn pathLen(p: [*:0]const u8) usize {
 // ── open family ───────────────────────────────────────────────────
 
 pub fn openatImpl(path: [*:0]const u8, flags: u32, mode: u32) c_int {
+    return openatAtImpl(-100, path, flags, mode); // -100 = AT_FDCWD
+}
+
+pub fn openatAtImpl(dir_fd: c_int, path: [*:0]const u8, flags: u32, mode: u32) c_int {
     const len = pathLen(path);
-    const rc = zag_fs_openat(path, len, flags, mode);
+    const rc = zag_fs_openat(dir_fd, path, len, flags, mode);
     if (rc < 0) {
         __errno_location().* = @intCast(-rc);
         return -1;
@@ -59,8 +66,7 @@ export fn open64(path: [*:0]const u8, flags: c_int, mode: c_uint) callconv(.c) c
     return openatImpl(path, @bitCast(flags), mode);
 }
 export fn openat(dir_fd: c_int, path: [*:0]const u8, flags: c_int, mode: c_uint) callconv(.c) c_int {
-    _ = dir_fd; // No dirfd-relative paths on Zag yet.
-    return openatImpl(path, @bitCast(flags), mode);
+    return openatAtImpl(dir_fd, path, @bitCast(flags), mode);
 }
 export fn openat64(dir_fd: c_int, path: [*:0]const u8, flags: c_int, mode: c_uint) callconv(.c) c_int {
     return openat(dir_fd, path, flags, mode);
@@ -179,8 +185,11 @@ export fn lseek64(fd: c_int, offset: i64, whence: c_int) callconv(.c) i64 {
 const Stat = extern struct { _padding: [144]u8 = @splat(0) };
 
 export fn stat(path: [*:0]const u8, st: *Stat) callconv(.c) c_int {
-    const len = pathLen(path);
-    return zag_fs_stat(path, len, st);
+    return zag_fs_statat(-100, path, pathLen(path), st);
+}
+export fn fstatat(dir_fd: c_int, path: [*:0]const u8, st: *Stat, flags: c_int) callconv(.c) c_int {
+    _ = flags;
+    return zag_fs_statat(dir_fd, path, pathLen(path), st);
 }
 export fn stat64(path: [*:0]const u8, st: *Stat) callconv(.c) c_int {
     return stat(path, st);
@@ -250,11 +259,11 @@ export fn ftruncate64(fd: c_int, size: i64) callconv(.c) c_int {
 // ── path manipulation ─────────────────────────────────────────────
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
-    return zag_fs_unlink(path, pathLen(path));
+    return zag_fs_unlinkat(-100, path, pathLen(path));
 }
 export fn unlinkat(dir_fd: c_int, path: [*:0]const u8, flags: c_int) callconv(.c) c_int {
-    _ = .{ dir_fd, flags };
-    return unlink(path);
+    _ = flags;
+    return zag_fs_unlinkat(dir_fd, path, pathLen(path));
 }
 export fn remove(path: [*:0]const u8) callconv(.c) c_int {
     return unlink(path);
@@ -298,11 +307,10 @@ export fn realpath(path: [*:0]const u8, resolved: ?[*]u8) callconv(.c) ?[*:0]u8 
 }
 
 export fn mkdir(path: [*:0]const u8, mode: c_uint) callconv(.c) c_int {
-    return zag_fs_mkdir(path, pathLen(path), mode);
+    return zag_fs_mkdirat(-100, path, pathLen(path), mode);
 }
 export fn mkdirat(dir_fd: c_int, path: [*:0]const u8, mode: c_uint) callconv(.c) c_int {
-    _ = dir_fd;
-    return mkdir(path, mode);
+    return zag_fs_mkdirat(dir_fd, path, pathLen(path), mode);
 }
 export fn mknod(path: [*:0]const u8, mode: c_uint, dev: u64) callconv(.c) c_int {
     _ = .{ path, mode, dev };
