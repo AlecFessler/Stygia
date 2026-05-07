@@ -1787,6 +1787,20 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\shlq $32, %%rax
             \\orq %%rax, %%gs:112
             \\
+            \\# Heuristic senders-bail: if the recv_port already holds
+            \\# pending senders (waiter_kind=.senders), the atomic-recv-
+            \\# park branch at R13 cannot rendezvous with them — the
+            \\# park asm only knows how to enqueue the caller as a
+            \\# receiver and clobbers waiter_kind. Bail to slow path
+            \\# (`.Lreply_handle_invalid` releases CD and jumps to
+            \\# `.Lsyscall_slow_path`); slow-path `port.recv` correctly
+            \\# pops the sender and delivers its event. The read here
+            \\# is unsynchronized so the bail doesn't catch every race
+            \\# (X arriving between R4b and R13 still slips through),
+            \\# but it closes the most common reply_24 timing window.
+            \\cmpb ${[wk_senders]d}, {[waiter_kind_off]d}(%%r11)
+            \\je .Lreply_handle_invalid
+            \\
             \\.Lreply_skip_recv_validate:
             \\movq %%gs:40, %%rcx
             \\
@@ -1801,6 +1815,8 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kh_size = @sizeOf(KernelHandle),
                 .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
                 .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                .wk_senders = @intFromEnum(zag.sched.port.WaiterKind.senders),
+                .waiter_kind_off = @offsetOf(zag.sched.port.Port, "waiter_kind"),
             },
         ) ++
 
@@ -2256,6 +2272,30 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\jmp .Lreply_acq_port
             \\.Lreply_port_acquired:
             \\
+            \\# Senders-bail under port lock: if the recv_port has
+            \\# pending senders, the park branch below would clobber
+            \\# waiter_kind to .receivers and strand them. Release
+            \\# port_lock + caller gen-lock and route to the Zig
+            \\# slow-path-recv helper which performs the rendezvous
+            \\# (deliverEvent stages event_state into caller's
+            \\# pending_event_word, helper marks caller .ready and
+            \\# enqueues on this core's run queue). Asm continues
+            \\# with R14 swap to the original replyee.
+            \\movq %%gs:120, %%rcx
+            \\cmpb ${[wk_senders]d}, {[waiter_kind_off]d}(%%rcx)
+            \\jne .Lreply_port_no_senders
+            \\andq $-2, {[port_lock_off]d}(%%rcx)
+            \\movq %%gs:32, %%rcx
+            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+            \\movq %%gs:32, %%rdi
+            \\movq %%gs:112, %%rsi
+            \\andq $0xFFF, %%rsi
+            \\subq $192, %%rsp
+            \\call replyAtomicRecvSendersFallback
+            \\addq $192, %%rsp
+            \\jmp .Lreply_R13_done
+            \\.Lreply_port_no_senders:
+            \\
             \\movq %%gs:32, %%r11
             \\movzbq {[priority_off]d}(%%r11), %%rax
             \\shlq $4, %%rax
@@ -2393,6 +2433,7 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .waiters_off = @offsetOf(zag.sched.port.Port, "waiters"),
                 .waiter_kind_off = @offsetOf(zag.sched.port.Port, "waiter_kind"),
                 .wk_recv = @intFromEnum(zag.sched.port.WaiterKind.receivers),
+                .wk_senders = @intFromEnum(zag.sched.port.WaiterKind.senders),
                 .priority_off = @offsetOf(ExecutionContext, "priority"),
                 .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
                 .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
@@ -2728,6 +2769,14 @@ pub fn switchTo(ec: *ExecutionContext) void {
                 while (i < scheduler.MAX_CORES) : (i += 1) {
                     const zr = slots[i] orelse continue;
                     const z = zr.ptr;
+                    // See `takeOwnPendingZombie`'s on_cpu doc — reaping
+                    // an on_cpu EC unmaps the kstack mapped via TSS.RSP0
+                    // and triple-faults the next ring transition. The
+                    // outgoing ec's on_cpu is still true here (cleared
+                    // post-reaper at line ~2770), so this also covers
+                    // the prev-ec case the standing_on_zombie check was
+                    // approximating.
+                    if (z.on_cpu.load(.acquire)) continue;
                     const z_top = z.kernel_stack.top.addr;
                     const z_base = z.kernel_stack.base.addr;
                     const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;

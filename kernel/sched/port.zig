@@ -554,6 +554,58 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     return 0;
 }
 
+/// Reply-FP atomic-recv-park senders bail. Called from the reply fast
+/// path's asm when, having committed the reply portion (R6/R9/R10),
+/// the recv portion's port_lock acquire reveals
+/// `waiter_kind == .senders` — meaning a peer EC arrived on the
+/// recv_port BEFORE the caller's atomic-recv reached this point. The
+/// asm cannot enqueue the caller as a receiver (would clobber
+/// waiter_kind and strand the sender), so it releases port_lock +
+/// caller_gen_lock and routes here to perform the slow-path equivalent
+/// of `port.recv` against the now-unlocked port. Slow-path recv sees
+/// `.senders`, pops the highest-priority sender, calls `deliverEvent`
+/// (mints reply handle, stages event_state in
+/// `caller.pending_event_word`), and returns; we then transition the
+/// caller from `.running` to `.ready` and enqueue it on this core's
+/// run queue so the asm's R14 swap to the original replyee can proceed
+/// while the caller awaits dispatch with the event ready to deliver.
+///
+/// The asm has already cleared the reply slot (R6) and resumed the
+/// replyee (R9/R10 sender state writes), so a true bail to the
+/// reply-syscall slow path is impossible — that path would re-resolve
+/// the now-cleared reply handle and return E_BADCAP. The
+/// reply-half-already-committed shape is what makes this helper
+/// necessary in the first place.
+pub export fn replyAtomicRecvSendersFallback(
+    caller: *ExecutionContext,
+    recv_port_handle: u64,
+) callconv(.c) void {
+    // Slow-path recv. Re-acquires the receiver CD lock and the port
+    // gen-lock, observes `.senders` under lock, runs the rendezvous
+    // path. Return value is the §[event_state] word for the rendezvous
+    // case or `0` for the (race-window: senders drained between asm
+    // observation and here) park case. Either way the data is staged
+    // through `pending_event_word` / port wait queue; we don't need
+    // the return value here.
+    _ = recv(caller, recv_port_handle, 0);
+
+    // After recv:
+    //   - Rendezvous case: `caller.state == .running` (deliverEvent
+    //     doesn't transition state — it expects the syscall epilogue
+    //     to handle the post-syscall flow). We need to enqueue the
+    //     caller as `.ready` so the next dispatch picks it up; the
+    //     asm's R14 swap to the original replyee dispatches a
+    //     different EC on this core, leaving the caller in the run
+    //     queue with `pending_event_word` ready to flush at iretq.
+    //   - Park case: `caller.state == .suspended_on_port` (recv
+    //     parked it on the port wait queue). Nothing more to do.
+    if (caller.state == .running) {
+        caller.state = .ready;
+        const calling_core: u8 = @truncate(arch.smp.coreID());
+        scheduler.enqueueOnCore(calling_core, caller, @src());
+    }
+}
+
 /// `reply` syscall handler. Spec §[reply].reply.
 pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
     kprof.enter(.reply);

@@ -333,6 +333,29 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const core: u8 = @truncate(arch.smp.coreID());
+    // Clear the OUTGOING ec's on_cpu BEFORE setCurrentEc rewrites
+    // current_ec to the new dispatch. The reaper inside
+    // `interrupts.switchTo` reads `on_cpu` to decide whether a queued
+    // zombie's kstack is still in use; without this clear, prev's
+    // on_cpu stays `true` indefinitely (no later writer flips it
+    // false) and the slot's pending_zombie post can never be reaped on
+    // this core — the queue piles up and `postZombie` from cross-core
+    // terminate spins.
+    //
+    // Clear prev's on_cpu only if prev still names US as its last
+    // dispatched core. The `current_ec` slot can carry a STALE ref to
+    // an EC that has since migrated to another core (the other core's
+    // setCurrentEc bumps `last_dispatched_core` but doesn't reach back
+    // to clear our slot). If we cleared on_cpu unconditionally on a
+    // migrated EC, we'd flip its on_cpu false while it is actively
+    // running on its new core; the reaper there sees on_cpu=false,
+    // finalizes, unmaps the kstack mapped via TSS.RSP0 → next ring
+    // transition triple-faults.
+    if ((&core_states[core]).current_ec) |prev_ref| {
+        if (prev_ref.ptr != current and prev_ref.ptr.last_dispatched_core == core) {
+            prev_ref.ptr.on_cpu.store(false, .release);
+        }
+    }
     setCurrentEc(core, current);
     current.state = .running;
     kprof.point(.dispatch, @intFromPtr(current));
@@ -354,8 +377,18 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         // caller-pinned: `current_ec` names the EC running on this core
         // — caller is in its syscall path so the slot is pinned.
         const cur = cur_ref.ptr;
-        cur.state = .ready;
-        state.run_queue.enqueue(cur);
+        // A peer-core terminate may have flipped state to .exited
+        // before this preempt fired. Don't resurrect a terminated EC
+        // by overwriting state and re-enqueueing — terminate already
+        // removed it from every queue (`removeFromQueue`) and posted
+        // its zombie; pulling it back into a run queue would dispatch
+        // a freed slab next tick. Same gate covers the .suspended /
+        // .idle_wait / .futex_wait cases where another path took
+        // ownership of the EC's lifecycle and yieldTo musn't trample.
+        if (cur.state == .running) {
+            cur.state = .ready;
+            state.run_queue.enqueue(cur);
+        }
     }
     const next = if (target) |t| blk: {
         if (t.state == .ready and state.run_queue.remove(t)) break :blk t;
@@ -725,6 +758,19 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
     while (i < MAX_CORES) : (i += 1) {
         const zr = slots[i] orelse continue;
         const z = zr.ptr;
+        // `on_cpu` is the EC's "kstack is live somewhere" flag — set by
+        // every dispatch path (suspend FP step 14, reply FP R14, slow
+        // `switchTo`) before the swap that hands ring 3 control to the
+        // EC, cleared on the next preempt away from it. Reaping under
+        // on_cpu would unmap an in-use kstack: the reply FP race
+        // sysretq's into a freshly-resumed sender whose terminate
+        // posted a zombie to last_dispatched_core (= us); after the
+        // sysretq the on-stack is the user-mode rsp, so the rsp-only
+        // standing_on_zombie check below misses it, and finalize would
+        // unmap the kstack mapped via TSS.RSP0 → next ring transition
+        // pushes an iret frame at unmapped → #PF → #DF → triple-fault.
+        const ec_on_cpu = z.on_cpu.load(.acquire);
+        if (ec_on_cpu) continue;
         const z_top = z.kernel_stack.top.addr;
         const z_base = z.kernel_stack.base.addr;
         const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;

@@ -599,6 +599,14 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // the slab so outstanding handles still resolve (just to a parked
     // EC) until the owning domain is destroyed.
     ec.state = .exited;
+    // Clear on_cpu — this EC is no longer running. Without this, a
+    // peer-core terminate posts the EC to its last_dispatched_core's
+    // pending_zombie, but the reaper sees on_cpu=true and refuses to
+    // finalize (correctly, to avoid unmapping a kstack mapped via
+    // TSS.RSP0). With state already .exited and the EC off every
+    // queue, on_cpu has no further legitimate writer; leaving it
+    // `true` permanently wedges the zombie.
+    ec.on_cpu.store(false, .release);
 }
 
 /// Park the calling EC into `.idle_wait` — used by the aarch64 wfi/wfe

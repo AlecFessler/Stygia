@@ -451,6 +451,7 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
                 while (i < sched_mod.MAX_CORES) : (i += 1) {
                     const zr = slots[i] orelse continue;
                     const z = zr.ptr;
+                    if (z.on_cpu.load(.acquire)) continue;
                     const z_top = z.kernel_stack.top.addr;
                     const z_base = z.kernel_stack.base.addr;
                     const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;
