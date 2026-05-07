@@ -52,6 +52,15 @@ export fn malloc(n: usize) callconv(.c) ?[*]u8 {
 
 export fn free(ptr: ?*anyopaque) callconv(.c) void {
     const p = ptr orelse return;
+    // Guard against empty-slice sentinels and other small bogus
+    // addresses. Our zag_mmap_anon always returns page-aligned bases,
+    // so the user pointer is at exactly base+16. Anything below the
+    // first user page (or not at the +16 offset) is not a real
+    // allocation — silently ignore. This makes free() safe on the
+    // 0xaaaa-pattern empty-slice ptrs the no-LLVM backend produces.
+    const addr = @intFromPtr(p);
+    if (addr < 0x10000) return;
+    if ((addr & 0xFFF) != HEADER_SIZE) return;
     const h = headerOf(p);
     const base = @intFromPtr(h);
     _ = zag_munmap(base, h.pages);

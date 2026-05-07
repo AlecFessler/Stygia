@@ -9,15 +9,22 @@
 
 // ── memory ────────────────────────────────────────────────────────
 
+// IMPORTANT: do NOT use Zig's @memcpy/@memset in these exports. The
+// no-LLVM backend on x86_64-zag-none lowers @memcpy/@memset to CALLs
+// to libc's memcpy/memset, which would recurse infinitely back here
+// and blow the stack. Hand-rolled byte loops are the only safe shape.
+
 export fn memcpy(noalias dest: [*]u8, noalias src: [*]const u8, n: usize) callconv(.c) [*]u8 {
-    @memcpy(dest[0..n], src[0..n]);
+    var i: usize = 0;
+    while (i < n) : (i += 1) dest[i] = src[i];
     return dest;
 }
 
 export fn memmove(dest: [*]u8, src: [*]const u8, n: usize) callconv(.c) [*]u8 {
     if (n == 0) return dest;
     if (@intFromPtr(dest) < @intFromPtr(src) or @intFromPtr(dest) >= @intFromPtr(src) + n) {
-        @memcpy(dest[0..n], src[0..n]);
+        var i: usize = 0;
+        while (i < n) : (i += 1) dest[i] = src[i];
     } else {
         var i: usize = n;
         while (i > 0) {
@@ -29,7 +36,9 @@ export fn memmove(dest: [*]u8, src: [*]const u8, n: usize) callconv(.c) [*]u8 {
 }
 
 export fn memset(dest: [*]u8, c: c_int, n: usize) callconv(.c) [*]u8 {
-    @memset(dest[0..n], @truncate(@as(c_uint, @bitCast(c))));
+    const byte: u8 = @truncate(@as(c_uint, @bitCast(c)));
+    var i: usize = 0;
+    while (i < n) : (i += 1) dest[i] = byte;
     return dest;
 }
 
