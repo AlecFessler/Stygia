@@ -282,6 +282,20 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         if (exceptionEvent(vector)) |event| {
             const ec = scheduler.currentEc() orelse
                 @panic("user exception with no current EC");
+            // Diag: print vector + RIP + first byte at RIP for any user fault.
+            // Helps catch silent EC terminations from `unreachable` (#UD)
+            // and other faults during in-Zag compiler bring-up.
+            const rip_byte: u8 = if (paging_mod.resolveVaddr(
+                ec.domain.ptr.addr_space_root,
+                VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF)),
+            )) |phys| blk: {
+                const physmap_base = VAddr.fromPAddr(phys, null).addr;
+                const byte_ptr: *const u8 = @ptrFromInt(physmap_base + (ctx.rip & 0xFFF));
+                break :blk byte_ptr.*;
+            } else 0;
+            serial.print("[USR-FAULT] vec={d} rip=0x{x} byte=0x{x}\n", .{
+                vector, ctx.rip, rip_byte,
+            });
             switch (event) {
                 .thread_fault => |subcode| port.fireThreadFault(ec, subcode, ctx.rip),
                 .breakpoint => port.fireBreakpoint(ec, 0),
@@ -424,6 +438,52 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         }
     }
 
+    if (from_user) {
+        const ec_for_diag = scheduler.currentEc();
+        const vmar_label: []const u8 = if (ec_for_diag) |ec_d| blk: {
+            const cov = vmar.findVmarCovering(ec_d.domain.ptr, VAddr.fromInt(faulting_addr));
+            break :blk if (cov) |_| "in-vmar" else "no-vmar";
+        } else "no-ec";
+        // Read instruction bytes at user RIP. Walk the EC's page tables so
+        // we see the correct user-mode mapping (kernel page tables don't
+        // include the user code).
+        var rip_bytes: [16]u8 = @splat(0);
+        if (ec_for_diag) |ec_b| {
+            const rip_page = VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF));
+            if (paging_mod.resolveVaddr(ec_b.domain.ptr.addr_space_root, rip_page)) |phys| {
+                const physmap_base = VAddr.fromPAddr(phys, null).addr;
+                const off = ctx.rip & 0xFFF;
+                var i: usize = 0;
+                while (i < 16 and (off + i) < 0x1000) : (i += 1) {
+                    const byte_ptr: *const u8 = @ptrFromInt(physmap_base + off + i);
+                    rip_bytes[i] = byte_ptr.*;
+                }
+            }
+        }
+        // Read GP registers at fault — useful for backtracking which reg
+        // sourced the bad pointer.
+        serial.print("[USR-PF] rip=0x{x} addr=0x{x} err=0x{x} w={} x={} {s}\n", .{
+            ctx.rip, faulting_addr, ctx.err_code, pf_err.is_write, pf_err.instr_fetch, vmar_label,
+        });
+        serial.print("[USR-PF] insn={x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
+            rip_bytes[0],  rip_bytes[1],  rip_bytes[2],  rip_bytes[3],
+            rip_bytes[4],  rip_bytes[5],  rip_bytes[6],  rip_bytes[7],
+            rip_bytes[8],  rip_bytes[9],  rip_bytes[10], rip_bytes[11],
+            rip_bytes[12], rip_bytes[13], rip_bytes[14], rip_bytes[15],
+        });
+        serial.print("[USR-PF] rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x}\n", .{
+            ctx.regs.rax, ctx.regs.rbx, ctx.regs.rcx, ctx.regs.rdx,
+        });
+        serial.print("[USR-PF] rsi=0x{x} rdi=0x{x} rbp=0x{x} rsp=0x{x}\n", .{
+            ctx.regs.rsi, ctx.regs.rdi, ctx.regs.rbp, ctx.rsp,
+        });
+        serial.print("[USR-PF] r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x}\n", .{
+            ctx.regs.r8, ctx.regs.r9, ctx.regs.r10, ctx.regs.r11,
+        });
+        serial.print("[USR-PF] r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n", .{
+            ctx.regs.r12, ctx.regs.r13, ctx.regs.r14, ctx.regs.r15,
+        });
+    }
     const pf_ctx = PageFaultContext{
         .faulting_address = faulting_addr,
         .is_kernel_privilege = !from_user,

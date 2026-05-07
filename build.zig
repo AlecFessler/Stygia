@@ -305,7 +305,9 @@ pub fn build(b: *std.Build) void {
             // parse_kprof.py (task #12) can resolve trace/sample IPs
             // to source locations without a separate symbol bundle.
             // null leaves Zig's default behavior for non-kprof builds.
-            .strip = if (kprof_enabled) false else null,
+            // Always false: link_emit_relocs (set below) is incompatible
+            // with --strip-all, which ReleaseSmall enables by default.
+            .strip = false,
         }),
         .linkage = .static,
     });
@@ -479,6 +481,7 @@ pub fn build(b: *std.Build) void {
             \\ -serial mon:stdio \
             \\ -display {s} \
             \\ -no-reboot \
+            \\ -s \
             \\ {s} \
             \\ {s} \
             \\ {s} \

@@ -59,8 +59,10 @@ const ROOT_EC_CAPS = EcCaps{
 };
 
 /// Pages reserved for the per-EC user stack created by
-/// create_capability_domain.
-pub const USER_STACK_PAGES: u64 = 16;
+/// create_capability_domain. Bumped from the spec-default 16 to 1024
+/// (4 MiB) so the in-Zag self-hosted Zig compiler's recursive AstGen
+/// for std-sized files has comfortable headroom.
+pub const USER_STACK_PAGES: u64 = 1024;
 pub const USER_STACK_BYTES: u64 = USER_STACK_PAGES * paging_consts.PAGE4K;
 
 /// Bytes reserved for the read-only cap-table view mapped into a new
