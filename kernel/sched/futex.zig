@@ -16,7 +16,6 @@ const arch = zag.arch.dispatch;
 const arch_syscall = zag.arch.dispatch.syscall;
 const errors = zag.syscall.errors;
 const sched = zag.sched.scheduler;
-const spin_diag = zag.utils.sync.spin_diag;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const PAddr = zag.memory.address.PAddr;
@@ -237,11 +236,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         // for any same-bucket sibling).
         removeNodesExcept(ec, node, wake_idx);
 
-        var on_cpu_spin: u64 = 0;
-        while (ec.on_cpu.load(.acquire)) {
-            std.atomic.spinLoopHint();
-            spin_diag.tick(&on_cpu_spin, @src(), "on_cpu-futex-wake");
-        }
+        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         if (ec.futex_deadline_ns != 0) {
             ec.futex_deadline_ns = 0;
             removeTimedWaiter(ec);
@@ -259,7 +254,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         ec.futex_wait_nodes = null;
         ec.futex_wait_vaddrs = null;
         ec.state = .ready;
-        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec, @src());
+        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
         woken += 1;
     }
 
@@ -590,11 +585,7 @@ pub fn expireTimedWaiters() void {
         }
 
         if (removed) {
-            var on_cpu_spin: u64 = 0;
-            while (ec.on_cpu.load(.acquire)) {
-                std.atomic.spinLoopHint();
-                spin_diag.tick(&on_cpu_spin, @src(), "on_cpu-futex-timeout");
-            }
+            while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
             // [test 06]: timeout returns E_TIMEOUT in vreg 1. The
@@ -606,7 +597,7 @@ pub fn expireTimedWaiters() void {
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.state = .ready;
-            sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec, @src());
+            sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
         }
     }
 }

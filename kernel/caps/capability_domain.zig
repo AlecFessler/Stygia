@@ -411,7 +411,7 @@ pub fn createCapabilityDomain(
         }
         break :blk @ctz(initial_ec_affinity);
     };
-    scheduler.enqueueOnCore(@intCast(enqueue_core), child_ec, @src());
+    scheduler.enqueueOnCore(@intCast(enqueue_core), child_ec);
 
     // Spec §[error_codes] / §[capabilities]: success returns the
     // packed Word0 (id | type<<12 | caps<<48) so the type tag in bits

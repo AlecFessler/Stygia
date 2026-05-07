@@ -22,7 +22,6 @@ const errors = zag.syscall.errors;
 const execution_context = zag.sched.execution_context;
 const kprof = zag.kprof.trace_id;
 const scheduler = zag.sched.scheduler;
-const spin_diag = zag.utils.sync.spin_diag;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const EcCaps = execution_context.EcCaps;
@@ -171,11 +170,7 @@ pub fn expireTimedRecvWaiters() void {
         if (!removed) continue;
 
         // EC has been removed from the wait queue; safe to wake.
-        var on_cpu_spin: u64 = 0;
-        while (ec.on_cpu.load(.acquire)) {
-            std.atomic.spinLoopHint();
-            spin_diag.tick(&on_cpu_spin, @src(), "on_cpu-port");
-        }
+        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         ec.recv_deadline_ns = 0;
         ec.suspend_port = null;
         ec.event_type = .none;
@@ -183,7 +178,7 @@ pub fn expireTimedRecvWaiters() void {
         // resume path restores the syscall-return register on iretq.
         arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
         ec.state = .ready;
-        scheduler.markReady(ec, @src());
+        scheduler.markReady(ec);
     }
 }
 
@@ -602,7 +597,7 @@ pub export fn replyAtomicRecvSendersFallback(
     if (caller.state == .running) {
         caller.state = .ready;
         const calling_core: u8 = @truncate(arch.smp.coreID());
-        scheduler.enqueueOnCore(calling_core, caller, @src());
+        scheduler.enqueueOnCore(calling_core, caller);
     }
 }
 
@@ -1470,7 +1465,7 @@ pub fn rendezvousWithReceiver(
         receiver.recv_port_xfer,
     );
     receiver.state = .ready;
-    scheduler.markReady(receiver, @src());
+    scheduler.markReady(receiver);
     return true;
 }
 
@@ -1584,7 +1579,7 @@ fn propagateClosedToReceivers(p: *Port) void {
         }
         waiter.suspend_port = null;
         waiter.state = .ready;
-        scheduler.markReady(waiter, @src());
+        scheduler.markReady(waiter);
     }
     p.waiter_kind = .none;
 }
@@ -1605,7 +1600,7 @@ fn propagateClosedToSenders(p: *Port) void {
         sender.event_addr = 0;
         sender.originating_write_cap = false;
         sender.state = .ready;
-        scheduler.markReady(sender, @src());
+        scheduler.markReady(sender);
     }
     p.waiter_kind = .none;
 }

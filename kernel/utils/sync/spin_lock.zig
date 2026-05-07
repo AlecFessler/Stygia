@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const debug = zag.utils.sync.debug;
-const spin_diag = zag.utils.sync.spin_diag;
 
 const SrcLoc = debug.SrcLoc;
 
@@ -29,10 +28,8 @@ pub const SpinLock = struct {
     /// AB-BA deadlocks.
     pub fn lockOrdered(self: *SpinLock, src: SrcLoc, ordered_group: u32) void {
         debug.acquire(self, self.class, ordered_group, src);
-        var spin_count: u64 = 0;
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
-            spin_diag.tick(&spin_count, src, "SpinLock");
         }
     }
 
@@ -58,10 +55,8 @@ pub const SpinLock = struct {
     pub fn lockIrqSaveOrdered(self: *SpinLock, src: SrcLoc, ordered_group: u32) u64 {
         const state = arch.cpu.saveAndDisableInterrupts();
         debug.acquire(self, self.class, ordered_group, src);
-        var spin_count: u64 = 0;
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
-            spin_diag.tick(&spin_count, src, "SpinLock-irq");
         }
         return state;
     }

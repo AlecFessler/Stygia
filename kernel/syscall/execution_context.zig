@@ -318,7 +318,7 @@ pub fn createExecutionContext(
         }
         break :blk @ctz(affinity_mask);
     };
-    scheduler.enqueueOnCore(@intCast(enqueue_core), new_ec, @src());
+    scheduler.enqueueOnCore(@intCast(enqueue_core), new_ec);
 
     // Spec §[error_codes]: a successful create_* returns the packed
     // Word0 so the type tag in bits 12-15 disambiguates from the

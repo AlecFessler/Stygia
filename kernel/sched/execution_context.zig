@@ -12,7 +12,6 @@ const paging_consts = zag.memory.paging;
 const perfmon_mod = zag.sched.perfmon;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
-const spin_diag = zag.utils.sync.spin_diag;
 const stack = zag.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
@@ -730,6 +729,17 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     }
 
     ec.state = .exited;
+    // Re-sweep run_queues after state=.exited so any yieldTo that
+    // re-enqueued ec during the prepare phase (saw state=.running,
+    // raced ahead of the first sweep) is undone here. The second
+    // sweep also publishes state=.exited via every core_locks[]
+    // acquire/release pairing, so any yieldTo that still owes a
+    // state read sees the new state on its next lock acquire and
+    // refuses to re-enqueue. Without this re-sweep the dangling
+    // pointer in the run_queue is consumed by the next dequeue,
+    // which traverses freed memory once `finalizeDestroyMarkedDead`
+    // has zeroed/unmapped the slab slot.
+    scheduler.removeFromQueue(ec);
 
     // Re-acquire the EC's gen-lock briefly to atomically rotate gen to
     // the freed parity. After this point any concurrent handle
@@ -772,10 +782,8 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        var post_spin: u64 = 0;
         while (!scheduler.postZombie(core, ec, expected_gen)) {
             std.atomic.spinLoopHint();
-            spin_diag.tick(&post_spin, @src(), "postZombie-terminate");
         }
         // Wake the target core so it runs `switchTo` promptly and
         // drains the zombie. Without this, an idle target stays in
@@ -1398,7 +1406,7 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.pending_pair_count = 0;
     ec.originating_read_cap = false;
     ec.state = .ready;
-    scheduler.markReady(ec, @src());
+    scheduler.markReady(ec);
 }
 
 /// Mark a pending reply against `ec` as abandoned — invoked when
@@ -1719,10 +1727,8 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        var post_spin: u64 = 0;
         while (!scheduler.postZombie(core, ec, @intCast(gen))) {
             std.atomic.spinLoopHint();
-            spin_diag.tick(&post_spin, @src(), "postZombie-destroyLocked");
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);
     } else {
