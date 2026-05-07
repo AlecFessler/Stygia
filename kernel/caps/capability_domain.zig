@@ -174,6 +174,18 @@ pub const CapabilityDomain = struct {
     /// one per spec (the VM handle is non-transferable, exactly one
     /// holder = the binding domain). `null` on non-VM domains.
     vm: ?SlabRef(VirtualMachine) = null,
+
+    /// Backing of the eagerly-mapped user stack as one contiguous PMM
+    /// buddy block. Set by `mapUserStack`; freed wholesale at domain
+    /// teardown so the buddy can rejoin a single 4 MiB block instead of
+    /// fragmenting into 1024 single-page frees (which broke
+    /// `pmm.allocBlock(USER_TABLE_BYTES)` after a few hundred reps when
+    /// the test runner kept spawning new domains). 0 when the stack is
+    /// not allocated yet (transient init state) or has already been
+    /// freed. `freeUserAddrSpace` skips this range so the per-page walk
+    /// doesn't double-free.
+    user_stack_phys: u64 = 0,
+    user_stack_bytes: u64 = 0,
 };
 
 pub const Allocator = SecureSlab(CapabilityDomain, 256);
@@ -370,12 +382,33 @@ pub fn createCapabilityDomain(
             src_user.field1,
         ) catch return errors.E_FULL;
 
+        // For refcounted types (page_frame, timer) the new alias is a
+        // real reference: bump refcount so the child's eventual handle
+        // release in `destroyPhase2`'s kernel_table walk is balanced and
+        // a `delete` of the source handle in the caller cannot destroy
+        // the object out from under the child. Other types are
+        // domain-or-system-lifetime (cd / ec / vmar / port / vm / device)
+        // and don't carry a per-handle refcount.
+        switch (src_type) {
+            .page_frame => zag.memory.page_frame.incHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+            .timer => zag.sched.timer.incHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+            else => {},
+        }
+
         if (move) {
             // move=1: remove the source handle from the caller's table.
             // For now do a coarse slot clear; full delete-with-derivation
             // belongs in the proper derivation path. The runner uses
             // move=0 for the port handoff so this branch is unexercised
             // on the success path.
+            // The src refcount bump above is "the new owner's ref"; for
+            // move=1 the caller's old handle goes away, so undo the bump
+            // (otherwise refcount climbs unbounded as ownership passes).
+            switch (src_type) {
+                .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                else => {},
+            }
             caller_dom.user_table[src_slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
             caller_dom.kernel_table[src_slot].ref = .{};
         }
@@ -869,6 +902,12 @@ pub const DestroyDeferred = struct {
     user_buf: [*]u8,
     kernel_buf: [*]u8,
     addr_space_id: u16,
+    /// Phys base + size of the contiguous user-stack buddy block.
+    /// `pmm.freeBlock`'d wholesale at destroy and skipped by the
+    /// per-page `freeUserAddrSpace` walk (the leaves point into this
+    /// range). 0/0 means the stack wasn't allocated for this CD.
+    user_stack_phys: u64,
+    user_stack_bytes: u64,
     /// Caller-running EC (the one that invoked `delete(SLOT_SELF)`).
     /// Skipped by phase-2's EC walk because its kernel stack is in
     /// active use. The gen is captured before `parkSelfFaulted`; the
@@ -886,6 +925,23 @@ pub const DestroyDeferred = struct {
 pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
     zag.sched.timer.disarmTimerHandlesInDomain(cd);
 
+    // Tear down every VMAR bound to the domain. The destroy-path
+    // variant clears leaf PTEs (so `freeUserAddrSpace` can distinguish
+    // PF-backed leaves from singleton PMM leaves) and decrements
+    // `pf.mapcnt` for every still-installed page_frame, but skips the
+    // per-page TLB shootdown — no core has the dying CD's CR3 active.
+    // removeVar tail-swaps so iterating from the tail each step lets
+    // the array shrink under us without reordering un-walked entries.
+    while (cd.var_count > 0) {
+        const last = cd.var_count - 1;
+        const v_ref = cd.vars[last] orelse {
+            cd.var_count = last;
+            continue;
+        };
+        // caller-pinned: VMAR's domain.ptr is cd; we hold cd._gen_lock.
+        zag.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
+    }
+
     const cd_gen = cd._gen_lock.currentGen();
     const deferred = DestroyDeferred{
         .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
@@ -894,6 +950,8 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
         .user_buf = @ptrCast(cd.user_table),
         .kernel_buf = @ptrCast(cd.kernel_table),
         .addr_space_id = cd.addr_space_id,
+        .user_stack_phys = cd.user_stack_phys,
+        .user_stack_bytes = cd.user_stack_bytes,
         .caller_ec = if (caller_ec) |ec|
             SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
         else
@@ -912,6 +970,23 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
 /// the gen check rejects any new CD that lands on the freed slab slot
 /// between phase 1 and phase 2.
 pub fn destroyPhase2(deferred: DestroyDeferred) void {
+    // Mask IRQs across the whole of phase 2. With my caller_ec deferred-
+    // zombie reap, freeUserAddrSpace, and per-handle release walk, the
+    // post-Phase1 work is no longer trivially short — a preempt landing
+    // mid-phase-2 enters yieldTo, finds current_ec=null (from the
+    // earlier parkSelfFaulted), dequeues a runnable EC (often the
+    // result-port runner), and switchTo's away. The destroyPhase2 frame
+    // is abandoned, so the rest of the cleanup (PMM blocks, kernel_buf,
+    // freeAddrSpaceId, kernel_table walk, freeUserAddrSpace) never
+    // runs. Resources accumulate across reps and the kernel hangs at
+    // ~rep 11 of an N=500 boot. Masking IRQs guarantees the entire
+    // teardown completes before any yieldTo/preempt path can grab the
+    // calling kstack. Each sub-operation (PMM lock, slab gen-lock)
+    // already does its own IrqSave; the outer mask is just preventing
+    // preempt from interrupting the cumulative sequence.
+    const irq = arch.cpu.saveAndDisableInterrupts();
+    defer arch.cpu.restoreInterrupts(irq);
+
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
     zag.sched.execution_context.destroyEcsInDomain(
@@ -920,9 +995,73 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         deferred.caller_ec,
     );
 
+    // Reap the destroying-domain's caller EC's slab slot. `parkSelfFaulted`
+    // left it at gen=odd / state=.exited / off-freelist — `destroyEcsInDomain`
+    // skipped it via `keep_ref` because we are still standing on its kstack.
+    // Route through the standard deferred-destroy path: `bumpDeadGenLocked`
+    // flips gen → even immediately, `postZombie` hands the EC to this
+    // core's pending_zombie column, and the next dispatch
+    // (`yieldTo` / `parkAndAwaitIRQ` / `switchTo` `takeOwnPendingZombie`)
+    // finalizes it once `rsp` is no longer in the EC's kstack range.
+    // Without this, every domain-destroy leaks one EC slab slot — slabs
+    // are capped at 256 unique indices, so the test runner's
+    // ~481 destroys/rep starve `allocExecutionContext` at ~rep 5.
+    if (deferred.caller_ec) |caller_ref| {
+        zag.sched.execution_context.destroyExecutionContextLocked(
+            caller_ref.ptr,
+            deferred.cd_addr_space_root,
+            deferred.cd_ref.ptr,
+        );
+    }
+
     if (deferred.vm_ref) |vm_slab_ref| {
         zag.hv.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
     }
+
+    // Walk slots [3..MAX) and apply per-handle release semantics for
+    // types whose object holds a per-handle refcount the wholesale
+    // freeBlock below would otherwise abandon. With the alias-side
+    // `incHandleRef` in passed_handles processing, every page_frame /
+    // timer handle in this table is a real reference; releasing them
+    // here is the symmetric drop. VMARs are owned by destroyPhase1's
+    // `cd.vars[]` walk; capability_domain / execution_context /
+    // device_region / port / reply / vm are domain-or-system-lifetime
+    // and have nothing to release here.
+    const user_table: [*]Capability = @ptrCast(@alignCast(deferred.user_buf));
+    const kernel_table: [*]KernelHandle = @ptrCast(@alignCast(deferred.kernel_buf));
+    var slot: u16 = 3;
+    while (slot < MAX_HANDLES_PER_DOMAIN) : (slot += 1) {
+        const entry = &kernel_table[slot];
+        const obj_ptr = entry.ref.ptr orelse continue;
+        const tag = Word0.typeTag(user_table[slot].word0);
+        switch (tag) {
+            .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(obj_ptr))),
+            .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(obj_ptr))),
+            else => {},
+        }
+    }
+
+    // Reclaim user-half page tables and the eagerly-mapped user-stack /
+    // ELF / table-view leaves that landed in this address space. The
+    // page-table walker frees PT/PD/PDPT/PML4 pages and any leaf
+    // physical page that came from a single-page PMM.create — i.e.
+    // mapUserStack and loadElfSegments allocations. Page-frame leaves
+    // were already cleared by the destroyPhase1 vars[] walk; the leaves
+    // shared with `user_buf` (mapUserTableView aliases the user_buf
+    // pages into user space at `table_base`) are skipped via the
+    // [user_buf_phys, user_buf_phys + USER_TABLE_BYTES) range so the
+    // wholesale freeBlock below isn't double-freeing them.
+    const user_buf_phys = zag.memory.address.PAddr.fromVAddr(
+        zag.memory.address.VAddr.fromInt(@intFromPtr(deferred.user_buf)),
+        null,
+    );
+    arch.paging.freeUserAddrSpace(
+        deferred.cd_addr_space_root,
+        user_buf_phys.addr,
+        USER_TABLE_BYTES,
+        deferred.user_stack_phys,
+        deferred.user_stack_bytes,
+    );
 
     pmm_mgr.freeBlock(deferred.user_buf[0..USER_TABLE_BYTES]);
     pmm_mgr.freeBlock(deferred.kernel_buf[0..KERNEL_TABLE_BYTES]);

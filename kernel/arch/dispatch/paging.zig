@@ -313,6 +313,45 @@ pub fn allocAddrSpaceRoot() !PAddr {
     };
 }
 
+/// Free the user-half of an address space root and every page reachable
+/// through it back to PMM. See per-arch implementations for the walk
+/// strategy. Two `(skip_phys_start, skip_phys_bytes)` ranges define
+/// physical extents whose leaves are NOT freed individually — the
+/// caller is freeing them via a wholesale `pmm.freeBlock`. Pass
+/// `skipN_bytes = 0` to disable a range. Used by capability-domain
+/// teardown to reclaim the eagerly-mapped user stack, ELF segments,
+/// and page-table pages that accumulate per-spawn under the test
+/// runner; the user_table view aliases the cap-domain's user_buf
+/// block (skip range 1) and the user stack lives in a contiguous
+/// buddy block freed wholesale (skip range 2).
+pub fn freeUserAddrSpace(
+    root: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.freeUserAddrSpace(root, skip1_start, skip1_bytes, skip2_start, skip2_bytes),
+        .aarch64 => aarch64.paging.freeUserAddrSpace(root, skip1_start, skip1_bytes, skip2_start, skip2_bytes),
+        else => unreachable,
+    }
+}
+
+/// Clear a leaf PTE in `addr_space_root` for `virt` without issuing
+/// local INVLPG or remote TLB shootdown. Used by VMAR destroy in the
+/// capability-domain teardown path — no core has the dying CD's CR3
+/// active by the time `freeUserAddrSpace` returns, so the shootdown is
+/// unnecessary. Returns the leaf physical address that was cleared
+/// (caller may freePage it) or null if no leaf was installed.
+pub fn unmapPageNoShootdown(addr_space_root: PAddr, virt: VAddr) ?PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.unmapPageNoShootdown(addr_space_root, virt),
+        .aarch64 => aarch64.paging.unmapPage(addr_space_root, virt),
+        else => unreachable,
+    };
+}
+
 /// Cross-core TLB shootdown over the same page range, addressed by
 /// `addr_space_id` so remote cores can filter quickly. Issues a
 /// shootdown IPI and waits for ack from every core that may hold a

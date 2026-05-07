@@ -230,6 +230,40 @@ pub fn releaseHandle(pf: *PageFrame) void {
     decHandleRef(pf);
 }
 
+/// Bump the per-handle refcount when an alias of an existing PageFrame
+/// is minted into a fresh slot (e.g. `passed_handles` into a child
+/// domain, `mintHandleAlwaysNew` for §[handle_attachments] recv-time
+/// delivery). Mirrors the implicit `refcount = 1` that `createPageFrame`
+/// installs for its caller's handle. Without this, every such alias
+/// would share the original handle's refcount slot — `releaseHandle` on
+/// any one of them would over-decrement, and a `delete` of the original
+/// while aliases still exist would destroy the PF out from under them.
+pub fn incHandleRef(pf: *PageFrame) void {
+    const irq = pf._gen_lock.lockIrqSave(@src());
+    defer pf._gen_lock.unlockIrqRestore(irq);
+    pf.refcount += 1;
+}
+
+/// Mapping-count decrement: every VMAR install increments `mapcnt`;
+/// the matching unmap path must decrement it here. Mirrors
+/// `decHandleRef` for the destroy gate (both counters at zero under
+/// `_gen_lock`). Without this, `mapcnt` only ever climbs and PFs whose
+/// last handle has been released (refcount==0) still don't reach
+/// `destroyPageFrame`, so their backing buddy block is never returned —
+/// the leak that prevents the test runner from completing many reps
+/// inside a single QEMU memory budget.
+pub fn releaseMapping(pf: *PageFrame) void {
+    const irq = pf._gen_lock.lockIrqSave(@src());
+    if (pf.mapcnt > 0) pf.mapcnt -= 1;
+    const reached_zero = pf.refcount == 0 and pf.mapcnt == 0;
+    if (!reached_zero) {
+        pf._gen_lock.unlockIrqRestore(irq);
+        return;
+    }
+    destroyPageFrame(pf);
+    arch.cpu.restoreInterrupts(irq);
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 inline fn pageSizeBytes(sz: PageSize) u64 {

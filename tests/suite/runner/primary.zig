@@ -414,8 +414,29 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         serial.print("[runner] spawn FAILED (");
         serial.print(entry.name);
         serial.print(")\n");
+        // Even on failure, drop the per-spawn ELF page_frame handle the
+        // runner staged in its own table — otherwise the runner's 4096
+        // handle slots fill up over many reps and the next spawn loop
+        // iteration creates handles whose error returns get interpreted
+        // as pointers (var_base = E_BADCAP/E_FULL), faulting the runner
+        // in user mode at addr=0x3 / 0x6.
+        syscall.issueRegDiscard(.delete, 0, .{ .v1 = pf_handle });
         return false;
     }
+
+    // Drop the runner-side per-spawn handles that aren't needed anymore:
+    //   - pf_handle: the staged ELF page_frame. The child got an alias
+    //     in its own table during create_capability_domain; with
+    //     `incHandleRef` on alias the PF refcount is 2 here, so dropping
+    //     the runner side leaves the child's reference at 1 and the PF
+    //     stays alive until the child's domain destroys.
+    //   - idc_handle (returned slot in r.v1 low 12 bits): the runner
+    //     never sends IDCs to children, so it doesn't need this handle
+    //     past spawn. Reclaiming the slot is required for N>>1 reps to
+    //     avoid filling the runner's 4096-entry table after ~5 reps.
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = pf_handle });
+    const idc_slot: caps.HandleId = @truncate(r.v1 & 0xFFF);
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = idc_slot });
     return true;
 }
 

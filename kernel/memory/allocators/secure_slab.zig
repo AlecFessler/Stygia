@@ -552,8 +552,18 @@ pub fn SecureSlab(
 
             zeroExceptGenLock(ptr);
 
-            self.lock.lock(@src());
-            defer self.lock.unlock();
+            // Mixed-mode acquire: this slab lock is taken from both
+            // process-context (`destroyExecutionContextLocked`'s
+            // self-help drain in `terminate` / domain-destroy paths,
+            // IRQs enabled) and IRQ-context (preempt → `yieldTo` →
+            // `switchTo` → `finalizeDestroyMarkedDead` reaper, IRQs
+            // disabled). Use IrqSave so an interrupt landing while the
+            // process-context site holds the lock can't trap into the
+            // same class on an IPI/preempt and deadlock. Lockdep (see
+            // `IRQ-mode mix` panic at this site under N>>1 reps)
+            // explicitly diagnoses this exact pair.
+            const irq = self.lock.lockIrqSave(@src());
+            defer self.lock.unlockIrqRestore(irq);
 
             const idx = self.indexOf(ptr);
             const draw_push = self.randStep();

@@ -748,6 +748,32 @@ pub fn allocAddrSpaceRoot() !PAddr {
     return PAddr.fromVAddr(new_virt, null);
 }
 
+/// Free the user-half (TTBR0_EL1) translation table walking from
+/// `root` and return all reachable user pages and intermediate table
+/// pages to PMM. The aarch64 walk depth depends on TCR_EL1 settings
+/// (typically 4-level for 48-bit VAs); this is currently a stub for
+/// the test-runner cleanup path on x86_64.
+///
+/// TODO: implement the L0→L1→L2→L3 walk and per-leaf free with the
+/// same skip-range semantics as the x86 backend. The aarch64 user
+/// shape mirrors x86's PML4→PDPT→PD→PT and the existing
+/// `kernel_data_local` mappings make the user/kernel split clean —
+/// porting `freeUserAddrSpace` is mechanical once the test runner
+/// targets aarch64 with N>1 reps.
+pub fn freeUserAddrSpace(
+    root: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    _ = root;
+    _ = skip1_start;
+    _ = skip1_bytes;
+    _ = skip2_start;
+    _ = skip2_bytes;
+}
+
 /// Read the current TTBR0_EL1 base PA (low-half / user translation root).
 /// Strips ASID bits [63:48] and reserved bits [11:0]; returns a clean PA.
 /// ARM ARM DDI 0487 §D13.2.136 TTBR0_EL1.

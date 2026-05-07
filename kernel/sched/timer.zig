@@ -450,6 +450,15 @@ pub fn decHandleRef(t: *Timer) void {
     if (last) destroyTimer(t);
 }
 
+/// Bump the per-handle refcount when an alias of an existing Timer is
+/// minted into a fresh slot (e.g. `passed_handles` into a child domain).
+/// See `page_frame.incHandleRef` for the matching rationale on PFs.
+pub fn incHandleRef(t: *Timer) void {
+    const irq = t._gen_lock.lockIrqSave(@src());
+    defer t._gen_lock.unlockIrqRestore(irq);
+    t.refcount += 1;
+}
+
 /// Disarm every Timer reachable from `cd`'s handle table. Called by
 /// `destroyCapabilityDomain` BEFORE the cd struct is destroyed, while
 /// the caller still holds `cd._gen_lock` from `lockTyped`. Without this,

@@ -76,14 +76,33 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 /// implemented via IPI + INVLPG on each remote core.
 var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
+/// 0 = INVLPG single-page, 1 = INVPCID type-1 (single PCID, all addresses).
+/// Encoded into `shootdown_addr` low bits via the kind discriminator below.
+const ShootdownKind = enum(u8) { invlpg = 0, invpcid_single = 1 };
+var shootdown_kind: u8 = @intFromEnum(ShootdownKind.invlpg);
+var shootdown_pcid: u16 = 0;
 
-/// IPI handler for TLB shootdown: invalidate the requested address.
-/// endOfInterrupt is called by dispatchInterrupt for .external vectors.
+/// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`:
+///   - .invlpg → invlpg `shootdown_addr` (per-page flush, including globals).
+///   - .invpcid_single → INVPCID type 1 against `shootdown_pcid` (every TLB
+///     entry tagged with that PCID, all linear addresses, retains globals).
 ///
-/// Intel SDM Vol 3A, Section 5.10.4.1 -- INVLPG invalidates any TLB entries
-/// for the page containing the operand address, including global entries.
+/// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID.
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     kprof.point(.tlb_shootdown, 0);
+    const kind = @atomicLoad(u8, &shootdown_kind, .acquire);
+    if (kind == @intFromEnum(ShootdownKind.invpcid_single)) {
+        const pcid: u16 = @atomicLoad(u16, &shootdown_pcid, .acquire);
+        if (cpu.pcid_enabled) {
+            const desc: [2]u64 align(16) = .{ @as(u64, pcid) & 0xFFF, 0 };
+            asm volatile ("invpcid (%[desc]), %[type]"
+                :
+                : [desc] "r" (&desc),
+                  [type] "r" (@as(u64, 1)),
+                : .{ .memory = true });
+        }
+        return;
+    }
     cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
 }
 
@@ -110,7 +129,39 @@ fn flushRemoteTlb(virt_addr: u64) void {
     shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
+    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invlpg), .release);
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);
+
+    const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
+    for (apic.lapics.?, 0..) |la, i| {
+        if (i == self_id) continue;
+        apic.sendIpi(@intCast(la.apic_id), vec);
+    }
+}
+
+/// Broadcast a per-PCID TLB invalidation to every remote core. Used by
+/// `pcid.free` so a recycled PCID does not inherit stale TLB entries on
+/// cores that previously ran the dying domain. Without this, a CD whose
+/// PCID gets reused by a new domain may resolve user-half VAs to the
+/// freed (and possibly already-reallocated) physical pages of the prior
+/// owner — visible as random user faults / corruption mid-rep on
+/// SMP > 1 once the test runner starts recycling PCIDs.
+///
+/// Intel SDM Vol 2A INVPCID, Vol 3A §5.10.1: type 1 (single-context
+/// invalidation) flushes every TLB entry tagged with the descriptor's
+/// PCID at all linear addresses; retains entries tagged with other
+/// PCIDs and global entries (kernel mappings).
+pub fn flushRemotePcid(pcid: u16) void {
+    const core_count = apic.coreCount();
+    if (core_count <= 1) return;
+
+    const self_id = apic.coreID();
+
+    shootdown_lock.lock(@src());
+    defer shootdown_lock.unlock();
+
+    @atomicStore(u16, &shootdown_pcid, pcid, .release);
+    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invpcid_single), .release);
 
     const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
     for (apic.lapics.?, 0..) |la, i| {
@@ -508,6 +559,34 @@ pub fn unmapPage(
     return phys;
 }
 
+/// Variant of `unmapPage` for the capability-domain destroy path: clears
+/// the leaf PTE but skips the local INVLPG and the remote-core
+/// shootdown IPI. Safe because no core has the dying CD's CR3 active —
+/// the calling core's own switchAddrSpace runs on its way out of
+/// `scheduler.run`'s next dispatch, and other cores never used it. The
+/// leaf clear lets the subsequent `freeUserAddrSpace` walk distinguish
+/// PF-backed leaves (already cleared here) from singleton PMM leaves
+/// (still present, freePage'd by the walk).
+pub fn unmapPageNoShootdown(addr_space_root: PAddr, virt: VAddr) ?PAddr {
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+
+    const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
+    for (walk_indices) |idx| {
+        const entry = &table[idx];
+        if (!entry.present) return null;
+        if (entry.huge_page) return null;
+        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        table = @ptrFromInt(next_virt.addr);
+    }
+
+    const l1_entry = &table[l1Idx(virt)];
+    if (!l1_entry.present) return null;
+    const phys = l1_entry.getPAddr();
+    l1_entry.* = default_page_entry;
+    return phys;
+}
+
 /// Recursively walk the 4-level paging hierarchy for the user half of the
 /// address space (PML4 indices 0–255) and free all leaf pages and table pages.
 /// Intel SDM Vol 3A, §4.5 "4-Level Paging and 5-Level Paging" — the hierarchy
@@ -582,6 +661,148 @@ pub fn allocAddrSpaceRoot() !PAddr {
     const new_virt = VAddr.fromInt(@intFromPtr(new_table));
     copyKernelMappings(new_virt);
     return PAddr.fromVAddr(new_virt, null);
+}
+
+/// Tear down the user-half of an address space root and return every
+/// page reachable through PML4[0..255] to PMM:
+///   - intermediate table pages (PDPT, PD, PT) — always single-page
+///     PMM allocations made by `mapPage`'s on-demand walk
+///   - leaf 4 KiB pages whose physical address is NOT in the
+///     [skip_phys_start, skip_phys_start + skip_phys_bytes) skip range
+///     (used by the caller to keep page-aliased buddy blocks alive — the
+///     `mapUserTableView` path aliases the cap-domain's `user_buf` block
+///     into user space, and that block is freed wholesale via
+///     `pmm.freeBlock` rather than per-page)
+///   - the PML4 itself
+///
+/// Leaves backed by VMAR-installed page_frames must already be cleared
+/// (PTE.present = 0) by the caller — `destroyVmar`'s `unmapAll` does
+/// this and decrements PageFrame mapcnt for each entry. Any present
+/// leaves remaining at this point came from boot-side eager mappings:
+///   - `mapUserStack` — 1024 pages × 4 KiB per child
+///   - `loadElfSegments` — N × 4 KiB per child for ELF text/data/rodata
+///   - `mapUserTableView` — aliases `user_buf` (skipped via skip range)
+///
+/// PML4 indices 256..511 are kernel-shared (per `copyKernelMappings`)
+/// and are NEVER touched by this walk — the kernel half lives until
+/// shutdown.
+///
+/// Intel SDM Vol 3A §5.5.4: each table is 512 PageEntry slots; entries
+/// 0–255 cover the canonical low half (user). PT entries are leaf
+/// PTEs; PDPT/PD entries are non-leaf when `huge_page == 0`. Huge-page
+/// leaves at L3/L2 are not produced by the user-side mapping path
+/// (mapPage hard-codes 4 KiB walks) but defensive checks below keep
+/// the recursion correct if a future patch lands one.
+pub fn freeUserAddrSpace(
+    root: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
+    const root_virt = VAddr.fromPAddr(root, null);
+    const pml4: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        const entry = &pml4[i];
+        if (!entry.present) continue;
+        if (entry.huge_page) {
+            // 1 GiB leaf at PML4 — not produced today, but if it ever
+            // is, treat as a leaf and free per skip-range.
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freePdpt(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+
+    // Deliberately do NOT free the PML4 root here — it is still the
+    // active CR3 on the calling core until the next dispatch swaps
+    // address space. Freeing it inline would let PMM hand the page
+    // out to another allocator, whose write would corrupt the live
+    // page-table walk on this core. The kernel-half (entries 256..511)
+    // remains intact for kernel-mode references; the user-half is now
+    // empty so no future user TLB miss can walk into freed pages. The
+    // 4 KiB leak is reaped at the next reuse of the addr_space_id /
+    // PCID (which currently never happens — see allocAddrSpaceRoot
+    // doc) — addressable later by deferring the free until after a
+    // CR3 swap, e.g. via a per-core "pending PML4 free" slot drained
+    // by `loadEcContextAndReturn`.
+}
+
+fn freePdpt(pmm_mgr: *pmm.PhysicalMemoryManager, pdpt_phys: PAddr, skip1_start: u64, skip1_bytes: u64, skip2_start: u64, skip2_bytes: u64) void {
+    const pdpt_virt = VAddr.fromPAddr(pdpt_phys, null);
+    const pdpt: *[page_entry_table_size]PageEntry = @ptrFromInt(pdpt_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &pdpt[i];
+        if (!entry.present) continue;
+        if (entry.huge_page) {
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freePd(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(pdpt_virt.addr)));
+}
+
+fn freePd(pmm_mgr: *pmm.PhysicalMemoryManager, pd_phys: PAddr, skip1_start: u64, skip1_bytes: u64, skip2_start: u64, skip2_bytes: u64) void {
+    const pd_virt = VAddr.fromPAddr(pd_phys, null);
+    const pd: *[page_entry_table_size]PageEntry = @ptrFromInt(pd_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &pd[i];
+        if (!entry.present) continue;
+        if (entry.huge_page) {
+            // 2 MiB leaf at L2.
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freePt(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(pd_virt.addr)));
+}
+
+fn freePt(pmm_mgr: *pmm.PhysicalMemoryManager, pt_phys: PAddr, skip1_start: u64, skip1_bytes: u64, skip2_start: u64, skip2_bytes: u64) void {
+    const pt_virt = VAddr.fromPAddr(pt_phys, null);
+    const pt: *[page_entry_table_size]PageEntry = @ptrFromInt(pt_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &pt[i];
+        if (!entry.present) continue;
+        const phys = entry.getPAddr().addr;
+        entry.* = default_page_entry;
+        if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+            pmm_mgr.freePage(physToPagePtr(phys));
+        }
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(pt_virt.addr)));
+}
+
+inline fn leafSkipped(phys: u64, s1: u64, n1: u64, s2: u64, n2: u64) bool {
+    if (n1 != 0 and phys >= s1 and phys < s1 + n1) return true;
+    if (n2 != 0 and phys >= s2 and phys < s2 + n2) return true;
+    return false;
+}
+
+inline fn physToPagePtr(phys: u64) [*]u8 {
+    return @ptrFromInt(VAddr.fromPAddr(.{ .addr = phys }, null).addr);
 }
 
 pub fn shootdownTlbRange(

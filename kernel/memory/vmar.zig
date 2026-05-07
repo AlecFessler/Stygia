@@ -881,6 +881,48 @@ pub fn destroyVmar(v: *VMAR) void {
     slab_instance.destroy(v, gen) catch {};
 }
 
+/// VMAR teardown variant for the capability-domain destroy path:
+/// drops mapcnt for every installed page_frame, clears the leaf PTEs
+/// without issuing per-page TLB shootdowns (no core has the dying CD's
+/// CR3 active), removes from `domain.vars[]`, and frees the slab slot.
+/// Used by `destroyPhase1`'s `cd.vars[]` walk where paying for
+/// O(page_count) IPI broadcasts per VMAR is the dominant cost — a
+/// 4 MiB-stack-sized child with multiple VMARs would otherwise eat
+/// thousands of shootdown IPIs per spawn.
+pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
+    const domain = v.domain.ptr;
+    const gen = v._gen_lock.currentGen();
+    if (v.map == .page_frame or v.map == .demand) {
+        const sz_bytes = pageSizeBytes(v.sz);
+        var off: u64 = 0;
+        while (off < @as(u64, v.page_count) * sz_bytes) {
+            _ = dispatch.paging.unmapPageNoShootdown(
+                domain.addr_space_root,
+                .fromInt(v.base_vaddr.addr + off),
+            );
+            off += sz_bytes;
+        }
+        for (&v.installed_pfs) |*entry| {
+            if (entry.pf) |pf_ref| {
+                zag.memory.page_frame.releaseMapping(pf_ref.ptr);
+            }
+            entry.* = .{};
+        }
+    } else if (v.map == .mmio) {
+        const sz_bytes = pageSizeBytes(v.sz);
+        var off: u64 = 0;
+        while (off < @as(u64, v.page_count) * sz_bytes) {
+            _ = dispatch.paging.unmapPageNoShootdown(
+                domain.addr_space_root,
+                .fromInt(v.base_vaddr.addr + off),
+            );
+            off += sz_bytes;
+        }
+    }
+    zag.caps.capability_domain.removeVar(domain, v);
+    slab_instance.destroy(v, gen) catch {};
+}
+
 /// Allocate a contiguous VA range of `pages * sz` bytes for a new VMAR.
 /// `preferred_base != 0` returns that base verbatim (the create_vmar
 /// caller is asking for a specific address; the per-domain overlap
@@ -1049,11 +1091,13 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     for (&v.installed_pfs) |*entry| {
         if (entry.pf) |pf_ref| {
             if (entry.offset == offset) {
-                // caller-pinned: PF refcount kept by the installed entry
-                // we are about to remove; caller will release the
-                // mapcnt below.
                 removed = pf_ref.ptr;
                 entry.* = .{};
+                // PageFrame mapcnt was bumped at install (incMapCntShim);
+                // this is the matching decrement. `releaseMapping` may
+                // run destroyPageFrame inline if the last handle has
+                // also been released.
+                zag.memory.page_frame.releaseMapping(pf_ref.ptr);
                 break;
             }
         }
@@ -1203,7 +1247,15 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
         );
         off += sz_bytes;
     }
+    // Decrement mapcnt for every still-installed page_frame entry; the
+    // PTEs are gone but the PageFrame's per-mapping counter is what
+    // gates `destroyPageFrame`. Without this the PF stays alive at
+    // mapcnt > 0 even after every handle is released — the cross-rep
+    // leak the test runner trips on at N>1.
     for (&v.installed_pfs) |*entry| {
+        if (entry.pf) |pf_ref| {
+            zag.memory.page_frame.releaseMapping(pf_ref.ptr);
+        }
         entry.* = .{};
     }
     dispatch.paging.shootdownTlbRange(

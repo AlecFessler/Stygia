@@ -59,10 +59,15 @@ const ROOT_EC_CAPS = EcCaps{
 };
 
 /// Pages reserved for the per-EC user stack created by
-/// create_capability_domain. Bumped from the spec-default 16 to 1024
-/// (4 MiB) so the in-Zag self-hosted Zig compiler's recursive AstGen
-/// for std-sized files has comfortable headroom.
-pub const USER_STACK_PAGES: u64 = 1024;
+/// create_capability_domain. 16 pages (64 KiB) is the spec default
+/// and the right size for nearly every userspace task. The in-Zag
+/// self-hosted Zig compiler's recursive AstGen / Sema descent for
+/// std-sized files needs more headroom — that's a per-process opt-in
+/// (TODO: surface via a `create_capability_domain` argument or via
+/// demand-paged stack growth) rather than a global bump that would
+/// 64× every spawn's PMM footprint and starve the test runner past
+/// ~rep 2 of an N=500 boot.
+pub const USER_STACK_PAGES: u64 = 16;
 pub const USER_STACK_BYTES: u64 = USER_STACK_PAGES * paging_consts.PAGE4K;
 
 /// Bytes reserved for the read-only cap-table view mapped into a new

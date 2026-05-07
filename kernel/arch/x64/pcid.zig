@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
+const paging = zag.arch.x64.paging;
 
 const SpinLock = zag.utils.sync.SpinLock;
 
@@ -58,6 +59,16 @@ pub fn free(id: u16) void {
     std.debug.assert(id != 0);
     std.debug.assert(id < pcid_count);
 
+    // Flush remote cores' TLB entries for this PCID before recycling.
+    // A core that previously ran the dying domain may still hold stale
+    // PCID-tagged entries; if the PCID is reused for a new domain
+    // before those clear naturally, the new domain's user-half VAs
+    // can resolve to the dying domain's freed physical pages —
+    // particularly dangerous now that the destroy path returns those
+    // pages to PMM via `freeUserAddrSpace` (vs the prior leak-style
+    // teardown that left them quiescent). See SDM Vol 2A INVPCID type
+    // 1 (single-PCID, all addresses).
+    paging.flushRemotePcid(id);
     invalidateTlb(id);
 
     const irq_state = lock.lockIrqSave(@src());
