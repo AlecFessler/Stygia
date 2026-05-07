@@ -207,14 +207,14 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Parent halts forever. The child is the sole reporter; the
-    // runner indexes results by build-time test tag so a single
-    // report from the child satisfies this test's slot.
-    while (true) {
-        switch (builtin.cpu.arch) {
-            .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfi"),
-            else => @compileError("unsupported arch"),
-        }
-    }
+    // Parent returns. The child is the sole reporter; the runner
+    // indexes results by build-time test tag so a single report from
+    // the child satisfies this test's slot. Returning lets `_start`
+    // invoke `delete(SLOT_SELF)` and tear the parent CD down — without
+    // it the parent CD stayed alive indefinitely and ~10 reps of the
+    // test runner exhausted the CD slab class. The child sub-domain
+    // is independent (top-level CDs are not parent-linked under v3),
+    // so destroying the parent here does not affect the child's
+    // ability to report.
+    return;
 }

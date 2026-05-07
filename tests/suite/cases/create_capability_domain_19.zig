@@ -167,8 +167,43 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     writeU64(dst, ph + 0x28, PAGE_SIZE); // p_memsz
     writeU64(dst, ph + 0x30, PAGE_SIZE); // p_align
 
-    // Single hlt instruction at e_entry so the domain halts cleanly.
-    dst[entry_off] = 0xF4; // hlt
+    // Self-destruct stub at e_entry: invoke `delete(SLOT_SELF)` so the
+    // child capability domain tears itself down and its slab slot
+    // returns to the freelist. Without this the child stays alive
+    // indefinitely (per spec §[delete] capability_domain IDC handle
+    // drops do NOT terminate the bound domain — only an in-domain
+    // delete(SLOT_SELF) does), and ~10 reps of the test runner exhaust
+    // the CD slab class and wedge the timer_rearm tail of the run.
+    //
+    // x86-64 instruction stream (matches libz/syscall_x64.zig
+    // issueRegDiscard):
+    //   xor    %eax, %eax            ; v1 = SLOT_SELF (= 0)
+    //   mov    $0x10, %ecx            ; syscall_word = delete (num 16)
+    //   sub    $0x10, %rsp            ; reserve vreg-0 slot
+    //   mov    %rcx, (%rsp)           ; [rsp] = syscall_word
+    //   syscall                        ; → kernel deleteAndDetach
+    //   hlt                            ; unreachable on success
+    //   jmp    -1                       ; pin the EC if syscall ever returns
+    //
+    // delete(SLOT_SELF) parks the calling EC as faulted and tears the
+    // domain down via destroyPhase1+2. Spec §[delete] table:
+    // capability_domain_self → "calling domain is cleaned up; each
+    // handle in its table is released with its type-specific delete
+    // behavior applied." That is exactly what is required to keep the
+    // CD slab balanced across runner reps.
+    const child_stub = [_]u8{
+        0x31, 0xC0, // xor %eax, %eax
+        0xB9, 0x10, 0x00, 0x00, 0x00, // mov $0x10, %ecx
+        0x48, 0x83, 0xEC, 0x10, // sub $0x10, %rsp
+        0x48, 0x89, 0x0C, 0x24, // mov %rcx, (%rsp)
+        0x0F, 0x05, // syscall
+        0xF4, // hlt (unreachable on success)
+        0xEB, 0xFD, // jmp -3 (back to hlt)
+    };
+    var ci: usize = 0;
+    while (ci < child_stub.len) : (ci += 1) {
+        dst[entry_off + ci] = child_stub[ci];
+    }
 
     return PAGE_SIZE;
 }
