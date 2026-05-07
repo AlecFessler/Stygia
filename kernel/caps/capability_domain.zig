@@ -306,11 +306,30 @@ pub fn createCapabilityDomain(
     const child_root_virt = VAddr.fromPAddr(child_cd.addr_space_root, null);
     zag.arch.dispatch.paging.copyKernelMappings(child_root_virt);
 
+    // Past this point, every error must tear `child_cd` down. The CD's
+    // gen-lock is published-live (alloc returned successfully), so a
+    // bare `return errors.E_NOMEM` without cleanup leaks the
+    // user_table / kernel_table PMM blocks plus any ECs that were
+    // allocated before the failing step. Spec-test runs that exercise
+    // the failure paths in `loadElfSegments` / `mapUserStack` /
+    // `allocExecutionContext` / `mintHandle` accumulated ~5 leaked CDs
+    // per rep before this teardown was added — slabs filled and the
+    // 11th rep wedged at `timer_rearm_05..08` once handle-table /
+    // PCID exhaustion gated the next createPort/createTimer.
+
     // Load ELF segments into the child's address space.
-    userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed, layout.elf_slide) catch
+    userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed, layout.elf_slide) catch {
+        cleanupPartiallyCreatedCd(child_cd, null);
         return errors.E_NOMEM;
-    userspace_init.mapUserStack(child_cd, layout.stack_top) catch return errors.E_NOMEM;
-    userspace_init.mapUserTableView(child_cd, layout.table_base) catch return errors.E_NOMEM;
+    };
+    userspace_init.mapUserStack(child_cd, layout.stack_top) catch {
+        cleanupPartiallyCreatedCd(child_cd, null);
+        return errors.E_NOMEM;
+    };
+    userspace_init.mapUserTableView(child_cd, layout.table_base) catch {
+        cleanupPartiallyCreatedCd(child_cd, null);
+        return errors.E_NOMEM;
+    };
 
     // Allocate the initial EC bound to the child domain. Entry =
     // slid_entry; affinity from spec §[create_capability_domain] [5];
@@ -323,7 +342,10 @@ pub fn createCapabilityDomain(
         .normal,
         null,
         null,
-    ) catch return errors.E_NOMEM;
+    ) catch {
+        cleanupPartiallyCreatedCd(child_cd, null);
+        return errors.E_NOMEM;
+    };
 
     // Patch the initial EC's iret frame for user-mode dispatch.
     zag.arch.dispatch.cpu.patchUserModeIretFrame(
@@ -368,7 +390,10 @@ pub fn createCapabilityDomain(
             caller_dom,
             src_slot,
             null,
-        ) orelse return errors.E_BADCAP;
+        ) orelse {
+            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            return errors.E_BADCAP;
+        };
 
         const src_user = caller_dom.user_table[src_slot];
         const src_type = Word0.typeTag(src_user.word0);
@@ -380,7 +405,10 @@ pub fn createCapabilityDomain(
             new_caps,
             src_user.field0,
             src_user.field1,
-        ) catch return errors.E_FULL;
+        ) catch {
+            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            return errors.E_FULL;
+        };
 
         // For refcounted types (page_frame, timer) the new alias is a
         // real reference: bump refcount so the child's eventual handle
@@ -429,7 +457,10 @@ pub fn createCapabilityDomain(
         caller_cridc,
         0,
         0,
-    ) catch return errors.E_FULL;
+    ) catch {
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return errors.E_FULL;
+    };
 
     // Enqueue the initial EC on a core that satisfies its affinity
     // mask. With affinity = 0 (any core) or a mask containing the
@@ -462,6 +493,34 @@ inline fn pageFrameSizeBytes(sz: zag.memory.vmar.PageSize) u64 {
         .sz_1g => 0x40000000,
         ._reserved => unreachable,
     };
+}
+
+/// Tear down a partially-constructed CD whose `createCapabilityDomain`
+/// hit a post-`allocCapabilityDomain` error. The CD is published-live
+/// at this point (gen-lock is odd / unlocked), so the destroy follows
+/// the standard `destroyPhase1` → `destroyPhase2` path. The optional
+/// `partial_ec` is the initial EC that was alloc'd before the failing
+/// step but never published into a handle (slot 1 of the child's table
+/// may or may not have been written). Phase 2's `destroyEcsInDomain`
+/// walks the EC slab matching `(cd, gen)` and reaps every EC bound to
+/// this CD — so even the still-`.ready`-but-not-yet-enqueued initial
+/// EC is reaped here. Spec §[create_capability_domain] failure paths
+/// must not leak the freshly-allocated CD; without this cleanup the
+/// kernel slab class fills after ~10 reps of the test runner and any
+/// subsequent `createPort` / `createTimer` returns E_NOMEM.
+fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionContext) void {
+    _ = partial_ec; // covered by destroyEcsInDomain's slab-walk match
+    const cd_gen = cd._gen_lock.currentGen();
+    const cd_ref: SlabRef(CapabilityDomain) = .{ .ptr = cd, .gen = @intCast(cd_gen) };
+    const lr = cd_ref.lockIrqSave(@src()) catch return;
+    // destroyPhase1 runs under cd._gen_lock and ends by releasing it
+    // via destroyLocked (gen flips to even). Restore IRQ state
+    // manually because the deferred unlockIrqRestore would assert on
+    // the just-cleared lock bit. Mirrors the slot==0 SLOT_SELF path
+    // in derivation.deleteAndDetach.
+    const deferred = destroyPhase1(cd, null);
+    arch.cpu.restoreInterrupts(lr.irq_state);
+    destroyPhase2(deferred);
 }
 
 
@@ -970,20 +1029,13 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
 /// the gen check rejects any new CD that lands on the freed slab slot
 /// between phase 1 and phase 2.
 pub fn destroyPhase2(deferred: DestroyDeferred) void {
-    // Mask IRQs across the whole of phase 2. With my caller_ec deferred-
-    // zombie reap, freeUserAddrSpace, and per-handle release walk, the
+    // Mask IRQs across the whole of phase 2. With the deferred caller_ec
+    // reap, freeUserAddrSpace, and per-handle release walk, the
     // post-Phase1 work is no longer trivially short — a preempt landing
-    // mid-phase-2 enters yieldTo, finds current_ec=null (from the
-    // earlier parkSelfFaulted), dequeues a runnable EC (often the
-    // result-port runner), and switchTo's away. The destroyPhase2 frame
-    // is abandoned, so the rest of the cleanup (PMM blocks, kernel_buf,
-    // freeAddrSpaceId, kernel_table walk, freeUserAddrSpace) never
-    // runs. Resources accumulate across reps and the kernel hangs at
-    // ~rep 11 of an N=500 boot. Masking IRQs guarantees the entire
-    // teardown completes before any yieldTo/preempt path can grab the
-    // calling kstack. Each sub-operation (PMM lock, slab gen-lock)
-    // already does its own IrqSave; the outer mask is just preventing
-    // preempt from interrupting the cumulative sequence.
+    // mid-phase-2 would enter yieldTo, find current_ec=null (from the
+    // earlier parkSelfFaulted), dequeue a runnable EC, and switchTo
+    // away. The destroyPhase2 frame is abandoned, so the rest of the
+    // cleanup never runs and resources accumulate across reps.
     const irq = arch.cpu.saveAndDisableInterrupts();
     defer arch.cpu.restoreInterrupts(irq);
 
