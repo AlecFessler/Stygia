@@ -525,7 +525,11 @@ const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
     link_to_list,
 );
 
-const MAX_ORDER = 14;
+// MAX_ORDER=15 → max single allocation = 2^15 * 4 KiB = 128 MiB. Bumped
+// from 14 (64 MiB) to accommodate the cross-compiled Zig compiler ELF
+// (~70 MiB stripped → rounded up to 128 MiB / order 15). Stays within
+// u4 (which can represent 0-15).
+const MAX_ORDER = 15;
 const NUM_ORDERS = MAX_ORDER + 1;
 const ORDERS = blk: {
     var arr: [NUM_ORDERS]u64 = undefined;

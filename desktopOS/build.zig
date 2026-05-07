@@ -620,6 +620,12 @@ pub fn build(b: *std.Build) void {
     _ = services_wf.addCopyFile(hello2_elf, "zig_hello2.elf");
     _ = services_wf.addCopyFile(hello_std_elf, "zig_hello_std.elf");
     _ = services_wf.addCopyFile(fs_smoke_elf, "fs_smoke.elf");
+    // Phase 4c.5: the cross-compiled real Zig compiler binary (165 MB).
+    // Built once outside the tree at /tmp/zig-for-zag/bin/zig, then
+    // copied to desktopOS/zig_compiler/zig.elf (gitignored) so the build
+    // system has a stable path. Embedding it makes desktopOS.elf large
+    // but the kernel/bootloader can handle it.
+    _ = services_wf.addCopyFile(b.path("zig_compiler/zig.elf"), "zig_compiler.elf");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -633,6 +639,7 @@ pub fn build(b: *std.Build) void {
         \\pub const zig_hello2_elf = @embedFile("zig_hello2.elf");
         \\pub const zig_hello_std_elf = @embedFile("zig_hello_std.elf");
         \\pub const fs_smoke_elf = @embedFile("fs_smoke.elf");
+        \\pub const zig_compiler_elf = @embedFile("zig_compiler.elf");
         \\
     );
     const services_mod = b.createModule(.{

@@ -105,6 +105,10 @@ pub fn main(cap_table_base: u64) void {
     const zig_hello_std_pf = stageElfPageFrame(services.zig_hello_std_elf) orelse powerShutdown();
     // libc_smoke fs_smoke: exercises libc.a → runtime.o → fs IPC chain.
     const fs_smoke_pf = stageElfPageFrame(services.fs_smoke_elf) orelse powerShutdown();
+    // Phase 4c.5: the real cross-compiled Zig compiler. Pre-staged at
+    // desktopOS/zig_compiler/zig.elf (gitignored). Linked statically
+    // for x86_64-zag-none against libz/libc.a + libc_smoke/runtime.zig.
+    const zig_compiler_pf = stageElfPageFrame(services.zig_compiler_elf) orelse powerShutdown();
 
     // Collect MMIO device_regions to forward to the NVMe driver.
     var mmio_devs: [16]HandleId = undefined;
@@ -232,6 +236,22 @@ pub fn main(cap_table_base: u64) void {
         appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
         appendDevice(&passed, &n, com1, .{});
         _ = spawnService("fs_smoke", fs_smoke_pf, passed[0..n]) orelse powerShutdown();
+    }
+
+    // ── Spawn zig_compiler ──────────────────────────────────────────
+    // Phase 4c.5: the cross-compiled real Zig compiler running on Zag.
+    // Same cap layout as fs_smoke (it links the same libc.a + runtime).
+    // Hardcoded argv = ["zig", "version"] from the patched start.zig
+    // for first-cut bringup; once we see the version string on serial
+    // we know the binary loads + the self-hosted runtime's startup
+    // path works on Zag. Compilation comes after.
+    {
+        var passed: [MAX_PASSED]u64 = undefined;
+        var n: usize = 0;
+        appendPort(&passed, &n, fs_port, .{ .xfer = true, .bind = true });
+        appendPf(&passed, &n, io_scratch, .{ .r = true, .w = true });
+        appendDevice(&passed, &n, com1, .{});
+        _ = spawnService("zig_compiler", zig_compiler_pf, passed[0..n]) orelse powerShutdown();
     }
 
     // ── Spawn doom ──────────────────────────────────────────────────
