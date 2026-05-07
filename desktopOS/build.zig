@@ -278,6 +278,236 @@ pub fn build(b: *std.Build) void {
     fs_smoke_run.addArg(libc_a);
     const fs_smoke_elf = fs_smoke_run.addPrefixedOutputFileArg("-femit-bin=", "fs_smoke.elf");
 
+    // ── lib_bundle.bin — packed lib/std + lib/compiler_rt + extras
+    //    that provisioner.elf walks at boot to pre-populate the SQL FS
+    //    with everything the in-Zag zig compiler needs to read.
+    const bundle_tool_exe = b.addExecutable(.{
+        .name = "make_lib_bundle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/make_lib_bundle.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // hello.zig — tiny source the provisioner stages at /hello.zig
+    // for the in-Zag compiler to read.
+    const hello_src_wf = b.addWriteFiles();
+    // Truly freestanding hello: no `pub fn main`, so start.zig isn't
+    // pulled in, so std isn't pulled in, so mem.zig (the compile blocker)
+    // is never parsed. The CALL self-loop produces a valid ELF whose
+    // entry point hangs at `wfi`-style spin — enough to prove the
+    // compile path end-to-end; spawn-then-execute is a separate item.
+    // hello.zig: a small but non-trivial Zag program. The compiler
+    // produces this binary, root_service spawns it (via the in-zig.elf
+    // post-build path), and it: (1) walks its inbound cap table to find
+    // the COM1 device_region we passed it, (2) creates a VMAR + mapMmio
+    // to map COM1's port_io range into its address space, (3) writes a
+    // greeting plus a counted decimal one byte at a time to COM1, (4)
+    // exits via SYS_DELETE on SLOT_SELF. ~120 lines, no libz link, just
+    // inline asm syscalls (Spec §[syscall_abi] x86-64 vreg layout) and
+    // cap-table walking (mirrors libz/caps.zig bit fields).
+    const hello_zig_path = hello_src_wf.add("hello.zig",
+        \\const Cap = extern struct { word0: u64, field0: u64, field1: u64 };
+        \\const SLOT_SELF: u12 = 0;
+        \\const SLOT_FIRST_PASSED: u32 = 3;
+        \\const HANDLE_TABLE_MAX: u32 = 4096;
+        \\const SYS_DELETE: u12 = 16;
+        \\const SYS_CREATE_VMAR: u12 = 32;
+        \\const SYS_MAP_MMIO: u12 = 34;
+        \\const COM1_BASE_PORT: u16 = 0x3F8;
+        \\const COM1_PORT_COUNT: u16 = 8;
+        \\
+        \\const Regs = struct {
+        \\    v1: u64 = 0, v2: u64 = 0, v3: u64 = 0, v4: u64 = 0,
+        \\    v5: u64 = 0, v6: u64 = 0, v7: u64 = 0, v8: u64 = 0,
+        \\    v9: u64 = 0, v10: u64 = 0, v11: u64 = 0, v12: u64 = 0,
+        \\    v13: u64 = 0,
+        \\};
+        \\
+        \\fn buildWord(num: u12, extra: u64) u64 {
+        \\    return (@as(u64, num) & 0xFFF) | (extra & ~@as(u64, 0xFFF));
+        \\}
+        \\
+        \\fn issueRaw(word: u64, in: Regs) Regs {
+        \\    var ov1: u64 = undefined;
+        \\    var ov2: u64 = undefined;
+        \\    var ov3: u64 = undefined;
+        \\    var ov5: u64 = undefined;
+        \\    var ov6: u64 = undefined;
+        \\    var ov7: u64 = undefined;
+        \\    var ov8: u64 = undefined;
+        \\    var ov9: u64 = undefined;
+        \\    var ov10: u64 = undefined;
+        \\    var ov11: u64 = undefined;
+        \\    var ov12: u64 = undefined;
+        \\    var ov13: u64 = undefined;
+        \\    var rbp_save: u64 = undefined;
+        \\    const iv4_mem: u64 = in.v4;
+        \\    var ov4_mem: u64 = undefined;
+        \\    asm volatile (
+        \\        \\ movq %%rbp, %[rbp_save]
+        \\        \\ movq %[iv4_mem], %%rbp
+        \\        \\ subq $16, %%rsp
+        \\        \\ movq %%rcx, (%%rsp)
+        \\        \\ syscall
+        \\        \\ addq $16, %%rsp
+        \\        \\ movq %%rbp, %[ov4_mem]
+        \\        \\ movq %[rbp_save], %%rbp
+        \\        : [v1] "={rax}" (ov1),
+        \\          [v2] "={rbx}" (ov2),
+        \\          [v3] "={rdx}" (ov3),
+        \\          [v5] "={rsi}" (ov5),
+        \\          [v6] "={rdi}" (ov6),
+        \\          [v7] "={r8}" (ov7),
+        \\          [v8] "={r9}" (ov8),
+        \\          [v9] "={r10}" (ov9),
+        \\          [v10] "={r12}" (ov10),
+        \\          [v11] "={r13}" (ov11),
+        \\          [v12] "={r14}" (ov12),
+        \\          [v13] "={r15}" (ov13),
+        \\          [rbp_save] "+m" (rbp_save),
+        \\          [ov4_mem] "=m" (ov4_mem),
+        \\        : [word] "{rcx}" (word),
+        \\          [iv1] "{rax}" (in.v1),
+        \\          [iv2] "{rbx}" (in.v2),
+        \\          [iv3] "{rdx}" (in.v3),
+        \\          [iv4_mem] "m" (iv4_mem),
+        \\          [iv5] "{rsi}" (in.v5),
+        \\          [iv6] "{rdi}" (in.v6),
+        \\          [iv7] "{r8}" (in.v7),
+        \\          [iv8] "{r9}" (in.v8),
+        \\          [iv9] "{r10}" (in.v9),
+        \\          [iv10] "{r12}" (in.v10),
+        \\          [iv11] "{r13}" (in.v11),
+        \\          [iv12] "{r14}" (in.v12),
+        \\          [iv13] "{r15}" (in.v13),
+        \\        : .{ .rcx = true, .r11 = true, .memory = true });
+        \\    return .{
+        \\        .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4_mem,
+        \\        .v5 = ov5, .v6 = ov6, .v7 = ov7, .v8 = ov8,
+        \\        .v9 = ov9, .v10 = ov10, .v11 = ov11, .v12 = ov12,
+        \\        .v13 = ov13,
+        \\    };
+        \\}
+        \\
+        \\fn capHandleType(c: Cap) u4 {
+        \\    return @truncate((c.word0 >> 12) & 0xF);
+        \\}
+        \\fn capDevType(c: Cap) u4 {
+        \\    return @truncate(c.field0 & 0xF);
+        \\}
+        \\fn capDevPort(c: Cap) u16 {
+        \\    return @truncate((c.field0 >> 4) & 0xFFFF);
+        \\}
+        \\fn capDevPortCount(c: Cap) u16 {
+        \\    return @truncate((c.field0 >> 20) & 0xFFFF);
+        \\}
+        \\
+        \\fn findCom1(cap_table_base: u64) ?u12 {
+        \\    var slot: u32 = SLOT_FIRST_PASSED;
+        \\    while (slot < HANDLE_TABLE_MAX) : (slot += 1) {
+        \\        const tbl: [*]const Cap = @ptrFromInt(cap_table_base);
+        \\        const c = tbl[slot];
+        \\        if (capHandleType(c) != 5) continue; // device_region
+        \\        if (capDevType(c) != 1) continue; // port_io
+        \\        if (capDevPort(c) != COM1_BASE_PORT) continue;
+        \\        if (capDevPortCount(c) != COM1_PORT_COUNT) continue;
+        \\        return @truncate(slot);
+        \\    }
+        \\    return null;
+        \\}
+        \\
+        \\fn mapCom1(com1: u12) ?[*]volatile u8 {
+        \\    // VmarCap bits: 0=move, 1=copy, 2=r, 3=w, 4=x, 5=mmio.
+        \\    const vmar_caps: u64 = (1 << 2) | (1 << 3) | (1 << 5);
+        \\    // Vmar props: bit 5 = mmio-backed, bits 0..1 = mode (anonymous=0).
+        \\    const props: u64 = (1 << 5);
+        \\    const cv = issueRaw(buildWord(SYS_CREATE_VMAR, 0), .{
+        \\        .v1 = vmar_caps, .v2 = props, .v3 = 1,
+        \\    });
+        \\    if (cv.v1 < 16) return null;
+        \\    const vh: u12 = @truncate(cv.v1 & 0xFFF);
+        \\    const mm = issueRaw(buildWord(SYS_MAP_MMIO, 0), .{ .v1 = vh, .v2 = com1 });
+        \\    if (mm.v1 != 0) return null;
+        \\    return @ptrFromInt(cv.v2);
+        \\}
+        \\
+        \\fn writeBytes(p: [*]volatile u8, s: []const u8) void {
+        \\    var i: usize = 0;
+        \\    while (i < s.len) : (i += 1) p[0] = s[i];
+        \\}
+        \\
+        \\fn writeUsize(p: [*]volatile u8, n: usize) void {
+        \\    var buf: [20]u8 = undefined;
+        \\    var x = n;
+        \\    var i: usize = buf.len;
+        \\    if (x == 0) {
+        \\        i -= 1; buf[i] = '0';
+        \\    } else while (x > 0) {
+        \\        i -= 1;
+        \\        buf[i] = @intCast('0' + (x % 10));
+        \\        x /= 10;
+        \\    }
+        \\    writeBytes(p, buf[i..]);
+        \\}
+        \\
+        \\fn exit() noreturn {
+        \\    _ = issueRaw(buildWord(SYS_DELETE, 0), .{ .v1 = SLOT_SELF });
+        \\    while (true) asm volatile ("hlt");
+        \\}
+        \\
+        \\export fn _start(cap_table_base: u64) callconv(.c) noreturn {
+        \\    const com1 = findCom1(cap_table_base) orelse exit();
+        \\    const sink = mapCom1(com1) orelse exit();
+        \\
+        \\    writeBytes(sink, "[hello] greetings from /hello.elf\n");
+        \\    writeBytes(sink, "[hello] this binary was compiled INSIDE Zag userspace by\n");
+        \\    writeBytes(sink, "[hello] zig.elf reading /hello.zig from the in-memory bundle,\n");
+        \\    writeBytes(sink, "[hello] writing /hello.elf to the SQLite-backed fs, and then\n");
+        \\    writeBytes(sink, "[hello] spawning it via SYS_CREATE_CAPABILITY_DOMAIN.\n");
+        \\
+        \\    // Tiny computation: sum 1..100 to prove the integer-literal /
+        \\    // arithmetic codegen path actually executes.
+        \\    var sum: usize = 0;
+        \\    var k: usize = 1;
+        \\    while (k <= 100) : (k += 1) sum += k;
+        \\    writeBytes(sink, "[hello] sum(1..100) = ");
+        \\    writeUsize(sink, sum);
+        \\    writeBytes(sink, " (expected 5050)\n");
+        \\
+        \\    writeBytes(sink, "[hello] exiting cleanly.\n");
+        \\    exit();
+        \\}
+        \\
+    );
+
+    const bundle_run = b.addRunArtifact(bundle_tool_exe);
+    bundle_run.addArg(zag_zig_lib);
+    const bundle_bin = bundle_run.addOutputFileArg("lib_bundle.bin");
+    bundle_run.addFileArg(hello_zig_path);
+    bundle_run.addFileArg(runtime_obj);
+    bundle_run.addArg(libc_a);
+
+    // ── provisioner.elf — Zag-target ELF that maps the bundle pf and
+    //    walks it via libc fopen/mkdir/fwrite/fclose. Same build pattern
+    //    as fs_smoke (build-obj then build-exe linking libc.a + runtime.o).
+    const provisioner_obj_run = b.addSystemCommand(&.{ zag_zig, "build-obj" });
+    provisioner_obj_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    provisioner_obj_run.addArgs(&zag_args);
+    provisioner_obj_run.addArgs(&.{ "--name", "provisioner" });
+    provisioner_obj_run.addFileArg(b.path("libc_smoke/provisioner.zig"));
+    const provisioner_obj = provisioner_obj_run.addPrefixedOutputFileArg("-femit-bin=", "provisioner.o");
+
+    const provisioner_run = b.addSystemCommand(&.{ zag_zig, "build-exe" });
+    provisioner_run.addArgs(&.{ "--zig-lib-dir", zag_zig_lib });
+    provisioner_run.addArgs(&zag_args);
+    provisioner_run.addArgs(&.{ "--name", "provisioner" });
+    provisioner_run.addFileArg(provisioner_obj);
+    provisioner_run.addFileArg(runtime_obj);
+    provisioner_run.addArg(libc_a);
+    const provisioner_elf = provisioner_run.addPrefixedOutputFileArg("-femit-bin=", "provisioner.elf");
+
     // ── usb_driver.elf ──────────────────────────────────────────────
     const usb_app_mod = b.createModule(.{
         .root_source_file = b.path("usb_driver/main.zig"),
@@ -626,6 +856,8 @@ pub fn build(b: *std.Build) void {
     // system has a stable path. Embedding it makes desktopOS.elf large
     // but the kernel/bootloader can handle it.
     _ = services_wf.addCopyFile(b.path("zig_compiler/zig.elf"), "zig_compiler.elf");
+    _ = services_wf.addCopyFile(provisioner_elf, "provisioner.elf");
+    _ = services_wf.addCopyFile(bundle_bin, "lib_bundle.bin");
     const services_src = services_wf.add(
         "embedded_services.zig",
         \\pub const nvme_driver_elf = @embedFile("nvme_driver.elf");
@@ -640,6 +872,8 @@ pub fn build(b: *std.Build) void {
         \\pub const zig_hello_std_elf = @embedFile("zig_hello_std.elf");
         \\pub const fs_smoke_elf = @embedFile("fs_smoke.elf");
         \\pub const zig_compiler_elf = @embedFile("zig_compiler.elf");
+        \\pub const provisioner_elf = @embedFile("provisioner.elf");
+        \\pub const lib_bundle = @embedFile("lib_bundle.bin");
         \\
     );
     const services_mod = b.createModule(.{

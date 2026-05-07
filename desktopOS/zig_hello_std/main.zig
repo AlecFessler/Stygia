@@ -199,16 +199,45 @@ export fn zag_exit(status: u8) callconv(.c) noreturn {
 // by this Phase-4b smoke test but the linker may want them present.
 const Stat = std.os.zag.Stat;
 export fn zag_fs_openat(
+    dir_fd: i32,
     path_ptr: [*]const u8,
     path_len: usize,
     flags: u32,
     mode: u32,
 ) callconv(.c) i64 {
-    _ = .{ path_ptr, path_len, flags, mode };
+    _ = .{ dir_fd, path_ptr, path_len, flags, mode };
     return -1;
 }
 export fn zag_fs_read(fd: i32, buf_ptr: [*]u8, buf_len: usize, offset: i64) callconv(.c) i64 {
     _ = .{ fd, buf_ptr, buf_len, offset };
+    return -1;
+}
+export fn zag_fs_write(fd: i32, buf_ptr: [*]const u8, buf_len: usize, offset: i64) callconv(.c) i64 {
+    _ = .{ fd, buf_ptr, buf_len, offset };
+    return -1;
+}
+export fn zag_fs_lseek(fd: i32, offset: i64, whence: c_int) callconv(.c) i64 {
+    _ = .{ fd, offset, whence };
+    return -1;
+}
+export fn zag_fs_mkdirat(dir_fd: i32, path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) i32 {
+    _ = .{ dir_fd, path_ptr, path_len, mode };
+    return -1;
+}
+export fn zag_fs_unlinkat(dir_fd: i32, path_ptr: [*]const u8, path_len: usize) callconv(.c) i32 {
+    _ = .{ dir_fd, path_ptr, path_len };
+    return -1;
+}
+export fn zag_fs_statat(dir_fd: i32, path_ptr: [*]const u8, path_len: usize, stat_out: *Stat) callconv(.c) i32 {
+    _ = .{ dir_fd, path_ptr, path_len, stat_out };
+    return -1;
+}
+export fn zag_fs_truncate(path_ptr: [*]const u8, path_len: usize, size: i64) callconv(.c) i32 {
+    _ = .{ path_ptr, path_len, size };
+    return -1;
+}
+export fn zag_fs_ftruncate(fd: i32, size: i64) callconv(.c) i32 {
+    _ = .{ fd, size };
     return -1;
 }
 export fn zag_fs_close(fd: i32) callconv(.c) i32 {
