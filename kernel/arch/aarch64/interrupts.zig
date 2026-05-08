@@ -244,3 +244,57 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.x12 = gprs[12];
 }
 
+/// Write syscall-return vreg `idx` per Spec §[syscall_abi] aarch64
+/// mapping (`docs/kernel/specv3.md` §[syscall_abi], table "vreg mapping
+/// (aarch64)"):
+///   vreg 1..31  → x0..x30 (`vreg N → x(N-1)`)
+///   vreg 32..127 → `[ctx.sp_el0 + (idx - 31) * 8]` on the user stack
+///
+/// Caller MUST already be in the target EC's address space (TTBR0_EL1)
+/// when `idx >= 32`; PAN is cleared internally for the user-page write.
+/// See `arch.dispatch.syscall.setSyscallVreg` for the cross-arch
+/// contract.
+pub fn setSyscallVreg(ctx: *ArchCpuContext, idx: u8, value: u64) void {
+    switch (idx) {
+        0 => @panic("setSyscallVreg: vreg 0 is the syscall word — use writeUserSyscallWord"),
+        1 => ctx.regs.x0 = value,
+        2 => ctx.regs.x1 = value,
+        3 => ctx.regs.x2 = value,
+        4 => ctx.regs.x3 = value,
+        5 => ctx.regs.x4 = value,
+        6 => ctx.regs.x5 = value,
+        7 => ctx.regs.x6 = value,
+        8 => ctx.regs.x7 = value,
+        9 => ctx.regs.x8 = value,
+        10 => ctx.regs.x9 = value,
+        11 => ctx.regs.x10 = value,
+        12 => ctx.regs.x11 = value,
+        13 => ctx.regs.x12 = value,
+        14 => ctx.regs.x13 = value,
+        15 => ctx.regs.x14 = value,
+        16 => ctx.regs.x15 = value,
+        17 => ctx.regs.x16 = value,
+        18 => ctx.regs.x17 = value,
+        19 => ctx.regs.x18 = value,
+        20 => ctx.regs.x19 = value,
+        21 => ctx.regs.x20 = value,
+        22 => ctx.regs.x21 = value,
+        23 => ctx.regs.x22 = value,
+        24 => ctx.regs.x23 = value,
+        25 => ctx.regs.x24 = value,
+        26 => ctx.regs.x25 = value,
+        27 => ctx.regs.x26 = value,
+        28 => ctx.regs.x27 = value,
+        29 => ctx.regs.x28 = value,
+        30 => ctx.regs.x29 = value,
+        31 => ctx.regs.x30 = value,
+        32...127 => {
+            const off: u64 = @as(u64, idx - 31) * 8;
+            cpu.panDisable();
+            @as(*u64, @ptrFromInt(ctx.sp_el0 + off)).* = value;
+            cpu.panEnable();
+        },
+        else => @panic("setSyscallVreg: vreg index out of range (0..127)"),
+    }
+}
+

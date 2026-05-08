@@ -55,6 +55,41 @@ pub fn setSyscallVreg4(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
+/// Write a syscall-return vreg by index per Spec §[syscall_abi]
+/// (`docs/kernel/specv3.md` §[syscall_abi]). Indices 1..N route to the
+/// architecture's GPR-backed register; indices above N spill to the
+/// caller's user stack at `[user_sp + (idx - N) * 8]`.
+///
+///   x86-64: vregs 1..13 are GPRs (rax, rbx, rdx, rbp, rsi, rdi, r8,
+///           r9, r10, r12, r13, r14, r15); vregs 14..127 land at
+///           `[ctx.rsp + (idx - 13) * 8]`.
+///   aarch64: vregs 1..31 are x0..x30; vregs 32..127 land at
+///            `[ctx.sp_el0 + (idx - 31) * 8]`.
+///
+/// Used by syscalls that surface a packed array of return values
+/// (e.g. `random`, `idc_read`/`idc_write`, `info_cores`,
+/// `acquire_ecs`/`acquire_vmars`, `create_ecs`, `create_vmars`)
+/// where the count exceeds the small fixed set covered by the
+/// `setSyscallVreg{2,3,4}` helpers.
+///
+/// Caller contract for the stack-spill range:
+///   - The caller's address space (CR3 on x86-64 / TTBR0_EL1 on
+///     aarch64) MUST already be active so the user stack pages are
+///     mapped — same contract as `writeUserSyscallWord`. The kernel's
+///     own kernel stack is not touched; the write goes to user memory.
+///   - SMAP / PAN gating is applied internally via
+///     `arch.dispatch.cpu.userAccessBegin`/`End`.
+///   - Vreg 0 is the syscall word at `[user_sp + 0]` and is written
+///     by `writeUserSyscallWord`; this helper accepts only `idx >= 1`
+///     (vreg 0 panics) and rejects `idx >= 128` (out of vreg range).
+pub fn setSyscallVreg(ctx: *ArchCpuContext, idx: u8, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setSyscallVreg(ctx, idx, value),
+        .aarch64 => aarch64.interrupts.setSyscallVreg(ctx, idx, value),
+        else => unreachable,
+    }
+}
+
 /// Write event-state vreg 2 — the per-event-type sub-code (Spec
 /// §[event_state]). x86-64: rbx; aarch64: x1.
 pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {

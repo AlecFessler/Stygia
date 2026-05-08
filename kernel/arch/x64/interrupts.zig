@@ -3144,6 +3144,44 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.r15 = gprs[12];
 }
 
+/// Write syscall-return vreg `idx` per Spec §[syscall_abi] x86-64
+/// mapping (`docs/kernel/specv3.md` §[syscall_abi], table "vreg mapping
+/// (x86-64)"):
+///   vreg 1  → rax   vreg 2  → rbx   vreg 3  → rdx   vreg 4  → rbp
+///   vreg 5  → rsi   vreg 6  → rdi   vreg 7  → r8    vreg 8  → r9
+///   vreg 9  → r10   vreg 10 → r12   vreg 11 → r13   vreg 12 → r14
+///   vreg 13 → r15
+///   vreg 14..127 → `[ctx.rsp + (idx - 13) * 8]` on the user stack
+///
+/// Caller MUST already be in the target EC's address space (CR3) when
+/// `idx >= 14`; STAC/CLAC bracket the user-page write under SMAP. See
+/// `arch.dispatch.syscall.setSyscallVreg` for the cross-arch contract.
+pub fn setSyscallVreg(ctx: *ArchCpuContext, idx: u8, value: u64) void {
+    switch (idx) {
+        0 => @panic("setSyscallVreg: vreg 0 is the syscall word — use writeUserSyscallWord"),
+        1 => ctx.regs.rax = value,
+        2 => ctx.regs.rbx = value,
+        3 => ctx.regs.rdx = value,
+        4 => ctx.regs.rbp = value,
+        5 => ctx.regs.rsi = value,
+        6 => ctx.regs.rdi = value,
+        7 => ctx.regs.r8 = value,
+        8 => ctx.regs.r9 = value,
+        9 => ctx.regs.r10 = value,
+        10 => ctx.regs.r12 = value,
+        11 => ctx.regs.r13 = value,
+        12 => ctx.regs.r14 = value,
+        13 => ctx.regs.r15 = value,
+        14...127 => {
+            const off: u64 = @as(u64, idx - 13) * 8;
+            cpu.stac();
+            @as(*u64, @ptrFromInt(ctx.rsp + off)).* = value;
+            cpu.clac();
+        },
+        else => @panic("setSyscallVreg: vreg index out of range (0..127)"),
+    }
+}
+
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
     kprof.enter(.irq);
     defer kprof.exit(.irq);
