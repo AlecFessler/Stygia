@@ -9,6 +9,20 @@ const MemoryPerms = zag.memory.address.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VmarPageSize = zag.memory.vmar.PageSize;
 
+/// True when an IOMMU is present and providing DMA remapping for this
+/// kernel build. On x86-64 this is VT-d or AMD-Vi having latched a
+/// backend at boot. On aarch64 there is no SMMU driver yet (the
+/// aarch64 backend runs in identity-passthrough), so this reports
+/// false even when the platform exposes an SMMU. Surfaces through
+/// `info_system` features bit 1 (spec §[system_info]).
+pub fn iommuPresent() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.isAvailable(),
+        .aarch64 => false,
+        else => unreachable,
+    };
+}
+
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).
 pub fn iommuMapPage(

@@ -40,6 +40,18 @@ pub fn vmPerCoreInit() void {
     }
 }
 
+/// True when hardware virtualization is reachable from this kernel
+/// build: VMX or SVM on x86-64 (CPU advertises and per-core VMXON/EFER
+/// SVME succeeded), or EL2 + installed hyp-stub on aarch64. Surfaces
+/// through `info_system` features bit 0 (spec §[system_info]).
+pub fn vmSupported() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmSupported(),
+        .aarch64 => aarch64.vm.vmSupported(),
+        else => unreachable,
+    };
+}
+
 /// BSP post-bootloader handoff. On aarch64, when UEFI's firmware drops
 /// us at EL2 (only observable by the bootloader, which signals via
 /// `boot_info.arrived_at_el2`), arm the hyp-stub gate and install the

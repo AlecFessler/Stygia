@@ -442,6 +442,26 @@ pub fn initZeroPageFeatures() void {
 
 // --- Per-core hardware state (freq / temp / C-state) -------------------
 
+/// True when the current CPU implements the architecture's wide vector
+/// ISA: AVX-512F on x86-64 (CPUID.(EAX=7,ECX=0):EBX bit 16, Intel SDM
+/// Vol 2A "CPUID — Structured Extended Feature Flags"), or SVE on
+/// aarch64 (`ID_AA64PFR0_EL1.SVE != 0`, ARM ARM K.a §D23.2.79).
+/// Surfaces through `info_system` features bit 3 (spec §[system_info]).
+pub fn wideVectorPresent() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => (x64.cpu.cpuidRaw(0x7, 0).ebx & (1 << 16)) != 0,
+        .aarch64 => blk: {
+            var pfr0: u64 = undefined;
+            asm volatile ("mrs %[v], id_aa64pfr0_el1"
+                : [v] "=r" (pfr0),
+            );
+            const sve_field: u4 = @truncate((pfr0 >> 32) & 0xF);
+            break :blk sve_field != 0;
+        },
+        else => unreachable,
+    };
+}
+
 /// One-time bring-up on the bootstrap core. Called from `kMain` after
 /// pmuInit and before `sched.globalInit`.
 pub fn sysInfoInit() void {

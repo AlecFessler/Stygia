@@ -2,9 +2,12 @@ const zag = @import("zag");
 
 const cpu = zag.arch.dispatch.cpu;
 const errors = zag.syscall.errors;
+const iommu = zag.arch.dispatch.iommu;
+const pmu = zag.arch.dispatch.pmu;
 const smp = zag.arch.dispatch.smp;
 const sync = zag.utils.sync;
 const time = zag.arch.dispatch.time;
+const vm = zag.arch.dispatch.vm;
 
 const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
@@ -181,7 +184,7 @@ pub fn infoSystem(caller: *anyopaque) i64 {
     // value the kernel currently exposes; missing detail surfaces as
     // a 0 bit, never a panic.
     const cores: u64 = smp.coreCount();
-    const features: u64 = 0; // TODO: vmx/iommu/pmu/wide-vector probes
+    const features: u64 = featureBits();
     const total_phys_pages: u64 = totalPhysPages();
     const page_size_mask: u64 = 0b1; // 4 KiB always supported (spec test 03)
 
@@ -200,6 +203,21 @@ fn totalPhysPages() u64 {
     const n = zag.memory.pmm.totalPageCount();
     if (n != 0) return n;
     return 1;
+}
+
+/// Build the `info_system` features bitmask from the per-arch dispatch
+/// predicates. Spec §[system_info]:
+///   bit 0 — hardware virtualization (`vm.vmSupported`)
+///   bit 1 — IOMMU present (`iommu.iommuPresent`)
+///   bit 2 — PMU present (`pmu.pmuGetInfo().num_counters != 0`)
+///   bit 3 — wide-vector ISA (`cpu.wideVectorPresent`)
+fn featureBits() u64 {
+    var features: u64 = 0;
+    if (vm.vmSupported()) features |= 1 << 0;
+    if (iommu.iommuPresent()) features |= 1 << 1;
+    if (pmu.pmuGetInfo().num_counters != 0) features |= 1 << 2;
+    if (cpu.wideVectorPresent()) features |= 1 << 3;
+    return features;
 }
 
 /// Returns information about a specific core.

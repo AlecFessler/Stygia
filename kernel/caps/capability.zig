@@ -604,16 +604,29 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             // VMAR field1: page_count[0..31], sz[32..33], cch[34..35],
             // cur_rwx[36..38], map[39..40], device[41..52]. cur_rwx,
             // map, and device are the kernel-mutable subset. The device
-            // sub-field is the device's handle id in the holding
-            // domain; resolution is done via a reverse lookup that
-            // depends on the per-VMAR DeviceRegion → CapabilityDomain
-            // back-reference (not yet plumbed through). Until then the
-            // device sub-field stays 0.
+            // sub-field is the device's handle id in `holder`; resolve
+            // it via a linear scan of the user table for the slot that
+            // points at `v.device`. Mirrors the per-syscall fast path
+            // in `kernel/memory/vmar.zig refreshVmarSnapshot`.
+            var dev_id: u12 = 0;
+            if (v.device) |dr_ref| {
+                const dr_ptr: *const anyopaque = @ptrCast(dr_ref.ptr);
+                var i: u16 = 0;
+                while (i < holder.user_table.len) : (i += 1) {
+                    const cap = holder.user_table[i];
+                    if (Word0.typeTag(cap.word0) != .device_region) continue;
+                    if (holder.kernel_table[i].ref.ptr == dr_ptr) {
+                        dev_id = @intCast(i);
+                        break;
+                    }
+                }
+            }
             const new_field1 = (@as(u64, v.page_count)) |
                 (@as(u64, @intFromEnum(v.sz)) << 32) |
                 (@as(u64, @intFromEnum(v.cch)) << 34) |
                 (@as(u64, v.cur_rwx) << 36) |
-                (@as(u64, @intFromEnum(v.map)) << 39);
+                (@as(u64, @intFromEnum(v.map)) << 39) |
+                (@as(u64, dev_id) << 41);
             user_entry.field1 = new_field1;
         },
         .device_region => {
