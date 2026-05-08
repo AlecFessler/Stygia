@@ -245,9 +245,13 @@ pub const TimerHeap = struct {
         // duration of residency (see `HeapEntry.timer` doc comment).
         top.timer.ptr.wheel_idx = WHEEL_NOT_QUEUED;
         top.timer.ptr.wheel_core = WHEEL_NO_CORE; // caller-pinned
-        // Atomic so a concurrent `timerRearm` that races the
+        // caller-pinned: lock-free monotonic bump on the wheel-pinned
+        // Timer. Atomic so a concurrent `timerRearm` racing the
         // pop-vs-fire window observes the post-increment value when it
-        // bumps `pop_gen` again under `_gen_lock`.
+        // bumps `pop_gen` again under `_gen_lock`. Bracketing this RMW
+        // inside `top.timer.lock()/unlock()` would force ordering we
+        // don't need: `pop_gen` is monotonic and the only validation
+        // happens later, under `t._gen_lock`, in `onFire`.
         _ = @atomicRmw(u64, &top.timer.ptr.pop_gen, .Add, 1, .acq_rel);
 
         const last_idx = self.len - 1;
@@ -668,7 +672,13 @@ pub fn wheelExpireDue() void {
             // takes `t._gen_lock` for the fire-side mutation. Snapshot
             // `pop_gen` under the wheel lock — `popMin` just bumped it,
             // so this value is the unique tag for *this* fire intent.
-            fire_target = popped.timer.ptr;
+            fire_target = popped.timer.ptr; // caller-pinned (see block above)
+            // caller-pinned: lock-free read of the just-bumped `pop_gen`
+            // tag. The popped Timer is wheel-pinned by the slab refcount
+            // (handles outlive wheel residency); the analyzer-required
+            // `<ref>.lock()/unlock()` bracket would force ordering with
+            // no purpose — `pop_gen` is monotonic and the validating
+            // re-read happens later under `t._gen_lock` in `onFire`.
             fire_pop_gen = @atomicLoad(u64, &popped.timer.ptr.pop_gen, .acquire);
         }
         onFire(fire_target.?, fire_pop_gen);

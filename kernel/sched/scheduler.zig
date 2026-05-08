@@ -154,7 +154,18 @@ pub const PerCore = struct {
     /// before sti+hlt, so that edge has nothing to read prev_ref from
     /// and the EC stays `on_cpu=true` forever (`takeOwnPendingZombie`
     /// keeps skipping it; the slab slot leaks).
-    post_park_clear_on_cpu: ?*ExecutionContext = null,
+    ///
+    /// Stored as `SlabRef(ExecutionContext)` (rather than bare pointer)
+    /// to satisfy the gen-lock-analyzer fat-pointer invariant. The
+    /// post-wake reader takes `lock` → bumps `pop_gen`-style validation
+    /// is not needed here: this slot is single-producer (the parking
+    /// core writes it pre-park) / single-consumer (the same core reads
+    /// it post-wake) and is consumed in the same task-context window
+    /// during which the EC's slot cannot have been freed-and-realloced
+    /// (`finalizeDestroyMarkedDead` skips ECs with `on_cpu=true`, which
+    /// is exactly what this clear releases). The carried gen is a
+    /// parity-correct placeholder for SlabRef constructor compatibility.
+    post_park_clear_on_cpu: ?SlabRef(ExecutionContext) = null,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -568,13 +579,13 @@ fn parkAndAwaitIRQ() noreturn {
     // that edge has nothing to clear from. The post-wake drain is what
     // actually catches the zombie now that its kstack is no longer in
     // use on this core.
-    const prev_ec_to_clear: ?*ExecutionContext = blk: {
+    const prev_ec_to_clear: ?SlabRef(ExecutionContext) = blk: {
         if ((&core_states[core]).current_ec) |prev_ref| {
             // Match scheduler.switchTo's discipline: only clear when this
             // core was the EC's last_dispatched_core. The slot can carry
             // a stale ref to an EC that migrated; the other core owns
             // its on_cpu lifecycle in that case.
-            if (prev_ref.ptr.last_dispatched_core == core) break :blk prev_ref.ptr;
+            if (prev_ref.ptr.last_dispatched_core == core) break :blk prev_ref;
         }
         break :blk null;
     };
@@ -603,8 +614,13 @@ export fn scheduler_run_after_park() callconv(.c) noreturn {
     // the prev kstack. Clearing on_cpu unblocks `takeOwnPendingZombie`
     // for any zombie that pinned this slot during the park.
     const state_ptr = &core_states[core];
-    if (state_ptr.post_park_clear_on_cpu) |prev| {
-        prev.on_cpu.store(false, .release);
+    if (state_ptr.post_park_clear_on_cpu) |prev_ref| {
+        // caller-pinned: single-producer/single-consumer slot written by
+        // this same core in `parkAndAwaitIRQ` immediately before sti+hlt.
+        // The EC slab slot cannot have been freed in the park window
+        // because `finalizeDestroyMarkedDead` skips ECs with on_cpu=true,
+        // and that flag is exactly what this clear is about to release.
+        prev_ref.ptr.on_cpu.store(false, .release);
         state_ptr.post_park_clear_on_cpu = null;
     }
     // Re-drain pending_zombie now that the prev EC's on_cpu is false.

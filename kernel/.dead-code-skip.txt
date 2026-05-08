@@ -69,8 +69,10 @@
 #   * sched/port.zig (firePmuOverflow)                 — pmu_overflow event
 #     route fire helper; aarch64/pmu.zig and the PMU-overflow ISR path call
 #     it once that bring-up lands.
-#   * syscall/errors.zig (E_AGAIN)                     — POSIX-shape error
-#     code reserved for future blocking syscalls.
+#   * syscall/errors.zig (E_AGAIN, E_REFUSED)          — spec-mandated
+#     error codes (E_AGAIN: POSIX-shape, future blocking syscalls;
+#     E_REFUSED: spec error code 13 reserved for capability-refused
+#     conditions, no kernel returner yet).
 #   * sched/priority_queue.zig (enqueueFront) — generic re-queue
 #     helper documented for IPC cap-transfer rollback (kept until that
 #     rollback path lands).
@@ -239,11 +241,11 @@ arch/aarch64/hv/regs.zig:379-379    sha256:520b53455740f7bf462f95fe2f616e420d530
 arch/aarch64/hv/regs.zig:383-383    sha256:c1ed923a6c348452995cd36e3b4658150a37a168a2c5a0010a1a897ed17be3d9
 arch/aarch64/hv/vcpu.zig:21-21    sha256:c731c11eb406849f0d8c8825966117dde3dc95e5820245bf96ed30217b34f972
 arch/aarch64/hv/vm.zig:68-68    sha256:c13d1e30c25cc1c23acc553da7d48a0defbc524ac972b5e33ff906c7f21f304a
-arch/aarch64/paging.zig:132-132    sha256:3b734deca039fd38b4871e0be57f1b771e7ba93a94e6f83c5f0b31233072526e
-arch/aarch64/paging.zig:154-154    sha256:23869abec2546da83311fb5d5d7aff06b824117ed7729ff6d2e1c6e18050088f
-arch/aarch64/paging.zig:160-160    sha256:63b0c1e373bd4f80ae9b0213f7b307d3300fb76ae4c04d6889e69e1081b4a77e
-arch/aarch64/paging.zig:162-162    sha256:d5ff8c3c789448e4d3b73e5fed9e3cad5c9aac2b0cd1188b99adcbbd0ddbd98a
-arch/aarch64/paging.zig:164-164    sha256:2c878349f1b3f80e6efce888776a107f6e1147f788b14ca74046d4670fae2d86
+arch/aarch64/paging.zig:132-132    sha256:a8daed364fd02d03dbbdd463e1175e16afa1c0a254739d97c8a90953e2ade77b
+arch/aarch64/paging.zig:154-154    sha256:ad2d476440c14a436ca488f64596882a75b57dcdadcca12f8926101048c8432a
+arch/aarch64/paging.zig:160-160    sha256:23869abec2546da83311fb5d5d7aff06b824117ed7729ff6d2e1c6e18050088f
+arch/aarch64/paging.zig:162-162    sha256:3b9ad045c7b6d8a95682bb5c6c68646868142a28f1502bc3b175f4ef9b2aeda9
+arch/aarch64/paging.zig:164-164    sha256:331829fde610cb91f19b5b01a45c77eca5cb190c95a38b772906369c4cde9b70
 arch/aarch64/power.zig:56-56    sha256:0d47a407a3db32a7a2f6f930482458a21162faeeae47d3bebd39bd9ceb4eea23
 arch/aarch64/power.zig:58-58    sha256:c7c41eb057b8676cee4b11cdd106b9c92249417ced2b570ccd0e6923ab2c2888
 arch/aarch64/power.zig:62-62    sha256:4a148a78e773a5412b4f0538d02d6f4470aa8a8827d7b15bdbfd73e6401d9d21
@@ -526,7 +528,7 @@ boot/protocol.zig:57-57    sha256:704f6312b332cf2d95fabe4f419334f9438ca77561dace
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
 sched/execution_context.zig:87-87    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
-syscall/errors.zig:32-32    sha256:2745d7e8f7ad434662cee5fca8244d0741daef88c2b2ebde686283526773f967
+syscall/errors.zig:32-32    sha256:36ce65a4f62c0caeda3db2c60a9f6e4817b110816a0e11c86fdf2e7ac3bbd758
 sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
 
 # ── Recovery merge (c94aea42) additions ──────────────────────────────────
@@ -589,11 +591,11 @@ arch/aarch64/hyp.zig:171-171    sha256:9bca0ec231de07d5eb6c433ba69cb3a1ce8922eef
 arch/aarch64/hyp.zig:273-273    sha256:277ed268940699b93384cb5c52354fe1e13fd7c486a81de2d387165515c435ec
 arch/aarch64/hyp.zig:274-274    sha256:53112e5e3b2b1f7d8485a4e5f07a1724d078bf478b7a75b3dc3699ba1a080f9f
 arch/aarch64/hyp.zig:275-275    sha256:de1a000a35d804ab1b33e4687b5583c8857ac16caf287c5a3666bd3c4cdcdf7b
-arch/aarch64/paging.zig:133-133    sha256:dc3d82b96888fbcd763f8be3fa05379c61668241b0c96b4df7145e51710d08bd
-arch/aarch64/paging.zig:155-155    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
-arch/aarch64/paging.zig:161-161    sha256:3f17e403c5eac89d87b0ad6312c31ec965abb3cc58c2d3323c84afaca86615ae
-arch/aarch64/paging.zig:163-163    sha256:64de2c918a497dc524f47621b377c73d2d885e1d7601114127e51ad8b014399d
-arch/aarch64/paging.zig:165-165    sha256:652b19ee3f7032217985854e70d688df338dfb727899fbc85289fa0280edeb97
+arch/aarch64/paging.zig:133-133    sha256:e5ee1db4f95121c236369c0d78fa616cd470a77af6b69646a162547591334db0
+arch/aarch64/paging.zig:155-155    sha256:4c4658b9b8bddb1becf02c3e057762979c1c35f87c9403eddffa1929f48542b0
+arch/aarch64/paging.zig:161-161    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
+arch/aarch64/paging.zig:163-163    sha256:dbfac774a981cf36b9df9ec8a36be26798fd71eaf3a20dc44aded2ca6bedefca
+arch/aarch64/paging.zig:165-165    sha256:763b05dac96e27237239d28d4eb2552042df4efeb489889e79780fb4dbdae24e
 arch/aarch64/stage2.zig:171-171    sha256:4f4d9b70d21ba8bbe9c365280b369907cc93eb6d2082524a896c985b60adab1f
 arch/aarch64/stage2.zig:175-175    sha256:0400880bea535dc86ac9e1d4409b36f86d7ca85973c643cf6390cb8337b7de3a
 arch/aarch64/stage2.zig:177-177    sha256:eaba7c84506b5bbd9ae80dd133deb37cc45d98f5c7f965970a4fb82c85e71cb6
@@ -683,10 +685,10 @@ libz/errors.zig:19-19    sha256:c39f1cc906475be7923d0b66d2978a89000bcda017763196
 libz/errors.zig:25-27    sha256:d9741cb38c019649fe81d737ef9ded037d045e69f3f2cec719bd22631b1663c4
 libz/syscall.zig:141-143    sha256:2ae069e135d9e72e10b1763ac38519f4d72ab3deb1ca16d8418839ead9cb9c5b
 libz/syscall_extern.zig:149-151    sha256:2ae069e135d9e72e10b1763ac38519f4d72ab3deb1ca16d8418839ead9cb9c5b
-libz/syscall_aarch64.zig:240-242    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
-libz/syscall_aarch64_extern.zig:382-384    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
-libz/syscall_x64.zig:249-251    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
-libz/syscall_x64_extern.zig:394-396    sha256:1939747203da0c0e2a832f9ab77974f636e224106c64e03484686ecdd2f0de7d
+libz/syscall_aarch64.zig:240-242    sha256:2e65b6f37f7836a0e090cc365f5e9cb506eec34e8137cbd12a72a76ebec0d0ef
+libz/syscall_aarch64_extern.zig:382-384    sha256:d443436b33c98ac7b4a2752fa7d2aae61b35d67fb641b58a59b671590d8af192
+libz/syscall_x64.zig:249-251    sha256:06eadbc67d3117638b2b5a0b8bd36a77cd84738401b37e24fc17b8a6f107f0c7
+libz/syscall_x64_extern.zig:394-396    sha256:8fc43426258d8e0dccfaa9890946df5f0c12a729374b39e6c5a8a02278f1c2f8
 libz/libc/src/libc.zig:24-24    sha256:fd0971f2123fcf99d37b9644f6029abeb5f0d34f66fd51e04a9875428b136bfb
 libz/libc/src/process.zig:156-156    sha256:b9dee8acb9420236152a13848534037d8291d9f903d4f3360f93b49988d7e2e0
 libz/libc/src/signal.zig:13-14    sha256:ff65becaaac9d0ab65dbfafc39c3b708c53699fa5feb79d6b9ea3ccb758fd60d
@@ -708,20 +710,20 @@ arch/aarch64/hv/vgic.zig:64-64    sha256:9331cef17b97876cabbcc55b2266185af481fc2
 arch/aarch64/hv/vgic.zig:66-66    sha256:0e7316b84ea4c8fd93b2bda47ff7ce981ea4f4ec9f636bb337c968bda3af1964
 arch/aarch64/hv/vgic.zig:86-86    sha256:dc9c0ea83d4e7988d2756de4500152c2ba8b16523d629aaf2bd7b62fab7d01de
 arch/aarch64/hv/vgic.zig:116-116    sha256:1f4c4cdc92abdc11f56ea1ed3417f821e091bfe5d4cd9288403a4965d303b991
-arch/aarch64/hv/vgic.zig:172-172    sha256:0e20b3bbe2028b6ed819f82ddbb964120a04d7c277ceb6d1467a9b1c12c7817c
+arch/aarch64/hv/vgic.zig:172-172    sha256:4893f40e3781eb896c82d046a08067a11e35cdf2f1dfaf26fea90b8db6676413
 arch/aarch64/vm_runloop.zig:68-68    sha256:51b9437cc28611bc8f3f397e4831477368042d5d19583cd14cd2590a45aa33b4
-arch/aarch64/vm_runloop.zig:337-337    sha256:a1903fbfe775e65ba24f4ec25e581572229400769d4501fecbae33dbd304b1f4
-arch/aarch64/vm_runloop.zig:349-349    sha256:ecef1f28bbddb8a4ab075372a91da468019da8d073bb77ae8391b4701c661a72
+arch/aarch64/vm_runloop.zig:337-337    sha256:57a5ffa3e095df05b6b3333871aba1c1b3e25ab3dbf1d492f154c2cc2b122f57
+arch/aarch64/vm_runloop.zig:349-349    sha256:1eac3819cb204c86a7d80f714ac54fe201deb807cea39674e49e43f29ebe7e09
 arch/x64/amd/svm.zig:133-133    sha256:213b00fb03a7fae04cbe34ab40dfd8217182293490d32b8438468c0cc79612b1
 arch/x64/amd/svm.zig:134-134    sha256:711dd8733ad9d012714d6cc9436389097b12438757690bdef5b1b0170fdc0528
 arch/x64/intel/pmu.zig:60-60    sha256:cb9e29acb1faa46e5f2c8c242d098c4bb57e89f3c230ab528fecf0ecb9a0d4ad
-arch/x64/paging.zig:193-193    sha256:fe83edbb5456c5c88c09b659c3b4f00687c91a060593a64b780cc9247692b6a3
-arch/x64/paging.zig:203-203    sha256:ce0cadce231d1d8073fb242adc468279fcdfbf54eed17ca959716e496b68e5c0
-arch/x64/paging.zig:207-207    sha256:ecc461fa34590f7e0f9b1e09b7c9d4f2230e14d24f2a44d7aae96a6549ce2e6d
+arch/x64/paging.zig:193-193    sha256:fc91793fdd16e16fd796fb663baa55df949318fec9d9699cca408e0fda9c5289
+arch/x64/paging.zig:203-203    sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+arch/x64/paging.zig:207-207    sha256:ee63e68a0c34e2ae771f4998068e775be14527b8bf3727283d78e79f1e7d1066
 arch/x64/vm.zig:199-199    sha256:76724d4459dfb677471389c98badc276cc06a5c42e7f866a66ae8377468c10c2
 arch/x64/vm.zig:205-205    sha256:8603838db7be95f29842a5dbef63af828b2f6a48925f329fe088debd92d7b882
 arch/x64/vm.zig:298-298    sha256:d9ed2e44dd9572bc36ff175bf5375ca0fd2b0912ac999f12ec26e76b1e7c247d
-arch/x64/vm_runloop.zig:335-335    sha256:c3e78392222ead648841450e2705106ce1c9079fb447198afc871a3411081225
+arch/x64/vm_runloop.zig:335-335    sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
 devices/device_region.zig:155-155    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
 libz/caps.zig:244-244    sha256:f85fd26e8d6ba4fc94091a496d493bbba90a48bda54e25164e14e2b1ec51137f
 libz/caps.zig:283-283    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
@@ -750,3 +752,4 @@ memory/vmar.zig:81-81    sha256:a288911c380720c587d59bb322fc8502fd9aa7fb0c98e767
 memory/vmar.zig:157-157    sha256:104afe2ff16d45b15efd44554aa8a38aa207e26b86f24093b7fc1f35eed819f2
 arch/x64/irq.zig:65-65    sha256:cb15abec79ad3b2cd846db5d225a1695efac93c3f1132eb6fe26a63e6633008c
 arch/x64/irq.zig:73-73    sha256:43842cd016338453efd1203cc84cb6691c420d1f3da18b9ae49ded4bdd3829d8
+syscall/errors.zig:26-26    sha256:ba2a3dac72e117a85289669cf4f73431090c145fead19595927b0981a30cf3e3
