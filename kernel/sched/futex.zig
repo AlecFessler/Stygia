@@ -75,7 +75,7 @@ var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext
 /// the tick interrupted. Combined with the recv-waiter snapshot
 /// (`port.expire_recv_scratch`, 4 KiB) and the rest of the scheduler
 /// chain, IRQ-context stack usage was clobbering adjacent frames'
-/// saved-RIP slots (cf. d1948fbd lockdep visited[] fix). One scratch
+/// saved-RIP slots. One scratch
 /// per core is safe: `schedTimerHandler` runs to completion in IRQ
 /// context with IRQs masked, never recurses, and each core has its
 /// own timer.

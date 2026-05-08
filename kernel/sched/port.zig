@@ -63,7 +63,7 @@ pub var timed_recv_lock: SpinLock = .{ .class = "port.timed_recv_lock" };
 /// the tick interrupted. That 4 KiB plus the 1 KiB futex-tick snapshot
 /// plus the rest of the scheduler chain pushed cumulative IRQ-context
 /// stack usage past the point where adjacent frames' saved-RIP slots
-/// were getting clobbered (cf. d1948fbd lockdep visited[] fix). One
+/// were getting clobbered. One
 /// scratch per core is safe because `schedTimerHandler` runs to
 /// completion in IRQ context with IRQs masked, never recurses, and
 /// each core has its own timer. Spec §[port] / kernel/arch/x64/irq.zig

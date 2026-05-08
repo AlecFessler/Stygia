@@ -940,8 +940,7 @@ pub fn endOfInterrupt(intid: u32) void {
 ///     / §2.2.34 by storming the IPC reply path.
 ///   * Same broadcast gated on `remote.rq.head != null` — same result.
 ///
-/// Further discovery (2026-04-15, §2.1.25 / §2.2.16 investigation):
-/// the Pi 5 KVM vGICv2 drop is broader than just CNTP/CNTV PPIs —
+/// Further discovery: the Pi 5 KVM vGICv2 drop is broader than just CNTP/CNTV PPIs —
 /// empirically, when a secondary vCPU is executing at EL0 (running a
 /// user thread), ALL interrupt injections to that vCPU are silently
 /// dropped, including SGIs from the BSP (the `broadcastSchedTick`

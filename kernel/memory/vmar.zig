@@ -1098,7 +1098,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
             // install never leaves dangling translations behind. After the
             // caller drops its handle the page_frame can be freed and its
             // physical pages handed back to PMM; a stale PTE here would be
-            // a UAF primitive. mapcnt was not yet bumped (incMapCntShim
+            // a UAF primitive. mapcnt was not yet bumped (the bump
             // runs only after the loop) and installed_pfs[slot_reserved]
             // was never committed, so this only undoes hardware state.
             var u: u32 = 0;
@@ -1135,7 +1135,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
         .offset = offset,
         .pf = SlabRef(PageFrame).init(pf, pf._gen_lock.currentGen()),
     };
-    incMapCntShim(pf);
+    _ = @atomicRmw(u32, &pf.mapcnt, .Add, 1, .seq_cst);
     return 0;
 }
 
@@ -1157,7 +1157,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
             if (entry.offset == offset) {
                 removed = pf_ref.ptr;
                 entry.* = .{};
-                // PageFrame mapcnt was bumped at install (incMapCntShim);
+                // PageFrame mapcnt was bumped at install;
                 // this is the matching decrement. `releaseMapping` may
                 // run destroyPageFrame inline if the last handle has
                 // also been released.
@@ -1290,10 +1290,6 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             return errors.E_PERM;
         },
     }
-}
-
-fn incMapCntShim(pf: *PageFrame) void {
-    _ = @atomicRmw(u32, &pf.mapcnt, .Add, 1, .seq_cst);
 }
 
 /// Linear scan for any VMAR whose [base, base + page_count*sz) covers

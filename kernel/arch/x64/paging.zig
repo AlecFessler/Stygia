@@ -548,8 +548,7 @@ pub fn unmapPage(
     // core 0 but core 1's TLB still maps them. The freed pages land
     // wherever PMM's next allocation sends them, and the resulting
     // corruption manifests as a hang on the subsequent `serial.write`
-    // path in ~60% of multi-core runs (see commit message for the
-    // visible symptom on `[PASS] §2.4.9` truncation).
+    // path in ~60% of multi-core runs.
     //
     // Paying for a remote-TLB shootdown on every unmap is fine because
     // the kernel rarely unmaps pages outside of process teardown and

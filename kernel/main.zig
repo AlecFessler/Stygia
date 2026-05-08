@@ -110,8 +110,6 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.vm.bspBootHandoff(boot_info.arrived_at_el2 != 0);
     arch.pmu.pmuInit();
     arch.cpu.sysInfoInit();
-    // TODO(spec-v3): wall-clock is now read directly via arch.time.readRtc()
-    // in syscall/system.zig; no kernel-side wall_offset state remains.
     grantBootFramebuffer(boot_info.framebuffer);
     try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
