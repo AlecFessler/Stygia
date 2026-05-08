@@ -1440,13 +1440,6 @@ fn decodePortIoFault(
     // servicing; its kernel stack is the running stack and its bound
     // domain is alive across this handler.
     const ec = scheduler.currentEc() orelse return errors.E_BADADDR;
-    return switch (builtin.cpu.arch) {
-        .x86_64 => zag.arch.x64.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev),
-        // Spec §[port_io_virtualization] test 01: map_mmio rejects
-        // port_io device_regions on non-x86-64, so a port-IO VMAR
-        // can never exist on aarch64 and this dispatch is unreachable.
-        .aarch64 => unreachable,
-        else => unreachable,
-    };
+    return zag.arch.dispatch.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev);
 }
 
