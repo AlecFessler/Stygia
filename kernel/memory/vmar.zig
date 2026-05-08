@@ -278,8 +278,15 @@ pub fn createVmar(
 
     // Mint a handle for the new VMAR in the caller's domain. field0 =
     // base vaddr; field1 = packed page_count|sz|cch|cur_rwx|map|device.
+    //
+    // Spec §[create_vmar] test 22: "on success, when caps.dma = 1,
+    // field1's `device` field equals [5]'s handle id". Carry the
+    // bound device_region handle's slot id through to the freshly-
+    // minted VMAR's snapshot so spec-test observers see it without
+    // first triggering a `sync` round-trip.
+    const dev_id_at_create: u12 = if (vmar_caps.dma) @truncate(device_region & 0xFFF) else 0;
     const field0: u64 = base.addr;
-    const field1: u64 = packField1(@intCast(pages), sz, cch, cur_rwx, .unmapped, 0);
+    const field1: u64 = packField1(@intCast(pages), sz, cch, cur_rwx, .unmapped, dev_id_at_create);
     const handle_caps: u16 = @truncate(caps);
     const slot = zag.caps.capability_domain.mintHandle(
         domain,

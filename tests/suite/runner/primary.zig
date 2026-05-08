@@ -62,6 +62,12 @@ const RECV_TIMEOUT_NS: u64 = 30_000_000_000;
 const TAG_MAGIC: u64 = 0x8000;
 const TAG_INDEX_MASK: u64 = 0x7FFF;
 
+// Sentinel phys_base values for the boot-minted test-fixture
+// device_regions. Must match
+// kernel/boot/userspace_init.zig:grantTestFixtureDevices.
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+const FIXTURE_PLAIN_PHYS_BASE: u64 = 0xBABE_0000;
+
 pub const ResultCode = enum(u64) {
     fail = 0,
     pass = 1,
@@ -90,6 +96,29 @@ var serial: serial_mod.Serial = serial_mod.DISABLED;
 // startup. Cached so spawnOne can build the PassedHandle without
 // re-querying the cap table.
 var libz_pf_handle: caps.HandleId = 0;
+
+// Test-fixture device_region handles in the runner's own cap table,
+// minted by the kernel at boot under -Dprofile=test (see
+// kernel/boot/userspace_init.zig grantTestFixtureDevices). The runner
+// scans for them at startup and forwards them to every test child via
+// passed_handles so spec tests targeting `device_region` / IRQ / DMA
+// surfaces have something to scan for.
+//
+//   fixture_dma_irq_handle: caps={move,copy,dma,irq} — exercises
+//                            §[create_vmar] tests 22/15 (success path
+//                            on dma create_vmar) and §[ack] / §[map_pf]
+//                            paths that need a dma+irq cap on [5].
+//   fixture_plain_handle:    caps={move,copy} — bare device_region
+//                            without dma or irq, needed by §[create_vmar]
+//                            test 15 to observe E_PERM (caps.dma=1
+//                            requested but device lacks dma cap).
+//
+// Both are zero (= SLOT_SELF id) when the fixtures are absent (e.g.
+// production build without -Dtests_fixture_devices=true). The runner's
+// findFixtureMmio scan returns null in that case and spawnOne forwards
+// only the result-port + ELF + libz triple.
+var fixture_dma_irq_handle: caps.HandleId = 0;
+var fixture_plain_handle: caps.HandleId = 0;
 
 pub fn main(cap_table_base: u64) void {
     serial = serial_mod.init(cap_table_base);
@@ -124,6 +153,21 @@ pub fn main(cap_table_base: u64) void {
     // mapPfs it at LIBZ_SLIDE and patches own GOT/PLT against it via
     // libz_loader.relocateSelf before app.main runs.
     libz_pf_handle = stageLibzPf();
+
+    // Scan the runner's own cap_table for the boot-minted test-fixture
+    // device_regions (kernel/boot/userspace_init.zig
+    // grantTestFixtureDevices, gated on -Dtests_fixture_devices).
+    // Two synthetic mmio device_regions are minted on the runner's
+    // table:
+    //   - phys_base = 0xCAFE_0000, caps = {move,copy,dma,irq}
+    //   - phys_base = 0xBABE_0000, caps = {move,copy}
+    // We pin them by phys_base because the table also holds COM1 (port_io)
+    // and on bare-metal boots may hold a framebuffer (mmio with caps
+    // {move,copy,dma,irq} too) and PCI BAR mmio — distinguishing by
+    // phys_base avoids forwarding any real-hardware mmio region to the
+    // child by accident.
+    fixture_dma_irq_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse 0;
+    fixture_plain_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse 0;
 
     serial.print("[runner] starting ");
     serial.printU64(embedded_tests.manifest.len);
@@ -325,6 +369,23 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     //                                    libz.elf page_frame, R+X
     //                                    cap so the child's _start
     //                                    can mapPf it at LIBZ_SLIDE.
+    //   slot 6 (SLOT_FIRST_PASSED + 3) — boot-minted test-fixture
+    //                                    device_region with
+    //                                    {move,copy,dma,irq} caps
+    //                                    (sentinel phys_base
+    //                                    0xCAFE_0000). Forwarded
+    //                                    only when present in the
+    //                                    runner's table (i.e. the
+    //                                    kernel was built with
+    //                                    -Dtests_fixture_devices=true).
+    //   slot 7 (SLOT_FIRST_PASSED + 4) — boot-minted bare
+    //                                    device_region with
+    //                                    {move,copy} caps (sentinel
+    //                                    phys_base 0xBABE_0000).
+    //                                    Used by §[create_vmar]
+    //                                    test 15 to observe E_PERM
+    //                                    (caps.dma=1 requested but
+    //                                    [5] handle lacks dma cap).
     const child_port_caps = caps.PortCap{
         .move = false,
         .copy = false,
@@ -343,23 +404,67 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         .w = false,
         .x = true,
     };
-    const passed: [3]u64 = .{
-        (caps.PassedHandle{
-            .id = port_handle,
-            .caps = child_port_caps.toU16(),
-            .move = false,
-        }).toU64(),
-        (caps.PassedHandle{
-            .id = pf_handle,
-            .caps = child_pf_caps.toU16(),
-            .move = false,
-        }).toU64(),
-        (caps.PassedHandle{
-            .id = libz_pf_handle,
-            .caps = child_libz_caps.toU16(),
-            .move = false,
-        }).toU64(),
+    // Per §[create_capability_domain] passed-handle entry encoding
+    // (libz/caps.zig:PassedHandle) the new caps word in the child
+    // is `entry.caps`, NOT subset-checked against any ceiling — the
+    // kernel forwards verbatim for passed handles. So the dma+irq
+    // device_region forwarded here lands on the child with the same
+    // caps the runner asks for.
+    const child_dma_irq_caps = caps.DeviceCap{
+        .move = false,
+        .copy = false,
+        .dma = true,
+        .irq = true,
     };
+    const child_plain_caps = caps.DeviceCap{
+        .move = false,
+        .copy = false,
+    };
+
+    var passed_buf: [5]u64 = undefined;
+    passed_buf[0] = (caps.PassedHandle{
+        .id = port_handle,
+        .caps = child_port_caps.toU16(),
+        .move = false,
+    }).toU64();
+    passed_buf[1] = (caps.PassedHandle{
+        .id = pf_handle,
+        .caps = child_pf_caps.toU16(),
+        .move = false,
+    }).toU64();
+    passed_buf[2] = (caps.PassedHandle{
+        .id = libz_pf_handle,
+        .caps = child_libz_caps.toU16(),
+        .move = false,
+    }).toU64();
+    var passed_len: usize = 3;
+    // Order matters: spec test files scan their own cap_table from
+    // slot 0 upward and stop at the first device_region. ack_02
+    // (E_PERM if [1] lacks `irq`) and create_vmar_15 (E_PERM if
+    // [5] lacks `dma`) need the "no-cap" device to land at the
+    // lower slot id. ack_03 / map_pf_13 / ack_05 / ack_08 /
+    // create_vmar_22 explicitly tolerate E_PERM as a degraded
+    // outcome and otherwise drive the success path through any
+    // device they find — so the plain fixture comes first, the
+    // dma+irq fixture second. This wires both classes of test to
+    // their full path under one runner config.
+    if (fixture_plain_handle != 0) {
+        passed_buf[passed_len] = (caps.PassedHandle{
+            .id = fixture_plain_handle,
+            .caps = child_plain_caps.toU16(),
+            .move = false,
+        }).toU64();
+        passed_len += 1;
+    }
+    if (fixture_dma_irq_handle != 0) {
+        passed_buf[passed_len] = (caps.PassedHandle{
+            .id = fixture_dma_irq_handle,
+            .caps = child_dma_irq_caps.toU16(),
+            .move = false,
+        }).toU64();
+        passed_len += 1;
+    }
+    const passed: []const u64 = passed_buf[0..passed_len];
 
     // Spec §[create_capability_domain] [2] ceilings_inner field layout:
     //   bits  0-7   ec_inner_ceiling   = 0xFF
@@ -506,6 +611,33 @@ fn stageLibzPf() caps.HandleId {
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = vmar_handle });
 
     return pf_handle;
+}
+
+// Scan the runner's own cap_table for an mmio device_region whose
+// `phys_base` matches `target_phys_base`. Returns the slot id or null
+// if no matching handle is present. Used at startup to discover the
+// boot-minted test-fixture device_regions (see
+// kernel/boot/userspace_init.zig:grantTestFixtureDevices).
+//
+// Spec §[device_region] field0 layout (mmio): bits 4-51 carry
+// paddr>>12; we shift back up by 12 to compare against the sentinel.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            // mmio = 0
+            if (dev_type == 0) {
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }
 
 fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {

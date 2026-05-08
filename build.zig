@@ -117,6 +117,17 @@ pub fn build(b: *std.Build) void {
     // stalled (the smp=4 lost-wakeup signature: all cores idle hlt with
     // current_ec=null and run-queues empty).
     const kernel_hang_watchdog = b.option(bool, "kernel_hang_watchdog", "Enable HPET-NMI hang watchdog (default: off)") orelse false;
+    // Test-only fixture devices (synthetic device_regions handed to the
+    // root service so spec tests targeting `device_region` / IRQ / DMA
+    // surfaces have something to scan for). Defaults on under
+    // -Dprofile=test, off elsewhere. The fixture path is dead-stripped
+    // when the option is false, so production builds carry no test
+    // surface in the boot path.
+    const tests_fixture_devices = b.option(
+        bool,
+        "tests_fixture_devices",
+        "Mint synthetic test-only fixture device_regions in the boot path (default: on under -Dprofile=test)",
+    ) orelse (profile_name != null and std.mem.eql(u8, profile_name.?, "test"));
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -207,6 +218,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_ec_log", kernel_ec_log);
     build_opts.addOption(bool, "kernel_pf_log", kernel_pf_log);
     build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
+    build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 

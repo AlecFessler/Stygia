@@ -379,6 +379,17 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
         return errors.E_BADCAP;
     };
 
+    // Spec §[ack] test 02: returns E_PERM if [1] does not have the `irq`
+    // cap. The cap word lives in user_table[slot].word0 bits 48-63 and
+    // is sourced from the device_region cap layout in §[device_region]
+    // (bit 3 = irq).
+    const dev_caps_word: u16 = Word0.caps(cd.user_table[slot].word0);
+    const dev_caps: device_region.DeviceRegionCaps = @bitCast(dev_caps_word);
+    if (!dev_caps.irq) {
+        cd_ref.unlockIrqRestore(cd_irq_state);
+        return errors.E_PERM;
+    }
+
     // Resolve the physical address of the caller's `field1` slot in its
     // domain's user_table — the futex-watch address Spec §[device_irq]
     // wakes on. The user_table page is identity-mapped via the kernel's
@@ -392,6 +403,13 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
     const drlr = dr_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const dr = drlr.ptr;
     defer dr_ref.unlockIrqRestore(drlr.irq_state);
+
+    // Spec §[ack] test 03: returns E_INVAL if the device_region has no
+    // IRQ delivery configured. `irq_source == IRQ_SOURCE_NONE` is the
+    // not-configured sentinel (kernel/devices/device_region.zig).
+    if (dr.irq_source == device_region.IRQ_SOURCE_NONE) {
+        return errors.E_INVAL;
+    }
 
     const prior = device_region.ack(dr, field1_paddr);
     return @bitCast(prior);

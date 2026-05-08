@@ -1,3 +1,4 @@
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
@@ -588,6 +589,100 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
         },
         else => {},
     }
+
+    // Test-only fixture device_regions. Gated on `tests_fixture_devices`
+    // build option (auto-on under -Dprofile=test). Two synthetic MMIO
+    // regions are minted into the root service's cap table so spec
+    // tests targeting `device_region` / IRQ / DMA surfaces have
+    // something to scan for. The runner forwards them to test
+    // children via `passed_handles` (see tests/suite/runner/primary.zig).
+    // Spec §[device_region] does not constrain how device_regions are
+    // sourced at boot — kernel is free to mint synthetic ones for test
+    // purposes — and userspace cannot tell a fixture from real
+    // hardware (no introspection on `phys_base` validity).
+    if (build_options.tests_fixture_devices) {
+        grantTestFixtureDevices(root_cd);
+    }
+}
+
+/// Mint two synthetic test-only device_regions:
+///   - `caps={move,copy,dma,irq}` — exercises `caps.dma=1` and
+///     `caps.irq=1` paths in §[create_vmar] / §[ack] / §[device_irq].
+///   - `caps={move,copy}` — bare device_region with neither dma nor
+///     irq. Used by §[create_vmar] tests that need a valid handle whose
+///     caps subset check fails (test 15: `caps.dma=1` and [5] without
+///     `dma` cap → E_PERM).
+///
+/// Both fixtures use sentinel `phys_base` addresses (0xCAFE_0000 /
+/// 0xBABE_0000) chosen to be far outside any real PCI/MMIO BAR; tests
+/// only use the handle metadata, not the backing memory. `irq_source`
+/// stays `IRQ_SOURCE_NONE` for both — no IOAPIC line is bound, so
+/// `onIrq → maskIrq` and `ack → unmaskIrq` short-circuit on the
+/// IRQ_SOURCE_NONE guard inside `device_region.zig`. Triggering an
+/// actual hardware IRQ for these fixtures requires kernel-side
+/// IRQ-injection infrastructure that this branch does not provide;
+/// see the spec test files (device_irq_*.zig, ack_07.zig) for the
+/// outstanding harness gap.
+fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
+    const TEST_DMA_IRQ_BASE: u64 = 0xCAFE_0000;
+    const TEST_DMA_IRQ_SIZE: u64 = 0x1000;
+    const TEST_PLAIN_BASE: u64 = 0xBABE_0000;
+    const TEST_PLAIN_SIZE: u64 = 0x1000;
+
+    mintTestFixtureMmio(
+        root_cd,
+        PAddr.fromInt(TEST_DMA_IRQ_BASE),
+        TEST_DMA_IRQ_SIZE,
+        zag.devices.device_region.DeviceRegionCaps{
+            .move = true,
+            .copy = true,
+            .dma = true,
+            .irq = true,
+        },
+    );
+    mintTestFixtureMmio(
+        root_cd,
+        PAddr.fromInt(TEST_PLAIN_BASE),
+        TEST_PLAIN_SIZE,
+        zag.devices.device_region.DeviceRegionCaps{
+            .move = true,
+            .copy = true,
+        },
+    );
+}
+
+fn mintTestFixtureMmio(
+    root_cd: *CapabilityDomain,
+    phys_base: PAddr,
+    size: u64,
+    dr_caps: zag.devices.device_region.DeviceRegionCaps,
+) void {
+    const dr = zag.devices.device_region.registerMmio(phys_base, size) catch {
+        arch.boot.print("[boot] WARNING: test-fixture MMIO registerMmio failed\n", .{});
+        return;
+    };
+    // Spec §[device_region] field0 layout (mmio):
+    //   bits  0-3   dev_type (0 = mmio)
+    //   bits  4-51  base_paddr >> 12
+    //   bits 52-63  size_pages
+    const field0: u64 = 0 |
+        ((phys_base.addr >> 12) << 4) |
+        ((size >> 12) << 52);
+
+    const erased: ErasedSlabRef = .{
+        .ptr = @ptrCast(dr),
+        .gen = @intCast(dr._gen_lock.currentGen()),
+    };
+    _ = capdom.mintHandle(
+        root_cd,
+        erased,
+        zag.caps.capability.CapabilityType.device_region,
+        @bitCast(dr_caps),
+        field0,
+        0,
+    ) catch {
+        arch.boot.print("[boot] WARNING: test-fixture device_region handle mint failed\n", .{});
+    };
 }
 
 fn grantBootDevices(root_cd: *CapabilityDomain) void {
