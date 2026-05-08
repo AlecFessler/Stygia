@@ -1,131 +1,121 @@
-// Spec §[device_irq] device IRQ delivery — test 01.
+// Spec §[device_irq] device_irq — test 01.
 //
 // "[test 01] when the device fires an IRQ, within a bounded delay every
 //  domain-local copy of [1] returns `field1.irq_count = (prior + 1)`
 //  from a fresh `sync`."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful shape of test 01 requires four resources that the v0
-//   test harness does not yet expose to a single test child capability
-//   domain:
+// Faithful path (post-injection)
+//   The faithful test wants:
+//     1. Read [1].field1.irq_count via a fresh sync; record `prior`.
+//     2. Cause the device to fire an IRQ.
+//     3. Within a bounded delay, observe a fresh sync return
+//        `prior + 1` on every domain-local copy.
 //
-//     (a) An IRQ-firing device. The kernel side of §[device_irq] only
-//         increments `field1.irq_count` and emits a futex wake when an
-//         actual hardware IRQ is delivered from the device bound to the
-//         device_region (spec lines 1353-1356). The runner currently
-//         spawns each test as a one-shot capability domain on the
-//         primary kernel under QEMU with no devices wired through to
-//         the test child — there is no way for the test EC to cause its
-//         own bound device to raise an IRQ, nor any test fixture device
-//         that fires on demand. A faithful version needs either a
-//         loopback "fire IRQ now" device (test-only) or a real device
-//         the runner can poke from the host side with a timing
-//         guarantee bounded enough to compare against the spec's
-//         "bounded delay" clause.
+//   Step 2 is unreachable on this branch. The runner-fix commit
+//   (kernel/boot/userspace_init.zig grantTestFixtureDevices) mints two
+//   synthetic device_regions onto root_cd with `irq_source =
+//   IRQ_SOURCE_NONE`. There is no IOAPIC/GIC line bound, so the kernel
+//   `onIrq` path never fires for these fixtures, and there is no
+//   test-only injection syscall. Furthermore
+//   `device_region.handle_list_head` is left null at handle-table
+//   alias time (caps module never appends), so even with an injected
+//   IRQ source bound at runtime, `propagateIrqAndWake` would walk an
+//   empty list. Both gaps are flagged in the runner-fix commit
+//   message (commit 27efffc76).
 //
-//     (b) A device_region handle to that device. v0 `create_capability
-//         _domain` populates the test child's handle table with self,
-//         initial EC, self-IDC, and the result port (slots 0-3). No
-//         device_region handle is granted to the child, and there is
-//         no syscall available to the child that mints one — the spec
-//         frames device_regions as kernel-issued at boot to root and
-//         transferred via suspend/reply (spec line 115). The runner
-//         primary would need to acquire a device_region for the
-//         fixture device and pass it through `passed_handles` of
-//         `create_capability_domain` to the test child.
-//
-//     (c) A second domain holding a copy of [1]. Test 01 asserts that
-//         "every domain-local copy of [1]" reflects the increment.
-//         Observing more than the calling domain's own copy requires
-//         at least one peer capability domain that received a copy via
-//         `xfer` (with `caps.copy = 1`) and a way for the test to read
-//         that peer's copy of `field1.irq_count`. The runner does not
-//         yet stand up sibling test domains for cross-domain
-//         observation, and the test child has no `xfer` partner to
-//         hand a copy to.
-//
-//     (d) Bounded-delay timing. The "within a bounded delay" clause
-//         needs a timer source the child can read (perfmon counters
-//         or a wall-clock IDC service) plus a runner-side timeout
-//         bound expressing what "bounded" means for this test class.
-//         Neither is wired into the v0 test child runtime.
-//
-//   Reaching the faithful path needs all four pieces: a fixture
-//   IRQ-firing device exposed by the runner kernel, a device_region
-//   handle granted to the child, a sibling capability domain holding
-//   a copy of that handle (and an observation channel back to the
-//   test reporter), and a timing primitive bounded by the runner's
-//   harness. None of these are present today.
-//
-// Strategy (smoke prelude)
-//   We exercise only the call shape that the post-IRQ observer would
-//   use: `sync` against a handle that exists in the child's table
-//   (slot 0 — self). `sync` is the syscall the spec names for
-//   refreshing field1 from the kernel's authoritative state, so
-//   reaching the dispatch entry point with a valid handle is the
-//   thinnest smoke for the post-IRQ side of test 01. No IRQ is fired,
-//   no device_region exists, no peer domain is observed. The smoke
-//   reports pass-with-id-0 unconditionally because the spec assertion
-//   under test (post-IRQ counter increment in every domain-local
-//   copy) is unreachable from the v0 child surface.
+//   What IS reachable: the prior=0 base case. A fresh-spawned spec-test
+//   capability domain inherits the dma+irq fixture handle with no IRQs
+//   ever delivered (the kernel can't deliver to it), so a fresh sync
+//   must observe `field1.irq_count == 0`. This is the boundary case
+//   of the test 01 contract — `prior` is fixed at 0 — and lets us
+//   exercise the sync side of the test 01 path against an actual
+//   IRQ-capable handle (caps.irq=1, dev_type=mmio, valid backing
+//   DeviceRegion in the kernel slab) rather than against an unrelated
+//   handle. The increment side of the assertion (sync returns
+//   prior+1 *after* an IRQ) is documented as the deferred half.
 //
 // Action
-//   1. sync(self_slot) — issue a sync against the self handle (slot
-//      0, always present in the child's handle table per spec line
-//      435-437). The faithful action would issue sync against a
-//      device_region handle held by the child (and by every peer
-//      capability domain) after the runner fires the bound device's
-//      IRQ.
+//   1. Scan cap_table for a device_region handle whose backing
+//      phys_base == 0xCAFE_0000 (dma+irq fixture). Pin by phys_base
+//      so we don't race against an unrelated MMIO region (e.g.
+//      framebuffer) that another harness might forward.
+//   2. If none → degraded smoke (e.g. -Dtests_fixture_devices=false
+//      build). Pass-id-0.
+//   3. sync(found) — must return OK; a fresh kernel-authoritative
+//      snapshot of field0/field1 lands in the read-only cap-table
+//      mapping.
+//   4. Read the post-sync cap snapshot. Per the prior=0 boundary of
+//      test 01, field1.irq_count must be 0 — no IRQ has been (or
+//      can be) delivered to this fixture in this child's lifetime.
 //
-// Assertion
-//   No spec assertion is checked — passes with assertion id 0 because
-//   the IRQ-driven counter increment is unreachable from the v0 test
-//   child. Test reports pass regardless of what `sync` returns: any
-//   failure of the prelude itself is also reported as pass-with-id-0
-//   since no spec assertion is being checked.
+// Assertions
+//   1: sync returned non-OK on a valid IRQ-capable fixture handle.
+//   2: post-sync field1 != 0 — either an unexpected IRQ was delivered
+//      (kernel bug) or the sync side of the §[device_irq] contract
+//      is broken for the prior=0 case.
 //
-// Faithful-test note
-//   Faithful test deferred pending:
-//     - a kernel-side fixture IRQ-firing device (or runner-driven
-//       hardware device) the test harness can fire on command;
-//     - runner wiring that mints a device_region for that device and
-//       hands it to the test child via `passed_handles`;
-//     - a sibling capability domain holding a copied handle to the
-//       same device_region, with a reporting channel back to the
-//       test runner;
-//     - a bounded-delay timing primitive (timer IDC or perfmon read)
-//       and a harness-defined timeout class for this assertion.
-//   Once those exist, the action becomes:
-//     <runner: mint device_region for fixture device, copy to child
-//      and to a sibling domain>
-//     <child: read field1.irq_count → record `prior`>
-//     <runner: fire the bound device's IRQ>
-//     <child: spin sync(handle) until field1.irq_count == prior + 1
-//      or bounded-delay deadline expires>
-//     <sibling: same spin>
-//     <both report observed final count back through the reporter>
-//   The equality assertion (id 1) — every domain-local copy reads
-//   exactly `prior + 1` from a post-IRQ sync within the bounded
-//   delay — would replace this smoke's pass-with-id-0.
+// Faithful-test note (deferred half)
+//   The post-IRQ `prior + 1` assertion needs:
+//     - kernel-side test-only IRQ-injection hook (e.g. a syscall
+//       gated on -Dtests_fixture_devices that calls
+//       device_region.onIrq for a named fixture);
+//     - device_region handle-list propagation: every cap-table alias
+//       must append a HandleListNode under the parent DeviceRegion's
+//       _gen_lock so onIrq's propagateIrqAndWake can walk it.
+//   Once both exist, replace this body's prior=0 check with the
+//   prior+1 assertion (id 3): inject after step 4, re-sync, observe
+//   field1 == 1.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse {
+        // Degraded smoke: dma+irq fixture missing. The full IRQ-capable
+        // handle path is unreachable without it; pass-id-0 to document
+        // the harness gap.
+        testing.pass();
+        return;
+    };
 
-    // Self handle is always at slot 0 in the child capability domain's
-    // handle table (spec line 435-437). Issue sync against it as the
-    // thinnest smoke for the call shape the faithful test would use
-    // post-IRQ. No spec assertion is checked.
-    const self_slot: u12 = 0;
-    _ = syscall.sync(self_slot);
+    const s = syscall.sync(dev_handle);
+    if (s.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(1);
+        return;
+    }
 
-    // No spec assertion is being checked — IRQ delivery is unreachable
-    // from the v0 test child. Pass with assertion id 0 to mark this
-    // slot as smoke-only in coverage.
+    const cap_post = caps.readCap(cap_table_base, dev_handle);
+    // Prior=0 boundary of test 01: no IRQ has been (or can be) delivered
+    // to this fixture in this child's lifetime, so a fresh sync must
+    // observe field1.irq_count == 0.
+    if (cap_post.field1 != 0) {
+        testing.fail(2);
+        return;
+    }
+
     testing.pass();
+}
+
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) { // mmio
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }

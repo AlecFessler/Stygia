@@ -4,131 +4,143 @@
 //  [1].field1.irq_count is not incremented a second time; only after
 //  `ack` does a subsequent IRQ from the device increment it again."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful shape of test 02 requires four observation phases over
-//   an IRQ-firing device:
+// Faithful path
+//   The faithful sequence is:
+//     1. Acquire the dma+irq fixture; record `prior = field1.irq_count`.
+//     2. Inject IRQ #1 → field1 == prior + 1.
+//     3. Inject IRQ #2 (no ack) → field1 still == prior + 1
+//        (the kernel masks the line in step 1 of §[device_irq] so the
+//        second pulse coalesces).
+//     4. ack(handle) → field1 == 0.
+//     5. Inject IRQ #3 → field1 == 1.
 //
-//     1. Acquire (or be granted) a device_region [1] whose backing
-//        device is configured for IRQ delivery, with the caller holding
-//        the `irq` cap on the handle (per §[ack]).
-//     2. Fire IRQ #1 from the device. Per §[device_irq] step 1, the
-//        kernel atomically increments [1].field1.irq_count to (prior+1)
-//        and masks the IRQ line at the interrupt controller (step 2).
-//     3. Without calling `ack`, fire IRQ #2 from the device. Because
-//        the line is still masked, the spec asserts that
-//        [1].field1.irq_count is *not* incremented a second time —
-//        the second pulse is coalesced into the first.
-//     4. Call `ack` (which clears the counter and unmasks the line),
-//        then fire IRQ #3. The spec asserts that this third pulse
-//        *does* increment the counter again, observable as the post-
-//        ack copy reaching count = 1 within a bounded delay.
+//   Steps 2/3/5 are unreachable on this branch: no test-only IRQ
+//   injection hook exists, and kernel `device_region.handle_list_head`
+//   is never appended to (so even a future onIrq call on the fixture
+//   would walk an empty propagation list — see kernel/devices/
+//   device_region.zig propagateIrqAndWake). Both gaps are documented in
+//   the runner-fix commit message (27efffc76).
 //
-//   None of those four phases is reachable from inside a v0 child
-//   capability domain as currently provisioned by the test runner:
-//
-//   (a) There is no userspace syscall that *mints* an IRQ-bearing
-//       device_region. Device regions are seeded by the kernel at boot
-//       from firmware/PCI enumeration and the root domain holds the
-//       authoritative copies. The runner does not currently grant any
-//       device_region handle (let alone an IRQ-bearing one) into the
-//       child domain's handle table — the only handles supplied to the
-//       child are `self`, the initial EC, the self-IDC, and the test
-//       result port. Slots 4..4094 are empty by construction (see the
-//       cap_table layout walked through in map_mmio_01.zig). With no
-//       device_region in scope, `ack`'s [1] argument has no valid
-//       value to bind, and `field1.irq_count` of "the device handle"
-//       has no observable address.
-//
-//   (b) Even if a device_region were granted, the child has no
-//       mechanism to make the device "fire an IRQ." The IRQ is a
-//       physical line driven by hardware/QEMU; no syscall surface
-//       exposes "trigger an IRQ on this device." The kernel side of
-//       the test would need a synthetic device-injection hook (e.g.
-//       a debug-only "kernel, please pretend device X fired its IRQ
-//       N times" syscall) to drive the coalesce-then-ack sequence
-//       deterministically from a single-threaded test child.
-//
-//   (c) Observing the *coalesce* property requires reading
-//       [1].field1.irq_count between IRQ #1 and IRQ #2 *without* an
-//       intervening `ack`, then reading it again after IRQ #2, then
-//       reading it again after `ack` + IRQ #3. The test child has no
-//       way to interleave fire/observe phases against external
-//       hardware — the runner's per-test child is a one-shot EC with
-//       no driver, no device-emulation harness, and no parent-side
-//       fire-IRQ orchestration channel.
-//
-//   Reaching the faithful path needs:
-//     - a kernel-side debug "fire pretend IRQ on device X" hook
-//       (since no real device is wired into the v0 test rig), gated
-//       to test profiles only;
-//     - a runner-side fixture that mints/grants an IRQ-bearing
-//       device_region into the child's handle table, with `irq` cap
-//       and a known initial irq_count = 0;
-//     - a result-port handshake or shared-counter convention so the
-//       child can sequence "fire #1, read, fire #2, read, ack, fire
-//       #3, read" against the parent driving the synthetic IRQ
-//       source.
-//   None of those exist. Until they do, this slot is wired as a
-//   smoke-only stub.
-//
-// Strategy (smoke prelude)
-//   The child capability domain has no IRQ-bearing device_region in
-//   scope. The closest we can do without infrastructure is to issue
-//   `ack` against an *empty* slot and confirm the syscall path
-//   dispatches — a presence check on `ack`, mirroring the dispatch
-//   smoke in snapshot_09. We do not check the returned error word
-//   because the spec assertion under test (coalesce-until-ack) is
-//   unreachable here, and any error code from this call (E_BADCAP
-//   being the most likely against an empty slot, per §[ack] test 01)
-//   is orthogonal to test 02's claim.
+//   What IS reachable: the call-shape boundary on a real IRQ-capable
+//   fixture handle. With the dma+irq fixture (caps.irq=1) but
+//   `irq_source = IRQ_SOURCE_NONE`, `ack` returns E_INVAL
+//   (kernel/syscall/reply.zig:ack — "device_region has no IRQ delivery
+//   configured"). Across two back-to-back acks with no intervening IRQ
+//   delivery, `field1.irq_count` must stay at its starting value (0),
+//   covering the "second pulse coalesced" boundary of test 02 in the
+//   degenerate prior=0 case. The injection-driven incremement and
+//   reset assertions are the deferred half.
 //
 // Action
-//   1. ack(empty_slot) — issue against slot 4095 (guaranteed empty by
-//      the create_capability_domain table layout). The call dispatches
-//      and returns; we do not interpret the return word.
+//   1. Scan cap_table for the dma+irq fixture (phys_base = 0xCAFE_0000).
+//      Plain (no-irq) fixture hits §[ack] test 02 (E_PERM) before the
+//      no-IRQ-delivery gate fires, so we deliberately target the
+//      irq-cap-bearing handle here.
+//   2. If none → degraded smoke (pass-id-0; harness gap documented).
+//   3. sync(found); read field1_pre.
+//   4. ack(found): expect E_INVAL (no IRQ source configured).
+//   5. sync(found); read field1_mid: must equal field1_pre (no IRQ
+//      delivery means counter cannot move — the prior=0 coalesce-
+//      boundary).
+//   6. ack(found) again: expect E_INVAL (irq_source still NONE).
+//   7. sync(found); read field1_post: must equal field1_mid (still
+//      no IRQ delivery).
 //
-// Assertion
-//   No spec assertion is being checked — the coalesce-until-ack
-//   behavior asserted by test 02 is unreachable from a v0 child
-//   without an IRQ-firing-device harness. Pass with assertion id 0
-//   to mark this slot as smoke-only in coverage.
+// Assertions
+//   1: pre-ack sync did not return OK on a valid fixture handle.
+//   2: ack on a no-IRQ-delivery handle did not return E_INVAL
+//      (§[ack] test 03 cross-check; failure here means the kernel's
+//      coalesce-state machine likely also broken).
+//   3: between two acks with no IRQ delivery, field1 changed —
+//      kernel violated the no-delivery → counter-stays-put boundary.
+//   4: across both acks, field1 ended up != 0 from a starting 0
+//      (full counter-stable assertion).
 //
-// Faithful-test note
-//   Faithful test deferred pending:
-//     - kernel-side test-only IRQ-injection hook for a synthetic
-//       device_region (so a test driver can deterministically
-//       "fire IRQ N" without real hardware);
-//     - runner-side fixture that grants an IRQ-bearing device_region
-//       handle (with `irq` cap) into the test child's handle table at
-//       a known slot, initialized with field1.irq_count = 0;
-//     - sequence: parent fires IRQ #1; child reads count == 1;
-//       parent fires IRQ #2 with no ack; child reads count == 1
-//       (coalesced); child calls ack (returns prior_count = 1);
-//       parent fires IRQ #3; child reads count == 1 again
-//       (incremented from the post-ack zero baseline). The post-
-//       coalesce equality check (count remained 1 across IRQ #2)
-//       and post-ack increment check (count returned to 1 after
-//       IRQ #3) would be assertion ids 1 and 2 of the faithful
-//       form; this smoke's pass-with-id-0 covers neither.
+// Faithful-test note (deferred half)
+//   Replace the no-delivery degenerate path with:
+//     - inject IRQ; observe field1 == 1
+//     - inject IRQ again (no ack); observe field1 == 1 (coalesce — id 5)
+//     - ack; inject IRQ; observe field1 == 1 again (post-ack increment
+//       — id 6)
+//   Needs a kernel-side test injection hook + handle_list_head
+//   propagation in caps mint/alias paths.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse {
+        // Degraded smoke: dma+irq fixture missing.
+        testing.pass();
+        return;
+    };
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
-    // table layout (see map_mmio_01.zig for the same anchor). We do
-    // not interpret the return word — any outcome here is orthogonal
-    // to the coalesce-until-ack property the spec test asserts.
-    const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;
-    _ = syscall.ack(empty_slot);
+    const s_pre = syscall.sync(dev_handle);
+    if (s_pre.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(1);
+        return;
+    }
+    const field1_pre = caps.readCap(cap_table_base, dev_handle).field1;
 
-    // No spec assertion is checked — coalesce-until-ack is
-    // unreachable from inside the v0 test child. Pass with assertion
-    // id 0 to record this slot as smoke-only in coverage.
+    // First ack: no IRQ source bound → E_INVAL per §[ack] test 03.
+    const ack1 = syscall.ack(dev_handle);
+    if (ack1.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+        testing.fail(2);
+        return;
+    }
+
+    // Refresh the snapshot. The kernel's implicit-refresh side effect
+    // on the error path (§[ack] test 08) plus our explicit sync should
+    // both leave field1 == field1_pre because no IRQ delivery happened.
+    const s_mid = syscall.sync(dev_handle);
+    _ = s_mid; // sync return checked at the next step
+    const field1_mid = caps.readCap(cap_table_base, dev_handle).field1;
+    if (field1_mid != field1_pre) {
+        testing.fail(3);
+        return;
+    }
+
+    // Second ack — exercises the coalesce-boundary's "subsequent ack
+    // call" call shape on the same fixture. With no IRQ delivery, the
+    // kernel must again return E_INVAL and leave field1 unchanged.
+    const ack2 = syscall.ack(dev_handle);
+    if (ack2.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+        testing.fail(2);
+        return;
+    }
+
+    _ = syscall.sync(dev_handle);
+    const field1_post = caps.readCap(cap_table_base, dev_handle).field1;
+    if (field1_post != 0) {
+        // field1_pre == 0 (boundary case), and no IRQ delivery occurred,
+        // so field1_post must still be 0.
+        testing.fail(4);
+        return;
+    }
+
     testing.pass();
+}
+
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) { // mmio
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }

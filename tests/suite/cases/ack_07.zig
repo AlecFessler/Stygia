@@ -1,90 +1,116 @@
-// Spec §[ack] — test 07 (degraded smoke).
+// Spec §[ack] — test 07.
 //
 // "[test 07] on success, after a subsequent IRQ from the device, every
 //  domain-local copy's `field1.irq_count` reaches the new value within
 //  a bounded delay and an EC blocked in `futex_wait_val` on each copy's
 //  `field1` paddr is woken."
 //
-// A faithful test needs three pieces of harness that this branch does
-// not yet provide:
-//   1. A real IRQ-delivering device_region (or a kernel-driven IRQ
-//      injection knob) reachable from a child capability domain so the
-//      test can drive a "subsequent IRQ" after a successful `ack`.
-//   2. At least two capability domains each holding a copy of the same
-//      device_region so the propagation-to-every-copy assertion is
-//      observable. The runner today spawns a single child per test ELF
-//      (runner/primary.zig spawnOne forwards only the result port at
-//      slot 3 of the child cap table), so cross-domain propagation is
-//      structurally untestable in-process.
-//   3. An EC parked in `futex_wait_val` on each copy's `field1` paddr
-//      ahead of the IRQ — i.e. a multi-EC, multi-domain choreography
-//      where the test binary blocks one EC, releases the device, and
-//      observes the wake. The current ELF runs as a single EC inside a
-//      single child domain, so a real `futex_wait_val` here would
-//      either hang or be trivially unblocked by the same EC issuing the
-//      `ack`.
+// Faithful path
+//   The faithful sequence requires:
+//     1. A dma+irq fixture with `irq_source` bound to a real IRQ line
+//        (so kernel/devices/device_region.zig onIrq actually reaches
+//        propagateIrqAndWake on injection).
+//     2. handle_list_head wired by the caps mint/alias path so
+//        propagateIrqAndWake walks every domain-local copy and bumps
+//        field1.irq_count saturating + futex.wake on its paddr.
+//     3. A worker EC parked in `futex_wait_val(addr=&copy.field1,
+//        expected=copy.field1.irq_count)` ahead of the second IRQ so
+//        the wake side of the assertion has someone to deliver to.
+//     4. A bounded-delay timing primitive (time_monotonic or a timer
+//        IDC service) so "within a bounded delay" can be asserted.
 //
-// With none of those harness pieces in place, the test 07 contract is
-// structurally unreachable from inside a spec-test child today.
+// What's reachable on this branch
+//   None of pieces 1-4 land in this commit. The runner-fix
+//   (commit 27efffc76) forwards the dma+irq fixture into every spec-
+//   test child, but its `irq_source = IRQ_SOURCE_NONE` and
+//   `device_region.handle_list_head` is never appended (caps module's
+//   handle-table mint/alias path does not register a HandleListNode
+//   under the parent DeviceRegion's _gen_lock). Both gaps are flagged
+//   in the runner-fix commit message.
 //
-// Degraded smoke
-//   This test scans its cap table for any device_region handle. If
-//   none is found — the expected case on the current runner — it
-//   reports a degraded smoke pass: the test ELF links, loads, and
-//   exercises the cap-table scan plumbing, but cannot drive `ack` down
-//   a real success-then-IRQ path, let alone the multi-domain
-//   propagation + futex_wait_val wake assertion. The day the runner
-//   forwards an IRQ-bearing device_region to multiple child domains
-//   and provides a way to block an EC on `field1` ahead of an injected
-//   IRQ, this test starts exercising the real assertion automatically.
-//
-//   If a device_region handle is found, the most we can do here is
-//   attempt `ack` once and report a non-failure outcome regardless of
-//   the kernel's response: any error path (E_PERM, E_INVAL, E_BADCAP)
-//   means the success precondition for test 07 is not met through this
-//   handle, and the success path itself only validates the immediate
-//   ack return — not the post-IRQ propagation + wake — so even
-//   `prior_count = 0` does not prove the spec contract. Smoke-pass and
-//   document the blocker.
+//   What we tighten today: pin the test to the dma+irq fixture by
+//   sentinel phys_base so when injection lands, the assertion
+//   automatically promotes from smoke to the post-IRQ propagation
+//   path. We also tag the call shape that test 07 actually exercises:
+//   ack on the fixture must reach the no-IRQ-delivery gate
+//   (E_INVAL) — it must NOT trip E_PERM (cap missing) or E_BADCAP
+//   (slot empty), because both would invalidate the precondition the
+//   faithful test 07 chains off of (a "successful ack" prefix). If
+//   the kernel ever flips the dma+irq fixture's caps or removes it
+//   from the runner forwards, this test fail() catches the regression
+//   even though the wake-side assertion stays deferred.
 //
 // Action
-//   1. Scan cap_table for the first device_region handle.
-//   2. If none → smoke-pass (degraded; documented).
-//   3. Otherwise → smoke-pass (degraded; harness for IRQ injection +
-//      multi-domain copies + parked futex_wait_val unavailable).
+//   1. Scan cap_table for the dma+irq fixture (phys_base = 0xCAFE_0000).
+//   2. If none → degraded smoke (pass-id-0).
+//   3. ack(found): expect either success (faithful future) or E_INVAL
+//      (no IRQ source bound today). Anything else (E_PERM on a
+//      handle we just confirmed carries `irq`, E_BADCAP on a slot
+//      the scan resolved) means the fixture's contract regressed
+//      and the wake-side assertion will never be testable.
 //
 // Assertions
-//   None reachable on this branch. The post-`ack` IRQ propagation and
-//   the futex_wait_val wake assertion both require harness this branch
-//   does not provide. Pass id 0 documents the gap.
+//   1: ack returned an unexpected outcome on a known-irq-cap-bearing
+//      handle — neither success nor E_INVAL.
+//
+// Faithful-test note (deferred half)
+//   Once IRQ injection + handle-list propagation + a worker-EC harness
+//   land, the test body extends to:
+//     - mint and ack to set baseline;
+//     - spawn a worker EC parked in futex_wait_val(addr=&field1,
+//       expected=current_count);
+//     - inject IRQ;
+//     - test EC reads field1 == current_count + 1 (id 2);
+//     - worker side-channels its observed [1] (the field1 vaddr) back
+//       to the test EC; assert it equals the expected vaddr (id 3);
+//     - bounded-delay primitive guards both observations.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    _ = findDeviceRegion(cap_table_base);
-    // Whether or not a device_region is in scope, the test 07
-    // assertion (post-ack IRQ propagation + parked futex_wait_val
-    // wake across every domain-local copy) is structurally unreachable
-    // here. Smoke-pass id 0 to validate ELF link/load and document the
-    // harness gap; no per-assertion fail() ids are claimed.
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse {
+        // Degraded smoke: dma+irq fixture missing.
+        testing.pass();
+        return;
+    };
+
+    const r = syscall.ack(dev_handle);
+    const v: u64 = r.v1;
+
+    // Acceptable: success (faithful future when injection lands) or
+    // E_INVAL (today's no-IRQ-source gate). Any other return code
+    // means the fixture's `irq` cap or backing DeviceRegion was
+    // mis-minted by the runner-fix, and the wake-side assertion will
+    // never be reachable through this handle.
+    if (v != @intFromEnum(errors.Error.OK) and
+        v != @intFromEnum(errors.Error.E_INVAL))
+    {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
 }
 
-fn findDeviceRegion(cap_table_base: u64) ?caps.HandleId {
-    // Scan the full handle table. Slots 0/1/2 are self / initial EC /
-    // self-IDC for a child capability domain (§[capability_domain]),
-    // and passed_handles start at slot 3. Today the runner forwards
-    // only the result port at slot 3; no device_regions reach a child.
-    // Scan everything to remain robust if that changes.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
     var slot: u32 = 0;
     while (slot < caps.HANDLE_TABLE_MAX) {
         const c = caps.readCap(cap_table_base, slot);
         if (c.handleType() == .device_region) {
-            return @truncate(slot);
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) { // mmio
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
         }
         slot += 1;
     }

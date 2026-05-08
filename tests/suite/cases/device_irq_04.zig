@@ -3,95 +3,112 @@
 // "[test 04] when the device has no IRQ delivery configured,
 //  [1].field1.irq_count remains 0."
 //
-// DEGRADED SMOKE VARIANT
-//   Faithful test 04 needs the calling capability domain to hold a
-//   handle to a device_region that was *not* configured for IRQ
-//   delivery — e.g. a port_io device_region with no IRQ binding, or
-//   an MMIO device_region whose underlying device the kernel did not
-//   wire to an IRQ line. With such a handle in slot S, the assertion
-//   reads back as a one-liner: `caps.readCap(cap_table_base, S).field1
-//   == 0`, optionally with a fresh `sync(S)` first to force a
-//   kernel-authoritative snapshot.
+// Faithful path
+//   The runner forwards two boot-minted test-fixture device_regions
+//   into every spec-test child cap_table (kernel/boot/userspace_init.zig
+//   grantTestFixtureDevices, gated on -Dtests_fixture_devices /
+//   -Dprofile=test). Both fixtures use sentinel `phys_base` addresses
+//   far outside any real PCI/MMIO BAR so the test can pin them
+//   structurally without touching real hardware.
 //
-//   Per §[device_region] (line 115 of specv3.md), device_region
-//   handles are kernel-issued at boot to the root service and
-//   propagate elsewhere only via xfer / suspend-reply transfer. The
-//   v0 test runner (runner/primary.zig) spawns each spec test as a
-//   child capability domain whose `passed_handles` carry only the
-//   result port at slot 3 — no device_region of any flavor is
-//   forwarded into the test child.
+//     - 0xCAFE_0000 — caps={move,copy,dma,irq}, IRQ-capable handle
+//       (but `irq_source` stays IRQ_SOURCE_NONE in the kernel: no
+//       IOAPIC/GIC line is bound today).
+//     - 0xBABE_0000 — caps={move,copy}, bare device_region with
+//       neither dma nor irq. `irq_source = IRQ_SOURCE_NONE`.
 //
-//   Without a device_region in scope inside the test child, neither
-//   side of the assertion is reachable: there is no handle to read
-//   field1 from, and no way to confirm that the device backing it has
-//   no IRQ delivery configured. The structural shape of the test —
-//   "read field1 of a non-IRQ device_region; expect 0" — collapses
-//   to a no-op once the device_region argument is removed.
+//   Test 04 specifically targets the no-IRQ-delivery case. The plain
+//   fixture (0xBABE_0000) lacks the `irq` cap entirely; the kernel
+//   never increments `field1.irq_count` for it, and the spec wording
+//   ("remains 0") covers both the cap-bit-clear handle and the
+//   IRQ_SOURCE_NONE backing. We pin the no-irq fixture by phys_base
+//   to avoid racing against the dma+irq fixture's eventual irq_count
+//   (which is also 0 today only because IRQ injection is unavailable;
+//   under a future harness the dma+irq fixture's count will tick on
+//   each injected IRQ).
 //
-//   This smoke variant therefore checks no spec assertion. It is left
-//   in place as a coverage placeholder so the slot stays accounted
-//   for in the manifest and so a future runner extension that mints
-//   or forwards device_regions to test children can graft the
-//   faithful body onto an already-wired test ELF.
-//
-// Strategy (smoke prelude)
-//   The test does just enough syscall work to confirm the test ELF
-//   loads, runs, and reports through the standard pass channel:
-//     1. `self()` — round-trip a syscall through the kernel; the
-//        return is not consulted.
-//     2. `pass()` — report the spec slot as smoke-only via assertion
-//        id 0.
-//
-//   We deliberately do *not* mint a VMAR or any other unrelated
-//   handle. The faithful path's only fixture requirement is a
-//   non-IRQ device_region; no auxiliary VMAR/PF/EC construction is
-//   needed in the eventual replacement, so the smoke prelude leaves
-//   that surface untouched.
+//   The §[device_region] field0 layout for an mmio handle is:
+//     bits  0-3   dev_type (0 = mmio)
+//     bits  4-51  base_paddr >> 12
+//     bits 52-63  size_pages
+//   We extract the base_paddr by undoing that pack and matching
+//   against the sentinel.
 //
 // Action
-//   1. self() — exercises the syscall path and returns a self-handle
-//                snapshot; the value is discarded.
+//   1. Scan cap_table for a device_region handle whose backing
+//      phys_base == 0xBABE_0000 (the bare fixture, no irq cap).
+//   2. If none found → degraded smoke (the runner is missing the
+//      fixture, e.g. -Dtests_fixture_devices=false). Pass-with-id-0
+//      so coverage stays clean while the harness gap is documented.
+//   3. sync(found) — refresh field0/field1 from kernel-authoritative
+//      state. The spec wording "remains 0" is observed on the post-
+//      sync snapshot so a hypothetical kernel bug that writes
+//      irq_count out-of-band would still surface.
+//   4. Read the post-sync cap and assert field1 == 0.
 //
-// Assertion
-//   No spec assertion is checked — the device_region surface needed
-//   to observe `field1.irq_count == 0` is not reachable from the v0
-//   test child. Passes with assertion id 0 to mark this slot as
-//   smoke-only in coverage.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner extension that mints (or
-//   carves out from a kernel-issued boot-time region) a device_region
-//   with no IRQ delivery configured and forwards it to the test
-//   child via `passed_handles`. With that handle at slot
-//   `SLOT_FIRST_PASSED + N`, the action becomes:
-//
-//     <runner: forward non-irq device_region D to the test child>
-//     <child: sync(D)>                                // refresh field0/1
-//     <child: cap = caps.readCap(cap_table_base, D)>  // read snapshot
-//     <child: assert cap.field1 == 0>                 // irq_count = 0
-//
-//   That equality assertion (id 1) would replace this smoke's pass-
-//   with-id-0. If the runner has both an IRQ-configured and a non-
-//   IRQ device_region forwarded, this test must read the *non-IRQ*
-//   one — reading the IRQ-configured one would race against any
-//   actual IRQ that has fired since boot.
+// Assertions
+//   1: sync returned non-OK on a valid fixture handle.
+//   2: post-sync field1.irq_count != 0 — kernel violated the
+//      "no IRQ delivery → counter remains 0" contract.
 
 const lib = @import("lib");
 
+const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_PLAIN_PHYS_BASE: u64 = 0xBABE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse {
+        // Degraded smoke: fixture missing (e.g. -Dtests_fixture_devices=
+        // false build). The plain-no-irq path is structurally
+        // unreachable without it; document the gap and pass-id-0.
+        testing.pass();
+        return;
+    };
 
-    // Smoke prelude: round-trip a syscall to confirm the test ELF
-    // loads and dispatches through the kernel. Result is discarded —
-    // no spec assertion of test 04 is reachable from here.
-    _ = syscall.self();
+    // Refresh the slot snapshot from kernel-authoritative state. sync's
+    // success contract (§[capabilities]) is that field0/field1 reflect
+    // the kernel's view on return; any post-sync read is a faithful
+    // observation of "the kernel says irq_count is X".
+    const s = syscall.sync(dev_handle);
+    if (s.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(1);
+        return;
+    }
 
-    // No spec assertion is being checked — the non-IRQ device_region
-    // handle the assertion would read from is not in the test child's
-    // capability table. Pass with assertion id 0 to mark this slot as
-    // smoke-only in coverage.
+    const cap_post = caps.readCap(cap_table_base, dev_handle);
+    if (cap_post.field1 != 0) {
+        // Spec violation: a device with no IRQ delivery configured
+        // must observe field1.irq_count == 0.
+        testing.fail(2);
+        return;
+    }
+
     testing.pass();
+}
+
+// Scan the child cap_table for an mmio device_region whose `phys_base`
+// matches `target_phys_base`. Mirrors the runner's findFixtureMmio.
+// Spec §[device_region] field0 layout (mmio): bits 4-51 carry
+// paddr>>12; we shift back up by 12 to compare against the sentinel.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            // mmio = 0
+            if (dev_type == 0) {
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }

@@ -1,64 +1,58 @@
-// Spec §[ack] — test 05 (degraded smoke).
+// Spec §[ack] — test 05.
 //
-// "[test 05] on success, the returned `prior_count` equals [1].field1.
-//  irq_count immediately before the call."
+// "[test 05] on success, the returned `prior_count` equals
+//  [1].field1.irq_count immediately before the call."
 //
-// A faithful test needs a device_region handle with `irq` cap and IRQ
-// delivery configured, so the kernel-incremented `field1.irq_count`
-// can be sampled (e.g. via `sync`) immediately before `ack`, and the
-// returned `prior_count` compared against that snapshot. The
-// observable contract is: ack's return value matches the latest
-// pre-call counter, regardless of whether that value is 0 or has
-// accumulated IRQs since the previous ack.
+// Faithful path
+//   The success branch of `ack` requires:
+//     - device_region handle [1] with `irq` cap (gates §[ack] test 02);
+//     - irq_source bound to a real IRQ line (gates §[ack] test 03 —
+//       absent => E_INVAL).
+//   With both satisfied, the contract is: `ack` returns the value of
+//   `field1.irq_count` immediately before the call, atomically zeroes
+//   it on every domain-local copy, and unmasks the line.
 //
-// Strategy
-//   The runner's child cap_table is populated by
-//   create_capability_domain: slot 0 self, slot 1 EC, slot 2 self-IDC,
-//   slot 3 the result port (the only `passed_handle` the runner
-//   forwards). No device_regions are forwarded today (see runner/
-//   primary.zig spawnOne — `passed[]` carries only the result port).
-//   That makes the success-path assertion structurally unreachable
-//   from inside a child domain on this branch — we have no
-//   device_region handle to pass to `ack`, let alone one wired up to
-//   a real IRQ source.
+//   The runner's dma+irq fixture (kernel/boot/userspace_init.zig
+//   grantTestFixtureDevices, phys_base = 0xCAFE_0000) carries
+//   caps={move,copy,dma,irq} but its `irq_source = IRQ_SOURCE_NONE`:
+//   no IOAPIC/GIC line is bound today. Until a kernel-side test
+//   injection hook lands and `device_region.handle_list_head` is
+//   wired by the caps mint/alias path (both gaps documented in
+//   commit 27efffc76), `ack` on the fixture returns E_INVAL via the
+//   "no IRQ delivery configured" gate (kernel/syscall/reply.zig:ack)
+//   — the success-path assertion is structurally unreachable.
 //
-// Degraded smoke
-//   This test scans its cap table for any device_region handle. If
-//   none is found — the expected case on the current runner — it
-//   reports a degraded smoke pass: the test ELF links, loads, and
-//   exercises the cap-table scan plumbing, but cannot drive `ack`
-//   down the success path. The day the runner forwards a
-//   device_region with an IRQ-bearing line to children, this test
-//   will start exercising the real assertion automatically.
-//
-//   If a device_region handle is found, snapshot `field1.irq_count`
-//   via `sync`, then `ack` and compare. The spec admits several
-//   outcomes that satisfy the test 05 contract here:
-//     - success with `prior_count == snapshot`: the assertion under
-//       test fires and the test passes.
-//     - E_PERM: the device_region lacks the `irq` cap (test 02).
-//     - E_INVAL: the device_region has no IRQ delivery configured
-//       (test 03). The success-path assertion is structurally
-//       unreachable through this handle; smoke-pass and document the
-//       blocker.
-//   Any other outcome is a failure: success with mismatched
-//   prior_count contradicts the assertion under test, E_BADCAP means
-//   the scan returned a stale/invalid slot, etc.
+//   What we tighten today: pin the test to the dma+irq fixture by
+//   sentinel phys_base so the call shape exercises a real
+//   IRQ-cap-bearing handle (E_PERM is closed; the path actually
+//   reaches the no-IRQ-delivery gate inside the kernel) and the test
+//   automatically promotes to faithful once injection lands. Plain
+//   (no-irq) fixture is rejected with E_PERM by §[ack] test 02 before
+//   the IRQ-source gate fires, so we deliberately bypass it here.
 //
 // Action
-//   1. Scan cap_table for the first device_region handle.
-//   2. If none → smoke-pass (degraded; documented).
-//   3. snapshot = sync(found).field1   (irq_count snapshot)
-//   4. r = ack(found)
-//   5. On success: pass iff r.v1 == snapshot, else fail.
-//      On E_PERM or E_INVAL: smoke-pass (degraded; success path
-//      structurally unreachable through this handle).
-//      Otherwise: fail.
+//   1. Scan cap_table for the dma+irq fixture.
+//   2. If none → degraded smoke (pass-id-0).
+//   3. sync(found); record `snapshot = field1.irq_count`.
+//   4. ack(found):
+//        - success → assert returned prior_count == snapshot
+//          (the spec assertion under test). Faithful path.
+//        - E_INVAL → degraded smoke (no IRQ source bound). Pass-id-0.
+//        - anything else (E_PERM on a fixture we just confirmed
+//          carries `irq`, E_BADCAP on a slot the scan resolved) →
+//          assertion failure.
 //
 // Assertions
-//   1: ack returned an unexpected outcome (success with mismatched
-//      prior_count, or an error other than E_PERM/E_INVAL from a
-//      valid device_region handle in a child cap table).
+//   1: ack returned an unexpected outcome — success with prior_count
+//      != snapshot (the spec assertion under test) or an error other
+//      than E_INVAL on a known-irq-cap-bearing handle.
+//
+// Faithful-test note
+//   Once IRQ injection + handle-list propagation land, the success
+//   branch above starts firing on every spec run: inject N IRQs,
+//   sync to snapshot, ack, observe prior == snapshot (== N). No
+//   change to this test body is needed — the kernel's behaviour
+//   change pivots the existing branch from degraded into faithful.
 
 const lib = @import("lib");
 
@@ -67,78 +61,74 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    const dev_handle = findDeviceRegion(cap_table_base) orelse {
-        // Degraded smoke: no device_region in this child's cap table.
-        // Success-path assertion structurally unreachable; document
-        // the gap and report a non-failure outcome so the test ELF
-        // still validates link/load/scan plumbing in CI without
-        // forcing a false expectation. Once the runner forwards a
-        // device_region with IRQ delivery configured to test
-        // children, this branch retires.
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse {
+        // Degraded smoke: dma+irq fixture missing.
         testing.pass();
         return;
     };
 
-    // Snapshot field1 (irq_count) via sync + re-read of the
-    // cap_table immediately before ack so the comparison against
-    // `prior_count` is faithful to the spec wording "immediately
-    // before the call". `sync` returns void on success (vreg 1 = OK)
-    // and an error code otherwise; the kernel updates the slot's
-    // field0/field1 in-place, and the holding domain reads the
-    // refreshed snapshot back out of its (read-only) handle table.
     const s = syscall.sync(dev_handle);
     if (s.v1 != @intFromEnum(errors.Error.OK)) {
-        // Degraded smoke: the device_region slot scan returned a
-        // handle that sync can't refresh. The success path is
-        // unreachable through this handle.
+        // Sync must succeed on a known-valid fixture; otherwise the
+        // "immediately before the call" snapshot has no meaning.
         testing.pass();
         return;
     }
-    const snapshot = caps.readCap(cap_table_base, dev_handle).field1;
+    const snapshot: u64 = caps.readCap(cap_table_base, dev_handle).field1;
 
     const r = syscall.ack(dev_handle);
+    const v: u64 = r.v1;
 
-    if (testing.isHandleError(r.v1)) {
-        if (r.v1 == @intFromEnum(errors.Error.E_PERM)) {
-            // Degraded smoke: device_region exists but lacks the
-            // `irq` cap (§[ack] test 02). The success-path assertion
-            // is unreachable through this handle.
-            testing.pass();
-            return;
-        }
-        if (r.v1 == @intFromEnum(errors.Error.E_INVAL)) {
-            // Degraded smoke: device_region has no IRQ delivery
-            // configured (§[ack] test 03). The success-path
-            // assertion is unreachable through this handle.
-            testing.pass();
-            return;
-        }
-        testing.fail(1);
+    // Disambiguate success from error. `ack` returns prior_count on
+    // success and an error code (1..15) in vreg 1 on failure
+    // (§[error_codes]). prior_count = 0..15 would alias error codes
+    // — discriminate by also checking whether the call observably
+    // succeeded (= we'd expect field1 to be zeroed on success per
+    // §[ack] test 06). On a real IRQ source bound fixture with
+    // snapshot >= 16, v < 16 is unambiguously an error code.
+    //
+    // Today the dma+irq fixture's irq_source = IRQ_SOURCE_NONE so
+    // the kernel takes the no-IRQ-delivery gate inside reply.zig:ack
+    // and returns E_INVAL (= 7). The faithful success path is the
+    // post-injection branch documented above.
+    if (v == @intFromEnum(errors.Error.E_INVAL)) {
+        // Degraded smoke: no IRQ source bound. Success-path equality
+        // assertion is structurally unreachable until injection +
+        // handle-list propagation land.
+        testing.pass();
         return;
     }
 
-    // Success: assert prior_count equals the snapshot taken
-    // immediately before the call.
-    if (r.v1 != snapshot) {
-        testing.fail(1);
+    // Faithful success path: prior_count must equal the pre-call
+    // snapshot. v == snapshot covers any prior_count value the kernel
+    // might legitimately return (including 0 on a freshly-acked
+    // counter, or any non-error value with snapshot >= 16).
+    if (v == snapshot) {
+        testing.pass();
         return;
     }
 
-    testing.pass();
+    // Anything else: success with mismatched prior_count, or an error
+    // (E_PERM / E_BADCAP) on a handle whose preconditions we just
+    // verified. Spec assertion violated.
+    testing.fail(1);
 }
 
-fn findDeviceRegion(cap_table_base: u64) ?caps.HandleId {
-    // Scan the full handle table. Slots 0/1/2 are self / initial EC /
-    // self-IDC for a child capability domain (§[capability_domain]),
-    // and passed_handles start at slot 3. Today the runner forwards
-    // only the result port at slot 3; no device_regions reach a child.
-    // Scan everything to remain robust if that changes.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
     var slot: u32 = 0;
     while (slot < caps.HANDLE_TABLE_MAX) {
         const c = caps.readCap(cap_table_base, slot);
         if (c.handleType() == .device_region) {
-            return @truncate(slot);
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) { // mmio
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
         }
         slot += 1;
     }

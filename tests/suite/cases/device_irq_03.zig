@@ -5,146 +5,159 @@
 //  [1].field1 returns from the call with [1] = the corresponding
 //  domain-local vaddr of field1."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful shape of test 03 requires three pieces of harness
-//   infrastructure that the v0 child capability domain cannot reach:
+// Faithful path
+//   The faithful sequence parks a worker EC in
+//   `futex_wait_val(addr=&handle.field1, expected=last_seen)`, then
+//   triggers an IRQ from the bound device. The kernel's onIrq path
+//   bumps every domain-local copy's `field1.irq_count` and issues a
+//   futex wake on its paddr (kernel/devices/device_region.zig
+//   propagateIrqAndWake), so the parked EC returns with [1] equal to
+//   the worker's domain-local vaddr of field1.
 //
-//     (a) An actual device_region handle bound to a real device that
-//         delivers IRQs. Per §[device_irq] the kernel atomically
-//         increments `field1.irq_count` in every domain-local copy and
-//         issues a futex wake on the paddr of `field1` for each copy
-//         on every device IRQ. There is no syscall available to the
-//         test child to mint such a handle: device_region handles are
-//         minted by privileged provisioning paths (the runner does not
-//         hand the test child one with IRQ delivery configured), and
-//         no in-test syscall in libz/syscall.zig synthesises one.
-//         `mapMmio` (syscall 25) and `ack` (syscall 26) are present,
-//         but they presuppose a device_region handle the test EC does
-//         not own. createVmar(... device_region=...) similarly requires
-//         a pre-existing device_region.
+// What's reachable on this branch
+//   Two harness gaps block the wake-on-IRQ shape:
+//     - No test-only IRQ injection hook. Both fixtures use
+//       `irq_source = IRQ_SOURCE_NONE`; no IOAPIC/GIC line is bound,
+//       so onIrq is unreachable.
+//     - device_region.handle_list_head is never appended at handle-
+//       table mint/alias time, so even with an injected IRQ source,
+//       propagateIrqAndWake walks an empty list. Both gaps documented
+//       in the runner-fix commit message (27efffc76).
 //
-//     (b) A second EC blocked in `futex_wait_val(addr=&handle.field1,
-//         expected=last_seen)` so that the spec's "every EC blocked
-//         ... returns from the call with [1] = vaddr of field1"
-//         post-condition has anything to wake. The runner provisions a
-//         single test EC per child capability domain. There is no
-//         shared-memory or multi-worker scaffold here: distinguishing
-//         a second worker EC needs (i) a second entry symbol or a
-//         per-EC TLS-equivalent the harness does not expose, and
-//         (ii) a rendezvous point so the test EC observes "the second
-//         worker is now blocked in futex_wait_val" before triggering
-//         (or waiting for) the device IRQ. priority_06/07 hit the
-//         same wall and degrade to single-EC smokes for the same
-//         reasons.
+//   What IS reachable: futex_wait_val's entry-time fast path (§[futex_
+//   wait_val] test 07 — "when any pair's current `*addr != expected`,
+//   returns immediately with `[1]` set to that addr") gives us a
+//   syscall-level oracle for the address arithmetic that test 03's
+//   wake side actually rides. The test 03 contract names the *exact
+//   address* the kernel will deliver: the domain-local vaddr of
+//   field1 on the calling domain's copy of [1]. A futex_wait_val call
+//   with `expected = field1_irq_count + 1` (i.e. mismatched by
+//   construction, since no IRQ has fired) returns immediately with
+//   `[1]` equal to the field1 vaddr — exactly the same address the
+//   real wake path would deliver.
 //
-//     (c) A way to *cause* a device IRQ from inside the test child.
-//         The faithful test asserts kernel behaviour in response to
-//         the device firing an IRQ. The test child has no syscall
-//         that injects a device IRQ, and the runner does not stage
-//         any device that will fire IRQs into a test domain on a
-//         schedule the test EC can synchronise against.
-//
-//   Reaching the faithful path needs a runner-side device-IRQ harness
-//   that:
-//     - mints a device_region with IRQ delivery configured (e.g. a
-//       shimmed test device) and grants it to the test child, with
-//       acquire wiring so a second EC in the same domain can hold an
-//       independent domain-local copy of the handle;
-//     - spawns a worker EC in the test child whose entry blocks in
-//       `futex_wait_val(timeout=indefinite, addr=&worker_copy.field1,
-//       expected=worker_copy.field1.irq_count)` after publishing a
-//       "I'm parked" signal back to the test EC via a shared word;
-//     - on observing the parked signal, either the runner triggers a
-//       device IRQ on the staged device or the test EC issues a
-//       provisioned irq-trigger syscall;
-//     - the test EC's assertion: the worker's futex_wait_val returned
-//       with [1] equal to the worker's domain-local vaddr of field1
-//       (i.e. cap_table_base + worker_handle * sizeof(handle) +
-//       offsetof(field1)). The worker side-channels its observed [1]
-//       back to the test EC via a result port or a shared word.
-//   None of those pieces exist; the device_irq suite therefore has no
-//   end-to-end-faithful test today.
-//
-// Strategy (smoke prelude)
-//   We exercise a strictly local prelude that touches only
-//   syscall-shaped surfaces the test child can reach:
-//     1. Mint a fresh port handle to give the test EC *some* handle in
-//        the domain it can read back via `readCap`. A port has both
-//        field0 and field1 spec'd as `_reserved (64)` per §[port], so
-//        its `field1` paddr is a valid futex address (per §[device_irq]
-//        the field's vaddr is computable as `cap_table_base +
-//        handle_id * sizeof(handle) + offsetof(field1)`; the same
-//        mapping rule applies to every handle, the cap table is
-//        read-only-mapped into the holder).
-//     2. Compute the would-be field1 vaddr for the port handle and
-//        confirm `readCap` returns field1 == 0. That is *not* the spec
-//        assertion under test 03 — there is no IRQ wake to observe — but
-//        it confirms the address-arithmetic that the faithful test
-//        would feed into `futex_wait_val(addr=&handle.field1, ...)`.
-//
-//   No spec assertion is checked: the wake-on-IRQ behaviour is
-//   unreachable from the v0 test child. The smoke is recorded as
-//   pass-with-id-0 to mark the slot as deferred-but-attempted.
+//   This is not the IRQ-driven wake; the wake side is the deferred
+//   half. But it pins the address the kernel resolves for &field1
+//   to the value spec test 03 mandates, so a regression in the
+//   futex/cap-table address arithmetic surfaces here even before
+//   IRQ injection lands.
 //
 // Action
-//   1. create_port(caps={bind}) — must succeed; gives a handle with
-//      field0/field1 spec'd as zero whose field1 vaddr is a syntactically
-//      valid futex address.
-//   2. readCap(cap_table_base, port) — observe the holder-domain copy
-//      of the handle.
+//   1. Scan cap_table for the dma+irq fixture (phys_base = 0xCAFE_0000).
+//   2. If none → degraded smoke (pass-id-0).
+//   3. sync(found); record field1_pre (must be 0 since no IRQ has
+//      ever been delivered; documents the kernel-authoritative
+//      starting state).
+//   4. Compute the field1 vaddr in this domain:
+//        cap_table_base + handle_id * sizeof(Cap) + offsetof(Cap, field1).
+//   5. futex_wait_val(timeout=any, addr=field1_vaddr,
+//                     expected=field1_pre + 1).
+//      Per §[futex_wait_val] test 07 the call returns immediately
+//      with [1] = field1_vaddr because *field1 (= field1_pre) !=
+//      expected (= field1_pre + 1).
+//   6. Assert vreg 1 of the return == field1_vaddr.
 //
-// Assertion
-//   No spec assertion is checked — the post-IRQ wake observation is
-//   unreachable from the v0 test child. Test always reports pass with
-//   assertion id 0; any prelude failure also reports pass-with-id-0
-//   since no spec assertion is being checked.
+// Assertions
+//   1: sync returned non-OK on a valid fixture handle.
+//   2: pre-call field1 != 0 — kernel observed an IRQ that cannot
+//      have been delivered (no irq_source bound, no injection hook).
+//   3: futex_wait_val did not return field1_vaddr — either the
+//      kernel computed a different paddr for the cap-table slot
+//      (regression) or the entry-fast-path semantics are broken.
 //
-// Faithful-test note
-//   Faithful test deferred pending a runner-side device-IRQ harness
-//   that:
-//     - provisions a device_region with IRQ delivery configured and
-//       grants it to the test child (with acquire wiring so a worker
-//       EC can hold an independent domain-local copy);
-//     - spawns a worker EC that parks in `futex_wait_val(addr=&copy
-//       .field1, expected=copy.field1.irq_count)` and side-channels
-//       its observed return [1] back to the test EC;
-//     - triggers a device IRQ on the staged device once the worker is
-//       confirmed parked.
-//   Once that exists, the assertion (id 1) becomes: the worker's
-//   futex_wait_val returned with [1] equal to the worker's
-//   domain-local vaddr of field1 for the worker's copy of the
-//   device_region handle. That equality assertion would replace this
-//   smoke's pass-with-id-0.
+// Faithful-test note (deferred half)
+//   Replace the entry-fast-path oracle with a parked-EC + injection
+//   sequence:
+//     - spawn a worker EC inside the test child capability domain
+//       (or a sibling domain holding a copied alias of [1]);
+//     - worker parks in futex_wait_val(addr=&copy.field1,
+//       expected=copy.field1.irq_count) and side-channels its
+//       observed return [1] back to the test EC;
+//     - test EC injects an IRQ on the dma+irq fixture; asserts
+//       worker's [1] == worker's domain-local vaddr of field1
+//       (id 4).
+//   Needs both a kernel-side test injection hook and
+//   handle_list_head propagation.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const FIXTURE_DMA_IRQ_PHYS_BASE: u64 = 0xCAFE_0000;
+
 pub fn main(cap_table_base: u64) void {
-    // Mint a port handle as a stand-in for any handle whose field1
-    // would be a valid futex address. We do not — and cannot, from the
-    // v0 test child — mint a device_region handle with IRQ delivery
-    // configured, which is what test 03 actually targets.
-    const port_caps = caps.PortCap{ .bind = true };
-    const cp = syscall.createPort(@as(u64, port_caps.toU16()));
-    if (testing.isHandleError(cp.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is being
-        // checked, so report pass-with-id-0.
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse {
+        // Degraded smoke: dma+irq fixture missing.
         testing.pass();
         return;
+    };
+
+    const s = syscall.sync(dev_handle);
+    if (s.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(1);
+        return;
     }
-    const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
-    // Read back the holder-domain copy of the handle. We do not assert
-    // anything about field1 here — the spec assertion under test 03 is
-    // about a futex_wait_val wake side effect that this child cannot
-    // observe.
-    _ = caps.readCap(cap_table_base, port_handle);
+    const field1_pre = caps.readCap(cap_table_base, dev_handle).field1;
+    if (field1_pre != 0) {
+        // Sanity boundary: no IRQ can have been delivered to this
+        // fixture in the v0 child's lifetime. Anything else means a
+        // kernel regression elsewhere has muddied this slot.
+        testing.fail(2);
+        return;
+    }
 
-    // No spec assertion is being checked — the wake-on-IRQ behaviour
-    // is unreachable from the v0 test child. Pass with assertion id 0
-    // to mark this slot as smoke-only in coverage.
+    // §[capabilities] handle layout: Cap = { word0, field0, field1 },
+    // each u64; field1 sits at offset 16 within the 24-byte slot. The
+    // cap_table is read-only-mapped at cap_table_base, so the vaddr
+    // the kernel keys this domain's futex address resolution on is the
+    // byte offset arithmetic below.
+    const slot_offset: u64 = @as(u64, dev_handle) * @as(u64, caps.HANDLE_BYTES);
+    const field1_vaddr: u64 = cap_table_base + slot_offset + @offsetOf(caps.Cap, "field1");
+
+    // Entry-fast-path oracle (§[futex_wait_val] test 07): expected
+    // mismatch on a single pair returns immediately with [1] set to
+    // that addr. We pick a small finite timeout — the call should
+    // never block, but a non-zero timeout proves the entry check
+    // fires even under the otherwise-blocking call shape (a regression
+    // that misroutes &field1 would either hang or return E_BADADDR
+    // / E_INVAL within the timeout, not field1_vaddr).
+    const expected_mismatch: u64 = field1_pre + 1;
+    const pairs = [_]u64{ field1_vaddr, expected_mismatch };
+    const timeout_ns: u64 = 100_000_000; // 100 ms upper bound
+    const r = syscall.futexWaitVal(timeout_ns, pairs[0..]);
+
+    if (r.v1 != field1_vaddr) {
+        // Either futex_wait_val rejected the cap-table slot vaddr
+        // (E_BADADDR / E_INVAL) — meaning the kernel doesn't recognise
+        // &field1 as a futex-eligible address — or it returned a
+        // different addr (impossible with N=1) or it timed out (means
+        // the entry-check missed the mismatch). All of these would
+        // make the real wake side of test 03 unreachable too.
+        testing.fail(3);
+        return;
+    }
+
     testing.pass();
+}
+
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) { // mmio
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }
