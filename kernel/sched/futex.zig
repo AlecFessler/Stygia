@@ -4,7 +4,8 @@
 //! The kernel hashes the watched physical address into one of
 //! `BUCKET_COUNT` buckets, each holding a priority-ordered intrusive
 //! queue of `WaitNode`s. A multi-address wait allocates one `WaitNode`
-//! per watched address on the EC's own kernel stack, so the EC
+//! per watched address out of the EC's own
+//! `futex_wait_nodes_storage[MAX_FUTEX_ADDRS]` array, so the EC
 //! simultaneously occupies N independent bucket chains without aliasing
 //! a shared link — the per-bucket queues cannot cross-pollute the way
 //! they would if every bucket reached for the same EC link slot.
@@ -35,10 +36,11 @@ pub const MAX_FUTEX_ADDRS = 63;
 // UINT64_MAX is far enough in the future to be unambiguous.
 const FUTEX_TIMEOUT_SENTINEL: u64 = ~@as(u64, 0);
 
-/// Per-(EC, bucket) wait entry. Allocated on the waiting EC's kernel
-/// stack — one per address in a multi-address wait — and threaded into
-/// bucket queues via its own `next` field. Each node carries its own
-/// link slot so multi-address waits cannot cross-pollute the chains.
+/// Per-(EC, bucket) wait entry. Allocated out of the waiting EC's
+/// `futex_wait_nodes_storage[MAX_FUTEX_ADDRS]` array — one per address
+/// in a multi-address wait — and threaded into bucket queues via its
+/// own `next` field. Each node carries its own link slot so
+/// multi-address waits cannot cross-pollute the chains.
 pub const WaitNode = struct {
     ec: SlabRef(ExecutionContext),
     paddr: PAddr,
@@ -54,9 +56,13 @@ const WaitNodePriorityQueue = zag.sched.priority_queue.PriorityQueue(
 );
 
 /// `Bucket.lock` ordered_group. Multi-bucket waits and the wake-side
-/// cross-bucket cleanup both hold two `Bucket.lock` instances at once;
-/// `sortByBucket` (waits) and the `except_idx` skip in
-/// `removeNodesExcept` (wake) keep acquisition AB-BA-free.
+/// cross-bucket cleanup both hold multiple `Bucket.lock` instances at
+/// once; both paths sort their target bucket indices into ascending
+/// order before acquiring (`sortByBucket` for the wait paths,
+/// `removeNodesExcept` for the wake path), and the wake path skips the
+/// `held_idx` slot it already owns. A single global ordering across all
+/// futex `Bucket.lock` acquisitions keeps the graph AB-BA-free, which
+/// is what this `ordered_group` tag asserts.
 const FUTEX_BUCKET_GROUP: u32 = 1;
 
 const Bucket = struct {
@@ -124,9 +130,9 @@ fn removeTimedWaiter(ec: *ExecutionContext) void {
 /// WaitNode owned by `ec` from its bucket queue(s) and drop the
 /// timed_waiters slot if registered. Called from `terminate` /
 /// `destroyExecutionContextLocked` when the dying EC is in
-/// `.futex_wait` — the WaitNodes live on `ec`'s kernel stack, and
-/// freeing the kstack later (via `stack.destroyKernel`) leaves the
-/// bucket queues holding pointers into unmapped pages, faulting the
+/// `.futex_wait` — the WaitNodes live in `ec.futex_wait_nodes_storage`,
+/// and freeing the EC slab later leaves the bucket queues holding
+/// pointers into a recycled struct, faulting (or worse, mis-waking) the
 /// next `wake()` that walks the bucket.
 ///
 /// Safe to call after `ec.state` is no longer `.futex_wait` — the loop
@@ -156,32 +162,65 @@ pub fn cancelWait(ec: *ExecutionContext) void {
 /// by `held_idx`; pass an out-of-range value if none is held). Same-
 /// bucket nodes other than `except_node` are removed under the held
 /// lock without re-acquisition.
+///
+/// Acquires sibling-bucket locks in strict ascending bucket-index
+/// order to match the global ordering used by `acquireBucketLocks`.
+/// This is required: two concurrent wakes on different paddrs (e.g.
+/// IRQ-driven wakes on two cores) can each hold a different `held_idx`
+/// while reaching across to clean up the same EC's other nodes; a
+/// storage-order traversal would seed a classic AB-BA cycle. The skip
+/// of `held_idx` plus ascending acquisition of the rest keeps the
+/// wake-side acquisition graph identical to the wait-side one.
 fn removeNodesExcept(ec: *ExecutionContext, except_node: *const WaitNode, held_idx: usize) void {
     const nodes = ec.futex_wait_nodes orelse return;
     const count: usize = ec.futex_bucket_count;
-    var i: usize = 0;
-    while (i < count) {
-        const node = &nodes[i];
-        if (node == except_node) {
-            i += 1;
-            continue;
+
+    // Insertion-sort the surviving nodes' storage indices by bucket
+    // index ascending. `count <= MAX_FUTEX_ADDRS = 63`, so quadratic
+    // sort is fine and keeps the routine allocation-free.
+    var sorted: [MAX_FUTEX_ADDRS]u8 = undefined;
+    var n: usize = 0;
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        if (&nodes[k] == except_node) continue;
+        sorted[n] = @intCast(k);
+        n += 1;
+    }
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        var j = i;
+        while (j > 0 and bucketIdx(nodes[sorted[j]].paddr) < bucketIdx(nodes[sorted[j - 1]].paddr)) {
+            const tmp = sorted[j];
+            sorted[j] = sorted[j - 1];
+            sorted[j - 1] = tmp;
+            j -= 1;
         }
-        const idx = bucketIdx(node.paddr);
+    }
+
+    // Walk the sorted list. Coalesce contiguous same-bucket entries
+    // under one lock acquisition; skip the bucket the caller already
+    // holds, removing those entries under the held lock.
+    var p: usize = 0;
+    while (p < n) {
+        const idx = bucketIdx(nodes[sorted[p]].paddr);
+        var q: usize = p + 1;
+        while (q < n and bucketIdx(nodes[sorted[q]].paddr) == idx) q += 1;
         const bucket = &buckets[idx];
         if (idx == held_idx) {
-            _ = bucket.pq.remove(node);
+            var r: usize = p;
+            while (r < q) : (r += 1) _ = bucket.pq.remove(&nodes[sorted[r]]);
         } else {
-            // Caller (wake) already holds buckets[held_idx].lock; this
-            // is a second `Bucket.lock` acquisition in the same class.
-            // The `idx == held_idx` skip above plus the strict
-            // bucket-index ordering used by `acquireBucketLocks` keeps
-            // the global acquisition graph AB-BA-free, so opt out of
-            // the same-class overlap panic via FUTEX_BUCKET_GROUP.
+            // Second `Bucket.lock` acquisition in the same class; the
+            // ascending bucket-index ordering above (matching
+            // `acquireBucketLocks`) keeps the global graph AB-BA-free,
+            // so opt out of the same-class overlap panic via
+            // FUTEX_BUCKET_GROUP.
             const birq = bucket.lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
-            _ = bucket.pq.remove(node);
+            var r: usize = p;
+            while (r < q) : (r += 1) _ = bucket.pq.remove(&nodes[sorted[r]]);
             bucket.lock.unlockIrqRestore(birq);
         }
-        i += 1;
+        p = q;
     }
 }
 
@@ -216,10 +255,11 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
             continue;
         }
 
-        // caller-pinned: the node lives on the waiting EC's kernel stack
-        // — the EC cannot have been freed while this node is still in
-        // our bucket. The gen-locked SlabRef is for tooling uniformity
-        // and the implicit liveness assertion.
+        // caller-pinned: the node lives in the waiting EC's
+        // `futex_wait_nodes_storage` array — the EC cannot have been
+        // freed while this node is still in our bucket. The gen-locked
+        // SlabRef is for tooling uniformity and the implicit liveness
+        // assertion.
         const ec_lr = node.ec.lockIrqSave(@src()) catch continue;
         const ec = ec_lr.ptr;
         node.ec.unlockIrqRestore(ec_lr.irq_state);

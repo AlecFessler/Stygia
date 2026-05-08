@@ -65,7 +65,7 @@ fn readSelfHasFutWake(domain_ref: SlabRef(CapabilityDomain)) bool {
 ///
 /// ```
 /// futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
-///   syscall_num = 43
+///   syscall_num = 57
 ///
 ///   syscall word bits 12-19: N (1..63)
 ///
@@ -129,7 +129,7 @@ pub fn futexWaitVal(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64
 ///
 /// ```
 /// futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] addr
-///   syscall_num = 44
+///   syscall_num = 58
 ///
 ///   syscall word bits 12-19: N (1..63)
 ///
@@ -188,7 +188,7 @@ pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) 
 ///
 /// ```
 /// futex_wake([1] addr, [2] count) -> [1] woken
-///   syscall_num = 45
+///   syscall_num = 59
 ///
 ///   [1] addr: 8-byte-aligned user address in the caller's domain
 ///   [2] count: maximum number of ECs to wake
