@@ -398,7 +398,17 @@ pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i6
             return errors.E_BADCAP;
         const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
 
-        const rc = mappingInstall(v, offset, pf);
+        // Spec §[var].map_pf test 12: effective PTE perms must equal
+        // `VMAR.cur_rwx ∩ page_frame.r/w/x`. PageFrame caps live in the
+        // calling domain's user_table at the handle's slot — read them
+        // here so `mappingInstall` can intersect per page.
+        const pf_caps_word: u16 = Word0.caps(domain.user_table[pf_slot].word0);
+        const pf_caps: PageFrameCaps = @bitCast(pf_caps_word);
+        const pf_rwx: u3 = (@as(u3, @intFromBool(pf_caps.r))) |
+            (@as(u3, @intFromBool(pf_caps.w)) << 1) |
+            (@as(u3, @intFromBool(pf_caps.x)) << 2);
+
+        const rc = mappingInstall(v, offset, pf, pf_rwx);
         if (rc != 0) return rc;
 
         i += 2;
@@ -1015,8 +1025,11 @@ var aslr_fallback_counter: u64 = 0;
 
 /// Install a page_frame at offset, increments mapcnt, programs PTE or
 /// IOMMU PTE. Spec §[var].map_pf — installs every page in the page
-/// frame contiguously starting at `offset`.
-fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame) i64 {
+/// frame contiguously starting at `offset`. `pf_rwx` carries the
+/// page_frame handle's `r/w/x` caps from the calling domain; spec
+/// §[var].map_pf test 12 requires effective PTE perms =
+/// `VMAR.cur_rwx ∩ page_frame.r/w/x`.
+fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     // caller-pinned: VMAR's domain is its owner.
     const domain = v.domain.ptr;
     const slot_idx = handleSlotOf(v, domain);
@@ -1025,7 +1038,11 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame) i64 {
     else
         0;
     const vmar_caps: VmarCaps = @bitCast(caps_word);
-    const perms = rwxToPerms(v.cur_rwx);
+    // PageFrame caps are uniform across all pages of the frame (caps
+    // live on the handle, not per-page), so a single intersection covers
+    // every PTE installed below.
+    const effective_rwx: u3 = v.cur_rwx & pf_rwx;
+    const perms = rwxToPerms(effective_rwx);
     const pf_sz_bytes = pageSizeBytes(pf.sz);
 
     // Reserve a slot in the inline installed-pf table before touching
