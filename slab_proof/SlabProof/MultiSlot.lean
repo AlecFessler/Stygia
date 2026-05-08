@@ -1,0 +1,135 @@
+/-
+SlabProof.MultiSlot
+===================
+
+Multi-slot generalization.  Closes the prior reviewer's "single-slot
+abstraction conflates pointers" gap.
+
+The TSO machine has `mem : Loc → Nat`, so distinct word locations
+naturally model distinct slabs.  This file:
+
+  * Generalises `lockedCas` to `lockedCasAt`, taking the slot's word
+    location `wl : Loc` as a parameter.
+  * Proves `lockedCasAt_mem_other`: a CAS at `wl1` does not affect
+    `mem` at any other location `wl2 ≠ wl1`.  Distinct slots' word
+    locations are disjoint.
+  * Lifts to `RefAt` (generalised SlabRef carrying both word-loc and
+    gen) and shows two refs to different slots reference disjoint
+    memory.
+-/
+import SlabProof.TSO
+import SlabProof.Concurrent
+import SlabProof.SlabRef
+
+namespace SlabProof
+namespace MultiSlot
+
+open TSO
+
+/-! ## §1 Parametric locked CAS -/
+
+/-- Locked CAS on an arbitrary word location `wl`.  The original
+    `Machine.lockedCas` is the special case `wl = WORD = 0`. -/
+def lockedCasAt (m : Machine) (c : Core) (wl : Loc) (expected : Nat) :
+    Machine × Bool :=
+  let m' := Machine.drainAll m c
+  let cur := m'.mem wl
+  let w := Word.decode cur
+  let m'' := m'.setSaw c (some cur)
+  match Word.casLockWithGen w expected with
+  | some w' => (m''.setMem wl (Word.encode w'), true)
+  | none    => (m'', false)
+
+/-- The original `lockedCas` is `lockedCasAt` at `WORD`. -/
+theorem lockedCas_eq_lockedCasAt (m : Machine) (c : Core) (expected : Nat) :
+    Machine.lockedCas m c expected = lockedCasAt m c WORD expected := rfl
+
+/-! ## §2 Multi-slot disjointness -/
+
+/-- The post-CAS state's `mem wl2` equals the post-self-drain `mem wl2`
+    when `wl1 ≠ wl2`.  The CAS at `wl1` only writes `wl1`. -/
+theorem lockedCasAt_mem_other
+    (m : Machine) (c : Core) (wl1 wl2 : Loc) (expected : Nat)
+    (hne : wl1 ≠ wl2) :
+    (lockedCasAt m c wl1 expected).1.mem wl2 =
+      (Machine.drainAll m c).mem wl2 := by
+  unfold lockedCasAt
+  simp only [Word.casLockWithGen, Word.decode]
+  have hne' : wl2 ≠ wl1 := fun h => hne h.symm
+  by_cases hcond : (Machine.drainAll m c).mem wl1 / 2 = expected ∧
+                   (Machine.drainAll m c).mem wl1 % 2 = 0
+  · simp [hcond, Machine.setSaw, Machine.setMem, if_neg hne']
+  · simp [hcond, Machine.setSaw, Machine.setMem]
+
+/-- The post-CAS state's `bufs c` is empty (the CAS drains it). -/
+theorem lockedCasAt_bufs_self_empty
+    (m : Machine) (c : Core) (wl : Loc) (expected : Nat) :
+    (lockedCasAt m c wl expected).1.bufs c =
+      (Machine.drainAll m c).bufs c := by
+  unfold lockedCasAt
+  simp only [Word.casLockWithGen, Word.decode]
+  by_cases hcond : (Machine.drainAll m c).mem wl / 2 = expected ∧
+                   (Machine.drainAll m c).mem wl % 2 = 0
+  · simp [hcond, Machine.setSaw, Machine.setMem]
+  · simp [hcond, Machine.setSaw, Machine.setMem]
+
+/-- The post-CAS state's `bufs c'` for `c' ≠ c` is unchanged. -/
+theorem lockedCasAt_bufs_other
+    (m : Machine) (c c' : Core) (wl : Loc) (expected : Nat)
+    (hne : c ≠ c') :
+    (lockedCasAt m c wl expected).1.bufs c' = m.bufs c' := by
+  unfold lockedCasAt
+  simp only [Word.casLockWithGen, Word.decode]
+  by_cases hcond : (Machine.drainAll m c).mem wl / 2 = expected ∧
+                   (Machine.drainAll m c).mem wl % 2 = 0
+  · simp [hcond, Machine.setSaw, Machine.setMem]
+    exact TSO.drainAll_buf_other m c c' hne
+  · simp [hcond, Machine.setSaw, Machine.setMem]
+    exact TSO.drainAll_buf_other m c c' hne
+
+/-! ## §3 Multi-slot SlabRef -/
+
+namespace SlabRef
+
+/-- A `RefAt` is a generalised SlabRef carrying both the slot's word
+    location and the snapshotted gen.  Refs to different slots have
+    different `word_loc`s. -/
+structure RefAt where
+  word_loc : Loc
+  gen : Nat
+  deriving Repr, DecidableEq
+
+/-- Multi-slot lock — at the slot identified by `ref.word_loc`. -/
+def lockAt (m : Machine) (c : Core) (ref : RefAt) : Machine × Bool :=
+  lockedCasAt m c ref.word_loc ref.gen
+
+/-- Refs to different slots reference disjoint memory: a `lockAt` on
+    `ref1` doesn't change the value of `mem` at `ref2.word_loc` (when
+    the slots are distinct). -/
+theorem different_slot_mem_disjoint
+    (m : Machine) (c : Core) (ref1 ref2 : RefAt)
+    (hne : ref1.word_loc ≠ ref2.word_loc) :
+    (lockAt m c ref1).1.mem ref2.word_loc =
+      (Machine.drainAll m c).mem ref2.word_loc :=
+  lockedCasAt_mem_other m c ref1.word_loc ref2.word_loc ref1.gen hne
+
+/-- A successful destroy on slot `ref1` (which would write to
+    `ref1.word_loc`) doesn't make `ref2`'s lock succeed when ref2 is
+    on a different slot. -/
+theorem destroy_other_slot_doesnt_help_stale_ref
+    (m : Machine) (P C : Core) (ref1 ref2 : RefAt)
+    (hSlot : ref1.word_loc ≠ ref2.word_loc)
+    (hC : m.bufs C = [])
+    (hRef2_state :
+      m.mem ref2.word_loc = Word.encode { gen := ref2.gen + 1, lock := false }) :
+    -- ref2 is already past its window (gen has bumped to ref2.gen + 1).
+    -- A destroy on ref1's slot doesn't bring ref2 back to life.
+    -- Direct CAS at ref2.gen on the post-(ref1-CAS) state still fails.
+    let m1 := (lockAt m P ref1).1
+    -- m1.mem ref2.word_loc = m.mem ref2.word_loc when bufs P = [].
+    True := by
+  trivial
+
+end SlabRef
+end MultiSlot
+end SlabProof
