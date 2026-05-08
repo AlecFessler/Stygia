@@ -88,8 +88,16 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // with caps = ec_inner_ceiling per spec §[create_capability_domain]
 // [test 21] — without these bits the child silently returns from
 // `testing.report` with E_PERM and the runner times out (MISS).
+//
+// CHILD_VMAR_INNER must include `r` (bit 2) and `x` (bit 4): libz
+// bootstrap in tests/suite/runner/start.zig calls
+// `createVmar(caps={r, x}, ...)` to map the libz image at
+// LIBZ_SLIDE before any extern wrapper is callable. Spec
+// §[create_vmar] [test 02] gates the requested r/w/x against the
+// caller's `vmar_inner_ceiling`, so a ceiling without r+x makes
+// the child halt immediately at startup (MISS).
 const CHILD_EC_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of EC inner caps (susp+read+write set)
-const CHILD_VMAR_INNER: u16 = 0x00AA; // strict subset of runner 0x01FF
+const CHILD_VMAR_INNER: u16 = 0x00BE; // strict subset of runner 0x01FF (copy|r|w|x|mmio|max_sz=2)
 const CHILD_CRIDC: u8 = 0x15; // strict subset of runner 0x3F (move|crec|aqvr)
 const CHILD_IDC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
 const CHILD_PF_CLG: u8 = 0x0F; // strict subset of runner 0x1F (max_rwx all + max_sz=01)
