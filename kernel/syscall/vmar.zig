@@ -7,6 +7,7 @@ const vmar = zag.memory.vmar;
 
 const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const VmarCaps = zag.memory.vmar.VmarCaps;
 const Word0 = capability.Word0;
 
 /// Self-handle slot. Spec §[capability_domain]: slot 0 is reserved for
@@ -100,10 +101,33 @@ pub fn createVmar(
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
+    // Spec §[capability_domain] self-handle field0 bits 8-23 carry
+    // `vmar_inner_ceiling` — the per-domain ceiling on every VmarCaps
+    // bit `create_vmar` may mint. Snapshot under the same lock so the
+    // tests-02/03/04 subset gates use a consistent view.
+    const vmar_inner_ceiling_word: u16 = @truncate((cd.user_table[SELF_HANDLE_SLOT].field0 >> 8) & 0xFFFF);
     cd_ref.unlockIrqRestore(lr.irq_state);
 
     // Spec §[create_vmar] test 01: caller's self-handle must carry `crvr`.
     if (!self_caps.crvr) return errors.E_PERM;
+
+    // Spec §[create_vmar] tests 02/03/04: ceiling-subset checks against
+    // `vmar_inner_ceiling`. Decoded from the same VmarCaps layout that
+    // `[1].caps` uses so r/w/x/max_sz/mmio align bit-for-bit.
+    const requested_caps: VmarCaps = @bitCast(@as(u16, @truncate(caps)));
+    const ceiling_caps: VmarCaps = @bitCast(vmar_inner_ceiling_word);
+    // Test 02: caps' r/w/x must be a subset of the ceiling's r/w/x.
+    if ((requested_caps.r and !ceiling_caps.r) or
+        (requested_caps.w and !ceiling_caps.w) or
+        (requested_caps.x and !ceiling_caps.x))
+    {
+        return errors.E_PERM;
+    }
+    // Test 03: caps.max_sz must not exceed the ceiling's max_sz. max_sz
+    // is a 2-bit numeric enum; `>` is a strict numeric comparison.
+    if (requested_caps.max_sz > ceiling_caps.max_sz) return errors.E_PERM;
+    // Test 04: caps.mmio = 1 requires the ceiling to permit mmio.
+    if (requested_caps.mmio and !ceiling_caps.mmio) return errors.E_PERM;
 
     return vmar.createVmar(ec, caps, props, pages, preferred_base, device_region);
 }
