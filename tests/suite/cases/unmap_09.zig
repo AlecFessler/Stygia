@@ -4,127 +4,100 @@
 //  device_region installation is removed and `device` is cleared
 //  to 0."
 //
-// DEGRADED SMOKE VARIANT
-//   The strict test 09 path requires landing the success leg of
-//   `unmap(var, &.{})` (N = 0) on a VMAR whose `map` is already 2.
-//   Reaching `map = 2` in the first place requires a successful
-//   `map_mmio` call (per §[map_mmio] test 06: `map` becomes 2 only
-//   on success), which itself requires a *valid* device_region
-//   handle in [2] (test 02). Per §[device_region], device_region
-//   handles are kernel-issued at boot to the root service and
-//   otherwise propagate via xfer/IDC.
+// Strategy
+//   To exercise the test 09 success leg every earlier §[unmap] gate
+//   must be inert and `map` must already be 2:
+//     - test 01 (invalid VMAR)         — pass a freshly-minted MMIO
+//                                        VMAR.
+//     - test 02 (`map` = 0)            — drive `map` to 2 via a
+//                                        successful map_mmio call
+//                                        before unmap.
+//     - test 03 (`map` = 2 + N > 0)    — call unmap with N = 0, the
+//                                        only N value the spec admits
+//                                        for `map = 2`.
 //
-//   The v0 runner (runner/primary.zig) spawns each test child with
-//   passed_handles carrying only the result port at slot 3 — no
-//   device_region is forwarded. The same `findCom1`-style scan that
-//   runner/serial.zig uses to bootstrap the primary's serial VMAR
-//   cannot succeed inside a test child, because the child's table
-//   holds self / initial_ec / self_idc / port and nothing else. So
-//   the "successful map_mmio first, then unmap clears the device
-//   field" path is unreachable: the prior map_mmio cannot succeed
-//   without a real device_region.
+//   Reaching `map = 2` requires a successful map_mmio call (§[map_mmio]
+//   test 06), which itself requires a *valid* device_region handle in
+//   [2] (test 02) whose size matches the MMIO VMAR's size (test 05).
+//   The runner forwards a boot-minted bare device_region (caps =
+//   {move, copy}, dev_type = mmio, sentinel phys_base 0xBABE_0000) to
+//   every test child via `passed_handles` (see runner/primary.zig).
+//   The fixture region is 4 KiB (size_pages = 1), matching a
+//   freshly-created MMIO VMAR with `pages = 1` and `sz = 0`. The bare
+//   fixture has neither `dma` nor `irq` caps — neither is needed for
+//   an mmio mapping.
 //
-//   With no construction landing `map = 2` on an MMIO VMAR from the
-//   test child, the strict test 09 success leg cannot be exercised
-//   end-to-end here.
+//   Per §[map_mmio] test 07, on success `field1.device` is set to
+//   [2]'s handle id. After the unmap call (with N = 0 on a
+//   `map = 2` VMAR), §[unmap] test 09 requires `device` to be
+//   cleared to 0. Per §[capabilities], any syscall taking a handle
+//   refreshes that handle's snapshot from authoritative state — a
+//   subsequent `sync` against the VMAR forces a fresh field1 read.
 //
-//   This smoke variant pins the negative observation: a freshly
-//   created MMIO-capable VMAR (caps = {r, w, mmio}) starts in
-//   `map = 0` per §[var] line 877. A subsequent `unmap` with N = 0
-//   is rejected by §[unmap] test 02 (E_INVAL on `map = 0`,
-//   "nothing to unmap") rather than reaching the test 09 success
-//   leg, because `map = 0` fires first in the spec's check
-//   ordering. The smoke exercises the same VMAR shape used by the
-//   eventual faithful test — caps = {r, w, mmio}, cch = 1 (uc),
-//   sz = 0, pages = 1 — without asserting the test 09 behavior
-//   itself.
-//
-// Strategy (smoke prelude)
-//   §[unmap]'s gate order ahead of the test 09 success leg is:
-//     - test 01 (VMAR is invalid)         — pass a freshly-minted
-//                                           MMIO VMAR.
-//     - test 02 (`map` = 0)              — fires here because the
-//                                           MMIO VMAR starts in
-//                                           `map = 0` and no
-//                                           construction can advance
-//                                           it to `map = 2` from the
-//                                           test child. This
-//                                           pre-empts the test 09
-//                                           success leg.
-//   The MMIO VMAR is built without an actual map_mmio call. Per
-//   §[create_vmar] caps.mmio = 1 requires props.sz = 0 (test 08),
-//   caps.x = 0 (test 11), caps.dma = 0 (test 13), and cch = 1 (uc).
-//   The same construction is used by map_mmio_06.zig, unmap_03.zig,
-//   and runner/serial.zig.
-//
-// Action
-//   1. createVmar(caps={r, w, mmio}, props={cch=1, sz=0,
-//                cur_rwx=0b011}, pages=1, preferred_base=0,
-//                device_region=0) — must succeed; gives an MMIO
-//      VMAR in `map = 0`.
-//   2. unmap(vmar_handle, &.{}) — issues the call with N = 0 so the
-//      shape matches what the eventual faithful test will issue
-//      against a `map = 2` VMAR. The kernel rejects on `map == 0`
-//      (test 02) ahead of the test 09 success leg; this is the
-//      documented ordering, not the assertion target.
-//
-// Assertion
-//   No assertion is checked — passes with assertion id 0 because
-//   the test 09 success leg (`map = 2`, N = 0, observe device
-//   cleared to 0) is unreachable from the v0 test child. Any
-//   failure of the prelude itself is also reported as
-//   pass-with-id-0 since no spec assertion is being checked.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner extension that mints
-//   or carves a device_region whose size matches a freshly-created
-//   MMIO VMAR (4 KiB) and forwards it to the test child via
-//   passed_handles. The action then becomes:
-//     create_vmar(caps={r, w, mmio}, props={sz=0, cch=1,
-//                cur_rwx=0b011}, pages=1, preferred_base=0,
-//                device_region=0) -> mmio_var, map = 0
-//     map_mmio(mmio_var, forwarded_dev) -> success; per §[map_mmio]
-//                                          test 06 map becomes 2;
-//                                          per test 07 device =
-//                                          forwarded_dev's id.
-//     unmap(mmio_var, &.{}) -> *expected* success
-//     readCap(self, mmio_var) -> field1.map == 0 AND field1.device
-//                                == 0  (the assertion id 1 a
-//                                       faithful version checks)
 //   §[var] field1 layout:
 //     page_count[0..31] | sz[32..33] | cch[34..35] |
 //     cur_rwx[36..38]   | map[39..40] | device[41..52]
 //   `device` is a 12-bit field at bits 41-52; mask via
 //     (field1 >> 41) & 0xFFF.
-//   Per §[unmap] test 12, field0/field1 are refreshed from the
-//   kernel's authoritative state on every unmap call regardless of
-//   result, so a follow-up readCap observes the post-unmap snapshot
-//   directly.
 //
-//   Until then, this file holds the prelude verbatim so the
-//   eventual faithful version can graft on the device_region
-//   forwarding step without re-deriving the inert-check matrix.
+// Action
+//   1. Scan cap_table for the plain fixture device_region (mmio,
+//      phys_base = 0xBABE_0000). If absent (kernel built without
+//      -Dtests_fixture_devices) → degraded smoke pass.
+//   2. createVmar(caps={r, w, mmio}, props={cch=1, sz=0,
+//                cur_rwx=0b011}, pages=1, preferred_base=0,
+//                device_region=0).
+//   3. mapMmio(mmio_var, plain_fixture). On success `map` = 2 and
+//      `device` = plain_fixture's id (§[map_mmio] tests 06/07).
+//   4. unmap(mmio_var, &.{}). N = 0; per §[unmap] test 08 the mmio
+//      installation is removed and `map` becomes 0; per test 09
+//      `device` is cleared to 0.
+//   5. sync(vmar_handle). Forces a fresh field1 snapshot per
+//      §[sync] test 03.
+//   6. readCap(cap_table_base, vmar_handle) → field1.device.
+//
+// Assertions
+//   1: field1.device was non-zero after a successful N=0 unmap on a
+//      VMAR that had been in `map = 2` — the spec assertion under
+//      test (test 09).
+//   2: a setup syscall returned an error code (createVmar, map_mmio,
+//      unmap, or sync), breaking the success-path precondition.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+// Sentinel phys_base of the bare (caps={move,copy}) test-fixture mmio
+// device_region minted by the kernel at boot under
+// -Dtests_fixture_devices and forwarded to every test child by the
+// runner. Must match runner/primary.zig:FIXTURE_PLAIN_PHYS_BASE and
+// kernel/boot/userspace_init.zig:grantTestFixtureDevices.
+const FIXTURE_PLAIN_PHYS_BASE: u64 = 0xBABE_0000;
 
-    // Build an MMIO-capable VMAR — same shape map_mmio_06 and
-    // unmap_03 use to exercise the MMIO leg of their respective
-    // syscalls. Per §[create_vmar]:
-    //   - caps.mmio = 1 requires props.sz = 0 (test 08), caps.x = 0
-    //     (test 11), caps.dma = 0 (test 13).
-    //   - The root domain's vmar_inner_ceiling permits mmio (the
-    //     same construction is used by runner/serial.zig).
-    // Without a map_mmio call this VMAR starts in `map = 0` per
-    // §[var] line 877 — the closest reachable approximation of the
-    // test 09 pre-state, since `map = 2` requires a successful
-    // map_mmio which the v0 test child cannot perform.
+const DEVICE_SHIFT: u6 = 41;
+const DEVICE_MASK: u64 = 0xFFF;
+
+fn deviceField(field1: u64) u64 {
+    return (field1 >> DEVICE_SHIFT) & DEVICE_MASK;
+}
+
+pub fn main(cap_table_base: u64) void {
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse {
+        // Degraded smoke: fixture devices absent (kernel built without
+        // -Dtests_fixture_devices). The test 09 success leg requires a
+        // real device_region to drive `map` to 2; pass with assertion
+        // id 0 so the slot validates link/load/scan plumbing without
+        // forcing a false expectation in this configuration.
+        testing.pass();
+        return;
+    };
+
+    // Build an MMIO VMAR matching the fixture device's 4 KiB size.
+    // §[create_vmar] for caps.mmio=1: props.sz=0, caps.x=0,
+    // caps.dma=0, cch=1 (uc).
     const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
@@ -132,31 +105,71 @@ pub fn main(cap_table_base: u64) void {
     const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
-        1, // pages = 1
+        1, // pages = 1 (4 KiB) — matches fixture size_pages = 1
         0, // preferred_base = kernel chooses
         0, // device_region = unused (caps.dma = 0)
     );
     if (testing.isHandleError(cvar.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is
-        // being checked, so report pass-with-id-0.
-        testing.pass();
+        testing.fail(2);
         return;
     }
     const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
-    // [2..N+1] = &.{}: N = 0 so the call shape matches what the
-    // eventual faithful test will issue against a `map = 2` VMAR
-    // (per §[unmap], for `map = 2` N must be 0). The MMIO VMAR is
-    // still in `map = 0` from create_vmar, so the kernel rejects
-    // via test 02 (E_INVAL on `map = 0`) ahead of reaching the
-    // test 09 success leg; the smoke does not assert which path
-    // fires — it only pins that the success leg (and the device
-    // clearing it asserts) is unreachable from this construction.
-    _ = syscall.unmap(vmar_handle, &.{});
+    // Drive `map` 0 -> 2 via a successful map_mmio. After this:
+    //   field1.map    = 2 (§[map_mmio] test 06)
+    //   field1.device = dev_handle (§[map_mmio] test 07)
+    const r_map = syscall.mapMmio(vmar_handle, dev_handle);
+    if (errors.isError(r_map.v1)) {
+        testing.fail(2);
+        return;
+    }
 
-    // No spec assertion is being checked — the test 09 success leg
-    // requires an MMIO VMAR with `map = 2`, which is unreachable
-    // from the v0 test child. Pass with assertion id 0 to mark
-    // this slot as smoke-only in coverage.
+    // unmap with N = 0 against a `map = 2` VMAR. Per §[unmap] test 08
+    // the mmio installation is removed and `map` becomes 0; per test 09
+    // `device` is cleared to 0. The call must succeed.
+    const r_unmap = syscall.unmap(vmar_handle, &.{});
+    if (errors.isError(r_unmap.v1)) {
+        testing.fail(2);
+        return;
+    }
+
+    // §[sync] test 03: field0/field1 reflect the authoritative kernel
+    // state at the moment of the call. Forces a fresh snapshot before
+    // the readCap below observes field1.device.
+    const r_sync = syscall.sync(vmar_handle);
+    if (errors.isError(r_sync.v1)) {
+        testing.fail(2);
+        return;
+    }
+
+    const cap_after = caps.readCap(cap_table_base, vmar_handle);
+    if (deviceField(cap_after.field1) != 0) {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
+}
+
+// Scan the caller's cap_table for an mmio device_region whose
+// `phys_base` matches `target_phys_base`. Returns the slot id or null
+// if no matching handle is present. §[device_region] field0 layout
+// (mmio): bits 4-51 carry paddr>>12.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            // mmio = 0
+            if (dev_type == 0) {
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }
