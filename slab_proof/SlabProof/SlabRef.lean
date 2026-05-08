@@ -146,6 +146,48 @@ theorem lock_after_realloc_fails
   rw [hRealloc]
   simp [Word.encode]
 
+/-! ## §4b Durable state-level safety
+
+The three theorems above (`lock_after_retired_destroy_fails`,
+`lock_after_realloc_fails`, and the destroy-window theorem in §5) are
+all special cases of a single state-level lemma: a stale ref's lock
+fails *whenever* the post-drain `mem WORD` is not the canonical
+encoding `{ ref.gen, false }`.  Every reaper-window state, every
+chained-phase state, every spurious mid-flight state reduces to this
+one condition.  We add it explicitly so users of the API don't have
+to enumerate windows. -/
+
+/-- State-level necessary-and-sufficient stale safety.  Given a
+    consumer with empty buffer, a stale `SlabRef.lock` succeeds iff
+    `mem WORD` is exactly `encode { ref.gen, false }` — the unique
+    canonical "live and unlocked at ref.gen" shape.  Every other
+    word value (different gen, lock-bit set, or both) makes the
+    lock fail.  This subsumes both `stale_rejected_locked` and
+    `stale_rejected_gen` and is the load-bearing primitive for the
+    durable-safety run-induction in `Invariant.lean`. -/
+theorem lock_fails_unless_canonical
+    (m : Machine) (c : Core) (ref : Ref)
+    (hC : m.bufs c = [])
+    (h : m.mem WORD ≠ Word.encode { gen := ref.gen, lock := false }) :
+    (SlabRef.lock m c ref).2 = false := by
+  have hDrain : Machine.drainAll m c = m := by
+    unfold Machine.drainAll; rw [hC]; rfl
+  rw [lock_eq_lockedCas]
+  apply lockedCas_fails_if
+  rw [hDrain]; exact h
+
+/-- Contrapositive form: lock success forces the canonical word. -/
+theorem lock_success_forces_canonical
+    (m : Machine) (c : Core) (ref : Ref)
+    (hC : m.bufs c = [])
+    (hOk : (SlabRef.lock m c ref).2 = true) :
+    m.mem WORD = Word.encode { gen := ref.gen, lock := false } := by
+  have hDrain : Machine.drainAll m c = m := by
+    unfold Machine.drainAll; rw [hC]; rfl
+  have := (lock_success_iff_word_matches m c ref).mp hOk
+  rw [hDrain] at this
+  exact this
+
 /-! ## §5 Destroy-window: in-progress destroy is also safe -/
 
 /-- A stale ref's `lock` fails throughout the destroy window — the

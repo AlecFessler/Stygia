@@ -35,10 +35,9 @@ def lockedCasAt (m : Machine) (c : Core) (wl : Loc) (expected : Nat) :
   let m' := Machine.drainAll m c
   let cur := m'.mem wl
   let w := Word.decode cur
-  let m'' := m'.setSaw c (some cur)
   match Word.casLockWithGen w expected with
-  | some w' => (m''.setMem wl (Word.encode w'), true)
-  | none    => (m'', false)
+  | some w' => (m'.setMem wl (Word.encode w'), true)
+  | none    => (m', false)
 
 /-- The original `lockedCas` is `lockedCasAt` at `WORD`. -/
 theorem lockedCas_eq_lockedCasAt (m : Machine) (c : Core) (expected : Nat) :
@@ -58,8 +57,8 @@ theorem lockedCasAt_mem_other
   have hne' : wl2 ≠ wl1 := fun h => hne h.symm
   by_cases hcond : (Machine.drainAll m c).mem wl1 / 2 = expected ∧
                    (Machine.drainAll m c).mem wl1 % 2 = 0
-  · simp [hcond, Machine.setSaw, Machine.setMem, if_neg hne']
-  · simp [hcond, Machine.setSaw, Machine.setMem]
+  · simp [hcond, Machine.setMem, if_neg hne']
+  · simp [hcond, Machine.setMem]
 
 /-- The post-CAS state's `bufs c` is empty (the CAS drains it). -/
 theorem lockedCasAt_bufs_self_empty
@@ -70,8 +69,8 @@ theorem lockedCasAt_bufs_self_empty
   simp only [Word.casLockWithGen, Word.decode]
   by_cases hcond : (Machine.drainAll m c).mem wl / 2 = expected ∧
                    (Machine.drainAll m c).mem wl % 2 = 0
-  · simp [hcond, Machine.setSaw, Machine.setMem]
-  · simp [hcond, Machine.setSaw, Machine.setMem]
+  · simp [hcond, Machine.setMem]
+  · simp [hcond, Machine.setMem]
 
 /-- The post-CAS state's `bufs c'` for `c' ≠ c` is unchanged. -/
 theorem lockedCasAt_bufs_other
@@ -82,9 +81,9 @@ theorem lockedCasAt_bufs_other
   simp only [Word.casLockWithGen, Word.decode]
   by_cases hcond : (Machine.drainAll m c).mem wl / 2 = expected ∧
                    (Machine.drainAll m c).mem wl % 2 = 0
-  · simp [hcond, Machine.setSaw, Machine.setMem]
+  · simp [hcond, Machine.setMem]
     exact TSO.drainAll_buf_other m c c' hne
-  · simp [hcond, Machine.setSaw, Machine.setMem]
+  · simp [hcond, Machine.setMem]
     exact TSO.drainAll_buf_other m c c' hne
 
 /-! ## §3 Multi-slot SlabRef -/
@@ -113,22 +112,30 @@ theorem different_slot_mem_disjoint
       (Machine.drainAll m c).mem ref2.word_loc :=
   lockedCasAt_mem_other m c ref1.word_loc ref2.word_loc ref1.gen hne
 
-/-- A successful destroy on slot `ref1` (which would write to
-    `ref1.word_loc`) doesn't make `ref2`'s lock succeed when ref2 is
-    on a different slot. -/
-theorem destroy_other_slot_doesnt_help_stale_ref
-    (m : Machine) (P C : Core) (ref1 ref2 : RefAt)
+/-- A `lockAt` on slot `ref1` does not perturb `mem` at any other
+    slot.  In particular, if `ref2`'s slot is already past its
+    lifetime (`mem ref2.word_loc` shows the freed gen), `ref2`'s
+    slot remains in the freed state after the `ref1` lockAt.
+
+    Combined with `lockAt = lockedCasAt`, this means a stale ref's
+    own subsequent `lockAt` reads the same word it would have read
+    without the cross-slot operation — it cannot succeed. -/
+theorem stale_ref_at_other_slot_unaffected
+    (m : Machine) (c : Core) (ref1 ref2 : RefAt)
+    (hC : m.bufs c = [])
     (hSlot : ref1.word_loc ≠ ref2.word_loc)
-    (hC : m.bufs C = [])
-    (hRef2_state :
+    (hStale :
       m.mem ref2.word_loc = Word.encode { gen := ref2.gen + 1, lock := false }) :
-    -- ref2 is already past its window (gen has bumped to ref2.gen + 1).
-    -- A destroy on ref1's slot doesn't bring ref2 back to life.
-    -- Direct CAS at ref2.gen on the post-(ref1-CAS) state still fails.
-    let m1 := (lockAt m P ref1).1
-    -- m1.mem ref2.word_loc = m.mem ref2.word_loc when bufs P = [].
-    True := by
-  trivial
+    (lockAt m c ref1).1.mem ref2.word_loc =
+      Word.encode { gen := ref2.gen + 1, lock := false } := by
+  have hDrain : Machine.drainAll m c = m := by
+    unfold Machine.drainAll
+    rw [hC]; rfl
+  have h1 : (lockAt m c ref1).1.mem ref2.word_loc =
+              (Machine.drainAll m c).mem ref2.word_loc :=
+    lockedCasAt_mem_other m c ref1.word_loc ref2.word_loc ref1.gen hSlot
+  rw [h1, hDrain]
+  exact hStale
 
 end SlabRef
 end MultiSlot

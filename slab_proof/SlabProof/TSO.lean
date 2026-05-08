@@ -49,21 +49,16 @@ structure BufEntry where
   deriving Repr
 
 /-- TSO machine state.  Each core has its own FIFO store buffer
-    (`bufs c`); `mem` is globally-visible memory; `consSaw` records
-    the value each core's most recent locked CAS observed (used by the
-    publication / stale-rejection theorems to refer to "what core c
-    saw"). -/
+    (`bufs c`); `mem` is globally-visible memory. -/
 structure Machine where
   bufs    : Core → List BufEntry
   mem     : Loc → Nat
-  consSaw : Core → Option Nat
 
 namespace Machine
 
 @[simp] def empty : Machine :=
   { bufs := fun _ => []
-  , mem := fun _ => 0
-  , consSaw := fun _ => none }
+  , mem := fun _ => 0 }
 
 /-- Update the buffer of a single core. -/
 @[simp] def setBuf (m : Machine) (c : Core) (b : List BufEntry) : Machine :=
@@ -72,10 +67,6 @@ namespace Machine
 /-- Update memory at a single location. -/
 @[simp] def setMem (m : Machine) (l : Loc) (v : Nat) : Machine :=
   { m with mem := fun l' => if l' = l then v else m.mem l' }
-
-/-- Update consSaw for a single core. -/
-@[simp] def setSaw (m : Machine) (c : Core) (v : Option Nat) : Machine :=
-  { m with consSaw := fun c' => if c' = c then v else m.consSaw c' }
 
 /-- TSO read with self-store-buffer forwarding: youngest matching
     buffered entry from `c`'s buffer, else memory. -/
@@ -107,10 +98,9 @@ def lockedCas (m : Machine) (c : Core) (expected : Nat) : Machine × Bool :=
   let m' := drainAll m c
   let cur := m'.mem WORD
   let w := Word.decode cur
-  let m'' := m'.setSaw c (some cur)
   match Word.casLockWithGen w expected with
-  | some w' => (m''.setMem WORD (Word.encode w'), true)
-  | none    => (m'', false)
+  | some w' => (m'.setMem WORD (Word.encode w'), true)
+  | none    => (m', false)
 
 /-- Buffered release-store of `(g <<< 1) | 0` to WORD.  This matches
     the real `GenLock.setGenRelease` — a plain `.release` store on

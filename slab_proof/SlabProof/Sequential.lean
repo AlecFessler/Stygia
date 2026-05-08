@@ -91,17 +91,6 @@ theorem run_gen_eq_lastSetGen (w0 : Word) :
       have := ih { gen := w0.gen, lock := false }
       simpa using this
 
-/-! ### Lock-state invariant: between successful lock and unlock,
-    the word's lock bit must be `true`. -/
-
-/-- The slot's lock-bit state is determined by the *latest* `lockTry`
-    that succeeded vs `unlock` (or `setGen`, which clears it). -/
-def lastTouchClearedLock (g0 : Nat) : List Op → Bool
-  | [] => true                            -- starts unlocked
-  | .setGen _ :: rest  => lastTouchClearedLock g0 rest
-  | .lockTry _ :: rest => lastTouchClearedLock g0 rest
-  | .unlock :: rest    => lastTouchClearedLock g0 rest
-
 /-! ### P3 : sequential UAF safety. -/
 
 /-- If a `lockTry expected` succeeds during a trace, then the word the
@@ -158,5 +147,20 @@ theorem lock_success_implies_lastSetGen
   have := trace_ends_in_successful_lock w0 ops expected hres
   rw [run_gen_eq_lastSetGen] at this
   exact this.1
+
+/-- Headline sequential UAF claim, contrapositive of
+    `lock_success_implies_lastSetGen`.  Whenever the most recent
+    `setGen` arg is *not* `expected` (canonically: a destroy issued
+    `setGen (expected + 1)` and no subsequent `setGen` returned the
+    gen to `expected`), a fresh `lockTry expected` issues `.stale`,
+    not `.ok`.  This is the single-thread shape of the durable safety
+    claim that the TSO version generalises. -/
+theorem sequential_uaf_after_destroy
+    (w0 : Word) (ops : List Op) (expected : Nat)
+    (h : lastSetGen w0.gen ops ≠ expected) :
+    (step (run w0 ops) (.lockTry expected)).2 = .stale := by
+  cases hres : (step (run w0 ops) (.lockTry expected)).2 with
+  | stale => rfl
+  | ok    => exact (h (lock_success_implies_lastSetGen w0 ops expected hres)).elim
 
 end SlabProof

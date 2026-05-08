@@ -45,10 +45,8 @@ open TSO
 def lockedCasWeak (m : Machine) (c : Core) (expected : Nat)
     (spuriousFail : Bool) : Machine × Bool :=
   let m' := Machine.drainAll m c
-  let cur := m'.mem WORD
-  let m'' := m'.setSaw c (some cur)
   if spuriousFail then
-    (m'', false)
+    (m', false)
   else
     Machine.lockedCas m c expected
 

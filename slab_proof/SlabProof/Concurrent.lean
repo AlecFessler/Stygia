@@ -171,16 +171,28 @@ theorem drainAll_mem_eq
         simp [hloc]
         exact drainOne_mem_other m c e rest l hbuf hne
 
-/-! ## §3 Locked-CAS observation -/
+/-- If no entry in `xs` targets location `l`, `lastWriteTo xs l = none`. -/
+theorem lastWriteTo_none_of_no_match
+    (xs : List BufEntry) (l : Loc) (h : ∀ e ∈ xs, e.loc ≠ l) :
+    lastWriteTo xs l = none := by
+  induction xs with
+  | nil => simp [lastWriteTo]
+  | cons e rest ih =>
+    have hne : e.loc ≠ l := h e List.mem_cons_self
+    have hrest : ∀ e' ∈ rest, e'.loc ≠ l :=
+      fun e' he' => h e' (List.mem_cons_of_mem _ he')
+    have hr := ih hrest
+    simp [lastWriteTo, hr, hne]
 
-/-- The locked CAS observes `(drainAll m c).mem WORD`. -/
-theorem lockedCas_observed
-    (m : Machine) (c : Core) (expected : Nat) :
-    (Machine.lockedCas m c expected).1.consSaw c =
-      some ((Machine.drainAll m c).mem WORD) := by
-  unfold Machine.lockedCas
-  simp [Machine.setSaw, Machine.setMem]
-  split <;> simp
+/-- Corollary of the FIFO commit lemma: if a core's buffer contains no
+    write to location `l`, draining doesn't change `mem l`. -/
+theorem drainAll_mem_unchanged_no_writes
+    (m : Machine) (c : Core) (l : Loc)
+    (h : ∀ e ∈ m.bufs c, e.loc ≠ l) :
+    (Machine.drainAll m c).mem l = m.mem l := by
+  rw [drainAll_mem_eq, lastWriteTo_none_of_no_match (m.bufs c) l h]
+
+/-! ## §3 Locked-CAS observation -/
 
 /-- If the locked CAS succeeded, the post-drain memory at WORD decoded
     to `{ gen := expected, lock := false }`. -/
@@ -240,7 +252,7 @@ theorem lockedCas_mem_other
     (m : Machine) (c : Core) (expected : Nat) (l : Loc) (hl : l ≠ WORD) :
     (Machine.lockedCas m c expected).1.mem l = (Machine.drainAll m c).mem l := by
   unfold Machine.lockedCas
-  simp [Machine.setSaw, Machine.setMem]
+  simp [Machine.setMem]
   split <;> simp [hl]
 
 /-- The full publication theorem.  After producer drains and consumer
