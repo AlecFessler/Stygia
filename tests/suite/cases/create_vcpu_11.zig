@@ -151,7 +151,9 @@ pub fn main(cap_table_base: u64) void {
 
     // 5. Mint the exit port. `bind` cap is required for the port to be
     //    usable as the destination of create_vcpu's vm_exit deliveries.
-    const exit_port_caps = caps.PortCap{ .bind = true };
+    //    `recv` is added to satisfy create_port's structural rule (must
+    //    include `recv` and one of `{suspend, bind}`).
+    const exit_port_caps = caps.PortCap{ .recv = true, .bind = true };
     const cp = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

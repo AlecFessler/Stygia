@@ -223,8 +223,11 @@ pub fn main(cap_table_base: u64) void {
     // post-condition (§[handle_attachments] test 08: "caps =
     // entry.caps verbatim for other handle types") applies cleanly
     // without involving idc_rx. S needs `copy` so the move=0 entry
-    // can pass §[handle_attachments] test 05.
-    const port_s_caps = caps.PortCap{ .copy = true, .recv = true };
+    // can pass §[handle_attachments] test 05. `bind` is added to
+    // satisfy create_port's structural rule (must include `recv` and
+    // one of `{suspend, bind}`); the entry caps subset check (test 03)
+    // still holds because entry.caps = {recv} is a subset.
+    const port_s_caps = caps.PortCap{ .copy = true, .recv = true, .bind = true };
     const cp_s = syscall.createPort(@as(u64, port_s_caps.toU16()));
     if (testing.isHandleError(cp_s.v1)) {
         testing.fail(2);

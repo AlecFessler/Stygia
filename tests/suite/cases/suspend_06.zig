@@ -147,7 +147,9 @@ pub fn main(cap_table_base: u64) void {
 
     // 5. Mint the exit port for the vCPU. `bind` is required for the
     //    port to be usable as the destination of vm_exit deliveries.
-    const exit_port_caps = caps.PortCap{ .bind = true };
+    //    `recv` is added to satisfy create_port's structural rule (must
+    //    include `recv` and one of `{suspend, bind}`).
+    const exit_port_caps = caps.PortCap{ .recv = true, .bind = true };
     const cep = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cep.v1)) {
         testing.fail(1);
@@ -172,10 +174,12 @@ pub fn main(cap_table_base: u64) void {
     }
     const vcpu_handle: HandleId = @truncate(cvcpu.v1 & 0xFFF);
 
-    // 7. Destination port for the suspend syscall. `bind` is required
-    //    on the port handle so suspend test 04's E_PERM gate cannot
-    //    fire ahead of test 06.
-    const dest_port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
+    // 7. Destination port for the suspend syscall. `suspend` is
+    //    required on the port handle so suspend test 04's E_PERM gate
+    //    cannot fire ahead of test 06; `recv` is added to satisfy
+    //    create_port's structural rule (must include `recv` and one of
+    //    `{suspend, bind}`).
+    const dest_port_caps = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cdp = syscall.createPort(@as(u64, dest_port_caps.toU16()));
     if (testing.isHandleError(cdp.v1)) {
         testing.fail(1);

@@ -100,7 +100,9 @@ pub fn main(cap_table_base: u64) void {
     // bound below is the absolute maximum table size — in practice the
     // loop terminates after roughly HANDLE_TABLE_MAX - 6 iterations
     // (slots 0..3 plus pf and var slots are already occupied).
-    const port_caps = caps.PortCap{ .bind = true };
+    // create_port's structural rule requires `recv` plus one of
+    // `{suspend, bind}`; `{recv, bind}` is the minimal satisfying shape.
+    const port_caps = caps.PortCap{ .recv = true, .bind = true };
     const port_caps_word: u64 = @as(u64, port_caps.toU16());
     var filled = false;
     var i: u32 = 0;

@@ -9,13 +9,15 @@
 //   numeric semantics (those exist only on EC and VMAR handles, which
 //   tests 03 and 04 cover separately).
 //
-//   Mint a port with `bind` only. Then call restrict to install a
-//   superset {bind, recv}: the recv bit is set in new but not in
-//   current, so the subset check must reject with E_PERM.
+//   Mint a port with `{recv, bind}` (the minimal cap shape that
+//   satisfies create_port's structural rule). Then call restrict to
+//   install a superset that adds `suspend`: the suspend bit is set
+//   in new but not in current, so the subset check must reject with
+//   E_PERM.
 //
 // Action
-//   1. create_port(caps={bind})        — must succeed
-//   2. restrict(port, caps={bind,recv}) — must return E_PERM
+//   1. create_port(caps={recv, bind})              — must succeed
+//   2. restrict(port, caps={recv, bind, suspend})  — must return E_PERM
 //
 // Assertions
 //   1: setup syscall failed (create_port returned an error word)
@@ -31,7 +33,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const initial = caps.PortCap{ .bind = true };
+    const initial = caps.PortCap{ .recv = true, .bind = true };
     const cp = syscall.createPort(@as(u64, initial.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);
@@ -39,7 +41,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    const expanded = caps.PortCap{ .bind = true, .recv = true };
+    const expanded = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const new_caps_word: u64 = @as(u64, expanded.toU16());
     const result = syscall.restrict(port_handle, new_caps_word);
 

@@ -1,15 +1,20 @@
 // Spec §[suspend] suspend — test 04.
 //
-// "[test 04] returns E_PERM if [2] does not have the `bind` cap."
+// "[test 04] returns E_PERM if [2] does not have the `suspend` cap."
+//
+// (Spec text in docs/kernel/specv3.md still names the older `bind` cap
+// here; the kernel's port-bind / port-suspend cap split moved the
+// suspend-syscall gate to a dedicated `suspend` cap. The kernel
+// implementation in kernel/syscall/port.zig is authoritative — the
+// gate now checks `suspend`, not `bind`.)
 //
 // Strategy
-//   Mint a fresh port handle whose caps explicitly omit `bind`. Port
-//   caps use bitwise subset semantics — the runner's `port_ceiling`
-//   (0x1C = {xfer, recv, bind} per §[capability_domain]) covers every
-//   bit we need, so producing a bind-less port handle by simply not
-//   asking for the bit is direct. Then mint a fresh EC handle with the
-//   `susp` cap so test 03 (E_PERM if [1] lacks `susp`) is neutralized,
-//   and call `suspend(ec, port, &.{})`.
+//   Mint a fresh port handle whose caps explicitly omit `suspend`.
+//   Include `recv` and `bind` so create_port's structural rule
+//   (must include `recv` and one of `{suspend, bind}`) is satisfied
+//   while still leaving the suspend-syscall gate violated. Then mint
+//   a fresh EC handle with the `susp` cap so test 03 (E_PERM if [1]
+//   lacks `susp`) is neutralized, and call `suspend(ec, port, &.{})`.
 //
 //   Failure-path neutralization:
 //     - test 01 (E_BADCAP if [1] not a valid EC handle): handle id
@@ -23,19 +28,16 @@
 //     - test 07 (E_INVAL if [1] already suspended): the EC was just
 //       created and starts running at `dummyEntry`; it has not been
 //       suspended.
-//   The bind-cap check is therefore the only spec-mandated failure
+//   The suspend-cap check is therefore the only spec-mandated failure
 //   path that applies, isolating E_PERM.
 //
 //   The new EC begins executing immediately at `dummyEntry`, which
 //   halts forever (`hlt`). No synchronization is needed because the
-//   bind-cap check happens against the port handle's caps field in our
-//   domain's handle table; the running EC's state is irrelevant. The
-//   port carries no other caps so attempting any other operation on it
-//   would also be impossible — but the suspend syscall's port-cap
-//   gate is the one under test.
+//   suspend-cap check happens against the port handle's caps field in
+//   our domain's handle table; the running EC's state is irrelevant.
 //
 // Action
-//   1. create_port(caps={recv})                                   — must succeed
+//   1. create_port(caps={recv, bind})                             — must succeed
 //   2. create_execution_context(target=self, caps={susp})         — must succeed
 //   3. suspend(ec, port, no_attachments)                          — must return E_PERM
 //
@@ -54,14 +56,13 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Port with no `bind` bit. `recv` is included so the caps word is
-    // non-zero and the port has at least one operational cap unrelated
-    // to the gate under test; nothing in the spec requires a non-empty
-    // caps word and a fully-empty caps port would also be valid for
-    // this test.
+    // Port with no `suspend` bit. `recv` and `bind` are included so
+    // create_port's structural rule (must include `recv` and one of
+    // `{suspend, bind}`) is satisfied while the suspend-syscall gate
+    // (which checks the dedicated `suspend` cap) still fails.
     const port_caps = caps.PortCap{
-        .bind = false,
         .recv = true,
+        .bind = true,
     };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {

@@ -178,13 +178,15 @@ pub fn main(cap_table_base: u64) void {
     }
     const p_recv: u12 = @truncate(cp_recv.v1 & 0xFFF);
 
-    // Step 2: source port for the pair entry. Caps = {recv} only —
-    // critically no `copy`, no `move`. This is the "lacks the `copy`
-    // cap" condition test 15 demands. The recv bit keeps the caps word
-    // non-zero so the entry's caps subset (test 13) has a meaningful
-    // cap to inherit.
+    // Step 2: source port for the pair entry. Caps lack `copy`, `move`
+    // — this is the "lacks the `copy` cap" condition test 15 demands.
+    // `bind` is added to satisfy create_port's structural rule (must
+    // include `recv` and one of `{suspend, bind}`); the entry caps
+    // subset (test 13) still holds because entry.caps = {recv} ⊆
+    // {recv, bind}.
     const p_src_caps = caps.PortCap{
         .recv = true,
+        .bind = true,
     };
     const cp_src = syscall.createPort(@as(u64, p_src_caps.toU16()));
     if (testing.isHandleError(cp_src.v1)) {

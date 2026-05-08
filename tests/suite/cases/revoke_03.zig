@@ -35,8 +35,8 @@
 //   OK in vreg 1.
 //
 // Action
-//   1. create_port(caps={recv})  — must succeed
-//   2. revoke(port)              — must return OK
+//   1. create_port(caps={recv, bind}) — must succeed
+//   2. revoke(port)                   — must return OK
 //
 // Assertions
 //   1: setup syscall failed (create_port returned an error word)
@@ -52,7 +52,11 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const initial = caps.PortCap{ .recv = true };
+    // `bind` is added to satisfy create_port's structural rule (must
+    // include `recv` and one of `{suspend, bind}`); the test only needs
+    // a valid handle id with no descendants, the specific cap shape is
+    // irrelevant.
+    const initial = caps.PortCap{ .recv = true, .bind = true };
     const cp = syscall.createPort(@as(u64, initial.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

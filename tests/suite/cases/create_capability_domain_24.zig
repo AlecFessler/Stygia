@@ -184,11 +184,15 @@ fn writeMinimalElf(dst: [*]volatile u8) void {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Step 1 — donor port with full move + xfer caps.
+    // Step 1 — donor port with full move + xfer caps. `recv` is
+    // required by create_port's structural rule (must include `recv`
+    // and one of `{suspend, bind}`); the donor's downstream cap subset
+    // for the passed-handle entry below is unaffected.
     const donor_caps = caps.PortCap{
         .move = true,
         .copy = true,
         .xfer = true,
+        .recv = true,
         .bind = true,
     };
     const cp = syscall.createPort(@as(u64, donor_caps.toU16()));

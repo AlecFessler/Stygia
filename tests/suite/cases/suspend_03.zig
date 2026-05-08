@@ -76,9 +76,12 @@ pub fn main(cap_table_base: u64) void {
     }
     const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    // PortCap with `bind` so the port-side cap check (test 04) passes
-    // and we isolate the EC-handle `susp` cap check.
-    const port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
+    // PortCap with `suspend` so the port-side cap check (test 04)
+    // passes and we isolate the EC-handle `susp` cap check. `recv`
+    // is added to satisfy create_port's structural rule (must include
+    // `recv` and one of `{suspend, bind}`); `bind` keeps shape parity
+    // with sibling tests.
+    const port_caps = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(2);

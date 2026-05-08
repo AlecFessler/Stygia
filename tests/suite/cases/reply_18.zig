@@ -274,11 +274,12 @@ pub fn main(cap_table_base: u64) void {
     }
     const s_handle: u12 = @truncate(cec_s.v1 & 0xFFF);
 
-    // Step 6: saturate the handle table. create_port with no caps mints
-    // a port that takes a slot but holds no rights — the cheapest filler.
-    // Bound the loop at HANDLE_TABLE_MAX so a misbehaving kernel cannot
-    // hang the test.
-    const empty_port_caps_word: u64 = @as(u64, (caps.PortCap{}).toU16());
+    // Step 6: saturate the handle table. create_port mints a port that
+    // takes a slot — the cheapest filler that satisfies create_port's
+    // structural rule (must include `recv` and one of `{suspend, bind}`)
+    // is `{recv, bind}`. Bound the loop at HANDLE_TABLE_MAX so a
+    // misbehaving kernel cannot hang the test.
+    const empty_port_caps_word: u64 = @as(u64, (caps.PortCap{ .recv = true, .bind = true }).toU16());
     var saturated: bool = false;
     var i: u32 = 0;
     while (i < caps.HANDLE_TABLE_MAX) {

@@ -19,11 +19,12 @@
 //   one handle).
 //
 //   The runner passes a single passed-handle entry: the result port,
-//   with caps = `{xfer = true, bind = true}` (see primary.zig:
-//   `child_port_caps`). Per §[port], `PortCap` lays out
-//   `move=bit0, copy=bit1, xfer=bit2, recv=bit3, bind=bit4`, so the
-//   expected 16-bit caps word is `0b10100 = 0x14`. The handle type at
-//   slot 3 must be `port` (§[capabilities] type tag = 6).
+//   with caps = `{xfer = true, bind = true, suspend = true}` (see
+//   primary.zig: `child_port_caps`). Per §[port], `PortCap` lays out
+//   `move=bit0, copy=bit1, xfer=bit2, recv=bit3, bind=bit4,
+//   restart_policy=bit5, suspend=bit6`, so the expected 16-bit caps
+//   word is `0b1010100 = 0x54`. The handle type at slot 3 must be
+//   `port` (§[capabilities] type tag = 6).
 //
 //   No syscall side effects are needed: the static handle layout
 //   (word0 carries id/type/caps in bits 0-11/12-15/48-63) is set at
@@ -62,11 +63,12 @@ const caps = lib.caps;
 const testing = lib.testing;
 
 // Mirrors `child_port_caps` in tests/suite/runner/primary.zig:
-//   PortCap{ .xfer = true, .bind = true }
-// Per §[port] layout (move=0, copy=1, xfer=2, recv=3, bind=4) this is
-// the 16-bit value 0b0000_0000_0001_0100 = 0x0014.
+//   PortCap{ .xfer = true, .bind = true, .@"suspend" = true }
+// Per §[port] layout (move=0, copy=1, xfer=2, recv=3, bind=4,
+// restart_policy=5, suspend=6) this is the 16-bit value
+// 0b0000_0000_0101_0100 = 0x0054.
 const EXPECTED_PASSED_CAPS: u16 = blk: {
-    const c = caps.PortCap{ .xfer = true, .bind = true };
+    const c = caps.PortCap{ .xfer = true, .bind = true, .@"suspend" = true };
     break :blk c.toU16();
 };
 

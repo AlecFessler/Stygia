@@ -144,14 +144,18 @@ fn suspendWithDupPair(target: u12, port: u12, entry: u64) u64 {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Mint a source port we control. caps = {move, copy} so that
-    // entries with move=0 satisfy test 05's `copy` requirement and
-    // entries with move=1 (not used here) would also be valid; either
-    // way the source's caps trivially contain the entry caps so test 03
-    // also passes.
+    // Mint a source port we control. caps = {move, copy} carry the
+    // shape this test needs for its pair entries (move=0 satisfies
+    // test 05's `copy` requirement; move=1 would also be valid). `recv`
+    // and `bind` are added to satisfy create_port's structural rule
+    // (must include `recv` and one of `{suspend, bind}`); the entry
+    // caps subset check (test 03) still holds because entry.caps =
+    // {move, copy} is a subset of {move, copy, recv, bind}.
     const src_caps = caps.PortCap{
         .move = true,
         .copy = true,
+        .recv = true,
+        .bind = true,
     };
     const cp = syscall.createPort(@as(u64, src_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {

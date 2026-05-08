@@ -146,8 +146,10 @@ pub fn main(cap_table_base: u64) void {
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
     // 5. Mint a port for the vCPU's exit_port arg. Runner grants
-    //    `crpt` and port_ceiling covers `bind`.
-    const port_caps = caps.PortCap{ .bind = true };
+    //    `crpt` and port_ceiling covers `bind` and `recv`. `recv` is
+    //    added to satisfy create_port's structural rule (must include
+    //    `recv` and one of `{suspend, bind}`).
+    const port_caps = caps.PortCap{ .recv = true, .bind = true };
     const cport = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cport.v1)) {
         testing.fail(1);

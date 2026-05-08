@@ -55,11 +55,12 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Drive the table to saturation. Use a port handle for the filler:
-    // create_port has no side effects beyond minting a slot, and a
-    // port with no caps is the smallest possible new entry. We bound
-    // the loop at HANDLE_TABLE_MAX so a misbehaving kernel cannot
-    // hang the test.
-    const port_caps_word: u64 = @as(u64, (caps.PortCap{}).toU16());
+    // create_port has no side effects beyond minting a slot. The
+    // minimal cap shape that satisfies create_port's structural rule
+    // (must include `recv` and one of `{suspend, bind}`) is
+    // `{recv, bind}`. We bound the loop at HANDLE_TABLE_MAX so a
+    // misbehaving kernel cannot hang the test.
+    const port_caps_word: u64 = @as(u64, (caps.PortCap{ .recv = true, .bind = true }).toU16());
     var saturated: bool = false;
     var i: u32 = 0;
     while (i < caps.HANDLE_TABLE_MAX) {

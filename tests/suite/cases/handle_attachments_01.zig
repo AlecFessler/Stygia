@@ -74,11 +74,13 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Step 1: mint a port with `bind` only (no `xfer`). bind is
-    // required to satisfy §[suspend] test 04; xfer is intentionally
-    // absent so §[handle_attachments] test 01 is the live failure
-    // mode when pair_count > 0.
-    const port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
+    // Step 1: mint a port with `bind`/`suspend` (no `xfer`). `suspend`
+    // is required to satisfy §[suspend] test 04 (the suspend syscall
+    // gate); xfer is intentionally absent so §[handle_attachments]
+    // test 01 is the live failure mode when pair_count > 0. `recv` is
+    // added to satisfy create_port's structural rule (must include
+    // `recv` and one of `{suspend, bind}`).
+    const port_caps = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

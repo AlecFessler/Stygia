@@ -83,11 +83,12 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Step 1: destination port with `bind` so suspend's [2] cap gate
-    // (test 04) stays inert. No other caps are load-bearing for this
-    // test; the port never receives a `recv`, so its sender queue
-    // simply holds the helper EC across the second call.
-    const port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
+    // Step 1: destination port with `suspend` so suspend's [2] cap gate
+    // (test 04) stays inert. `recv` is added to satisfy create_port's
+    // structural rule (must include `recv` and one of `{suspend, bind}`);
+    // the test never calls recv on the port, so the cap is harmless.
+    // `bind` keeps shape parity with sibling tests.
+    const port_caps = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

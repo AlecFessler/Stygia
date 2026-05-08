@@ -30,7 +30,7 @@
 //   bit 63 into vreg 1.
 //
 // Action
-//   1. create_port(caps={bind})              — must succeed
+//   1. create_port(caps={recv, bind})        — must succeed
 //   2. ack(handle | (1 << 63))               — must return E_INVAL
 //      (reserved bit 63 of [1] set; low 12 bits hold a valid id)
 //
@@ -49,7 +49,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const initial = caps.PortCap{ .bind = true };
+    const initial = caps.PortCap{ .recv = true, .bind = true };
     const cp = syscall.createPort(@as(u64, initial.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

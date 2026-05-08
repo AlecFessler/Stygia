@@ -74,8 +74,10 @@ const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
     // Mint a port with `bind` cap so §[bind_event_route] test 05
-    // (E_PERM on port lacking `bind`) does not fire.
-    const port_initial = caps.PortCap{ .bind = true };
+    // (E_PERM on port lacking `bind`) does not fire. `recv` is added
+    // to satisfy create_port's structural rule (must include `recv`
+    // and one of `{suspend, bind}`).
+    const port_initial = caps.PortCap{ .recv = true, .bind = true };
     const cp = syscall.createPort(@as(u64, port_initial.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

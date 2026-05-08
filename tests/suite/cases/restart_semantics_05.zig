@@ -55,7 +55,12 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
+    // `recv` is added to satisfy create_port's structural rule (must
+    // include `recv` and one of `{suspend, bind}`); the test's intent
+    // (verify the requested caps appear verbatim on the returned
+    // handle) is preserved by including `recv` in the requested set.
     const requested = caps.PortCap{
+        .recv = true,
         .bind = true,
         .restart_policy = true,
     };

@@ -156,11 +156,13 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 3: saturate the handle table. Use a no-cap port for the
-    // filler — `create_port` mints a slot with no extra side effects.
-    // Bound the loop at HANDLE_TABLE_MAX so a misbehaving kernel
-    // cannot hang the test.
-    const filler_caps_word: u64 = @as(u64, (caps.PortCap{}).toU16());
+    // Step 3: saturate the handle table. Use a port for the filler —
+    // `create_port` mints a slot with no extra side effects. The
+    // minimal cap shape that satisfies create_port's structural rule
+    // (must include `recv` and one of `{suspend, bind}`) is
+    // `{recv, bind}`. Bound the loop at HANDLE_TABLE_MAX so a
+    // misbehaving kernel cannot hang the test.
+    const filler_caps_word: u64 = @as(u64, (caps.PortCap{ .recv = true, .bind = true }).toU16());
     var saturated: bool = false;
     var i: u32 = 0;
     while (i < caps.HANDLE_TABLE_MAX) {

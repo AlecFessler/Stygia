@@ -11,23 +11,35 @@
 //   E_PERM, leave the reply handle in the caller's table, and skip the
 //   atomic park step.
 //
+//   create_port's structural rule (must include `recv` and one of
+//   `{suspend, bind}`) prevents minting a port handle without `recv`
+//   directly. To obtain a port-typed slot whose caps lack `recv`, we
+//   mint with `{recv, bind}` and then `restrict` to drop `recv` while
+//   keeping `bind`. The kernel's recv-mode cap check in reply
+//   (kernel/syscall/reply.zig) reads the recv bit from the caller's
+//   user_table snapshot — which `restrict` updates synchronously — and
+//   does not lock the underlying port object before this gate, so the
+//   syscall returns E_PERM purely from the user_table caps word.
+//
 //   Pipeline (test EC owns both ports + W):
-//     1. mint port_A with caps = {bind, recv}    — used to obtain a
-//        reply handle via the suspend → recv choreography.
-//     2. mint port_B with caps = {bind} only     — no recv cap. This
-//        is the port we'll name in the recv-mode reply word.
-//     3. mint sibling EC W with caps = {susp, restart_policy = 0} and
+//     1. mint port_A with caps = {bind, recv, suspend} — used to obtain
+//        a reply handle via the suspend → recv choreography.
+//     2. mint port_B with caps = {bind, recv} — temporarily holds
+//        `recv` so create_port's shape rule is satisfied.
+//     3. restrict(port_B, {bind}) — drops `recv` from port_B's caps.
+//        This is the recv-less handle test 23 names.
+//     4. mint sibling EC W with caps = {susp, restart_policy = 0} and
 //        target = self so it runs in the test EC's address space.
-//     4. suspend(W, port_A)                      — queues W as a
+//     5. suspend(W, port_A)                      — queues W as a
 //        suspended sender on port_A; non-blocking on the test EC since
 //        [1] != self per §[suspend].
-//     5. recv(port_A, 0)                         — returns immediately
+//     6. recv(port_A, 0)                         — returns immediately
 //        with reply_handle_id in syscall-word bits 32-43.
-//     6. issue unified reply via raw asm with reply_handle_id (bits
+//     7. issue unified reply via raw asm with reply_handle_id (bits
 //        20-31) and recv_port_handle_id = port_B (bits 32-43). The
 //        kernel must check the recv cap on port_B before parking, so
 //        no event needs to ever fire on port_B.
-//     7. assert E_PERM and that the reply handle is still typed
+//     8. assert E_PERM and that the reply handle is still typed
 //        `reply` in the caller's table.
 //
 //   The unified reply word layout per §[reply]:
@@ -42,24 +54,26 @@
 //   reply word.
 //
 // Action
-//   1. create_port(caps = {bind, recv})          — must succeed (port_A)
-//   2. create_port(caps = {bind})                — must succeed (port_B)
-//   3. create_execution_context(target = self,
+//   1. create_port(caps = {bind, recv, suspend}) — must succeed (port_A)
+//   2. create_port(caps = {bind, recv})          — must succeed (port_B)
+//   3. restrict(port_B, {bind})                  — drops `recv`; OK
+//   4. create_execution_context(target = self,
 //        caps = {susp, restart_policy = 0})      — must succeed
-//   4. suspend(W, port_A)                        — must return OK
-//   5. recv(port_A, 0)                           — must return OK
-//   6. raw-asm reply(reply_handle_id,
+//   5. suspend(W, port_A)                        — must return OK
+//   6. recv(port_A, 0)                           — must return OK
+//   7. raw-asm reply(reply_handle_id,
 //                   recv_port_handle_id = port_B) — must return E_PERM
-//   7. readCap(reply_handle_id).handleType() == .reply
+//   8. readCap(reply_handle_id).handleType() == .reply
 //
 // Assertions
 //   1: setup port_A creation failed
 //   2: setup port_B creation failed
-//   3: setup EC creation failed
-//   4: suspend did not return OK
-//   5: recv did not return OK
-//   6: recv-mode reply returned something other than E_PERM
-//   7: reply handle was consumed (slot no longer typed `reply`)
+//   3: restrict on port_B did not return OK
+//   4: setup EC creation failed
+//   5: suspend did not return OK
+//   6: recv did not return OK
+//   7: recv-mode reply returned something other than E_PERM
+//   8: reply handle was consumed (slot no longer typed `reply`)
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -81,10 +95,10 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_a_handle: u12 = @truncate(cp_a.v1 & 0xFFF);
 
-    // Step 2: mint port_B with bind only — no recv cap. This is the
-    // port the recv-mode reply will name; the missing recv cap is the
-    // assertion under test.
-    const port_b_caps = caps.PortCap{ .bind = true };
+    // Step 2: mint port_B with {bind, recv}. recv is required by
+    // create_port's structural rule; we drop it via restrict in step 3
+    // to obtain the recv-less handle the test asserts on.
+    const port_b_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp_b = syscall.createPort(@as(u64, port_b_caps.toU16()));
     if (testing.isHandleError(cp_b.v1)) {
         testing.fail(2);
@@ -92,7 +106,19 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_b_handle: u12 = @truncate(cp_b.v1 & 0xFFF);
 
-    // Step 3: mint sibling EC W. susp lets the test EC queue W onto
+    // Step 3: drop the `recv` bit on port_B. The kernel's recv-mode cap
+    // check in reply reads from the caller's user_table caps word,
+    // which restrict updates synchronously. The reply syscall does not
+    // lock the underlying port object before its recv-cap gate, so the
+    // gate fires from the user_table snapshot alone.
+    const port_b_restricted = caps.PortCap{ .bind = true };
+    const rb = syscall.restrict(port_b_handle, @as(u64, port_b_restricted.toU16()));
+    if (rb.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+
+    // Step 4: mint sibling EC W. susp lets the test EC queue W onto
     // port_A via suspend. restart_policy = 0 (kill) keeps the call
     // inside the runner-granted ec_restart_max ceiling.
     const w_caps = caps.EcCap{
@@ -109,33 +135,33 @@ pub fn main(cap_table_base: u64) void {
         0,
     );
     if (testing.isHandleError(cec.v1)) {
-        testing.fail(3);
+        testing.fail(4);
         return;
     }
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    // Step 4: queue W as a suspended sender on port_A. [1] = W != self,
+    // Step 5: queue W as a suspended sender on port_A. [1] = W != self,
     // so the call returns immediately without blocking the test EC.
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_a_handle,
     });
     if (sus.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(4);
+        testing.fail(5);
         return;
     }
 
-    // Step 5: recv on port_A. The test EC holds port_A's bind cap
+    // Step 6: recv on port_A. The test EC holds port_A's bind cap
     // (alive) and W is queued, so recv returns immediately with the
     // minted reply handle id in syscall-word bits 32-43.
     const got = syscall.recv(port_a_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(5);
+        testing.fail(6);
         return;
     }
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
-    // Step 6: dispatch the recv-mode reply directly. libz's typed
+    // Step 7: dispatch the recv-mode reply directly. libz's typed
     // `reply` wrapper covers only the bare-reply case; recv-mode and
     // attachment-bearing forms ride raw inline asm. The word packs
     // syscall_num (52) at bits 0-11, pair_count = 0 at bits 12-19,
@@ -173,18 +199,18 @@ pub fn main(cap_table_base: u64) void {
     }
 
     if (rax_out != @intFromEnum(errors.Error.E_PERM)) {
-        testing.fail(6);
+        testing.fail(7);
         return;
     }
 
-    // Step 7: the reply handle must NOT have been consumed. The
+    // Step 8: the reply handle must NOT have been consumed. The
     // capability table is mapped read-only in the holding domain, so
     // re-reading the slot via readCap reflects the kernel's authoritative
     // view; a `reply` HandleType means the slot still holds the live
     // reply handle.
     const slot = caps.readCap(cap_table_base, reply_handle_id);
     if (slot.handleType() != .reply) {
-        testing.fail(7);
+        testing.fail(8);
         return;
     }
 

@@ -190,13 +190,17 @@ pub fn main(cap_table_base: u64) void {
     // 32-43 (12 bits).
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
-    // Step 5: donor M — a port with full move + copy + xfer + bind.
-    // The pair entry below requests {xfer, bind} with move = 1; this
-    // donor has `move`, so reply test 14 is not what fires.
+    // Step 5: donor M — a port with move + copy + xfer + bind. The pair
+    // entry below requests {xfer, bind} with move = 1; this donor has
+    // `move`, so reply test 14 is not what fires. `recv` is added to
+    // satisfy create_port's structural rule (must include `recv` and
+    // one of `{suspend, bind}`); the entry caps subset (test 13) still
+    // holds because entry.caps = {xfer, bind} ⊆ donor caps.
     const donor_m_caps = caps.PortCap{
         .move = true,
         .copy = true,
         .xfer = true,
+        .recv = true,
         .bind = true,
     };
     const cp_m = syscall.createPort(@as(u64, donor_m_caps.toU16()));
@@ -208,10 +212,13 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 6: donor C — a port with copy (but no move). The pair
     // entry below requests {xfer, bind} with move = 0; the donor has
-    // `copy`, so reply test 15 is not what fires.
+    // `copy`, so reply test 15 is not what fires. `recv` is added to
+    // satisfy create_port's structural rule (must include `recv` and
+    // one of `{suspend, bind}`).
     const donor_c_caps = caps.PortCap{
         .copy = true,
         .xfer = true,
+        .recv = true,
         .bind = true,
     };
     const cp_c = syscall.createPort(@as(u64, donor_c_caps.toU16()));
