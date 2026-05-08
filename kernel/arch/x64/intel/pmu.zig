@@ -21,11 +21,14 @@
 
 const zag = @import("zag");
 
+const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
+const port_mod = zag.sched.port;
+const scheduler = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -334,20 +337,159 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
     out[2] = 0;
 }
 
+/// PMU overflow handler. Registered on the LAPIC PerfMon vector via
+/// `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
+/// `dispatchInterrupt` issues `apic.endOfInterrupt()` after this returns
+/// — the handler MUST NOT EOI here.
+///
+/// Behavior (mirrors aarch64 PMUv3 PMI in `arch/aarch64/pmu.zig`):
+///   1. Read `IA32_PERF_GLOBAL_STATUS` (MSR 0x38E) to find the
+///      overflow-status bitmap. Intel SDM Vol 3B §19.2.1 / §19.2.4:
+///      bits [0..N-1] of GLOBAL_STATUS map to GP PMC overflow flags
+///      (one bit per `IA32_PMCx`). Bits 32+ cover fixed counters and
+///      the trace overflow which we do not configure here.
+///   2. For every overflowed PMC slot owned by the running EC's
+///      configured counter range, re-arm by writing the configured
+///      preload via `IA32_PMCx` (MSR 0xC1+x). Without re-preload the
+///      counter would only wrap again after a full 2^width events,
+///      losing the configured `overflow_threshold` periodicity (Intel
+///      SDM Vol 3B §19.2.3 "Full-Width Writes").
+///   3. Write the overflowed bitmap back to
+///      `IA32_PERF_GLOBAL_STATUS_RESET` (MSR 0x390 — same MSR alias as
+///      `IA32_PERF_GLOBAL_OVF_CTRL` on PMU v1/v2; per Intel SDM Vol 3B
+///      §19.2.4 writing 1 to bit n clears `GLOBAL_STATUS[n]`) so the
+///      LAPIC PerfMon line deasserts.
+///   4. Re-enable the counters via `IA32_PERF_GLOBAL_CTRL` (MSR 0x38F)
+///      so the re-armed counters keep ticking after we ERET. The
+///      hardware does NOT auto-disable counters on overflow on Intel
+///      v2+ — only the LAPIC LVT PerfMon mask bit is auto-set, which
+///      we don't manipulate here (the LAPIC EOI path re-arms the
+///      vector). Restoring `GLOBAL_CTRL` to the active mask matches
+///      the value `programCounters` last wrote.
+///   5. Deliver a single `.pmu_overflow` event to the running EC via
+///      `port.firePmuOverflow`. Subcode = lowest-index overflowed
+///      PMC. Spec §[event_route] no-route fallback drops the event
+///      and the EC keeps running.
+///
+/// Defensive paths: if no EC is dispatched on this core or the EC has
+/// no `perfmon_state` attached, we still clear the overflow bits and
+/// disable the contributing counters so a subsequent ERET does not
+/// re-trigger the PMI on the same residual flags.
 fn pmiHandler(ctx: *cpu.Context) void {
     _ = ctx;
-    // The PMI vector is registered as `.external`, so `dispatchInterrupt`
-    // already issues `apic.endOfInterrupt()` after this handler returns.
-    // Do NOT EOI here.
-    const status = cpu.rdmsr(IA32_PERF_GLOBAL_STATUS);
-    cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, status);
 
+    const status = cpu.rdmsr(IA32_PERF_GLOBAL_STATUS);
+    // GP-PMC overflow bits are the low 32; we never arm fixed counters
+    // or the trace overflow on this kernel, so mask the relevant bits.
+    const gp_overflow = status & gpCounterMask();
+    if (gp_overflow == 0) return;
+
+    const ec_opt = scheduler.currentEc();
+
+    // Defensive cleanup: no EC is dispatched, or it has no perfmon
+    // state. Clear the overflow bits and zero the matching
+    // PERFEVTSELx slots so the PMI doesn't re-fire on ERET.
+    if (ec_opt == null or ec_opt.?.perfmon_state == null) {
+        cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, gp_overflow);
+        var cleanup_remaining = gp_overflow;
+        while (cleanup_remaining != 0) {
+            const i: u8 = @intCast(@ctz(cleanup_remaining));
+            const sh: u6 = @intCast(i);
+            cleanup_remaining &= ~(@as(u64, 1) << sh);
+            cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), 0);
+        }
+        return;
+    }
+
+    const ec = ec_opt.?;
+    const ps_ref = ec.perfmon_state.?;
+    const ps_lr = ps_ref.lockIrqSave(@src()) catch {
+        // Slab gen flipped — perfmon was deallocated by a remote
+        // core between our null-check and lock. Fall back to the
+        // defensive cleanup path.
+        cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, gp_overflow);
+        var cleanup_remaining = gp_overflow;
+        while (cleanup_remaining != 0) {
+            const i: u8 = @intCast(@ctz(cleanup_remaining));
+            const sh: u6 = @intCast(i);
+            cleanup_remaining &= ~(@as(u64, 1) << sh);
+            cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), 0);
+        }
+        return;
+    };
+    const ps = ps_lr.ptr;
+    const ps_irq_state = ps_lr.irq_state;
+    const state = &ps.arch_state;
+
+    // Stop counting while we re-preload to avoid races between
+    // PMC writes and live counting (Intel SDM Vol 3B §19.2.3
+    // recommends disabling via GLOBAL_CTRL before MSR full-width
+    // writes when the counter is enabled).
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
-    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
-    // PMI ownership / state lookup needs to be re-wired against the new
-    // PMU storage location (per-core or per-port?). Until then we panic
-    // — userspace cannot start counters, so this should be unreachable
-    // in practice.
-    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
+    var lowest_idx: u8 = 0xFF;
+    var enable_mask: u64 = 0;
+    var remaining = gp_overflow;
+    while (remaining != 0) {
+        const i: u8 = @intCast(@ctz(remaining));
+        const sh: u6 = @intCast(i);
+        remaining &= ~(@as(u64, 1) << sh);
+        if (lowest_idx == 0xFF) lowest_idx = i;
+        if (i >= state.num_counters) {
+            // Not ours — disable the contributing PERFEVTSEL so it
+            // can't fire again before the EC is rebound.
+            cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), 0);
+            continue;
+        }
+        const cfg = state.configs[i];
+        if (!cfg.has_threshold) continue;
+        const preload = preloadValue(cfg);
+        cpu.wrmsr(IA32_PMC_BASE + @as(u32, i), preload);
+        state.values[i] = preload;
+        enable_mask |= @as(u64, 1) << sh;
+    }
+
+    // Add back any previously-active counters that weren't part of
+    // this overflow set, so we restore the full enable mask.
+    var j: u8 = 0;
+    while (j < state.num_counters) {
+        const sh: u6 = @intCast(j);
+        const bit: u64 = @as(u64, 1) << sh;
+        if ((gp_overflow & bit) == 0) enable_mask |= bit;
+        j += 1;
+    }
+
+    // Write-1-to-clear the overflow flags. GLOBAL_STATUS_RESET
+    // (alias 0x390) is the documented clear path (Intel SDM Vol 3B
+    // §19.2.4).
+    cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, gp_overflow);
+
+    // Re-enable counters.
+    cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, enable_mask);
+
+    ps_ref.unlockIrqRestore(ps_irq_state);
+
+    if (lowest_idx == 0xFF) return;
+
+    port_mod.firePmuOverflow(ec, lowest_idx);
+
+    // If event delivery suspended the EC (route bound), drive the
+    // scheduler so this core dispatches the next ready EC instead of
+    // ERET-ing back to the now-parked context.
+    const core: u8 = @truncate(apic.coreID());
+    if (!scheduler.coreCurrentIs(core, ec)) {
+        scheduler.preempt();
+    }
+}
+
+/// Mask covering all general-purpose PMC slots configurable on this
+/// CPU. Bit n = 1 means `IA32_PMCn` is in scope. Used to filter
+/// `IA32_PERF_GLOBAL_STATUS` so we ignore fixed-counter / uncore /
+/// trace overflow flags this kernel never arms.
+fn gpCounterMask() u64 {
+    const n = cached_info.num_counters;
+    if (n == 0) return 0;
+    if (n >= 64) return ~@as(u64, 0);
+    const sh: u6 = @intCast(n);
+    return (@as(u64, 1) << sh) - 1;
 }

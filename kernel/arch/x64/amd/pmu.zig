@@ -36,6 +36,8 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmu_facade = zag.arch.x64.pmu;
 const pmu_sched = zag.syscall.pmu;
+const port_mod = zag.sched.port;
+const scheduler = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -82,7 +84,9 @@ const PERFEVTSEL_EN: u64 = 1 << 22;
 //   0xC000_0301  PerfCntrGlobalCtl         (RW)
 //   0xC000_0302  PerfCntrGlobalStatusClr   (WO)
 const PERFMON_V2_LEAF: u32 = 0x8000_0022;
+const PERFCNTR_GLOBAL_STATUS: u32 = 0xC000_0300;
 const PERFCNTR_GLOBAL_CTL: u32 = 0xC000_0301;
+const PERFCNTR_GLOBAL_STATUS_CLR: u32 = 0xC000_0302;
 
 const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
 
@@ -446,13 +450,164 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     return true;
 }
 
+/// AMD PMU overflow handler. Registered on the LAPIC PerfMon vector
+/// via `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
+/// `dispatchInterrupt` issues the LAPIC EOI after this returns — the
+/// handler MUST NOT EOI here.
+///
+/// Behavior (mirrors aarch64 PMUv3 PMI in `arch/aarch64/pmu.zig`):
+///   1. Detect which PMCs overflowed.
+///        * PerfMonV2 (Zen 4+): read `PerfCntrGlobalStatus`
+///          (MSR 0xC000_0300) — bit n = PMC n overflow flag.
+///          AMD APM Vol 2 §13.2.4.
+///        * Pre-PerfMonV2: AMD has no architectural global status MSR,
+///          so we infer overflow from the per-counter PMC value: an
+///          armed counter that is currently below its preload value
+///          must have wrapped past 2^48 and re-entered the low region
+///          (AMD APM Vol 2 §13.2.1 / §13.2.3 — the overflow interrupt
+///          is fired on counter wrap, and the EN bit stays asserted).
+///   2. For every overflowed PMC owned by the running EC's configured
+///      counter range, re-arm by writing the configured preload to
+///      the per-counter PMC register (`PerfCtrx`).
+///   3. Clear the overflow flag.
+///        * PerfMonV2: write 1 to bit n of `PerfCntrGlobalStatusClr`
+///          (MSR 0xC000_0302). AMD APM Vol 2 §13.2.4.
+///        * Pre-PerfMonV2: the per-counter PMC write in step 2 already
+///          re-arms the counter past the wrap, so no separate clear is
+///          required (the wrap detection is purely value-based).
+///   4. Deliver a single `.pmu_overflow` event to the running EC via
+///      `port.firePmuOverflow`. Subcode = lowest-index overflowed PMC.
+///      Spec §[event_route] no-route fallback drops the event and the
+///      EC keeps running.
+///
+/// Defensive paths: if no EC is dispatched on this core or the EC has
+/// no `perfmon_state` attached, we still clear the overflow source
+/// (PerfMonV2 status clear, or per-counter EN disable on pre-V2) so a
+/// subsequent ERET does not re-trigger the PMI on the same residual
+/// flags.
 fn pmiHandler(ctx: *cpu.Context) void {
     _ = ctx;
-    // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
-    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
-    // PMI ownership / state lookup needs to be re-wired against the new
-    // PMU storage location (per-core or per-port?). Until then we panic
-    // — userspace cannot start counters, so this should be unreachable
-    // in practice.
-    @panic("not implemented: PMI handler — pmu_state migrated off ExecutionContext");
+
+    const ec_opt = scheduler.currentEc();
+
+    // Without a running EC we have no way to identify which counter
+    // wrapped on pre-V2 hardware (no global status MSR). On V2 we can
+    // still ack the global status. In both cases mask the LAPIC LVT
+    // entry's contributing counters by zeroing every PerfEvtSelx so
+    // residual EN bits can't re-trigger the PMI on ERET.
+    if (ec_opt == null or ec_opt.?.perfmon_state == null) {
+        if (has_perfmon_v2) {
+            const status = cpu.rdmsr(PERFCNTR_GLOBAL_STATUS) & gpCounterMask();
+            if (status != 0) cpu.wrmsr(PERFCNTR_GLOBAL_STATUS_CLR, status);
+        }
+        var i: u8 = 0;
+        while (i < cached_info.num_counters) {
+            cpu.wrmsr(perfevtselMsr(i), 0);
+            i += 1;
+        }
+        return;
+    }
+
+    const ec = ec_opt.?;
+    const ps_ref = ec.perfmon_state.?;
+    const ps_lr = ps_ref.lockIrqSave(@src()) catch {
+        if (has_perfmon_v2) {
+            const status = cpu.rdmsr(PERFCNTR_GLOBAL_STATUS) & gpCounterMask();
+            if (status != 0) cpu.wrmsr(PERFCNTR_GLOBAL_STATUS_CLR, status);
+        }
+        var i: u8 = 0;
+        while (i < cached_info.num_counters) {
+            cpu.wrmsr(perfevtselMsr(i), 0);
+            i += 1;
+        }
+        return;
+    };
+    const ps = ps_lr.ptr;
+    const ps_irq_state = ps_lr.irq_state;
+    const state = &ps.arch_state;
+
+    const overflow_mask = detectOverflow(state);
+    if (overflow_mask == 0) {
+        ps_ref.unlockIrqRestore(ps_irq_state);
+        return;
+    }
+
+    var lowest_idx: u8 = 0xFF;
+    var remaining = overflow_mask;
+    while (remaining != 0) {
+        const i: u8 = @intCast(@ctz(remaining));
+        const sh: u6 = @intCast(i);
+        remaining &= ~(@as(u64, 1) << sh);
+        if (lowest_idx == 0xFF) lowest_idx = i;
+        if (i >= state.num_counters) {
+            cpu.wrmsr(perfevtselMsr(i), 0);
+            continue;
+        }
+        const cfg = state.configs[i];
+        if (!cfg.has_threshold) continue;
+        const preload = preloadValue(cfg);
+        cpu.wrmsr(perfctrMsr(i), preload);
+        state.values[i] = preload;
+    }
+
+    // PerfMonV2: write-1-to-clear so the LAPIC PerfMon line deasserts.
+    // Pre-V2 has no architectural status MSR; the per-counter
+    // PMC re-preload above is the entire ack — the LAPIC PerfMon LVT
+    // mask bit will be auto-cleared by the EOI path.
+    if (has_perfmon_v2) {
+        cpu.wrmsr(PERFCNTR_GLOBAL_STATUS_CLR, overflow_mask);
+    }
+
+    ps_ref.unlockIrqRestore(ps_irq_state);
+
+    if (lowest_idx == 0xFF) return;
+
+    port_mod.firePmuOverflow(ec, lowest_idx);
+
+    const core: u8 = @truncate(apic.coreID());
+    if (!scheduler.coreCurrentIs(core, ec)) {
+        scheduler.preempt();
+    }
+}
+
+/// Mask covering all configurable PMC slots on this CPU. Used to
+/// filter PerfCntrGlobalStatus and to bound pre-V2 PMC scans.
+fn gpCounterMask() u64 {
+    const n = cached_info.num_counters;
+    if (n == 0) return 0;
+    if (n >= 64) return ~@as(u64, 0);
+    const sh: u6 = @intCast(n);
+    return (@as(u64, 1) << sh) - 1;
+}
+
+/// Build a bitmap of PMC indices whose hardware counter overflowed.
+///
+/// PerfMonV2 (Zen 4+): exact via `PerfCntrGlobalStatus` (AMD APM Vol 2
+/// §13.2.4). Pre-V2: AMD does not expose an architectural overflow
+/// status MSR, so we infer overflow from the counter value — an armed
+/// counter (`has_threshold`) that currently reads below its preload
+/// must have wrapped past 2^48 and re-entered the low region. Same
+/// approach as `kprofSampleCheckAndRearm`. The 48-bit counter
+/// guarantees no false positives at any realistic event rate within
+/// the PMI service window.
+fn detectOverflow(state: *PmuState) u64 {
+    if (cached_info.num_counters == 0) return 0;
+
+    if (has_perfmon_v2) {
+        return cpu.rdmsr(PERFCNTR_GLOBAL_STATUS) & gpCounterMask();
+    }
+
+    var mask: u64 = 0;
+    var i: u8 = 0;
+    while (i < state.num_counters) : (i += 1) {
+        const cfg = state.configs[i];
+        if (!cfg.has_threshold) continue;
+        const preload = preloadValue(cfg);
+        const val = cpu.rdmsr(perfctrMsr(i)) & COUNTER_MASK;
+        if (val < preload) {
+            const sh: u6 = @intCast(i);
+            mask |= @as(u64, 1) << sh;
+        }
+    }
+    return mask;
 }
