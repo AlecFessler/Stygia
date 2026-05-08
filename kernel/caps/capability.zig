@@ -329,19 +329,16 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
         const new_caps: port.PortCaps = @bitCast(requested_caps);
         const port_lr = ref.lockIrqSave(@src()) catch return 0;
         const p = port_lr.ptr;
-        const had_susp_side = old_caps.@"suspend" or old_caps.bind;
-        const has_susp_side = new_caps.@"suspend" or new_caps.bind;
-        var dec_result: port.DecResult = .{ .destroyed = false, .pending_vcpus = null };
-        if (had_susp_side and !has_susp_side) {
-            dec_result = port.decSuspendRef(p);
+        // Bind-side dec never destroys; recv-side dec is the slab
+        // teardown owner. Run the bind dec first so a handle holding
+        // both `bind` and `recv` doesn't have its bind dec operate on
+        // a freed slab if recv-side teardown beats it.
+        if (old_caps.bind and !new_caps.bind) {
+            port.decBindRef(p);
         }
-        if (!dec_result.destroyed and old_caps.recv and !new_caps.recv) {
-            const recv_result = port.decRecvRef(p);
-            if (recv_result.destroyed) {
-                dec_result = recv_result;
-            } else if (dec_result.pending_vcpus == null) {
-                dec_result.pending_vcpus = recv_result.pending_vcpus;
-            }
+        var dec_result: port.DecResult = .{ .destroyed = false, .pending_vcpus = null };
+        if (old_caps.recv and !new_caps.recv) {
+            dec_result = port.decRecvRef(p);
         }
         if (!dec_result.destroyed) {
             ref.unlockIrqRestore(port_lr.irq_state);

@@ -465,7 +465,7 @@ pub const ExecutionContext = struct {
     /// Port where vm_exit events are delivered for this vCPU. Set at
     /// `create_vcpu` together with `vm`; nulled when the vCPU is
     /// destroyed or when the port's destruction cascades. The vCPU's
-    /// existence increments `port.suspend_refcount` per spec §[port]
+    /// existence increments `port.bind_refcount` per spec §[port]
     /// lifetime model; the matching dec runs in
     /// `destroyExecutionContextLocked`.
     exit_port: ?SlabRef(Port) = null,
@@ -1697,32 +1697,26 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     zag.sched.fpu.clearFromLastFpuOwner(ec);
 
     // Spec §[port] lifetime: each kernel-held event route increments
-    // the destination port's suspend_refcount; the matching dec runs
+    // the destination port's bind_refcount; the matching dec runs
     // here when the route owner (this EC) goes away. Without this dec
-    // the port's suspend_refcount is leaked and the port is never
-    // destroyed even after every handle holder releases.
+    // the port's bind_refcount is leaked and recv-side E_CLOSED is
+    // never delivered even after every bind-cap holder releases.
     for (&ec.event_routes) |*slot| {
         const port_ref = slot.* orelse continue;
         const port_lr = port_ref.lockIrqSave(@src()) catch {
             slot.* = null;
             continue;
         };
-        const result = zag.sched.port.decSuspendRef(port_lr.ptr);
-        if (!result.destroyed) {
-            port_ref.unlockIrqRestore(port_lr.irq_state);
-        } else {
-            arch.cpu.restoreInterrupts(port_lr.irq_state);
-        }
-        zag.sched.port.finalizePendingVcpus(result.pending_vcpus);
+        zag.sched.port.decBindRef(port_lr.ptr);
+        port_ref.unlockIrqRestore(port_lr.irq_state);
         slot.* = null;
     }
 
     // Spec §[port] lifetime: a vCPU's exit_port is pinned for the
     // vCPU's lifetime. Unlink from the port's vcpu_list_head and
-    // decrement the port's suspend_refcount; the cascade only fires
-    // if some non-vCPU caller had also been holding the port alive
-    // (handle holders, routes) — otherwise this dec is balanced by
-    // the inc from create_vcpu and won't drive the count to zero.
+    // decrement the port's bind_refcount; teardown is independent —
+    // the slab dies only when `recv_refcount` hits zero, which can
+    // only happen via a separate recv-side handle release.
     if (ec.exit_port) |port_ref| {
         const port_lr_or_err = port_ref.lockIrqSave(@src());
         if (port_lr_or_err) |plr| {
@@ -1737,13 +1731,8 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 cursor = &node.vcpu_list_next;
             }
             ec.vcpu_list_next = null;
-            const result = zag.sched.port.decSuspendRef(p);
-            if (!result.destroyed) {
-                port_ref.unlockIrqRestore(plr.irq_state);
-            } else {
-                arch.cpu.restoreInterrupts(plr.irq_state);
-            }
-            zag.sched.port.finalizePendingVcpus(result.pending_vcpus);
+            zag.sched.port.decBindRef(p);
+            port_ref.unlockIrqRestore(plr.irq_state);
         } else |_| {}
         ec.exit_port = null;
     }

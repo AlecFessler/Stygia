@@ -52,7 +52,6 @@ const CREATE_PORT_CAPS_MASK: u64 = 0xFFFF;
 /// [test 02] returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
 /// [test 03] returns E_INVAL if any reserved bits are set in [1].
 /// [test 04] on success, the caller receives a port handle with caps = `[1].caps`.
-/// [test 05] returns E_PERM if `[1].caps` does not include `recv`, or includes neither of `{suspend, bind}`.
 pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     if (caps & ~CREATE_PORT_CAPS_MASK != 0) return errors.E_INVAL;
 
@@ -66,15 +65,14 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crpt) return errors.E_PERM;
 
-    // Spec §[create_port] cap-shape rule (test 05): the minted handle
-    // must be able to participate in the port's lifetime — `recv` keeps
-    // the recv side alive, and at least one of `suspend`/`bind` keeps
-    // the suspend side alive. A handle missing either side authorizes
-    // nothing operational and would leave the port stuck in the
-    // "alive iff both refcounts > 0" predicate forever.
+    // Port lifetime is governed by `recv_refcount` (Spec §[recv] tests
+    // 04/05): a port stays alive while any handle carries `recv`. A
+    // handle without `recv` cannot pin the slab, so a port minted with
+    // no `recv` cap on the creator's handle would be unobservable —
+    // the slab would never be reachable from any recv path and the
+    // create syscall's success would be operationally meaningless.
     const requested_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
     if (!requested_caps.recv) return errors.E_PERM;
-    if (!requested_caps.@"suspend" and !requested_caps.bind) return errors.E_PERM;
 
     return port_obj.createPort(ec, caps);
 }

@@ -274,10 +274,12 @@ pub fn createVcpu(
         return errors.E_BADCAP;
 
     // Spec §[port] lifetime: the vCPU pins exit_port via
-    // suspend_refcount for as long as the vCPU exists. The matching
-    // dec runs in `destroyExecutionContextLocked`. observed_zero is
-    // structurally impossible — `lookupPort` resolved against the
-    // caller's CD whose handle pins the port.
+    // bind_refcount for as long as the vCPU exists (vm_exit events
+    // fire spontaneously on the bound port — same lifetime class as
+    // event_routes and bind-cap holders). The matching dec runs in
+    // `destroyExecutionContextLocked`. observed_zero is structurally
+    // impossible — `lookupPort` resolved against the caller's CD
+    // whose handle pins the port.
     const vcpu_ec = allocVcpu(vm, domain, affinity, port) catch
         return errors.E_NOMEM;
     vcpu_ec.priority = requested_priority;
@@ -287,7 +289,7 @@ pub fn createVcpu(
     // consistent view.
     {
         const irq = port._gen_lock.lockIrqSave(@src());
-        port_mod.incSuspendRef(port) catch unreachable;
+        port_mod.incBindRef(port) catch unreachable;
         vcpu_ec.vcpu_list_next = port.vcpu_list_head;
         port.vcpu_list_head = vcpu_ec;
         port._gen_lock.unlockIrqRestore(irq);

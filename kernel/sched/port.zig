@@ -3,14 +3,26 @@
 //! See docs/kernel/specv3.md §[port].
 //!
 //! Lifecycle invariant: a port is alive iff
-//!     suspend_refcount > 0 AND recv_refcount > 0.
-//! `suspend_refcount` aggregates handle-side `suspend`/`bind` references,
-//! event-route registrations targeting the port, and vCPU exit_port pins;
-//! `recv_refcount` counts handles with `recv`. A handle that carries only
-//! `copy`/`move`/`restart_policy`/`xfer` authorizes no lifetime-bearing
-//! operation and so does not keep the port alive. When either refcount
-//! drops to 0 the port is destroyed and the corresponding side is woken
-//! with E_CLOSED. The dec that observes `.observed_zero` owns teardown.
+//!     recv_refcount > 0.
+//! Slab teardown is gated solely on the recv side so the recv-cap holder
+//! always has a chance to observe E_CLOSED before the underlying slot is
+//! reclaimed. `bind_refcount` aggregates the contributors that fire
+//! events on the port (handles with the `bind` cap, kernel-held
+//! event_routes targeting the port, and vCPU `exit_port` pins);
+//! `recv_refcount` counts handles with `recv`. A handle that carries
+//! only `copy`/`move`/`restart_policy`/`xfer`/`suspend` authorizes no
+//! port-lifetime contribution. When `bind_refcount` hits zero, blocked
+//! receivers are woken with E_CLOSED but the port stays alive — recv-
+//! cap holders may still call `recv` and observe E_CLOSED until they
+//! release. When `recv_refcount` hits zero the port is destroyed:
+//! parked senders wake with E_CLOSED and any vCPUs still pinning
+//! `exit_port` are cascade-terminated. The dec that observes
+//! `.observed_zero` on `recv_refcount` owns teardown.
+//!
+//! Spec §[recv] tests 04/05 map directly to the bind-side check: recv
+//! returns E_CLOSED iff the port has no bind-cap holders, no
+//! event_routes targeting it (both contribute to `bind_refcount`), and
+//! no queued events.
 
 const std = @import("std");
 const zag = @import("zag");
@@ -232,27 +244,30 @@ pub const Port = struct {
     /// guards every mutable field below.
     _gen_lock: GenLock = .{},
 
-    /// Reference count keeping the sender side of the port alive.
-    /// Contributors:
-    ///   - handles with `suspend` OR `bind` caps (one per handle),
+    /// Bind-side reference count. Aggregates everything that can fire
+    /// an event on this port spontaneously:
+    ///   - handles with the `bind` cap (one per handle),
     ///   - kernel-held event routes targeting this port (one per route),
     ///   - vCPU ECs whose `exit_port` references this port (one per vCPU).
     /// `inc → .observed_zero` raises `error.BadCap` so a SlabRef-walking
-    /// minter that races a concurrent destroy aborts the mint instead of
-    /// resurrecting a Sticky'd object. `dec → .observed_zero` is the
-    /// destruction trigger; the dec-owner runs `destroyPort` and the
-    /// counter is left at the Sticky pattern (i32 sign bit set).
-    suspend_refcount: Refcount = .{},
+    /// minter that races a concurrent close aborts the mint instead of
+    /// resurrecting a Sticky'd counter. `dec → .observed_zero` wakes
+    /// blocked receivers with E_CLOSED but does NOT destroy the port —
+    /// the recv-cap holder may still call `recv` and observe E_CLOSED
+    /// until they release their handle. Spec §[recv] tests 04/05.
+    bind_refcount: Refcount = .{},
 
-    /// Reference count for `recv`-side handles. Same observed_zero
-    /// semantics as `suspend_refcount`.
+    /// Reference count for `recv`-side handles. `dec → .observed_zero`
+    /// owns slab teardown: parked senders wake with E_CLOSED, any
+    /// vCPUs still pinning `exit_port` are cascade-terminated, and the
+    /// slab slot is freed via `destroyPort`.
     recv_refcount: Refcount = .{},
 
     /// Head of the singly-linked list of vCPU ECs whose `exit_port`
     /// references this port. Each vCPU contributes one to
-    /// `suspend_refcount`; when the port is destroyed via the
-    /// suspend-side decrement path the cascade walks this list and
-    /// terminates each bound vCPU. Mutated under `_gen_lock` only.
+    /// `bind_refcount`; the cascade walk on `recv_refcount → 0`
+    /// terminates each bound vCPU before the slab is freed. Mutated
+    /// under `_gen_lock` only.
     vcpu_list_head: ?*ExecutionContext = null,
 
     /// Wait queue, holding either suspended senders OR blocked receivers
@@ -502,12 +517,14 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer);
     }
 
-    // No sender ready. Spec §[port].recv test 04: if the port has no
-    // suspend/bind holders, no event_routes, no vCPU exit_port pins,
-    // and no events queued, return E_CLOSED rather than blocking forever.
-    // Routes and vCPU exit_ports also contribute to suspend_refcount, so
-    // this single check covers the full set per Spec §[port] lifetime.
-    if (p.suspend_refcount.snapshot() == 0) {
+    // No sender ready. Spec §[recv] test 04: if the port has no
+    // bind-cap holders, no event_routes targeting it, and no queued
+    // events, return E_CLOSED rather than blocking forever. Routes
+    // and vCPU exit_ports also contribute to `bind_refcount`, so this
+    // single check covers the full "no future events possible" set.
+    // The `senders` waiter-kind branch above already handled queued
+    // events; reaching here means the queue is empty.
+    if (p.bind_refcount.snapshot() == 0) {
         port_ref.unlockIrqRestore(port_irq_state);
         return errors.E_CLOSED;
     }
@@ -916,19 +933,19 @@ fn deliverReplyTransferResume(
 
 /// Install `port` as `ec.event_routes[slot_idx]`, replacing any prior
 /// binding. Caller has already locked `ec` and `port` and validated caps.
-/// Bumps `port.suspend_refcount` (routes contribute to suspend-side
-/// liveness) and decrements the prior port's suspend_refcount (if any)
+/// Bumps `port.bind_refcount` (routes contribute to bind-side
+/// liveness) and decrements the prior port's bind_refcount (if any)
 /// under their respective `_gen_lock`s. The new port's increment runs
 /// BEFORE the prior port's decrement so the rebind is observably
 /// monotonic to event firing.
 pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
     // Inc on the new port first so a route-only-refcount window where
     // the destination flips between (decremented prior, not-yet-inc'd
-    // new) cannot drive the new port's suspend_refcount through 0 and
+    // new) cannot drive the new port's bind_refcount through 0 and
     // close it before the bind even publishes. Caller already resolved
     // `port` via SlabRef.lock so observed_zero would mean concurrent
-    // destroy is in flight; surface E_BADCAP.
-    incSuspendRef(port) catch return errors.E_BADCAP;
+    // close-via-bind-drop is in flight; surface E_BADCAP.
+    incBindRef(port) catch return errors.E_BADCAP;
     if (ec.event_routes[slot_idx]) |prior_ref| {
         // Caller already holds `port._gen_lock` and `ec._gen_lock`. The
         // prior port is a different slab slot; reach in to dec its route
@@ -938,19 +955,10 @@ pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
         // sole writer of `ec.event_routes[slot_idx]` (it holds `ec`'s
         // gen-lock) and never inverts the (new_port → prior_port)
         // acquire order, so same-class detection here is a false
-        // positive. If the dec drove the prior port to teardown,
-        // `destroyLocked` already released its lock — skip the
-        // SlabRef-side unlock.
+        // positive.
         if (prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src())) |prior_lr| {
-            const result = decSuspendRef(prior_lr.ptr);
-            if (!result.destroyed) {
-                prior_ref.unlockIrqRestore(prior_lr.irq_state);
-            } else {
-                // Teardown path released the lock via setGenRelease without
-                // restoring IRQ state — do it manually here.
-                arch.cpu.restoreInterrupts(prior_lr.irq_state);
-            }
-            finalizePendingVcpus(result.pending_vcpus);
+            decBindRef(prior_lr.ptr);
+            prior_ref.unlockIrqRestore(prior_lr.irq_state);
         } else |_| {}
     }
     ec.event_routes[slot_idx] = SlabRef(Port).init(port, port._gen_lock.currentGen());
@@ -969,25 +977,18 @@ const PORT_REROUTE_GROUP: u32 = 0x504F; // "PO"
 
 /// Remove the binding at `ec.event_routes[slot_idx]`. Caller has already
 /// locked `ec` and validated `unbind` cap and that the slot is non-null.
-/// Decrements the bound port's `suspend_refcount` under its `_gen_lock`,
+/// Decrements the bound port's `bind_refcount` under its `_gen_lock`,
 /// triggering `propagateClosedToReceivers` if the port now has no
-/// remaining holders.
+/// remaining bind-side holders.
 pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
     const prior_ref = ec.event_routes[slot_idx] orelse return errors.E_NOENT;
     const prior_lr = prior_ref.lockIrqSave(@src()) catch {
         ec.event_routes[slot_idx] = null;
         return 0;
     };
-    const result = decSuspendRef(prior_lr.ptr);
-    if (!result.destroyed) {
-        prior_ref.unlockIrqRestore(prior_lr.irq_state);
-    } else {
-        // Teardown path released the lock via setGenRelease without
-        // restoring IRQ state — do it manually here.
-        arch.cpu.restoreInterrupts(prior_lr.irq_state);
-    }
+    decBindRef(prior_lr.ptr);
+    prior_ref.unlockIrqRestore(prior_lr.irq_state);
     ec.event_routes[slot_idx] = null;
-    finalizePendingVcpus(result.pending_vcpus);
     return 0;
 }
 
@@ -1207,34 +1208,43 @@ pub const DecResult = struct {
 /// observes the Sticky bit (a concurrent dec already drove the count
 /// to 0); the caller must NOT proceed as if it acquired a reference.
 /// All run under `p._gen_lock`.
-pub fn incSuspendRef(p: *Port) error{BadCap}!void {
-    if (p.suspend_refcount.inc() == .observed_zero) return error.BadCap;
+pub fn incBindRef(p: *Port) error{BadCap}!void {
+    if (p.bind_refcount.inc() == .observed_zero) return error.BadCap;
 }
-pub fn decSuspendRef(p: *Port) DecResult {
-    const result = p.suspend_refcount.dec();
-    if (result == .observed_zero) {
+
+/// Drop one bind-side reference. On `observed_zero` (last bind holder
+/// gone, no routes targeting the port, no vCPU `exit_port` pin), wake
+/// any blocked receivers with E_CLOSED but DO NOT destroy the slab —
+/// the recv-cap holder is still authorized to call `recv` and observe
+/// E_CLOSED until they release. Slab teardown is gated solely on
+/// `recv_refcount → 0` (see `decRecvRef`). The vcpu_list is empty by
+/// invariant when this fires: each vCPU's destroy decrements
+/// `bind_refcount` before the count can hit zero.
+pub fn decBindRef(p: *Port) void {
+    if (p.bind_refcount.dec() == .observed_zero) {
         propagateClosedToReceivers(p);
-        // Cascade-terminate any vCPUs still bound to this port. Their
-        // exit_port pin was their contribution to suspend_refcount;
-        // if the count reached zero with vcpus still in the list it's
-        // because a non-vCPU dec (handle release, route teardown) drove
-        // it down. Spec §[create_vcpu] test 14. Detach under the lock;
-        // the actual EC destroy runs AFTER the caller drops `p._gen_lock`.
-        const pending = cascadeDetachVcpus(p);
-        destroyPort(p);
-        return .{ .destroyed = true, .pending_vcpus = pending };
     }
-    return .{ .destroyed = false, .pending_vcpus = null };
 }
 pub fn incRecvRef(p: *Port) error{BadCap}!void {
     if (p.recv_refcount.inc() == .observed_zero) return error.BadCap;
 }
+
+/// Drop one recv-side reference. On `observed_zero` the port is
+/// unreachable from any future recv path: parked senders wake with
+/// E_CLOSED, any blocked receivers still queued (their handle was
+/// deleted while they were parked) wake with E_CLOSED, vCPUs still
+/// pinning `exit_port` are detached for cascade-terminate, and the
+/// slab is freed. The destroyed flag tells the caller to skip its
+/// standard unlock — `destroyLocked` consumed the gen-lock.
 pub fn decRecvRef(p: *Port) DecResult {
     const result = p.recv_refcount.dec();
     if (result == .observed_zero) {
         propagateClosedToSenders(p);
-        // recv hit zero but vCPUs may still be pinning suspend_refcount;
-        // the spec mandates they be terminated when the port is dead.
+        // A blocked recv whose handle was deleted while parked sees
+        // its port die from underneath it. Wake with E_CLOSED so the
+        // EC doesn't sit on a stale waiter list past the slab's gen
+        // bump.
+        propagateClosedToReceivers(p);
         const pending = cascadeDetachVcpus(p);
         destroyPort(p);
         return .{ .destroyed = true, .pending_vcpus = pending };
@@ -1244,49 +1254,64 @@ pub fn decRecvRef(p: *Port) DecResult {
 
 /// Aggregate handle-cap bookkeeping. Called from caps copy/delete/
 /// restrict to translate cap-bit edge transitions into refcount calls.
+/// Only the `bind` and `recv` caps contribute to port lifetime — the
+/// `suspend` cap authorizes the `suspend` syscall but doesn't pin the
+/// slab; suspend-only handles silently observe E_BADCAP if recv-side
+/// teardown frees the port out from under them.
 /// On `.observed_zero` from either inc, returns `error.BadCap` — and
-/// rolls back the suspend-side inc if the recv-side inc fails after it.
+/// rolls back the bind-side inc if the recv-side inc fails after it.
 pub fn onHandleAcquire(p: *Port, caps: u16) error{BadCap}!void {
     const c: PortCaps = @bitCast(caps);
-    var inc_susp = false;
-    if (c.@"suspend" or c.bind) {
-        try incSuspendRef(p);
-        inc_susp = true;
+    var inc_bind = false;
+    if (c.bind) {
+        try incBindRef(p);
+        inc_bind = true;
     }
     if (c.recv) {
         incRecvRef(p) catch |err| {
-            if (inc_susp) {
+            if (inc_bind) {
                 // Rollback dec must not drive teardown — we just inc'd.
-                const rb = decSuspendRef(p);
-                std.debug.assert(!rb.destroyed and rb.pending_vcpus == null);
+                // bind_refcount dec never destroys; just walk the wake
+                // path if it observes zero (which it can't here since
+                // we just inc'd).
+                decBindRef(p);
             }
             return err;
         };
     }
 }
 
-/// Run both decs BEFORE inspecting either result so the second dec
-/// doesn't operate on a slab slot already freed by the first dec's
-/// destroy (a handle holding both `suspend|bind` AND `recv` brings
-/// both sides to potentially-zero in one pass). Returns the cascade
-/// snapshot for the caller to finalize after lock release.
+/// Run both decs BEFORE inspecting the recv result so a handle holding
+/// both `bind` AND `recv` doesn't have its second dec operate on a
+/// freed slab. Returns the cascade snapshot for the caller to
+/// finalize after lock release. The bind-side dec never destroys —
+/// only the recv-side dec can drive slab teardown.
 fn onHandleRelease(p: *Port, caps: u16) DecResult {
     const c: PortCaps = @bitCast(caps);
-    var susp_zero = false;
+    var bind_zero = false;
     var recv_zero = false;
-    if (c.@"suspend" or c.bind) {
-        susp_zero = p.suspend_refcount.dec() == .observed_zero;
+    if (c.bind) {
+        bind_zero = p.bind_refcount.dec() == .observed_zero;
     }
     if (c.recv) {
         recv_zero = p.recv_refcount.dec() == .observed_zero;
     }
-    if (!susp_zero and !recv_zero) return .{ .destroyed = false, .pending_vcpus = null };
+    if (!bind_zero and !recv_zero) return .{ .destroyed = false, .pending_vcpus = null };
 
-    if (susp_zero) propagateClosedToReceivers(p);
-    if (recv_zero) propagateClosedToSenders(p);
-    const pending = cascadeDetachVcpus(p);
-    destroyPort(p);
-    return .{ .destroyed = true, .pending_vcpus = pending };
+    if (bind_zero) propagateClosedToReceivers(p);
+    if (recv_zero) {
+        propagateClosedToSenders(p);
+        // A blocked recv whose handle was the same one being dropped
+        // here observes E_CLOSED through the bind-side wake above; the
+        // recv-side wake catches the rare race where a different
+        // recv-cap holder's blocked recv was queued and the port now
+        // has no recv path at all.
+        if (!bind_zero) propagateClosedToReceivers(p);
+        const pending = cascadeDetachVcpus(p);
+        destroyPort(p);
+        return .{ .destroyed = true, .pending_vcpus = pending };
+    }
+    return .{ .destroyed = false, .pending_vcpus = null };
 }
 
 /// Public release-handle entry point invoked from the cross-cutting
@@ -1679,7 +1704,8 @@ pub fn resumeWithAbandoned(sender: *ExecutionContext) void {
     execution_context.resumeFromReply(sender, false);
 }
 
-/// On suspend_refcount → 0: wake all blocked receivers with E_CLOSED.
+/// On bind_refcount → 0 (or recv_refcount → 0 with blocked recvs in
+/// flight): wake all blocked receivers with E_CLOSED.
 fn propagateClosedToReceivers(p: *Port) void {
     if (p.waiter_kind != .receivers) return;
     while (p.waiters.dequeue()) |waiter| {
