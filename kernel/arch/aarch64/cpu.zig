@@ -609,13 +609,25 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     _ = park_top;
 }
 
+/// Swap SP to the per-core park kstack top, unmask IRQs, halt until any
+/// IRQ wakes us, then branch to `scheduler_run_after_park`. The original
+/// caller's stack frame is abandoned by the SP swap — callers are
+/// noreturn, so this is intentional. Without the swap each park-wake
+/// cycle leaves a fresh frame on the caller's kstack (run() →
+/// parkAndAwaitIRQ → wake → scheduler_run_after_park → run() → …); after
+/// ~12 pages of cycles the kstack overflows into its guard page and the
+/// next push faults at the SP0 sync vector entry. Mirrors the x86_64
+/// `mov rsp, [top]; sti; hlt; cli; jmp scheduler_run_after_park`
+/// shape. ARM ARM DDI 0487 §C5.2.4 WFI.
 pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
-    _ = park_top;
     asm volatile (
+        \\mov sp, %[top]
         \\msr daifclr, #2
         \\wfi
         \\msr daifset, #2
         \\b scheduler_run_after_park
-        ::: .{ .memory = true });
+        :
+        : [top] "r" (park_top),
+        : .{ .memory = true });
     unreachable;
 }

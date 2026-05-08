@@ -596,6 +596,13 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     // Initialize per-core scheduler state (idle thread, running thread).
     sched.perCoreInit();
 
-    // Enter the idle loop.
-    cpu.halt();
+    // Drop into the scheduler loop. APs start with empty run queues and
+    // no per-core idle EC, so `sched.run` will fall through to
+    // `parkAndAwaitIRQ` (WFI on the per-core park kstack) and wait for a
+    // cross-core wake / preempt IPI from `enqueueOnCore`. `sched.run` is
+    // `noreturn`. Mirrors arch/x64/smp.zig's AP entry. Without this, ECs
+    // enqueued on a secondary core (e.g. via affinity-targeted spawns)
+    // never run because the IRQ-driven preempt path on a halt() loop has
+    // no outer scheduler to dispatch the woken EC into.
+    sched.run();
 }
