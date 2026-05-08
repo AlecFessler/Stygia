@@ -568,13 +568,13 @@ fn runCell(vmar_rwx: u3, pf_rwx: u3, failed_assertion: *u64) bool {
 
     // Step 6: execute leg. We need at least one valid instruction at
     // cell.base for the allowed-execute case. Plant a return
-    // instruction. Planting requires cur_rwx.w on the cell VMAR — in
-    // our 3×3 set the only cell with eff_x is (r|w|x, r|w|x), which
-    // has vmar_rwx.w = 1, so we can plant directly. For other cells
-    // we don't need to plant (the worker faults on fetch before
-    // decode), but planting is safe as long as the test EC's view is
-    // writable; if it isn't, skip planting.
-    const can_plant = (vmar_rwx & 0b010) != 0;
+    // instruction. Planting requires write to actually reach the page
+    // — i.e. the EFFECTIVE rwx (vmar_rwx ∩ pf_rwx) must include w.
+    // Using vmar_rwx alone faults on cells like (r|w, r): the VMAR
+    // says writable but the kernel's mappingInstall correctly
+    // intersects with pf.caps so the PTE is read-only and the plant
+    // store traps the test EC.
+    const can_plant = eff_w;
     if (can_plant) {
         const dst: [*]volatile u8 = @ptrFromInt(cell.base);
         plantReturn(dst);
