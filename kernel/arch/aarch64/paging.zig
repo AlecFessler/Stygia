@@ -70,6 +70,12 @@ const VAddr = zag.memory.address.VAddr;
 const VmarCacheType = zag.memory.vmar.CacheType;
 const VmarPageSize = zag.memory.vmar.PageSize;
 
+/// First user-mappable virtual address. The NULL guard `[0, 0x1000)` is
+/// reserved by spec §[address_space] so that NULL dereferences always
+/// fault; this is the upper bound of that guard. Mirrors the value in
+/// `arch.dispatch.paging.user_null_guard.end`.
+const FIRST_USER_PAGE: u64 = 0x1000;
+
 /// Per-MappingKind descriptor attributes. cache/global/user fields are
 /// owned by the arch backend (ARM ARM D5.4, D13.2.97).
 const KindAttrs = struct {
@@ -211,29 +217,80 @@ fn l0Idx(virt: VAddr) u9 {
 /// MAIR layout the firmware/UEFI left in place. We cannot safely
 /// rewrite MAIR_EL1 under a live MMU (Linux arm64 head.S / proc.S
 /// only ever writes MAIR with the MMU disabled), so instead we
-/// walk the live MAIR, find the index holding Normal WB (0xFF) and
-/// the index holding Device-nGnRnE (0x00), and cache them here.
-/// Page table entries built after `initMairIndices` use these
-/// firmware-matched indices.
+/// scan the live MAIR for the four attribute encodings we need:
+///   - Normal WB cacheable     (0xFF) → `mair_normal`
+///   - Device-nGnRnE           (0x00) → `mair_device`
+///   - Normal Inner+Outer NC   (0x44) → `mair_normal_nc` (used for WC)
+///   - Normal Inner+Outer WT   (0xBB) → `mair_normal_wt`
+/// and cache the resolved indices for later page-table builds.
+///
+/// If the firmware MAIR layout does not include a slot for a
+/// requested encoding, the index falls back to the closest available
+/// equivalent: WC → Device-nGnRnE (strongly-ordered, no combining)
+/// and WT → Normal WB. The fallbacks are conservative — they trade
+/// performance for correctness, never the other way around.
 ///
 /// Default values are a fallback only — `initMairIndices()` must
 /// be called before any mapping is built.
 /// ARM ARM D13.2.97 — MAIR_EL1 layout.
 pub var mair_device: u3 = 0;
 pub var mair_normal: u3 = 1;
+pub var mair_normal_nc: u3 = 0; // WC fallback target — overridden if firmware exposes 0x44
+pub var mair_normal_wt: u3 = 1; // WT fallback target — overridden if firmware exposes 0xBB
 
 pub fn initMairIndices() void {
     var mair: u64 = undefined;
     asm volatile ("mrs %[v], mair_el1"
         : [v] "=r" (mair),
     );
+    var found_nc: bool = false;
+    var found_wt: bool = false;
     var i: u6 = 0;
     while (i < 8) {
         const attr: u8 = @truncate((mair >> (i * 8)) & 0xFF);
         if (attr == 0xFF) mair_normal = @intCast(i);
         if (attr == 0x00) mair_device = @intCast(i);
+        if (attr == 0x44) {
+            mair_normal_nc = @intCast(i);
+            found_nc = true;
+        }
+        if (attr == 0xBB) {
+            mair_normal_wt = @intCast(i);
+            found_wt = true;
+        }
         i += 1;
     }
+    // Apply fallbacks for any encoding firmware did not expose: WC
+    // collapses to Device-nGnRnE (strongly-ordered, no combining) and
+    // WT collapses to Normal-WB. The fallbacks trade performance for
+    // correctness — never the other way around.
+    if (!found_nc) mair_normal_nc = mair_device;
+    if (!found_wt) mair_normal_wt = mair_normal;
+}
+
+/// Resolve the MAIR index to use for a given VMAR `cch` value. The
+/// firmware-provided MAIR slots cover at minimum WB and Device-nGnRnE;
+/// WC and WT fall back to those when firmware doesn't expose Normal-NC
+/// (0x44) or Normal-WT (0xBB) — see `initMairIndices`.
+fn cchToAttrIndx(cch: VmarCacheType) u3 {
+    return switch (cch) {
+        .wb => mair_normal,
+        .uc => mair_device,
+        .wc => mair_normal_nc,
+        .wt => mair_normal_wt,
+    };
+}
+
+/// Shareability for a given cache type. Normal cacheable / WT memory
+/// runs Inner-Shareable for SMP coherency; non-cacheable Normal memory
+/// also runs Inner-Shareable (PE-coherent). Device memory is
+/// non-shareable (the access is already strongly ordered).
+/// ARM ARM D5.4, Table D5-39 (shareability + cacheability interaction).
+fn cchToSh(cch: VmarCacheType) u2 {
+    return switch (cch) {
+        .wb, .wt, .wc => 0b11,
+        .uc => 0b00,
+    };
 }
 
 /// Disable UEFI's identity mapping by disabling TTBR0 walks and flushing TLB.
@@ -282,6 +339,12 @@ pub fn mapPage(
     const pmm_mgr = &pmm.global_pmm.?;
 
     const attrs = kindAttrs(kind);
+    if (attrs.user and virt.addr < FIRST_USER_PAGE) {
+        // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
+        // fault. Runtime check (active in all build modes) so a buggy
+        // caller cannot silently install a leaf into the first page.
+        @panic("paging.mapPage: user mapping into NULL guard");
+    }
     const ap = permsToAp(perms, attrs.user);
     const xn = !perms.exec;
     const pxn = xn;
@@ -714,6 +777,15 @@ fn tlbiVae1is(vaddr: u64) void {
     isb();
 }
 
+/// Map a single user 4 KiB page with cache attributes drawn from the
+/// VMAR's `cch` field. Spec §[var] line 1444: 0=wb, 1=uc, 2=wc, 3=wt.
+///
+/// Cache attribute selection on aarch64 uses the per-PTE `attr_indx`
+/// field to index into MAIR_EL1 (ARM ARM D5.3, Table D5-15 + D13.2.97).
+/// Since we cannot rewrite MAIR_EL1 under a live MMU, the indices come
+/// from `initMairIndices` — see that function for the firmware-fallback
+/// policy when WC (Normal-NC, 0x44) or WT (Normal-WT, 0xBB) are not
+/// exposed by firmware.
 pub fn mapPageSized(
     addr_space_root: PAddr,
     phys: PAddr,
@@ -722,9 +794,70 @@ pub fn mapPageSized(
     cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
-    _ = cch;
     std.debug.assert(sz == .sz_4k);
-    return mapPage(addr_space_root, phys, virt, perms, .user_data);
+    std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
+    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
+
+    if (virt.addr < FIRST_USER_PAGE) {
+        // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
+        // fault. Runtime check (active in all build modes) so a buggy
+        // caller cannot silently install a leaf into the first page.
+        @panic("paging.mapPageSized: NULL guard");
+    }
+
+    kprof.point(.map_page, virt.addr);
+
+    const ap = permsToAp(perms, true);
+    const xn = !perms.exec;
+    const pxn = xn;
+
+    const parent_entry = PageEntry{
+        .valid = true,
+        .is_table = true,
+        .attr_indx = mair_normal,
+        .ap = 0b00,
+        .sh = 0b11,
+        .af = true,
+    };
+
+    const leaf_entry = PageEntry{
+        .valid = true,
+        .is_table = true, // Level 3 page descriptor: bits [1:0] = 0b11
+        .attr_indx = cchToAttrIndx(cch),
+        .ap = ap,
+        .sh = cchToSh(cch),
+        .af = true,
+        .ng = true, // user mappings are non-global (ASID-tagged)
+        .xn = xn,
+        .pxn = pxn,
+    };
+
+    const pmm_mgr = &pmm.global_pmm.?;
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+
+    const walk_indices = [_]u9{ l3Idx(virt), l2Idx(virt), l1Idx(virt) };
+    for (walk_indices) |idx| {
+        const entry = &table[idx];
+        if (!entry.valid) {
+            const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
+            const new_virt = VAddr.fromInt(@intFromPtr(new_page));
+            const new_phys = PAddr.fromVAddr(new_virt, null);
+            entry.* = parent_entry;
+            entry.setPAddr(new_phys);
+        }
+        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        table = @ptrFromInt(next_virt.addr);
+    }
+
+    const l0_entry = &table[l0Idx(virt)];
+    l0_entry.* = leaf_entry;
+    l0_entry.setPAddr(phys);
+
+    // ARM ARM D5.9: after installing a new leaf entry, broadcast TLB
+    // maintenance so cached "not-present" (faulting) entries from prior
+    // translations are invalidated across all inner-shareable cores.
+    tlbiVae1is(virt.addr);
 }
 
 pub fn unmapPageSized(

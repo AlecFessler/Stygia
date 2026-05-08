@@ -68,58 +68,171 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
     };
 }
 
-/// TLB shootdown: per-core pending invalidation addresses.
-/// Each core checks its slot before returning to userspace.
+/// TLB shootdown: cross-core invalidation broadcast.
 ///
-/// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes to
-/// Multiple Processors" requires software to broadcast invalidations; this is
-/// implemented via IPI + INVLPG on each remote core.
+/// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes
+/// to Multiple Processors" requires software to broadcast invalidations to
+/// every logical processor that may have cached the old translation.
+///
+/// Two shootdown modes co-exist on top of the same lock + descriptor:
+///
+///   1. **Synchronous** (`flushRemotePcid`, `shootdownTlbRange`): the
+///      initiator holds `shootdown_lock`, publishes the request descriptor
+///      (kind/addr/pcid), arms `shootdown_acks_remaining = remote_count`,
+///      fans out IPIs, then spins on `shootdown_acks_remaining == 0`
+///      before releasing the lock or publishing the next descriptor. The
+///      remote IPI handler performs the requested invalidation and
+///      decrements the counter. This is the Linux-style "send-then-wait"
+///      pattern — without it, a per-page loop that overwrites the shared
+///      descriptor between IPIs leaves remote cores executing INVPCID
+///      against the *next* descriptor instead of the one they were
+///      summoned for, leaking stale TLB entries (cross-core UAF on
+///      unmap+free races). Both syscall-side teardown paths run with
+///      interrupts enabled, so the wait is safe.
+///
+///   2. **Fire-and-forget** (`flushRemoteTlb`, single-page): the initiator
+///      holds the lock, publishes a `.invlpg_no_ack` descriptor, fans
+///      out IPIs, releases the lock. The handler INVLPGs but does NOT
+///      decrement `shootdown_acks_remaining`, so a later synchronous
+///      initiator's wait is not falsely satisfied by these strangler
+///      IPIs. This mode is used by `unmapPage`'s kernel-stack teardown,
+///      which is reachable from `finalizeDestroyMarkedDead` inside the
+///      IRQ-disabled scheduler critical section (`yieldTo`,
+///      `parkAndAwaitIRQ`). A synchronous wait there would be a hard
+///      deadlock — two cores both calling `unmapPage` with IRQs off
+///      would each spin on `shootdown_lock` waiting for the other's
+///      ack while neither can process the other's IPI. The
+///      pre-existing UAF window described in `unmapPage`'s body
+///      remains for this single-page kernel-side path.
 var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
-/// 0 = INVLPG single-page, 1 = INVPCID type-1 (single PCID, all addresses).
-/// Encoded into `shootdown_addr` low bits via the kind discriminator below.
-const ShootdownKind = enum(u8) { invlpg = 0, invpcid_single = 1 };
+/// Shootdown request kind:
+///   - .invlpg          → INVLPG `shootdown_addr` (flushes every PCID +
+///                        globals at this VA on the remote core). Used
+///                        by the synchronous fan-outs below — handler
+///                        decrements `shootdown_acks_remaining`.
+///   - .invpcid_single  → INVPCID type 1 against `shootdown_pcid`
+///                        (every linear address, single PCID). Sync.
+///   - .invpcid_addr    → INVPCID type 0 against `(shootdown_pcid,
+///                        shootdown_addr)` (one VA, one PCID — used by
+///                        the range walk so remote cores only pay for
+///                        the address space being torn down). Sync.
+///   - .invlpg_no_ack   → like .invlpg but the IPI handler does NOT
+///                        decrement the ack counter. Used by the
+///                        fire-and-forget kernel-side unmap path
+///                        (`flushRemoteTlb`, called from IRQ-disabled
+///                        scheduler contexts where waiting would
+///                        deadlock — see that function's doc).
+const ShootdownKind = enum(u8) {
+    invlpg = 0,
+    invpcid_single = 1,
+    invpcid_addr = 2,
+    invlpg_no_ack = 3,
+};
 var shootdown_kind: u8 = @intFromEnum(ShootdownKind.invlpg);
 var shootdown_pcid: u16 = 0;
+/// Per-shootdown remaining-ack counter. The initiator stores
+/// `remote_count` here before fanning out IPIs, then waits for it to
+/// drain to zero. Each IPI handler decrements it (release semantics)
+/// after completing the invalidation so the initiator's acquire-load
+/// observes the completed flush, not just the published request.
+var shootdown_acks_remaining: u32 = 0;
 
-/// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`:
-///   - .invlpg → invlpg `shootdown_addr` (per-page flush, including globals).
-///   - .invpcid_single → INVPCID type 1 against `shootdown_pcid` (every TLB
-///     entry tagged with that PCID, all linear addresses, retains globals).
+/// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`, performs
+/// the requested invalidation, then signals completion by decrementing
+/// `shootdown_acks_remaining`.
 ///
-/// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID.
+/// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID (types 0 and 1).
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     kprof.point(.tlb_shootdown, 0);
     const kind = @atomicLoad(u8, &shootdown_kind, .acquire);
-    if (kind == @intFromEnum(ShootdownKind.invpcid_single)) {
-        const pcid: u16 = @atomicLoad(u16, &shootdown_pcid, .acquire);
-        if (cpu.pcid_enabled) {
-            const desc: [2]u64 align(16) = .{ @as(u64, pcid) & 0xFFF, 0 };
-            asm volatile ("invpcid (%[desc]), %[type]"
-                :
-                : [desc] "r" (&desc),
-                  [type] "r" (@as(u64, 1)),
-                : .{ .memory = true });
-        }
-        return;
+    switch (kind) {
+        @intFromEnum(ShootdownKind.invpcid_single) => {
+            const pcid: u16 = @atomicLoad(u16, &shootdown_pcid, .acquire);
+            if (cpu.pcid_enabled) {
+                const desc: [2]u64 align(16) = .{ @as(u64, pcid) & 0xFFF, 0 };
+                asm volatile ("invpcid (%[desc]), %[type]"
+                    :
+                    : [desc] "r" (&desc),
+                      [type] "r" (@as(u64, 1)),
+                    : .{ .memory = true });
+            }
+        },
+        @intFromEnum(ShootdownKind.invpcid_addr) => {
+            const pcid: u16 = @atomicLoad(u16, &shootdown_pcid, .acquire);
+            const va: u64 = @atomicLoad(u64, &shootdown_addr, .acquire);
+            if (cpu.pcid_enabled) {
+                const desc: [2]u64 align(16) = .{ @as(u64, pcid) & 0xFFF, va };
+                asm volatile ("invpcid (%[desc]), %[type]"
+                    :
+                    : [desc] "r" (&desc),
+                      [type] "r" (@as(u64, 0)),
+                    : .{ .memory = true });
+            } else {
+                cpu.invlpg(va);
+            }
+        },
+        else => {
+            // .invlpg or .invlpg_no_ack — both perform the same
+            // INVLPG; only the ack-decrement decision below differs.
+            cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
+        },
     }
-    cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
+    if (kind != @intFromEnum(ShootdownKind.invlpg_no_ack)) {
+        _ = @atomicRmw(u32, &shootdown_acks_remaining, .Sub, 1, .release);
+    }
 }
 
-/// Flush a virtual address from all cores' TLBs.
+/// Wait for the most recent shootdown fan-out to complete (every remote
+/// core has executed its invalidation and decremented the ack counter).
+/// Caller must hold `shootdown_lock`.
 ///
-/// Intel SDM Vol 3A, Section 5.10.5 -- when a paging-structure entry is
-/// modified on one logical processor, software must propagate the
-/// invalidation to other processors that may have cached the old
-/// translation. This is done here by broadcasting an IPI that executes
-/// INVLPG on each remote core (Section 5.10.4.1).
+/// While spinning we explicitly keep interrupts in the caller's pre-call
+/// state — we deliberately do NOT toggle them on/off here, because
+/// callers from inside `switchTo`-style critical sections rely on the
+/// outer IRQ-off invariant being preserved across our call. The IPI
+/// handler runs CPU-side with auto-cli (Intel SDM Vol 3A §6.8.1) and
+/// only touches `shootdown_acks_remaining` plus the local TLB, so it
+/// is safe even when nested inside other kernel critical sections on
+/// the *remote* cores.
+inline fn waitForShootdownAcks() void {
+    while (@atomicLoad(u32, &shootdown_acks_remaining, .acquire) != 0) {
+        asm volatile ("pause" ::: .{ .memory = true });
+    }
+}
+
+/// Send the shootdown IPI to every remote core. Caller must hold
+/// `shootdown_lock` and have armed `shootdown_acks_remaining` to the
+/// expected ack count.
+inline fn fanoutShootdownIpis(self_id: u64) void {
+    const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
+    for (apic.lapics.?, 0..) |la, i| {
+        if (i == self_id) continue;
+        apic.sendIpi(@intCast(la.apic_id), vec);
+    }
+}
+
+/// Flush a virtual address from all cores' TLBs (every PCID).
 ///
-/// The IPI is fire-and-forget: remote cores may have interrupts disabled
-/// (e.g. mid-syscall), but the IPI will be delivered before any userspace
-/// instruction executes (the pending interrupt fires on iret).  This is
-/// safe because the physical page is only freed after this function
-/// returns, and the remote core cannot touch the old mapping from
-/// userspace until after the IPI handler runs.
+/// Used on unmap paths where the affected address space is unknown to
+/// the caller (kernel-stack teardown in `thread_kill`, where the dying
+/// thread last ran on some other core).
+///
+/// Fire-and-forget — does NOT wait for remote acks. The synchronous
+/// `flushRemotePcid` / `shootdownTlbRange` paths are reachable via
+/// scheduler-internal callers (`finalizeDestroyMarkedDead` in the
+/// `yieldTo` / `parkAndAwaitIRQ` IRQ-disabled critical section), and a
+/// synchronous wait there is a hard SMP=4 deadlock vector: two cores
+/// both reaching `unmapPage` with IRQs off would each spin on
+/// `shootdown_lock` waiting for the other's ack while neither can
+/// process the other's IPI. The original UAF window described below
+/// remains for this single-page kernel-side unmap; cross-domain user
+/// mappings shoot down through `shootdownTlbRange`, which IS waited
+/// (see that function for why the IRQ-context concern doesn't
+/// apply).
+///
+/// Intel SDM Vol 3A §5.10.4.1 (INVLPG), §5.10.5 (multiprocessor
+/// invalidation propagation).
 fn flushRemoteTlb(virt_addr: u64) void {
     const core_count = apic.coreCount();
     if (core_count <= 1) return;
@@ -129,14 +242,16 @@ fn flushRemoteTlb(virt_addr: u64) void {
     shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
-    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invlpg), .release);
+    // .invlpg_no_ack: handler will INVLPG but NOT decrement
+    // `shootdown_acks_remaining`. This matters because we don't wait
+    // here, so a later synchronous initiator (`flushRemotePcid` /
+    // `shootdownTlbRange`) could otherwise see its acks counter
+    // decremented by our straggler IPIs and falsely believe its
+    // shootdown completed.
+    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invlpg_no_ack), .release);
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);
 
-    const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
-    for (apic.lapics.?, 0..) |la, i| {
-        if (i == self_id) continue;
-        apic.sendIpi(@intCast(la.apic_id), vec);
-    }
+    fanoutShootdownIpis(self_id);
 }
 
 /// Broadcast a per-PCID TLB invalidation to every remote core. Used by
@@ -162,12 +277,10 @@ pub fn flushRemotePcid(pcid: u16) void {
 
     @atomicStore(u16, &shootdown_pcid, pcid, .release);
     @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invpcid_single), .release);
+    @atomicStore(u32, &shootdown_acks_remaining, @intCast(core_count - 1), .release);
 
-    const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
-    for (apic.lapics.?, 0..) |la, i| {
-        if (i == self_id) continue;
-        apic.sendIpi(@intCast(la.apic_id), vec);
-    }
+    fanoutShootdownIpis(self_id);
+    waitForShootdownAcks();
 }
 
 /// Page-table entry for 4-level paging.
@@ -344,10 +457,12 @@ pub fn mapPage(
     const pmm_mgr = &pmm.global_pmm.?;
 
     const attrs = kindAttrs(kind);
-    if (attrs.user_accessible) {
+    if (attrs.user_accessible and virt.addr < FIRST_USER_PAGE) {
         // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
-        // fault. No mapping path may install a leaf into the first page.
-        std.debug.assert(virt.addr >= FIRST_USER_PAGE);
+        // fault. No mapping path may install a leaf into the first page,
+        // even in release builds — checked unconditionally so a buggy
+        // caller cannot silently install a leaf there.
+        @panic("paging.mapPage: user mapping into NULL guard");
     }
     const writable = perms.write;
     const not_executable = !perms.exec;
@@ -591,8 +706,14 @@ pub fn unmapPageNoShootdown(addr_space_root: PAddr, virt: VAddr) ?PAddr {
 /// Intel SDM Vol 3A, §4.5 "4-Level Paging and 5-Level Paging" — the hierarchy
 /// is PML4 → PDPT → PD → PT; each table is a 4-KB page of 512 eight-byte
 /// entries. Only PML4 entries 0–255 cover user space (canonical low half).
-/// Walk the 4-level paging hierarchy and return the physical address mapped
-/// at the given virtual address, or null if not mapped.
+/// Walk the 4-level paging hierarchy and return the page-base physical
+/// address mapped at the given virtual address, or null if not mapped.
+///
+/// Decodes huge-page leaves at L3 (1 GiB, PDPTE.PS=1) and L2 (2 MiB,
+/// PDE.PS=1) so callers (e.g. `pageTableOverlaps` in vmar) don't miss
+/// user-half block mappings produced by `mapPageBoot`. Returned PAddr
+/// is page-base (4 KiB aligned for 4 KiB leaves; the 2 MiB / 1 GiB
+/// block bases ORed with the within-block page index).
 ///
 /// Intel SDM Vol 3A, Section 5.5.4 -- performs a software page-table walk
 /// through PML4 -> PDPT -> PD -> PT (Tables 5-15, 5-17, 5-19, 5-20).
@@ -603,20 +724,52 @@ pub fn resolveVaddr(
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
-    const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
-    for (walk_indices) |idx| {
-        const entry = &table[idx];
-        if (!entry.present) return null;
-        if (entry.huge_page) return null;
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
-        table = @ptrFromInt(next_virt.addr);
-    }
+    // L4 (PML4): no huge-page form (1 PML4E covers 512 GiB; HW does not
+    // support 512 GiB pages on current x86_64). PML4E.PS is reserved.
+    const l4_entry = &table[l4Idx(virt)];
+    if (!l4_entry.present) return null;
+    table = @ptrFromInt(VAddr.fromPAddr(l4_entry.getPAddr(), null).addr);
 
+    // L3 (PDPT): PS=1 → 1 GiB block leaf (Intel SDM Vol 3A, Table 5-16).
+    const l3_entry = &table[l3Idx(virt)];
+    if (!l3_entry.present) return null;
+    if (l3_entry.huge_page) {
+        const base = l3_entry.getPAddr().addr & ~@as(u64, (1 << 30) - 1);
+        const within = virt.addr & ((1 << 30) - 1) & ~@as(u64, 0xFFF);
+        return PAddr.fromInt(base | within);
+    }
+    table = @ptrFromInt(VAddr.fromPAddr(l3_entry.getPAddr(), null).addr);
+
+    // L2 (PD): PS=1 → 2 MiB block leaf (Intel SDM Vol 3A, Table 5-18).
+    const l2_entry = &table[l2Idx(virt)];
+    if (!l2_entry.present) return null;
+    if (l2_entry.huge_page) {
+        const base = l2_entry.getPAddr().addr & ~@as(u64, (1 << 21) - 1);
+        const within = virt.addr & ((1 << 21) - 1) & ~@as(u64, 0xFFF);
+        return PAddr.fromInt(base | within);
+    }
+    table = @ptrFromInt(VAddr.fromPAddr(l2_entry.getPAddr(), null).addr);
+
+    // L1 (PT): bit 7 is the PAT bit, NOT a PS bit — there is no L1
+    // huge-page leaf (Intel SDM Vol 3A, Table 5-20).
     const l1_entry = &table[l1Idx(virt)];
     if (!l1_entry.present) return null;
     return l1_entry.getPAddr();
 }
 
+/// Map a single user 4 KiB page with cache attributes drawn from the
+/// VMAR's `cch` field. Spec §[var] line 1444: 0=wb, 1=uc, 2=wc, 3=wt.
+///
+/// Cache attribute selection on x86_64 uses the per-PTE PAT index
+/// formed by `{PAT, PCD, PWT}` (Intel SDM Vol 3A §11.12, Table 11-10);
+/// in a 4 KiB leaf entry bit 7 is the PAT bit (`huge_page` field here
+/// — see Table 5-20). The boot-time IA32_PAT layout
+/// (`arch.x64.cpu.initPat`) is `PAT0=WB, PAT1=WT, PAT2=UC-, PAT3=UC,
+/// PAT4=WB, PAT5=WC, PAT6=UC-, PAT7=UC`, so:
+///   wb → {PAT,PCD,PWT}=000 → PAT0 (WB)
+///   uc → {PAT,PCD,PWT}=011 → PAT3 (UC, strong-uncacheable)
+///   wc → {PAT,PCD,PWT}=101 → PAT5 (WC)
+///   wt → {PAT,PCD,PWT}=001 → PAT1 (WT)
 pub fn mapPageSized(
     addr_space_root: PAddr,
     phys: PAddr,
@@ -625,14 +778,71 @@ pub fn mapPageSized(
     cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
-    _ = cch;
     // v0: only 4 KiB pages supported through the VMAR-side map path.
     // 2 MiB / 1 GiB landings go through `mapPageBoot` for the kernel
     // address space; userspace VARs are spec'd over 4 KiB throughout
     // the test runner so the simple fallback covers what the runner
     // exercises.
     std.debug.assert(sz == .sz_4k);
-    return mapPage(addr_space_root, phys, virt, perms, .user_data);
+
+    kprof.point(.map_page, virt.addr);
+    std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
+    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
+
+    // Spec §[address_space]: NULL guard `[0, 0x1000)` must always fault.
+    // Runtime check (active in all build modes) so a buggy caller cannot
+    // silently install a leaf into the first page.
+    if (virt.addr < FIRST_USER_PAGE) @panic("paging.mapPageSized: NULL guard");
+
+    const writable = perms.write;
+    const not_executable = !perms.exec;
+
+    // {PAT_bit, PCD, PWT} encoding for each cch enum value.
+    const pat_bits: struct { pat: bool, pcd: bool, pwt: bool } = switch (cch) {
+        .wb => .{ .pat = false, .pcd = false, .pwt = false },
+        .uc => .{ .pat = false, .pcd = true, .pwt = true },
+        .wc => .{ .pat = true, .pcd = false, .pwt = true },
+        .wt => .{ .pat = false, .pcd = false, .pwt = true },
+    };
+
+    const parent_entry = PageEntry{
+        .present = true,
+        .writable = true,
+        .user_accessible = true,
+    };
+
+    const leaf_entry = PageEntry{
+        .present = true,
+        .writable = writable,
+        .user_accessible = true,
+        .write_through = pat_bits.pwt,
+        .not_cacheable = pat_bits.pcd,
+        .huge_page = pat_bits.pat, // bit 7 = PAT in 4 KiB leaf
+        .global = false,
+        .not_executable = not_executable,
+    };
+
+    const pmm_mgr = &pmm.global_pmm.?;
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+
+    const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
+    for (walk_indices) |idx| {
+        const entry = &table[idx];
+        if (!entry.present) {
+            const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
+            const new_virt = VAddr.fromInt(@intFromPtr(new_page));
+            const new_phys = PAddr.fromVAddr(new_virt, null);
+            entry.* = parent_entry;
+            entry.setPAddr(new_phys);
+        }
+        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        table = @ptrFromInt(next_virt.addr);
+    }
+
+    const l1_entry = &table[l1Idx(virt)];
+    l1_entry.* = leaf_entry;
+    l1_entry.setPAddr(phys);
 }
 
 pub fn unmapPageSized(
@@ -804,20 +1014,61 @@ inline fn physToPagePtr(phys: u64) [*]u8 {
     return @ptrFromInt(VAddr.fromPAddr(.{ .addr = phys }, null).addr);
 }
 
+/// Per-PCID, per-VA shootdown over a contiguous range. Each iteration
+/// publishes a fresh `(pcid, va)` request, fans out IPIs to every remote
+/// core, and waits for every remote to ack before publishing the next
+/// request. Without the wait, a fire-and-forget loop overwrites the
+/// shared descriptor while remote cores are still mid-handler against
+/// the prior descriptor — the second IPI may even coalesce in the LAPIC
+/// IRR (one pending interrupt for the remote vector at a time), so only
+/// the *last* descriptor in the loop is observed by remote cores. That
+/// is the cross-core UAF window on unmap+free races.
+///
+/// `addr_space_id` is threaded through so remote cores execute INVPCID
+/// type 0 (single-PCID, single-address) when PCIDs are enabled — without
+/// the PCID, a remote core that later reloads CR3 with the dying AS's
+/// PCID would walk into stale TLB entries, since INVLPG only flushes
+/// the *current* CR3's translations.
+///
+/// Intel SDM Vol 3A §5.10.4.1 (INVLPG), Vol 2A INVPCID, §5.10.5
+/// (multiprocessor invalidation).
 pub fn shootdownTlbRange(
     addr_space_id: u16,
     virt: VAddr,
     sz: VmarPageSize,
     page_count: u32,
 ) void {
-    _ = addr_space_id;
     std.debug.assert(sz == .sz_4k);
+    if (page_count == 0) return;
+
+    const core_count = apic.coreCount();
+    const remote_count: u32 = if (core_count > 1) @intCast(core_count - 1) else 0;
+    const self_id = if (remote_count != 0) apic.coreID() else 0;
+
+    // Local invalidation always runs (the calling core may itself hold
+    // a stale TLB entry). Remote shootdown only when there is more than
+    // one core online.
     var i: u32 = 0;
-    while (i < page_count) {
-        const va = virt.addr + @as(u64, i) * paging.PAGE4K;
-        cpu.invlpg(va);
-        flushRemoteTlb(va);
-        i += 1;
+    while (i < page_count) : (i += 1) {
+        cpu.invlpg(virt.addr + @as(u64, i) * paging.PAGE4K);
+    }
+    if (remote_count == 0) return;
+
+    shootdown_lock.lock(@src());
+    defer shootdown_lock.unlock();
+
+    const kind: ShootdownKind = if (cpu.pcid_enabled) .invpcid_addr else .invlpg;
+    @atomicStore(u16, &shootdown_pcid, addr_space_id, .release);
+
+    var j: u32 = 0;
+    while (j < page_count) : (j += 1) {
+        const va = virt.addr + @as(u64, j) * paging.PAGE4K;
+        @atomicStore(u64, &shootdown_addr, va, .release);
+        @atomicStore(u8, &shootdown_kind, @intFromEnum(kind), .release);
+        @atomicStore(u32, &shootdown_acks_remaining, remote_count, .release);
+
+        fanoutShootdownIpis(self_id);
+        waitForShootdownAcks();
     }
 }
 
