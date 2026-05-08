@@ -1,98 +1,89 @@
-// Spec §[map_pf] — test 13 (degraded variant: smoke only).
+// Spec §[map_pf] — test 13.
 //
-// "[test 13] on success, when [1].caps.dma = 1, a DMA read by the bound
-//  device from `VMAR.base + offset` returns the installed page_frame's
-//  contents, and a DMA access whose access type is not in `VMAR.cur_rwx`
-//  ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching
-//  the page_frame."
+// "[test 13] on success, when [1].caps.dma = 1, a DMA read by the
+//  bound device from `VMAR.base + offset` returns the installed
+//  page_frame's contents, and a DMA access whose access type is not
+//  in `VMAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU
+//  rather than reaching the page_frame."
 //
-// Faithful exercise requires a real DMA initiator: the spec assertion
-// is that DMA traffic from a device bound to a `caps.dma = 1` VMAR (a)
-// reaches the installed page_frame's bytes through the IOMMU and (b)
-// is rejected by the IOMMU when the access type is outside the
-// effective r/w/x of the mapping. Both observations require *the
-// device* to issue the bus transaction; a CPU read of the page_frame
-// would only exercise the CPU paging path, which is what test 12
-// already covers. There is no userspace primitive in the v3 surface
-// that emits a hardware DMA cycle, so the second clause of this test
-// is structurally out of reach from a userspace spec test in this
-// branch.
+// Hardware-traffic clauses
+//   The "DMA read returns page_frame contents" and "out-of-rwx DMA
+//   rejected by IOMMU" assertions both require a real bus initiator
+//   (the bound device) emitting transactions against the VMAR's IOVA.
+//   The v3 userspace surface has no primitive for synthesizing DMA
+//   cycles from a child capability domain — only an integration harness
+//   driving the kernel's IOMMU under hardware (or a QEMU-backed
+//   fixture) can observe those clauses faithfully. Both clauses stay
+//   out of reach of any test running entirely inside a userspace EC.
 //
-// Compounding that, the v0 runner does not currently forward any
-// device_region to test children. runner/primary.zig spawnOne builds
-// each test child's `passed_handles` with only the result port at
-// SLOT_FIRST_PASSED — see also create_var_22's matching DMA blocker
-// note. So even the dma create_vmar prelude that would normally
-// precede a map_pf into a DMA VMAR cannot be set up: no
-// `caps.dma = 1` device_region is reachable from this child's cap
-// table.
+// What this test exercises
+//   The kernel-observable structural invariant the hardware-traffic
+//   clauses sit on top of: a successful map_pf into a dma VMAR (a)
+//   takes the dma dispatch path (§[map_pf] description: "DMA VMAR
+//   (caps.dma = 1): pages are mapped into the bound device's IOMMU
+//   page tables") rather than the regular CPU dispatch, and (b) leaves
+//   the VMAR's field1 `device` subfield equal to the bound
+//   device_region's handle id (§[var] field1 bits 41-52). Any test
+//   that observes DMA traffic through this VMAR depends on those two
+//   structural properties being intact; if the kernel silently
+//   dropped to the regular CPU path or cleared `device`, no DMA traffic
+//   could be routed even with a hardware initiator. Asserting them
+//   here pins the structural prerequisites the hardware test needs.
 //
 // Strategy
-//   Drive create_vmar down its dma success path. Per §[create_vmar]
-//   prelude this requires:
+//   §[create_vmar] dma success path requires:
 //     - self-handle has `crvr` (runner grants it).
-//     - caps.r/w ⊆ vmar_inner_ceiling (runner template = 0x01FF, which
-//       includes r, w, dma — bits 0, 1, and 6 of vmar_inner_ceiling).
+//     - caps.r/w ⊆ vmar_inner_ceiling (runner template = 0x01FF
+//       includes r, w, dma — bits 0, 1, and 6).
 //     - caps.dma = 1, caps.x = 0 (test 12 closed).
-//     - caps.mmio = 0, dma = 1 (test 13 of create_vmar closed).
-//     - caps.max_sz = 0 (tests 03/07/10 closed).
-//     - props.sz = 0 (4 KiB), cur_rwx = 0b011 (r|w) ⊆ caps.{r,w}
-//       (test 16 closed).
-//     - pages = 1 (test 05 closed), preferred_base = 0 (test 06 closed).
+//     - caps.mmio = 0 (tests 04/08/11/13 closed).
+//     - caps.max_sz = 0, props.sz = 0 (tests 03/07/09/10 closed).
+//     - props.cur_rwx = 0b011 (r|w) ⊆ caps.{r,w} (test 16 closed).
+//     - pages = 1 (test 05), preferred_base = 0 (test 06 closed).
 //     - reserved bits zero (test 17 closed).
-//     - [5] is a valid device_region handle (test 14 closed) and has
-//       the `dma` cap (test 15 closed).
+//     - [5] valid dma device_region (tests 14/15 closed).
 //
-//   Today no device_region with the `dma` cap reaches the test child,
-//   so the dma create_vmar path is not reachable. And even if it were,
-//   the second clause of map_pf test 13 — "DMA read returns page_frame
-//   contents" / "IOMMU rejects out-of-rwx DMA" — needs a hardware DMA
-//   harness that has no v0 userspace analogue.
-//
-// Degraded smoke
-//   This test scans its cap table for any device_region handle. If
-//   none is found — the expected case on the current runner — it
-//   reports a degraded smoke pass (assertion id 0): the test ELF
-//   links, loads, and exercises the cap-table scan plumbing, but
-//   cannot drive create_vmar down the dma success path, let alone the
-//   subsequent map_pf into the dma VMAR.
-//
-//   If a device_region handle is found, attempt a dma create_vmar
-//   bound to it and, on success, a map_pf of a freshly-minted r|w
-//   page_frame at offset 0. The CPU side of map_pf is the closest a
-//   userspace test can get; the spec's DMA-traffic assertion still
-//   requires hardware that is out of scope. Smoke-pass at every
-//   terminal outcome to keep the test slot honest about what is
-//   actually being checked here.
+//   §[map_pf] dma path requires:
+//     - [1] valid VMAR handle with caps.mmio = 0 (test 03 closed).
+//     - N >= 1 (test 04 closed).
+//     - offset aligned to VMAR.sz (test 05 closed): we use 0.
+//     - pf.sz >= VMAR.sz (test 06 closed): both 4 KiB.
+//     - range within VMAR size and non-overlapping (tests 07/08/09):
+//       single pair at offset 0 in a 1-page VMAR.
+//     - field1.map ∈ {0, 1} (test 10 closed): freshly created VMAR
+//       has map = 0.
 //
 // Action
-//   1. Scan cap_table for the first device_region handle.
-//   2. If none → smoke-pass with assertion id 0 (degraded; documented).
-//   3. createVmar(caps={r,w,dma}, props={cur_rwx=0b011, sz=0, cch=0},
-//                pages=1, preferred_base=0, device_region=found)
-//   4. createPageFrame(caps={r,w}, props=0, pages=1)
-//   5. mapPf(vmar_handle, &.{ 0, pf_handle })
-//   6. smoke-pass at end regardless of intermediate errors — no spec
-//      assertion is being checked because the DMA observation is
-//      hardware-only.
-//
-// Faithful-test note
-//   Faithful test 13 requires (a) a runner extension that forwards a
-//   dma-capable device_region to the test child *and* (b) a hardware
-//   DMA harness that can emit reads/writes from that device into a
-//   kernel-controlled IOVA window, with the test EC observing both
-//   the data path (DMA returns page_frame bytes) and the rejection
-//   path (DMA outside cur_rwx ∩ pf.rwx is dropped by the IOMMU
-//   without reaching the page_frame). Neither piece exists in v0,
-//   and (b) almost certainly belongs in an integration harness, not
-//   a userspace spec test. Until both land, this slot stays smoke.
+//   1. Scan cap_table for the first device_region with caps.dma = 1.
+//      If none → smoke-pass (runner built without fixture devices).
+//   2. createVmar(caps={r,w,dma}, props={cur_rwx=0b011, sz=0, cch=0},
+//                 pages=1, preferred_base=0, device_region=found)
+//      — must succeed.
+//   3. createPageFrame(caps={r,w}, props=0, pages=1) — must succeed.
+//   4. mapPf(vmar, &.{0, pf_handle}) — must return OK on the dma
+//      dispatch path.
+//   5. readCap(vmar) and assert:
+//        - field1.device (bits 41-52) == found device handle id.
+//        - field1.map (bits 39-40) == 1 (pf installed).
 //
 // Assertions
-//   None (asserts assertion id 0 on every terminal path).
+//   1: createVmar returned an error (dma success path setup broke).
+//   2: createPageFrame returned an error.
+//   3: mapPf did not return OK on the dma dispatch path.
+//   4: post-map readCap field1's `device` subfield does not equal the
+//      bound device handle id (§[var] field1 bits 41-52). This is the
+//      structural prerequisite the hardware DMA-traffic clause sits on:
+//      if `device` is wrong, no IOMMU translation would route the bound
+//      device's transactions to this page_frame.
+//   5: post-map readCap field1's `map` subfield is not 1 (§[map_pf]
+//      test 11). If `map` stayed 0, the kernel didn't install the pf;
+//      if it became 2 (mmio) or 3 (demand), the dma dispatch went
+//      through the wrong path.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
@@ -101,15 +92,9 @@ const SZ: u64 = 0; // 4 KiB
 const CCH: u64 = 0; // wb
 
 pub fn main(cap_table_base: u64) void {
-    const dev_handle = findDeviceRegion(cap_table_base) orelse {
-        // Degraded smoke: no device_region in this child's cap table.
-        // Both the dma create_vmar prelude and the DMA-traffic
-        // observation are unreachable; document the gap and report a
-        // non-failure outcome so the test ELF still validates link/
-        // load/scan plumbing in CI without forcing a false
-        // expectation. Once the runner forwards a dma-capable
-        // device_region to test children *and* a hardware DMA harness
-        // exists, this branch retires.
+    const dev_handle = findDmaDeviceRegion(cap_table_base) orelse {
+        // Runner built without -Dtests_fixture_devices=true. The dma
+        // create_vmar prelude is unreachable; smoke-pass.
         testing.pass();
         return;
     };
@@ -125,18 +110,15 @@ pub fn main(cap_table_base: u64) void {
         @as(u64, dev_handle),
     );
     if (testing.isHandleError(cv.v1)) {
-        // Prelude broke (most likely E_PERM if the device lacks the
-        // `dma` cap, per §[create_vmar] test 15). No spec assertion is
-        // being checked — the DMA observation is hardware-only —
-        // so smoke-pass with id 0 to mark this slot as degraded.
-        testing.pass();
+        testing.fail(1);
         return;
     }
-    const vmar_handle: caps.HandleId = @truncate(cv.v1 & 0xFFF);
+    const vmar_handle: u12 = @truncate(cv.v1 & 0xFFF);
 
-    // Mint a page_frame to install. r|w mirrors the VMAR's cur_rwx so
-    // the CPU-visible portion of the prelude is set up the way a
-    // faithful test 13 would arrange it.
+    // r|w mirrors the VMAR's cur_rwx so the intersection equals the
+    // VMAR's cur_rwx — the IOMMU PTEs the kernel would install (per
+    // §[map_pf] test 13's "VMAR.cur_rwx ∩ page_frame.r/w/x" rule)
+    // permit the spec-allowed access set to the maximum extent.
     const pf_caps = caps.PfCap{ .r = true, .w = true };
     const cpf = syscall.createPageFrame(
         @as(u64, pf_caps.toU16()),
@@ -144,33 +126,53 @@ pub fn main(cap_table_base: u64) void {
         1, // pages = 1
     );
     if (testing.isHandleError(cpf.v1)) {
-        testing.pass();
+        testing.fail(2);
         return;
     }
     const pf_handle: u64 = @as(u64, cpf.v1 & 0xFFF);
 
-    // Closest CPU-side analogue of the spec's DMA installation. The
-    // call may fail on a dma VMAR for kernel reasons that are out of
-    // scope for this smoke; either way the DMA-traffic assertion is
-    // not what's being checked.
-    _ = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
+    const m = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
+    if (m.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
 
-    // Smoke-pass: no spec assertion is checked. Faithful test 13
-    // requires a hardware DMA harness — see top-of-file note.
+    // §[var] field1 layout (per spec table):
+    //   bits 39-40 = map (0=unmapped, 1=pf, 2=mmio, 3=demand)
+    //   bits 41-52 = device (12-bit handle id of the bound
+    //                device_region; immutable on dma VMARs from
+    //                create_vmar)
+    const cap = caps.readCap(cap_table_base, vmar_handle);
+    const device_field: u12 = @truncate((cap.field1 >> 41) & 0xFFF);
+    if (device_field != dev_handle) {
+        testing.fail(4);
+        return;
+    }
+
+    const map_field: u2 = @truncate((cap.field1 >> 39) & 0x3);
+    if (map_field != 1) {
+        testing.fail(5);
+        return;
+    }
+
     testing.pass();
 }
 
-fn findDeviceRegion(cap_table_base: u64) ?caps.HandleId {
-    // Scan the full handle table. Slots 0/1/2 are self / initial EC /
-    // self-IDC for a child capability domain (§[capability_domain]),
-    // and passed_handles start at slot 3. Today the runner forwards
-    // only the result port at slot 3; no device_regions reach a child.
-    // Scan everything to remain robust if that changes.
+// Scan the handle table for the first device_region whose DeviceCap.dma
+// is set. The runner's fixture forwarder (runner/primary.zig spawnOne)
+// places the dma+irq fixture (caps={move,copy,dma,irq}, phys_base
+// 0xCAFE_0000) at a higher slot id than the bare fixture
+// (caps={move,copy}); we filter on the cap bit rather than slot order
+// to remain robust to forwarder reordering.
+fn findDmaDeviceRegion(cap_table_base: u64) ?caps.HandleId {
     var slot: u32 = 0;
     while (slot < caps.HANDLE_TABLE_MAX) {
         const c = caps.readCap(cap_table_base, slot);
         if (c.handleType() == .device_region) {
-            return @truncate(slot);
+            const dev_caps: caps.DeviceCap = @bitCast(c.caps());
+            if (dev_caps.dma) {
+                return @truncate(slot);
+            }
         }
         slot += 1;
     }

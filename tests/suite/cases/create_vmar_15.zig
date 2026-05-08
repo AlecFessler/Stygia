@@ -3,41 +3,9 @@
 // "[test 15] returns E_PERM if caps.dma = 1 and [5] does not have the
 //  `dma` cap."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful test for E_PERM here requires a *valid*
-//   device_region handle in the test domain whose `dma` cap is
-//   cleared. The kernel's create_vmar prelude must walk through the
-//   E_BADCAP check on [5] (test 14) — i.e. resolve [5] as a real
-//   device_region handle — before it reaches the cap-bit subset
-//   check that this test exercises.
-//
-//   Per §[device_region], device_region handles are kernel-issued at
-//   boot to the root service and otherwise propagate via xfer/IDC.
-//   They cannot be minted in-domain. The v0 runner
-//   (runner/primary.zig) spawns each test as a child capability
-//   domain whose `passed_handles` contain only the result port at
-//   slot 3; no device_region is forwarded. The runner's
-//   `runner/serial.zig` `findCom1` scan only succeeds because it
-//   runs in the *root service* table — children's tables hold
-//   self / initial_ec / self_idc / port and nothing else, so a
-//   `findCom1`-shaped scan from inside a test would always return
-//   `null`.
-//
-//   With no device_region reachable from the test domain there is
-//   no in-domain way to construct a "valid handle, missing dma cap"
-//   argument. `restrict` cannot help either — restrict requires an
-//   existing device_region handle in the table to begin with.
-//
-//   This smoke variant pins only the negative observation: a
-//   create_vmar with caps.dma = 1 and an unminted [5] slot returns
-//   *some* spec-mandated error (E_BADCAP under test 14). The strict
-//   test 15 path — kernel rejects with E_PERM — is left unchecked
-//   pending runner support for forwarding a no-dma device_region
-//   handle to test children.
-//
 // Strategy
-//   The check ordering ahead of the dma-handle subset check is
-//   identical to test 14, so we mirror its prelude:
+//   The check ordering ahead of the dma-handle subset check is identical
+//   to test 14, so we mirror its prelude:
 //     - caller self-handle has `crvr` (runner grants it).
 //     - caps.r/w/x ⊆ vmar_inner_ceiling (runner ceiling 0x01FF
 //       permits r, w, dma — see runner/primary.zig).
@@ -49,51 +17,80 @@
 //     - preferred_base = 0 so test 06 cannot fire.
 //     - pages = 1 so test 05 cannot fire.
 //     - reserved bits zero so test 17 cannot fire.
-//   With caps.dma = 1, the kernel must validate [5]. The child's
-//   slot 4095 (HANDLE_TABLE_MAX - 1) is unminted by construction,
-//   so the kernel falls into test 14's E_BADCAP path before it
-//   could reach test 15's E_PERM path.
+//
+//   With caps.dma = 1, the kernel must validate [5]. We need a VALID
+//   device_region handle (test 14 closed) whose `dma` cap bit is clear
+//   (the precondition under test). The runner's spawnOne forwards two
+//   boot-minted fixture device_regions to test children:
+//     - the BARE fixture (caps={move,copy} only) at the lower slot id
+//     - the DMA+IRQ fixture (caps={move,copy,dma,irq}) at the higher
+//       slot id
+//   This test scans for the FIRST device_region whose DeviceCap.dma is
+//   false — the bare fixture — and uses it as [5]. Test 14 is closed
+//   because the slot is a real device_region; the only spec-mandated
+//   outcome is E_PERM (test 15) because the slot lacks `dma`.
 //
 // Action
-//   create_vmar(caps={r, w, dma}, props={sz=0, cch=0, cur_rwx=0b011},
-//              pages=1, preferred_base=0,
-//              device_region=HANDLE_TABLE_MAX - 1)
-//   — returns E_BADCAP under the prevailing test 14 path.
+//   1. Scan cap_table for the first device_region with caps.dma = 0.
+//   2. createVmar(caps={r, w, dma}, props={sz=0, cch=0, cur_rwx=0b011},
+//                 pages=1, preferred_base=0, device_region=found)
+//      — must return E_PERM.
 //
-// Assertion
-//   No assertion is checked — passes with assertion id 0 because the
-//   smoke can only reach the test 14 path, not the test 15 path. The
-//   header documents this gap so coverage reporting reflects reality.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner/primary.zig extension
-//   that mints (or carves out) a device_region with `dma = 0` and
-//   forwards it to the test child via passed_handles. Once
-//   available, the action becomes:
-//     create_vmar(caps={r, w, dma}, ..., device_region=that_handle)
-//   and the assertion becomes:
-//     result.v1 == E_PERM   (assertion id 1)
+// Assertions
+//   1: createVmar did not return E_PERM (the spec assertion under test).
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const dev_handle = findNoDmaDeviceRegion(cap_table_base) orelse {
+        // Runner not built with -Dtests_fixture_devices=true. The
+        // E_PERM branch is structurally unreachable without a no-dma
+        // device_region; smoke-pass and document the gap.
+        testing.pass();
+        return;
+    };
 
     const vmar_caps = caps.VmarCap{ .r = true, .w = true, .dma = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
-    const unminted_dev: u64 = caps.HANDLE_TABLE_MAX - 1; // slot 4095
 
-    _ = syscall.createVmar(
+    const cv = syscall.createVmar(
         @as(u64, vmar_caps.toU16()),
         props,
         1, // pages = 1
         0, // preferred_base = kernel chooses
-        unminted_dev,
+        @as(u64, dev_handle),
     );
 
+    if (cv.v1 != @intFromEnum(errors.Error.E_PERM)) {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
+}
+
+// Scan the handle table for the first device_region whose DeviceCap.dma
+// is clear. Per runner/primary.zig spawnOne, the bare fixture
+// (phys_base 0xBABE_0000, caps={move,copy}) is forwarded at a lower
+// slot id than the dma+irq fixture (phys_base 0xCAFE_0000); the bare
+// one matches first. Returns null if no such handle exists (the runner
+// was built without -Dtests_fixture_devices=true).
+fn findNoDmaDeviceRegion(cap_table_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_caps: caps.DeviceCap = @bitCast(c.caps());
+            if (!dev_caps.dma) {
+                return @truncate(slot);
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }
