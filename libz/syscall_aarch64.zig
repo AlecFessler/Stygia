@@ -38,7 +38,11 @@ const SyscallNum = syscall.SyscallNum;
 
 // Issues an svc with the syscall word at [sp + 0] and vregs 1..13 in
 // x0..x12. Returns updated v1..v13 (kernel writes back into the same
-// registers). 16 bytes reserved to keep sp 16-aligned per AAPCS64.
+// registers). Reserves 784 bytes so the kernel's slow-path arg
+// collector can read vregs 32..127 at `[sp + (N-31)*8]` without
+// walking past the upper guard page; sp stays 16-byte aligned per
+// AAPCS64. Unread bytes in the reservation are inert — the handler
+// bound-checks count from the syscall word before consuming any vreg.
 pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -54,10 +58,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #16
+        \\ sub sp, sp, #784
         \\ str %[word], [sp]
         \\ svc #0
-        \\ add sp, sp, #16
+        \\ add sp, sp, #784
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -112,10 +116,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
 /// clobber plus `volatile` keep emission required.
 pub fn issueRegDiscard(word: u64, in: Regs) void {
     asm volatile (
-        \\ sub sp, sp, #16
+        \\ sub sp, sp, #784
         \\ str %[word], [sp]
         \\ svc #0
-        \\ add sp, sp, #16
+        \\ add sp, sp, #784
         :
         : [word] "r" (word),
           [iv1] "{x0}" (in.v1),
@@ -221,13 +225,111 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     };
 }
 
-// Stack-arg path stub. Mirrors syscall_x64.zig: not exercised by the
-// current runner; falls through to issueRawNoStack so call sites
-// typecheck.
+// Stack-arg path. Spec §[syscall_abi] aarch64: vreg N at `[sp + (N-31)*8]`
+// for 32 <= N <= 127, with vreg 0 (the syscall word) at `[sp + 0]`.
+// Buffer-pointed pattern mirroring x64's `stack_vreg_buf`: Zig fills
+// the 97-slot kernel-visible vreg window (vreg 0 at index 0, vregs
+// 32..127 at indices 1..96), then the asm swaps sp to point at the
+// buffer for the svc instant. libz's narrow API exposes only vregs
+// 1..13 (x0..x12); vregs 14..31 (x13..x30) are not user-staged here.
+// Hidden visibility: see the matching note in syscall_x64.zig — libz
+// is a shared library and the inline asm references these symbols via
+// direct adrp/:lo12: relocations, which require non-preemptible
+// (hidden) visibility under ld.lld's PIC rules.
+var stack_vreg_buf_arm: [97]u64 align(16) = .{0} ** 97;
+var stack_vreg_saved_sp: u64 align(8) = 0;
+comptime {
+    @export(&stack_vreg_buf_arm, .{ .name = "stack_vreg_buf_arm", .visibility = .hidden });
+    @export(&stack_vreg_saved_sp, .{ .name = "stack_vreg_saved_sp", .visibility = .hidden });
+}
+
+// Buffer fill is split out so the asm-bearing function below has no
+// stack-spilled locals competing with the tied vreg input registers
+// (mirrors the rbp-interference fix on x64).
+fn stagestackVregBufArm(word: u64, slots: *const [16]u64, n: usize) callconv(.c) void {
+    @memset(stack_vreg_buf_arm[0..97], 0);
+    stack_vreg_buf_arm[0] = word; // vreg 0
+    var i: usize = 0;
+    while (i < n and i < 16) : (i += 1) {
+        // slots[i] -> vreg (32 + i) -> stage index (1 + i).
+        stack_vreg_buf_arm[1 + i] = slots[i];
+    }
+}
+
 pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
-    _ = slots;
-    _ = n;
-    return issueRawNoStack(word, in);
+    stagestackVregBufArm(word, slots, n);
+
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ adrp x13, stack_vreg_saved_sp
+        \\ add x13, x13, :lo12:stack_vreg_saved_sp
+        \\ mov x14, sp
+        \\ str x14, [x13]
+        \\ adrp x13, stack_vreg_buf_arm
+        \\ add x13, x13, :lo12:stack_vreg_buf_arm
+        \\ mov sp, x13
+        \\ svc #0
+        \\ adrp x13, stack_vreg_saved_sp
+        \\ add x13, x13, :lo12:stack_vreg_saved_sp
+        \\ ldr x14, [x13]
+        \\ mov sp, x14
+        : [v1] "={x0}" (ov1),
+          [v2] "={x1}" (ov2),
+          [v3] "={x2}" (ov3),
+          [v4] "={x3}" (ov4),
+          [v5] "={x4}" (ov5),
+          [v6] "={x5}" (ov6),
+          [v7] "={x6}" (ov7),
+          [v8] "={x7}" (ov8),
+          [v9] "={x8}" (ov9),
+          [v10] "={x9}" (ov10),
+          [v11] "={x10}" (ov11),
+          [v12] "={x11}" (ov12),
+          [v13] "={x12}" (ov13),
+        : [iv1] "{x0}" (in.v1),
+          [iv2] "{x1}" (in.v2),
+          [iv3] "{x2}" (in.v3),
+          [iv4] "{x3}" (in.v4),
+          [iv5] "{x4}" (in.v5),
+          [iv6] "{x5}" (in.v6),
+          [iv7] "{x6}" (in.v7),
+          [iv8] "{x7}" (in.v8),
+          [iv9] "{x8}" (in.v9),
+          [iv10] "{x9}" (in.v10),
+          [iv11] "{x10}" (in.v11),
+          [iv12] "{x11}" (in.v12),
+          [iv13] "{x12}" (in.v13),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
+             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
+             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
+             .x29 = true, .x30 = true, .memory = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
 }
 
 // Reply-transfer high-vreg path. Spec §[handle_attachments]: pair

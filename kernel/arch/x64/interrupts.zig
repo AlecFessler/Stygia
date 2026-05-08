@@ -314,18 +314,47 @@ pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
 /// inline. Anything reaching here is the slow-path tail.
 export fn syscallDispatch(ctx: *cpu.Context) void {
     const r = &ctx.regs;
+    // Spec §[syscall_abi] x86-64: vreg 0 (syscall word) lives at
+    // `[rsp + 0]`; vregs 1..13 ride GPRs (rax/rbx/rdx/rbp/rsi/rdi/r8/r9/
+    // r10/r12-r15); vregs 14..127 spill to the user stack at
+    // `[rsp + (N-13)*8]`. Read the syscall word, parse it for the
+    // syscall's structurally-required upper vreg, then drain the
+    // GPR-backed band into args[0..13] and the stack band (if any)
+    // into args[13..max_vreg] under a single STAC/CLAC bracket.
+    // Reading more than the syscall promises is unsafe — `issueRawNoStack`
+    // callers reserve only 16 bytes of user stack, so for register-only
+    // syscalls (max_vreg ≤ 13) the stack-read loop runs zero iterations.
     var syscall_word: u64 = undefined;
+    var args: [127]u64 = .{0} ** 127;
     cpu.stac();
     syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
+    const max_vreg: u8 = zag.syscall.dispatch.expectedMaxVreg(syscall_word);
+    if (max_vreg > 13) {
+        var i: u8 = 14;
+        while (i <= max_vreg) : (i += 1) {
+            const off: u64 = @as(u64, i - 13) * 8;
+            args[i - 1] = @as(*const u64, @ptrFromInt(ctx.rsp + off)).*;
+        }
+    }
     cpu.clac();
+    args[0] = r.rax;
+    args[1] = r.rbx;
+    args[2] = r.rdx;
+    args[3] = r.rbp;
+    args[4] = r.rsi;
+    args[5] = r.rdi;
+    args[6] = r.r8;
+    args[7] = r.r9;
+    args[8] = r.r10;
+    args[9] = r.r12;
+    args[10] = r.r13;
+    args[11] = r.r14;
+    args[12] = r.r15;
     const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
     ctx_trace.mark(caller, .slowpath_save);
 
-    var args: [13]u64 = .{
-        r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
-        r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
-    };
-    const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
+    const dispatch_len: usize = @max(@as(usize, max_vreg), 13);
+    const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..dispatch_len]);
 
     // Only commit the syscall return into the saved frame if the
     // dispatched handler did NOT park `caller`. A handler that suspends

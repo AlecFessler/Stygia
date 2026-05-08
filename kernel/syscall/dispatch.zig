@@ -94,6 +94,82 @@ inline fn arg(args: []const u64, i: usize) u64 {
     return if (i < args.len) args[i] else 0;
 }
 
+/// Compute the highest vreg index a syscall could read (1-based per
+/// Spec §[syscall_abi]; vreg 0 = syscall word, vregs 1..=N are payload).
+/// Used by the arch slow-path entry to size the user-stack read window.
+/// vregs above the architecture's register-backed band (vreg > 13 on
+/// x86-64, vreg > 31 on aarch64) live on the user stack and require
+/// an SMAP/PAN-gated load. The libz issue primitives reserve enough
+/// user stack to cover any vreg in 0..127, so the kernel can always
+/// read up to the syscall's structurally-required upper bound without
+/// page-faulting.
+///
+/// Each high-arg syscall encodes its count in syscall-word bits 12-19
+/// (or 13-20 for `vm_set_policy`). The mapping from count to upper
+/// vreg follows §[syscall_abi]'s per-syscall layout.
+pub fn expectedMaxVreg(syscall_word: u64) u8 {
+    const num_raw: u64 = syscall_word & 0xFFF;
+    if (num_raw <= 13) return 2; // fast-suspend: target + port
+    const num = std.meta.intToEnum(SyscallNum, num_raw) catch return 13;
+    const n_reg: u64 = (syscall_word >> 12) & 0xFF;
+    return switch (num) {
+        // Register-only — at most 5 args, all in vregs 1..N.
+        .restrict, .delete, .revoke, .sync,
+        .acquire_ecs, .acquire_vmars,
+        .self, .terminate, .yield, .priority, .affinity,
+        .perfmon_info, .perfmon_read, .perfmon_stop,
+        .create_execution_context,
+        .create_vmar, .map_mmio, .remap, .snapshot, .idc_read,
+        .create_page_frame, .ack,
+        .create_virtual_machine, .create_vcpu,
+        .vm_inject_irq,
+        .create_port, .recv, .bind_event_route, .clear_event_route,
+        .timer_arm, .timer_rearm, .timer_cancel,
+        .futex_wake,
+        .time_monotonic, .time_getwall, .time_setwall,
+        .random,
+        .info_system, .info_cores,
+        .power_shutdown, .power_reboot, .power_sleep, .power_screen_off,
+        .power_set_freq, .power_set_idle,
+        .kprof_dump,
+        => 13,
+
+        // create_capability_domain: passed_handles list, no syscall-word
+        // count. Surface the full upper window.
+        .create_capability_domain => 127,
+
+        // perfmon_start: vreg 1=target, 2=num_configs, 3..2+2*count =
+        // configs (each config = (event, threshold) pair = 2 vregs).
+        .perfmon_start => @intCast(@min(2 + 2 * n_reg, 127)),
+
+        // map_pf, map_guest, futex_wait_val/change: pairs of 2 vregs
+        // each. Vreg 1 = handle/timeout, vregs 2..1+2N = pair data.
+        .map_pf, .map_guest, .futex_wait_val, .futex_wait_change => @intCast(@min(1 + 2 * n_reg, 127)),
+
+        // unmap, unmap_guest: singleton entries. vreg 1 = handle,
+        // vregs 2..1+N = entries.
+        .unmap, .unmap_guest => @intCast(@min(1 + n_reg, 127)),
+
+        // idc_write: vreg 1 = vmar, vreg 2 = offset, vregs 3..2+count
+        // = qwords.
+        .idc_write => @intCast(@min(2 + n_reg, 127)),
+
+        // vm_set_policy: bit 12 = kind, bits 13-20 = count. Per-arch
+        // entry width — surface the full upper window.
+        .vm_set_policy => 127,
+
+        // suspend (general variant): pair_count in bits 12-19; pair
+        // entries in the high band [128-N..127] so when pair_count > 0
+        // the entire upper window must be covered.
+        .@"suspend" => if (n_reg > 0) @as(u8, 127) else @as(u8, 13),
+
+        // reply / reply_transfer: pair_count in bits 12-19; pair entries
+        // in the high band — handler reads them itself via userAccess
+        // gating, so dispatch's args slice does NOT need to carry them.
+        .reply => 13,
+    };
+}
+
 pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     kprof.enter(.syscall);
     defer kprof.exit(.syscall);

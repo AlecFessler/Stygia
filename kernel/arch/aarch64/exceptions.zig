@@ -540,15 +540,43 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         .svc_aarch64 => {
             // Spec §[syscall_abi] aarch64 ABI:
             //   - syscall_word at vreg 0 = `[sp_el0 + 0]` (user stack).
-            //   - args[0..31] map to vregs 1..31 = x0..x30. Registers
-            //     is an extern struct of 31 u64s declared in x0..x30
-            //     order so we point the slice straight at it.
+            //   - vregs 1..31 ride x0..x30 in `ctx.regs` order.
+            //   - vregs 32..127 spill to the user stack at
+            //     `[sp_el0 + (N-31)*8]`; reading them requires a
+            //     PAN-gated load.
             //   - return: i64 → x0 (vreg 1).
-            const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+            //
+            // Read the syscall word, parse it for the syscall's
+            // structurally-required upper vreg, then assemble the
+            // dispatch args slice. For register-only syscalls
+            // (max_vreg ≤ 31) the stack-read loop runs zero iterations,
+            // matching the contract that `issueRawNoStack` reserves
+            // only 16 bytes — so reading vregs 32+ would walk past the
+            // mapped reservation into caller-frame territory we must
+            // not touch.
+            var args: [127]u64 = .{0} ** 127;
+            cpu.panDisable();
             const syscall_word: u64 = @as(*const u64, @ptrFromInt(ctx.sp_el0)).*;
+            const max_vreg: u8 = syscall_dispatch.expectedMaxVreg(syscall_word);
+            if (max_vreg > 31) {
+                var i: u8 = 32;
+                while (i <= max_vreg) : (i += 1) {
+                    const off: u64 = @as(u64, i - 31) * 8;
+                    args[i - 1] = @as(*const u64, @ptrFromInt(ctx.sp_el0 + off)).*;
+                }
+            }
+            cpu.panEnable();
+            // Copy vregs 1..31 from ctx.regs into args[0..31]. The regs
+            // struct is laid out as 31 u64s in x0..x30 order, so the
+            // copy is a straight loop.
+            const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+            var ri: usize = 0;
+            while (ri < 31) : (ri += 1) args[ri] = regs_ptr[ri];
+
             const caller = scheduler.currentEc() orelse
                 @panic("syscall with no current EC");
-            const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
+            const dispatch_len: usize = @max(@as(usize, max_vreg), 31);
+            const ret = syscall_dispatch.dispatch(caller, syscall_word, args[0..dispatch_len]);
 
             // Only commit the syscall return into the saved frame if the
             // dispatched handler did NOT park `caller`. A handler that

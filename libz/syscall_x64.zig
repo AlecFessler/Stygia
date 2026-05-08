@@ -26,11 +26,22 @@ const Regs = syscall.Regs;
 const RecvReturn = syscall.RecvReturn;
 const SyscallNum = syscall.SyscallNum;
 
-// Sole call site of the raw `syscall` instruction. Reserves 16 bytes of
-// stack (avoiding the System V red zone — Zig may have stored locals
-// there) so vreg 0 at [rsp + 0] sits on a stable slot the kernel can
-// load via STAC; on return, frees the slot. Stack args (vregs 14+) are
-// pushed by the caller on top of the slot.
+// Sole call site of the raw `syscall` instruction. Reserves 928 bytes
+// of user stack — enough to cover vreg 0 at [rsp + 0] AND all 114
+// stack-spilled vregs (14..127) at [rsp + 8..rsp + 920], so the
+// kernel's slow-path arg collector can always read the syscall's
+// structurally-required vreg window without faulting. This works even
+// for "register-only" syscalls because the kernel's collector reads
+// only `expectedMaxVreg(syscall_word)` slots, and unread bytes within
+// the reservation are inert.
+//
+// Earlier versions reserved only 16 bytes — tight enough to keep the
+// vreg-0 slot safe but too small for the kernel to read above vreg 14
+// without walking past the upper guard page. Bumping to 928 gives the
+// slow path one consistent window for both no-stack and with-slots
+// callers; the SysV AMD64 red zone (caller_rsp - 128 .. caller_rsp - 1)
+// still falls inside the 928-byte reservation, so any caller-frame
+// spills LLVM placed there remain inviolate.
 pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -46,10 +57,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ subq $16, %%rsp
+        \\ subq $928, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ addq $16, %%rsp
+        \\ addq $928, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
@@ -107,10 +118,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
 /// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15.
 pub fn issueRegDiscard(word: u64, in: Regs) void {
     asm volatile (
-        \\ subq $16, %%rsp
+        \\ subq $928, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ addq $16, %%rsp
+        \\ addq $928, %%rsp
         :
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (in.v1),
@@ -232,17 +243,107 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     };
 }
 
-// Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8]
-// when the syscall executes. Disk-backed loading and >13-vreg paths
-// are not exercised by the v0 mock runner; the disk-backed loader is
-// the planned next step once the runner stabilizes. The current
-// implementation falls through to issueRawNoStack so the call sites
-// typecheck — first call from a real test will replace this with the
-// explicit asm sequence (sub rsp, N*8; movs; push word; syscall; add).
+// Stack-arg path. Spec §[syscall_abi] x86-64: vreg N at `[rsp + (N-13)*8]`
+// for 14 <= N <= 127, with vreg 0 (the syscall word) at `[rsp + 0]`.
+// Mirrors `replyVmExitAsm`'s buffer-pointed pattern: Zig populates a
+// .bss-resident scratch buffer (`stack_vreg_buf`) with vreg 0 at
+// index 0 and vregs 14..127 at indices 1..114; the asm swaps rsp to
+// point at the buffer for the syscall instant, executes syscall with
+// vregs 1..13 tied via `{reg}`, then restores rsp. Buffer size 116
+// u64 covers vregs 0 + 14..127 plus 1 alignment slot.
+// Hidden visibility: this symbol must remain non-preemptible so the
+// inline asm below can reference it via direct (%%rip) PC32 relocation.
+// libz.elf is built as a shared library (-dynamic); a default-visibility
+// `export var` would force ld.lld to require GOTPCREL (R_X86_64_PC32 is
+// rejected against preemptible symbols). The matching `_extern.zig`
+// twin in the test ELF uses an ordinary `export var` because the test
+// ELF is statically linked.
+var stack_vreg_buf: [116]u64 align(16) = .{0} ** 116;
+var stack_vreg_saved_rsp: u64 align(8) = 0;
+comptime {
+    @export(&stack_vreg_buf, .{ .name = "stack_vreg_buf", .visibility = .hidden });
+    @export(&stack_vreg_saved_rsp, .{ .name = "stack_vreg_saved_rsp", .visibility = .hidden });
+}
+
+// Buffer fill is split out so the asm-bearing function below has no
+// stack-spilled locals competing with the `{rbp}` tied vreg-4 input.
+// In Debug builds (libz.elf) the compiler emits `-fno-omit-frame-pointer`,
+// which would otherwise interfere with rbp's allocation as both frame
+// pointer and vreg-4 register.
+fn stagestackVregBuf(word: u64, slots: *const [16]u64, n: usize) callconv(.c) void {
+    @memset(stack_vreg_buf[0..116], 0);
+    stack_vreg_buf[0] = word; // vreg 0
+    var i: usize = 0;
+    while (i < n and i < 16) : (i += 1) {
+        // slots[i] -> vreg (14 + i) -> stage index (1 + i).
+        stack_vreg_buf[1 + i] = slots[i];
+    }
+}
+
 pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
-    _ = slots;
-    _ = n;
-    return issueRawNoStack(word, in);
+    stagestackVregBuf(word, slots, n);
+
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ movq %%rsp, stack_vreg_saved_rsp(%%rip)
+        \\ leaq stack_vreg_buf(%%rip), %%rsp
+        \\ movq (%%rsp), %%rcx
+        \\ syscall
+        \\ movq stack_vreg_saved_rsp(%%rip), %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [iv1] "{rax}" (in.v1),
+          [iv2] "{rbx}" (in.v2),
+          [iv3] "{rdx}" (in.v3),
+          [iv4] "{rbp}" (in.v4),
+          [iv5] "{rsi}" (in.v5),
+          [iv6] "{rdi}" (in.v6),
+          [iv7] "{r8}" (in.v7),
+          [iv8] "{r9}" (in.v8),
+          [iv9] "{r10}" (in.v9),
+          [iv10] "{r12}" (in.v10),
+          [iv11] "{r13}" (in.v11),
+          [iv12] "{r14}" (in.v12),
+          [iv13] "{r15}" (in.v13),
+        : .{ .rcx = true, .r11 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
 }
 
 // Reply + atomic recv-on-port — bare. Wraps issueRawCaptureWord.

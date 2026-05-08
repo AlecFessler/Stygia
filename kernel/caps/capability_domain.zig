@@ -640,7 +640,12 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     }
     if (cd.free_count < ec_count) return errors.E_FULL;
 
-    var minted_slots: [13]u12 = undefined;
+    // Spec §[acquire_ecs] tests 04/05: kernel returns handles for every
+    // non-vCPU EC bound to the target domain. The syscall word's count
+    // field is 8 bits (0..255), and vreg space tops out at 127, so cap
+    // the minted-slot buffer at 127 — handles 1..127 land in vregs
+    // 1..127 per §[acquire_ecs] return shape.
+    var minted_slots: [127]u12 = undefined;
     var n: u8 = 0;
     var seen_caller: bool = false;
 
@@ -654,7 +659,7 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
         if (ec_obj.vm != null) continue; // [test 07] excludes vCPUs
 
         if (ec_obj == caller) seen_caller = true;
-        if (n >= minted_slots.len) break; // TODO: vreg 6+ writeback
+        if (n >= minted_slots.len) break;
         const new_slot = mintHandle(
             cd,
             ec_ref,
@@ -699,12 +704,22 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     caller.pending_event_word = count_field;
     caller.pending_event_word_valid = true;
 
-    // Vregs 2..N — use the existing helpers for the secondary slots.
-    // Vreg 1 rides the i64 return value below.
+    // Vregs 2..N. Vreg 1 rides the i64 return value below. Vregs 2..5
+    // use the dedicated event-state helpers (rbx/rdx/rbp/rsi on x86-64;
+    // x1..x4 on aarch64); vregs 6..N route via the generic
+    // `setSyscallVreg(idx)` helper, which lands GPR-backed indices in
+    // their architectural register and stack-spilled indices on the
+    // caller's user stack via SMAP/PAN-gated writes. The caller's CR3 /
+    // TTBR0 is active throughout the handler so the user-stack writes
+    // reach the right address space.
     if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
     if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
     if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
     if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
+    var k: u8 = 6;
+    while (k <= n) : (k += 1) {
+        arch.syscall.setSyscallVreg(caller.ctx, k, packHandleWord(minted_slots[k - 1], minted_caps));
+    }
 
     if (n == 0) return @bitCast(@as(i64, errors.OK));
     return @intCast(packHandleWord(minted_slots[0], minted_caps));
@@ -768,7 +783,10 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
     }
     if (cd.free_count < var_count) return errors.E_FULL;
 
-    var minted_slots: [13]u12 = undefined;
+    // Spec §[acquire_vmars] tests 04/05: kernel returns handles for
+    // every map=1/3 VMAR bound to the target domain. Same vreg-127
+    // bound as acquire_ecs.
+    var minted_slots: [127]u12 = undefined;
     var n: u8 = 0;
 
     var i: u16 = 0;
@@ -781,7 +799,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
             else => continue, // [test 07]: exclude MMIO and unmapped/DMA-only
         }
 
-        if (n >= minted_slots.len) break; // TODO: vreg 6+ writeback
+        if (n >= minted_slots.len) break;
 
         const var_field0: u64 = v.base_vaddr.addr;
         const vmar_field1: u64 = zag.memory.vmar.packField1(
@@ -827,11 +845,17 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
     caller.pending_event_word = count_field;
     caller.pending_event_word_valid = true;
 
-    // Vregs 2..5 — Vreg 1 rides the i64 return value below.
+    // Vregs 2..N. Vreg 1 rides the i64 return value below. Vregs 6..N
+    // route via the generic `setSyscallVreg(idx)` helper — see
+    // `acquireEcs` for the shared CR3/TTBR0 contract.
     if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
     if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
     if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
     if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
+    var k: u8 = 6;
+    while (k <= n) : (k += 1) {
+        arch.syscall.setSyscallVreg(caller.ctx, k, packHandleWord(minted_slots[k - 1], minted_caps));
+    }
 
     if (n == 0) return @bitCast(@as(i64, errors.OK));
     return @intCast(packHandleWord(minted_slots[0], minted_caps));

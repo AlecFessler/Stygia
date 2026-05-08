@@ -26,11 +26,18 @@ const Regs = syscall.Regs;
 const RecvReturn = syscall.RecvReturn;
 const SyscallNum = syscall.SyscallNum;
 
-// Sole call site of the raw `syscall` instruction. Reserves 16 bytes of
-// stack (avoiding the System V red zone — Zig may have stored locals
-// there) so vreg 0 at [rsp + 0] sits on a stable slot the kernel can
-// load via STAC; on return, frees the slot. Stack args (vregs 14+) are
-// pushed by the caller on top of the slot.
+// Sole call site of the raw `syscall` instruction. Reserves 928 bytes
+// of user stack — large enough to cover vreg 0 at [rsp + 0] AND the
+// full vreg 14..127 spill window at [rsp + 8..rsp + 920]. The kernel's
+// slow-path arg collector reads `expectedMaxVreg(syscall_word)` slots
+// off this region; the 928-byte reservation guarantees those reads
+// always hit mapped user memory, even for syscalls that don't actually
+// stage stack vregs (the kernel reads zero-initialized junk in that
+// case, which is harmless because the handler bound-checks count
+// against syscall-word bits before consuming any vreg). The SysV-AMD64
+// red zone (caller_rsp - 128 .. caller_rsp - 1) sits inside the 928-
+// byte reservation, so caller-side spills LLVM placed there remain
+// inviolate across the syscall.
 pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -46,10 +53,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ subq $16, %%rsp
+        \\ subq $928, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ addq $16, %%rsp
+        \\ addq $928, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
@@ -107,10 +114,10 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
 /// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15.
 pub fn issueRegDiscard(word: u64, in: Regs) void {
     asm volatile (
-        \\ subq $16, %%rsp
+        \\ subq $928, %%rsp
         \\ movq %%rcx, (%%rsp)
         \\ syscall
-        \\ addq $16, %%rsp
+        \\ addq $928, %%rsp
         :
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (in.v1),
@@ -232,17 +239,116 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     };
 }
 
-// Stack-arg path. SPEC AMBIGUITY: spec lists vreg 14 at [rsp + 8]
-// when the syscall executes. Disk-backed loading and >13-vreg paths
-// are not exercised by the v0 mock runner; the disk-backed loader is
-// the planned next step once the runner stabilizes. The current
-// implementation falls through to issueRawNoStack so the call sites
-// typecheck — first call from a real test will replace this with the
-// explicit asm sequence (sub rsp, N*8; movs; push word; syscall; add).
+// Stack-arg path. Spec §[syscall_abi] x86-64: vreg N at `[rsp + (N-13)*8]`
+// for 14 <= N <= 127, with vreg 0 (the syscall word) at `[rsp + 0]`.
+//
+// Uses a static .bss-resident scratch buffer (`stack_vreg_buf`) the
+// way `replyTransferAsm` uses `vm_exit_reply_buf` — Zig populates the
+// 116-slot kernel-visible vreg window (vreg 0 at index 0, vregs
+// 14..127 at indices 1..114), then the asm swaps rsp to point at the
+// buffer for the syscall instruction (and only the syscall
+// instruction). All 13 GPR-backed vregs ride through tied
+// `{reg}`/`={reg}` operands; rsp is restored from a saved-rsp slot
+// after the syscall returns. The buffer-pointed pattern keeps the asm
+// body free of scratch-register pressure — there are no spare GPRs
+// once the 13-input + 13-output operand budget is committed.
+//
+// `stack_vreg_buf` is @export'd so the asm can `lea` it via a RIP-
+// relative reference; a `_saved_rsp` companion stores the user rsp
+// across the syscall. Both are PROCESS-LOCAL (single libz instance per
+// EC; no SMP within an EC). Concurrent issue from a different EC in
+// the same process is impossible because each EC has its own user
+// stack and runs its own copy of libz code, but only one is in the
+// asm body at a time per EC, and different ECs can't share rsp.
+// Hidden visibility: the inline asm uses direct (%%rip) relocations
+// which require non-preemptible symbols under PIC rules. The
+// `vm_exit_reply_buf` companion in the same file uses `export var`
+// only because the test ELF is fully statically linked and not a
+// shared library — but new symbols default to hidden here for
+// forward-safety against accidental dynamic-link surface.
+var stack_vreg_buf: [116]u64 align(16) = .{0} ** 116;
+var stack_vreg_saved_rsp: u64 align(8) = 0;
+comptime {
+    @export(&stack_vreg_buf, .{ .name = "stack_vreg_buf", .visibility = .hidden });
+    @export(&stack_vreg_saved_rsp, .{ .name = "stack_vreg_saved_rsp", .visibility = .hidden });
+}
+
+// Buffer fill is split out so the asm-bearing function below has no
+// stack-spilled locals competing with the `{rbp}` tied vreg-4 input.
+fn stagestackVregBuf(word: u64, slots: *const [16]u64, n: usize) callconv(.c) void {
+    @memset(stack_vreg_buf[0..116], 0);
+    stack_vreg_buf[0] = word; // vreg 0
+    var i: usize = 0;
+    while (i < n and i < 16) : (i += 1) {
+        // slots[i] -> vreg (14 + i) -> stage index (1 + i).
+        stack_vreg_buf[1 + i] = slots[i];
+    }
+}
+
 pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
-    _ = slots;
-    _ = n;
-    return issueRawNoStack(word, in);
+    stagestackVregBuf(word, slots, n);
+
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ movq %%rsp, stack_vreg_saved_rsp(%%rip)
+        \\ leaq stack_vreg_buf(%%rip), %%rsp
+        \\ movq (%%rsp), %%rcx
+        \\ syscall
+        \\ movq stack_vreg_saved_rsp(%%rip), %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [iv1] "{rax}" (in.v1),
+          [iv2] "{rbx}" (in.v2),
+          [iv3] "{rdx}" (in.v3),
+          [iv4] "{rbp}" (in.v4),
+          [iv5] "{rsi}" (in.v5),
+          [iv6] "{rdi}" (in.v6),
+          [iv7] "{r8}" (in.v7),
+          [iv8] "{r9}" (in.v8),
+          [iv9] "{r10}" (in.v9),
+          [iv10] "{r12}" (in.v10),
+          [iv11] "{r13}" (in.v11),
+          [iv12] "{r14}" (in.v12),
+          [iv13] "{r15}" (in.v13),
+        : .{ .rcx = true, .r11 = true, .memory = true, .cc = true });
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
 }
 
 // Reply-transfer high-vreg path. Spec §[handle_attachments]: pair
