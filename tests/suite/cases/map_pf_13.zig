@@ -30,22 +30,6 @@
 //   could be routed even with a hardware initiator. Asserting them
 //   here pins the structural prerequisites the hardware test needs.
 //
-// IOMMU-active fixture limitation
-//   The test fixtures (`grantTestFixtureDevices` in
-//   kernel/boot/userspace_init.zig) mint synthetic device_regions with
-//   `pci.valid = 0` (sentinel `phys_base` 0xCAFE_0000, no real PCI
-//   binding). The x86 IOMMU drivers (intel/vtd, amd/vi) require a
-//   PCI BDF to provision a per-device translation domain — a synthetic
-//   fixture trips `error.NotPci` in `ensureProvisioned` on the very
-//   first `iommuMapPage`, which `mappingInstall` translates to E_NOMEM.
-//   The aarch64 IOMMU dispatch is a fail-closed stub (no SMMU driver
-//   yet) so every dma `map_pf` returns E_NOMEM there as well. Either
-//   case makes the dma success path unreachable from a userspace test
-//   even with a forwarded fixture, so we degrade-pass when the kernel
-//   reports an IOMMU present (`info_system` features bit 1) or we are
-//   on aarch64 — both arms guarantee `iommuMapPage` will refuse the
-//   synthetic fixture and the structural assertions can't be exercised.
-//
 // Strategy
 //   §[create_vmar] dma success path requires:
 //     - self-handle has `crvr` (runner grants it).
@@ -72,16 +56,13 @@
 // Action
 //   1. Scan cap_table for the first device_region with caps.dma = 1.
 //      If none → smoke-pass (runner built without fixture devices).
-//   2. info_system features bit 1 (IOMMU present) or aarch64 →
-//      smoke-pass: synthetic fixture cannot be IOMMU-mapped (see
-//      "IOMMU-active fixture limitation" above).
-//   3. createVmar(caps={r,w,dma}, props={cur_rwx=0b011, sz=0, cch=0},
+//   2. createVmar(caps={r,w,dma}, props={cur_rwx=0b011, sz=0, cch=0},
 //                 pages=1, preferred_base=0, device_region=found)
 //      — must succeed.
-//   4. createPageFrame(caps={r,w}, props=0, pages=1) — must succeed.
-//   5. mapPf(vmar, &.{0, pf_handle}) — must return OK on the dma
+//   3. createPageFrame(caps={r,w}, props=0, pages=1) — must succeed.
+//   4. mapPf(vmar, &.{0, pf_handle}) — must return OK on the dma
 //      dispatch path.
-//   6. readCap(vmar) and assert:
+//   5. readCap(vmar) and assert:
 //        - field1.device (bits 41-52) == found device handle id.
 //        - field1.map (bits 39-40) == 1 (pf installed).
 //
@@ -99,15 +80,12 @@
 //      if it became 2 (mmio) or 3 (demand), the dma dispatch went
 //      through the wrong path.
 
-const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
-
-const FEATURE_BIT_IOMMU: u64 = 1 << 1;
 
 const CUR_RWX: u64 = 0b011; // r|w
 const SZ: u64 = 0; // 4 KiB
@@ -120,22 +98,6 @@ pub fn main(cap_table_base: u64) void {
         testing.pass();
         return;
     };
-
-    // The fixture device_region is synthetic (no PCI BDF; sentinel
-    // phys_base 0xCAFE_0000). On any kernel build where the IOMMU
-    // dispatch can refuse a non-PCI device — x86 with VT-d/AMD-Vi
-    // active, and aarch64 (fail-closed stub until an SMMU driver
-    // lands) — the kernel cannot exercise the dma success path on
-    // this fixture. Smoke-pass instead so the structural assertions
-    // below are only run on a kernel that would actually let them
-    // succeed (a future build with no IOMMU active OR a fixture with
-    // a real PCI binding).
-    const sys = syscall.infoSystem();
-    const iommu_active = (sys.v2 & FEATURE_BIT_IOMMU) != 0;
-    if (iommu_active or builtin.cpu.arch == .aarch64) {
-        testing.pass();
-        return;
-    }
 
     const vmar_caps = caps.VmarCap{ .r = true, .w = true, .dma = true };
     const props: u64 = (CCH << 5) | (SZ << 3) | CUR_RWX;

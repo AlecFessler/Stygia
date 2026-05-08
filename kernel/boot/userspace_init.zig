@@ -608,10 +608,23 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
 /// Mint two synthetic test-only device_regions:
 ///   - `caps={move,copy,dma,irq}` — exercises `caps.dma=1` and
 ///     `caps.irq=1` paths in §[create_vmar] / §[ack] / §[device_irq].
+///     Stamped with a synthetic-but-valid PCI BDF (bus=0xCA, dev=0x1F,
+///     func=0x7) so the IOMMU drivers (`arch/x64/intel/vtd.zig`,
+///     `arch/x64/amd/vi.zig`) can lazily provision a per-device
+///     translation domain on the first `iommuMapPage`. The BDF is
+///     chosen far outside any real ACPI-discovered range — bus 0xCA
+///     is well above QEMU q35's PCI topology (which lives on bus 0
+///     and a handful of bridge-allocated busses) and the
+///     `dev=0x1F,func=0x7` slot is rarely populated in real hardware
+///     either. Neither IOMMU driver cross-checks BDFs against ACPI
+///     tables; both allocate context/DTE entries lazily on first use,
+///     so a synthetic BDF behaves identically to a real one as long
+///     as it is unique.
 ///   - `caps={move,copy}` — bare device_region with neither dma nor
 ///     irq. Used by §[create_vmar] tests that need a valid handle whose
 ///     caps subset check fails (test 15: `caps.dma=1` and [5] without
-///     `dma` cap → E_PERM).
+///     `dma` cap → E_PERM). Left with `pci.valid=0` since no IOMMU
+///     translation is ever attempted through it.
 ///
 /// Both fixtures use sentinel `phys_base` addresses (0xCAFE_0000 /
 /// 0xBABE_0000) chosen to be far outside any real PCI/MMIO BAR; tests
@@ -639,6 +652,7 @@ fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
             .dma = true,
             .irq = true,
         },
+        zag.devices.device_region.PciAddress.make(0xCA, 0x1F, 0x7),
     );
     mintTestFixtureMmio(
         root_cd,
@@ -648,6 +662,7 @@ fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
             .move = true,
             .copy = true,
         },
+        .{},
     );
 }
 
@@ -656,8 +671,9 @@ fn mintTestFixtureMmio(
     phys_base: PAddr,
     size: u64,
     dr_caps: zag.devices.device_region.DeviceRegionCaps,
+    pci: zag.devices.device_region.PciAddress,
 ) void {
-    const dr = zag.devices.device_region.registerMmio(phys_base, size) catch {
+    const dr = zag.devices.device_region.registerMmioPci(phys_base, size, pci) catch {
         arch.boot.print("[boot] WARNING: test-fixture MMIO registerMmio failed\n", .{});
         return;
     };
