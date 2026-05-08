@@ -1502,6 +1502,17 @@ fn deliverEvent(
         // otherwise the GPR-backed event-state vregs are zeroed.
         arch.syscall.setEventStateGprs(target_ctx, [_]u64{0} ** 13);
     }
+    // Spec §[error_codes]: vreg 1 (rax) is the syscall return register —
+    // OK on success, error code on failure. setEventStateGprs above
+    // wrote sender's rax into vreg 1, which clobbers the OK return on
+    // the rendezvous-from-suspendOnPort path (the receiver was already
+    // parked, so the recv-syscall epilogue's `r.rax = OK` is bypassed).
+    // The recv-from-queued-sender path doesn't see the bug because its
+    // post-deliverEvent `syscallDispatch` epilogue overwrites rax with
+    // OK; this assignment makes the two delivery paths symmetric.
+    // sender's rbx..r15 stay in vregs 2..13 per the §[event_state] GPR
+    // projection.
+    arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.OK));
     // Surface `subcode` in vreg 2 for events that carry an event-
     // specific sub-code (memory_fault, thread_fault, breakpoint,
     // vm_exit, pmu_overflow). The firing-site sub-code overlays the

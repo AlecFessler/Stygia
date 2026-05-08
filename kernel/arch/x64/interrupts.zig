@@ -1500,12 +1500,14 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   rcx = recv_user_rip   (recv_ctx.rip @ 136)
     //   r11 = recv_user_rflags (recv_ctx.rflags @ 152)
     //   rsp = recv_user_rsp   (already in rax; copy after stack writes)
-    //   rax = sender's target_id (gs:72) → receiver's vreg 1
+    //   rax = OK (0) — Spec §[error_codes]: vreg 1 is the syscall
+    //         return register. On recv success the slow path's
+    //         deliverEvent overwrites rax to OK; this fast path mirrors
+    //         that contract so both rendezvous shapes deliver vreg 1 = 0.
     //
-    // Vregs 1..13 (rax-r15 minus rcx/r11) flow zero-copy from sender's
-    // hw regs through the kernel into receiver's hw regs. rax was the
-    // sender's target_id, and that IS what the receiver sees as vreg 1
-    // per §[event_state] — we restore it from the gs:72 spill.
+    // Vregs 2..13 (rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14,
+    // r15) flow zero-copy from sender's hw regs through the kernel into
+    // receiver's hw regs per §[event_state]'s GPR projection.
     //
     // TODO §[event_state] vregs 15/16/17/18 (sender's RFLAGS, RSP,
     // FS.base, GS.base) — write to recv_user_rsp + 16/24/32/40. The
@@ -1530,7 +1532,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
         \\movq %%rax, %%rsp
-        \\movq %%gs:72, %%rax
+        \\xorl %%eax, %%eax
         \\swapgs
         \\sysretq
 
