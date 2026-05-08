@@ -9,14 +9,34 @@
 //   The full observable shape of test 05 is "guest CPUID at (leaf,
 //   subleaf) of an entry returns the entry's (eax, ebx, ecx, edx),
 //   while leaves that were in the *prior* table no longer match." That
-//   end-to-end witness requires a vCPU running guest code that issues
-//   CPUID and a recv loop on the exit_port to inspect the resumed
-//   state. The runner's environment cannot run guest code without
-//   hardware virt — and even with virt the spec property under test
-//   here is that `vm_set_policy` *replaces* the table on success. The
-//   syscall's success path is the load-bearing observable: a successful
-//   `vm_set_policy` is itself the act that "replaces" the table per
-//   the spec sentence's grammar.
+//   end-to-end witness requires two things this rig does not provide:
+//
+//     (a) Harness — staging a guest payload (instruction bytes plus
+//         GDT / segment registers / CR0 / CR3 / EFER / IDT seed) that
+//         the vCPU can execute after the initial-state handshake.
+//         The single-EC test child cannot author and load guest code
+//         into the VM's guest physical address space; create_vcpu_09
+//         hits the same wall and stops at the initial_state reply.
+//
+//     (b) Kernel — `cpuid_responses` table consultation. The kernel's
+//         vm_runloop (kernel/arch/x64/vm_runloop.zig) decodes the
+//         exit reason and forwards every CPUID exit to the VMM as a
+//         vm_exit; nothing in the runloop reads `vm.policy_ptr.
+//         cpuid_responses` to short-circuit a matching exit. The
+//         policy table is set by `vm_set_policy` and stored in the
+//         VM struct (kernel/arch/x64/vm.zig) but never consulted on
+//         exits. Until that consultation lands, even a faithful
+//         guest-running harness would observe every CPUID as a
+//         vm_exit regardless of the policy table — the spec
+//         post-condition is unobservable not because of harness
+//         limits alone but because the kernel feature is a stub.
+//
+//   Given (a)+(b), the strongest observation reachable from this
+//   rig is that the syscall succeeded — i.e. the kernel accepted
+//   the policy replacement and the VM's stored table now reflects
+//   the new entry. That's what we assert here. The spec sentence's
+//   "subsequent guest CPUIDs match" arm is left for a future test
+//   pass once both layers exist.
 //
 //   To isolate the success path we need every earlier gate to be
 //   inert:

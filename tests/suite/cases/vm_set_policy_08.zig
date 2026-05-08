@@ -27,11 +27,16 @@
 //      x86-64 row), not `sysreg_policies`. The aarch64-specific
 //      assertion under test is unreachable from this rig because no
 //      aarch64 guest can be constructed.
-//   2. No vCPU runtime. Even on aarch64 the spec assertion is observable
-//      only through guest execution, which the v0 runner does not yet
-//      drive (no recv loop on the exit port, no vm_resume action wired
-//      end-to-end). Running tests are deferred to a later checklist
-//      pass once the runner grows a guest-execution harness.
+//   2. No guest-execution harness. Even on aarch64 the spec assertion
+//      is observable only through guest sysreg execution, and the
+//      runner cannot stage guest code into a VM. create_vcpu_09 hits
+//      the same wall and stops at the initial_state reply.
+//   3. Kernel-side `sysreg_policies` consultation absent. The aarch64
+//      vm_runloop (kernel/arch/aarch64/vm_runloop.zig) does not read
+//      `sysreg_policies` on sysreg exits today; the policy table is
+//      stored on the VM but never consulted. Even with (1) and (2)
+//      the spec post-condition would not hold until the kernel
+//      feature lands.
 //
 //   This test is preserved as a tripwire / smoke for the syscall path:
 //   we mint a VM with the `policy` cap, issue vm_set_policy with kind=1

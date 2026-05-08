@@ -16,19 +16,32 @@
 //
 // Strategy
 //   The full observable in the spec text — "subsequent guest CR accesses
-//   match against this table per §[vm_policy]" — requires a vCPU
-//   actually executing a guest CR read or write so the kernel's CR-exit
-//   handler can match against the freshly installed table. That guest-
-//   execution path is the same one create_vcpu_09 needs and which is
-//   currently unimplemented in this suite (no test in tests/suite/tests
-//   reaches guest-mode execution). The portion of the spec line that
-//   *is* black-box-testable through the syscall ABI alone is the table-
-//   replacement step — the kernel must accept a kind=1 vm_set_policy
-//   with a valid CR policy table and return success. A failure on this
-//   path means the table was never replaced, in which case the second
-//   half of the spec line ("subsequent guest CR accesses match") is
-//   trivially unobservable. We assert the success path here and leave
-//   the guest-side match to a future test that runs a vCPU.
+//   match against this table per §[vm_policy]" — requires two
+//   ingredients this rig does not provide:
+//
+//     (a) Harness — a vCPU executing guest code that performs a CR
+//         read or write so the kernel's CR-exit handler can match
+//         against the freshly installed table. The single-EC test
+//         child cannot author and load guest code into the VM's
+//         guest physical address space; create_vcpu_09 hits the
+//         same wall and stops at the initial_state reply.
+//
+//     (b) Kernel — `cr_policies` table consultation. The kernel's
+//         vm_runloop (kernel/arch/x64/vm_runloop.zig) forwards every
+//         CR-access exit to the VMM as a vm_exit; nothing in the
+//         runloop reads `vm.policy_ptr.cr_policies` to short-circuit
+//         a matching access. The policy table is set by
+//         `vm_set_policy` and stored in the VM struct
+//         (kernel/arch/x64/vm.zig) but never consulted on exits.
+//         Until that consultation lands, even a faithful
+//         guest-running harness would observe every CR access as a
+//         vm_exit regardless of the policy table.
+//
+//   Given (a)+(b), the strongest observation reachable from this
+//   rig is that the syscall accepts the kind=1 replacement and
+//   returns success — the table has been written into the VM's
+//   stored policy. We assert that here and leave the guest-side
+//   match to a future test that runs a vCPU.
 //
 //   To isolate the success path every prior-numbered gate must be
 //   defused so vm_set_policy actually returns OK:

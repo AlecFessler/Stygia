@@ -12,11 +12,20 @@
 //   from this runner.
 //
 // Strategy
-//   The runner spawns child capability domains without vCPUs and
-//   never enters guest mode, so the spec's observation point — guest
-//   CPUID/CR exits matching against the configured tables — is not
-//   reachable here. The faithful surrogate left to us is functional:
-//   after a successful vm_set_policy(kind=0, ...), a subsequent
+//   Two ingredients block the strict observation:
+//
+//     (a) Harness — the runner spawns child capability domains
+//         without vCPUs and never enters guest mode, so the spec's
+//         observation point — guest CPUID/CR exits matching against
+//         the configured tables — is not reachable here.
+//
+//     (b) Kernel — neither `cpuid_responses` nor `cr_policies` is
+//         consulted on guest exits today (kernel/arch/x64/
+//         vm_runloop.zig forwards every CPUID/CR access exit to the
+//         VMM as a vm_exit). The tables are stored but unused.
+//
+//   The faithful surrogate left to us is functional: after a
+//   successful vm_set_policy(kind=0, ...), a subsequent
 //   vm_set_policy(kind=1, ...) must still succeed all the way up to
 //   that kind's MAX_*. If kind=0's call had clobbered or zeroed the
 //   kind=1 table's bookkeeping the second call could not faithfully
@@ -27,7 +36,8 @@
 //   it carries is "neither kind=0 nor kind=1 errors out when invoked
 //   after the other kind", which is necessary-but-not-sufficient for
 //   the spec's "other kind unchanged" contract. A vCPU-running test
-//   would replace this once the runner gains that capability.
+//   plus kernel-side policy consultation would together replace
+//   this once both layers exist.
 //
 // Defusing other vm_set_policy error paths
 //   - test 01 (E_BADCAP): we mint a real VM via createVirtualMachine.

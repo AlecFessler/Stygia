@@ -57,14 +57,27 @@
 //      (anything other than a valid handle or E_NODEV).
 //
 // Faithful-test note
-//   Faithful test deferred pending an aarch64 runner build. Once that
-//   exists, the action becomes:
+//   Faithful test deferred pending three pieces:
+//     1. An aarch64 runner build (cpu_arch = .aarch64) — only then
+//        does kind=0 dispatch to id_reg_responses.
+//     2. A guest-execution harness that can stage guest code into
+//        the VM and drive the vCPU through an ID_AA64* read so the
+//        kernel sees a sysreg exit it could match against the table.
+//     3. Kernel-side `id_reg_responses` consultation. The aarch64
+//        vm_runloop today does not read the policy table on sysreg
+//        exits — see kernel/arch/aarch64/vm_runloop.zig — so even
+//        with (1) and (2), the spec post-condition would not hold
+//        until the kernel feature lands.
+//   Once those three exist, the action becomes:
 //     <build runner with cpu_arch = .aarch64>
 //     <test: build IdRegResponse entry per §[vm_set_policy] aarch64
 //      kind=0 layout — vreg [2+2i+0] packs (op0, op1, crn, crm, op2,
 //      _pad u8[3]); vreg [2+2i+1] is value u64>
 //     <test: vmSetPolicy(vm, kind=0, count=1, &entry) — assert OK>
-//   That OK assertion (id 5) would replace this smoke's pass-with-id-0.
+//     <test: drive guest read of ID_AA64<X>_EL1 — assert resumed
+//      value matches entry's `value`>
+//   That guest-side assertion (id 5+) would replace this smoke's
+//   pass-with-id-0.
 
 const lib = @import("lib");
 
