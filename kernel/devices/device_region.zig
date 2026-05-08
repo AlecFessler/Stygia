@@ -8,9 +8,9 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const futex = zag.sched.futex;
 const irq = zag.arch.dispatch.irq;
 const secure_slab = zag.memory.allocators.secure_slab;
-const smp = zag.arch.dispatch.smp;
 const userio = zag.arch.dispatch.userio;
 
 const GenLock = secure_slab.GenLock;
@@ -458,37 +458,26 @@ pub fn onIrq(dr: *DeviceRegion) void {
 
 /// Step 2+3 of `onIrq`. Walks the per-region handle list; for each
 /// domain-local copy bumps `field1.irq_count` saturating at u64::MAX
-/// via `userio.atomicAddU64Saturating` and futex-wakes any waiter on
-/// that paddr. Idle remote cores hosting a recv-blocked EC are kicked
-/// via `smp.sendWakeIpi` so the wake takes effect promptly.
+/// via `userio.atomicAddU64Saturating` and futex-wakes every waiter
+/// parked in `futex_wait_val` on that paddr. Idle remote cores
+/// hosting a recv-blocked EC are kicked from inside `futex.wake`
+/// via `scheduler.enqueueOnCore` -> `arch.smp.sendWakeIpi`, so this
+/// path doesn't need its own IPI fan-out.
+///
+/// IRQ-context safety: called with IRQs masked. `futex.wake` takes
+/// `Bucket.lock` (and transitively `core_locks` / `timed_lock`) via
+/// `lockIrqSaveOrdered`, which preserves the masked state across
+/// the critical section. The same path is exercised every timer
+/// tick by `futex.expireTimedWaiters` and by `timer.zig`'s field0
+/// `futex.wake(paddr, maxInt(u32))` propagation, both of which
+/// run in IRQ context.
+///
 /// Spec §[device_irq] steps 1+3.
 pub fn propagateIrqAndWake(dr: *DeviceRegion) void {
     var cursor = dr.handle_list_head;
     while (cursor) |node| {
         _ = userio.atomicAddU64Saturating(node.field1_paddr, 1, std.math.maxInt(u64));
-        const woken = futexWakeIrq(node.field1_paddr);
-        if (woken.idle_core_mask != 0) {
-            var mask = woken.idle_core_mask;
-            while (mask != 0) {
-                const core = @ctz(mask);
-                smp.sendWakeIpi(@intCast(core));
-                mask &= mask - 1;
-            }
-        }
+        _ = futex.wake(node.field1_paddr, std.math.maxInt(u32));
         cursor = node.next;
     }
-}
-
-/// Stub: futex wake against a device IRQ counter. Returns the set of
-/// idle remote cores whose recv-blocked ECs need a `sendWakeIpi`
-/// follow-up. Real impl lives in `kernel/sched/futex.zig` once the
-/// spec-v3 EC + port wiring lands; calling sites here treat it as
-/// opaque.
-pub const FutexWakeResult = struct {
-    idle_core_mask: u64 = 0,
-};
-
-fn futexWakeIrq(paddr: PAddr) FutexWakeResult {
-    _ = paddr;
-    return .{};
 }
