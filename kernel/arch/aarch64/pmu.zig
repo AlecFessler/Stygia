@@ -30,7 +30,10 @@
 
 const zag = @import("zag");
 
+const gic = zag.arch.aarch64.gic;
 const pmu_sched = zag.syscall.pmu;
+const port_mod = zag.sched.port;
+const scheduler = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
@@ -521,28 +524,136 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 }
 
 /// PMU overflow PPI (INTID 23) handler. Invoked from
-/// `kernel/arch/aarch64/exceptions.zig dispatchIrq`.
+/// `kernel/arch/aarch64/exceptions.zig dispatchIrq` for the running EC
+/// on this core; the GIC EOI for INTID 23 was issued by the IRQ
+/// trampoline before this call (see `handleIrqLowerEl`), so we never
+/// touch the GIC here — only the PMU register file and the scheduler.
 ///
-/// Mirrors the Intel/AMD PMI contract: snapshot the overflow status and
-/// live counter values, mask the source (so the level-sensitive PPI 23
-/// line deasserts before we ERET back to userspace), deliver a
-/// `.pmu_overflow` fault to the process's fault handler, and yield.
+/// Behavior:
+///   1. Read PMOVSCLR_EL0 to find which counters overflowed (D23.5.20).
+///      The level-sensitive PPI 23 line is asserted while any
+///      `PMOVSSET[n] & PMINTENSET[n]` bit is set, so unless we either
+///      clear PMOVSCLR or mask PMINTENSET the line will re-trigger
+///      immediately on every ERET (D13.3.1).
+///   2. For every overflowed counter that lies within the running EC's
+///      active counter range, re-arm the counter by writing the
+///      configured preload via PMSELR_EL0 + PMXEVCNTR_EL0 (D23.5.27).
+///      This restores the configured `overflow_threshold` periodicity;
+///      without re-preload the counter would wrap again only after a
+///      full 2^32 events (D13.3 — 32-bit event counters under PMUv3
+///      pre-PMUv3p5).
+///   3. Write the overflowed bitmask back to PMOVSCLR_EL0 (write-1-to-
+///      clear semantics per D13.3.1: "the interrupt handler ... must
+///      cancel the interrupt request, by writing 1 to PMOVSCLR[n] to
+///      clear the overflow bit to 0") so PPI 23 deasserts.
+///   4. Deliver a single `.pmu_overflow` event to the running EC via
+///      `port.firePmuOverflow`. The event subcode carries the
+///      lowest-index overflowed counter; spec §[event_type] only
+///      defines a single counter index per delivery, so multi-counter
+///      simultaneous overflows fold into one event for the lowest.
+///      No-route fallback (spec §[event_route]): drop the event and
+///      let the EC continue running.
+///
+/// Defensive paths: if either no EC is currently dispatched on this
+/// core (`currentEc()` returns null) or the EC has no active perfmon
+/// state (`ec.perfmon_state` is null), we still clear PMOVSCLR for the
+/// firing bits and mask their PMINTENSET contributions so the
+/// level-sensitive PPI 23 line drops. This shouldn't happen — counters
+/// only fire while their owning EC is dispatched and `pmuSave` masks
+/// PMINTENSET on every context switch out — but a stale firing during
+/// the brief window between counter disarm and PMOVSCLR clear is
+/// possible, so the handler stays robust against it.
 ///
 /// Spec references:
-///   * ARM ARM DDI 0487 K.a §D13.3  Behavior on overflow
+///   * ARM ARM DDI 0487 K.a §D13.3   Behavior on overflow
 ///   * ARM ARM DDI 0487 K.a §D13.3.1 Generating overflow interrupt requests
-///     — PMU overflow connects as GICv3 PPI 23, level-sensitive.
-///   * ARM ARM DDI 0487 K.a §D13.3.17 PMOVSCLR_EL0 — clearing a bit
-///     deasserts that counter's contribution to the PMU overflow request.
-///   * ARM ARM DDI 0487 K.a §D13.3.21 PMINTENCLR_EL1 — masking removes
-///     the counter's contribution to PMUIRQ without losing PMOVSSET state.
+///     — PMU overflow connects as GICv3 PPI 23, level-sensitive; the
+///     handler "must cancel the interrupt request, by writing 1 to
+///     PMOVSCLR[n] to clear the overflow bit to 0".
+///   * ARM ARM DDI 0487 K.a §D23.5.20 PMOVSCLR_EL0 — write-1-to-clear
+///     unsigned-overflow flag register (P0..P30 + C for cycle counter).
+///   * ARM ARM DDI 0487 K.a §D23.5.17 PMINTENCLR_EL1 — write-1-to-clear
+///     overflow-interrupt-enable bits (masks a counter's contribution
+///     to PMUIRQ without disturbing PMOVSSET state).
+///   * ARM ARM DDI 0487 K.a §D23.5.22 PMSELR_EL0 — counter selector
+///     for PMXEVCNTR_EL0 / PMXEVTYPER_EL0 indirection.
+///   * ARM ARM DDI 0487 K.a §D23.5.27 PMXEVCNTR_EL0 — selected event
+///     counter, written here to re-preload after overflow.
 pub fn pmiHandler(ctx: *ArchCpuContext) void {
     _ = ctx;
-    // TODO(spec-v3): pmu_state has been removed from ExecutionContext;
-    // PMI ownership / state lookup needs to be re-wired against the new
-    // PMU storage location (per-core or per-port?). Until then we panic
-    // — userspace cannot start counters, so this should be unreachable
-    // in practice. Mirrors the Intel PMI handler stub in
-    // `arch/x64/intel/pmu.zig`.
-    @panic("aarch64 pmu not yet implemented");
+
+    const ovs = readPMOVSCLR();
+    if (ovs == 0) return;
+
+    const ec_opt = scheduler.currentEc();
+
+    // Defensive cleanup path: no EC is dispatched on this core, or the
+    // EC has no perfmon state attached. Clear every firing bit in
+    // PMOVSCLR and also mask PMINTENSET for those bits so the
+    // level-sensitive PPI 23 line drops and stays silent until a
+    // future `pmuRestore` re-arms a counter.
+    if (ec_opt == null or ec_opt.?.perfmon_state == null) {
+        writePMOVSCLR(ovs);
+        writePMINTENCLR(ovs);
+        return;
+    }
+
+    const ec = ec_opt.?;
+    const ps_ref = ec.perfmon_state.?;
+    const ps_lr = ps_ref.lockIrqSave(@src()) catch {
+        // Slab gen flipped underneath us — perfmon was deallocated by
+        // a remote core between our null-check and lock. Same defensive
+        // cleanup as the no-state path.
+        writePMOVSCLR(ovs);
+        writePMINTENCLR(ovs);
+        return;
+    };
+    const ps = ps_lr.ptr;
+    const ps_irq_state = ps_lr.irq_state;
+    const state = &ps.arch_state;
+
+    // Walk every overflowed bit. For counters whose slot is owned by
+    // the running EC's active counter set, re-preload so the next
+    // overflow arrives after another `overflow_threshold` events.
+    // Counters outside that range get their status bit cleared but no
+    // re-preload — they aren't ours to drive.
+    var lowest_idx: u8 = 0xFF;
+    var remaining = ovs & counterMask(MAX_COUNTERS);
+    while (remaining != 0) {
+        const i: u8 = @intCast(@ctz(remaining));
+        const sh: u6 = @intCast(i);
+        remaining &= ~(@as(u64, 1) << sh);
+        if (lowest_idx == 0xFF) lowest_idx = i;
+        if (i >= state.num_counters) continue;
+        const cfg = state.configs[i];
+        // Re-preload only if a threshold is configured. A free-running
+        // counter (no threshold) wraps at 2^32 by hardware; we still
+        // clear its PMOVSCLR bit below so the PPI line drops, but do
+        // not touch PMXEVCNTR.
+        if (!cfg.has_threshold) continue;
+        writePMSELR(i);
+        const preload = preloadValue(cfg);
+        writePMXEVCNTR(preload);
+        state.values[i] = preload;
+    }
+
+    // Write-1-to-clear all firing bits (D13.3.1 + D23.5.20).
+    writePMOVSCLR(ovs);
+
+    ps_ref.unlockIrqRestore(ps_irq_state);
+
+    if (lowest_idx == 0xFF) return;
+
+    // Deliver the event. Spec §[event_route] no-route fallback drops
+    // it and the EC keeps running. With a route, the EC is suspended
+    // on the route's port and `current_ec` is cleared on this core,
+    // so we drive the scheduler to dispatch the next EC. The
+    // `coreCurrentIs` check distinguishes the two cases without
+    // needing return-value plumbing through `firePmuOverflow`.
+    port_mod.firePmuOverflow(ec, lowest_idx);
+
+    const core: u8 = @truncate(gic.coreID());
+    if (!scheduler.coreCurrentIs(core, ec)) {
+        scheduler.preempt();
+    }
 }
