@@ -7,11 +7,13 @@
 //! via `acquire_vmars` (debugger primitive) or `copy`/`move` — UAF
 //! protection across domains comes from `_gen_lock`.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
 const dispatch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const scheduler = zag.sched.scheduler;
 const secure_slab = zag.memory.allocators.secure_slab;
 
 const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
@@ -1167,12 +1169,15 @@ fn demandAlloc(v: *VMAR, offset: u64) i64 {
 pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx: u3) i64 {
     const v = findVmarCovering(domain, fault_vaddr) orelse return errors.E_BADADDR;
     const v_irq = v._gen_lock.lockIrqSave(@src());
-    defer v._gen_lock.unlockIrqRestore(v_irq);
 
-    if ((access_rwx & ~v.cur_rwx) != 0) return errors.E_PERM;
+    if ((access_rwx & ~v.cur_rwx) != 0) {
+        v._gen_lock.unlockIrqRestore(v_irq);
+        return errors.E_PERM;
+    }
 
     switch (v.map) {
         .unmapped => {
+            defer v._gen_lock.unlockIrqRestore(v_irq);
             const offset = fault_vaddr.addr - v.base_vaddr.addr;
             const sz_bytes = pageSizeBytes(v.sz);
             const aligned = std.mem.alignBackward(u64, offset, sz_bytes);
@@ -1181,6 +1186,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             return rc;
         },
         .demand => {
+            defer v._gen_lock.unlockIrqRestore(v_irq);
             const offset = fault_vaddr.addr - v.base_vaddr.addr;
             const sz_bytes = pageSizeBytes(v.sz);
             const aligned = std.mem.alignBackward(u64, offset, sz_bytes);
@@ -1192,14 +1198,32 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // here are spurious (real PTEs were installed at map time)
             // and route to the EC's memory_fault event.
             // caller-pinned: device ref under VMAR's gen-lock.
-            const dev_ref = v.device orelse return errors.E_BADADDR;
+            const dev_ref = v.device orelse {
+                v._gen_lock.unlockIrqRestore(v_irq);
+                return errors.E_BADADDR;
+            };
             const dev = dev_ref.ptr;
-            if (dev.device_type == .port_io) {
-                return decodePortIoFault(domain, fault_vaddr, v, dev);
+            if (dev.device_type != .port_io) {
+                v._gen_lock.unlockIrqRestore(v_irq);
+                return errors.E_PERM;
             }
+            // Snapshot the immutable VMAR base under the lock, then
+            // release before invoking the port-IO emulator. Spec
+            // §[port_io_virtualization] tests 06/09/10/11 require the
+            // emulator to fire `memory_fault` / `thread_fault` inline
+            // and yield the EC; in those paths the emulator never
+            // returns, so a still-held VMAR `_gen_lock` would strand
+            // forever and deadlock any future walk of the domain's
+            // `vars[]`. The DeviceRegion pointer is stable for the
+            // kernel's lifetime once bound, so unlocking here is safe.
+            const var_base = v.base_vaddr.addr;
+            v._gen_lock.unlockIrqRestore(v_irq);
+            return decodePortIoFault(domain, fault_vaddr, var_base, dev);
+        },
+        .page_frame => {
+            v._gen_lock.unlockIrqRestore(v_irq);
             return errors.E_PERM;
         },
-        .page_frame => return errors.E_PERM,
     }
 }
 
@@ -1314,17 +1338,44 @@ fn resumeDomain(cd: *CapabilityDomain) void {
 }
 
 /// Decode the MOV that hit a port-IO VMAR, emit the matching IN/OUT,
-/// commit the result, advance RIP. Spec §[port_io_virtualization].
+/// commit the result, advance RIP. Spec §[port_io_virtualization]
+/// tests 04-11. Dispatches to the per-arch emulator: x86-64 owns the
+/// IN/OUT instructions and the MOV decoder; aarch64 has no port-IO
+/// concept and is unreachable per spec test 01 (`map_mmio` rejects
+/// `dev_type = port_io` on non-x86-64).
+///
+/// `var_base` is a pre-snapshot copy of `v.base_vaddr.addr` taken
+/// under the VMAR's `_gen_lock` by `handlePageFault`; the lock has
+/// already been released because the emulator may suspend or
+/// terminate the running EC (firing thread_fault / memory_fault
+/// inline per spec tests 06/09/10/11) and a still-held lock would
+/// strand. The currently-dispatched EC is `scheduler.currentEc()` —
+/// it owns the page-fault frame and is the target of any inline
+/// event delivery.
+///
+/// Always returns 0 on successful emulation (the emulator advanced
+/// the user RIP and the caller iretq's the user back to the next
+/// instruction). On inline-fired event paths the emulator yields
+/// and never returns; the caller's iretq window resumes whatever EC
+/// the scheduler dispatches next.
 fn decodePortIoFault(
     cd: *CapabilityDomain,
     fault_vaddr: VAddr,
-    v: *VMAR,
+    var_base: u64,
     dev: *DeviceRegion,
 ) i64 {
     _ = cd;
-    _ = fault_vaddr;
-    _ = v;
-    _ = dev;
-    return errors.E_INVAL;
+    // caller-pinned: currentEc() is the EC whose page-fault we're
+    // servicing; its kernel stack is the running stack and its bound
+    // domain is alive across this handler.
+    const ec = scheduler.currentEc() orelse return errors.E_BADADDR;
+    return switch (builtin.cpu.arch) {
+        .x86_64 => zag.arch.x64.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev),
+        // Spec §[port_io_virtualization] test 01: map_mmio rejects
+        // port_io device_regions on non-x86-64, so a port-IO VMAR
+        // can never exist on aarch64 and this dispatch is unreachable.
+        .aarch64 => unreachable,
+        else => unreachable,
+    };
 }
 

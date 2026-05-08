@@ -16,6 +16,7 @@ pub const mmio_decode = @import("mmio_decode.zig");
 pub const paging = @import("paging.zig");
 pub const pcid = @import("pcid.zig");
 pub const pmu = @import("pmu.zig");
+pub const port_io = @import("port_io.zig");
 pub const power = @import("power.zig");
 pub const rtc = @import("rtc.zig");
 pub const serial = @import("serial.zig");
