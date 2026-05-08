@@ -12,32 +12,23 @@
 //   from this runner.
 //
 // Strategy
-//   Two ingredients block the strict observation:
-//
-//     (a) Harness — the runner spawns child capability domains
-//         without vCPUs and never enters guest mode, so the spec's
-//         observation point — guest CPUID/CR exits matching against
-//         the configured tables — is not reachable here.
-//
-//     (b) Kernel — neither `cpuid_responses` nor `cr_policies` is
-//         consulted on guest exits today (kernel/arch/x64/
-//         vm_runloop.zig forwards every CPUID/CR access exit to the
-//         VMM as a vm_exit). The tables are stored but unused.
-//
-//   The faithful surrogate left to us is functional: after a
-//   successful vm_set_policy(kind=0, ...), a subsequent
-//   vm_set_policy(kind=1, ...) must still succeed all the way up to
-//   that kind's MAX_*. If kind=0's call had clobbered or zeroed the
-//   kind=1 table's bookkeeping the second call could not faithfully
-//   replace MAX_CR_POLICIES entries; the symmetric test against
-//   kind=0 after kind=1 closes the loop.
+//   The strict observable requires guest execution + kernel-side
+//   policy-table consultation on exits, neither of which the runner
+//   provides. The faithful surrogate left to us is functional:
+//   alternating kind=0 / kind=1 replacements with a live vCPU pinned
+//   to the same VM. If a kind=0 call had clobbered the kind=1 table
+//   (or vice versa), the symmetric counterpart would fail; if the
+//   policy_pf had been freed under the live vCPU, any subsequent
+//   replacement would surface as well. Running this sequence against
+//   a live vCPU (rather than a freshly-minted bare VM) closes the
+//   loop on the runtime-mutability promise of §[vm_policy].
 //
 //   This is explicitly a smoke surrogate for test 09: the assertion
 //   it carries is "neither kind=0 nor kind=1 errors out when invoked
-//   after the other kind", which is necessary-but-not-sufficient for
-//   the spec's "other kind unchanged" contract. A vCPU-running test
-//   plus kernel-side policy consultation would together replace
-//   this once both layers exist.
+//   after the other kind on a VM with a live vCPU", which is
+//   necessary-but-not-sufficient for the spec's "other kind unchanged"
+//   contract. A vCPU-running test plus kernel-side policy
+//   consultation would together replace this once both layers exist.
 //
 // Defusing other vm_set_policy error paths
 //   - test 01 (E_BADCAP): we mint a real VM via createVirtualMachine.
@@ -69,19 +60,24 @@
 //   2. createVmar + mapPf so userspace can zero the policy buffer.
 //   3. Zero VM_POLICY_BYTES so both num_* counts seed at zero.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf).
-//   5. vmSetPolicy(vm, kind=0, count=1, one CPUID entry) — must OK.
-//   6. vmSetPolicy(vm, kind=1, count=1, one CR entry) — must OK.
-//   7. vmSetPolicy(vm, kind=0, count=1, different CPUID entry) — OK.
-//   8. vmSetPolicy(vm, kind=1, count=1, different CR entry) — OK.
+//   5. createPort + createVcpu — pin policy_pf under a live vCPU.
+//   6. recv(exit_port) — initial vm_exit, subcode == initial_state.
+//   7. vmSetPolicy(vm, kind=0, count=1, one CPUID entry) — must OK.
+//   8. vmSetPolicy(vm, kind=1, count=1, one CR entry) — must OK.
+//   9. vmSetPolicy(vm, kind=0, count=1, different CPUID entry) — OK.
+//  10. vmSetPolicy(vm, kind=1, count=1, different CR entry) — OK.
 //
 // Assertions
-//   1: setup — page frame / var / map_pf / VM creation returned an
-//      unexpected error.
-//   2: vm_set_policy(kind=0) after fresh VM did not return OK.
-//   3: vm_set_policy(kind=1) after the kind=0 set did not return OK
+//   1: setup — page frame / var / map_pf / VM creation / port /
+//      vCPU creation returned an unexpected error.
+//   2: recv on the exit_port did not return OK in vreg 1.
+//   3: the recv'd event's sub-code (vreg 2) is not the initial-state
+//      sub-code.
+//   4: vm_set_policy(kind=0) after fresh VM did not return OK.
+//   5: vm_set_policy(kind=1) after the kind=0 set did not return OK
 //      (would suggest the kind=0 call corrupted kind=1 state).
-//   4: vm_set_policy(kind=0) after the kind=1 set did not return OK.
-//   5: vm_set_policy(kind=1) after the second kind=0 set did not
+//   6: vm_set_policy(kind=0) after the kind=1 set did not return OK.
+//   7: vm_set_policy(kind=1) after the second kind=0 set did not
 //      return OK.
 
 const lib = @import("lib");
@@ -163,7 +159,47 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. vm_set_policy(kind=0) with one CPUID entry. The entry covers
+    // 5. Mint exit port + vCPU. `bind` + `recv` are within
+    //    port_ceiling = 0x5C; `susp`/`read`/`write` within
+    //    ec_inner_ceiling = 0xFF. The vCPU pins policy_pf so the
+    //    alternating kind=0/1 replacements below run against a
+    //    live VM (the runtime-mutability promise from §[vm_policy]).
+    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
+    if (testing.isHandleError(cport.v1)) {
+        testing.fail(1);
+        return;
+    }
+    const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
+
+    const vcpu_caps = caps.EcCap{
+        .susp = true,
+        .read = true,
+        .write = true,
+    };
+    const cvcpu = syscall.createVcpu(
+        @as(u64, vcpu_caps.toU16()),
+        vm_handle,
+        0, // affinity = any core
+        exit_port,
+    );
+    if (testing.isHandleError(cvcpu.v1)) {
+        testing.fail(1);
+        return;
+    }
+
+    // 6. Recv the kernel-injected initial vm_exit.
+    const initial = syscall.recv(exit_port, 0);
+    if (initial.regs.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(2);
+        return;
+    }
+    if (initial.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
+        testing.fail(3);
+        return;
+    }
+
+    // 7. vm_set_policy(kind=0) with one CPUID entry. The entry covers
     //    leaf=1, subleaf=0 (the "feature info" leaf — guaranteed to
     //    have well-defined eax/ebx/ecx/edx semantics on x86-64).
     //    Layout from §[vm_set_policy] x86-64 kind=0:
@@ -181,11 +217,11 @@ pub fn main(cap_table_base: u64) void {
         &.{ cpuid0_word0, cpuid0_word1, cpuid0_word2 },
     );
     if (set0_a.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(2);
+        testing.fail(4);
         return;
     }
 
-    // 6. vm_set_policy(kind=1) with one CR entry. Covering CR0 with a
+    // 8. vm_set_policy(kind=1) with one CR entry. Covering CR0 with a
     //    benign read_value and a zero write_mask (writes ignored).
     //    Layout from §[vm_set_policy] x86-64 kind=1:
     //      vreg 2 = {cr_num u8, _pad u8[7]}
@@ -202,11 +238,11 @@ pub fn main(cap_table_base: u64) void {
         &.{ cr0_word0, cr0_word1, cr0_word2 },
     );
     if (set1_a.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(3);
+        testing.fail(5);
         return;
     }
 
-    // 7. Replace kind=0 with a different entry. If the prior kind=1
+    // 9. Replace kind=0 with a different entry. If the prior kind=1
     //    call had clobbered the kind=0 table's count/state in some
     //    way that broke a faithful replace, this would surface.
     const cpuid1_word0: u64 = (@as(u64, 0) << 32) | @as(u64, 0); // leaf=0
@@ -220,12 +256,12 @@ pub fn main(cap_table_base: u64) void {
         &.{ cpuid1_word0, cpuid1_word1, cpuid1_word2 },
     );
     if (set0_b.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(4);
+        testing.fail(6);
         return;
     }
 
-    // 8. Replace kind=1 again. Same rationale — the second kind=0
-    //    set must not have affected kind=1's ability to replace.
+    // 10. Replace kind=1 again. Same rationale — the second kind=0
+    //     set must not have affected kind=1's ability to replace.
     const cr1_word0: u64 = 4; // cr_num = 4 (CR4)
     const cr1_word1: u64 = 0;
     const cr1_word2: u64 = 0;
@@ -237,7 +273,7 @@ pub fn main(cap_table_base: u64) void {
         &.{ cr1_word0, cr1_word1, cr1_word2 },
     );
     if (set1_b.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(5);
+        testing.fail(7);
         return;
     }
 

@@ -39,13 +39,13 @@
 //      feature lands.
 //
 //   This test is preserved as a tripwire / smoke for the syscall path:
-//   we mint a VM with the `policy` cap, issue vm_set_policy with kind=1
-//   and count=0 (empty replacement, valid on both archs since count <=
+//   we mint a VM with the `policy` cap, stand up a vCPU so the policy
+//   frame is pinned through the same coexistence path the aarch64
+//   test will need, then issue vm_set_policy with kind=1 and count=0
+//   (empty replacement, valid on both archs since count <=
 //   MAX_SYSREG_POLICIES = 32 on aarch64 and <= MAX_CR_POLICIES = 8 on
-//   x86-64), and verify the kernel does not surface a hard error code
-//   that would indicate the syscall path is broken in a way the gated
-//   tests (01..04) would not catch. The full aarch64 sysreg replacement
-//   semantic is left for an aarch64 runner pass.
+//   x86-64). The full aarch64 sysreg replacement semantic is left for
+//   an aarch64 runner pass.
 //
 //   E_NODEV degradation
 //     `create_virtual_machine` returns E_NODEV on platforms without
@@ -74,24 +74,28 @@
 //      (zero counts ⇒ valid empty policy on both archs.)
 //   3. Zero the VmPolicy region with volatile stores.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerate
-//      E_NODEV / unexpected error with degraded pass since the kind=1
-//      replacement path is unreachable without a VM.
-//   5. vmSetPolicy(vm_handle, kind=1, count=0, entries=&.{}). This
-//      exercises the kind=1 replacement path end-to-end. Outcomes:
-//        - OK: the empty replacement was accepted on the host arch.
-//          On aarch64 this means sysreg_policies is now empty; on
-//          x86-64 it means cr_policies is now empty. The full
-//          aarch64 spec assertion (sysreg_policies _replaced by the
-//          count entries_) is satisfied trivially when count = 0.
-//        - any other code: the syscall path failed for a reason the
-//          gated tests don't cover. We don't ascribe that to the
-//          aarch64-specific assertion under test, so we degrade with
-//          pass rather than fail.
+//      E_NODEV with degraded pass since the kind=1 replacement path
+//      is unreachable without a VM.
+//   5. createPort + createVcpu to pin policy_pf under a live vCPU.
+//   6. recv(exit_port) — initial vm_exit, subcode == initial_state.
+//   7. vmSetPolicy(vm_handle, kind=1, count=0, entries=&.{}). This
+//      exercises the kind=1 replacement path end-to-end. The return
+//      is intentionally not checked: on x86-64 the call routes to
+//      cr_policies (test 06's territory) and on aarch64 it would
+//      route to sysreg_policies (the spec assertion under test). We
+//      smoke the call shape only.
 //
 // Assertions
 //   1: setup — createPageFrame returned an error word.
 //   2: setup — createVmar returned an error word.
 //   3: setup — mapPf returned non-OK in vreg 1.
+//   4: setup — createVirtualMachine returned an unexpected error
+//      (anything other than a valid handle or E_NODEV).
+//   5: setup — createPort returned an error word.
+//   6: setup — createVcpu returned an error word.
+//   7: recv on the exit_port did not return OK in vreg 1.
+//   8: the recv'd event's sub-code (vreg 2) is not the initial-state
+//      sub-code.
 //   (No spec-assertion-under-test fail path is wired; the aarch64
 //    sysreg-replacement guarantee cannot be observed from this rig.)
 
@@ -170,16 +174,50 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
     if (testing.isHandleError(cvm.v1)) {
-        // VM creation failed with something other than E_NODEV — the
-        // kind=1 replacement path is unreachable without a VM handle,
-        // so degrade rather than mis-attribute the failure to the
-        // aarch64-specific assertion under test.
-        testing.pass();
+        testing.fail(4);
         return;
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Smoke the kind=1 replacement path with an empty entry list.
+    // 5. Mint the exit port + vCPU so the policy_pf is pinned through
+    //    the same coexistence path the aarch64 test will require
+    //    once a guest-execution harness exists.
+    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
+    if (testing.isHandleError(cport.v1)) {
+        testing.fail(5);
+        return;
+    }
+    const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
+
+    const vcpu_caps = caps.EcCap{
+        .susp = true,
+        .read = true,
+        .write = true,
+    };
+    const cvcpu = syscall.createVcpu(
+        @as(u64, vcpu_caps.toU16()),
+        vm_handle,
+        0, // affinity = any core
+        exit_port,
+    );
+    if (testing.isHandleError(cvcpu.v1)) {
+        testing.fail(6);
+        return;
+    }
+
+    // 6. Recv the kernel-injected initial vm_exit.
+    const initial = syscall.recv(exit_port, 0);
+    if (initial.regs.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(7);
+        return;
+    }
+    if (initial.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
+        testing.fail(8);
+        return;
+    }
+
+    // 7. Smoke the kind=1 replacement path with an empty entry list.
     //    On aarch64 this clears sysreg_policies (count = 0 entries
     //    replace the prior table); on x86-64 it clears cr_policies.
     //    The aarch64 spec assertion ("the table is _replaced by the
