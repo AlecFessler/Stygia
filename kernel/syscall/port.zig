@@ -52,6 +52,7 @@ const CREATE_PORT_CAPS_MASK: u64 = 0xFFFF;
 /// [test 02] returns E_PERM if caps is not a subset of the caller's `port_ceiling`.
 /// [test 03] returns E_INVAL if any reserved bits are set in [1].
 /// [test 04] on success, the caller receives a port handle with caps = `[1].caps`.
+/// [test 05] returns E_PERM if `[1].caps` does not include `recv`, or includes neither of `{suspend, bind}`.
 pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     if (caps & ~CREATE_PORT_CAPS_MASK != 0) return errors.E_INVAL;
 
@@ -64,6 +65,16 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 
     const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
     if (!self_caps.crpt) return errors.E_PERM;
+
+    // Spec §[create_port] cap-shape rule (test 05): the minted handle
+    // must be able to participate in the port's lifetime — `recv` keeps
+    // the recv side alive, and at least one of `suspend`/`bind` keeps
+    // the suspend side alive. A handle missing either side authorizes
+    // nothing operational and would leave the port stuck in the
+    // "alive iff both refcounts > 0" predicate forever.
+    const requested_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
+    if (!requested_caps.recv) return errors.E_PERM;
+    if (!requested_caps.@"suspend" and !requested_caps.bind) return errors.E_PERM;
 
     return port_obj.createPort(ec, caps);
 }
@@ -84,7 +95,7 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 /// EC cap required on [1]: `susp`. Visibility and writability of the
 /// target's state in the suspension event are gated by [1]'s `read` and
 /// `write` caps.
-/// Port cap required on [2]: `bind`. Additionally `xfer` if any handles
+/// Port cap required on [2]: `suspend`. Additionally `xfer` if any handles
 /// are attached in the syscall word's `pair_count`.
 ///
 /// `[1]` may reference the calling EC; the syscall returns after the
@@ -96,7 +107,7 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 /// [test 01] returns E_BADCAP if [1] is not a valid EC handle.
 /// [test 02] returns E_BADCAP if [2] is not a valid port handle.
 /// [test 03] returns E_PERM if [1] does not have the `susp` cap.
-/// [test 04] returns E_PERM if [2] does not have the `bind` cap.
+/// [test 04] returns E_PERM if [2] does not have the `suspend` cap.
 /// [test 05] returns E_INVAL if any reserved bits are set.
 /// [test 06] returns E_INVAL if [1] references a vCPU.
 /// [test 07] returns E_INVAL if [1] is already suspended.
@@ -143,7 +154,7 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     cd_ref.unlockIrqRestore(irq_state);
 
     if (!ec_caps.susp) return errors.E_PERM;
-    if (!port_caps.bind) return errors.E_PERM;
+    if (!port_caps.@"suspend") return errors.E_PERM;
 
     // Spec §[handle_attachments] test 01: when the suspending EC
     // attaches handles (pair_count > 0), [2] must carry the `xfer`

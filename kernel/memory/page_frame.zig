@@ -23,6 +23,7 @@ const ErasedSlabRef = capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
+const Refcount = zag.utils.refcount.Refcount;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const VAddr = zag.memory.address.VAddr;
 
@@ -47,10 +48,13 @@ pub const PageFrame = struct {
     /// Slab generation lock + per-instance mutex.
     _gen_lock: GenLock = .{},
 
-    /// Total user-visible handles across all capability domains. Plain
-    /// u32 mutated under `_gen_lock`; the decrementer that brings
-    /// this to 0 owns teardown (returns physical pages to PMM).
-    refcount: u32 = 0,
+    /// Total user-visible handles across all capability domains.
+    /// CAS-loop atomic with sticky observed-zero marker; the dec that
+    /// transitions 1→Sticky AND mapcnt==0 owns teardown. Once Sticky
+    /// is set, future alias-mint `inc` returns observed_zero so the
+    /// canonical SlabRef-walking acquire never resurrects a doomed
+    /// PageFrame. Spec §[page_frame] lifetime.
+    refcount: Refcount = .{},
 
     /// Total active installations across all VARs and IOMMU domains.
     /// Mirrors user-visible field1 bits 0-31 (`mapcnt`). Mutated by
@@ -166,7 +170,9 @@ fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
     // writes are safe because no observer can `lockWithGen` against an
     // even gen.
     const pf = pending.ptr;
-    pf.refcount = 1;
+    pf.refcount = .{};
+    // Fresh slot, single observer (us): inc cannot observe Sticky.
+    if (pf.refcount.inc() == .observed_zero) unreachable;
     pf.mapcnt = 0;
     // PMM allocBlock returns a physmap virtual pointer (the buddy
     // allocator is initialized over the physmap window — see
@@ -205,22 +211,31 @@ fn destroyPageFrame(pf: *PageFrame) void {
     }
 }
 
-/// Handle delete: decrement refcount under `_gen_lock`; if both
-/// refcount and mapcnt are zero, calls `destroyPageFrame`.
+/// Handle delete: decrement refcount under `_gen_lock`; if the dec
+/// transitions to `.observed_zero` AND mapcnt is also 0, calls
+/// `destroyPageFrame`. Conjunctive lifetime per spec §[page_frame]:
+/// physical pages stay live as long as either a handle holds the PF or
+/// a VAR has it mapped. Once refcount has been driven to Sticky with
+/// mapcnt > 0, any subsequent alias-mint that calls `inc` will observe
+/// Sticky and abort with `error.BadCap`.
 fn decHandleRef(pf: *PageFrame) void {
     const irq = pf._gen_lock.lockIrqSave(@src());
-    if (pf.refcount > 0) pf.refcount -= 1;
-    const reached_zero = pf.refcount == 0 and pf.mapcnt == 0;
+    decHandleRefLocked(pf, irq);
+}
+
+/// `decHandleRef` for callers that already hold `pf._gen_lock`. The
+/// caller passes its IRQ-state token so the destroy path can restore
+/// interrupts when `destroyLocked` consumed the lock without restoring
+/// IRQs.
+pub fn decHandleRefLocked(pf: *PageFrame, held_irq: u64) void {
+    const result = pf.refcount.dec();
+    const reached_zero = result == .observed_zero and pf.mapcnt == 0;
     if (!reached_zero) {
-        pf._gen_lock.unlockIrqRestore(irq);
+        pf._gen_lock.unlockIrqRestore(held_irq);
         return;
     }
-    // Lock stays held — destroyPageFrame routes through
-    // SecureSlab.destroyLocked which expects the gen-lock held and
-    // releases it as part of the gen bump. The teardown bumps gen via
-    // setGenRelease without restoring IRQ state; do it manually here.
     destroyPageFrame(pf);
-    arch.cpu.restoreInterrupts(irq);
+    arch.cpu.restoreInterrupts(held_irq);
 }
 
 /// Public release-handle entry point invoked from the cross-cutting
@@ -228,6 +243,11 @@ fn decHandleRef(pf: *PageFrame) void {
 /// that don't have access to the module-private helper.
 pub fn releaseHandle(pf: *PageFrame) void {
     decHandleRef(pf);
+}
+
+/// `releaseHandle` for callers that already hold `pf._gen_lock`.
+pub fn releaseHandleLocked(pf: *PageFrame, held_irq: u64) void {
+    decHandleRefLocked(pf, held_irq);
 }
 
 /// Bump the per-handle refcount when an alias of an existing PageFrame
@@ -238,10 +258,10 @@ pub fn releaseHandle(pf: *PageFrame) void {
 /// would share the original handle's refcount slot — `releaseHandle` on
 /// any one of them would over-decrement, and a `delete` of the original
 /// while aliases still exist would destroy the PF out from under them.
-pub fn incHandleRef(pf: *PageFrame) void {
+pub fn incHandleRef(pf: *PageFrame) error{BadCap}!void {
     const irq = pf._gen_lock.lockIrqSave(@src());
     defer pf._gen_lock.unlockIrqRestore(irq);
-    pf.refcount += 1;
+    if (pf.refcount.inc() == .observed_zero) return error.BadCap;
 }
 
 /// Mapping-count decrement: every VMAR install increments `mapcnt`;
@@ -255,7 +275,10 @@ pub fn incHandleRef(pf: *PageFrame) void {
 pub fn releaseMapping(pf: *PageFrame) void {
     const irq = pf._gen_lock.lockIrqSave(@src());
     if (pf.mapcnt > 0) pf.mapcnt -= 1;
-    const reached_zero = pf.refcount == 0 and pf.mapcnt == 0;
+    // mapcnt-driven teardown fires when refcount has already been
+    // Sticky'd by a prior handle release; conjunctive lifetime per
+    // spec §[page_frame].
+    const reached_zero = pf.mapcnt == 0 and pf.refcount.isDead();
     if (!reached_zero) {
         pf._gen_lock.unlockIrqRestore(irq);
         return;

@@ -463,9 +463,21 @@ pub const ExecutionContext = struct {
     vm: ?SlabRef(VirtualMachine) = null,
 
     /// Port where vm_exit events are delivered for this vCPU. Set at
-    /// `create_vcpu` together with `vm`; immutable. `null` on regular
-    /// ECs.
+    /// `create_vcpu` together with `vm`; nulled when the vCPU is
+    /// destroyed or when the port's destruction cascades. The vCPU's
+    /// existence increments `port.suspend_refcount` per spec §[port]
+    /// lifetime model; the matching dec runs in
+    /// `destroyExecutionContextLocked`.
     exit_port: ?SlabRef(Port) = null,
+
+    /// Singly-linked list link used by `Port.vcpu_list_head` to
+    /// enumerate every vCPU pinning this port. Mutated under the
+    /// port's `_gen_lock` (insert at create_vcpu, remove at vCPU
+    /// destroy or cascade). `null` on regular ECs and on vCPUs whose
+    /// exit_port has already been cleared. Reused by
+    /// `port.cascadeDetachVcpus` as the chaining field for the
+    /// post-lock-release destroy walk.
+    vcpu_list_next: ?*ExecutionContext = null,
 
     /// Per-vCPU arch state cell allocated by `allocVcpuArchState`. On
     /// x86-64 this points at a `vcpu.VcpuArchState` (GuestState + 16-byte-
@@ -1684,7 +1696,57 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
     zag.sched.fpu.clearFromLastFpuOwner(ec);
 
-    for (&ec.event_routes) |*slot| slot.* = null;
+    // Spec §[port] lifetime: each kernel-held event route increments
+    // the destination port's suspend_refcount; the matching dec runs
+    // here when the route owner (this EC) goes away. Without this dec
+    // the port's suspend_refcount is leaked and the port is never
+    // destroyed even after every handle holder releases.
+    for (&ec.event_routes) |*slot| {
+        const port_ref = slot.* orelse continue;
+        const port_lr = port_ref.lockIrqSave(@src()) catch {
+            slot.* = null;
+            continue;
+        };
+        const result = zag.sched.port.decSuspendRef(port_lr.ptr);
+        if (!result.destroyed) {
+            port_ref.unlockIrqRestore(port_lr.irq_state);
+        } else {
+            arch.cpu.restoreInterrupts(port_lr.irq_state);
+        }
+        zag.sched.port.finalizePendingVcpus(result.pending_vcpus);
+        slot.* = null;
+    }
+
+    // Spec §[port] lifetime: a vCPU's exit_port is pinned for the
+    // vCPU's lifetime. Unlink from the port's vcpu_list_head and
+    // decrement the port's suspend_refcount; the cascade only fires
+    // if some non-vCPU caller had also been holding the port alive
+    // (handle holders, routes) — otherwise this dec is balanced by
+    // the inc from create_vcpu and won't drive the count to zero.
+    if (ec.exit_port) |port_ref| {
+        const port_lr_or_err = port_ref.lockIrqSave(@src());
+        if (port_lr_or_err) |plr| {
+            const p = plr.ptr;
+            // Splice this EC out of the port's vcpu list.
+            var cursor = &p.vcpu_list_head;
+            while (cursor.*) |node| {
+                if (node == ec) {
+                    cursor.* = ec.vcpu_list_next;
+                    break;
+                }
+                cursor = &node.vcpu_list_next;
+            }
+            ec.vcpu_list_next = null;
+            const result = zag.sched.port.decSuspendRef(p);
+            if (!result.destroyed) {
+                port_ref.unlockIrqRestore(plr.irq_state);
+            } else {
+                arch.cpu.restoreInterrupts(plr.irq_state);
+            }
+            zag.sched.port.finalizePendingVcpus(result.pending_vcpus);
+        } else |_| {}
+        ec.exit_port = null;
+    }
 
     if (ec.perfmon_state != null) releasePerfmonState(ec);
 

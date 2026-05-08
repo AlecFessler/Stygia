@@ -21,6 +21,7 @@ const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
+const Refcount = zag.utils.refcount.Refcount;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
@@ -66,9 +67,9 @@ pub const Timer = struct {
     _gen_lock: GenLock = .{},
 
     /// Total user-visible handles across all capability domains.
-    /// Mutated under `_gen_lock`; the decrementer that brings this to
-    /// 0 cancels (if armed) and frees.
-    refcount: u32 = 0,
+    /// CAS-loop atomic with sticky observed-zero marker; the dec that
+    /// transitions 1→Sticky cancels (if armed) and frees.
+    refcount: Refcount = .{},
 
     /// Fire counter. Incremented on each fire, saturating at
     /// `u64::MAX − 1`. Set to `CANCELLED` (u64::MAX) by `timer_cancel`.
@@ -421,7 +422,9 @@ pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
 fn allocTimer(periodic: bool, deadline_ns: u64) !*Timer {
     const pending = try slab_instance.create();
     const t = pending.ptr;
-    t.refcount = 1;
+    t.refcount = .{};
+    // Fresh slot, single observer (us): inc cannot observe Sticky.
+    if (t.refcount.inc() == .observed_zero) unreachable;
     t.counter = 0;
     t.armed = true;
     t.periodic = periodic;
@@ -441,22 +444,29 @@ fn destroyTimer(t: *Timer) void {
     slab_instance.destroy(t, gen) catch {};
 }
 
-/// Handle delete: decrement under `_gen_lock`; teardown at 0.
+/// Handle delete: decrement under `_gen_lock`; teardown when the dec
+/// transitions to `.observed_zero`.
 pub fn decHandleRef(t: *Timer) void {
     const irq = t._gen_lock.lockIrqSave(@src());
-    if (t.refcount > 0) t.refcount -= 1;
-    const last = t.refcount == 0;
-    t._gen_lock.unlockIrqRestore(irq);
+    decHandleRefLocked(t, irq);
+}
+
+/// `decHandleRef` for callers that already hold `t._gen_lock`. The
+/// caller passes its IRQ-state token so the destroy path can restore
+/// interrupts after the lock release.
+pub fn decHandleRefLocked(t: *Timer, held_irq: u64) void {
+    const last = t.refcount.dec() == .observed_zero;
+    t._gen_lock.unlockIrqRestore(held_irq);
     if (last) destroyTimer(t);
 }
 
 /// Bump the per-handle refcount when an alias of an existing Timer is
 /// minted into a fresh slot (e.g. `passed_handles` into a child domain).
 /// See `page_frame.incHandleRef` for the matching rationale on PFs.
-pub fn incHandleRef(t: *Timer) void {
+pub fn incHandleRef(t: *Timer) error{BadCap}!void {
     const irq = t._gen_lock.lockIrqSave(@src());
     defer t._gen_lock.unlockIrqRestore(irq);
-    t.refcount += 1;
+    if (t.refcount.inc() == .observed_zero) return error.BadCap;
 }
 
 /// Disarm every Timer reachable from `cd`'s handle table. Called by

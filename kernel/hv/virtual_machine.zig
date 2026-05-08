@@ -273,9 +273,25 @@ pub fn createVcpu(
     const port = lookupPort(domain, @truncate(exit_port)) orelse
         return errors.E_BADCAP;
 
+    // Spec §[port] lifetime: the vCPU pins exit_port via
+    // suspend_refcount for as long as the vCPU exists. The matching
+    // dec runs in `destroyExecutionContextLocked`. observed_zero is
+    // structurally impossible — `lookupPort` resolved against the
+    // caller's CD whose handle pins the port.
     const vcpu_ec = allocVcpu(vm, domain, affinity, port) catch
         return errors.E_NOMEM;
     vcpu_ec.priority = requested_priority;
+
+    // Inc + list-link under one port-lock acquire. Published into
+    // vcpu_list_head only after the inc, so cascade walks see a
+    // consistent view.
+    {
+        const irq = port._gen_lock.lockIrqSave(@src());
+        port_mod.incSuspendRef(port) catch unreachable;
+        vcpu_ec.vcpu_list_next = port.vcpu_list_head;
+        port.vcpu_list_head = vcpu_ec;
+        port._gen_lock.unlockIrqRestore(irq);
+    }
 
     const ec_gen = vcpu_ec._gen_lock.currentGen();
     const erased = capability.ErasedSlabRef{
@@ -731,13 +747,17 @@ fn pageFramePerms(caps_bits: PageFrameCaps) MemoryPerms {
 fn incPageFrameRef(pf: *PageFrame) void {
     const irq = pf._gen_lock.lockIrqSave(@src());
     defer pf._gen_lock.unlockIrqRestore(irq);
-    pf.refcount +|= 1;
+    // Caller pins `pf` via the active VM's stage-2 mapping (this is
+    // map_guest territory, not handle creation); a concurrent destroy
+    // that drove refcount to Sticky must have torn down the stage-2
+    // mappings first. observed_zero is structurally unreachable.
+    if (pf.refcount.inc() == .observed_zero) unreachable;
 }
 
 fn decPageFrameRef(pf: *PageFrame) void {
     const irq = pf._gen_lock.lockIrqSave(@src());
-    if (pf.refcount > 0) pf.refcount -= 1;
-    if (pf.refcount == 0 and pf.mapcnt == 0) {
+    const result = pf.refcount.dec();
+    if (result == .observed_zero and pf.mapcnt == 0) {
         destroyPageFrame(pf);
         // Teardown released the lock via setGenRelease without
         // restoring IRQ state — restore manually here.
@@ -756,7 +776,9 @@ fn incPageFrameMap(pf: *PageFrame) void {
 fn decPageFrameMap(pf: *PageFrame) void {
     const irq = pf._gen_lock.lockIrqSave(@src());
     if (pf.mapcnt > 0) pf.mapcnt -= 1;
-    if (pf.refcount == 0 and pf.mapcnt == 0) {
+    // Conjunctive teardown: mapcnt-driven destroy fires only when the
+    // matching refcount dec already drove it to Sticky.
+    if (pf.mapcnt == 0 and pf.refcount.isDead()) {
         destroyPageFrame(pf);
         arch.cpu.restoreInterrupts(irq);
         return;

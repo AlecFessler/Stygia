@@ -232,7 +232,8 @@ pub const PortCap = packed struct(u16) {
     recv: bool = false,
     bind: bool = false,
     restart_policy: bool = false,
-    _reserved: u10 = 0,
+    @"suspend": bool = false,
+    _reserved: u9 = 0,
 
     pub fn toU16(self: PortCap) u16 {
         return @bitCast(self);

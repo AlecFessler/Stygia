@@ -23,6 +23,7 @@
 
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const capability_domain = zag.caps.capability_domain;
 const derivation = zag.caps.derivation;
 const device_region = zag.devices.device_region;
@@ -314,6 +315,41 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
     if (!restartPolicyMonotone(current_caps, requested_caps, type_tag)) return errors.E_PERM;
 
     user_entry.word0 = Word0.pack(slot, type_tag, requested_caps);
+
+    // Spec §[capabilities].restrict (proposal §2.8): clearing a cap
+    // bit that contributes to a refcount-bearing object's lifetime
+    // must run the matching dec as if `delete` had been performed
+    // for that bit. Today only `.port` encodes lifetime authority in
+    // its caps (suspend / bind / recv); page_frame / device_region /
+    // timer use slot-keyed lifetime which is unaffected by restrict.
+    const cleared: u16 = current_caps & ~requested_caps;
+    if (cleared != 0 and type_tag == .port) {
+        const ref = typedRef(Port, entry.*) orelse return 0;
+        const old_caps: port.PortCaps = @bitCast(current_caps);
+        const new_caps: port.PortCaps = @bitCast(requested_caps);
+        const port_lr = ref.lockIrqSave(@src()) catch return 0;
+        const p = port_lr.ptr;
+        const had_susp_side = old_caps.@"suspend" or old_caps.bind;
+        const has_susp_side = new_caps.@"suspend" or new_caps.bind;
+        var dec_result: port.DecResult = .{ .destroyed = false, .pending_vcpus = null };
+        if (had_susp_side and !has_susp_side) {
+            dec_result = port.decSuspendRef(p);
+        }
+        if (!dec_result.destroyed and old_caps.recv and !new_caps.recv) {
+            const recv_result = port.decRecvRef(p);
+            if (recv_result.destroyed) {
+                dec_result = recv_result;
+            } else if (dec_result.pending_vcpus == null) {
+                dec_result.pending_vcpus = recv_result.pending_vcpus;
+            }
+        }
+        if (!dec_result.destroyed) {
+            ref.unlockIrqRestore(port_lr.irq_state);
+        } else {
+            arch.cpu.restoreInterrupts(port_lr.irq_state);
+        }
+        port.finalizePendingVcpus(dec_result.pending_vcpus);
+    }
 
     refreshSnapshot(cd, slot, entry);
     return 0;

@@ -213,7 +213,7 @@ pub fn init(root_service_elf: []const u8) !void {
     //   bits 32-39  idc_rx                    = 0xFF
     //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
     //   bits 48-55  vm_ceiling                = 0x01  (policy=1)
-    //   bits 56-63  port_ceiling              = 0x1C  (xfer|recv|bind)
+    //   bits 56-63  port_ceiling              = 0x5C  (xfer|recv|bind|suspend)
     const root_field0_ceilings: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0xFFFF) << 8) |
@@ -221,7 +221,7 @@ pub fn init(root_service_elf: []const u8) !void {
         (@as(u64, 0xFF) << 32) |
         (@as(u64, 0x1F) << 40) |
         (@as(u64, 0x01) << 48) |
-        (@as(u64, 0x1C) << 56);
+        (@as(u64, 0x5C) << 56);
     // ceilings_outer (field1):
     //   bits  0-7   ec_outer_ceiling           = 0xFF
     //   bits  8-15  vmar_outer_ceiling          = 0xFF

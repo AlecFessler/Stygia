@@ -5,4 +5,5 @@ pub const elf = @import("elf.zig");
 pub const hang_detector = @import("hang_detector.zig");
 pub const pf_log = @import("pf_log.zig");
 pub const range = @import("range.zig");
+pub const refcount = @import("refcount.zig");
 pub const sync = @import("sync/sync.zig");

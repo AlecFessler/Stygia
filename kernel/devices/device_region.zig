@@ -15,6 +15,7 @@ const userio = zag.arch.dispatch.userio;
 
 const GenLock = secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
+const Refcount = zag.utils.refcount.Refcount;
 const SecureSlab = secure_slab.SecureSlab;
 const SpinLock = zag.utils.sync.SpinLock;
 
@@ -144,8 +145,11 @@ pub const DeviceRegion = extern struct {
     /// `secure_slab.SlabRef`.
     _gen_lock: GenLock = .{},
 
-    /// Holder count. Lifetime invariant: object alive iff `refcount > 0`.
-    refcount: u32 = 0,
+    /// Holder count. Lifetime invariant: object alive iff
+    /// `refcount > 0` and not Sticky'd. CAS-loop atomic with sticky
+    /// observed-zero marker; the dec that transitions 1→Sticky owns
+    /// teardown.
+    refcount: Refcount = .{},
 
     device_type: DeviceType,
     _pad0: [3]u8 = [_]u8{0} ** 3,
@@ -272,7 +276,8 @@ pub fn registerMmio(base_paddr: PAddr, size: u64) !*DeviceRegion {
 pub fn registerMmioPci(base_paddr: PAddr, size: u64, pci: PciAddress) !*DeviceRegion {
     const pending = try allocRegion();
     const dr = pending.ptr;
-    dr.refcount = 1;
+    dr.refcount = .{};
+    if (dr.refcount.inc() == .observed_zero) unreachable;
     dr.device_type = .mmio;
     dr.access = .{ .mmio = .{ .phys_base = base_paddr, .size = size } };
     dr.irq_source = IRQ_SOURCE_NONE;
@@ -306,7 +311,8 @@ pub fn registerFramebuffer(
 ) !*DeviceRegion {
     const pending = try allocRegion();
     const dr = pending.ptr;
-    dr.refcount = 1;
+    dr.refcount = .{};
+    if (dr.refcount.inc() == .observed_zero) unreachable;
     dr.device_type = .framebuffer;
     dr.access = .{ .framebuffer = .{
         .phys_base = phys_base,
@@ -330,7 +336,8 @@ pub fn registerFramebuffer(
 pub fn registerPortIoPci(base_port: u16, port_count: u16, pci: PciAddress) !*DeviceRegion {
     const pending = try allocRegion();
     const dr = pending.ptr;
-    dr.refcount = 1;
+    dr.refcount = .{};
+    if (dr.refcount.inc() == .observed_zero) unreachable;
     dr.device_type = .port_io;
     dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
     dr.irq_source = IRQ_SOURCE_NONE;
@@ -349,6 +356,21 @@ pub fn releaseHandle(dr: *DeviceRegion) void {
     decHandleRef(dr, irq_state);
 }
 
+/// `releaseHandle` for callers that already hold `dr._gen_lock`.
+pub fn releaseHandleLocked(dr: *DeviceRegion, held_irq: u64) void {
+    decHandleRef(dr, held_irq);
+}
+
+/// Bump the per-handle refcount when an alias of an existing
+/// DeviceRegion is minted into a fresh slot (e.g. `passed_handles`
+/// into a child domain). Returns `error.BadCap` if a concurrent
+/// destroy already Sticky'd the refcount.
+pub fn incHandleRef(dr: *DeviceRegion) error{BadCap}!void {
+    const irq_state = dr._gen_lock.lockIrqSave(@src());
+    defer dr._gen_lock.unlockIrqRestore(irq_state);
+    if (dr.refcount.inc() == .observed_zero) return error.BadCap;
+}
+
 /// Decrement the refcount. The decrementer-to-zero owns teardown:
 /// evicts the IRQ-table entry (if any), then destroys the slab slot.
 /// Caller must hold `dr._gen_lock` (acquired via `lockIrqSave` and
@@ -358,9 +380,8 @@ pub fn releaseHandle(dr: *DeviceRegion) void {
 /// releases — avoiding the unlock/relock race window where a
 /// concurrent path could observe a still-odd gen.
 pub fn decHandleRef(dr: *DeviceRegion, held_irq_state: u64) void {
-    std.debug.assert(dr.refcount > 0);
-    dr.refcount -= 1;
-    if (dr.refcount != 0) {
+    const result = dr.refcount.dec();
+    if (result != .observed_zero) {
         dr._gen_lock.unlockIrqRestore(held_irq_state);
         return;
     }

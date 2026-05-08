@@ -114,6 +114,7 @@ pub fn main(cap_table_base: u64) void {
         .xfer = true,
         .recv = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
@@ -329,6 +330,7 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         .copy = false,
         .xfer = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const child_pf_caps = caps.PfCap{
         .move = false,
@@ -365,12 +367,12 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     //   bits 24-31  cridc_ceiling      = 0x3F
     //   bits 32-39  pf_ceiling         = 0x1F   (max_rwx | max_sz)
     //   bits 40-47  vm_ceiling         = 0x01   (policy bit)
-    //   bits 48-55  port_ceiling       = 0x1C   (xfer | recv | bind)
+    //   bits 48-55  port_ceiling       = 0x5C   (xfer | recv | bind | suspend)
     //   bits 56-63  _reserved          = 0
     // Test cases (e.g. create_capability_domain_03/05/08/10/11/12) read
     // their caller's installed sub-fields and construct violators or
     // exact-match baselines; the values here must match the per-test
-    // documented baseline (`0x001C_011F_3F01_FFFF`) so subset checks in
+    // documented baseline (`0x005C_011F_3F01_FFFF`) so subset checks in
     // syscall/capability_domain.zig fire only on intentional violators.
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
@@ -378,7 +380,7 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
         (@as(u64, 0x3F) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
-        (@as(u64, 0x1C) << 48);
+        (@as(u64, 0x5C) << 48);
 
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 

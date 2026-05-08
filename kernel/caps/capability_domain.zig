@@ -410,31 +410,50 @@ pub fn createCapabilityDomain(
             return errors.E_FULL;
         };
 
-        // For refcounted types (page_frame, timer) the new alias is a
-        // real reference: bump refcount so the child's eventual handle
-        // release in `destroyPhase2`'s kernel_table walk is balanced and
-        // a `delete` of the source handle in the caller cannot destroy
-        // the object out from under the child. Other types are
-        // domain-or-system-lifetime (cd / ec / vmar / port / vm / device)
-        // and don't carry a per-handle refcount.
+        // For refcount-lifetime types (page_frame, timer, port,
+        // device_region per spec proposal §3) the new alias is a real
+        // lifetime contributor: bump the object-side refcount so the
+        // child's destroyPhase2 kernel_table walk sees a balanced
+        // mint/release pair and a `delete` of the source handle in
+        // the caller cannot destroy the object out from under the
+        // child. observed_zero is structurally impossible here — the
+        // caller's source handle pins the object — so failures are
+        // unreachable.
         switch (src_type) {
-            .page_frame => zag.memory.page_frame.incHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
-            .timer => zag.sched.timer.incHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+            .page_frame => {
+                const alias_pf: *zag.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                zag.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
+            },
+            .timer => {
+                const alias_t: *zag.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                zag.sched.timer.incHandleRef(alias_t) catch unreachable;
+            },
+            .port => {
+                const alias_p: *zag.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                const port_irq = alias_p._gen_lock.lockIrqSave(@src());
+                defer alias_p._gen_lock.unlockIrqRestore(port_irq);
+                zag.sched.port.onHandleAcquire(alias_p, new_caps) catch unreachable;
+            },
+            .device_region => {
+                const alias_dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                zag.devices.device_region.incHandleRef(alias_dr) catch unreachable;
+            },
             else => {},
         }
 
         if (move) {
             // move=1: remove the source handle from the caller's table.
-            // For now do a coarse slot clear; full delete-with-derivation
-            // belongs in the proper derivation path. The runner uses
-            // move=0 for the port handoff so this branch is unexercised
-            // on the success path.
-            // The src refcount bump above is "the new owner's ref"; for
-            // move=1 the caller's old handle goes away, so undo the bump
-            // (otherwise refcount climbs unbounded as ownership passes).
+            // The alias bump above is the new owner's ref; the caller's
+            // old handle goes away, so balance with a matching release.
             switch (src_type) {
                 .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
                 .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .port => {
+                    const p: *zag.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    const src_caps_word: u16 = @truncate(src_user.word0 >> 48);
+                    zag.sched.port.releaseHandle(p, src_caps_word);
+                },
+                .device_region => zag.devices.device_region.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
                 else => {},
             }
             caller_dom.user_table[src_slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
@@ -1071,14 +1090,21 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     }
 
     // Walk slots [3..MAX) and apply per-handle release semantics for
-    // types whose object holds a per-handle refcount the wholesale
-    // freeBlock below would otherwise abandon. With the alias-side
-    // `incHandleRef` in passed_handles processing, every page_frame /
-    // timer handle in this table is a real reference; releasing them
-    // here is the symmetric drop. VMARs are owned by destroyPhase1's
-    // `cd.vars[]` walk; capability_domain / execution_context /
-    // device_region / port / reply / vm are domain-or-system-lifetime
-    // and have nothing to release here.
+    // refcount-lifetime object types (page_frame, timer, port,
+    // device_region per spec proposal §3). With the alias-side
+    // `incHandleRef`/`onHandleAcquire` in passed_handles processing,
+    // every such handle is a real lifetime contributor and must be
+    // released here. VMARs are owned by destroyPhase1's `cd.vars[]`
+    // walk; capability_domain / execution_context / reply / vm are
+    // domain-or-system-lifetime and have nothing to release here.
+    //
+    // The gen-validate-under-lock dance: destroyPhase2 runs after
+    // destroyPhase1 dropped the CD's gen-lock, so concurrent destroys
+    // on a port / page_frame / timer / device_region handle can
+    // complete in the window. Take the slot's `_gen_lock`; if the
+    // stamped `entry.ref.gen` no longer matches the live slab's gen,
+    // skip — the object has already been destroyed (and possibly
+    // reallocated) by another path.
     const user_table: [*]Capability = @ptrCast(@alignCast(deferred.user_buf));
     const kernel_table: [*]KernelHandle = @ptrCast(@alignCast(deferred.kernel_buf));
     var slot: u16 = 3;
@@ -1087,8 +1113,43 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         const obj_ptr = entry.ref.ptr orelse continue;
         const tag = Word0.typeTag(user_table[slot].word0);
         switch (tag) {
-            .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(obj_ptr))),
-            .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(obj_ptr))),
+            .page_frame => {
+                const pf: *zag.memory.page_frame.PageFrame = @ptrCast(@alignCast(obj_ptr));
+                const slot_irq = pf._gen_lock.lockIrqSave(@src());
+                if (pf._gen_lock.currentGen() != entry.ref.gen) {
+                    pf._gen_lock.unlockIrqRestore(slot_irq);
+                    continue;
+                }
+                zag.memory.page_frame.releaseHandleLocked(pf, slot_irq);
+            },
+            .timer => {
+                const t: *zag.sched.timer.Timer = @ptrCast(@alignCast(obj_ptr));
+                const slot_irq = t._gen_lock.lockIrqSave(@src());
+                if (t._gen_lock.currentGen() != entry.ref.gen) {
+                    t._gen_lock.unlockIrqRestore(slot_irq);
+                    continue;
+                }
+                zag.sched.timer.decHandleRefLocked(t, slot_irq);
+            },
+            .port => {
+                const p: *zag.sched.port.Port = @ptrCast(@alignCast(obj_ptr));
+                const slot_irq = p._gen_lock.lockIrqSave(@src());
+                if (p._gen_lock.currentGen() != entry.ref.gen) {
+                    p._gen_lock.unlockIrqRestore(slot_irq);
+                    continue;
+                }
+                const caps_word = Word0.caps(user_table[slot].word0);
+                zag.sched.port.releaseHandleLocked(p, caps_word, slot_irq);
+            },
+            .device_region => {
+                const dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj_ptr));
+                const slot_irq = dr._gen_lock.lockIrqSave(@src());
+                if (dr._gen_lock.currentGen() != entry.ref.gen) {
+                    dr._gen_lock.unlockIrqRestore(slot_irq);
+                    continue;
+                }
+                zag.devices.device_region.releaseHandleLocked(dr, slot_irq);
+            },
             else => {},
         }
     }
