@@ -80,15 +80,31 @@ pub fn initVmDevices(devices: *VmDevices) void {
 /// alongside as a separate PMM page; the old order-1 contiguous
 /// "vm_structures" allocation isn't available in spec-v3's PMM, so the
 /// stage-2 root and the control block are two separate pages and the
-/// run loop threads both PAddrs through `hyp.vmResume`).
+/// run loop threads both PAddrs through `hyp.vmResume`) plus the
+/// in-kernel emulated GIC distributor that `vm_inject_irq` mutates.
+/// Per spec §[vm_inject_irq] the vGIC pending bitmap must outlive any
+/// single syscall, so it lives here rather than on a syscall stack.
 pub const CtrlStateCell = extern struct {
     control_block_pa: PAddr align(paging.PAGE4K) = .{ .addr = 0 },
-    _pad: [paging.PAGE4K - @sizeOf(PAddr)]u8 = undefined,
+    /// In-kernel emulated GIC distributor. `vm_inject_irq` flips
+    /// pending bits here per Arm IHI 0069H §12.9.11/§12.9.28; the
+    /// vCPU run loop will read them on stage-2 entry to populate
+    /// list-registers (Arm IHI 0069H §11.2 ICH_LR<n>_EL2).
+    vgic: vgic_mod.Vgic = .{},
+    _pad: [paging.PAGE4K - @sizeOf(PAddr) - @sizeOf(vgic_mod.Vgic)]u8 = undefined,
 };
 
 comptime {
     std.debug.assert(@sizeOf(CtrlStateCell) == paging.PAGE4K);
     std.debug.assert(@alignOf(CtrlStateCell) == paging.PAGE4K);
+}
+
+/// Resolve the per-VM CtrlStateCell from `vm.arch_state`. Returns null
+/// when no arch-state has been seeded yet (e.g. `create_virtual_machine`
+/// failed mid-init); callers route that to the appropriate spec error.
+fn cellOf(vm: *VirtualMachine) ?*CtrlStateCell {
+    const erased = vm.arch_state orelse return null;
+    return @ptrCast(@alignCast(erased));
 }
 
 /// Allocate the stage-2 / nested page-table root for `vm`. On aarch64
@@ -139,12 +155,16 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
     cell.* = .{
         .control_block_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(cb_page)), null),
     };
+    // Belt-and-suspenders: the PMM `create` contract zero-initialises
+    // the page (matching the GICv3 reset state for GICD_ISPENDR<n> /
+    // GICD_ICPENDR<n>; Arm IHI 0069H §12.8 reset column = 0x0000_0000),
+    // but call `init` explicitly so the contract is local to this file.
+    cell.vgic.init();
     return @ptrCast(cell);
 }
 
 pub fn freeVmArchState(vm: *VirtualMachine) void {
-    const erased = vm.arch_state orelse return;
-    const cell: *CtrlStateCell = @ptrCast(@alignCast(erased));
+    const cell = cellOf(vm) orelse return;
     if (cell.control_block_pa.addr != 0) {
         const va = VAddr.fromPAddr(cell.control_block_pa, null);
         const cb_page: *paging.PageMem(.page4k) = @ptrFromInt(va.addr);
@@ -194,14 +214,24 @@ pub fn invalidateStage2Range(
     }
 }
 
-/// Apply a typed slice of VM policy entries. The aarch64 vCPU run
-/// loop isn't restored yet, so the policy seed lives only in the
-/// VmPolicy page-frame; no per-VM cache to invalidate. Per-spec
-/// bound checks against MAX_* (kind-dependent) are still enforced so
-/// vm_set_policy E_INVAL gates fire as written.
+/// Spec §[vm_set_policy] aarch64 — replace `id_reg_responses` (kind=0)
+/// or `sysreg_policies` (kind=1) on `vm`. The VmPolicy struct lives at
+/// offset 0 of `vm.policy_pf` and is read on guest exits by
+/// `vm_runloop.tryHandleSysregPolicy`; this routine writes the new
+/// entries into that struct. Concurrent reads happen only from the
+/// same kernel-mode core that owns the syscall (vCPU exits run on the
+/// owning core's stack), so no extra fencing is required beyond the
+/// per-VM domain lock the syscall layer already holds.
+///
+/// Each entry's vreg layout is documented in §[vm_set_policy] aarch64:
+///   kind=0: `[2+2i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`;
+///           `[2+2i+1]` = `value u64`.
+///   kind=1: `[2+3i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`;
+///           `[2+3i+1]` = `read_value u64`;
+///           `[2+3i+2]` = `write_mask u64`.
+///
+/// (op0/op1/crn/crm/op2) tuple follows Arm ARM C5.3 sysreg encoding.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
-    _ = vm;
-    _ = entries;
     const errors = zag.syscall.errors;
 
     // Spec §[vm_set_policy] aarch64 layout: kind 0 = id_reg_responses
@@ -213,14 +243,102 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
         else => return errors.E_INVAL,
     };
     if (@as(u32, count) > max) return errors.E_INVAL;
+
+    // Per-entry vreg width per §[vm_set_policy] aarch64: kind=0 is
+    // 2 vregs/entry, kind=1 is 3. The dispatch layer hands us the
+    // full vreg space above [1]; reject wires whose payload cannot
+    // supply the required number of vregs of entry data.
+    const vregs_per_entry: usize = switch (kind) {
+        0 => 2,
+        1 => 3,
+        else => unreachable,
+    };
+    const need: usize = @as(usize, count) * vregs_per_entry;
+    if (entries.len < need) return errors.E_INVAL;
+
+    // The seeded VmPolicy lives at offset 0 of `policy_pf`; the
+    // kernel physmap exposes it via VAddr.fromPAddr. policy_pf is
+    // held for the VM's lifetime by the hv layer
+    // (§[create_virtual_machine]) so the pointer stays valid for as
+    // long as the VM is reachable from the syscall.
+    const pf_ref = vm.policy_pf orelse return errors.E_NODEV;
+    const pf = pf_ref.ptr;
+    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
+    const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+
+    switch (kind) {
+        0 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) : (i += 1) {
+                const w0 = entries[i * vregs_per_entry + 0];
+                const w1 = entries[i * vregs_per_entry + 1];
+                policy_ptr.id_reg_responses[i] = .{
+                    .op0 = @truncate(w0),
+                    .op1 = @truncate(w0 >> 8),
+                    .crn = @truncate(w0 >> 16),
+                    .crm = @truncate(w0 >> 24),
+                    .op2 = @truncate(w0 >> 32),
+                    .value = w1,
+                };
+            }
+            policy_ptr.num_id_reg_responses = @as(u32, count);
+        },
+        1 => {
+            var i: usize = 0;
+            while (i < @as(usize, count)) : (i += 1) {
+                const w0 = entries[i * vregs_per_entry + 0];
+                const w1 = entries[i * vregs_per_entry + 1];
+                const w2 = entries[i * vregs_per_entry + 2];
+                policy_ptr.sysreg_policies[i] = .{
+                    .op0 = @truncate(w0),
+                    .op1 = @truncate(w0 >> 8),
+                    .crn = @truncate(w0 >> 16),
+                    .crm = @truncate(w0 >> 24),
+                    .op2 = @truncate(w0 >> 32),
+                    .read_value = w1,
+                    .write_mask = w2,
+                };
+            }
+            policy_ptr.num_sysreg_policies = @as(u32, count);
+        },
+        else => unreachable,
+    }
+
     return 0;
 }
 
+/// Assert (or de-assert) a virtual IRQ line on the VM's emulated GIC
+/// distributor. The kernel-internal vGIC (hv/vgic.zig) tracks pending
+/// state for INTIDs 0..(TOTAL_DIST_INTIDS-1) covering SGIs (0..15),
+/// PPIs (16..31), and SPIs (32..(31+MAX_SPIS)) per Arm IHI 0069H §2.2.1.
+/// Any `irq_num` beyond that range cannot be emulated and must be
+/// rejected with E_INVAL per spec §[vm_inject_irq] test 02. Returns 0
+/// on success.
+///
+/// On assert this mirrors a guest write of 1 to the matching bit of
+/// GICD_ISPENDR<n> per Arm IHI 0069H §12.9.28; on de-assert it mirrors
+/// a write of 1 to GICD_ICPENDR<n> per §12.9.11. Routing of the
+/// pending state into the guest's CPU interface (via list-register
+/// programming on stage-2 entry) is the vCPU run loop's responsibility.
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
-    _ = vm;
-    _ = assert;
+    const errors = zag.syscall.errors;
     if (irq_num >= vgic_mod.TOTAL_DIST_INTIDS)
-        return zag.syscall.errors.E_INVAL;
+        return errors.E_INVAL;
+
+    const intid: u16 = @intCast(irq_num);
+
+    // The vGIC lives in the per-VM CtrlStateCell allocated by
+    // `allocVmArchState`. If `arch_state` is null the VM was created
+    // before the arch-state allocation succeeded — surface that as
+    // E_NODEV to keep the error space disjoint from the irq_num
+    // bounds rejection above.
+    const cell = cellOf(vm) orelse return errors.E_NODEV;
+
+    if (assert) {
+        cell.vgic.assertIrq(intid);
+    } else {
+        cell.vgic.deassertIrq(intid);
+    }
     return 0;
 }
 

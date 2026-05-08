@@ -6,16 +6,42 @@
 //! around each guest run. The full GICD/GICR MMIO emulator lives elsewhere
 //! (currently the linux_guest VMM main.zig stubs the distributor); this
 //! file is the kernel-side state container only.
+//!
+//! Per spec §[virtual_machine].vm_inject_irq the VM's emulated interrupt
+//! controller maintains pending state per virtual IRQ line. On aarch64
+//! that is the GIC distributor's set/clear-pending register pair
+//! (GICv3 §12.9.11 / §12.9.28). This module also owns the in-kernel
+//! distributor model — `Vgic` — a packed pending bitmap indexed by
+//! INTID. Routing of pending state into the guest's CPU interface (via
+//! list-register programming on stage-2 entry) is wired up by the vCPU
+//! run loop; this struct supplies only the distributor side.
+//!
+//! References:
+//! - Arm IHI 0069H (GICv3/v4 architecture spec) §2.2.1, §4.5 Shared
+//!   Peripheral Interrupts, §12.8 Distributor register map, §12.9.11
+//!   GICD_ICPENDR<n>, §12.9.28 GICD_ISPENDR<n>.
+
+const std = @import("std");
 
 pub const MAX_LRS: u8 = 16;
 
 /// Maximum SPI count we expose. INTIDs 32..(32+MAX_SPIS-1).
+/// 256 is the smallest cap that comfortably covers a Linux-ish guest's
+/// SPI footprint while keeping the pending bitmap a single cache line.
 pub const MAX_SPIS: u16 = 256;
 
 /// Total distributor INTID count = 32 (SGI/PPI) + MAX_SPIS.
-/// Note: SGI/PPI state is per-vCPU (lives in the redistributor); SPIs
-/// start at INTID 32. GICv3 §2.2.1.
+/// Per Arm IHI 0069H §2.2.1: INTIDs 0..15 are SGIs (banked per PE),
+/// INTIDs 16..31 are PPIs (banked per PE), and INTIDs 32..1019 are
+/// SPIs. We emulate the full SGI/PPI range alongside MAX_SPIS shared
+/// peripheral interrupts. SGI/PPI live in the redistributor but are
+/// addressable through the distributor's pending registers as well.
 pub const TOTAL_DIST_INTIDS: u16 = 32 + MAX_SPIS;
+
+/// Number of u32 words in the pending bitmap. Each GICD_ISPENDR<n>
+/// register is 32 bits and covers INTIDs `32n..32n+31` per Arm IHI
+/// 0069H §12.9.28.
+pub const NUM_PENDING_WORDS: u16 = (TOTAL_DIST_INTIDS + 31) / 32;
 
 /// EL2 sysreg shadow handed to the `hvc_vgic_prepare_entry` /
 /// `hvc_vgic_save_exit` hyp stubs. `extern struct` with hardcoded
@@ -61,7 +87,6 @@ pub const VtimerState = extern struct {
 };
 
 comptime {
-    const std = @import("std");
     std.debug.assert(@offsetOf(VcpuHwShadow, "lrs") == 0x00);
     std.debug.assert(@offsetOf(VcpuHwShadow, "hcr") == 0x80);
     std.debug.assert(@offsetOf(VcpuHwShadow, "vmcr") == 0x88);
@@ -91,3 +116,63 @@ pub fn lrPendingGroup1(intid: u32) u64 {
 pub inline fn lrState(lr: u64) u2 {
     return @truncate(lr >> 62);
 }
+
+/// In-kernel emulated GIC distributor state. Mirrors the small surface
+/// of the GICv3 distributor that `vm_inject_irq` exercises today: the
+/// per-INTID pending bit. The full distributor MMIO emulator
+/// (GICD_CTLR, IROUTER, IPRIORITYR, ICFGR, etc.) and per-vCPU
+/// redistributor / list-register programming are reserved for the
+/// vCPU run loop bring-up; they read out of `pending` to decide which
+/// virtual interrupts to inject on guest entry (Arm IHI 0069H §11.2
+/// ICH_LR<n>_EL2).
+///
+/// The distributor is single-writer from the kernel's perspective —
+/// `vm_inject_irq` is gated by the syscall-level domain lock on the
+/// VM's owning capability domain. Concurrent vCPU run loops on other
+/// cores will eventually need a finer-grained guard; until then the
+/// per-VM domain lock suffices.
+pub const Vgic = extern struct {
+    /// One bit per INTID. Bit `(intid % 32)` of `pending[intid / 32]`
+    /// mirrors the corresponding bit of GICD_ISPENDR<intid/32> per
+    /// Arm IHI 0069H §12.9.28: writing 1 sets the interrupt pending,
+    /// writing 1 to GICD_ICPENDR<n> (§12.9.11) clears it.
+    pending: [NUM_PENDING_WORDS]u32 = .{0} ** NUM_PENDING_WORDS,
+
+    /// Zero-initialise the distributor. Called from `allocVmArchState`
+    /// after the backing cell is allocated. The PMM `create` contract
+    /// already zeros the page, so this is belt-and-suspenders that
+    /// matches the GICv3 reset state for GICD_ISPENDR<n>/GICD_ICPENDR<n>
+    /// (Arm IHI 0069H §12.8 reset column = 0x0000_0000).
+    pub fn init(self: *Vgic) void {
+        @memset(&self.pending, 0);
+    }
+
+    /// Set the pending bit for `intid`. Mirrors a write of 1 to the
+    /// matching bit in GICD_ISPENDR<intid/32> per Arm IHI 0069H
+    /// §12.9.28. Caller has already validated `intid < TOTAL_DIST_INTIDS`.
+    pub fn assertIrq(self: *Vgic, intid: u16) void {
+        std.debug.assert(intid < TOTAL_DIST_INTIDS);
+        const word: u16 = intid / 32;
+        const bit: u5 = @truncate(intid % 32);
+        self.pending[word] |= (@as(u32, 1) << bit);
+    }
+
+    /// Clear the pending bit for `intid`. Mirrors a write of 1 to the
+    /// matching bit in GICD_ICPENDR<intid/32> per Arm IHI 0069H
+    /// §12.9.11. Caller has already validated `intid < TOTAL_DIST_INTIDS`.
+    pub fn deassertIrq(self: *Vgic, intid: u16) void {
+        std.debug.assert(intid < TOTAL_DIST_INTIDS);
+        const word: u16 = intid / 32;
+        const bit: u5 = @truncate(intid % 32);
+        self.pending[word] &= ~(@as(u32, 1) << bit);
+    }
+
+    /// Read the current pending state of `intid`. Used by the vCPU
+    /// run loop to populate list-registers on stage-2 entry.
+    pub fn isPending(self: *const Vgic, intid: u16) bool {
+        if (intid >= TOTAL_DIST_INTIDS) return false;
+        const word: u16 = intid / 32;
+        const bit: u5 = @truncate(intid % 32);
+        return (self.pending[word] & (@as(u32, 1) << bit)) != 0;
+    }
+};
