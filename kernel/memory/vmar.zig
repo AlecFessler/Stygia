@@ -1118,12 +1118,48 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     return removed;
 }
 
-/// Demand-page allocation on first fault to an unmapped VMAR. Allocates
-/// a fresh zero PageFrame and installs at the faulting offset.
+/// Demand-page allocation on a fault to a regular VMAR (`caps.mmio = 0,
+/// caps.dma = 0`). Per spec §[var] (line 1409): "The first faulted
+/// access transitions it to `map = 3` (demand): the kernel allocates
+/// a fresh zero-filled page_frame and installs it at the faulting
+/// offset, with effective permissions = `VMAR.cur_rwx`."
+///
+/// Caller (`handlePageFault`) holds `v._gen_lock`, has already proved
+/// the access is rights-compatible with `v.cur_rwx`, and computed
+/// `offset` aligned-back to the VMAR's `sz`. We allocate a single-page
+/// PageFrame at the VMAR's `sz` (PMM returns it zero-filled by the
+/// zero-on-free invariant), install it via the same path used by
+/// `map_pf`, and drop the kernel's local handle ref so the PF lives
+/// purely on its mapcnt — spec §[snapshot]: "Demand-paged pages are
+/// kernel-allocated and not exposed elsewhere, so `mapcnt = 1` is
+/// implicit." Once `unmap` decrements mapcnt to 0, `releaseMapping`
+/// observes refcount == 0 and runs `destroyPageFrame` which returns
+/// the page to PMM.
+///
+/// Idempotent on already-installed offsets: if an installed_pfs slot
+/// already covers `offset` (cross-core fault race — both cores hit a
+/// fault on the same page, second wakes after first's install), we
+/// return success without re-allocating.
 fn demandAlloc(v: *VMAR, offset: u64) i64 {
-    _ = v;
-    _ = offset;
-    return errors.E_NOMEM;
+    for (&v.installed_pfs) |*entry| {
+        if (entry.pf != null and entry.offset == offset) return 0;
+    }
+
+    const pf = zag.memory.page_frame.allocForDemand(v.sz) catch return errors.E_NOMEM;
+
+    const rc = mappingInstall(v, offset, pf);
+    if (rc != 0) {
+        // mappingInstall failed before bumping mapcnt; drop the
+        // kernel's handle ref to release the PF back to PMM.
+        zag.memory.page_frame.releaseHandle(pf);
+        return rc;
+    }
+
+    // Spec §[snapshot]: demand pages have no user-visible handle, so
+    // drop the refcount=1 we got from allocForDemand. mapcnt=1 keeps
+    // the PF alive until `unmap` runs.
+    zag.memory.page_frame.releaseHandle(pf);
+    return 0;
 }
 
 /// Page-fault handler hook — looks up the VMAR covering `fault_vaddr`

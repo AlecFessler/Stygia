@@ -155,6 +155,21 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
 
 // ── Internal API ─────────────────────────────────────────────────────
 
+/// Allocate a single-page PageFrame at `sz` for demand-paging. Spec
+/// §[var] line 1409: "the kernel allocates a fresh zero-filled
+/// page_frame and installs it at the faulting offset". Returns the PF
+/// at refcount=1, mapcnt=0; the caller (vmar.demandAlloc) installs it
+/// via `mappingInstall` (which bumps mapcnt) and immediately drops
+/// the refcount to 0 — demand pages have no user-visible handle (spec
+/// §[snapshot]), so the PF lives purely on its mapcnt until `unmap`
+/// runs.
+///
+/// The PMM zero-on-free invariant (see `freeBlock` in pmm.zig) means
+/// the backing pages are already zero-filled when allocBlock returns.
+pub fn allocForDemand(sz: PageSize) !*PageFrame {
+    return allocPageFrame(sz, 1);
+}
+
 /// Allocate a PageFrame slot + `page_count` pages of `sz` from PMM,
 /// refcount=1, mapcnt=0. Spec §[page_frame] create.
 fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
