@@ -748,18 +748,38 @@ pub fn allocAddrSpaceRoot() !PAddr {
     return PAddr.fromVAddr(new_virt, null);
 }
 
-/// Free the user-half (TTBR0_EL1) translation table walking from
-/// `root` and return all reachable user pages and intermediate table
-/// pages to PMM. The aarch64 walk depth depends on TCR_EL1 settings
-/// (typically 4-level for 48-bit VAs); this is currently a stub for
-/// the test-runner cleanup path on x86_64.
+/// Tear down the user-half (TTBR0_EL1) of an address space root and
+/// return every page reachable through the L3 (PGD) table to PMM:
+///   - intermediate table pages (L2 / L1 / L0) — always single-page
+///     PMM allocations made by `mapPage`'s on-demand walk
+///   - leaf 4 KiB pages whose physical address is NOT in either skip
+///     range (used to keep page-aliased buddy blocks alive — the
+///     cap-domain's `user_buf` block is aliased into user space via
+///     `mapUserTableView` and freed wholesale via `pmm.freeBlock`,
+///     and the user stack lives in a contiguous buddy block)
 ///
-/// TODO: implement the L0→L1→L2→L3 walk and per-leaf free with the
-/// same skip-range semantics as the x86 backend. The aarch64 user
-/// shape mirrors x86's PML4→PDPT→PD→PT and the existing
-/// `kernel_data_local` mappings make the user/kernel split clean —
-/// porting `freeUserAddrSpace` is mechanical once the test runner
-/// targets aarch64 with N>1 reps.
+/// Leaves backed by VMAR-installed page_frames must already be cleared
+/// (PageEntry.valid = 0) by the caller — `destroyVmar`'s `unmapAll`
+/// does this and decrements PageFrame mapcnt for each entry. Any
+/// valid leaves remaining at this point came from boot-side eager
+/// mappings (mapUserStack, loadElfSegments, mapUserTableView).
+///
+/// On aarch64 the user/kernel split is cleaner than x86: TTBR0_EL1
+/// covers the canonical low half exclusively (VAs `0x0000_0000_0000_0000`
+/// .. `0x0000_FFFF_FFFF_FFFF`) and TTBR1_EL1 carries kernel mappings.
+/// Therefore ALL 512 entries of the L3 root are user-half — there is
+/// no `i < 256` guard like on x86's PML4. ARM ARM DDI 0487 §D5.2
+/// (VMSAv8-64 translation table format), §D13.2.136 (TTBR0_EL1 /
+/// TTBR1_EL1).
+///
+/// ARM ARM DDI 0487 §D5.3 Table D5-15: each translation table is 512
+/// 64-bit descriptors. At L1 / L2 a `valid && !is_table` descriptor
+/// is a block (1 GiB / 2 MiB leaf); at L0 (the leaf level in this
+/// codebase's naming) `valid && is_table` is a 4 KiB page descriptor.
+/// The on-demand `mapPage` walker only produces 4 KiB leaves at L0,
+/// but defensive checks at L1 / L2 keep the walk correct if a future
+/// patch lands a block mapping under TTBR0 (e.g. for a hugepage user
+/// VAR).
 pub fn freeUserAddrSpace(
     root: PAddr,
     skip1_start: u64,
@@ -767,11 +787,141 @@ pub fn freeUserAddrSpace(
     skip2_start: u64,
     skip2_bytes: u64,
 ) void {
-    _ = root;
-    _ = skip1_start;
-    _ = skip1_bytes;
-    _ = skip2_start;
-    _ = skip2_bytes;
+    const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
+    const root_virt = VAddr.fromPAddr(root, null);
+    const l3: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &l3[i];
+        if (!entry.valid) continue;
+        // L3 (root) block descriptors would map 512 GiB and are not
+        // produced by the codebase, but if one ever lands treat it as
+        // a leaf and free per skip-range.
+        if (!entry.is_table) {
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freeL2(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+
+    // Deliberately do NOT free the L3 root here — it is still the
+    // active TTBR0_EL1 on the calling core until the next dispatch
+    // swaps address space. Freeing it inline would let PMM hand the
+    // page out, whose write would corrupt the live page-table walk
+    // on this core. Kernel mappings live in TTBR1_EL1 and are
+    // unaffected; the user-half is now empty so no future user TLB
+    // miss can walk into freed pages. The 4 KiB leak is reaped at
+    // the next reuse of the addr_space_id / ASID — addressable later
+    // by deferring the free until after a TTBR0 swap.
+}
+
+/// Recurse one level down: free leaf pages and tables under an L2 (PUD)
+/// pointer. ARM ARM §D5.3 Table D5-15. Block descriptors at L2 map 1 GiB
+/// (`valid && !is_table`); table descriptors point at an L1 (PMD).
+fn freeL2(
+    pmm_mgr: *pmm.PhysicalMemoryManager,
+    l2_phys: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    const l2_virt = VAddr.fromPAddr(l2_phys, null);
+    const l2: *[page_entry_table_size]PageEntry = @ptrFromInt(l2_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &l2[i];
+        if (!entry.valid) continue;
+        if (!entry.is_table) {
+            // 1 GiB block leaf at L2.
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freeL1(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(l2_virt.addr)));
+}
+
+/// Recurse one level down: free leaf pages and tables under an L1 (PMD)
+/// pointer. ARM ARM §D5.3 Table D5-15. Block descriptors at L1 map 2 MiB
+/// (`valid && !is_table`); table descriptors point at an L0 (PT).
+fn freeL1(
+    pmm_mgr: *pmm.PhysicalMemoryManager,
+    l1_phys: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    const l1_virt = VAddr.fromPAddr(l1_phys, null);
+    const l1: *[page_entry_table_size]PageEntry = @ptrFromInt(l1_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &l1[i];
+        if (!entry.valid) continue;
+        if (!entry.is_table) {
+            // 2 MiB block leaf at L1.
+            const phys = entry.getPAddr().addr;
+            entry.* = default_page_entry;
+            if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+                pmm_mgr.freePage(physToPagePtr(phys));
+            }
+            continue;
+        }
+        freeL0(pmm_mgr, entry.getPAddr(), skip1_start, skip1_bytes, skip2_start, skip2_bytes);
+        entry.* = default_page_entry;
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(l1_virt.addr)));
+}
+
+/// Free 4 KiB leaf pages and the L0 (PT) table itself. ARM ARM §D5.3
+/// Table D5-15: at L0 (the level-3 leaf level in ARM spec naming) a
+/// `valid && is_table` descriptor encodes a 4 KiB page (descriptor
+/// type bits [1:0] = 0b11). There is no block-descriptor variant at
+/// L0; a `valid && !is_table` here is architecturally a reserved
+/// encoding and treated as no-op.
+fn freeL0(
+    pmm_mgr: *pmm.PhysicalMemoryManager,
+    l0_phys: PAddr,
+    skip1_start: u64,
+    skip1_bytes: u64,
+    skip2_start: u64,
+    skip2_bytes: u64,
+) void {
+    const l0_virt = VAddr.fromPAddr(l0_phys, null);
+    const l0: *[page_entry_table_size]PageEntry = @ptrFromInt(l0_virt.addr);
+    var i: usize = 0;
+    while (i < page_entry_table_size) : (i += 1) {
+        const entry = &l0[i];
+        if (!entry.valid) continue;
+        const phys = entry.getPAddr().addr;
+        entry.* = default_page_entry;
+        if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
+            pmm_mgr.freePage(physToPagePtr(phys));
+        }
+    }
+    pmm_mgr.freePage(@as([*]u8, @ptrFromInt(l0_virt.addr)));
+}
+
+inline fn leafSkipped(phys: u64, s1: u64, n1: u64, s2: u64, n2: u64) bool {
+    if (n1 != 0 and phys >= s1 and phys < s1 + n1) return true;
+    if (n2 != 0 and phys >= s2 and phys < s2 + n2) return true;
+    return false;
+}
+
+inline fn physToPagePtr(phys: u64) [*]u8 {
+    return @ptrFromInt(VAddr.fromPAddr(.{ .addr = phys }, null).addr);
 }
 
 /// Read the current TTBR0_EL1 base PA (low-half / user translation root).
