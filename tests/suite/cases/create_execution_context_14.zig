@@ -41,11 +41,18 @@
 //   2. sync(ec_handle)                                       — refresh
 //      field1 snapshot
 //   3. readCap(cap_table_base, ec_handle).field1 == 0b0011
+//   4. affinity(SLOT_INITIAL_EC, 0b0010)                    — pin self
+//   5. yieldEc(0)                                           — re-pick
+//   6. testing.currentCoreId() in {1}                       — verify
 //
 // Assertions
 //   1: setup syscall failed (create_execution_context returned an error)
 //   2: sync returned a non-OK status
 //   3: post-sync field1 does not equal the requested affinity mask
+//   4: self-affinity restriction returned non-OK
+//   5: yield returned non-OK
+//   6: observed core after yield is outside the new mask (scheduler
+//      ignored the cap-driven restriction)
 
 const lib = @import("lib");
 
@@ -100,5 +107,31 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
+    // End-to-end check: drive self to a single-bit affinity, yield,
+    // then verify dispatch satisfied the mask. Without this step the
+    // test only proves the field1 mirror reflects the mask we
+    // requested at create time — saying nothing about whether the
+    // scheduler honors affinity for an EC's first dispatch. Using
+    // SLOT_INITIAL_EC keeps the test self-contained (saff cap is
+    // included in the runner's ec_inner_ceiling = 0xFF).
+    const self_pin: u64 = 0b0010;
+    const self_aff_result = syscall.affinity(caps.SLOT_INITIAL_EC, self_pin);
+    if (self_aff_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(4);
+        return;
+    }
+    const yield_result = syscall.yieldEc(0);
+    if (yield_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(5);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((self_pin & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(6);
+        return;
+    }
+
+    // Restore unrestricted affinity before returning the result.
+    _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
     testing.pass();
 }

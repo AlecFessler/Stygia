@@ -54,6 +54,9 @@
 //      stack_pages=1, target=0, affinity=M0)        — must succeed
 //   2. affinity(ec, M1)                              — must return OK
 //   3. readCap(cap_table_base, ec).field1            — must equal M1
+//   4. affinity(SLOT_INITIAL_EC, 0b0010)             — pin self to core 1
+//   5. yieldEc(0)                                    — let scheduler re-pick
+//   6. testing.currentCoreId() in {1}                — observe satisfaction
 //
 // Assertions
 //   1: setup syscall failed (create_execution_context returned an error)
@@ -61,6 +64,10 @@
 //   3: post-affinity field1 snapshot does not equal M1, meaning the
 //      implicit-sync side effect of the affinity syscall did not refresh
 //      the holder's snapshot to the new authoritative kernel state
+//   4: self-affinity restriction returned non-OK
+//   5: yield returned non-OK
+//   6: observed core after yield is outside the new affinity mask
+//      (scheduler ignored the cap-driven restriction)
 
 const lib = @import("lib");
 
@@ -116,5 +123,29 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
+    // End-to-end check: drive self affinity to a single-bit mask, yield,
+    // then verify dispatch landed on the requested core. Without this
+    // step the test only proves the field0/field1 mirror was refreshed,
+    // which says nothing about the scheduler's run-queue choice. Picking
+    // core 1 (mask 0b0010) keeps the assertion unambiguous.
+    const self_pin: u64 = 0b0010;
+    const self_aff_result = syscall.affinity(caps.SLOT_INITIAL_EC, self_pin);
+    if (self_aff_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(4);
+        return;
+    }
+    const yield_result = syscall.yieldEc(0);
+    if (yield_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(5);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((self_pin & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(6);
+        return;
+    }
+
+    // Restore unrestricted affinity before returning the result.
+    _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
     testing.pass();
 }

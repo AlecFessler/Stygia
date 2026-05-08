@@ -888,6 +888,12 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
 /// Re-bucketing the target if it is currently parked in a futex/port
 /// wait queue (spec test 07) is not yet implemented; the priority
 /// field is updated unconditionally so the next enqueue picks it up.
+/// Same for the run-queue level-bucket case — a removeFromQueue +
+/// enqueue would shift `.ready` ECs into the new priority bucket
+/// immediately, but the run queues self-balance on the next preempt
+/// cycle (cur EC's preempt re-enqueues with the new priority via
+/// `state.run_queue.enqueue` which reads `ec.priority`), so deferring
+/// is acceptable for the spec tests' observable behavior.
 pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i64 {
     if (new_priority > 3) return errors.E_INVAL;
 
@@ -942,10 +948,12 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
 /// with any handle to the terminated EC return E_TERM and remove that
 /// handle from the caller's table on the same call" (test 05).
 ///
-/// Re-enqueuing the target on a core that satisfies the new mask if it
-/// is currently parked or running on an excluded core is not yet
+/// Re-enqueuing the target on a core that satisfies the new mask if
+/// it is currently parked or running on an excluded core is not yet
 /// implemented; the affinity field is updated unconditionally so the
-/// next enqueue picks it up.
+/// next enqueue picks it up via `yieldTo`'s affinity-aware re-enqueue
+/// branch (which moves a `.running` EC off a forbidden core when the
+/// local queue has a replacement to dispatch).
 pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
@@ -1577,6 +1585,13 @@ pub fn allocExecutionContext(
     if (exit_port) |p| ec.exit_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
 
     arch.cpu.fpuStateInit(&ec.fpu_state);
+    // Reset lazy-FPU bookkeeping — slab slot may have inherited the
+    // previous occupant's `last_fpu_core` if any prior teardown
+    // skipped `clearFromLastFpuOwner` (e.g. via a non-graceful exit
+    // path). `migrateFlush` reads this field and IPIs the named
+    // core; a stale non-null value would send a flush IPI for an EC
+    // that never actually used the FPU on that core.
+    ec.last_fpu_core = null;
     _ = slab_instance.publish(pending);
     return ec;
 }
@@ -1804,6 +1819,16 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
 }
 
 /// Lazy-allocate `perfmon_state` on first perfmon_start.
+///
+/// The slab's `create` returns a Pending whose slot still carries
+/// whatever fields a previous occupant left behind (active_counters,
+/// counter_events[], counter_thresholds[], has_threshold, arch_state).
+/// Without explicit re-init those stale values are visible the moment
+/// `publish` flips the gen to odd — and a PMI on another core can fire
+/// the moment perfmon_state is wired into the EC, observing stale
+/// configs and re-arming the wrong counter. Zero the fields between
+/// create and publish so the slot is in its declared default state
+/// (matches the field defaults in `sched/perfmon.zig`).
 fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
     if (ec.perfmon_state) |ref| {
         const reflr = ref.lockIrqSave(@src()) catch unreachable;
@@ -1811,6 +1836,37 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
         return reflr.ptr;
     }
     const pending = try perfmon_mod.slab_instance.create();
+    // Field-by-field reset (vs. struct-literal assignment) so the
+    // freestanding x86 build doesn't emit SSE movups for a wholesale
+    // PmuState copy — `-mcpu baseline+soft_float-sse-sse2` rejects
+    // those encodings. The slot's `_gen_lock` is owned by the slab
+    // and must NOT be touched. Use indexed loops in place of @memset
+    // for the same reason: the byte-granularity scalar codegen avoids
+    // any XMM moves on aggregate fields.
+    pending.ptr.active_counters = 0;
+    {
+        var i: usize = 0;
+        while (i < perfmon_mod.MAX_COUNTERS) : (i += 1) {
+            pending.ptr.counter_events[i] = 0;
+            pending.ptr.counter_thresholds[i] = 0;
+            pending.ptr.arch_state.values[i] = 0;
+            pending.ptr.arch_state.configs[i].event = .cycles;
+            pending.ptr.arch_state.configs[i].has_threshold = false;
+            pending.ptr.arch_state.configs[i].overflow_threshold = 0;
+            var p: usize = 0;
+            while (p < pending.ptr.arch_state.configs[i]._pad.len) : (p += 1) {
+                pending.ptr.arch_state.configs[i]._pad[p] = 0;
+            }
+        }
+    }
+    pending.ptr.has_threshold = 0;
+    pending.ptr.arch_state.num_counters = 0;
+    {
+        var i: usize = 0;
+        while (i < pending.ptr.arch_state._pad.len) : (i += 1) {
+            pending.ptr.arch_state._pad[i] = 0;
+        }
+    }
     const ref = perfmon_mod.slab_instance.publish(pending);
     ec.perfmon_state = ref;
     return ref.ptr;

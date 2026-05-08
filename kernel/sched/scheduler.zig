@@ -386,6 +386,10 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     const state = &core_states[core];
     const lock = &core_locks[core];
 
+    // Track an EC that needs cross-core enqueue after we drop the
+    // local lock — see the affinity-aware branch below.
+    var deferred_cross_core: ?*ExecutionContext = null;
+
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     if (state.current_ec) |cur_ref| {
         // caller-pinned: `current_ec` names the EC running on this core
@@ -401,7 +405,22 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         // ownership of the EC's lifecycle and yieldTo musn't trample.
         if (cur.state == .running) {
             cur.state = .ready;
-            state.run_queue.enqueue(cur);
+            // Honor affinity. If `cur` is no longer allowed on this
+            // core (e.g. setAffinity excluded it mid-quantum) hand it
+            // off to a satisfying core — but only when the local
+            // queue has a replacement to dispatch. Without one, a
+            // local re-enqueue is the safe fallback (the next preempt
+            // with a non-empty queue migrates it; the explicit
+            // `setAffinity`-side reposition also catches the case
+            // when callers change affinity from off-core). `affinity
+            // == 0` is the spec "any core" sentinel.
+            const local_allowed = cur.affinity == 0 or
+                (core < 64 and (cur.affinity & (@as(u64, 1) << @truncate(core))) != 0);
+            if (local_allowed or state.run_queue.isEmpty()) {
+                state.run_queue.enqueue(cur);
+            } else {
+                deferred_cross_core = cur;
+            }
         }
     }
     const next = if (target) |t| blk: {
@@ -409,6 +428,16 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         break :blk dequeueOrIdleLocked(core);
     } else dequeueOrIdleLocked(core);
     lock.unlockIrqRestore(irq);
+
+    // Cross-core enqueue runs unlocked: `enqueueOnCore` acquires the
+    // target core's lock, and we mustn't hold two `core_locks`
+    // simultaneously outside the registered ordered group. The EC's
+    // state was stamped `.ready` under the local lock, so any racing
+    // path that grabs it via `removeFromQueue` first sees no queue
+    // residence and just falls through to its normal handling.
+    if (deferred_cross_core) |cur| {
+        enqueueOnCore(pickCoreForAffinity(cur.affinity), cur);
+    }
 
     if (next) |n| {
         switchTo(n);
@@ -873,8 +902,9 @@ fn pickCoreForAffinity(affinity: u64) u8 {
 /// core than the calling core, IPI that core to FXSAVE its CPU regs
 /// into `ec.fpu_state`, then clear `last_fpu_core`. Called before
 /// the destination core arms its FPU trap so the trap handler can
-/// safely FXRSTOR from a fresh buffer.
+/// safely FXRSTOR from a fresh buffer. Delegates to `sched.fpu` which
+/// owns the per-arch mailbox protocol.
 pub fn migrateFlush(ec: *ExecutionContext) void {
-    _ = ec;
+    zag.sched.fpu.migrateFlush(ec);
 }
 

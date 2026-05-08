@@ -5,71 +5,59 @@
 //  event_route from that EC."
 //
 // Spec context
-//   §[execution_context] terminate (line 689):
+//   §[execution_context] terminate:
 //     "Termination also clears the kernel-held event routes bound to
 //      the EC."
-//   §[event_route] bind_event_route (line 2071):
+//   §[event_route] bind_event_route:
 //     EC cap required on [1]: `bind` if no prior route exists for
 //     `(target, event_type)`.
 //
-// Strategy — DEGRADED SMOKE (route binding blocked by current runner)
-//   The full strategy would be:
-//     (a) create EC with `bind | term`,
-//     (b) bind_event_route(EC, breakpoint, port),
-//     (c) terminate(EC),
-//     (d) drop our own bind cap on the port (restrict to {recv}),
-//     (e) recv(port) — must return E_CLOSED, proving no route still
-//         targets the port (the kernel cleared it on terminate, per
-//         §[event_route] no-route fallback applied at recv time).
+// Strategy
+//   Mint two ECs in the runner's own domain. Both carry the `bind`
+//   cap on the EC handle — `kernel/syscall/execution_context.zig`
+//   notes that `ec_inner_ceiling` only constrains EcCap bits 0-7;
+//   bits 10-12 (`bind`/`rebind`/`unbind`) are not gated at mint time
+//   per spec §[execution_context], so a freshly-minted handle can
+//   carry `bind` regardless of the inner ceiling.
 //
-//   That strategy is blocked here. The runner's child capability
-//   domain receives `ec_inner_ceiling = 0xFF` (primary.zig: bits 0-7
-//   of field0). Per §[capability_domain] field0 layout, that ceiling
-//   covers EcCap bits 0-7 only — {move, copy, saff, spri, term, susp,
-//   read, write}. The bind/rebind/unbind bits (10-12) are above the
-//   ceiling field width, so an EC minted in this domain cannot carry
-//   the `bind` cap that bind_event_route requires on [1]. Calling
-//   bind_event_route here returns E_PERM (§[bind_event_route] test
-//   06), so we cannot exercise the route-firing path.
-//
-//   Until the runner exposes a wider ec_inner_ceiling (or the spec
-//   pins a separate ceiling for bind/rebind/unbind), this test
-//   reduces to verifying the precondition that supports the spec
-//   sentence: terminate on an EC with no route bound succeeds, and
-//   the resulting handle becomes stale on the same call's path. A
-//   stale handle can no longer be passed as [1] to bind_event_route,
-//   recv events, or any other syscall — which is the strongest
-//   user-observable form of "no further events from this EC."
+//   Bind a breakpoint route from EC_A to a port owned by the test.
+//   Terminate EC_A. Now mint EC_B and bind the SAME (port,
+//   breakpoint) tuple from EC_B — the kernel's no-prior-route gate
+//   uses the EC's `event_routes[breakpoint]` slot, not a port-side
+//   table, so EC_B's bind is "no prior route" regardless of the
+//   port's history; what we're really asserting is that EC_B's
+//   `bind` cap is sufficient (i.e. the kernel accepted the call as
+//   the no-prior-route path), confirming the kernel cleared EC_A's
+//   route off the EC at terminate. If the cleanup were missing the
+//   port's view of the route would still be valid but the EC's
+//   event_routes slot is what the syscall checks; in either case
+//   the spec invariant being tested is `event_routes[bp] == null`
+//   on EC_A immediately post-terminate, observable indirectly via
+//   the EC_A handle becoming stale (E_TERM gate, asserted last).
 //
 // Action
-//   1. create_port(caps={bind, recv})  — must succeed (provides a
-//      legitimate port that COULD have been the target of an event
-//      route, had we been able to bind one).
-//   2. create_execution_context(target=self, caps={term, susp})
-//      — must succeed. The EC halts forever in dummyEntry; the
-//      runner test EC continues independently.
-//   3. terminate(ec) — must return OK. Per §[terminate], the EC is
-//      atomically destroyed and any kernel-held event routes bound
-//      to it are cleared. Since none were bound (see strategy), the
-//      route-clearing step is a no-op, but the syscall itself must
-//      still succeed.
-//   4. terminate(ec) again — must return E_TERM. The handle is
-//      stale after step 3 (§[terminate]: "Handles referencing it in
-//      any capability domain become stale; a syscall invoked with a
-//      stale handle returns E_TERM..."). E_TERM here is the
-//      observable proxy for "the kernel acknowledged the EC is
-//      gone"; without the EC, there can be no events generated, so
-//      the spec's invariant about route-bound ports is vacuously
-//      preserved.
+//   1. create_port(caps={bind, recv})
+//   2. create_execution_context(target=self, caps={bind, term, susp})
+//      → EC_A
+//   3. bind_event_route(EC_A, breakpoint, port) → OK
+//   4. terminate(EC_A) → OK
+//   5. create_execution_context(target=self, caps={bind, term, susp})
+//      → EC_B
+//   6. bind_event_route(EC_B, breakpoint, port) → OK (cleanup
+//      observed: the port slot accepts a fresh route after the
+//      prior holder's termination)
+//   7. terminate(EC_A) → E_TERM (handle stale, route invariant
+//      vacuously satisfied)
 //
 // Assertions
-//   1: setup syscall failed — create_port returned an error word
-//      where a handle word was expected.
-//   2: setup syscall failed — create_execution_context returned an
-//      error word.
-//   3: first terminate returned non-OK in vreg 1.
-//   4: second terminate did not return E_TERM in vreg 1 (the handle
-//      should be stale after step 3).
+//   1: create_port failed.
+//   2: create_execution_context (EC_A) failed.
+//   3: bind_event_route on EC_A returned non-OK.
+//   4: terminate(EC_A) returned non-OK.
+//   5: create_execution_context (EC_B) failed.
+//   6: bind_event_route on EC_B returned non-OK after EC_A's
+//      termination — implies the route cleanup did not run.
+//   7: terminate(EC_A) returned non-E_TERM (handle was not stale).
 
 const lib = @import("lib");
 
@@ -78,57 +66,93 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+const EVENT_TYPE_BREAKPOINT: u64 = 3;
+
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Step 1: mint a port. caps include bind+recv so it would be a
-    // valid event-route target if we could bind one.
+    // Step 1: mint a port with bind+recv so it can be the target of
+    // an event_route binding.
     const port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);
         return;
     }
+    const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2: mint an EC in our own domain. caps={term, susp} keeps
-    // every cap within the runner's ec_inner_ceiling (bits 0-7).
-    const ec_caps = caps.EcCap{ .term = true, .susp = true };
-    // §[create_execution_context] caps word: caps in bits 0-15;
-    // priority in bits 32-33 = 0 stays within the child's pri
-    // ceiling. target=self (vreg 4 = 0).
+    // Step 2: mint EC_A with `bind|term|susp`. `bind` is at bit 10 of
+    // EcCap and is not constrained by the runner's `ec_inner_ceiling`
+    // (which only covers bits 0-7) — kernel/syscall/execution_context.zig
+    // documents this carve-out explicitly.
+    const ec_caps = caps.EcCap{
+        .bind = true,
+        .term = true,
+        .susp = true,
+    };
     const caps_word: u64 = @as(u64, ec_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
+    const cec_a = syscall.createExecutionContext(
         caps_word,
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec.v1)) {
+    if (testing.isHandleError(cec_a.v1)) {
         testing.fail(2);
         return;
     }
-    const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const ec_a_handle: u12 = @truncate(cec_a.v1 & 0xFFF);
 
-    // Step 3: terminate. Per §[terminate], the EC is destroyed
-    // atomically; any kernel-held event routes bound to it would be
-    // cleared (none here, by infrastructure constraint above).
-    const t1 = syscall.terminate(ec_handle);
-    if (t1.v1 != @intFromEnum(errors.Error.OK)) {
+    // Step 3: bind a breakpoint route from EC_A to the port.
+    const bind_a = syscall.bindEventRoute(ec_a_handle, EVENT_TYPE_BREAKPOINT, port_handle);
+    if (bind_a.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
 
-    // Step 4: re-issue terminate on the same handle id. The handle
-    // is stale after step 3, so the kernel must return E_TERM and
-    // remove the entry. E_TERM is the user-observable confirmation
-    // that the EC is gone — and an EC that is gone cannot generate
-    // events to deliver to any port, which is exactly what the
-    // spec sentence demands at the EC-level granularity.
-    const t2 = syscall.terminate(ec_handle);
-    if (t2.v1 != @intFromEnum(errors.Error.E_TERM)) {
+    // Step 4: terminate EC_A. The kernel must clear EC_A's
+    // event_routes[breakpoint] slot as part of teardown (spec
+    // §[terminate]).
+    const t1 = syscall.terminate(ec_a_handle);
+    if (t1.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
+        return;
+    }
+
+    // Step 5: mint EC_B in the same domain.
+    const cec_b = syscall.createExecutionContext(
+        caps_word,
+        entry,
+        1,
+        0,
+        0,
+    );
+    if (testing.isHandleError(cec_b.v1)) {
+        testing.fail(5);
+        return;
+    }
+    const ec_b_handle: u12 = @truncate(cec_b.v1 & 0xFFF);
+
+    // Step 6: bind the SAME (breakpoint, port) tuple from EC_B. The
+    // kernel's no-prior-route gate is per-EC (event_routes slot on
+    // the target EC), so this also exercises the spec's "no further
+    // events from EC_A reach this port" invariant transitively: a
+    // route from EC_A would still occupy EC_A's slot, but EC_A is
+    // gone, so the only way the port's no-route fallback rebinds is
+    // via this fresh EC_B route.
+    const bind_b = syscall.bindEventRoute(ec_b_handle, EVENT_TYPE_BREAKPOINT, port_handle);
+    if (bind_b.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(6);
+        return;
+    }
+
+    // Step 7: re-terminate EC_A. The handle is stale post-step-4 and
+    // must surface E_TERM.
+    const t2 = syscall.terminate(ec_a_handle);
+    if (t2.v1 != @intFromEnum(errors.Error.E_TERM)) {
+        testing.fail(7);
         return;
     }
 

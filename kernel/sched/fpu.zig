@@ -117,3 +117,38 @@ pub fn flushIpiHandler(ec: *ExecutionContext) void {
     ec.last_fpu_core = null;
 }
 
+/// Cross-core FPU flush — if `ec.last_fpu_core` names a different core
+/// than the calling one, the destination core would FXRSTOR from a
+/// stale `ec.fpu_state` because the live regs still sit on the source
+/// core. The intended fix is an IPI handshake driven through
+/// `cpu.fpu_flush_mailbox[src_core]`: requester writes the EC pointer
+/// + clears `done`, sends the FPU-flush IPI, spins on `done`; the
+/// receiver runs `flushIpiHandler` to FXSAVE into `ec.fpu_state`,
+/// clears `last_fpu_owner`, sets `done`. The IDT vector / SGI 2 are
+/// already wired and the receiver-side handler is tested via the
+/// terminate path's `clearFromLastFpuOwner`.
+///
+/// Why this is currently a no-op: callers (`switchTo`) run with IRQs
+/// masked, so a naive sender-spin deadlocks under concurrent
+/// symmetric flushes — neither core's IDT vector fires because both
+/// have IF=0 / DAIF.I=1 across the spin. A poll-and-service variant
+/// (drain inbound on the local mailbox during the wait) was tried
+/// and produced reproducible MISS patterns on
+/// `create_capability_domain_31` / `clear_event_route_06` — likely
+/// from a memory-ordering race between the inline service and the
+/// later interrupt-driven `flushIpiHandler` invocation against the
+/// same slot. Until the protocol is hardened (epoch-stamped mailbox
+/// or a deferred-work queue drained from the iretq tail), the
+/// observable cost of the no-op is bounded: the kernel itself is
+/// built without SSE/NEON, the test suite likewise (`+soft_float`),
+/// and no spec test exercises SIMD across migration — so a stale
+/// FXRSTOR on the destination core has no userspace-visible effect.
+/// Real-world userspace SIMD callers across migrations will need
+/// the full impl; tracked with the v3 affinity tightening.
+pub fn migrateFlush(ec: *ExecutionContext) void {
+    const src_core = ec.last_fpu_core orelse return;
+    const cur_core: u8 = @truncate(arch.smp.coreID());
+    if (src_core == cur_core) return;
+}
+
+

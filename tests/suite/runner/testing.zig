@@ -57,3 +57,41 @@ pub fn dummyEntry() noreturn {
         }
     }
 }
+
+// Read the calling EC's currently-dispatched logical core id. On x86
+// this comes from RDPID (IA32_TSC_AUX MSR), which the kernel primes at
+// `apic.writeTscAuxCoreId` with the per-core index, NOT the raw APIC
+// id. On aarch64 it comes from MPIDR_EL1.Aff0 (single-cluster topology
+// which matches the smp=4 test rig). Returns the core id as a u64 so
+// callers can compare directly against an affinity bit position.
+//
+// Used by affinity tests to verify the scheduler honored a cap-driven
+// affinity restriction by sampling RDPID after a yield: the kernel
+// preempts on the timer tick or an explicit yield, re-evaluates the
+// run queue, and dispatches on a satisfying core. The RDPID read after
+// resume names that core.
+pub inline fn currentCoreId() u64 {
+    switch (@import("builtin").cpu.arch) {
+        .x86_64 => {
+            // RDPID is gated on CPUID.07H:0H ECX[22]. KVM-host targets
+            // (Skylake / Zen 2+ Intel; Zen 2+ AMD) all expose it. The
+            // kernel writes the per-core index into IA32_TSC_AUX at
+            // SMP bring-up (`apic.writeTscAuxCoreId`) so RDPID returns
+            // the logical core id, not the raw APIC id.
+            var idx: u64 = undefined;
+            asm volatile (
+                \\rdpid %[idx]
+                : [idx] "=r" (idx),
+            );
+            return idx;
+        },
+        .aarch64 => {
+            var mpidr: u64 = undefined;
+            asm volatile ("mrs %[v], MPIDR_EL1"
+                : [v] "=r" (mpidr),
+            );
+            return mpidr & 0xFF;
+        },
+        else => @compileError("unsupported arch"),
+    }
+}
