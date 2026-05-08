@@ -1211,7 +1211,10 @@ fn demandAlloc(v: *VMAR, offset: u64) i64 {
 
     const pf = zag.memory.page_frame.allocForDemand(v.sz) catch return errors.E_NOMEM;
 
-    const rc = mappingInstall(v, offset, pf);
+    // Demand-paged PFs are kernel-allocated with no user-visible handle (spec
+    // §[snapshot]); spec §[var] demand transition: effective perms = VMAR.cur_rwx.
+    // Pass 0b111 so the intersection in mappingInstall is a no-op.
+    const rc = mappingInstall(v, offset, pf, 0b111);
     if (rc != 0) {
         // mappingInstall failed before bumping mapcnt; drop the
         // kernel's handle ref to release the PF back to PMM.
