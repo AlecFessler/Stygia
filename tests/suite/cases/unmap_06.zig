@@ -3,105 +3,63 @@
 // "[test 06] returns E_INVAL if [1].field1 `map` is 3 and any offset
 //  selector is not aligned to [1]'s `sz`."
 //
-// DEGRADED SMOKE VARIANT
-//   Test 06 fires only on a VMAR whose `map` field is 3 (demand). Per
-//   §[var] (line 877), a regular VMAR (`caps.mmio = 0, caps.dma = 0`)
-//   transitions to `map = 3` exclusively on the first faulted access:
-//   the kernel allocates a fresh zero-filled page_frame, installs it
-//   at the faulting offset, and bumps `map` from 0 to 3. There is no
-//   syscall in the v3 surface that drives a VMAR into `map = 3`
-//   *without* an actual CPU page fault on its range — `map_pf` lifts
-//   `map` to 1 (and §[map_pf] test 10 forbids `map_pf` once `map` is
-//   3 anyway), `map_mmio` lifts `map` to 2, and there is no
-//   `force_demand` or analogous helper.
+// Strategy
+//   To isolate the `map = 3` alignment gate every earlier §[unmap] gate
+//   must be inert:
+//     - test 01 (invalid VMAR)         — pass a freshly-minted VMAR.
+//     - test 02 (map = 0)              — drive `map` to 3 via a demand
+//                                        fault before issuing `unmap`.
+//     - test 03 (map = 2 + N > 0)      — VMAR caps.mmio = 0, so a
+//                                        demand fault transitions to
+//                                        `map = 3`, never to 2.
+//     - tests 04, 05 (map = 1 selector — n/a on `map = 3`.
+//                    validation)
 //
-//   From a v0 test child the only way to fault on a VMAR's range is to
-//   dereference a pointer at `VMAR.field0 + offset`. That requires the
-//   test EC to (a) issue a load/store at a kernel-chosen base and
-//   (b) survive the page fault entry/exit cleanly, with the test EC's
-//   register state preserved well enough to follow up with a `unmap`
-//   syscall. The faithful sequence would be:
+//   Per §[var]: a regular VMAR (caps.mmio = 0, caps.dma = 0) starts at
+//   `map = 0`; the first faulted access transitions it to `map = 3`
+//   (demand) — the kernel allocates a fresh zero-filled page_frame and
+//   installs it at the faulting offset. We trigger that transition by
+//   issuing a volatile store through `VMAR.base` (reported in field0
+//   per §[create_vmar] test 19). After the store completes the kernel
+//   has installed a demand page at offset 0 and `map` is 3.
 //
-//     create_vmar(caps={r, w}, props={sz=0, cur_rwx=0b011}, pages=1, ...)
-//                                         -> regular VMAR, map = 0
-//     <load from VMAR.field0>              -> kernel demand-faults a
-//                                            page; VMAR.map -> 3
-//     unmap(var, &.{ misaligned_offset }) -> *expected* E_INVAL via
-//                                            test 06
-//
-//   Until the runner gains a faulting-helper (a controlled trampoline
-//   that issues the demand-trigger load and returns into the test EC
-//   without clobbering its caller-saved state), the strict test 06
-//   path cannot be exercised end-to-end here. See map_pf_10.zig for
-//   the parallel discussion of the `map = 3` arm.
-//
-// Strategy (smoke prelude)
-//   The check ordering ahead of the alignment check on `map = 3` is:
-//     - test 01 (VMAR is invalid) — pass a freshly-minted regular VMAR
-//       so the first dispatch succeeds.
-//     - test 02 (`map` is 0) — kernel rejects with E_INVAL because a
-//       fresh regular VMAR is in `map = 0`. This is the *first* check
-//       a test can reach without driving the VMAR through a page fault.
-//
-//   We stop at the test 02 wall: confirming that a regular VMAR with
-//   `map = 0` rejects an `unmap` call (regardless of selector shape)
-//   via test 02, not test 06. A faithful test 06 setup would have to
-//   first transition the VMAR to `map = 3` via a real fault, then
-//   issue `unmap` with a deliberately misaligned offset; we cannot
-//   take that step from a child capability domain.
+//   With `map = 3` reached we issue `unmap(vmar, &.{ misaligned })`
+//   where `misaligned` is a non-page-aligned byte offset. The VMAR's
+//   `sz = 0` is 4 KiB, so any offset whose low 12 bits are non-zero
+//   trips the alignment gate. The selector we pick (1) is the smallest
+//   value that is unambiguously misaligned and is not a valid handle
+//   id either — the test 06 alignment check is the only signal.
 //
 // Action
-//   1. createVmar(caps={r, w}, props={sz=0, cch=0, cur_rwx=0b011},
-//                pages=1, preferred_base=0, device_region=0) — must
-//      succeed; gives a regular VMAR in `map = 0`.
-//   2. unmap(vmar_handle, &.{ 1 }) — kernel rejects via §[unmap]
-//      test 02 (`map = 0`), not test 06. The selector value 1 (a
-//      deliberately sub-page-aligned byte offset, what a faithful
-//      test 06 would supply once the VMAR was in `map = 3`) is inert
-//      against `map = 0`: the dispatch never inspects selectors when
-//      `map` is 0.
+//   1. createVmar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
+//                 pages=1, preferred_base=0, device_region=0). Records
+//                 the chosen base in field0 (cvar.v2).
+//   2. Volatile store at VMAR.base[0] — kernel demand-faults on first
+//      access; allocates a zero-filled page at offset 0 and bumps
+//      `map` from 0 to 3 per §[var].
+//   3. unmap(var, &.{ 1 }) — selector 1 is a sub-page-aligned byte
+//      offset against `sz = 0` (4 KiB pages). Per §[unmap] test 06
+//      the kernel must return E_INVAL.
 //
-// Assertion
-//   No assertion is checked — passes with assertion id 0 because the
-//   `map = 3` rejection target is unreachable. Test reports pass
-//   regardless of what `unmap` returns: the prelude only smokes the
-//   create_vmar path. Any failure of the prelude itself is also
-//   reported as pass-with-id-0 since no spec assertion is being
-//   checked.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner-side faulting helper that
-//   drives a regular VMAR into `map = 3` from a controlled trampoline
-//   (issues a load at `VMAR.field0`, returns into the test EC with no
-//   register clobber on the test's side). Once that exists, the
-//   action becomes:
-//     create_vmar(...) -> regular VMAR, map = 0
-//     <fault helper: load from VMAR.field0>
-//                      -> kernel demand-faults; VMAR.map -> 3
-//     unmap(var, &.{ 1 }) -> *expected* E_INVAL via test 06
-//   That assertion (id 1) would replace this smoke's pass-with-id-0.
-//
-//   A second misaligned offset is also worth checking once the
-//   helper exists: e.g. `&.{ 0x1001 }` (page-plus-one) or
-//   `&.{ 0, 0x1001 }` (one aligned + one misaligned, to confirm
-//   "any offset selector" applies element-wise).
-//
-//   Until then, this file holds the create_vmar prelude verbatim so
-//   the eventual faithful version can graft on the demand-fault step
-//   without re-deriving the inert-check matrix.
+// Assertions
+//   1: vreg 1 was not E_INVAL after `unmap` with a misaligned offset
+//      on a `map = 3` VMAR (the spec assertion under test).
+//   2: a setup syscall returned an error code, breaking the
+//      success-path precondition.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Regular VMAR (caps.mmio = 0, caps.dma = 0); per §[var] line 877
-    // it starts in `map = 0`. One 4 KiB page is enough — test 06's
-    // alignment check on offsets only fires once `map` reaches 3.
+    // Step 1: regular VMAR (caps.mmio = 0, caps.dma = 0). Starts at
+    // `map = 0` per §[var]. cur_rwx = r|w so the demand store below
+    // is permitted by the page-fault permission check.
     const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
     const cvar = syscall.createVmar(
@@ -112,22 +70,31 @@ pub fn main(cap_table_base: u64) void {
         0, // device_region = unused (caps.dma = 0)
     );
     if (testing.isHandleError(cvar.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is
-        // being checked, so report pass-with-id-0.
-        testing.pass();
+        testing.fail(2);
         return;
     }
     const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_base: u64 = cvar.v2;
 
-    // Inert call: a regular VMAR is in `map = 0`, so this dispatches
-    // through §[unmap] test 02 (E_INVAL — nothing to unmap), not
-    // test 06. The misaligned selector value (1) is what a faithful
-    // test 06 would deliver against a `map = 3` VMAR; here it never
-    // gets inspected because the kernel rejects on `map = 0` first.
-    _ = syscall.unmap(vmar_handle, &.{1});
+    // Step 2: drive `map` 0 -> 3. The volatile store forces the
+    // optimizer to emit a real memory access; the kernel's
+    // page-fault handler runs `demandAlloc` (kernel/memory/vmar.zig
+    // §demandAlloc), installs a zero-filled page at offset 0, and
+    // bumps `v.map` to .demand. After this line the VMAR is in
+    // `map = 3` with one demand page installed at offset 0.
+    const qword_ptr: [*]volatile u64 = @ptrFromInt(vmar_base);
+    qword_ptr[0] = 0;
 
-    // No spec assertion is being checked — the `map = 3` state is
-    // unreachable from the v0 test child. Pass with assertion id 0
-    // to mark this slot as smoke-only in coverage.
+    // Step 3: unmap with a misaligned byte offset. Selector value 1
+    // is < `sz_bytes` (4096) and has its low 12 bits set, so it
+    // fails the `offset & (sz_bytes - 1) == 0` alignment check the
+    // kernel enforces on `map = 3` selectors.
+    const result = syscall.unmap(vmar_handle, &.{1});
+
+    if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
 }

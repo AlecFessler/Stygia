@@ -3,159 +3,94 @@
 // "[test 07] returns E_NOENT if [1].field1 `map` is 3 and no
 //  demand-allocated page exists at any offset selector."
 //
-// DEGRADED SMOKE VARIANT
-//   This assertion fires only when the VMAR is in `map = 3` (demand)
-//   state — the same demand-paging blocker documented in
-//   tests/map_pf_10.zig applies here. Per §[var] (line 877) a regular
-//   VMAR transitions to `map = 3` only on the first faulted access:
-//   the kernel allocates a zero-filled page_frame, installs it at the
-//   faulting offset, and bumps `map` to 3. From a v0 test child there
-//   is no syscall in the spec-v3 surface that drives a VMAR into `map
-//   = 3` *without* an actual CPU page fault, and there is no spec'd
-//   faulting helper that a test EC can call to trigger demand-paging
-//   on a VMAR whose base is not yet known to the test code generator.
+// Strategy
+//   To isolate the `map = 3` not-installed gate every earlier §[unmap]
+//   gate must be inert:
+//     - test 01 (invalid VMAR)        — pass a freshly-minted VMAR.
+//     - test 02 (map = 0)             — drive `map` to 3 via a demand
+//                                       fault before issuing `unmap`.
+//     - test 03 (map = 2 + N > 0)     — caps.mmio = 0, never reaches 2.
+//     - tests 04, 05 (map = 1 arms)   — n/a on `map = 3`.
+//     - test 06 (misaligned offset)   — selector we pass is page-
+//                                       aligned (4 KiB).
 //
-//   With `map = 3` unreachable from the test domain, the strict test
-//   07 path — kernel rejects `unmap` with E_NOENT when no demand page
-//   exists at the offered offset selector — cannot be exercised end-
-//   to-end here.
+//   Per §[var]: a regular VMAR (caps.mmio = 0, caps.dma = 0) starts at
+//   `map = 0`; the first faulted access transitions it to `map = 3`
+//   with a demand page installed at the faulting offset. We reserve
+//   two pages (so the VMAR.base + 0x1000 selector is in-range), then
+//   fault at offset 0 only — this yields `map = 3` with a single
+//   demand page at offset 0, and offset 0x1000 left empty.
 //
-//   This smoke pins only the negative observation: a regular VMAR
-//   (caps.mmio = 0, caps.dma = 0) created without explicit mapping
-//   starts in `map = 0` per §[var]; mapping a single page_frame
-//   transitions it to `map = 1` per §[map_pf] test 11 — which is the
-//   wrong arm for test 07 (test 07 is the `map = 3` arm). The smoke
-//   confirms the prelude shape used by the eventual faithful test
-//   but does not assert the rejection itself.
-//
-// Strategy (smoke prelude)
-//   The check ordering ahead of the `map = 3 + missing offset` arm
-//   that test 07 targets is:
-//     - test 01 (VMAR is invalid) — pass a freshly-minted regular VMAR.
-//     - test 02 (map = 0) — must be cleared *before* test 07 can fire;
-//       a freshly-minted VMAR is `map = 0`, so we must transition out
-//       of `map = 0` to even reach later checks. The only transition
-//       reachable from a test child is `map_pf` (0 -> 1) — driving to
-//       `map = 3` requires a CPU demand fault which is unreachable
-//       (see above).
-//     - test 03 (map = 2 + N > 0) — n/a on a `map = 1` VMAR.
-//     - test 04, 05 (map = 1 arm checks) — these *would* fire on a
-//       `map = 1` VMAR with bogus selectors, so the smoke is careful
-//       to issue only valid `map = 1` selectors so the call exits
-//       success rather than crossing into the test 04/05 rejection
-//       paths.
-//   In other words: the only arm of `unmap` reachable from a test
-//   child without a fault driver is the `map = 1` success arm. The
-//   smoke walks 0 -> 1 via map_pf, then unmap removes the install
-//   and `map` returns to 0 (§[unmap] test 10). This is exactly the
-//   arm not covered by test 07, but it is the closest legal prelude
-//   the v0 runner can drive.
+//   With those gates inert, `unmap(var, &.{ 0x1000 })` is the
+//   minimum probe of test 07: 0x1000 is page-aligned (passes the
+//   test 06 gate), in range (page index 1 of a 2-page VMAR), and not
+//   currently demand-allocated. The kernel must return E_NOENT.
 //
 // Action
-//   1. createPageFrame(caps={r, w}, props=0, pages=1) — must succeed.
-//   2. createVmar(caps={r, w}, props={sz=0, cch=0, cur_rwx=0b011},
-//                pages=1, preferred_base=0, device_region=0) —
-//      must succeed; gives a regular VMAR in `map = 0`.
-//   3. mapPf(vmar_handle, &.{ 0, pf }) — transitions map 0 -> 1
-//      (§[map_pf] test 11). Required so that a subsequent unmap call
-//      isn't trivially rejected by §[unmap] test 02 (`map = 0` =>
-//      E_INVAL).
-//   4. unmap(vmar_handle, &.{ pf }) — succeeds on the `map = 1` arm
-//      (§[unmap] test 10): removes the lone installation, `map`
-//      returns to 0. This is *not* the `map = 3` rejection arm test
-//      07 targets — it's the closest legal exercise of the unmap
-//      surface from a v0 test child.
+//   1. createVmar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
+//                pages=2, preferred_base=0, device_region=0). Records
+//                the chosen base in field0 (cvar.v2). Two pages so
+//                offset 0x1000 is a legal in-range probe.
+//   2. Volatile store at VMAR.base[0] — kernel demand-faults; allocates
+//      a zero-filled page at offset 0; `map` bumps from 0 to 3.
+//   3. unmap(var, &.{ 0x1000 }) — page-aligned, in-range, no demand
+//      page installed. Per §[unmap] test 07 must return E_NOENT.
 //
-// Assertion
-//   No spec assertion is being checked — `map = 3` is unreachable
-//   from the v0 test child without a fault driver, so test 07's
-//   `E_NOENT on missing demand offset` arm cannot be reached. Pass
-//   with assertion id 0 to mark this slot as smoke-only in coverage.
-//   Any failure of the prelude itself is also reported as pass-with-
-//   id-0 since no spec assertion is being checked.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner-side fault driver that
-//   can transition a VMAR into `map = 3` without leaving the test EC
-//   in an unrecoverable state. The cleanest path is a runner helper
-//   that issues a load at `VMAR.base + offset_a` from a controlled
-//   trampoline, returns into the test EC with no register clobber,
-//   and leaves `VMAR.map = 3` with exactly one demand-allocated page
-//   installed at offset_a. The action then becomes:
-//     create_vmar(...)              -> regular VMAR, map = 0
-//     <load from VMAR.base + 0>     -> kernel demand-faults a page,
-//                                     VMAR.map -> 3, page at offset 0
-//     unmap(var, &.{ 0x1000 })     -> *expected* E_NOENT via test 07
-//                                     (no demand page at offset
-//                                     0x1000; only offset 0 was
-//                                     faulted in)
-//   This is the assertion id 1 a faithful version would check.
-//
-//   Until the fault driver lands, this file holds the prelude
-//   verbatim so the eventual faithful version can graft on the
-//   demand-fault step without re-deriving the inert-check matrix.
+// Assertions
+//   1: vreg 1 was not E_NOENT after `unmap` with a missing-demand-page
+//      offset on a `map = 3` VMAR (the spec assertion under test).
+//   2: a setup syscall returned an error code, breaking the
+//      success-path precondition.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // page_frame for the prelude's map_pf — drives the VMAR from
-    // map = 0 to map = 1 so that the subsequent unmap is not
-    // rejected by §[unmap] test 02 (map = 0 => E_INVAL).
-    const pf_caps = caps.PfCap{ .r = true, .w = true };
-    const cpf = syscall.createPageFrame(
-        @as(u64, pf_caps.toU16()),
-        0, // props: sz = 0 (4 KiB)
-        1, // pages = 1
-    );
-    if (testing.isHandleError(cpf.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is
-        // being checked, so report pass-with-id-0.
-        testing.pass();
-        return;
-    }
-    const pf: u64 = @as(u64, cpf.v1 & 0xFFF);
-
-    // Regular VMAR (caps.mmio = 0, caps.dma = 0); per §[var] line 877
-    // it starts in `map = 0`. One page suffices — the smoke installs
-    // a single page_frame at offset 0 to walk into `map = 1`.
+    // Step 1: regular VMAR (caps.mmio = 0, caps.dma = 0). Two pages
+    // so the test 07 probe at offset 0x1000 is in-range. cur_rwx =
+    // r|w so the demand store below is permitted by the page-fault
+    // permission check.
     const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = 0b011; // cur_rwx = r|w; sz = 0 (4 KiB); cch = 0
     const cvar = syscall.createVmar(
         @as(u64, vmar_caps.toU16()),
         props,
-        1, // pages = 1
+        2, // pages = 2
         0, // preferred_base = kernel chooses
         0, // device_region = unused (caps.dma = 0)
     );
     if (testing.isHandleError(cvar.v1)) {
-        testing.pass();
+        testing.fail(2);
         return;
     }
     const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_base: u64 = cvar.v2;
 
-    // Drive map 0 -> 1 (§[map_pf] test 11). Required so that the
-    // following unmap is reachable past §[unmap] test 02. The
-    // demand-paging arm (map -> 3) is unreachable without a fault
-    // driver in the test runner.
-    _ = syscall.mapPf(vmar_handle, &.{ 0, pf });
+    // Step 2: drive `map` 0 -> 3 by faulting at offset 0 only. The
+    // volatile store forces a real memory access; the kernel's
+    // page-fault handler runs `demandAlloc` (kernel/memory/vmar.zig
+    // §demandAlloc) and installs a zero-filled page at offset 0.
+    // Offset 0x1000 is left untouched: the test 07 probe expects no
+    // demand page there.
+    const qword_ptr: [*]volatile u64 = @ptrFromInt(vmar_base);
+    qword_ptr[0] = 0;
 
-    // unmap on the `map = 1` arm with a valid installed page_frame
-    // selector — succeeds via §[unmap] test 10, removes the lone
-    // installation, and `map` returns to 0. This is the closest
-    // legal exercise of the unmap surface from a v0 test child;
-    // the `map = 3 + missing offset` rejection arm that test 07
-    // targets is not reachable here.
-    _ = syscall.unmap(vmar_handle, &.{pf});
+    // Step 3: unmap at a page-aligned, in-range offset where no demand
+    // page exists. 0x1000 is the second page of a 2-page VMAR; only
+    // offset 0 was faulted in above. Per §[unmap] test 07 the kernel
+    // must reject with E_NOENT.
+    const result = syscall.unmap(vmar_handle, &.{0x1000});
 
-    // No spec assertion is being checked — the `map = 3` state is
-    // unreachable from the v0 test child without a fault driver.
-    // Pass with assertion id 0 to mark this slot as smoke-only in
-    // coverage.
+    if (result.v1 != @intFromEnum(errors.Error.E_NOENT)) {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
 }
