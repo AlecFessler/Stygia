@@ -1087,10 +1087,16 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // are capped at 256 unique indices, so the test runner's
     // ~481 destroys/rep starve `allocExecutionContext` at ~rep 5.
     if (deferred.caller_ec) |caller_ref| {
+        // caller-pinned: `deferred.cd_ref.ptr` is passed for identity-only
+        // comparison against `ec.pending_reply_domain.ptr` inside
+        // `destroyExecutionContextLocked`; the CD slab slot is already
+        // freed (Phase 1 ran `destroyLocked`) and we only use the raw
+        // pointer value as a key, never deref it.
+        const cd_for_identity = deferred.cd_ref.ptr;
         zag.sched.execution_context.destroyExecutionContextLocked(
             caller_ref.ptr,
             deferred.cd_addr_space_root,
-            deferred.cd_ref.ptr,
+            cd_for_identity,
         );
     }
 

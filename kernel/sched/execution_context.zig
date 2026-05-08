@@ -477,6 +477,11 @@ pub const ExecutionContext = struct {
     /// exit_port has already been cleared. Reused by
     /// `port.cascadeDetachVcpus` as the chaining field for the
     /// post-lock-release destroy walk.
+    /// caller-pinned: list membership pins each EC's slab slot — every
+    /// vCPU on this chain contributes one to `port.bind_refcount`, so
+    /// the slot can't be freed while it's a list node. The list is
+    /// only walked under `p._gen_lock` (insertion/removal) or owned by
+    /// `cascadeDetachVcpus`'s detached snapshot (caller's destroy walk).
     vcpu_list_next: ?*ExecutionContext = null,
 
     /// Per-vCPU arch state cell allocated by `allocVcpuArchState`. On

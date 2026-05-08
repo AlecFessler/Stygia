@@ -919,6 +919,10 @@ pub fn destroyVmar(v: *VMAR) void {
 /// 4 MiB-stack-sized child with multiple VMARs would otherwise eat
 /// thousands of shootdown IPIs per spawn.
 pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
+    // caller-pinned: the only caller is `capability_domain.destroyPhase1`
+    // walking `cd.vars[]` under `cd._gen_lock`; v's `domain` SlabRef
+    // points back at the locked CD, so the slab slot can't be reaped
+    // out from under us.
     const domain = v.domain.ptr;
     const gen = v._gen_lock.currentGen();
     if (v.map == .page_frame or v.map == .demand) {

@@ -268,6 +268,9 @@ pub const Port = struct {
     /// `bind_refcount`; the cascade walk on `recv_refcount → 0`
     /// terminates each bound vCPU before the slab is freed. Mutated
     /// under `_gen_lock` only.
+    /// caller-pinned: every EC on this chain holds a `bind_refcount`
+    /// reference on `self`, and exactly mirrors the same pin running
+    /// the EC's slab slot — list membership keeps both ends alive.
     vcpu_list_head: ?*ExecutionContext = null,
 
     /// Wait queue, holding either suspended senders OR blocked receivers
@@ -1183,10 +1186,15 @@ pub fn finalizePendingVcpus(head: ?*ExecutionContext) void {
     while (cur) |ec| {
         const next = ec.vcpu_list_next;
         ec.vcpu_list_next = null;
+        // caller-pinned: each EC on this detached snapshot holds the
+        // pre-cascade `bind_refcount` contribution and is not yet on
+        // any other reachability path, so its slab slot can't be
+        // reaped before this destroy completes.
+        const ec_dom = ec.domain.ptr;
         execution_context.destroyExecutionContextLocked(
             ec,
-            ec.domain.ptr.addr_space_root,
-            ec.domain.ptr,
+            ec_dom.addr_space_root,
+            ec_dom,
         );
         cur = next;
     }
@@ -1201,6 +1209,11 @@ pub fn finalizePendingVcpus(head: ?*ExecutionContext) void {
 /// `finalizePendingVcpus(pending_vcpus)` to complete the cascade.
 pub const DecResult = struct {
     destroyed: bool,
+    /// caller-pinned: snapshot head detached under `p._gen_lock` from
+    /// `p.vcpu_list_head`; each EC on the chain still holds a kernel
+    /// reference (the pre-cascade `bind_refcount` contribution) until
+    /// `finalizePendingVcpus` destroys it, so the slab slots stay live
+    /// for the duration of the post-lock-release walk.
     pending_vcpus: ?*ExecutionContext,
 };
 

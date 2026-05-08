@@ -285,8 +285,11 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // Diag: print vector + RIP + first byte at RIP for any user fault.
             // Helps catch silent EC terminations from `unreachable` (#UD)
             // and other faults during in-Zag compiler bring-up.
+            // caller-pinned: ec is currentEc() running on this core; its
+            // domain SlabRef stays valid for the fault handler's duration.
+            const dom_root = ec.domain.ptr.addr_space_root;
             const rip_byte: u8 = if (paging_mod.resolveVaddr(
-                ec.domain.ptr.addr_space_root,
+                dom_root,
                 VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF)),
             )) |phys| blk: {
                 const physmap_base = VAddr.fromPAddr(phys, null).addr;
@@ -441,6 +444,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     if (from_user) {
         const ec_for_diag = scheduler.currentEc();
         const vmar_label: []const u8 = if (ec_for_diag) |ec_d| blk: {
+            // caller-pinned: ec_d is currentEc() running on this core; its
+            // domain SlabRef stays valid for the fault handler's duration.
             const cov = vmar.findVmarCovering(ec_d.domain.ptr, VAddr.fromInt(faulting_addr));
             break :blk if (cov) |_| "in-vmar" else "no-vmar";
         } else "no-ec";
@@ -450,6 +455,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         var rip_bytes: [16]u8 = @splat(0);
         if (ec_for_diag) |ec_b| {
             const rip_page = VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF));
+            // caller-pinned: ec_b is currentEc() running on this core; its
+            // domain SlabRef stays valid for the fault handler's duration.
             if (paging_mod.resolveVaddr(ec_b.domain.ptr.addr_space_root, rip_page)) |phys| {
                 const physmap_base = VAddr.fromPAddr(phys, null).addr;
                 const off = ctx.rip & 0xFFF;
