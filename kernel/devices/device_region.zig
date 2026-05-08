@@ -161,10 +161,9 @@ pub const DeviceRegion = extern struct {
     irq_source: u32 = IRQ_SOURCE_NONE,
 
     /// Linker-language: head of the singly-linked list of every
-    /// `KernelHandle` that names this region. Used by
-    /// `propagateIrqAndWake` to bump every domain-local copy of
-    /// `field1.irq_count`. Stored type-erased to avoid a
-    /// caps-module dependency cycle.
+    /// `KernelHandle` that names this region. Used by `onIrq` to bump
+    /// every domain-local copy of `field1.irq_count`. Stored
+    /// type-erased to avoid a caps-module dependency cycle.
     handle_list_head: ?*HandleListNode = null,
 
     /// PCI requester identifier (bus / dev / func). `valid=0` for
@@ -195,9 +194,9 @@ pub const IRQ_SOURCE_NONE: u32 = std.math.maxInt(u32);
 /// inside `KernelHandle` so storage is owned by the handle table itself;
 /// threaded through `next` into the parent region's `handle_list_head`.
 /// `appendHandleListNode` / `removeHandleListNode` mutate the list under
-/// `DeviceRegion._gen_lock`; `propagateIrqAndWake` / `ack` likewise take
-/// the lock when walking so a concurrent CD-destroy unlinking nodes can
-/// not yank `next` out from under the walker.
+/// `DeviceRegion._gen_lock`; `onIrq` / `ack` likewise take the lock when
+/// walking so a concurrent CD-destroy unlinking nodes can not yank
+/// `next` out from under the walker.
 pub const HandleListNode = extern struct {
     field1_paddr: PAddr = .{ .addr = 0 },
     next: ?*HandleListNode = null,
@@ -243,11 +242,39 @@ const DeviceRegionSlab = SecureSlab(DeviceRegion, MAX_DEVICE_REGIONS);
 var device_region_slab: DeviceRegionSlab = undefined;
 var slab_initialized: bool = false;
 
-/// Reverse map: hardware IRQ source → owning DeviceRegion. The IRQ ISR
-/// hits this table from interrupt context, so it is guarded by a
-/// dedicated SpinLock instead of any per-object GenLock — taking a
-/// GenLock from an ISR is forbidden by the kernel's lock ordering.
-var irq_table: [MAX_IRQ_SOURCES]?*DeviceRegion = [_]?*DeviceRegion{null} ** MAX_IRQ_SOURCES;
+/// Per-entry of `irq_table`. Stores the gen captured at bind time
+/// alongside the `*DeviceRegion`, so the ISR can detect a free→realloc
+/// race on the slot before walking the region's handle list. Without
+/// this snapshot, an ISR that resolved `dr` from the table can race
+/// against a concurrent `decHandleRef` to a refcount of zero, observe
+/// the slot get destroyed and recycled (gen bumped twice), and walk
+/// the recycled occupant's `handle_list_head`. With the snapshot the
+/// ISR's `lockWithGen` rejects the stale gen and drops the IRQ silently.
+const IrqTableEntry = extern struct {
+    region: ?*DeviceRegion = null,
+    gen: u32 = 0,
+};
+
+/// Snapshot returned by `findDeviceByIrqSource`. The ISR carries this
+/// across the irq_table_lock release → `dr._gen_lock` acquire window;
+/// `onIrq` validates the gen via `lockWithGenIrqSave` and drops the IRQ
+/// silently on `StaleHandle` (the slot was destroyed and possibly
+/// recycled between resolve and acquire).
+pub const IrqSnapshot = struct {
+    region: *DeviceRegion,
+    gen: u32,
+};
+
+/// Reverse map: hardware IRQ source → (owning DeviceRegion, bind gen).
+/// The IRQ ISR hits this table from interrupt context, so it is
+/// guarded by a dedicated SpinLock — IRQ-context paths cannot take a
+/// `GenLock` first because `decHandleRef` evicts the table entry while
+/// holding `dr._gen_lock`, fixing the lock order to
+/// `dr._gen_lock → irq_table_lock` on the destroy side. The ISR holds
+/// `irq_table_lock` only across the snapshot read, then drops it
+/// before reaching for `dr._gen_lock`, so the same edge is taken in
+/// the same direction.
+var irq_table: [MAX_IRQ_SOURCES]IrqTableEntry = [_]IrqTableEntry{.{}} ** MAX_IRQ_SOURCES;
 var irq_table_lock: SpinLock = .{ .class = "device_region.irq_table" };
 
 /// Boot-time list of DeviceRegions that platform enumerators (PCI scan,
@@ -428,7 +455,7 @@ pub fn decHandleRef(dr: *DeviceRegion, held_irq_state: u64) void {
         const src = dr.irq_source;
         dr.irq_source = IRQ_SOURCE_NONE;
         const irq_irq = irq_table_lock.lockIrqSave(@src());
-        if (src < MAX_IRQ_SOURCES) irq_table[src] = null;
+        if (src < MAX_IRQ_SOURCES) irq_table[src] = .{};
         irq_table_lock.unlockIrqRestore(irq_irq);
     }
 
@@ -439,14 +466,24 @@ pub fn decHandleRef(dr: *DeviceRegion, held_irq_state: u64) void {
     arch.cpu.restoreInterrupts(held_irq_state);
 }
 
-/// O(1) reverse lookup keyed by the hardware IRQ source identifier the
-/// per-arch ISR delivered. Returns null when no region is bound — the
-/// ISR drops the spurious interrupt. Spec §[device_irq].
-pub fn findDeviceByIrqSource(irq_source: u32) ?*DeviceRegion {
+/// O(1) reverse lookup keyed by the kernel-internal IRQ-source key
+/// the per-arch ISR delivered (IOAPIC GSI on x86, `intid - 32` on
+/// aarch64). Returns null when no region is bound — the ISR drops the
+/// spurious interrupt.
+///
+/// The snapshot pairs the resolved `*DeviceRegion` with the gen
+/// captured at bind time. Callers (the per-arch ISR shims) hand the
+/// snapshot to `onIrq`, which validates gen via `lockWithGen` so a
+/// concurrent `decHandleRef` that destroys + recycles the slot in the
+/// resolve→acquire window is rejected cleanly instead of corrupting
+/// the recycled occupant's handle list. Spec §[device_irq].
+pub fn findDeviceByIrqSource(irq_source: u32) ?IrqSnapshot {
     if (irq_source >= MAX_IRQ_SOURCES) return null;
     const irq_irq = irq_table_lock.lockIrqSave(@src());
     defer irq_table_lock.unlockIrqRestore(irq_irq);
-    return irq_table[irq_source];
+    const entry = irq_table[irq_source];
+    const region = entry.region orelse return null;
+    return .{ .region = region, .gen = entry.gen };
 }
 
 /// Acknowledge accumulated IRQs from `dr`: atomically reads the IRQ
@@ -469,7 +506,11 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
     }
 
     if (dr.irq_source == IRQ_SOURCE_NONE) return prior;
-    const line: u8 = @intCast(dr.irq_source & 0xFF);
+    // `irq_source` is the IRQ-source table key (IOAPIC GSI on x86,
+    // `intid - 32` on aarch64). The dispatch shim translates to native
+    // controller geometry; full u32 width survives so GIC SPI lines
+    // beyond the first 256 don't truncate.
+    const line = dr.irq_source;
     irq.endOfInterrupt(line);
     irq.unmaskIrq(line);
     return prior;
@@ -482,36 +523,52 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
 ///      against any of those counters.
 ///
 /// Called from per-arch ISR context. The caller must already have
-/// looked the region up via `findDeviceByIrqSource`. Acquires
-/// `dr._gen_lock` for the handle-list walk so a concurrent
-/// CD-destroy `removeHandleListNodeLocked` cannot unlink a node
-/// whose `next` we're about to dereference.
-pub fn onIrq(dr: *DeviceRegion) void {
-    if (dr.irq_source != IRQ_SOURCE_NONE) {
-        const line: u8 = @intCast(dr.irq_source & 0xFF);
-        irq.maskIrq(line);
-    }
-    propagateIrqAndWake(dr);
-}
+/// looked the region up via `findDeviceByIrqSource`, which paired the
+/// `*DeviceRegion` with the gen captured at bind time. Acquires
+/// `dr._gen_lock` *with the snapshot's gen* for the handle-list walk:
+///
+///   * Closes the resolve→acquire race against a concurrent
+///     `decHandleRef` that destroys + recycles the slot. The slab's
+///     `lockWithGen` rejects the stale gen and we drop the IRQ
+///     silently — same shape as a spurious delivery.
+///   * Closes the CD-destroy `removeHandleListNodeLocked` race; the
+///     mutual exclusion under `dr._gen_lock` keeps `node.next` stable
+///     across the walk.
+///
+/// On `StaleHandle` we deliberately do NOT touch the interrupt
+/// controller (no EOI, no unmask). `decHandleRef`'s `irq_table` evict
+/// runs under the same `dr._gen_lock` it then drops via
+/// `destroyLocked`, so by the time our snapshot is stale the IOAPIC /
+/// GIC entry has been reprogrammed (or torn down) by the destroy
+/// path — this ISR no longer owns the line.
+pub fn onIrq(snapshot: IrqSnapshot) void {
+    const dr = snapshot.region;
+    const drlr = dr._gen_lock.lockWithGenIrqSave(@intCast(snapshot.gen), @src()) catch return;
+    defer dr._gen_lock.unlockIrqRestore(drlr);
 
-/// Step 2+3 of `onIrq`. Walks the per-region handle list; for each
-/// domain-local copy bumps `field1.irq_count` saturating at u64::MAX
-/// via `userio.atomicAddU64Saturating` and futex-wakes every waiter
-/// parked in `futex_wait_val` on that paddr. Idle remote cores
-/// hosting a recv-blocked EC are kicked from inside `futex.wake`
-/// via `scheduler.enqueueOnCore` -> `arch.smp.sendWakeIpi`, so this
-/// path doesn't need its own IPI fan-out.
-///
-/// IRQ-context safety: called with IRQs masked. The taken
-/// `dr._gen_lock` and `futex.wake`'s `Bucket.lock` (taken via
-/// `lockIrqSaveOrdered`, which preserves the masked state) both
-/// nest correctly under the existing `dr._gen_lock → futex.Bucket.lock`
-/// ordering used by `decHandleRef` / `irq_table_lock` evictions.
-///
-/// Spec §[device_irq] steps 1+3.
-pub fn propagateIrqAndWake(dr: *DeviceRegion) void {
-    const irq_state = dr._gen_lock.lockIrqSave(@src());
-    defer dr._gen_lock.unlockIrqRestore(irq_state);
+    // Step 1: mask the line at the controller before walking the handle
+    // list, so a level-sensitive line cannot re-pend before userspace
+    // calls `ack`. `irq_source` was captured under the same lock that
+    // gated this entry's bind, so it's stable for the held window.
+    if (dr.irq_source != IRQ_SOURCE_NONE) {
+        irq.maskIrq(dr.irq_source);
+    }
+
+    // Steps 2+3: walk the per-region handle list; for each domain-local
+    // copy bump `field1.irq_count` saturating at u64::MAX via
+    // `userio.atomicAddU64Saturating` and futex-wake every waiter parked
+    // in `futex_wait_val` on that paddr. Idle remote cores hosting a
+    // recv-blocked EC are kicked from inside `futex.wake` via
+    // `scheduler.enqueueOnCore` -> `arch.smp.sendWakeIpi`, so this
+    // path doesn't need its own IPI fan-out.
+    //
+    // IRQ-context safety: called with IRQs masked by the per-arch ISR.
+    // `futex.wake`'s `Bucket.lock` (taken via `lockIrqSaveOrdered`,
+    // which preserves the masked state) nests correctly under the
+    // existing `dr._gen_lock → futex.Bucket.lock` ordering used by
+    // `decHandleRef` / `irq_table_lock` evictions.
+    //
+    // Spec §[device_irq] steps 1+3.
     var cursor = dr.handle_list_head;
     while (cursor) |node| {
         _ = userio.atomicAddU64Saturating(node.field1_paddr, 1, std.math.maxInt(u64));

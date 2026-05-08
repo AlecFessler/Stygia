@@ -660,7 +660,7 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             // mmio: base_paddr>>12 (4-51), size_pages (52-63). field1
             // = irq_count, owned by the IRQ handler — it propagates
             // increments directly to each copy's `field1` paddr via
-            // `propagateIrqAndWake`. Refresh must NOT clobber it (would
+            // `device_region.onIrq`. Refresh must NOT clobber it (would
             // race with concurrent IRQs and erase coalesced counts not
             // yet ack'd by userspace).
             var field0: u64 = @intFromEnum(dr.device_type);

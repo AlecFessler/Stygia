@@ -1,3 +1,4 @@
+const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
@@ -34,6 +35,44 @@ var spurious_interrupts: u64 = 0;
 /// I/O APIC MMIO base virtual address. Set during ACPI parsing.
 var ioapic_base: u64 = 0;
 var ioapic_lock: SpinLock = .{ .class = "irq.ioapic_lock" };
+
+/// Vector → GSI translation. `deviceIrqHandler` consults this table to
+/// recover the IOAPIC pin (= the kernel-internal `irq_source` key the
+/// device_region table is indexed on) from the LAPIC vector the CPU
+/// delivered. Populated by `bindVectorToGsi` when an IOAPIC redirection
+/// entry is programmed; unbound vectors hold `VECTOR_GSI_NONE` so a
+/// stray delivery on an unprogrammed vector lands as a silent drop in
+/// `findDeviceByIrqSource` instead of mis-keying into pin 0.
+///
+/// Sized for the 256-entry x86 vector space; entries 0-31 (architectural
+/// exceptions) are unused. Reads from `deviceIrqHandler` are unsynchronized
+/// monotonic loads — once `bindVectorToGsi` publishes a GSI, the binding
+/// is stable for the lifetime of the IOAPIC entry, and the device IRQ that
+/// observes it has by construction been programmed by that bind. Writes
+/// take `ioapic_lock` so concurrent rebinds against the same vector
+/// serialize against IOAPIC programming.
+const VECTOR_GSI_NONE: u32 = std.math.maxInt(u32);
+var vector_to_gsi: [256]u32 = [_]u32{VECTOR_GSI_NONE} ** 256;
+
+/// Publish a vector→GSI binding for `deviceIrqHandler`. Called from the
+/// IOAPIC redirection-entry programmer immediately after writing the
+/// vector field of a redirection-table entry, while `ioapic_lock` is
+/// already held by the programmer. The binding stays in effect until
+/// the entry is masked + reprogrammed; rebinds simply overwrite the
+/// slot. Out-of-range vectors are silently ignored — the call site is
+/// inside the IOAPIC programmer, which already constrains vector to
+/// the 32..255 device range.
+pub fn bindVectorToGsi(vector: u8, gsi: u32) void {
+    vector_to_gsi[vector] = gsi;
+}
+
+/// Drop a previously-published vector→GSI binding. Called from the
+/// IOAPIC redirection-entry programmer when an entry is decommissioned
+/// (mask + zero) so a subsequent stray delivery on the orphaned vector
+/// can't index a stale GSI back into the device_region table.
+pub fn unbindVector(vector: u8) void {
+    vector_to_gsi[vector] = VECTOR_GSI_NONE;
+}
 
 /// Sets up IDT gates for hardware IRQs, the spurious interrupt vector, the TLB
 /// shootdown IPI vector, and the scheduler timer vector.
@@ -149,13 +188,26 @@ pub fn init() void {
 /// to the generic `device_region.onIrq` path which masks the line, bumps
 /// every domain-local copy of `field1.irq_count`, and futex-wakes
 /// waiters per Spec §[device_irq].
+///
+/// The device_region IRQ-source table is keyed on the IOAPIC pin (GSI),
+/// NOT the LAPIC vector. The IOAPIC redirection-entry programmer
+/// publishes the vector→GSI binding via `bindVectorToGsi` at the same
+/// time it programs the redirection entry; this handler reads it back
+/// through `vector_to_gsi`. Stray deliveries on unprogrammed vectors
+/// (`VECTOR_GSI_NONE`) drop silently — same shape as a spurious IRQ.
+///
+/// This matches the aarch64 contract (`exceptions.dispatchIrq` stores
+/// `intid - 32` as the table key, the dispatch shim adds 32 back when
+/// poking the GIC), keeping `dispatch.irq.maskIrq` / `unmaskIrq` /
+/// `endOfInterrupt` arch-uniform: the kernel-internal key on both
+/// arches is "the index into the IRQ-source table", and the shim
+/// translates to native controller geometry.
 fn deviceIrqHandler(ctx: *cpu.Context) void {
-    // The vector number is embedded in the Context by the interrupt stub.
-    // The IRQ source identifier the device_region table is keyed on is
-    // the LAPIC vector itself.
     const vector: u8 = @truncate(ctx.int_num);
-    const dr = device_region.findDeviceByIrqSource(vector) orelse return;
-    device_region.onIrq(dr);
+    const gsi = vector_to_gsi[vector];
+    if (gsi == VECTOR_GSI_NONE) return;
+    const snapshot = device_region.findDeviceByIrqSource(gsi) orelse return;
+    device_region.onIrq(snapshot);
 }
 
 /// Intel SDM Vol 3A, §13.9 — spurious interrupt handler must return without EOI
@@ -274,14 +326,27 @@ pub fn programIoapicNmi(gsi: u32, bsp_apic_id: u32) bool {
     return true;
 }
 
+/// Maximum IOAPIC redirection-table entry index. The legacy ISA-era
+/// IOAPIC exposes 24 entries (pins 0..23); modern chips can expose up
+/// to 240 but Zag's testbed targets the ISA layout, and out-of-range
+/// `irq_line` values would write into unrelated IOAPIC registers. The
+/// gate here is defensive in depth: callers should already have mapped
+/// device IRQs through a vector→GSI translation that yields a sane
+/// pin index.
+const IOAPIC_MAX_PIN: u32 = 240;
+
 /// Mask an IRQ line by setting bit 16 (interrupt mask) of the low dword of
-/// the I/O APIC redirection table entry for the given IRQ.
+/// the I/O APIC redirection table entry for the given IRQ. `irq_line` is
+/// the IOAPIC pin / GSI (NOT the LAPIC vector — the device_region table
+/// is keyed on the GSI, and `deviceIrqHandler` translates vector→GSI
+/// before dispatching `maskIrq`).
 /// 82093AA I/O APIC Datasheet, §3.2.4 "I/O Redirection Table Registers" —
 /// bit 16 of the low dword is the Interrupt Mask bit; 1 = masked.
 /// Redirection table entry n occupies registers 0x10+2n (low) and 0x11+2n (high).
-pub fn maskIrq(irq_line: u8) void {
+pub fn maskIrq(irq_line: u32) void {
     if (ioapic_base == 0) return;
-    const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
+    if (irq_line >= IOAPIC_MAX_PIN) return;
+    const reg = @as(u32, 0x10) + irq_line * 2;
     const irq_state = ioapic_lock.lockIrqSave(@src());
     const val = ioapicRead(reg);
     ioapicWrite(reg, val | (1 << 16));
@@ -289,12 +354,14 @@ pub fn maskIrq(irq_line: u8) void {
 }
 
 /// Unmask an IRQ line by clearing bit 16 (interrupt mask) of the low dword of
-/// the I/O APIC redirection table entry for the given IRQ.
+/// the I/O APIC redirection table entry for the given IRQ. `irq_line`
+/// is the IOAPIC pin / GSI; see `maskIrq` for the vector→GSI contract.
 /// 82093AA I/O APIC Datasheet, §3.2.4 "I/O Redirection Table Registers" —
 /// bit 16 of the low dword is the Interrupt Mask bit; 0 = unmasked.
-pub fn unmaskIrq(irq_line: u8) void {
+pub fn unmaskIrq(irq_line: u32) void {
     if (ioapic_base == 0) return;
-    const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
+    if (irq_line >= IOAPIC_MAX_PIN) return;
+    const reg = @as(u32, 0x10) + irq_line * 2;
     const irq_state = ioapic_lock.lockIrqSave(@src());
     const val = ioapicRead(reg);
     ioapicWrite(reg, val & ~@as(u32, 1 << 16));

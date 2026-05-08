@@ -1041,15 +1041,15 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             // Spec §[device_irq].
             //
             // The `irq_source` keyed in the device-region table is the
-            // 8-bit IRQ line — the same value the per-arch shim in
-            // `arch/dispatch/irq.zig` accepts. On aarch64 that shim
-            // adds 32 to recover the GIC INTID, so the SPI line bound
-            // to INTID `N` is registered as `N - 32`. This matches the
-            // x64 contract (`arch/x64/irq.zig deviceIrqHandler`) where
-            // the LAPIC vector is the table key, and lets the shared
-            // `device_region.ack` / `device_region.onIrq` paths route
-            // mask / EOI / unmask through `arch.dispatch.irq`
-            // unchanged.
+            // SPI line offset (`intid - 32`), full u32 width so SPI
+            // INTIDs up to 1019 (line up to 987) survive without
+            // truncation. The per-arch shim in `arch/dispatch/irq.zig`
+            // adds 32 back when poking the GIC. The x86 side keys on
+            // the IOAPIC pin (GSI) — `arch/x64/irq.zig deviceIrqHandler`
+            // translates LAPIC vector → GSI before calling
+            // `findDeviceByIrqSource`, so the table contract is
+            // arch-uniform: "kernel-internal IRQ-source key, controller
+            // geometry handled by the shim".
             //
             // EOI sequencing: `handleIrqLowerEl` /
             // `handleIrqCurrentEl` already wrote ICC_EOIR1_EL1 (GICv3)
@@ -1068,9 +1068,9 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             // INTIDs above the SPI range that aren't otherwise
             // handled fall through to the original diagnostic.
             if (intid >= 32 and intid - 32 < device_region.MAX_IRQ_SOURCES) {
-                const line: u8 = @intCast(intid - 32);
-                if (device_region.findDeviceByIrqSource(line)) |dr| {
-                    device_region.onIrq(dr);
+                const line: u32 = intid - 32;
+                if (device_region.findDeviceByIrqSource(line)) |snapshot| {
+                    device_region.onIrq(snapshot);
                     return;
                 }
             }
