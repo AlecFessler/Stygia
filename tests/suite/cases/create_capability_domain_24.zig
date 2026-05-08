@@ -4,78 +4,51 @@
 //  caller's handle table after the call."
 //
 // Strategy
-//   Pre-condition: this test runs as a child capability domain spawned
-//   by the runner primary. The runner grants the child enough rights
-//   for the setup we need: `crcd` (so create_capability_domain itself
-//   doesn't return E_PERM via test 01), `crpt` (to mint a donor port),
-//   and ceilings broad enough to satisfy tests 02-12.
+//   The post-condition only fires on a *successful* call. The pre-v3
+//   shape of this test built a tiny inline ELF that lacked PT_DYNAMIC,
+//   which §[create_capability_domain] [test 16a] correctly rejects
+//   with E_INVAL — the call never succeeded and the move=1 invariant
+//   was never exercised. A working full ELF is already in our hand:
+//   the runner forwards this test's own ELF page frame at
+//   SLOT_TEST_ELF_PF (= 4) for exactly the parent-spawn-child pattern
+//   used by tests like create_capability_domain_31. We reuse it as
+//   `[4]` here, so the call lands on the success path, and the
+//   move=1 post-condition becomes assertable cleanly.
 //
-//   To exercise test 24 we need a passed-handle entry whose source
-//   handle:
-//     - exists in the caller's table (avoids E_BADCAP / test 14),
-//     - has `move` in its current caps (otherwise the kernel rejects
-//       a `move = 1` transfer per §[handle_attachments] test 04),
-//     - has caps that are a strict superset of (or equal to) the
-//       caps requested in the entry (test 03 of handle_attachments).
+//   Donor: a fresh port handle minted by `create_port` with
+//   `{move, copy, xfer, recv, bind, suspend}`. We pass it with
+//   `caps = {xfer, bind}` and `move = 1` so the entry sits cleanly
+//   inside the move=1 sweet spot of §[handle_attachments] [test 04].
 //
-//   A freshly-created port with `{move, copy, xfer, bind}` satisfies
-//   all three. We request the entry with caps `{xfer, bind}` and
-//   `move = 1` so it sits cleanly inside test 24's sweet spot.
+//   Probe: spec §[capabilities] `restrict` test 03 establishes that
+//   restricting on a vacated slot returns E_BADCAP. With `new_caps =
+//   0` the call is unambiguous: any prior caps subset the request,
+//   reserved bits are clean, so the only reject path that fires on
+//   a released slot is E_BADCAP.
 //
-//   We then issue `create_capability_domain`. On a working kernel the
-//   call succeeds and §[create_capability_domain] test 24 mandates
-//   that the donor port slot is released from our table. We probe the
-//   slot with `restrict(donor, 0)`:
-//     - new caps = 0 is a subset of any prior caps, so no E_PERM,
-//     - reserved bits are clean, so no E_INVAL,
-//     - the slot is the only state restrict touches,
-//   leaving E_BADCAP as the spec-mandated post-condition for a
-//   released slot (cf. §[capabilities] delete test 03, which uses the
-//   same probe pattern).
-//
-// DEGRADED — ELF body unavailable in v0
-//   The runner stages each test's own ELF via build-time @embedFile
-//   into the primary's manifest, but a test ELF cannot embed a second
-//   inner ELF without recursive build coupling that does not yet
-//   exist. We provision an `elf_page_frame` of plausible size with
-//   uninitialized backing pages; on a real kernel that page frame's
-//   bytes do not parse as an ELF header and the call short-circuits
-//   to E_INVAL via §[create_capability_domain] test 15 before any
-//   handle-table mutation happens.
-//
-//   The spec line under test only fires on a *successful* call, so
-//   the assertion this test wants to make is unreachable until the
-//   harness can supply a valid inner ELF. Until then, we still issue
-//   the call so the syscall path is exercised end-to-end, and we
-//   defensively assert the post-condition that the working-kernel
-//   path requires. On the v0 kernel (which fails the call) this test
-//   reports a fail at assertion id 3; that is the expected degraded
-//   behavior and matches the same "needs full kernel" gating other
-//   complete-success tests will share.
+//   Child path: the spawned sub-domain re-enters this same ELF. We
+//   discriminate parent vs. child by reading the caller's own
+//   self-handle field0 `cridc_ceiling` (bits 24-31). The runner
+//   installs 0x3F; the parent path passes a strict-subset 0x07 to
+//   the sub-domain so the child branch can detect itself and silently
+//   return — the runner's libz `_start` then issues
+//   delete(SLOT_SELF) and the child CD tears down. No report from
+//   the child; the parent is the sole reporter.
 //
 // Action
-//   1. create_port(caps = {move, copy, xfer, bind}) — must succeed
-//   2. create_page_frame(2 pages of 4 KiB)          — must succeed
-//        (sized to comfortably exceed an ELF header so test 16's
-//        size-mismatch path is not what fires; isolates failure to
-//        test 15's malformed-header path on the v0 stub kernel)
-//   3. create_capability_domain(
-//        self_caps   = a strict subset of the runner-granted self caps,
-//        ceilings_in = subset of the caller's inner ceilings,
-//        ceilings_out= subset of the caller's outer ceilings,
-//        elf_pf      = pf from step 2,
-//        passed[0]   = { id = port, caps = {xfer, bind}, move = 1 },
-//      )                                             — must succeed
-//   4. restrict(port, 0)                             — must return E_BADCAP
+//   parent path:
+//     1. create_port(...) — donor with full caps                  — must succeed
+//     2. createCapabilityDomain(... [4] = SLOT_TEST_ELF_PF,
+//        passed = [donor, caps={xfer,bind}, move=1])              — must succeed
+//     3. restrict(donor, 0)                                        — must return E_BADCAP
+//   child path:
+//     - silent return; libz `_start` reaps the CD via delete(SLOT_SELF)
 //
 // Assertions
-//   1: create_port returned an error word (donor setup failed)
-//   2: create_page_frame returned an error word (ELF carrier failed)
-//   3: create_capability_domain did not return success in vreg 1
-//      (DEGRADED: fires on v0 due to missing inner ELF; see note above)
-//   4: post-call restrict on the donor port did not return E_BADCAP,
-//      i.e., the kernel did not remove the `move = 1` source from
-//      the caller's table
+//   1: create_port returned an error word
+//   2: createCapabilityDomain returned an error word in vreg 1
+//   3: post-call restrict on the donor port did not return E_BADCAP
+//      ← THE SPEC ASSERTION
 
 const lib = @import("lib");
 
@@ -84,116 +57,42 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-const SIZEOF_EHDR64: usize = 64;
-const SIZEOF_PHDR64: usize = 56;
-const PAGE_SIZE: usize = 4096;
+const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
+const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
+const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
-fn writeU16(dst: [*]volatile u8, off: usize, v: u16) void {
-    dst[off + 0] = @truncate(v & 0xFF);
-    dst[off + 1] = @truncate((v >> 8) & 0xFF);
-}
-
-fn writeU32(dst: [*]volatile u8, off: usize, v: u32) void {
-    dst[off + 0] = @truncate(v & 0xFF);
-    dst[off + 1] = @truncate((v >> 8) & 0xFF);
-    dst[off + 2] = @truncate((v >> 16) & 0xFF);
-    dst[off + 3] = @truncate((v >> 24) & 0xFF);
-}
-
-fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
-    var i: usize = 0;
-    while (i < 8) {
-        dst[off + i] = @truncate((v >> @as(u6, @intCast(i * 8))) & 0xFF);
-        i += 1;
-    }
-}
-
-fn writeMinimalElf(dst: [*]volatile u8) void {
-    var i: usize = 0;
-    while (i < PAGE_SIZE) {
-        dst[i] = 0;
-        i += 1;
-    }
-    dst[0] = 0x7F;
-    dst[1] = 'E';
-    dst[2] = 'L';
-    dst[3] = 'F';
-    dst[4] = 2; // ELFCLASS64
-    dst[5] = 1; // ELFDATA2LSB
-    dst[6] = 1; // EV_CURRENT
-    dst[7] = 0;
-
-    const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
-
-    writeU16(dst, 0x10, 3); // ET_DYN
-    writeU16(dst, 0x12, 62); // EM_X86_64
-    writeU32(dst, 0x14, 1);
-    writeU64(dst, 0x18, entry_off);
-    writeU64(dst, 0x20, SIZEOF_EHDR64); // e_phoff
-    writeU64(dst, 0x28, 0);
-    writeU32(dst, 0x30, 0);
-    writeU16(dst, 0x34, SIZEOF_EHDR64);
-    writeU16(dst, 0x36, SIZEOF_PHDR64);
-    writeU16(dst, 0x38, 1); // e_phnum
-    writeU16(dst, 0x3A, 0);
-    writeU16(dst, 0x3C, 0);
-    writeU16(dst, 0x3E, 0);
-
-    const ph: usize = SIZEOF_EHDR64;
-    writeU32(dst, ph + 0x00, 1); // PT_LOAD
-    writeU32(dst, ph + 0x04, 4 | 1); // PF_R | PF_X
-    writeU64(dst, ph + 0x08, 0);
-    writeU64(dst, ph + 0x10, 0);
-    writeU64(dst, ph + 0x18, 0);
-    writeU64(dst, ph + 0x20, PAGE_SIZE);
-    writeU64(dst, ph + 0x28, PAGE_SIZE);
-    writeU64(dst, ph + 0x30, PAGE_SIZE);
-
-    // Self-destruct stub at e_entry: invoke `delete(SLOT_SELF)` so the
-    // child capability domain tears itself down and its slab slot
-    // returns to the freelist. Without this the child stays alive
-    // indefinitely (per spec §[delete] capability_domain IDC handle
-    // drops do NOT terminate the bound domain — only an in-domain
-    // delete(SLOT_SELF) does), and ~10 reps of the test runner exhaust
-    // the CD slab class and wedge the timer_rearm tail of the run.
-    //
-    // x86-64 instruction stream (matches libz/syscall_x64.zig
-    // issueRegDiscard):
-    //   xor    %eax, %eax            ; v1 = SLOT_SELF (= 0)
-    //   mov    $0x10, %ecx            ; syscall_word = delete (num 16)
-    //   sub    $0x10, %rsp            ; reserve vreg-0 slot
-    //   mov    %rcx, (%rsp)           ; [rsp] = syscall_word
-    //   syscall                        ; → kernel deleteAndDetach
-    //   hlt                            ; unreachable on success
-    //   jmp    -1                       ; pin the EC if syscall ever returns
-    const child_stub = [_]u8{
-        0x31, 0xC0, // xor %eax, %eax
-        0xB9, 0x10, 0x00, 0x00, 0x00, // mov $0x10, %ecx
-        0x48, 0x83, 0xEC, 0x10, // sub $0x10, %rsp
-        0x48, 0x89, 0x0C, 0x24, // mov %rcx, (%rsp)
-        0x0F, 0x05, // syscall
-        0xF4, // hlt (unreachable on success)
-        0xEB, 0xFD, // jmp -3 (back to hlt)
-    };
-    var ci: usize = 0;
-    while (ci < child_stub.len) : (ci += 1) {
-        dst[entry_off + ci] = child_stub[ci];
-    }
-}
+// Strict-subset cridc_ceiling for the spawned sub-domain. Distinct
+// from the runner-installed 0x3F so the child path can detect itself
+// via the field0 cridc_ceiling byte.
+const CHILD_CRIDC: u8 = 0x07;
 
 pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+    const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
+    // §[capability_domain] Self handle field0: cridc_ceiling at bits 24-31.
+    const my_cridc_ceiling: u8 = @truncate((self_cap.field0 >> 24) & 0xFF);
 
-    // Step 1 — donor port with full move + xfer caps. `recv` is
-    // required by create_port's structural rule (must include `recv`
-    // and one of `{suspend, bind}`); the donor's downstream cap subset
-    // for the passed-handle entry below is unaffected.
+    if (my_cridc_ceiling != 0x3F) {
+        // ── Child path ──────────────────────────────────────────────
+        // We're the spawned sub-domain. Test 24's assertion lives in
+        // the parent (it observes the caller's own table); the child
+        // has no work to do. Returning lets libz `_start` invoke
+        // delete(SLOT_SELF) so the CD slab slot returns to the
+        // freelist.
+        return;
+    }
+
+    // ── Parent path ─────────────────────────────────────────────────
+
+    // Step 1 — donor port. Full caps so the move=1 transfer with
+    // requested caps {xfer, bind} sits cleanly inside test 24's
+    // sweet spot.
     const donor_caps = caps.PortCap{
         .move = true,
         .copy = true,
         .xfer = true,
         .recv = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const cp = syscall.createPort(@as(u64, donor_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
@@ -202,97 +101,103 @@ pub fn main(cap_table_base: u64) void {
     }
     const donor: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2 — page frame to act as elf_page_frame. One 4 KiB page is
-    // sufficient for a minimal valid ELF (Ehdr + one Phdr + entry).
-    const pf_caps = caps.PfCap{ .move = true, .copy = true, .r = true, .w = true, .x = true };
-    const cpf = syscall.createPageFrame(
-        @as(u64, pf_caps.toU16()),
-        0, // props.sz = 0 (4 KiB)
-        1,
-    );
-    if (testing.isHandleError(cpf.v1)) {
-        testing.fail(2);
-        return;
-    }
-    const elf_pf: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
-
-    // Stage the ELF into a writable VMAR mapping of the page frame
-    // (the kernel reads the page frame contents through physmap).
-    const stage_var_caps = caps.VmarCap{ .r = true, .w = true };
-    const cvar = syscall.createVmar(
-        @as(u64, stage_var_caps.toU16()),
-        0b011,
-        1,
-        0,
-        0,
-    );
-    if (testing.isHandleError(cvar.v1)) {
-        testing.fail(2);
-        return;
-    }
-    const stage_var: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
-    const stage_base: u64 = cvar.v2;
-    const map = syscall.mapPf(stage_var, &.{ 0, elf_pf });
-    if (map.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(2);
-        return;
-    }
-    const dst: [*]volatile u8 = @ptrFromInt(stage_base);
-    writeMinimalElf(dst);
-    _ = syscall.delete(stage_var);
-
-    // Step 3 — child self caps. Subset of what the runner grants this
-    // test domain (see runner/primary.zig spawnOne).
+    // Step 2 — spawn a sub-domain using the runner-forwarded test ELF
+    // as `[4]`. Mirror runner/primary.zig's child_self caps so libz
+    // bootstrap (crvr) succeeds; the child takes the silent-return
+    // branch above.
     const child_self = caps.SelfCap{
-        .crpt = true,
+        .crec = true,
+        .crvr = true,
+        .pri = 3,
     };
-    const self_caps_word: u64 = @as(u64, child_self.toU16());
 
-    // ceilings_inner (field0) — subset of the runner-granted ceilings.
-    //   bits  0-7   ec_inner_ceiling   = 0x00 (no EC ops needed)
-    //   bits  8-23  vmar_inner_ceiling  = 0x0000
-    //   bits 24-31  cridc_ceiling      = 0x00
-    //   bits 32-39  pf_ceiling         = 0x00
-    //   bits 40-47  vm_ceiling         = 0x00
-    //   bits 48-55  port_ceiling       = 0x1C (xfer/recv/bind)
-    //   bits 56-63  _reserved          = 0
-    const ceilings_inner: u64 = 0x001C_0000_0000_0000;
+    // §[create_capability_domain] [2] ceilings_inner sub-fields:
+    //   bits  0-7   ec_inner_ceiling   = 0xFF   (matches runner)
+    //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
+    //   bits 24-31  cridc_ceiling      = CHILD_CRIDC (discriminator)
+    //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
+    //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
+    //   bits 48-55  port_ceiling       = 0x5C  (matches runner)
+    const ceilings_inner: u64 =
+        @as(u64, 0xFF) |
+        (@as(u64, 0x01FF) << 8) |
+        (@as(u64, CHILD_CRIDC) << 24) |
+        (@as(u64, 0x1F) << 32) |
+        (@as(u64, 0x01) << 40) |
+        (@as(u64, 0x5C) << 48);
 
-    // ceilings_outer (field1) — also a clean subset.
-    //   bits  0-7   ec_outer_ceiling          = 0
-    //   bits  8-15  vmar_outer_ceiling         = 0
-    //   bits 16-31  restart_policy_ceiling    = 0
-    //   bits 32-37  fut_wait_max              = 0
-    //   bits 38-63  _reserved                 = 0
-    const ceilings_outer: u64 = 0;
+    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 
-    // The passed-handle entry we are exercising. PassedHandle's u64
-    // bit layout matches §[create_capability_domain] [4+] verbatim.
-    const passed_entry = caps.PassedHandle{
-        .id = donor,
-        .caps = (caps.PortCap{ .xfer = true, .bind = true }).toU16(),
-        .move = true,
+    // Standard pass-through: result port (so the child *could* report,
+    // even though it doesn't), the test ELF pf (forwarded for symmetry),
+    // the libz pf (mandatory for child `_start` libz bootstrap), and
+    // the donor port we are exercising the move=1 transfer on.
+    const port_caps_word = (caps.PortCap{
+        .xfer = true,
+        .bind = true,
+        .@"suspend" = true,
+    }).toU16();
+    const pf_caps_word = (caps.PfCap{
+        .r = true,
+    }).toU16();
+    const libz_pf_cap = caps.readCap(cap_table_base, SLOT_LIBZ_PF);
+    const libz_pf_id = libz_pf_cap.id();
+    const libz_pf_caps_word = (caps.PfCap{
+        .r = true,
+        .x = true,
+    }).toU16();
+    // The donor entry under test: caps {xfer, bind} (subset of donor's
+    // current caps, satisfying §[handle_attachments] [test 03]) and
+    // move = 1 (donor's `move` cap is set, satisfying [test 04]).
+    const donor_passed_caps_word = (caps.PortCap{
+        .xfer = true,
+        .bind = true,
+    }).toU16();
+    const passed: [4]u64 = .{
+        (caps.PassedHandle{
+            .id = SLOT_RESULT_PORT,
+            .caps = port_caps_word,
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = SLOT_TEST_ELF_PF,
+            .caps = pf_caps_word,
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = libz_pf_id,
+            .caps = libz_pf_caps_word,
+            .move = false,
+        }).toU64(),
+        (caps.PassedHandle{
+            .id = donor,
+            .caps = donor_passed_caps_word,
+            .move = true,
+        }).toU64(),
     };
-    const passed: [1]u64 = .{passed_entry.toU64()};
 
-    const ccd = syscall.createCapabilityDomain(self_caps_word, ceilings_inner, ceilings_outer, elf_pf, 0, // initial_ec_affinity
-        passed[0..]);
-
-    // On a working kernel with a valid ELF body this is OK. On the
-    // v0 stub kernel with no ELF body it is E_INVAL (test 15).
-    // Either way the test 24 assertion below is what we are after.
-    if (testing.isHandleError(ccd.v1)) {
-        testing.fail(3);
+    const r = syscall.createCapabilityDomain(
+        @as(u64, child_self.toU16()),
+        ceilings_inner,
+        ceilings_outer,
+        SLOT_TEST_ELF_PF,
+        0, // initial_ec_affinity = any core
+        passed[0..],
+    );
+    if (testing.isHandleError(r.v1)) {
+        testing.fail(2);
         return;
     }
 
-    // Step 4 — probe the donor slot. After a successful call with
-    // `move = 1`, the donor's slot must be released; restrict on a
-    // released slot returns E_BADCAP (cf. §[capabilities] delete
-    // test 03).
+    // Step 3 — probe the donor slot. After a successful call with
+    // move = 1, the donor's slot must be released; restrict on a
+    // released slot returns E_BADCAP (cf. §[capabilities] restrict
+    // test 03). `new_caps = 0` is a subset of any prior caps, so no
+    // E_PERM, and reserved bits are clean, so no E_INVAL — the only
+    // remaining reject is E_BADCAP.
     const probe = syscall.restrict(donor, 0);
     if (probe.v1 != @intFromEnum(errors.Error.E_BADCAP)) {
-        testing.fail(4);
+        testing.fail(3);
         return;
     }
 
