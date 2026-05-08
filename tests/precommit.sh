@@ -178,7 +178,7 @@ stage_gen_lock_analyzer() {
     fi
     ensure_callgraph_db || return 1
     local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
-    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --summary); then
+    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
         FAILURES+=("gen-lock analyzer findings")
         return 1
     fi

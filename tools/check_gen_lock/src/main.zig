@@ -265,7 +265,7 @@ const State = struct {
 
 // ── DB loaders ─────────────────────────────────────────────────────────
 
-fn loadFiles(db: *sqlite.Db, st: *State) !void {
+fn loadFiles(db: *sqlite.Db, st: *State, target: ?[]const u8) !void {
     const a = st.arena.allocator();
     var stmt = try db.prepare("SELECT id, path, source FROM file ORDER BY id", st.gpa);
     defer stmt.finalize();
@@ -287,6 +287,37 @@ fn loadFiles(db: *sqlite.Db, st: *State) !void {
             if (mem.startsWith(u8, path, pfx)) { is_non_kernel = true; break; }
         }
         if (is_non_kernel) continue;
+        // libz/ is userspace (a libc-style library that runs in user context
+        // with its own non-IRQ-saving SpinLock). It's pulled into the DB via
+        // `--extra-source-root libz` so the dead-code analyzer can see cross-
+        // references, but its locks are NOT subject to the kernel's IRQ
+        // discipline and would otherwise be conflated with kernel lock-classes
+        // sharing field names (e.g. `self.lock`). Always exclude it from gen-
+        // lock analysis. We check both `libz/` (raw indexer prefix) and
+        // `kernel/libz/` (defensive — in case future indexer tweaks reroot
+        // the path).
+        if (mem.startsWith(u8, path, "libz/") or
+            mem.startsWith(u8, path, "kernel/libz/")) continue;
+        if (target) |t| {
+            // `--target kernel` includes the raw kernel tree (no prefix in
+            // the DB) plus any path already rooted at `kernel/`. For any
+            // other target, require the literal `<target>/` prefix on the
+            // raw DB path.
+            if (mem.eql(u8, t, "kernel")) {
+                // Default `is_non_kernel` filter above already excludes the
+                // userspace trees pulled in via --extra-source-root. Kernel
+                // files in the DB are stored relative to the kernel root
+                // (e.g. `syscall/var.zig`) — they pass through here.
+                // Nothing further to do.
+            } else {
+                const want_pfx = t;
+                // Build "<target>/" without an allocator: compare prefix
+                // and require a path separator immediately after.
+                if (!mem.startsWith(u8, path, want_pfx) or
+                    path.len <= want_pfx.len or
+                    path[want_pfx.len] != '/') continue;
+            }
+        }
         const src = stmt.columnBlob(2) orelse "";
         // Indexer stores paths relative to the kernel root (e.g.
         // `syscall/var.zig`). Prepend `kernel/` when missing so the
@@ -1876,6 +1907,7 @@ const Args = struct {
     verbose: bool = false,
     entry_filter: ?[]const u8 = null,
     rule_filter: ?[]const u8 = null,
+    target: ?[]const u8 = null,
     print_help: bool = false,
     list_slab_types: bool = false,
 };
@@ -1896,6 +1928,8 @@ fn parseArgs(gpa: Allocator) !Args {
             if (it.next()) |v| args.entry_filter = v;
         } else if (mem.eql(u8, a, "--rule")) {
             if (it.next()) |v| args.rule_filter = v;
+        } else if (mem.eql(u8, a, "--target")) {
+            if (it.next()) |v| args.target = v;
         } else if (mem.eql(u8, a, "--list-slab-types")) {
             args.list_slab_types = true;
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
@@ -1919,6 +1953,10 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  --verbose, -v         per-ident access and lock-op summary
         \\  --entry NAME          drill into a single handler
         \\  --rule RULE           filter findings to a single rule
+        \\  --target PREFIX       restrict scan to files under <PREFIX>/.
+        \\                        Use `--target kernel` to scope to the kernel
+        \\                        tree (paths stored relative to it). libz/ is
+        \\                        excluded under every target — it's userspace.
         \\  --list-slab-types     print discovered slab-backed types and exit
         \\  --help, -h            show this help
         \\
@@ -1959,7 +1997,7 @@ pub fn main() !u8 {
     var st = State.init(gpa);
     defer st.deinit();
 
-    try loadFiles(&db, &st);
+    try loadFiles(&db, &st, args.target);
     try loadSlabTypes(&db, &st);
     try collectSlabFieldNames(&db, &st);
     try loadEntryPoints(&db, &st);
