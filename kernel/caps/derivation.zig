@@ -61,7 +61,7 @@ const MAX_DEPTH: u32 = 1 << 20;
 /// of their work. Each per-domain access still goes through that
 /// domain's `_gen_lock` for staleness validation; the tree mutex only
 /// orders concurrent tree mutations against each other.
-var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
+pub var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
 
 // ── External API ─────────────────────────────────────────────────────
 

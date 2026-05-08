@@ -434,10 +434,29 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         }
         caller.pending_pair_count = 0;
     }
+
     target_ref.unlockIrqRestore(target_irq_state);
 
     const plr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const p = plr.ptr;
+    // Re-validate target state under the port lock. Between the pre-port
+    // EC validation above and here, a concurrent `terminate` or
+    // `suspend(target=target_ec, ...)` from another core could have flipped
+    // the state to `.exited` or `.suspended_on_port`; without this check
+    // `suspendOnPort` trips the `assert(state ∈ {.running,.ready,.idle_wait})`
+    // at execution_context.zig:1339 and panics the kernel.
+    //
+    // Re-locking the EC's gen-lock here would invert the (Port → EC) order
+    // — the canonical kernel-wide order is EC → Port, established by
+    // bindEventRoute. Read the state without the EC lock: a torn read of
+    // the small enum is impossible (single-byte) and any post-check change
+    // is harmless: the suspend completes against a target that has just
+    // become `.exited` (the EC slab and kstack stay pinned by domain
+    // ownership; the target was already going to be unrunnable).
+    if (target_ec.state != .running and target_ec.state != .ready and target_ec.state != .idle_wait) {
+        port_ref.unlockIrqRestore(plr.irq_state);
+        return errors.E_INVAL;
+    }
     // `suspendOnPort` releases the port lock before returning (directly
     // on the no-receiver path, transitively via `rendezvousWithReceiver`
     // on the success path) so we MUST NOT add `defer port_ref.unlockIrqRestore(...)`.
@@ -1007,7 +1026,18 @@ fn fireRouted(
     addr: u64,
 ) bool {
     const slot_idx = execution_context.eventRouteSlot(event) orelse return false;
-    const route_ref = ec.event_routes[slot_idx] orelse return false;
+    // Snapshot `ec.event_routes[slot_idx]` under `ec._gen_lock` — the
+    // optional `SlabRef(Port)` is two words (ptr + gen) and an in-flight
+    // `installEventRoute`/`removeEventRoute` writer (see lines 967/989)
+    // can be torn-read by this fault-context observer otherwise. Match
+    // the wake/install pattern that uses `ec._gen_lock` as the route-
+    // table mutator's exclusion. Note: this fault path runs on the
+    // EC's own core, but cross-core rebind is allowed and is the race
+    // we're plugging.
+    const ec_irq = ec._gen_lock.lockIrqSave(@src());
+    const route_ref_opt = ec.event_routes[slot_idx];
+    ec._gen_lock.unlockIrqRestore(ec_irq);
+    const route_ref = route_ref_opt orelse return false;
     const route_lr = route_ref.lockIrqSave(@src()) catch return false;
     const port_ptr = route_lr.ptr;
     // `suspendOnPort` is responsible for releasing `port_ptr._gen_lock`
@@ -1035,35 +1065,62 @@ fn fireRouted(
 
 /// Fire a memory_fault event for `ec`. Looks up `ec.event_routes[0]`;
 /// if bound, suspends `ec` on the port; else applies the no-route
-/// fallback. Spec §[event_route] specifies restart-domain or release-
-/// self semantics here; until those are wired we park the faulting EC
-/// (mirrors `fireThreadFault`'s no-route path). Without this, a single
-/// faulting child anywhere in the system brings down the kernel before
-/// the runner can even drain results from the result port — a stub-vs-
-/// spec mismatch that turns every userland bug into an unrecoverable
-/// kernel panic.
+/// fallback per Spec §[event_route]:3247: "the EC's capability domain
+/// is restarted if its self-handle has the `restart` cap (per
+/// §[restart_semantics]); otherwise the capability domain is destroyed".
 ///
-/// Park (not terminate) for two reasons that mirror `fireThreadFault`'s
-/// fallback rationale:
+/// Restart engine is not yet wired in this kernel. We honor the
+/// destroy arm here: drive the standard SLOT_SELF tear-down via
+/// `releaseSelf` (parks the calling EC, then runs phase1 + phase2 of
+/// `destroyCapabilityDomain`). Without this — when this path used to
+/// just `parkSelfFaulted` — a faulting child stayed parked but its
+/// domain leaked, and any peer EC in the same domain kept running
+/// over a half-broken address space until the test runner timed out.
 ///
-///   1. Recursive CD lock. The user-mode page-fault path (and any
-///      syscall that page-faults while holding the caller's CD lock —
-///      e.g. `readSelfFutWaitMax` accessing the user-table view) reaches
-///      this fallback with the EC's CD `_gen_lock` already held.
-///      `terminate(ec, 0)` would re-acquire the same lock and lockdep
-///      flags it as a recursive acquire.
-///   2. Wrong slot resolution. `terminate(caller, target)` resolves
-///      `target` in the caller's table; slot 0 is the SELF
-///      capability_domain handle, so `terminate(ec, 0)` would always
-///      have surfaced E_BADCAP and iretq'd back onto the faulting RIP.
-///
-/// `parkSelfFaulted` clears the local core's `current_ec` and marks the
-/// state `.exited` so the scheduler stops re-enqueueing. The slab and
-/// kernel stack we're running on stay pinned until the owning domain is
-/// torn down.
+/// Lock discipline: `releaseSelf` acquires the CD `_gen_lock`. The
+/// in-tree fault paths reach this fallback with the CD lock already
+/// dropped (see fault.zig: the user-fault arm `defer`s the unlock
+/// before `fireMemoryFault`; the catch arm runs without taking the
+/// lock at all). `tree_mutex` is also untaken on these paths. If a
+/// future caller arrives with the CD lock held, `lockIrqSave` would
+/// dead-spin — hence the explicit lock-state contract documented on
+/// each call site under fault.zig / arch/*/exceptions.zig.
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
     if (fireRouted(ec, .memory_fault, subcode, fault_addr)) return;
-    execution_context.parkSelfFaulted(ec);
+
+    // No-route destroy. Park the EC first so it leaves the dispatch
+    // queue, then run the standard CD self-destruct via `releaseSelf`.
+    // `releaseSelf` calls `parkSelfFaulted` internally as well, but
+    // only on `currentEc()` — guard for the rare path that fires
+    // memory_fault on an EC that isn't this core's current_ec (e.g.
+    // a cross-core synthetic-fault handler). For the common case
+    // this is a no-op since `releaseSelf` will park it.
+    const cd_ref = ec.domain;
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch {
+        // CD slab gen has moved — domain is already being torn down
+        // by another path. Park the EC; the in-flight teardown will
+        // reap it.
+        execution_context.parkSelfFaulted(ec);
+        return;
+    };
+    const cd = cd_lr.ptr;
+    const cd_irq_state = cd_lr.irq_state;
+
+    // Acquire tree_mutex to mirror the `delete(SLOT_SELF)` path
+    // (caps.derivation.deleteAndDetach slot==0 arm); tree_mutex
+    // serializes against concurrent revoke/derive.
+    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSave(@src());
+
+    // `releaseSelf` releases `cd._gen_lock` via `destroyLocked`
+    // before returning; we restore the captured IRQ state manually
+    // because the standard `unlockIrqRestore` would assert on the
+    // already-cleared lock bit.
+    const deferred = capability_domain.releaseSelf(cd);
+    arch.cpu.restoreInterrupts(cd_irq_state);
+
+    zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+
+    capability_domain.destroyPhase2(deferred);
 }
 
 /// Fire a thread_fault event. Fallback on no route: park the EC so the
@@ -1455,6 +1512,39 @@ fn deliverEvent(
         while (k < pair_count) {
             const entry = sender.pending_pair_entries[k];
             const target_slot: u12 = @intCast(@as(u16, tstart) + k);
+            // Spec §[handle_attachments]: refcount-lifetime types
+            // (page_frame, timer, port, device_region) must take an
+            // object-side refcount on the new alias so a `delete` of
+            // the source slot cannot destroy the object out from under
+            // the receiver's freshly minted handle. Without this bump
+            // the new handle shares the source's single refcount slot
+            // and the first `releaseHandle` on either side over-decs.
+            // Mirrors capability_domain.zig:422-440 (the cross-domain
+            // copy/move alias path).
+            switch (entry.obj_type) {
+                .page_frame => {
+                    const pf: *zag.memory.page_frame.PageFrame =
+                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+                    zag.memory.page_frame.incHandleRef(pf) catch unreachable;
+                },
+                .timer => {
+                    const t: *zag.sched.timer.Timer =
+                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+                    zag.sched.timer.incHandleRef(t) catch unreachable;
+                },
+                .port => {
+                    const alias_p: *Port = @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+                    const alias_irq = alias_p._gen_lock.lockIrqSave(@src());
+                    defer alias_p._gen_lock.unlockIrqRestore(alias_irq);
+                    onHandleAcquire(alias_p, entry.caps) catch unreachable;
+                },
+                .device_region => {
+                    const dr: *zag.devices.device_region.DeviceRegion =
+                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+                    zag.devices.device_region.incHandleRef(dr) catch unreachable;
+                },
+                else => {},
+            }
             capability_domain.mintHandleAt(
                 dom,
                 target_slot,
@@ -1466,6 +1556,64 @@ fn deliverEvent(
             );
             k += 1;
         }
+
+        // Spec §[handle_attachments] test 09: on recv, source entries
+        // with `move = 1` are removed from the sender's table; entries
+        // with `move = 0` are not removed. Mirrors the source-slot
+        // clear in `replyTransfer` (port.zig:861-867) and the
+        // copy/move alias path in capability_domain.zig:444-468.
+        //
+        // Same-CD common case: the sender and receiver share a single
+        // CapabilityDomain (the suspend-target-self single-process
+        // tests live here). Receiver CD lock is already held, so we
+        // can clear the source slot directly. The acquire+release on
+        // refcount-lifetime types nets to zero — the new alias bumped
+        // above is the heir to the source handle's lifetime
+        // contribution, and the source's release here balances it.
+        //
+        // Cross-CD: skipping the source clear here is a known
+        // limitation. Honoring it would require dropping the receiver
+        // CD lock and re-locking the sender's CD via the same
+        // single-CD-at-a-time pattern as `replyTransfer`. The
+        // single-process spec tests (test 09) don't exercise the
+        // cross-CD path; the multi-process IPC path will need that
+        // refactor to be observably move-correct. TODO: extend the
+        // recv-time delivery to phase out receiver-CD before
+        // acquiring sender-CD for the source clear (matches the
+        // reply-transfer phase split).
+        if (sender.domain.ptr == dom) {
+            k = 0;
+            while (k < pair_count) : (k += 1) {
+                const entry = sender.pending_pair_entries[k];
+                if (!entry.move) continue;
+                const src_slot = entry.src_slot;
+                if (capability.resolveHandleOnDomain(dom, src_slot, null)) |src_entry| {
+                    // Apply the per-type release for refcount-lifetime
+                    // handles before clearing the slot. Mirrors the
+                    // copy/move-alias `move=1` arm in
+                    // capability_domain.zig:444-467.
+                    switch (entry.obj_type) {
+                        .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
+                        .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
+                        .port => {
+                            const sp: *Port = @ptrCast(@alignCast(src_entry.ref.ptr.?));
+                            const src_caps_word: u16 = @truncate(Word0.caps(dom.user_table[src_slot].word0));
+                            releaseHandle(sp, src_caps_word);
+                        },
+                        .device_region => {
+                            const sdr: *zag.devices.device_region.DeviceRegion =
+                                @ptrCast(@alignCast(src_entry.ref.ptr.?));
+                            const sdr_irq = sdr._gen_lock.lockIrqSave(@src());
+                            zag.devices.device_region.removeHandleListNodeLocked(sdr, &dom.kernel_table[src_slot].dr_node);
+                            zag.devices.device_region.releaseHandleLocked(sdr, sdr_irq);
+                        },
+                        else => {},
+                    }
+                    capability.clearAndFreeSlot(dom, src_slot, src_entry);
+                }
+            }
+        }
+
         // Consume the stash — the move/copy completes here. Spec
         // §[handle_attachments] test 10 specifies that if the suspend
         // resumes with E_CLOSED before any recv, no entry is moved or
@@ -1584,6 +1732,14 @@ pub fn rendezvousWithReceiver(
     port_irq_state: u64,
 ) bool {
     const receiver = popHighestPriorityReceiver(p) orelse return false;
+    // SMP race: a receiver popped here may still be on its previous core
+    // mid-context-save (the dequeuing core is the sender's CPU, distinct
+    // from where the receiver last ran). Mutating `receiver.ctx` /
+    // `receiver.event_*` before its prior core has cleared `on_cpu`
+    // would race the saving core's GPR writes. Mirror the standard
+    // wake-side pattern from futex.zig:239,588 and port.zig:187 — spin
+    // until the prior core releases the EC.
+    while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     receiver.event_type = .none;
     receiver.suspend_port = null;
 
@@ -1760,6 +1916,14 @@ fn propagateClosedToSenders(p: *Port) void {
         sender.event_subcode = 0;
         sender.event_addr = 0;
         sender.originating_write_cap = false;
+        // Spec §[handle_attachments] test 10: an E_CLOSED-resumed
+        // sender's pre-validated stash is dropped without effect — no
+        // entry is moved or copied. Clear the count so a subsequent
+        // recv on this EC doesn't observe stale stash from this
+        // closed suspend (`deliverEvent`'s install loop reads
+        // `sender.pending_pair_count` on the next pairing and would
+        // otherwise install ghost handles from the dead session).
+        sender.pending_pair_count = 0;
         sender.state = .ready;
         scheduler.markReady(sender);
     }
