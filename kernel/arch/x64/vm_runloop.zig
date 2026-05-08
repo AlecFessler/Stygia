@@ -14,12 +14,15 @@ const cpu = zag.arch.x64.cpu;
 const hv_vcpu = zag.arch.x64.hv.vcpu;
 const hv_vm = zag.arch.x64.hv.vm;
 const kprof = zag.kprof.trace_id;
+const mmio_decode = zag.arch.x64.mmio_decode;
 const timers = zag.arch.x64.timers;
 const vm_hw = zag.arch.x64.vm;
 
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
 const PAddr = zag.memory.address.PAddr;
+const VAddr = zag.memory.address.VAddr;
+const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 /// VM-exit delivery descriptor returned by `enterGuest`. Mirror of the
 /// dispatch-tier alias in `zag.arch.dispatch.vm.VmExitDelivery` — the
@@ -150,6 +153,26 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             .ept_violation => |ept| {
                 if (!hv_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
                 // Handled inline — re-enter the guest immediately.
+            },
+            // §[vm_policy] CPUID lookup — keyed on (leaf, subleaf) per
+            // the spec. On match, write the canned (eax, ebx, ecx, edx)
+            // into the guest GPRs, advance RIP past the CPUID
+            // (Intel SDM Vol 3C §27.2 / AMD APM Vol 2 §15.7.1), and
+            // re-enter the guest without delivering vm_exit. On miss,
+            // fall through to the existing decodeDelivery path so the
+            // VMM observes a CPUID exit per §[vm_exit_state].
+            .cpuid => |c| {
+                if (tryHandleCpuidPolicy(vm_ptr, &arch_state.guest_state, c)) continue;
+                break;
+            },
+            // §[vm_policy] CR-access lookup — keyed on cr_num per the
+            // spec. Read: write read_value into the destination GPR.
+            // Write: apply masked value to the kernel's GuestState CR
+            // field. Either branch advances RIP past the trapping mov.
+            // On miss, fall through to vm_exit delivery.
+            .cr_access => |cr| {
+                if (tryHandleCrPolicy(vm_ptr, &arch_state.guest_state, cr)) continue;
+                break;
             },
             // EXIT_REASON_EXTERNAL_INT — a host IRQ was pending when the
             // guest tried to enter (or fired during guest execution).
@@ -623,6 +646,112 @@ fn ctrlPhysFor(vm_ptr: *zag.hv.virtual_machine.VirtualMachine) ?PAddr {
     const erased = vm_ptr.arch_state orelse return null;
     const cell: *hv_vm.CtrlStateCell = @ptrCast(@alignCast(erased));
     return cell.ctrl_phys;
+}
+
+/// Resolve the live `VmPolicy` table backing `vm`. Returns `null` when
+/// no policy page frame has been seeded (pre-create_virtual_machine
+/// scaffolding paths) — caller treats that as "no inline policy
+/// configured". The page frame's physical pages are exposed through the
+/// kernel physmap; the seeded `VmPolicy` lives at offset 0 per
+/// §[create_virtual_machine] and §[vm_set_policy].
+fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
+    const pf_ref = vm_ptr.policy_pf orelse return null;
+    const pf = pf_ref.ptr;
+    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
+    return @ptrFromInt(phys_va.addr);
+}
+
+/// §[vm_policy] x86-64 CPUID lookup. Returns true if `(leaf, subleaf)`
+/// matches an entry in `cpuid_responses[0..num_cpuid_responses]`; the
+/// caller re-enters the guest after the canned (eax, ebx, ecx, edx)
+/// have been projected onto guest GPRs and RIP has advanced past the
+/// CPUID. Returns false on miss — caller delivers `.cpuid` to the VMM
+/// per §[vm_exit_state].
+fn tryHandleCpuidPolicy(
+    vm_ptr: *VirtualMachine,
+    gs: *GuestState,
+    c: vm_hw.VmExitInfo.CpuidExit,
+) bool {
+    const policy = vmPolicyFor(vm_ptr) orelse return false;
+    const n = policy.num_cpuid_responses;
+    if (n == 0) return false;
+    // Bound-check num_* against the array bound — `validateVmPolicy`
+    // already rejects out-of-range counts at create_virtual_machine
+    // time, but `applyVmPolicyTable` writes the same field at runtime.
+    // Defensive clamp here mirrors that bound so a miswritten count
+    // can't read past the entries array.
+    const max: u32 = vm_hw.VmPolicy.MAX_CPUID_POLICIES;
+    const limit: u32 = if (n > max) max else n;
+    var i: u32 = 0;
+    while (i < limit) : (i += 1) {
+        const e = policy.cpuid_responses[i];
+        if (e.leaf == c.leaf and e.subleaf == c.subleaf) {
+            // x86 CPUID writes results to (rax, rbx, rcx, rdx); the
+            // upper 32 bits of each are zeroed per Intel SDM Vol 2A
+            // "CPUID — CPU Identification" (the canonical "32-bit
+            // result, zero-extended to 64-bit" rule for arch
+            // operations writing 32-bit GPR sub-registers).
+            gs.rax = @as(u64, e.eax);
+            gs.rbx = @as(u64, e.ebx);
+            gs.rcx = @as(u64, e.ecx);
+            gs.rdx = @as(u64, e.edx);
+            gs.rip = c.next_rip;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// §[vm_policy] x86-64 CR-access lookup. Returns true if `cr_num`
+/// matches an entry in `cr_policies[0..num_cr_policies]`. On a write,
+/// the kernel applies `value & write_mask` into the corresponding
+/// GuestState CR field (bits not set in `write_mask` are ignored per
+/// the spec's "applied masked by write_mask" rule). On a read, the
+/// kernel writes `read_value` into the destination GPR. RIP advances
+/// past the trapping `mov`. Returns false on miss — caller delivers
+/// `.cr_access` to the VMM.
+///
+/// CR8 has no GuestState slot (it tracks the LAPIC TPR shadow on the
+/// fly); writes are silently dropped when `cr_num == 8` and the masked
+/// value is unused — matching the spec's "no separate CR8 backing"
+/// shape for the inline policy path.
+fn tryHandleCrPolicy(
+    vm_ptr: *VirtualMachine,
+    gs: *GuestState,
+    cr: vm_hw.VmExitInfo.CrAccessExit,
+) bool {
+    const policy = vmPolicyFor(vm_ptr) orelse return false;
+    const n = policy.num_cr_policies;
+    if (n == 0) return false;
+    const max: u32 = vm_hw.VmPolicy.MAX_CR_POLICIES;
+    const limit: u32 = if (n > max) max else n;
+    var i: u32 = 0;
+    while (i < limit) : (i += 1) {
+        const e = policy.cr_policies[i];
+        if (e.cr_num != @as(u8, cr.cr_num)) continue;
+
+        if (cr.is_write) {
+            const masked = cr.value & e.write_mask;
+            switch (cr.cr_num) {
+                0 => gs.cr0 = (gs.cr0 & ~e.write_mask) | masked,
+                3 => gs.cr3 = (gs.cr3 & ~e.write_mask) | masked,
+                4 => gs.cr4 = (gs.cr4 & ~e.write_mask) | masked,
+                // CR2 is the page-fault address — never a CR-access
+                // exit target on real hardware (mov to CR2 doesn't
+                // intercept). CR8 has no GuestState backing — the
+                // hardware TPR shadow handles it. Other indices are
+                // reserved. Drop the write inline; on a real CR8
+                // write the LAPIC TPR is the affected register and
+                // the VMM hooks LAPIC MMIO instead.
+                else => {},
+            }
+        } else {
+            mmio_decode.writeGpr(gs, cr.gpr, e.read_value);
+        }
+        gs.rip = cr.next_rip;
+        return true;
+    }
+    return false;
 }
 
 fn decodeDelivery(exit: vm_hw.VmExitInfo, gs: *const vm_hw.GuestState) VmExitDelivery {

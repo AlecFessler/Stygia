@@ -103,6 +103,12 @@ pub const VmExitInfo = union(enum) {
     pub const CpuidExit = struct {
         leaf: u32,
         subleaf: u32,
+        /// Guest RIP of the next sequential instruction past the
+        /// trapping CPUID (for RIP advance after inline policy
+        /// resolution). Intel sources this from VM_EXIT_INSTRUCTION_LEN
+        /// (SDM Vol 3C §28.2.5); AMD sources it from VMCB nRIP at offset
+        /// 0xC8 (APM Vol 2 §15.7.1).
+        next_rip: u64,
     };
 
     pub const IoExit = struct {
@@ -125,6 +131,10 @@ pub const VmExitInfo = union(enum) {
         is_write: bool,
         gpr: u4,
         value: u64,
+        /// Guest RIP of the next sequential instruction past the
+        /// trapping mov-to/from-CR (for RIP advance after inline
+        /// policy resolution). Same sources as CpuidExit.next_rip.
+        next_rip: u64,
     };
 
     pub const MsrExit = struct {

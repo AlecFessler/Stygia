@@ -85,6 +85,7 @@ const Vmcb = struct {
     const EVENTINJ: usize = 0x0A8; // Event injection
     const N_CR3: usize = 0x0B0; // Nested page table CR3 (host CR3 for NPT)
     const VMCB_CLEAN: usize = 0x0C0; // VMCB clean bits (AMD APM Vol 2, Section 15.15.3)
+    const NRIP_SAVE: usize = 0x0C8; // Next sequential instruction pointer (AMD APM Vol 2, Section 15.7.1)
 
     // State save area offsets (relative to VMCB + 0x400)
     // AMD APM Vol 2, Appendix B, Table B-2.
@@ -888,6 +889,7 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
         return .{ .cpuid = .{
             .leaf = @truncate(guest_state.rax),
             .subleaf = @truncate(guest_state.rcx),
+            .next_rip = readVmcb64(vmcb, Vmcb.NRIP_SAVE),
         } };
     }
 
@@ -937,6 +939,7 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
             .is_write = false,
             .gpr = gpr_num,
             .value = readGpr(guest_state, gpr_num),
+            .next_rip = readVmcb64(vmcb, Vmcb.NRIP_SAVE),
         } };
     }
 
@@ -947,6 +950,7 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
             .is_write = true,
             .gpr = gpr_num,
             .value = readGpr(guest_state, gpr_num),
+            .next_rip = readVmcb64(vmcb, Vmcb.NRIP_SAVE),
         } };
     }
 

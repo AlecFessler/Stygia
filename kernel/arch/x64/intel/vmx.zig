@@ -984,9 +984,11 @@ fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
 
     switch (exit_reason) {
         EXIT_REASON_CPUID => {
+            const instr_len = vmcsRead(VM_EXIT_INSTRUCTION_LEN);
             return .{ .cpuid = .{
                 .leaf = @truncate(guest_state.rax),
                 .subleaf = @truncate(guest_state.rcx),
+                .next_rip = guest_state.rip +% instr_len,
             } };
         },
         EXIT_REASON_IO => {
@@ -1020,11 +1022,13 @@ fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
             const gpr: u4 = @truncate((qualification >> 8) & 0xF);
             const is_write = (access_type == 0);
             const value = readGprFromGuest(guest_state, gpr);
+            const instr_len = vmcsRead(VM_EXIT_INSTRUCTION_LEN);
             return .{ .cr_access = .{
                 .cr_num = cr_num,
                 .is_write = is_write,
                 .gpr = gpr,
                 .value = value,
+                .next_rip = guest_state.rip +% instr_len,
             } };
         },
         EXIT_REASON_MSR_READ => {

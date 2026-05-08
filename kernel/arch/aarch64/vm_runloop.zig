@@ -21,6 +21,8 @@ const serial = zag.arch.aarch64.serial;
 const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
+const VAddr = zag.memory.address.VAddr;
+
 // Diagnostic counters — used during bring-up to attribute boot stall
 // to (a) enterGuest not being called, (b) vmResume not returning,
 // (c) specific exit types.
@@ -251,6 +253,29 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
                             // Advance past the trapping instruction. A64
                             // instructions are always 32-bit (ARM ARM B2.5.4),
                             // so unconditional +4 is safe.
+                            arch_state.guest_state.pc +%= 4;
+                            continue;
+                        }
+                    } else |_| {}
+                }
+                return decodeDelivery(exit_info, &arch_state.guest_state);
+            },
+            // §[vm_policy] aarch64 sysreg lookup. ID registers (per
+            // ARM ARM C5.3 and §[vm_policy] semantics) consult
+            // `id_reg_responses`; all other sysregs consult
+            // `sysreg_policies`. On match the kernel resolves the trap
+            // inline (return canned value on MRS, swallow MSR per the
+            // spec's "applied masked by write_mask" / "writes to ID
+            // registers are silently ignored" rules), advances PC by
+            // the fixed 32-bit A64 instruction width, and re-enters.
+            // On miss the trap surfaces to the VMM as `.sysreg_trap`
+            // per §[vm_exit_state].
+            .sysreg_trap => |t| {
+                if (vcpu_ec.vm) |vm_ref_inner| {
+                    if (vm_ref_inner.lock(@src())) |vm_ptr_inner| {
+                        const handled = tryHandleSysregPolicy(vm_ptr_inner, &arch_state.guest_state, t);
+                        vm_ref_inner.unlock();
+                        if (handled) {
                             arch_state.guest_state.pc +%= 4;
                             continue;
                         }
@@ -687,4 +712,111 @@ fn decodeDelivery(exit: VmExitInfo, gs: *const GuestState) VmExitDelivery {
             .payload = .{ raw, 0, 0 },
         },
     };
+}
+
+/// Resolve the live `VmPolicy` table backing `vm`. Returns `null` when
+/// no policy page frame has been seeded — caller treats that as "no
+/// inline policy configured". The seeded `VmPolicy` lives at offset 0
+/// of the policy page frame per §[create_virtual_machine] /
+/// §[vm_set_policy].
+fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
+    const pf_ref = vm_ptr.policy_pf orelse return null;
+    const pf = pf_ref.ptr;
+    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
+    return @ptrFromInt(phys_va.addr);
+}
+
+/// Write a guest GPR by index (Rt encoding, 0..31). Writes to index
+/// 31 are silently dropped — that encoding is the zero register on
+/// MRS Xt destinations (ARM ARM B1.2.1).
+fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
+    switch (idx) {
+        0 => gs.x0 = val,    1 => gs.x1 = val,    2 => gs.x2 = val,    3 => gs.x3 = val,
+        4 => gs.x4 = val,    5 => gs.x5 = val,    6 => gs.x6 = val,    7 => gs.x7 = val,
+        8 => gs.x8 = val,    9 => gs.x9 = val,    10 => gs.x10 = val,  11 => gs.x11 = val,
+        12 => gs.x12 = val,  13 => gs.x13 = val,  14 => gs.x14 = val,  15 => gs.x15 = val,
+        16 => gs.x16 = val,  17 => gs.x17 = val,  18 => gs.x18 = val,  19 => gs.x19 = val,
+        20 => gs.x20 = val,  21 => gs.x21 = val,  22 => gs.x22 = val,  23 => gs.x23 = val,
+        24 => gs.x24 = val,  25 => gs.x25 = val,  26 => gs.x26 = val,  27 => gs.x27 = val,
+        28 => gs.x28 = val,  29 => gs.x29 = val,  30 => gs.x30 = val,
+        else => {},
+    }
+}
+
+/// §[vm_policy] aarch64 sysreg lookup. The trapped tuple
+/// `(op0, op1, crn, crm, op2)` is matched first against
+/// `id_reg_responses[0..num_id_reg_responses]`: a hit on a read
+/// (`is_read=true`) returns the entry's `value` into Xt; a hit on a
+/// write swallows the MSR silently per "writes to ID registers are
+/// silently ignored". On miss, the same tuple is matched against
+/// `sysreg_policies[0..num_sysreg_policies]`: a read returns
+/// `read_value`; a write applies `value & write_mask` (the masked
+/// value is consumed by the policy — sysregs without a kernel
+/// shadow don't have a write-back target, mirroring the spec's
+/// pure "applied masked by write_mask" wording).
+///
+/// Returns true if any entry matched (caller advances PC and re-
+/// enters); false if the trap must surface to the VMM.
+fn tryHandleSysregPolicy(
+    vm_ptr: *VirtualMachine,
+    gs: *vm_hw.GuestState,
+    t: vm_hw.VmExitInfo.SysregTrap,
+) bool {
+    const policy = vmPolicyFor(vm_ptr) orelse return false;
+
+    // ID register table — keyed on (op0, op1, crn, crm, op2).
+    {
+        const n = policy.num_id_reg_responses;
+        const max: u32 = vm_hw.VmPolicy.MAX_ID_REG_RESPONSES;
+        const limit: u32 = if (n > max) max else n;
+        var i: u32 = 0;
+        while (i < limit) : (i += 1) {
+            const e = policy.id_reg_responses[i];
+            if (e.op0 == @as(u8, t.op0) and
+                e.op1 == @as(u8, t.op1) and
+                e.crn == @as(u8, t.crn) and
+                e.crm == @as(u8, t.crm) and
+                e.op2 == @as(u8, t.op2))
+            {
+                if (t.is_read) {
+                    writeGuestGpr(gs, t.rt, e.value);
+                }
+                // Writes to ID registers are silently ignored
+                // (spec §[vm_policy] aarch64 semantics).
+                return true;
+            }
+        }
+    }
+
+    // Sysreg policy table — keyed on (op0, op1, crn, crm, op2).
+    {
+        const n = policy.num_sysreg_policies;
+        const max: u32 = vm_hw.VmPolicy.MAX_SYSREG_POLICIES;
+        const limit: u32 = if (n > max) max else n;
+        var i: u32 = 0;
+        while (i < limit) : (i += 1) {
+            const e = policy.sysreg_policies[i];
+            if (e.op0 == @as(u8, t.op0) and
+                e.op1 == @as(u8, t.op1) and
+                e.crn == @as(u8, t.crn) and
+                e.crm == @as(u8, t.crm) and
+                e.op2 == @as(u8, t.op2))
+            {
+                if (t.is_read) {
+                    writeGuestGpr(gs, t.rt, e.read_value);
+                }
+                // Writes are swallowed inline. Per §[vm_policy]
+                // aarch64 the masked bits would be "applied", but
+                // without a per-sysreg shadow in GuestState the
+                // kernel has no slot to persist them in — the
+                // contract honored here is "no vm_exit delivered;
+                // no host-visible side effect." Sysregs that do
+                // have GuestState backing (SCTLR_EL1 etc.) would
+                // gate their masked updates at this seam.
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
