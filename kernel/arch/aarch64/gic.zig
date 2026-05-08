@@ -1150,11 +1150,39 @@ pub fn unmaskIrq(intid: u32) void {
     gicdWriteOffset(.isenabler0, reg_offset, bit);
 }
 
-/// Mask an interrupt at the GIC distributor — GICD_ICENABLER for SPIs,
-/// GICR_ICENABLER0 (v3) / banked GICD_ICENABLER0 (v2) for SGIs/PPIs.
-/// IHI 0069H, Section 8.9.6: GICD_ICENABLER<n>.
+/// Mask (disable) an interrupt.
+///
+/// For SPIs (INTID >= 32), writes the corresponding GICD_ICENABLER register.
+/// For SGIs/PPIs (INTID 0-31):
+///   GICv3 — writes GICR_ICENABLER0 on the current core.
+///   GICv2 — writes GICD_ICENABLER0 (banked per-CPU).
+///
+/// Writes are bit-significant: a 1 bit clears the matching enable bit, a 0
+/// bit is ignored, so unrelated INTIDs in the same 32-bit word are unaffected.
+///
+/// IHI 0069H, Section 8.9.8: GICD_ICENABLER<n>.
+/// IHI 0069H, Section 9.5.7: GICR_ICENABLER0.
+/// IHI 0048B, Section 4.3.6: GICD_ICENABLER0 (banked per-CPU for INTID 0-31).
 pub fn maskIrq(intid: u32) void {
-    _ = intid;
-    @panic("not implemented");
+    const bit: u32 = @as(u32, 1) << @intCast(intid & 0x1F);
+    const reg_offset: u32 = (intid / 32) * 4;
+
+    if (intid < 32) {
+        if (gicv3) {
+            // SGI/PPI — use redistributor for current core.
+            const core_idx: usize = @intCast(coreID());
+            const ptr: *volatile u32 = @ptrFromInt(
+                gicr_bases[core_idx] + 0x10000 + @intFromEnum(GicrSgiReg.icenabler0),
+            );
+            ptr.* = bit;
+        } else {
+            // GICv2: GICD_ICENABLER0 is banked per-CPU for INTID 0-31.
+            gicdWriteOffset(.icenabler0, 0, bit);
+        }
+        return;
+    }
+
+    // SPI — use distributor (same for v2 and v3).
+    gicdWriteOffset(.icenabler0, reg_offset, bit);
 }
 
