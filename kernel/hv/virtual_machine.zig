@@ -128,9 +128,9 @@ pub fn releaseHandle(vm: *VirtualMachine) void {
     destroyVm(vm);
 }
 
-/// Variant of `releaseHandle` for the `destroyCapabilityDomain` path:
-/// the owning CD slab slot has already been freed by the caller, so
-/// the `vm.domain.ptr.vm = null` back-pointer clear that `destroyVm`
+/// Variant of `releaseHandle` for the `destroyPhase2` path:
+/// the owning CD slab slot has already been freed by `destroyPhase1`,
+/// so the `vm.domain.ptr.vm = null` back-pointer clear that `destroyVm`
 /// performs is omitted — that write would race a reallocation of the
 /// CD slot.
 pub fn releaseHandleAfterDomainDestroyed(vm: *VirtualMachine) void {

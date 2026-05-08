@@ -493,8 +493,8 @@ pub fn incHandleRef(t: *Timer) error{BadCap}!void {
 }
 
 /// Disarm every Timer reachable from `cd`'s handle table. Called by
-/// `destroyCapabilityDomain` BEFORE the cd struct is destroyed, while
-/// the caller still holds `cd._gen_lock` from `lockTyped`. Without this,
+/// `destroyPhase1` BEFORE the cd struct is destroyed, while the caller
+/// still holds `cd._gen_lock` from `lockTyped`. Without this,
 /// a periodic timer armed by a test that has since released its
 /// self-handle keeps firing indefinitely — its onFire path runs an
 /// O(N_domains × MAX_HANDLES_PER_DOMAIN) `forEachAlive` walk every

@@ -1583,8 +1583,8 @@ pub fn allocExecutionContext(
 
 /// Walk the EC slab and destroy every alive EC whose `domain` SlabRef
 /// matches `(cd, cd_gen)`, skipping any EC named in `keep`. Used by
-/// `destroyCapabilityDomain` to reap vCPU ECs and sub-domain helper ECs
-/// that have no other release path. The caller-running EC (the one that
+/// `destroyPhase2` to reap vCPU ECs and sub-domain helper ECs that
+/// have no other release path. The caller-running EC (the one that
 /// invoked `delete(SLOT_SELF)`) must be passed in `keep` — its kernel
 /// stack is in active use and cannot be unmapped here.
 ///
@@ -1596,11 +1596,10 @@ pub fn allocExecutionContext(
 /// kstack unmap uses `cd_addr_space_root` and is only valid for ECs
 /// genuinely bound to *this* CD.
 ///
-/// `cd_addr_space_root` is read from the CD by the caller while it
-/// holds `cd._gen_lock`. We MUST NOT re-lock `cd._gen_lock` here:
-/// the caller (`destroyCapabilityDomain` invoked from `releaseSelf`)
-/// already holds it, and SecureSlab gen-locks don't allow recursive
-/// acquire on the same class.
+/// `cd_addr_space_root` is read from the CD by `destroyPhase1` while it
+/// holds `cd._gen_lock`; phase 2 runs after the lock has been released
+/// (the slab slot is already destroyed-marked) so there is no recursive-
+/// acquire risk here.
 pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root: PAddr, keep_ref: ?SlabRef(ExecutionContext)) void {
     // Visitor packs the loop-invariant args. The CD ref carries a
     // verified gen so the visitor can reject ECs whose `domain` ptr
@@ -1648,11 +1647,11 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
 }
 
 /// Same as `destroyExecutionContext`, but tailored for the
-/// `destroyCapabilityDomain` walk: avoids the same-class recursive
-/// acquire on `ec.domain._gen_lock` (the caller already holds that lock
-/// and SecureSlab disallows recursive acquire on the same class), and
-/// deliberately skips kstack reclaim (see comment near the slab destroy
-/// at the bottom of this fn for the rationale).
+/// `destroyPhase2` walk: avoids the same-class recursive acquire on
+/// `ec.domain._gen_lock` (the CD slab slot is already destroyed-marked
+/// by phase 1, so locking would fail), and deliberately skips kstack
+/// reclaim (see comment near the slab destroy at the bottom of this
+/// fn for the rationale).
 ///
 /// `dom_root` is reserved for a future kstack-reclaim path; today the
 /// kstack is left mapped because tearing it down inline races against
@@ -1783,10 +1782,22 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
+        // Cross-core postZombie can spin on a busy zombie column while
+        // the target core finishes a prior reap. If the outer caller
+        // (e.g. `destroyPhase2`) is running with IRQs masked, an
+        // unbounded spin here would block both timer interrupts and any
+        // inbound IPI from the target — the target may itself be
+        // blocked waiting on us. Snapshot+enable IRQs around the spin
+        // so wake IPIs and preempts can land; restore before returning
+        // so the gen-flip-finalize sequence stays IRQ-coherent for the
+        // caller.
+        const reap_irq = arch.cpu.saveAndDisableInterrupts();
+        arch.cpu.enableInterrupts();
         while (!scheduler.postZombie(core, ec, @intCast(gen))) {
             std.atomic.spinLoopHint();
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);
+        arch.cpu.restoreInterrupts(reap_irq);
     } else {
         finalizeDestroyMarkedDead(ec);
     }

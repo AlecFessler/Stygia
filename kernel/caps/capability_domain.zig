@@ -378,6 +378,11 @@ pub fn createCapabilityDomain(
     // Convention adopted here: an all-zero entry terminates the list.
     // The runner always passes a non-zero packed-entry (caps != 0 or
     // move != 0) for live entries, so this is unambiguous in practice.
+    // Spec §[idc_rx] test 01: IDC handles delivered into the new
+    // child's table get caps ∩ child.idc_rx. idc_rx lives in the child
+    // self-handle's field0 at bits 32-39 — already populated by
+    // `allocCapabilityDomain` from `[1] caps[16:24]` above.
+    const child_idc_rx: u16 = @truncate((child_cd.user_table[0].field0 >> 32) & 0xFF);
     var pass_idx: usize = 0;
     while (pass_idx < passed_handles.len) {
         const entry = passed_handles[pass_idx];
@@ -397,12 +402,16 @@ pub fn createCapabilityDomain(
 
         const src_user = caller_dom.user_table[src_slot];
         const src_type = Word0.typeTag(src_user.word0);
+        const installed_caps: u16 = if (src_type == .capability_domain)
+            new_caps & child_idc_rx
+        else
+            new_caps;
 
         _ = mintHandle(
             child_cd,
             src_kh.ref,
             src_type,
-            new_caps,
+            installed_caps,
             src_user.field0,
             src_user.field1,
         ) catch {
@@ -918,25 +927,35 @@ pub fn allocCapabilityDomain(
     kernel_table[1].ref = .{};
 
     // Slot 2 — self-IDC. Caps = `cridc_ceiling` from field0_ceilings
-    // bits 24-31 per spec §[cridc_ceiling]. The IDC's per-handle
+    // bits 24-31 per spec §[cridc_ceiling]. The IDC handle's per-handle
     // `ec_cap_ceiling` (field0 bits 0-15) and `vmar_cap_ceiling` (field0
-    // bits 16-23) are not constrained by the spec at create time; pick
-    // a permissive default so `acquire_ecs` / `acquire_vmars` through the
-    // self-IDC mint EC/VMAR handles whose cap masks are limited only by
-    // the domain's `*_outer_ceiling`. Spec §[idc_handle] / §[acquire_ecs]
-    // ([test 06]) use this self-IDC to enumerate the calling domain's
-    // own ECs; without a permissive `ec_cap_ceiling` the intersection
-    // is zero and the minted handles carry no caps.
+    // bits 16-23) — see spec §[capability_domain] IDC handle — are not
+    // initialized by `create_capability_domain` (no spec-defined
+    // syscall arg covers them); we apply a kernel-internal permissive
+    // default here so `acquire_ecs` / `acquire_vmars` through the
+    // self-IDC mint handles whose caps are bounded by the domain's
+    // `*_outer_ceiling` alone (the per-IDC ceilings degenerate to no-op
+    // intersections). Spec §[acquire_ecs] [test 06] / §[acquire_vmars]
+    // [test 06] consume these ceilings via intersection; without the
+    // permissive default the minted handles would carry no caps.
     //
-    // vmar_cap_ceiling clears VmarCap bit 5 (mmio) — at field0 bit 21 —
-    // so the §[acquire_vmars] [test 06] intersection naturally satisfies
-    // [test 07]'s "MMIO and DMA VARs are not included" invariant. mmio
-    // and dma describe the VMAR object (§[var]); minting an mmio cap on
-    // a non-MMIO VMAR (the only kind acquire_vmars returns) would
-    // misadvertise the handle. dma at VmarCap bit 8 falls outside the
-    // 8-bit vmar_cap_ceiling field, so it is implicitly excluded.
+    // SELF_IDC_FIELD0_DEFAULT = 0x00DF_FFFF:
+    //   bits  0-15 ec_cap_ceiling   = 0xFFFF (every defined EcCap bit set)
+    //   bits 16-23 vmar_cap_ceiling = 0xDF
+    //                                 (every defined VmarCap bit EXCEPT
+    //                                 bit 5 / VmarCap.mmio, at field0
+    //                                 bit 21)
+    //
+    // Clearing mmio is deliberate: §[acquire_vmars] [test 07] requires
+    // MMIO and DMA VARs be excluded from acquire_vmars output. The
+    // vmar_cap_ceiling intersection (`vmar_outer_ceiling ∩
+    // vmar_cap_ceiling`) drops the mmio bit on every minted handle so
+    // the result naturally honors test 07. dma at VmarCap bit 8 falls
+    // outside the 8-bit vmar_cap_ceiling field, so it is implicitly
+    // excluded.
+    const SELF_IDC_FIELD0_DEFAULT: u64 = 0x0000_0000_00DF_FFFF;
     const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
-    const idc_self_field0: u64 = 0x0000_0000_00DF_FFFF; // ec_cap_ceiling=0xFFFF, vmar_cap_ceiling=0xDF (mmio cleared)
+    const idc_self_field0: u64 = SELF_IDC_FIELD0_DEFAULT;
     user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
     user_table[2].field0 = idc_self_field0;
     user_table[2].field1 = 0;

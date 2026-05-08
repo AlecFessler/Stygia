@@ -838,16 +838,23 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         return errors.E_FULL;
     };
 
+    // Spec §[idc_rx] test 01: IDC handles delivered to the sender's
+    // domain get caps ∩ sender_cd.idc_rx (self-handle field0 bits 32-39).
+    const sender_idc_rx: u16 = @truncate((sender_cd.user_table[0].field0 >> 32) & 0xFF);
     var k: u8 = 0;
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
         const target_slot: u12 = @intCast(@as(u16, tstart) + k);
+        const installed_caps: u16 = if (stash.obj_type == .capability_domain)
+            stash.caps & sender_idc_rx
+        else
+            stash.caps;
         capability_domain.mintHandleAt(
             sender_cd,
             target_slot,
             stash.obj_ref,
             stash.obj_type,
-            stash.caps,
+            installed_caps,
             0,
             0,
         );
@@ -1508,6 +1515,10 @@ fn deliverEvent(
             // free slots (fragmented table). Surface E_FULL.
             return errors.E_FULL;
         };
+        // Spec §[idc_rx] test 01: when a domain receives an IDC handle
+        // over IDC, the installed caps = granted ∩ receiver's idc_rx.
+        // idc_rx lives in receiver self-handle field0 bits 32-39.
+        const dom_idc_rx: u16 = @truncate((dom.user_table[0].field0 >> 32) & 0xFF);
         var k: u8 = 0;
         while (k < pair_count) {
             const entry = sender.pending_pair_entries[k];
@@ -1516,11 +1527,7 @@ fn deliverEvent(
             // (page_frame, timer, port, device_region) must take an
             // object-side refcount on the new alias so a `delete` of
             // the source slot cannot destroy the object out from under
-            // the receiver's freshly minted handle. Without this bump
-            // the new handle shares the source's single refcount slot
-            // and the first `releaseHandle` on either side over-decs.
-            // Mirrors capability_domain.zig:422-440 (the cross-domain
-            // copy/move alias path).
+            // the receiver's freshly minted handle.
             switch (entry.obj_type) {
                 .page_frame => {
                     const pf: *zag.memory.page_frame.PageFrame =
@@ -1545,12 +1552,18 @@ fn deliverEvent(
                 },
                 else => {},
             }
+            // Spec §[idc_rx] test 01: when receiving an IDC handle over
+            // IDC, installed caps = granted ∩ receiver's idc_rx.
+            const installed_caps: u16 = if (entry.obj_type == .capability_domain)
+                entry.caps & dom_idc_rx
+            else
+                entry.caps;
             capability_domain.mintHandleAt(
                 dom,
                 target_slot,
                 entry.obj_ref,
                 entry.obj_type,
-                entry.caps,
+                installed_caps,
                 0,
                 0,
             );

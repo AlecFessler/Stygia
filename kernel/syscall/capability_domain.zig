@@ -222,18 +222,84 @@ pub fn createCapabilityDomain(
         return errors.E_PERM;
     }
 
-    // Spec §[create_capability_domain] test 12: requested `port_ceiling`
-    // (bits 48-55 of [2]) must be a bitwise subset of the caller's own
-    // `port_ceiling` on its self-handle field0 (bits 56-63 — shifted
-    // up by 8 from the [2] layout to make room for idc_rx at bits
-    // 32-39 in field0). Otherwise the new domain could mint port
-    // handles with caps the parent doesn't itself hold, breaking the
-    // monotonic-rights invariant. Reserved bit violations (sub-field
-    // bits 0-1, 5-7) belong to test 17 (E_INVAL) and are out of scope here.
+    // Spec §[create_capability_domain] tests 03/05/06/08/09/10/11/12:
+    // every ceiling field requested in [2]/[3] must be a bitwise subset
+    // (or numeric ≤ for the fut_wait_max counter) of the caller's
+    // corresponding self-handle field. Layout note: [2] ceilings_inner
+    // is the syscall-arg shape (pf/vm/port live at bits 32-55), while
+    // self-handle field0 inserts idc_rx at bits 32-39 and shifts pf/vm/
+    // port up by 8 bits to land at 40-63. The reads below hit the
+    // field0 offsets per spec §[capability_domain] field0 layout.
+    // Reserved-bit violations belong to test 17 (E_INVAL) and are
+    // separate from the subset rule.
     const caller_field0 = cd.user_table[SELF_HANDLE_SLOT].field0;
+
+    // [test 03] ec_inner_ceiling: [2] bits 0-7 ⊆ field0 bits 0-7.
+    const caller_ec_inner_ceiling: u8 = @truncate(caller_field0 & 0xFF);
+    const requested_ec_inner_ceiling: u8 = @truncate(ceilings_inner & 0xFF);
+    if (requested_ec_inner_ceiling & ~caller_ec_inner_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 05] vmar_inner_ceiling: [2] bits 8-23 ⊆ field0 bits 8-23.
+    const caller_vmar_inner_ceiling: u16 = @truncate((caller_field0 >> 8) & 0xFFFF);
+    const requested_vmar_inner_ceiling: u16 = @truncate((ceilings_inner >> 8) & 0xFFFF);
+    if (requested_vmar_inner_ceiling & ~caller_vmar_inner_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 09] cridc_ceiling: [2] bits 24-31 ⊆ field0 bits 24-31.
+    const caller_cridc_ceiling: u8 = @truncate((caller_field0 >> 24) & 0xFF);
+    const requested_cridc_ceiling: u8 = @truncate((ceilings_inner >> 24) & 0xFF);
+    if (requested_cridc_ceiling & ~caller_cridc_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 10] pf_ceiling: [2] bits 32-39 ⊆ field0 bits 40-47.
+    const caller_pf_ceiling: u8 = @truncate((caller_field0 >> 40) & 0xFF);
+    const requested_pf_ceiling: u8 = @truncate((ceilings_inner >> 32) & 0xFF);
+    if (requested_pf_ceiling & ~caller_pf_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 11] vm_ceiling: [2] bits 40-47 ⊆ field0 bits 48-55.
+    const caller_vm_ceiling: u8 = @truncate((caller_field0 >> 48) & 0xFF);
+    const requested_vm_ceiling: u8 = @truncate((ceilings_inner >> 40) & 0xFF);
+    if (requested_vm_ceiling & ~caller_vm_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 12] port_ceiling: [2] bits 48-55 ⊆ field0 bits 56-63.
     const caller_port_ceiling: u8 = @truncate((caller_field0 >> 56) & 0xFF);
     const requested_port_ceiling: u8 = @truncate((ceilings_inner >> 48) & 0xFF);
     if (requested_port_ceiling & ~caller_port_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
+    // [test 04] ec_outer_ceiling: [3] bits 0-7 ⊆ field1 bits 0-7.
+    // [test 06] vmar_outer_ceiling: [3] bits 8-15 ⊆ field1 bits 8-15.
+    // [test 08] fut_wait_max: [3] bits 32-37 ≤ field1 bits 32-37 (numeric).
+    const caller_ec_outer_ceiling: u8 = @truncate(caller_field1 & 0xFF);
+    const requested_ec_outer_ceiling: u8 = @truncate(ceilings_outer & 0xFF);
+    if (requested_ec_outer_ceiling & ~caller_ec_outer_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+    const caller_vmar_outer_ceiling: u8 = @truncate((caller_field1 >> 8) & 0xFF);
+    const requested_vmar_outer_ceiling: u8 = @truncate((ceilings_outer >> 8) & 0xFF);
+    if (requested_vmar_outer_ceiling & ~caller_vmar_outer_ceiling != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+    const caller_fut_wait_max: u6 = @truncate((caller_field1 >> 32) & 0x3F);
+    const requested_fut_wait_max: u6 = @truncate((ceilings_outer >> 32) & 0x3F);
+    if (requested_fut_wait_max > caller_fut_wait_max) {
         cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
