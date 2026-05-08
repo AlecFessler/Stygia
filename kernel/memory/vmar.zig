@@ -954,6 +954,17 @@ pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
 /// + §[address_space]). On overlap with an existing VMAR, retry a
 /// bounded number of times then fall back to a bump pointer for
 /// forward progress.
+///
+/// Overlap detection covers two classes of mapping:
+///   1. `domainOverlaps` — VMAR-tracked ranges (every successful
+///      `create_vmar` registers in `domain.vars[]`).
+///   2. `pageTableOverlaps` — eager mappings the kernel installs at boot
+///      that don't go through the VMAR layer: ELF segments
+///      (`loadElfSegments`), the user stack (`mapUserStack`), and the
+///      read-only cap-table view (`mapUserTableView`). Both classes
+///      occupy real linear addresses; allocating a VMAR base that
+///      overlaps either would let `map_pf`'s test 09 check fire on the
+///      eager PTEs and reject the install with E_INVAL.
 fn vaRangeAllocate(
     domain: *CapabilityDomain,
     pages: u32,
@@ -970,7 +981,7 @@ fn vaRangeAllocate(
     if (max_base < aslr.start) return null;
 
     // Try a small number of randomized placements first. The overlap
-    // check below is the authoritative collision test; here we simply
+    // checks below are the authoritative collision test; here we simply
     // probe distinct random bases.
     const RETRY_LIMIT = 8;
     var attempt: u8 = 0;
@@ -980,7 +991,9 @@ fn vaRangeAllocate(
         const off = r % span;
         const candidate = aslr.start + std.mem.alignBackward(u64, off, sz_bytes);
         if (candidate >= aslr.start and candidate <= max_base) {
-            if (!domainOverlaps(domain, candidate, range_bytes)) {
+            if (!domainOverlaps(domain, candidate, range_bytes) and
+                !pageTableOverlaps(domain, candidate, range_bytes, sz_bytes))
+            {
                 return .fromInt(candidate);
             }
         }
@@ -989,12 +1002,42 @@ fn vaRangeAllocate(
 
     // Fallback: bump-allocate from `next_var_base` so a VA-pressured
     // domain still makes forward progress when randomized probing
-    // keeps colliding.
-    const aligned = std.mem.alignForward(u64, domain.next_var_base, sz_bytes);
-    const new_top = aligned + range_bytes;
-    if (new_top > aslr.end) return null;
-    domain.next_var_base = new_top;
-    return .fromInt(aligned);
+    // keeps colliding. Walk the bump pointer forward past any eager
+    // mappings (ELF/stack/cap-table view) that happen to sit at the
+    // current bump position; without this the bump path inherits the
+    // same eager-overlap blind spot the randomized path used to have.
+    var aligned = std.mem.alignForward(u64, domain.next_var_base, sz_bytes);
+    while (aligned + range_bytes <= aslr.end) {
+        const new_top = aligned + range_bytes;
+        if (!domainOverlaps(domain, aligned, range_bytes) and
+            !pageTableOverlaps(domain, aligned, range_bytes, sz_bytes))
+        {
+            domain.next_var_base = new_top;
+            return .fromInt(aligned);
+        }
+        aligned = std.mem.alignForward(u64, aligned + sz_bytes, sz_bytes);
+    }
+    return null;
+}
+
+/// Return true when any page-sized slot in `[base, base + bytes)` already
+/// has a present leaf PTE in `domain`'s address space. Catches eager
+/// mappings (ELF segments, user stack, cap-table view) that aren't
+/// registered in `domain.vars[]` and would otherwise fall through
+/// `domainOverlaps` to be picked as a fresh VMAR base. Walks at the
+/// requested page size so an overlap test against a 4 KiB candidate
+/// only checks 4 KiB-aligned slots; larger sz aligns up to the
+/// granule.
+fn pageTableOverlaps(domain: *CapabilityDomain, base: u64, bytes: u64, sz_bytes: u64) bool {
+    var off: u64 = 0;
+    while (off < bytes) {
+        const va = VAddr.fromInt(base + off);
+        if (dispatch.paging.resolveVaddr(domain.addr_space_root, va) != null) {
+            return true;
+        }
+        off += sz_bytes;
+    }
+    return false;
 }
 
 /// Cheap overlap test against the domain's already-bound VARs. Used
