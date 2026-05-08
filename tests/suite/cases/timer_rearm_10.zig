@@ -20,13 +20,31 @@
 //   live timer, runs the side-effect refresh, then rejects the call
 //   on the reserved-bits check).
 //
-//   We arm a periodic timer with a very long deadline so the kernel
-//   never fires it during the test. Periodic + long deadline pins the
-//   authoritative kernel state at field0 = 0, field1.arm = 1,
-//   field1.pd = 1 across the entire test window. That gives us a
-//   stable post-condition for the implicit-sync side effect: whatever
-//   the cap-table snapshot looks like after the failed rearm call, it
-//   must agree with the same authoritative tuple.
+//   For the test 10 refresh post-condition to be load-bearing the
+//   authoritative kernel state must demonstrably *differ* from the
+//   pre-call domain-local snapshot — otherwise an "OK" readback after
+//   the failed rearm could be explained by the snapshot being
+//   correct already, with no refresh having occurred. We therefore:
+//
+//     1. timer_arm a one-shot with a short deadline (caps={arm,
+//        cancel}).
+//     2. futex_wait_val on &field0 with expected=0 — block until the
+//        fire wake returns with [1] = field0_addr (witnesses the
+//        fire end-to-end via §[timer] field0 wake / §[futex_wait_val]
+//        [test 08]).
+//     3. After the fire, kernel-authoritative state is field0 = 1,
+//        field1.arm = 0, field1.pd = 0 (§[timer_arm] [test 07] for
+//        the one-shot disarm).
+//     4. Issue timer_rearm with reserved bit 12 of [1] set — must
+//        return E_INVAL (§[timer_rearm] test 04). [1] resolves to a
+//        valid handle, so the side-effect refresh per spec test 10
+//        is mandated.
+//     5. Read the cap-table snapshot and assert it matches the
+//        post-fire authoritative state: field0 = 1, field1 = 0.
+//        Because we deliberately exited the rearm error path
+//        without success, the only way this readback can match is
+//        if the kernel performed the implicit refresh during the
+//        failing call — exactly the spec sentence under test.
 //
 //   We bypass the typed `timerRearm` wrapper (which takes u12 and
 //   would scrub the reserved bit) and dispatch through `issueReg`
@@ -34,27 +52,30 @@
 //   shape used in timer_rearm_04 and timer_cancel_09.
 //
 // Action
-//   1. timer_arm(caps={arm}, deadline_ns=1 hour, periodic=1)
-//                                                — must succeed
-//   2. readCap(handle) before the rearm call    — sanity check that
-//      the kernel propagated field0 = 0 and field1 = {arm=1, pd=1}
-//      into the domain-local snapshot at arm time
-//   3. timer_rearm(handle | (1 << 12), 1 hour, periodic=1)
-//                                                — must return
-//      E_INVAL (test 04 reserved-bits-on-[1] path)
-//   4. readCap(handle) after the rearm call     — must still observe
-//      the authoritative kernel state (field0 = 0, field1 = {arm=1,
-//      pd=1}) as the side-effect refresh mandated by test 10
+//   1. timer_arm(caps={arm,cancel}, deadline_ns=ARM_DEADLINE_NS,
+//                flags=0)                            — must succeed
+//   2. futex_wait_val(timeout=FUTEX_TIMEOUT_NS, addr=&field0,
+//                     expected=0)                    — wake with
+//      [1] = field0_addr (one-shot fire witnessed)
+//   3. timer_rearm(handle | (1 << 12), ARM_DEADLINE_NS, 0)
+//                                                    — must return
+//      E_INVAL (test 04 reserved-bits path) on a valid handle
+//   4. readCap(handle) — must observe the authoritative kernel
+//      state (field0 = 1, field1 = 0) as the side-effect refresh
+//      mandated by test 10
 //
 // Assertions
 //   1: timer_arm setup failed (arm returned an error word)
-//   2: pre-call snapshot did not match the just-armed kernel state
-//      (field0 != 0 or field1 != {arm=1, pd=1})
+//   2: futex_wait_val did not return [1] = &field0 — the one-shot
+//      fire never delivered a wake, so test 10's pre-call
+//      authoritative state is unestablished
 //   3: timer_rearm with reserved bit 12 of [1] set did not return
-//      E_INVAL
-//   4: post-call snapshot diverged from the authoritative kernel
-//      state — the kernel returned an error but did not refresh the
-//      domain-local field0/field1 as the spec requires
+//      E_INVAL (the call resolved a valid handle but did not take
+//      the reserved-bits failure path)
+//   4: post-call snapshot diverged from the post-fire authoritative
+//      kernel state — the kernel returned an error but did not
+//      refresh the domain-local field0/field1 as the spec requires.
+//      Concretely: field0 != 1 OR field1 != 0.
 
 const lib = @import("lib");
 
@@ -63,44 +84,50 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// §[timer] field1 bit layout: bit 0 = arm, bit 1 = pd, bits 2-63
-// _reserved. The expected post-condition for an armed periodic timer
-// is therefore exactly 0b11.
-const FIELD1_ARMED_PERIODIC: u64 = 0b11;
+// 5 ms — short enough that a one-shot fires inside the 1 s futex
+// timeout below; far above per-syscall latency so the call sequence
+// arrives at futex_wait_val while the timer is still genuinely
+// armed. Mirrors sizing in timer_rearm_05/06/07.
+const ARM_DEADLINE_NS: u64 = 5_000_000;
+
+// 1 s futex timeout — a 5 ms one-shot must fire inside this; an
+// E_TIMEOUT here is a structural failure surfaced via assertion 2.
+const FUTEX_TIMEOUT_NS: u64 = 1_000_000_000;
 
 pub fn main(cap_table_base: u64) void {
-    // §[timer] timer cap word: bit 2 = arm. `arm` is required so the
-    // rearm call's test 02 PERM check cannot fire on the reserved-bit
-    // path — we want test 04 to be the sole spec-mandated failure
-    // mode, with [1] still resolving to a live timer.
-    const timer_caps = caps.TimerCap{ .arm = true };
+    // §[timer] timer cap word: bit 2 = arm, bit 3 = cancel. `arm` is
+    // required so the rearm call's test 02 PERM check cannot fire on
+    // the reserved-bit path — we want test 04 to be the sole spec-
+    // mandated failure mode. `cancel` is unused here (the one-shot
+    // self-disarms on fire) but is harmless.
+    const timer_caps = caps.TimerCap{ .arm = true, .cancel = true };
     const caps_word: u64 = @as(u64, timer_caps.toU16());
 
-    // 1 hour in nanoseconds. Picked far above any plausible test
-    // wall-clock so the periodic timer cannot fire during the test
-    // window — that pins the authoritative kernel state at
-    // field0 = 0, field1 = {arm=1, pd=1} across the rearm call.
-    const deadline_ns: u64 = 60 * 60 * 1_000_000_000;
-
-    // §[timer_arm] flags: bit 0 = periodic. Periodic so field1.pd = 1
-    // shows up in the post-condition (one-shot would leave pd = 0,
-    // which is the same as the unset reserved-bit pattern and is
-    // therefore weaker as an authoritative-state probe).
-    const flags_periodic: u64 = 1;
-
-    const arm_result = syscall.timerArm(caps_word, deadline_ns, flags_periodic);
+    // §[timer_arm] flags: bit 0 = periodic. One-shot (periodic=0) so
+    // the post-fire authoritative state is uniquely determined:
+    // field0 = 1, field1.arm = 0, field1.pd = 0. That tuple is
+    // distinguishable from arm-time (field0 = 0, field1.arm = 1),
+    // which is what makes the post-call refresh observable.
+    const arm_result = syscall.timerArm(caps_word, ARM_DEADLINE_NS, 0);
     if (testing.isHandleError(arm_result.v1)) {
         testing.fail(1);
         return;
     }
     const timer_handle: u12 = @truncate(arm_result.v1 & 0xFFF);
 
-    // Pre-call sanity: the kernel must already have populated the
-    // domain-local snapshot at arm time. If this fails, test 10 is
-    // not meaningfully exercised because we cannot distinguish a
-    // post-call refresh from a snapshot that was always correct.
-    const pre = caps.readCap(cap_table_base, timer_handle);
-    if (pre.field0 != 0 or pre.field1 != FIELD1_ARMED_PERIODIC) {
+    // §[capabilities] handle layout: Cap = { word0, field0, field1 }
+    // (24 bytes). field0 sits at offset 8 within the slot — the
+    // kernel-keyed paddr for the per-fire futex wake.
+    const slot_offset: u64 = @as(u64, timer_handle) * @as(u64, caps.HANDLE_BYTES);
+    const field0_addr: u64 = cap_table_base + slot_offset + @offsetOf(caps.Cap, "field0");
+
+    // Block on the one-shot fire. *field0 starts at 0 (arm time),
+    // so this can only return via a wake — the entry-mismatch path
+    // is unreachable. The wake's [1] = field0_addr witnesses the
+    // fire end-to-end.
+    const pairs = [_]u64{ field0_addr, 0 };
+    const wake = syscall.futexWaitVal(FUTEX_TIMEOUT_NS, pairs[0..]);
+    if (wake.v1 != field0_addr) {
         testing.fail(2);
         return;
     }
@@ -110,15 +137,15 @@ pub fn main(cap_table_base: u64) void {
     // bit) and dispatch through issueReg directly so the bit reaches
     // the kernel. The low 12 bits hold the valid timer id, so [1] is
     // a "valid handle" per the spec's gating phrase even though the
-    // word encoding is rejected. deadline_ns is non-zero (so test 03
-    // cannot fire) and flags has only bit 0 set (so test 04 on [3]
+    // word encoding is rejected. deadline_ns is non-zero (test 03
+    // cannot fire) and flags has only bit 0 cleared (test 04 on [3]
     // cannot fire) — the reserved bit on [1] is the sole spec-
     // mandated failure trigger.
     const handle_with_reserved: u64 = @as(u64, timer_handle) | (@as(u64, 1) << 12);
     const rearm_result = syscall.issueReg(.timer_rearm, 0, .{
         .v1 = handle_with_reserved,
-        .v2 = deadline_ns,
-        .v3 = flags_periodic,
+        .v2 = ARM_DEADLINE_NS,
+        .v3 = 0,
     });
     if (rearm_result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(3);
@@ -128,11 +155,13 @@ pub fn main(cap_table_base: u64) void {
     // Post-call refresh check. The kernel rejected the call with
     // E_INVAL but, per test 10, must still have refreshed the
     // domain-local field0/field1 from authoritative kernel state.
-    // The timer is still armed and periodic and has not fired (1 h
-    // deadline >> test wall-clock), so authoritative state remains
-    // field0 = 0, field1 = {arm=1, pd=1}.
+    // After the witnessed one-shot fire that authoritative state is
+    //   field0 = 1, field1.arm = 0, field1.pd = 0 (i.e. field1 = 0).
+    // A snapshot showing anything else means the kernel skipped the
+    // implicit refresh on the error path — the exact behaviour
+    // test 10 forbids.
     const post = caps.readCap(cap_table_base, timer_handle);
-    if (post.field0 != 0 or post.field1 != FIELD1_ARMED_PERIODIC) {
+    if (post.field0 != 1 or post.field1 != 0) {
         testing.fail(4);
         return;
     }
