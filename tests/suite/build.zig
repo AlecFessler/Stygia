@@ -266,6 +266,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "perfmon_start_07", .path = "cases/perfmon_start_07.zig" },
     .{ .name = "perfmon_start_08", .path = "cases/perfmon_start_08.zig" },
     .{ .name = "perfmon_start_09", .path = "cases/perfmon_start_09.zig" },
+    .{ .name = "perfmon_start_10", .path = "cases/perfmon_start_10.zig" },
     .{ .name = "perfmon_stop_01", .path = "cases/perfmon_stop_01.zig" },
     .{ .name = "perfmon_stop_02", .path = "cases/perfmon_stop_02.zig" },
     .{ .name = "perfmon_stop_03", .path = "cases/perfmon_stop_03.zig" },

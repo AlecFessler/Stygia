@@ -160,9 +160,19 @@ pub fn main(cap_table_base: u64) void {
 
     const info = syscall.perfmonInfo();
 
-    // Degraded smoke: any error-shaped value in vreg 1 means the
-    // PMU success path is unobservable in this build.
-    if (info.v1 != 0 and info.v1 < 16) {
+    // Degraded smoke for perfmon_info itself. §[perfmon_info] only
+    // documents one error path (test 01: E_PERM if self-handle lacks
+    // `pmu`); the runner grants `pmu` so we don't expect to hit it,
+    // but if a kernel bug surfaces it we want a degraded-smoke pass
+    // rather than a misleading FAIL on this test.
+    //
+    // Crucially, do NOT use `info.v1 < 16` as the smoke gate: caps_word
+    // packs `num_counters` in bits 0..7 and `overflow_support` in bit 8
+    // (§[perfmon_info]). A small but legal num_counters (e.g. 5) would
+    // make `info.v1 < 16` and false-positive smoke-pass through here,
+    // skipping the real assertion. Compare against the only spec-
+    // documented error code instead.
+    if (info.v1 == @intFromEnum(errors.Error.E_PERM)) {
         testing.pass();
         return;
     }
