@@ -172,6 +172,18 @@ pub fn allocForDemand(sz: PageSize) !*PageFrame {
 
 /// Allocate a PageFrame slot + `page_count` pages of `sz` from PMM,
 /// refcount=1, mapcnt=0. Spec §[page_frame] create.
+///
+/// `pf.page_count` mirrors the user-requested count exactly — userspace
+/// sized its VMAR to that count and `map_pf` rejects pf range >
+/// vmar size (spec §[map_pf] E_INVAL). The buddy allocator under PMM
+/// only services power-of-two block sizes, so `buddyAllocBytes`
+/// internally rounds up the byte total when page_count isn't a power
+/// of two; the tail pages are inaccessible to userspace but stay
+/// reserved by the PMM until the PF is destroyed, at which point
+/// `destroyPageFrame` frees the same rounded byte total back to the
+/// buddy via `freeBlock`. No physical leak — both alloc and free
+/// route through `buddyAllocBytes` so the buddy accounting stays
+/// balanced.
 fn allocPageFrame(sz: PageSize, page_count: u32) !*PageFrame {
     const total_bytes: u64 = buddyAllocBytes(sz, page_count);
 

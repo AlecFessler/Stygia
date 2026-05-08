@@ -17,6 +17,7 @@ const capability = zag.caps.capability;
 const cd_mod = zag.caps.capability_domain;
 const ec_mod = zag.sched.execution_context;
 const errors = zag.syscall.errors;
+const page_frame_mod = zag.memory.page_frame;
 const port_mod = zag.sched.port;
 const vm_dispatch = zag.arch.dispatch.vm;
 
@@ -738,60 +739,34 @@ fn pageFramePerms(caps_bits: PageFrameCaps) MemoryPerms {
     };
 }
 
-/// Holder-side refcount + mapcnt accessors. The PageFrame module's
-/// own equivalents are file-private; the `_gen_lock` guard semantics
-/// are mirrored here so cross-object install paths cannot race a
-/// concurrent PageFrame teardown. Mirrors the canonical pattern in
-/// `memory/page_frame.zig`: when both counters reach 0 the decrementer
-/// owns teardown and `destroyPageFrame` is invoked while still holding
-/// the lock so the gen-bump on slot release cannot race with a
-/// concurrent acquire.
+/// Holder-side refcount + mapcnt accessors. Thin wrappers over the
+/// canonical helpers in `kernel/memory/page_frame.zig` — using those
+/// directly ensures the conjunctive (refcount==0 AND mapcnt==0)
+/// teardown path runs the canonical `destroyPageFrame`, which both
+/// frees the slab slot AND returns the buddy block to PMM. Earlier
+/// forks here only freed the slab slot, leaking the backing physical
+/// pages on every VM destroy / `unmap_guest`.
 fn incPageFrameRef(pf: *PageFrame) void {
-    const irq = pf._gen_lock.lockIrqSave(@src());
-    defer pf._gen_lock.unlockIrqRestore(irq);
-    // Caller pins `pf` via the active VM's stage-2 mapping (this is
-    // map_guest territory, not handle creation); a concurrent destroy
-    // that drove refcount to Sticky must have torn down the stage-2
-    // mappings first. observed_zero is structurally unreachable.
-    if (pf.refcount.inc() == .observed_zero) unreachable;
+    // Caller pins `pf` via either an existing VM-held SlabRef
+    // (createVm: caller-resolved policy_pf handle) or the active VM's
+    // map_guest install. A concurrent destroy that drove refcount to
+    // Sticky must have torn down those refs first, so observed_zero is
+    // structurally unreachable here.
+    page_frame_mod.incHandleRef(pf) catch unreachable;
 }
 
 fn decPageFrameRef(pf: *PageFrame) void {
-    const irq = pf._gen_lock.lockIrqSave(@src());
-    const result = pf.refcount.dec();
-    if (result == .observed_zero and pf.mapcnt == 0) {
-        destroyPageFrame(pf);
-        // Teardown released the lock via setGenRelease without
-        // restoring IRQ state — restore manually here.
-        arch.cpu.restoreInterrupts(irq);
-        return;
-    }
-    pf._gen_lock.unlockIrqRestore(irq);
+    page_frame_mod.releaseHandle(pf);
 }
 
 fn incPageFrameMap(pf: *PageFrame) void {
-    const irq = pf._gen_lock.lockIrqSave(@src());
-    defer pf._gen_lock.unlockIrqRestore(irq);
-    pf.mapcnt +|= 1;
+    // Mirrors `kernel/memory/vmar.zig:mappingInstall`: a plain atomic
+    // RMW. The pf is pinned by a SlabRef in `vm.installs` while we
+    // raise the count; the conjunctive teardown gate is checked under
+    // `_gen_lock` by `releaseMapping` on the matching dec.
+    _ = @atomicRmw(u32, &pf.mapcnt, .Add, 1, .seq_cst);
 }
 
 fn decPageFrameMap(pf: *PageFrame) void {
-    const irq = pf._gen_lock.lockIrqSave(@src());
-    if (pf.mapcnt > 0) pf.mapcnt -= 1;
-    // Conjunctive teardown: mapcnt-driven destroy fires only when the
-    // matching refcount dec already drove it to Sticky.
-    if (pf.mapcnt == 0 and pf.refcount.isDead()) {
-        destroyPageFrame(pf);
-        arch.cpu.restoreInterrupts(irq);
-        return;
-    }
-    pf._gen_lock.unlockIrqRestore(irq);
-}
-
-/// Final teardown — caller has observed both `refcount` and `mapcnt`
-/// at zero under `_gen_lock`. Returns the slab slot via `destroyLocked`
-/// which performs the gen bump as part of releasing the lock.
-fn destroyPageFrame(pf: *PageFrame) void {
-    const expected_gen: u63 = @intCast(pf._gen_lock.currentGen());
-    zag.memory.page_frame.slab_instance.destroyLocked(pf, expected_gen);
+    page_frame_mod.releaseMapping(pf);
 }

@@ -702,10 +702,29 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             user_entry.field1 = (@as(u64, @intFromBool(t.armed))) |
                 (@as(u64, @intFromBool(t.periodic)) << 1);
         },
+        .page_frame => {
+            const ref = typedRef(PageFrame, entry.*) orelse return;
+            const lr = ref.lockIrqSave(@src()) catch return;
+            defer ref.unlockIrqRestore(lr.irq_state);
+            const pf = lr.ptr;
+            // §[page_frame] field0 layout: page_count[0..31] | sz[32..33].
+            // page_count and sz are immutable, but refresh re-stamps
+            // them so a kernel-side rewrite of the snapshot (e.g. a
+            // future field0 layout extension) stays consistent.
+            user_entry.field0 = (@as(u64, @intFromEnum(pf.sz)) << 32) |
+                @as(u64, pf.page_count);
+            // §[page_frame] field1 layout: mapcnt[0..31] | _reserved[32..63].
+            // mapcnt is mutated by every map_pf / unmap / map_guest /
+            // unmap_guest. Spec line 2017: "sync-refreshed on any
+            // syscall touching the handle". Read it as an atomic load
+            // because vmar.mappingInstall raises it via @atomicRmw
+            // outside `_gen_lock`.
+            const mapcnt = @atomicLoad(u32, &pf.mapcnt, .acquire);
+            user_entry.field1 = @as(u64, mapcnt);
+        },
         // Types whose snapshots don't drift. For these, no-op.
         .capability_domain_self,
         .capability_domain,
-        .page_frame,
         .port,
         .reply,
         .virtual_machine,
