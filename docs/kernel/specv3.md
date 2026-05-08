@@ -183,6 +183,8 @@ None — reducing authority never requires authority.
 
 [test 07] on success, syscalls gated by caps cleared by restrict return E_PERM when invoked via this handle.
 
+[test 08] on success, when the handle is a `port` handle and `restrict` clears a cap that contributes to a port-side refcount (`bind` or `recv`), the matching refcount is decremented as if `delete` had been performed for that bit. Conversely, clearing a non-lifetime cap (`suspend`, `xfer`, `restart_policy`, `move`, `copy`) leaves both port-side refcounts intact: a recv on the same handle with a finite `timeout_ns` returns `E_TIMEOUT` rather than `E_CLOSED` when the `bind` cap is preserved and no senders are queued.
+
 
 ### delete
 
@@ -211,7 +213,7 @@ Per-type observable behavior:
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
-| `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
+| `port` | Decrement the bind-side refcount if this handle has `bind`; decrement the recv-side refcount if this handle has `recv`. The `suspend` cap does not contribute to either refcount. When the recv-side refcount hits zero, suspended senders resume with `E_CLOSED` and the port slab is destroyed. When the bind-side refcount hits zero and no event routes target the port and no vCPU `exit_port` pins remain, receivers suspended on the port resume with `E_CLOSED`; the port slab itself stays alive while any recv-cap holder remains. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
 | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
 | `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |
@@ -382,7 +384,7 @@ field0:
 | idc_rx | 32-39 | mask intersected with sent caps when this domain receives an IDC handle |
 | pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this domain (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
 | vm_ceiling | 48-55 | max caps `create_virtual_machine` may mint when called from this domain (`policy` bit 48) |
-| port_ceiling | 56-63 | max caps `create_port` may mint when called from this domain (`xfer` bit 58, `recv` bit 59, `bind` bit 60) |
+| port_ceiling | 56-63 | max caps `create_port` may mint when called from this domain (`xfer` bit 58, `recv` bit 59, `bind` bit 60, `suspend` bit 62) |
 
 field1:
 
@@ -2764,11 +2766,11 @@ word 2 (field1):
 cap (word 0, bits 48-63):
 
 ```
- 15                  6    5    4    3    2    1    0
-┌─────────────────────┬──────┬────┬────┬────┬────┬────┐
-│  _reserved (10)     │rstrt │bind│recv│xfer│copy│move│
-│                     │_plcy │    │    │    │    │    │
-└─────────────────────┴──────┴────┴────┴────┴────┴────┘
+ 15              7    6    5    4    3    2    1    0
+┌─────────────────┬─────┬──────┬────┬────┬────┬────┬────┐
+│  _reserved (9)  │susp │rstrt │bind│recv│xfer│copy│move│
+│                 │end  │_plcy │    │    │    │    │    │
+└─────────────────┴─────┴──────┴────┴────┴────┴────┴────┘
 ```
 
 | Bit | Name | Meaning |
@@ -2777,8 +2779,9 @@ cap (word 0, bits 48-63):
 | 1 | `copy` | transferring this handle via copy to another capability domain |
 | 2 | `xfer` | transferring capabilities on this port (attaching handles to a suspension event payload, or to a reply payload) |
 | 3 | `recv` | reading events off this port and receiving the associated reply capability |
-| 4 | `bind` | using this port as the destination of a `suspend` syscall, the `exit_port` of a `create_vcpu`, or an `event_route` registration |
+| 4 | `bind` | using this port as the `exit_port` of a `create_vcpu` or as an `event_route` registration target; pins the port's bind-side lifetime |
 | 5 | `restart_policy` | port behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 6 | `suspend` | using this port as the destination of a `suspend` syscall |
 
 ### create_port
 
@@ -2880,13 +2883,13 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 #### Capabilities
 
 - EC handle `[1]`: `susp`. Visibility and writability of the target's state in the suspension event are gated by `[1]`'s `read` and `write` caps.
-- Port handle `[2]`: `bind`. Additionally `xfer` if any handles are attached.
+- Port handle `[2]`: `suspend`. Additionally `xfer` if any handles are attached.
 
 #### Errors
 
 **E_BADCAP** — `[1]` is not a valid EC handle; `[2]` is not a valid port handle.
 
-**E_PERM** — `[1]` lacks `susp`; `[2]` lacks `bind`.
+**E_PERM** — `[1]` lacks `susp`; `[2]` lacks `suspend`.
 
 **E_INVAL** — reserved bits set; `[1]` references a vCPU; `[1]` is already suspended.
 
@@ -2898,7 +2901,7 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 [test 03] returns E_PERM if [1] does not have the `susp` cap.
 
-[test 04] returns E_PERM if [2] does not have the `bind` cap.
+[test 04] returns E_PERM if [2] does not have the `suspend` cap.
 
 [test 05] returns E_INVAL if any reserved bits are set.
 
@@ -2961,7 +2964,7 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 **E_INVAL** — reserved bits set in `[1]`.
 
-**E_CLOSED** — port has no bind-cap holders, no event_routes targeting it, and no queued events (call returns immediately rather than blocking); also raised if the port becomes terminally closed while a recv is blocked.
+**E_CLOSED** — port has no bind-cap holders, no event_routes targeting it, no vCPU `exit_port` bindings to it, and no queued events (call returns immediately rather than blocking); also raised if the port becomes terminally closed while a recv is blocked.
 
 **E_TIMEOUT** — `[2] timeout_ns` is nonzero, no sender queued, and none becomes queued within the deadline.
 
@@ -2975,9 +2978,9 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 [test 03] returns E_INVAL if any reserved bits are set in [1].
 
-[test 04] returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
+[test 04] returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, no vCPU `exit_port` pinning it, and no queued events.
 
-[test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
+[test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port, no vCPU `exit_port` pins it, and no events are queued.
 
 [test 06] returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
 
@@ -3000,6 +3003,10 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 [test 15] on success when [2] timeout_ns is nonzero and a sender is delivered before the deadline, the deadline is cancelled and no E_TIMEOUT is later observed.
 
 [test 16] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
+
+[test 17] returns E_CLOSED if `restrict` clears the `bind` cap on the only `bind`-cap-holding handle while no event_routes target the port and no vCPU `exit_port` pins it; the recv call observes this on its very next invocation against the (still-recv-capable) handle.
+
+[test 18] does NOT return E_CLOSED when `restrict` clears the `suspend` cap on a port whose `bind`-cap holder remains: the `suspend` cap does not contribute to bind-side lifetime, so a recv with a finite `timeout_ns` returns `E_TIMEOUT` (no sender queued) rather than E_CLOSED.
 
 
 ### §[event_type] Event Type
