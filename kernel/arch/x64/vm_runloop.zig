@@ -21,7 +21,6 @@ const vm_hw = zag.arch.x64.vm;
 const ExecutionContext = zag.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
 const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
 const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
 
 /// VM-exit delivery descriptor returned by `enterGuest`. Mirror of the
@@ -648,17 +647,12 @@ fn ctrlPhysFor(vm_ptr: *zag.hv.virtual_machine.VirtualMachine) ?PAddr {
     return cell.ctrl_phys;
 }
 
-/// Resolve the live `VmPolicy` table backing `vm`. Returns `null` when
-/// no policy page frame has been seeded (pre-create_virtual_machine
-/// scaffolding paths) — caller treats that as "no inline policy
-/// configured". The page frame's physical pages are exposed through the
-/// kernel physmap; the seeded `VmPolicy` lives at offset 0 per
-/// §[create_virtual_machine] and §[vm_set_policy].
+/// Resolve the kernel-private `VmPolicy` table backing `vm`. Lives in
+/// the per-VM CtrlStateCell so userspace cannot reach into it; copied
+/// from the user-supplied `policy_pf` at create time and mutated only
+/// by `applyVmPolicyTable`.
 fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
-    const pf_ref = vm_ptr.policy_pf orelse return null;
-    const pf = pf_ref.ptr;
-    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
-    return @ptrFromInt(phys_va.addr);
+    return hv_vm.vmPolicyFor(vm_ptr);
 }
 
 /// §[vm_policy] x86-64 CPUID lookup. Returns true if `(leaf, subleaf)`
@@ -667,19 +661,21 @@ fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
 /// have been projected onto guest GPRs and RIP has advanced past the
 /// CPUID. Returns false on miss — caller delivers `.cpuid` to the VMM
 /// per §[vm_exit_state].
+///
+/// Acquire-load on `num_*` pairs with the release-store in
+/// `applyVmPolicyTable` so a concurrent `vm_set_policy` from another
+/// core cannot publish a count before its entry writes are visible.
 fn tryHandleCpuidPolicy(
     vm_ptr: *VirtualMachine,
     gs: *GuestState,
     c: vm_hw.VmExitInfo.CpuidExit,
 ) bool {
     const policy = vmPolicyFor(vm_ptr) orelse return false;
-    const n = policy.num_cpuid_responses;
+    const n = @atomicLoad(u32, &policy.num_cpuid_responses, .acquire);
     if (n == 0) return false;
-    // Bound-check num_* against the array bound — `validateVmPolicy`
-    // already rejects out-of-range counts at create_virtual_machine
-    // time, but `applyVmPolicyTable` writes the same field at runtime.
-    // Defensive clamp here mirrors that bound so a miswritten count
-    // can't read past the entries array.
+    // Defensive clamp: the kernel-private copy is bounded at write
+    // time by `applyVmPolicyTable`, but mirror the bound here so a
+    // miswritten count cannot read past the entries array.
     const max: u32 = vm_hw.VmPolicy.MAX_CPUID_POLICIES;
     const limit: u32 = if (n > max) max else n;
     var i: u32 = 0;
@@ -721,7 +717,7 @@ fn tryHandleCrPolicy(
     cr: vm_hw.VmExitInfo.CrAccessExit,
 ) bool {
     const policy = vmPolicyFor(vm_ptr) orelse return false;
-    const n = policy.num_cr_policies;
+    const n = @atomicLoad(u32, &policy.num_cr_policies, .acquire);
     if (n == 0) return false;
     const max: u32 = vm_hw.VmPolicy.MAX_CR_POLICIES;
     const limit: u32 = if (n > max) max else n;

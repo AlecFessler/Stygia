@@ -259,6 +259,14 @@ pub const Lapic = struct {
         setBit(&self.irr, vector);
     }
 
+    /// Clear the IRR (and ISR) bit for `vector` so a deasserted IOAPIC
+    /// pin doesn't leave a stale pending interrupt on the LAPIC.
+    /// Spec §[vm_inject_irq] test 05.
+    pub fn clearPendingVector(self: *Lapic, vector: u8) void {
+        clearBit(&self.irr, vector);
+        clearBit(&self.isr, vector);
+    }
+
     // --- Internal helpers ---
 
     /// Compute Processor Priority Register (PPR).
@@ -337,15 +345,18 @@ pub const Lapic = struct {
 };
 
 /// Find the highest set bit across a 256-bit vector (8 x 32-bit words).
-/// Returns the bit index (0-255) or null if no bits are set.
+/// Returns the bit index (0-255) or null if no bits are set. Atomic
+/// loads so a concurrent `setBit` / `clearBit` from another core
+/// produces a consistent snapshot of each word at read time.
 fn highestSetBit(vec: *const [8]u32) ?u8 {
     var i: u8 = 8;
     while (i > 0) {
         i -= 1;
-        if (vec[i] != 0) {
+        const w = @atomicLoad(u32, &vec[i], .acquire);
+        if (w != 0) {
             var bit: u5 = 31;
             while (true) {
-                if (vec[i] & (@as(u32, 1) << bit) != 0) {
+                if (w & (@as(u32, 1) << bit) != 0) {
                     return @as(u8, i) * 32 + bit;
                 }
                 if (bit == 0) break;
@@ -356,23 +367,28 @@ fn highestSetBit(vec: *const [8]u32) ?u8 {
     return null;
 }
 
-/// Set a bit in a 256-bit vector.
+/// Set a bit in a 256-bit vector. Atomic-or so a cross-core
+/// `vm_inject_irq` (which lands here via IOAPIC.assertIrq →
+/// deliverInterrupt → injectExternal) cannot lose updates against the
+/// owning vCPU's run-loop reads/clears.
 fn setBit(vec: *[8]u32, bit_index: u8) void {
     const word: u3 = @truncate(bit_index >> 5);
     const bit: u5 = @truncate(bit_index & 0x1F);
-    vec[word] |= @as(u32, 1) << bit;
+    _ = @atomicRmw(u32, &vec[word], .Or, @as(u32, 1) << bit, .release);
 }
 
-/// Clear a bit in a 256-bit vector.
+/// Clear a bit in a 256-bit vector. Atomic-and counterpart to
+/// `setBit` for cross-core deassert / EOI / accept paths.
 fn clearBit(vec: *[8]u32, bit_index: u8) void {
     const word: u3 = @truncate(bit_index >> 5);
     const bit: u5 = @truncate(bit_index & 0x1F);
-    vec[word] &= ~(@as(u32, 1) << bit);
+    _ = @atomicRmw(u32, &vec[word], .And, ~(@as(u32, 1) << bit), .release);
 }
 
 /// Test a bit in a 256-bit vector.
 fn getBit(vec: *const [8]u32, bit_index: u8) bool {
     const word: u3 = @truncate(bit_index >> 5);
     const bit: u5 = @truncate(bit_index & 0x1F);
-    return (vec[word] & (@as(u32, 1) << bit)) != 0;
+    const w = @atomicLoad(u32, &vec[word], .acquire);
+    return (w & (@as(u32, 1) << bit)) != 0;
 }

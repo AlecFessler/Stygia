@@ -98,7 +98,6 @@ pub fn validateVmPolicy(policy_pf: *PageFrame) !void {
 }
 
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
-    _ = policy_pf;
     if (!vm_hw.vmSupported()) return error.NoDevice;
 
     // EPT/NPT root has been allocated by allocStage2Root above and
@@ -108,17 +107,35 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
     const ctrl_phys = vm_hw.allocVmCtrlState(vm.guest_pt_root) orelse
         return error.NoDevice;
 
-    // Pin the per-VM control PAddr in a heap-resident *anyopaque so
-    // the dispatch contract returns a stable pointer. The pointer is
-    // currently a tagged-PAddr cell (single u64) and is freed by
-    // freeVmArchState. If/when the per-VM control state grows to a
-    // larger struct (kernel LAPIC/IOAPIC state, exit_box, etc.) this
-    // is the seam to swap to a slab allocation.
+    // Pin the per-VM control PAddr + kernel policy copy in a heap-
+    // resident *anyopaque so the dispatch contract returns a stable
+    // pointer. Freed by `freeVmArchState`.
     const cell = pmm.global_pmm.?.create(CtrlStateCell) catch {
         vm_hw.vmFreeStructures(ctrl_phys);
         return error.OutOfMemory;
     };
     cell.* = .{ .ctrl_phys = ctrl_phys };
+
+    // Copy the user-supplied VmPolicy into kernel-private storage at
+    // create time. `validateVmPolicy` (called by the syscall layer
+    // before us) already bounded the table counts; clamp again here as
+    // a defensive truncation in case userspace mutated the page between
+    // validation and copy. The kernel copy is the only source consulted
+    // on guest exits / `applyVmPolicyTable` writes.
+    const phys_va = VAddr.fromPAddr(policy_pf.phys_base, null);
+    const src: *const vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    const cpuid_n = @min(src.num_cpuid_responses, vm_hw.VmPolicy.MAX_CPUID_POLICIES);
+    const cr_n = @min(src.num_cr_policies, vm_hw.VmPolicy.MAX_CR_POLICIES);
+    var i: u32 = 0;
+    while (i < cpuid_n) : (i += 1) {
+        cell.policy.cpuid_responses[i] = src.cpuid_responses[i];
+    }
+    cell.policy.num_cpuid_responses = cpuid_n;
+    i = 0;
+    while (i < cr_n) : (i += 1) {
+        cell.policy.cr_policies[i] = src.cr_policies[i];
+    }
+    cell.policy.num_cr_policies = cr_n;
     return @ptrCast(cell);
 }
 
@@ -132,13 +149,19 @@ pub fn freeVmArchState(vm: *VirtualMachine) void {
 
 /// Per-VM control-state envelope returned from `allocVmArchState`.
 /// Page-sized + page-aligned so it fits the PMM's `create`/`destroy`
-/// contract; the only payload today is the VMCS/VMCB physical address.
-/// Future arch-specific per-VM state (kernel LAPIC/IOAPIC,
-/// MSRPM/IOPM bookkeeping, exit_box, etc.) is the natural occupant of
-/// the rest of the page.
+/// contract. Holds the VMCS/VMCB control PA plus the kernel-private
+/// VmPolicy copy. Userspace retains its own writable mapping of
+/// `policy_pf` after `create_virtual_machine`, so reading directly from
+/// there would let userspace forge `num_*=0xFFFFFFFF` and drive the
+/// run-loop into an OOB entry walk. The kernel copy is the single
+/// source the run loop and `applyVmPolicyTable` consult.
 pub const CtrlStateCell = extern struct {
     ctrl_phys: PAddr align(paging.PAGE4K),
-    _pad: [paging.PAGE4K - @sizeOf(PAddr)]u8 = undefined,
+    /// Kernel-private VmPolicy copy. Seeded from `policy_pf` at create
+    /// time and mutated only by `applyVmPolicyTable`; userspace cannot
+    /// reach into it.
+    policy: vm_hw.VmPolicy = .{},
+    _pad: [paging.PAGE4K - @sizeOf(PAddr) - @sizeOf(vm_hw.VmPolicy)]u8 = undefined,
 };
 
 comptime {
@@ -197,21 +220,26 @@ pub fn invalidateStage2Range(
 }
 
 /// Spec §[vm_set_policy] x86-64 — replace `cpuid_responses` (kind=0) or
-/// `cr_policies` (kind=1) on `vm`. The VmPolicy struct lives at offset 0
-/// of `vm.policy_pf` and is read on guest exits; this routine writes the
-/// new entries into that struct atomically (kernel-owned mapping; no
-/// concurrent reader since vCPU exits run on the same kernel-mode core
-/// that owns the syscall). Each entry is 3 vregs:
+/// `cr_policies` (kind=1) on `vm`. Writes into the kernel-private
+/// VmPolicy copy in the per-VM CtrlStateCell — userspace cannot reach
+/// into that. Each entry is 3 vregs:
 ///   kind=0: [3i+0]={leaf u32, subleaf u32}; [3i+1]={eax u32, ebx u32};
 ///           [3i+2]={ecx u32, edx u32}.
 ///   kind=1: [3i+0]={cr_num u8, _pad u8[7]}; [3i+1]=read_value u64;
 ///           [3i+2]=write_mask u64.
+///
+/// Publication ordering: x86-64 is TSO and the syscall path runs with
+/// IRQs disabled, but mirror the aarch64 release-store discipline so
+/// readers on other cores can pair with `.acquire` loads without arch-
+/// specific scaffolding.
+///
+/// Reserved-bit enforcement: `kind=1`'s `[3i+0]` is `{cr_num u8, _pad u8[7]}`
+/// — bits [8..63] of the u64 vreg are reserved and must be zero per
+/// §[vm_set_policy] test 04.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
     const errors = zag.syscall.errors;
 
-    // Spec §[vm_set_policy] test 03: count > MAX_<kind> ⇒ E_INVAL. The
-    // bound is per-(kind, arch); on x86-64 kind=0 is bounded by
-    // MAX_CPUID_POLICIES, kind=1 by MAX_CR_POLICIES.
+    // Spec §[vm_set_policy] test 03: count > MAX_<kind> ⇒ E_INVAL.
     const max: u32 = switch (kind) {
         0 => vm_hw.VmPolicy.MAX_CPUID_POLICIES,
         1 => vm_hw.VmPolicy.MAX_CR_POLICIES,
@@ -219,22 +247,26 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
     };
     if (@as(u32, count) > max) return errors.E_INVAL;
 
-    // Both x86-64 kinds occupy 3 vregs/entry per §[vm_set_policy]. The
-    // dispatch layer hands us the full vreg space above [1]; reject
-    // wires whose payload cannot supply `count * 3` vregs of entry data.
     const VREGS_PER_ENTRY: usize = 3;
     const need: usize = @as(usize, count) * VREGS_PER_ENTRY;
     if (entries.len < need) return errors.E_INVAL;
 
-    // The seeded VmPolicy lives at offset 0 of `policy_pf`; the kernel
-    // physmap exposes it via VAddr.fromPAddr. policy_pf is held for the
-    // VM's lifetime by caps (§[create_virtual_machine]) so the pointer
-    // stays valid for as long as the VM is reachable from the syscall.
-    // caller-pinned: policy_pf refcount is held by the VM for its lifetime.
-    const pf_ref = vm.policy_pf orelse return errors.E_NODEV;
-    const pf = pf_ref.ptr;
-    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
-    const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    // §[vm_set_policy] test 04 — entry reserved-bit enforcement.
+    // kind=0 (`{leaf u32, subleaf u32}`) consumes the full u64 in
+    // `[3i+0]` and the full u64s in `[3i+1]/[3i+2]`, so no mask check.
+    // kind=1's `[3i+0]` is `{cr_num u8, _pad u8[7]}` — only bits
+    // [0..7] are defined; bits [8..63] must be zero.
+    if (kind == 1) {
+        const CR_RESERVED_MASK: u64 = ~@as(u64, 0xFF);
+        var i: usize = 0;
+        while (i < @as(usize, count)) : (i += 1) {
+            const w0 = entries[i * VREGS_PER_ENTRY + 0];
+            if ((w0 & CR_RESERVED_MASK) != 0) return errors.E_INVAL;
+        }
+    }
+
+    const cell = ctrlCellFor(vm) orelse return errors.E_NODEV;
+    const policy_ptr: *vm_hw.VmPolicy = &cell.policy;
 
     switch (kind) {
         0 => {
@@ -253,7 +285,10 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
                 };
                 i += 1;
             }
-            policy_ptr.num_cpuid_responses = @as(u32, count);
+            // Release-store: pair with the run loop's acquire-load on
+            // `num_cpuid_responses` so a vCPU on another core never
+            // observes a higher count than the entries it would walk.
+            @atomicStore(u32, &policy_ptr.num_cpuid_responses, @as(u32, count), .release);
         },
         1 => {
             var i: usize = 0;
@@ -268,12 +303,26 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
                 };
                 i += 1;
             }
-            policy_ptr.num_cr_policies = @as(u32, count);
+            @atomicStore(u32, &policy_ptr.num_cr_policies, @as(u32, count), .release);
         },
         else => unreachable,
     }
 
     return 0;
+}
+
+/// Resolve the per-VM CtrlStateCell from `vm.arch_state`. Returns null
+/// when no arch state has been seeded yet.
+pub fn ctrlCellFor(vm: *VirtualMachine) ?*CtrlStateCell {
+    const erased = vm.arch_state orelse return null;
+    return @ptrCast(@alignCast(erased));
+}
+
+/// Resolve the kernel-private VmPolicy backing `vm`. Lives in the
+/// per-VM CtrlStateCell; userspace cannot reach into it.
+pub fn vmPolicyFor(vm: *VirtualMachine) ?*const vm_hw.VmPolicy {
+    const cell = ctrlCellFor(vm) orelse return null;
+    return &cell.policy;
 }
 
 /// Inject (assert/de-assert) a virtual IRQ line on the VM's emulated

@@ -150,11 +150,15 @@ pub const Vgic = extern struct {
     /// Set the pending bit for `intid`. Mirrors a write of 1 to the
     /// matching bit in GICD_ISPENDR<intid/32> per Arm IHI 0069H
     /// §12.9.28. Caller has already validated `intid < TOTAL_DIST_INTIDS`.
+    ///
+    /// Atomic-or rather than plain RMW so a `vm_inject_irq` from any
+    /// core can race a vCPU run-loop scan on another core without
+    /// losing concurrent updates.
     pub fn assertIrq(self: *Vgic, intid: u16) void {
         std.debug.assert(intid < TOTAL_DIST_INTIDS);
         const word: u16 = intid / 32;
         const bit: u5 = @truncate(intid % 32);
-        self.pending[word] |= (@as(u32, 1) << bit);
+        _ = @atomicRmw(u32, &self.pending[word], .Or, @as(u32, 1) << bit, .release);
     }
 
     /// Clear the pending bit for `intid`. Mirrors a write of 1 to the
@@ -164,7 +168,7 @@ pub const Vgic = extern struct {
         std.debug.assert(intid < TOTAL_DIST_INTIDS);
         const word: u16 = intid / 32;
         const bit: u5 = @truncate(intid % 32);
-        self.pending[word] &= ~(@as(u32, 1) << bit);
+        _ = @atomicRmw(u32, &self.pending[word], .And, ~(@as(u32, 1) << bit), .release);
     }
 
     /// Read the current pending state of `intid`. Used by the vCPU
@@ -173,6 +177,20 @@ pub const Vgic = extern struct {
         if (intid >= TOTAL_DIST_INTIDS) return false;
         const word: u16 = intid / 32;
         const bit: u5 = @truncate(intid % 32);
-        return (self.pending[word] & (@as(u32, 1) << bit)) != 0;
+        const w = @atomicLoad(u32, &self.pending[word], .acquire);
+        return (w & (@as(u32, 1) << bit)) != 0;
+    }
+
+    /// Atomically clear the pending bit for `intid` and return whether
+    /// it was set before the clear. Used by the vCPU run loop to claim
+    /// a pending interrupt for delivery without losing wakeups from a
+    /// concurrent `assertIrq` on another core.
+    pub fn takePending(self: *Vgic, intid: u16) bool {
+        if (intid >= TOTAL_DIST_INTIDS) return false;
+        const word: u16 = intid / 32;
+        const bit: u5 = @truncate(intid % 32);
+        const mask: u32 = @as(u32, 1) << bit;
+        const prev = @atomicRmw(u32, &self.pending[word], .And, ~mask, .acquire);
+        return (prev & mask) != 0;
     }
 };

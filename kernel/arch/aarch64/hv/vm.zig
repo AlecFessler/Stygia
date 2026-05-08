@@ -85,13 +85,28 @@ pub fn initVmDevices(devices: *VmDevices) void {
 /// Per spec §[vm_inject_irq] the vGIC pending bitmap must outlive any
 /// single syscall, so it lives here rather than on a syscall stack.
 pub const CtrlStateCell = extern struct {
-    control_block_pa: PAddr align(paging.PAGE4K) = .{ .addr = 0 },
+    /// Kernel-private copy of the VmPolicy seeded into the user-supplied
+    /// `policy_pf`. Placed first so the natural u64 alignment of its
+    /// internal fields lines up against the page-aligned struct base
+    /// without compiler-inserted gap pads. Userspace retains its own
+    /// writable mapping of `policy_pf` after `create_virtual_machine`,
+    /// so reading directly from there would let userspace forge
+    /// `num_*=0xFFFFFFFF` to drive the run-loop into OOB entry reads.
+    /// This kernel copy is the single source of truth: `applyVmPolicyTable`
+    /// writes here, the run-loop reads here, userspace cannot reach in.
+    /// Concurrent reads from a vCPU on another core are gated by a
+    /// store-release on `num_*` paired with a load-acquire on the
+    /// reader side per the §[vm_policy] aarch64 publish ordering.
+    policy: vm_hw.VmPolicy align(paging.PAGE4K) = .{},
+    /// PAddr of the per-VM control block (allocated separately as a
+    /// PMM page; `vmResume` threads both this PA and the stage-2 root).
+    control_block_pa: PAddr = .{ .addr = 0 },
     /// In-kernel emulated GIC distributor. `vm_inject_irq` flips
     /// pending bits here per Arm IHI 0069H §12.9.11/§12.9.28; the
-    /// vCPU run loop will read them on stage-2 entry to populate
+    /// vCPU run loop reads them on stage-2 entry to populate
     /// list-registers (Arm IHI 0069H §11.2 ICH_LR<n>_EL2).
     vgic: vgic_mod.Vgic = .{},
-    _pad: [paging.PAGE4K - @sizeOf(PAddr) - @sizeOf(vgic_mod.Vgic)]u8 = undefined,
+    _pad: [paging.PAGE4K - @sizeOf(vm_hw.VmPolicy) - @sizeOf(PAddr) - @sizeOf(vgic_mod.Vgic)]u8 = undefined,
 };
 
 comptime {
@@ -102,7 +117,7 @@ comptime {
 /// Resolve the per-VM CtrlStateCell from `vm.arch_state`. Returns null
 /// when no arch-state has been seeded yet (e.g. `create_virtual_machine`
 /// failed mid-init); callers route that to the appropriate spec error.
-fn cellOf(vm: *VirtualMachine) ?*CtrlStateCell {
+pub fn cellOf(vm: *VirtualMachine) ?*CtrlStateCell {
     const erased = vm.arch_state orelse return null;
     return @ptrCast(@alignCast(erased));
 }
@@ -145,7 +160,6 @@ pub fn freeStage2Root(vm: *VirtualMachine) void {
 /// pieces it needs by the time `enterGuest` first runs.
 pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque {
     _ = vm;
-    _ = policy_pf;
     const cell = pmm.global_pmm.?.create(CtrlStateCell) catch
         return error.OutOfMemory;
     const cb_page = pmm.global_pmm.?.create(paging.PageMem(.page4k)) catch {
@@ -160,6 +174,28 @@ pub fn allocVmArchState(vm: *VirtualMachine, policy_pf: *PageFrame) !*anyopaque 
     // GICD_ICPENDR<n>; Arm IHI 0069H §12.8 reset column = 0x0000_0000),
     // but call `init` explicitly so the contract is local to this file.
     cell.vgic.init();
+
+    // Copy the user-supplied VmPolicy into kernel-private storage at
+    // create time. `validateVmPolicy` (called by the syscall layer
+    // before us) already bounded the table counts; clamp again here as
+    // a defensive truncation in case userspace mutated the page between
+    // validation and copy. The kernel copy is the only source consulted
+    // on guest exits / `applyVmPolicyTable` writes — userspace cannot
+    // forge `num_*` to drive an OOB read.
+    const phys_va = VAddr.fromPAddr(policy_pf.phys_base, null);
+    const src: *const vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    const id_n = @min(src.num_id_reg_responses, vm_hw.VmPolicy.MAX_ID_REG_RESPONSES);
+    const sys_n = @min(src.num_sysreg_policies, vm_hw.VmPolicy.MAX_SYSREG_POLICIES);
+    var i: u32 = 0;
+    while (i < id_n) : (i += 1) {
+        cell.policy.id_reg_responses[i] = src.id_reg_responses[i];
+    }
+    cell.policy.num_id_reg_responses = id_n;
+    i = 0;
+    while (i < sys_n) : (i += 1) {
+        cell.policy.sysreg_policies[i] = src.sysreg_policies[i];
+    }
+    cell.policy.num_sysreg_policies = sys_n;
     return @ptrCast(cell);
 }
 
@@ -215,13 +251,9 @@ pub fn invalidateStage2Range(
 }
 
 /// Spec §[vm_set_policy] aarch64 — replace `id_reg_responses` (kind=0)
-/// or `sysreg_policies` (kind=1) on `vm`. The VmPolicy struct lives at
-/// offset 0 of `vm.policy_pf` and is read on guest exits by
-/// `vm_runloop.tryHandleSysregPolicy`; this routine writes the new
-/// entries into that struct. Concurrent reads happen only from the
-/// same kernel-mode core that owns the syscall (vCPU exits run on the
-/// owning core's stack), so no extra fencing is required beyond the
-/// per-VM domain lock the syscall layer already holds.
+/// or `sysreg_policies` (kind=1) on `vm`. The kernel-private VmPolicy
+/// copy lives in the per-VM `CtrlStateCell` and is the sole source the
+/// run loop consults on guest exits; userspace cannot reach into it.
 ///
 /// Each entry's vreg layout is documented in §[vm_set_policy] aarch64:
 ///   kind=0: `[2+2i+0]` = `{op0 u8, op1 u8, crn u8, crm u8, op2 u8, _pad u8[3]}`;
@@ -231,6 +263,19 @@ pub fn invalidateStage2Range(
 ///           `[2+3i+2]` = `write_mask u64`.
 ///
 /// (op0/op1/crn/crm/op2) tuple follows Arm ARM C5.3 sysreg encoding.
+///
+/// Publication ordering: aarch64 is weak memory; a vCPU on another core
+/// observes `num_*` independently of the entry array unless the writer
+/// pairs an entry-fence with a store-release on `num_*`. Plain stores
+/// would let the reader see `num=N` before entry `[N-1]` is visible
+/// and walk an uninitialized slot. Stores below use `@atomicStore`
+/// with `.release` ordering on `num_*`; readers in the run loop pair
+/// with `.acquire` loads.
+///
+/// Reserved-bit enforcement: the entry word containing the (op0..op2)
+/// tuple has a `_pad u8[3]` field at bytes [5..7], which packs into
+/// bits [40..63] of the u64 vreg. Per §[vm_set_policy] test 04 these
+/// must be zero on entry; reject E_INVAL otherwise.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
     const errors = zag.syscall.errors;
 
@@ -256,15 +301,22 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
     const need: usize = @as(usize, count) * vregs_per_entry;
     if (entries.len < need) return errors.E_INVAL;
 
-    // The seeded VmPolicy lives at offset 0 of `policy_pf`; the
-    // kernel physmap exposes it via VAddr.fromPAddr. policy_pf is
-    // held for the VM's lifetime by the hv layer
-    // (§[create_virtual_machine]) so the pointer stays valid for as
-    // long as the VM is reachable from the syscall.
-    const pf_ref = vm.policy_pf orelse return errors.E_NODEV;
-    const pf = pf_ref.ptr;
-    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
-    const policy_ptr: *vm_hw.VmPolicy = @ptrFromInt(phys_va.addr);
+    // §[vm_set_policy] test 04: reject reserved bits in the entry
+    // word containing the sysreg tuple. The encoding occupies bits
+    // [0..39]; bits [40..63] are the `_pad u8[3]` field and must be
+    // zero. Both kinds share this layout for their first per-entry
+    // word.
+    const TUPLE_RESERVED_MASK: u64 = ~@as(u64, 0) << 40;
+    {
+        var i: usize = 0;
+        while (i < @as(usize, count)) : (i += 1) {
+            const w0 = entries[i * vregs_per_entry + 0];
+            if ((w0 & TUPLE_RESERVED_MASK) != 0) return errors.E_INVAL;
+        }
+    }
+
+    const cell = cellOf(vm) orelse return errors.E_NODEV;
+    const policy_ptr: *vm_hw.VmPolicy = &cell.policy;
 
     switch (kind) {
         0 => {
@@ -281,7 +333,10 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
                     .value = w1,
                 };
             }
-            policy_ptr.num_id_reg_responses = @as(u32, count);
+            // Release-store: pair with the run loop's acquire-load on
+            // `num_id_reg_responses` so a vCPU on another core never
+            // observes a higher count than the entries it would read.
+            @atomicStore(u32, &policy_ptr.num_id_reg_responses, @as(u32, count), .release);
         },
         1 => {
             var i: usize = 0;
@@ -299,12 +354,21 @@ pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []c
                     .write_mask = w2,
                 };
             }
-            policy_ptr.num_sysreg_policies = @as(u32, count);
+            @atomicStore(u32, &policy_ptr.num_sysreg_policies, @as(u32, count), .release);
         },
         else => unreachable,
     }
 
     return 0;
+}
+
+/// Resolve the kernel-private VmPolicy backing `vm`. Lives in the
+/// per-VM CtrlStateCell so userspace cannot reach into it (the
+/// user-supplied `policy_pf` is only consulted at create time, then
+/// copied here). Returns null when no arch state has been seeded yet.
+pub fn vmPolicyFor(vm: *VirtualMachine) ?*const vm_hw.VmPolicy {
+    const cell = cellOf(vm) orelse return null;
+    return &cell.policy;
 }
 
 /// Assert (or de-assert) a virtual IRQ line on the VM's emulated GIC

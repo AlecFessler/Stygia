@@ -98,6 +98,11 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     const vm_ptr = vm_ref.lock(@src()) catch return null;
     const cb_pa_opt = controlBlockPaFor(vm_ptr);
     const stage2_root = vm_ptr.guest_pt_root;
+    // Capture the cell pointer under the VM lock; the cell is freed
+    // only by `freeVmArchState` in the VM teardown path, which cannot
+    // run while a vCPU EC holds a SlabRef on the VM (that's the
+    // creator-domain lifetime contract). Safe to use post-unlock.
+    const cell_opt: ?*hv_vm.CtrlStateCell = hv_vm.cellOf(vm_ptr);
     vm_ref.unlock();
 
     const cb_pa = cb_pa_opt orelse return null;
@@ -141,6 +146,57 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         {
             arch_state.vgic_shadow.lrs[0] = vgic.lrPendingGroup1(VTIMER_PPI);
             arch_state.vtimer.cntv_ctl_el0 |= CNTV_CTL_IMASK;
+        }
+
+        // §[vm_inject_irq] aarch64: any IRQ asserted via `vmInjectIrq`
+        // lives as a pending bit on the per-VM vGIC distributor (Arm
+        // IHI 0069H §12.9.28). The CPU interface only sees interrupts
+        // through list-registers (Arm IHI 0069H §11.2 ICH_LR<n>_EL2),
+        // so pre-entry we must walk the pending bitmap and stage the
+        // highest-priority pending INTIDs into free LR slots. Without
+        // this scan `vmInjectIrq` is a no-op for the guest beyond the
+        // hard-coded vtimer PPI path above.
+        //
+        // Priority + grouping note: GICv3 lets the distributor program
+        // per-INTID priority via GICD_IPRIORITYR<n>; the in-kernel
+        // distributor model is bare-bones today (pending bit only),
+        // so "highest priority" reduces to "lowest INTID" — Linux's
+        // GIC driver writes IPRIORITYR but our run-loop hasn't grown
+        // the priority shadow yet, and SGIs/PPIs (low INTIDs) outrank
+        // SPIs (high INTIDs) in the architectural default precedence
+        // anyway (Arm IHI 0069H §4.8). All entries are staged as
+        // Group-1 virtual interrupts (the EL1-bound class Linux
+        // arms via ICC_IGRPEN1_EL1=1).
+        if (cell_opt) |cell| {
+            // Find the lowest free LR. Slots already populated by the
+            // vtimer fast-path above keep their entries — the priority
+            // inversion of staging vtimer first is intentional (vtimer
+            // maps to PPI 27 and is the boot-time hot interrupt).
+            var lr_slot: usize = 0;
+            const num_lrs: usize = @intCast(arch_state.vgic_shadow.num_lrs);
+            while (lr_slot < num_lrs and vgic.lrState(arch_state.vgic_shadow.lrs[lr_slot]) != 0) : (lr_slot += 1) {}
+
+            if (lr_slot < num_lrs) {
+                // Walk pending bitmap word-by-word, low INTID first.
+                var word_idx: u16 = 0;
+                outer: while (word_idx < vgic.NUM_PENDING_WORDS) : (word_idx += 1) {
+                    const w = @atomicLoad(u32, &cell.vgic.pending[word_idx], .acquire);
+                    if (w == 0) continue;
+                    var bit: u5 = 0;
+                    while (true) {
+                        if ((w & (@as(u32, 1) << bit)) != 0) {
+                            const intid: u16 = word_idx * 32 + bit;
+                            if (cell.vgic.takePending(intid)) {
+                                arch_state.vgic_shadow.lrs[lr_slot] = vgic.lrPendingGroup1(@as(u32, intid));
+                                lr_slot += 1;
+                                if (lr_slot >= num_lrs) break :outer;
+                            }
+                        }
+                        if (bit == 31) break;
+                        bit += 1;
+                    }
+                }
+            }
         }
 
         dbg_resume_count += 1;
@@ -714,16 +770,13 @@ fn decodeDelivery(exit: VmExitInfo, gs: *const GuestState) VmExitDelivery {
     };
 }
 
-/// Resolve the live `VmPolicy` table backing `vm`. Returns `null` when
-/// no policy page frame has been seeded — caller treats that as "no
-/// inline policy configured". The seeded `VmPolicy` lives at offset 0
-/// of the policy page frame per §[create_virtual_machine] /
-/// §[vm_set_policy].
+/// Resolve the kernel-private `VmPolicy` table backing `vm`. Lives in
+/// the per-VM CtrlStateCell so userspace cannot reach into it; copied
+/// from `policy_pf` at create time and mutated via `applyVmPolicyTable`.
+/// Returns `null` when no arch state has been seeded yet (e.g. a
+/// teardown raced the run loop).
 fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
-    const pf_ref = vm_ptr.policy_pf orelse return null;
-    const pf = pf_ref.ptr;
-    const phys_va = VAddr.fromPAddr(pf.phys_base, null);
-    return @ptrFromInt(phys_va.addr);
+    return hv_vm.vmPolicyFor(vm_ptr);
 }
 
 /// Write a guest GPR by index (Rt encoding, 0..31). Writes to index
@@ -743,6 +796,103 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
     }
 }
 
+/// Read a guest GPR by index. Index 31 reads as zero (the WZR/XZR
+/// encoding on MSR Xt sources per ARM ARM B1.2.1).
+fn readGuestGpr(gs: *const vm_hw.GuestState, idx: u8) u64 {
+    return switch (idx) {
+        0 => gs.x0,    1 => gs.x1,    2 => gs.x2,    3 => gs.x3,
+        4 => gs.x4,    5 => gs.x5,    6 => gs.x6,    7 => gs.x7,
+        8 => gs.x8,    9 => gs.x9,    10 => gs.x10,  11 => gs.x11,
+        12 => gs.x12,  13 => gs.x13,  14 => gs.x14,  15 => gs.x15,
+        16 => gs.x16,  17 => gs.x17,  18 => gs.x18,  19 => gs.x19,
+        20 => gs.x20,  21 => gs.x21,  22 => gs.x22,  23 => gs.x23,
+        24 => gs.x24,  25 => gs.x25,  26 => gs.x26,  27 => gs.x27,
+        28 => gs.x28,  29 => gs.x29,  30 => gs.x30,
+        else => 0,
+    };
+}
+
+/// Resolve the (op0, op1, crn, crm, op2) sysreg tuple to a pointer at
+/// the matching `GuestState` field. Returns `null` for sysregs without
+/// a kernel-side shadow — caller swallows the masked write per the
+/// §[vm_policy] aarch64 contract (no host-visible side effect; the
+/// trap was still inline-handled, just no slot to persist into).
+///
+/// Encoding follows Arm ARM C5.3 system register identification
+/// (op0:2, op1:3, crn:4, crm:4, op2:3 — packed into a u16 key for
+/// switch dispatch).
+fn sysregShadowOf(gs: *vm_hw.GuestState, op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) ?*u64 {
+    const key: u16 =
+        (@as(u16, op0) << 14) |
+        (@as(u16, op1) << 11) |
+        (@as(u16, crn) << 7) |
+        (@as(u16, crm) << 3) |
+        @as(u16, op2);
+    // (op0, op1, crn, crm, op2) → encoded key. Each comment cites the
+    // Arm ARM section that fixes the encoding. Coverage matches the
+    // GuestState fields above; sysregs the kernel doesn't shadow
+    // (e.g. AMAIR_EL1 is IMPL DEF passthrough) return null.
+    return switch (key) {
+        // SCTLR_EL1: op0=3, op1=0, crn=1, crm=0, op2=0. ARM ARM D13.2.110.
+        encSysreg(3, 0, 1, 0, 0) => &gs.sctlr_el1,
+        // CPACR_EL1: op0=3, op1=0, crn=1, crm=0, op2=2. ARM ARM D13.2.28.
+        encSysreg(3, 0, 1, 0, 2) => &gs.cpacr_el1,
+        // TTBR0_EL1: op0=3, op1=0, crn=2, crm=0, op2=0. ARM ARM D13.2.145.
+        encSysreg(3, 0, 2, 0, 0) => &gs.ttbr0_el1,
+        // TTBR1_EL1: op0=3, op1=0, crn=2, crm=0, op2=1. ARM ARM D13.2.146.
+        encSysreg(3, 0, 2, 0, 1) => &gs.ttbr1_el1,
+        // TCR_EL1:   op0=3, op1=0, crn=2, crm=0, op2=2. ARM ARM D13.2.135.
+        encSysreg(3, 0, 2, 0, 2) => &gs.tcr_el1,
+        // AFSR0_EL1: op0=3, op1=0, crn=5, crm=1, op2=0. ARM ARM D13.2.13.
+        encSysreg(3, 0, 5, 1, 0) => &gs.afsr0_el1,
+        // AFSR1_EL1: op0=3, op1=0, crn=5, crm=1, op2=1. ARM ARM D13.2.14.
+        encSysreg(3, 0, 5, 1, 1) => &gs.afsr1_el1,
+        // ESR_EL1:   op0=3, op1=0, crn=5, crm=2, op2=0. ARM ARM D13.2.40.
+        encSysreg(3, 0, 5, 2, 0) => &gs.esr_el1,
+        // FAR_EL1:   op0=3, op1=0, crn=6, crm=0, op2=0. ARM ARM D13.2.46.
+        encSysreg(3, 0, 6, 0, 0) => &gs.far_el1,
+        // MAIR_EL1:  op0=3, op1=0, crn=10, crm=2, op2=0. ARM ARM D13.2.83.
+        encSysreg(3, 0, 10, 2, 0) => &gs.mair_el1,
+        // AMAIR_EL1: op0=3, op1=0, crn=10, crm=3, op2=0. ARM ARM D13.2.11.
+        encSysreg(3, 0, 10, 3, 0) => &gs.amair_el1,
+        // VBAR_EL1:  op0=3, op1=0, crn=12, crm=0, op2=0. ARM ARM D13.2.152.
+        encSysreg(3, 0, 12, 0, 0) => &gs.vbar_el1,
+        // CONTEXTIDR_EL1: op0=3, op1=0, crn=13, crm=0, op2=1. ARM ARM D13.2.26.
+        encSysreg(3, 0, 13, 0, 1) => &gs.contextidr_el1,
+        // TPIDR_EL1: op0=3, op1=0, crn=13, crm=0, op2=4. ARM ARM D13.2.140.
+        encSysreg(3, 0, 13, 0, 4) => &gs.tpidr_el1,
+        // TPIDR_EL0: op0=3, op1=3, crn=13, crm=0, op2=2. ARM ARM D13.2.139.
+        encSysreg(3, 3, 13, 0, 2) => &gs.tpidr_el0,
+        // TPIDRRO_EL0: op0=3, op1=3, crn=13, crm=0, op2=3. ARM ARM D13.2.141.
+        encSysreg(3, 3, 13, 0, 3) => &gs.tpidrro_el0,
+        // ELR_EL1:   op0=3, op1=0, crn=4, crm=0, op2=1. ARM ARM C5.2.8.
+        encSysreg(3, 0, 4, 0, 1) => &gs.elr_el1,
+        // SPSR_EL1:  op0=3, op1=0, crn=4, crm=0, op2=0. ARM ARM C5.2.18.
+        encSysreg(3, 0, 4, 0, 0) => &gs.spsr_el1,
+        // MDSCR_EL1: op0=2, op1=0, crn=0, crm=2, op2=2. ARM ARM D13.3.15.
+        encSysreg(2, 0, 0, 2, 2) => &gs.mdscr_el1,
+        // CNTKCTL_EL1: op0=3, op1=0, crn=14, crm=1, op2=0. ARM ARM D13.11.26.
+        encSysreg(3, 0, 14, 1, 0) => &gs.cntkctl_el1,
+        // CNTV_CVAL_EL0: op0=3, op1=3, crn=14, crm=3, op2=2. ARM ARM D13.11.18.
+        encSysreg(3, 3, 14, 3, 2) => &gs.cntv_cval_el0,
+        // CNTV_CTL_EL0:  op0=3, op1=3, crn=14, crm=3, op2=1. ARM ARM D13.11.17.
+        encSysreg(3, 3, 14, 3, 1) => &gs.cntv_ctl_el0,
+        else => null,
+    };
+}
+
+/// Comptime-evaluable version of the sysreg key encoding used by the
+/// switch arms in `sysregShadowOf`. Matches the runtime computation
+/// bit-for-bit so the constant labels in the switch are exactly the
+/// keys the dispatch loop computes.
+fn encSysreg(op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u16 {
+    return (@as(u16, op0) << 14) |
+        (@as(u16, op1) << 11) |
+        (@as(u16, crn) << 7) |
+        (@as(u16, crm) << 3) |
+        @as(u16, op2);
+}
+
 /// §[vm_policy] aarch64 sysreg lookup. The trapped tuple
 /// `(op0, op1, crn, crm, op2)` is matched first against
 /// `id_reg_responses[0..num_id_reg_responses]`: a hit on a read
@@ -750,13 +900,18 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
 /// write swallows the MSR silently per "writes to ID registers are
 /// silently ignored". On miss, the same tuple is matched against
 /// `sysreg_policies[0..num_sysreg_policies]`: a read returns
-/// `read_value`; a write applies `value & write_mask` (the masked
-/// value is consumed by the policy — sysregs without a kernel
-/// shadow don't have a write-back target, mirroring the spec's
-/// pure "applied masked by write_mask" wording).
+/// `read_value`; a write applies `value & write_mask` to the
+/// matching `GuestState` shadow per the spec's "applied masked by
+/// write_mask" rule. Sysregs without a `GuestState` slot (e.g. impl-
+/// def passthroughs) are inline-swallowed with no shadow update.
 ///
 /// Returns true if any entry matched (caller advances PC and re-
 /// enters); false if the trap must surface to the VMM.
+///
+/// Acquire-load on `num_*` pairs with the release-store in
+/// `applyVmPolicyTable` so a concurrent `vm_set_policy` from another
+/// core never races us into an OOB index — entries before the count
+/// are always visible by the time we read the count.
 fn tryHandleSysregPolicy(
     vm_ptr: *VirtualMachine,
     gs: *vm_hw.GuestState,
@@ -766,7 +921,7 @@ fn tryHandleSysregPolicy(
 
     // ID register table — keyed on (op0, op1, crn, crm, op2).
     {
-        const n = policy.num_id_reg_responses;
+        const n = @atomicLoad(u32, &policy.num_id_reg_responses, .acquire);
         const max: u32 = vm_hw.VmPolicy.MAX_ID_REG_RESPONSES;
         const limit: u32 = if (n > max) max else n;
         var i: u32 = 0;
@@ -790,7 +945,7 @@ fn tryHandleSysregPolicy(
 
     // Sysreg policy table — keyed on (op0, op1, crn, crm, op2).
     {
-        const n = policy.num_sysreg_policies;
+        const n = @atomicLoad(u32, &policy.num_sysreg_policies, .acquire);
         const max: u32 = vm_hw.VmPolicy.MAX_SYSREG_POLICIES;
         const limit: u32 = if (n > max) max else n;
         var i: u32 = 0;
@@ -804,15 +959,23 @@ fn tryHandleSysregPolicy(
             {
                 if (t.is_read) {
                     writeGuestGpr(gs, t.rt, e.read_value);
+                } else if (sysregShadowOf(gs, t.op0, t.op1, t.crn, t.crm, t.op2)) |shadow| {
+                    // §[vm_policy] aarch64 "applied masked by
+                    // write_mask": `(shadow & ~mask) | (guest & mask)`
+                    // updates only the bits the policy permits, leaving
+                    // other bits at their pre-trap value. The shadow
+                    // is reloaded into the live sysreg by the existing
+                    // restore path on the next vmentry (the world-
+                    // switch save/restore stage in `vm_runloop` treats
+                    // GuestState as the ground truth between exits).
+                    const guest_val = readGuestGpr(gs, t.rt);
+                    const masked = guest_val & e.write_mask;
+                    shadow.* = (shadow.* & ~e.write_mask) | masked;
                 }
-                // Writes are swallowed inline. Per §[vm_policy]
-                // aarch64 the masked bits would be "applied", but
-                // without a per-sysreg shadow in GuestState the
-                // kernel has no slot to persist them in — the
-                // contract honored here is "no vm_exit delivered;
-                // no host-visible side effect." Sysregs that do
-                // have GuestState backing (SCTLR_EL1 etc.) would
-                // gate their masked updates at this seam.
+                // Sysregs without a GuestState shadow swallow the
+                // write inline with no host-visible side effect —
+                // mirrors the spec's "no vm_exit delivered" half of
+                // the matched-write contract for unshadowed regs.
                 return true;
             }
         }

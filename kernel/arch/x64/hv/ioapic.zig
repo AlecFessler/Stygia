@@ -61,9 +61,16 @@ pub const Ioapic = struct {
 
     /// Assert an IRQ line. Routes through the redirection table to the LAPIC.
     /// Section 3.2.4: Redirection table entry format.
+    ///
+    /// Atomic-load on the redirection-table entry so a concurrent
+    /// `mmioWrite(REG_REDTBL_*)` on another core (Linux's GIC/IOAPIC
+    /// programming runs on whichever vCPU drives boot) cannot tear the
+    /// 64-bit entry across the assert path. Atomic-or on `irq_level`
+    /// is the cross-core race fix for `vm_inject_irq` from any core
+    /// vs. the owning vCPU run loop.
     pub fn assertIrq(self: *Ioapic, irq: u5) void {
         if (irq >= NUM_REDIR_ENTRIES) return;
-        const entry = self.redir_table[irq];
+        const entry = @atomicLoad(u64, &self.redir_table[irq], .acquire);
 
         // Bit 16: mask. If masked, ignore.
         if (entry & (1 << 16) != 0) return;
@@ -73,40 +80,78 @@ pub const Ioapic = struct {
 
         if (trigger_mode == 0) {
             // Edge-triggered: deliver on rising edge (transition from 0 to 1).
-            if (self.irq_level & irq_bit != 0) return;
-            self.irq_level |= irq_bit;
+            const prev = @atomicRmw(u32, &self.irq_level, .Or, irq_bit, .acq_rel);
+            if ((prev & irq_bit) != 0) return;
         } else {
             // Level-triggered: deliver if not already pending (remote IRR = 0).
             if (entry & (1 << 14) != 0) return;
-            self.irq_level |= irq_bit;
-            self.redir_table[irq] |= (1 << 14);
+            _ = @atomicRmw(u32, &self.irq_level, .Or, irq_bit, .release);
+            _ = @atomicRmw(u64, &self.redir_table[irq], .Or, @as(u64, 1 << 14), .release);
         }
 
         self.deliverInterrupt(entry);
     }
 
     /// De-assert an IRQ line.
+    ///
+    /// Spec §[vm_inject_irq] test 05: after a deassert immediately
+    /// following an assert, "no interrupt vm_exit corresponding to
+    /// line [2] is delivered to any vCPU even when the vCPU's
+    /// interrupt window opens or it becomes runnable with the line
+    /// unmasked." Honor that by also dropping the matching pending
+    /// IRR/ISR bit from the LAPIC (the assert path called
+    /// `deliverInterrupt` → `lapic.injectExternal` which set IRR;
+    /// without this the next `deliverPendingInterrupts` would surface
+    /// the interrupt anyway), and clearing Remote IRR on every
+    /// redirection entry that shares the vector so a follow-up
+    /// `assertIrq` re-delivers cleanly. Atomic-and on `irq_level`
+    /// matches the assertIrq atomic-or so cross-core `vm_inject_irq`
+    /// calls never race a vCPU run-loop scan.
     pub fn deassertIrq(self: *Ioapic, irq: u5) void {
         if (irq >= NUM_REDIR_ENTRIES) return;
-        self.irq_level &= ~(@as(u32, 1) << irq);
+        const irq_bit: u32 = @as(u32, 1) << irq;
+        _ = @atomicRmw(u32, &self.irq_level, .And, ~irq_bit, .release);
+
+        // Capture the deasserted line's vector once, then clear remote
+        // IRR (bit 14) on every entry sharing that vector. Mirrors
+        // `handleEOI`'s shared-vector loop because Linux maps multiple
+        // GSIs onto a single LAPIC vector.
+        const entry_irq = @atomicLoad(u64, &self.redir_table[irq], .acquire);
+        const vector: u8 = @truncate(entry_irq & 0xFF);
+        for (&self.redir_table) |*entry_ptr| {
+            const entry = @atomicLoad(u64, entry_ptr, .acquire);
+            const entry_vector: u8 = @truncate(entry & 0xFF);
+            if (entry_vector == vector) {
+                _ = @atomicRmw(u64, entry_ptr, .And, ~@as(u64, 1 << 14), .release);
+            }
+        }
+        self.lapic.clearPendingVector(vector);
     }
 
     /// Handle EOI from LAPIC for a level-triggered interrupt.
     /// Clears Remote IRR (bit 14) in all redirection-table entries that
     /// map to this vector. Linux shares vectors across GSIs, so we must
     /// scan every entry rather than stopping after the first match.
+    ///
+    /// Atomic ops on each entry mirror `assertIrq` / `mmioWrite` so a
+    /// concurrent re-program of the redirection table from another
+    /// core cannot lose the Remote-IRR clear or the re-deliver edge.
     pub fn handleEOI(self: *Ioapic, vector: u8) void {
-        for (&self.redir_table, 0..) |*entry, i| {
-            const entry_vector: u8 = @truncate(entry.* & 0xFF);
-            if (entry_vector == vector and (entry.* & (1 << 14) != 0)) {
-                // Clear Remote IRR
-                entry.* &= ~@as(u64, 1 << 14);
-                // If the IRQ line is still asserted (level-sensitive), re-deliver
-                if (self.irq_level & (@as(u32, 1) << @as(u5, @truncate(i))) != 0) {
-                    entry.* |= (1 << 14);
-                    self.deliverInterrupt(entry.*);
+        for (&self.redir_table, 0..) |*entry_ptr, i| {
+            const entry = @atomicLoad(u64, entry_ptr, .acquire);
+            const entry_vector: u8 = @truncate(entry & 0xFF);
+            if (entry_vector == vector and (entry & (1 << 14) != 0)) {
+                // Clear Remote IRR.
+                _ = @atomicRmw(u64, entry_ptr, .And, ~@as(u64, 1 << 14), .release);
+                // If the IRQ line is still asserted (level-sensitive),
+                // re-set Remote IRR and re-deliver.
+                const level = @atomicLoad(u32, &self.irq_level, .acquire);
+                if (level & (@as(u32, 1) << @as(u5, @truncate(i))) != 0) {
+                    _ = @atomicRmw(u64, entry_ptr, .Or, @as(u64, 1 << 14), .release);
+                    self.deliverInterrupt(entry);
                 }
-                // Do not return -- continue scanning for other entries sharing this vector.
+                // Do not return — continue scanning for other entries
+                // sharing this vector.
             }
         }
     }
@@ -126,7 +171,7 @@ pub const Ioapic = struct {
                 const reg_off = index - REG_REDTBL_BASE;
                 const entry_idx = reg_off / 2;
                 if (entry_idx >= NUM_REDIR_ENTRIES) break :blk 0;
-                const entry = self.redir_table[entry_idx];
+                const entry = @atomicLoad(u64, &self.redir_table[entry_idx], .acquire);
                 if (reg_off & 1 == 0) {
                     break :blk @truncate(entry);
                 } else {
@@ -138,6 +183,10 @@ pub const Ioapic = struct {
     }
 
     /// Write an IOAPIC register by index (via IOREGSEL).
+    ///
+    /// Redirection-table edits use a CAS loop so a concurrent
+    /// `assertIrq` / `handleEOI` on another core cannot lose the
+    /// Remote-IRR/level-state preservation across the half-update.
     fn writeRegister(self: *Ioapic, index: u8, value: u32) void {
         switch (index) {
             REG_ID => self.ioapic_id = value & 0x0F000000,
@@ -146,16 +195,18 @@ pub const Ioapic = struct {
                 const reg_off = index - REG_REDTBL_BASE;
                 const entry_idx = reg_off / 2;
                 if (entry_idx >= NUM_REDIR_ENTRIES) return;
-                // Bits 12 (delivery status) and 14 (remote IRR) are read-only
+                // Bits 12 (delivery status) and 14 (remote IRR) are read-only.
                 const ro_mask_lo: u64 = (1 << 12) | (1 << 14);
-                if (reg_off & 1 == 0) {
-                    const old = self.redir_table[entry_idx];
-                    const preserved = old & (ro_mask_lo | 0xFFFFFFFF_00000000);
-                    const written = @as(u64, value) & ~ro_mask_lo;
-                    self.redir_table[entry_idx] = preserved | written;
-                } else {
-                    const old = self.redir_table[entry_idx];
-                    self.redir_table[entry_idx] = (old & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32);
+                while (true) {
+                    const old = @atomicLoad(u64, &self.redir_table[entry_idx], .acquire);
+                    const new_val: u64 = if (reg_off & 1 == 0) blk: {
+                        const preserved = old & (ro_mask_lo | 0xFFFFFFFF_00000000);
+                        const written = @as(u64, value) & ~ro_mask_lo;
+                        break :blk preserved | written;
+                    } else
+                        (old & 0x00000000_FFFFFFFF) | (@as(u64, value) << 32);
+                    const r = @cmpxchgWeak(u64, &self.redir_table[entry_idx], old, new_val, .release, .monotonic);
+                    if (r == null) break;
                 }
             },
             else => {},
