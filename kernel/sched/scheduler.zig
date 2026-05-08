@@ -139,6 +139,22 @@ pub const PerCore = struct {
         .guard = .{ .addr = 0 },
         .slot = std.math.maxInt(u64),
     },
+
+    /// EC whose `on_cpu` flag must be cleared after the next park-IRQ
+    /// wake. Captured by `parkAndAwaitIRQ` from `current_ec` BEFORE the
+    /// rsp swap so the post-wake landing pad knows which slab slot to
+    /// clear without a stale-ref hazard. The wake's `scheduler_run_after_park`
+    /// runs on the park kstack, with TSS.RSP0 already pointing at the
+    /// park kstack — at that moment any kstack range comparison against
+    /// the prev EC's kstack is safe (rsp no longer in range; TSS no
+    /// longer references it), and clearing `on_cpu` lets the post-wake
+    /// pending_zombie drain finally reap the EC. Without this clear, the
+    /// only writer of prev's on_cpu is `switchTo`'s "current_ec → new"
+    /// edge — but `parkAndAwaitIRQ` already cleared `current_ec` to null
+    /// before sti+hlt, so that edge has nothing to read prev_ref from
+    /// and the EC stays `on_cpu=true` forever (`takeOwnPendingZombie`
+    /// keeps skipping it; the slab slot leaks).
+    post_park_clear_on_cpu: ?*ExecutionContext = null,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -423,6 +439,21 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     if (park_top != 0) {
         arch.cpu.parkPerCoreCaches(core, park_top);
     }
+    // Clear the previously-current EC's on_cpu flag now that TSS.RSP0
+    // has been retargeted at the park kstack. Future ring transitions
+    // on this core no longer push iret frames onto prev's kstack, so
+    // a reap that unmaps it is safe. Without this clear, the only
+    // writer of prev's on_cpu is `switchTo`'s "current_ec → new" edge,
+    // but `clearCurrentEc(core)` below sets the slot to null, leaving
+    // the next dispatch on this core with no `prev_ref` to drive the
+    // clear from. The EC stays `on_cpu=true` forever — every reap pass
+    // (`takeOwnPendingZombie`) skips it, the kstack stays mapped, and
+    // the slab slot leaks. Same window as parkAndAwaitIRQ; same fix.
+    if ((&core_states[core]).current_ec) |prev_ref| {
+        if (prev_ref.ptr.last_dispatched_core == core) {
+            prev_ref.ptr.on_cpu.store(false, .release);
+        }
+    }
     clearCurrentEc(core);
 
     // Drain any pending_zombie before returning — same rationale as
@@ -498,6 +529,28 @@ fn parkAndAwaitIRQ() noreturn {
         execution_context.finalizeDestroyMarkedDead(z);
     }
 
+    // Stash the previously-dispatched EC ref so the post-wake landing
+    // pad can clear its `on_cpu` flag. Without this, an EC that was
+    // dispatched on this core (e.g. a `dummyEntry` worker EC running
+    // `hlt`) and then has its owning capability domain destroyed leaves
+    // `on_cpu=true` indefinitely: the only writer that clears prev's
+    // on_cpu is `switchTo`'s "current_ec → new" edge, but parkAndAwaitIRQ
+    // sets `current_ec = null` here before any subsequent dispatch, so
+    // that edge has nothing to clear from. The post-wake drain is what
+    // actually catches the zombie now that its kstack is no longer in
+    // use on this core.
+    const prev_ec_to_clear: ?*ExecutionContext = blk: {
+        if ((&core_states[core]).current_ec) |prev_ref| {
+            // Match scheduler.switchTo's discipline: only clear when this
+            // core was the EC's last_dispatched_core. The slot can carry
+            // a stale ref to an EC that migrated; the other core owns
+            // its on_cpu lifecycle in that case.
+            if (prev_ref.ptr.last_dispatched_core == core) break :blk prev_ref.ptr;
+        }
+        break :blk null;
+    };
+    (&core_states[core]).post_park_clear_on_cpu = prev_ec_to_clear;
+
     // Update per-core caches FIRST while still on the caller's stack.
     // After the rsp swap below, locals on this stack frame go
     // unreferenced; the outer noreturn semantics make abandonment
@@ -513,6 +566,25 @@ fn parkAndAwaitIRQ() noreturn {
 /// `run()` is noreturn so the call never returns; the pushed return
 /// address sits unused on the park stack.
 export fn scheduler_run_after_park() callconv(.c) noreturn {
+    const core: u8 = @truncate(arch.smp.coreID());
+    // Clear the previously-dispatched EC's `on_cpu` flag now that we
+    // are on the park kstack. TSS.RSP0 was repointed by parkPerCoreCaches
+    // before sti+hlt, and the rsp swap moved us off the prev EC's kstack
+    // entirely — neither hardware nor any code on this core references
+    // the prev kstack. Clearing on_cpu unblocks `takeOwnPendingZombie`
+    // for any zombie that pinned this slot during the park.
+    const state_ptr = &core_states[core];
+    if (state_ptr.post_park_clear_on_cpu) |prev| {
+        prev.on_cpu.store(false, .release);
+        state_ptr.post_park_clear_on_cpu = null;
+    }
+    // Re-drain pending_zombie now that the prev EC's on_cpu is false.
+    // The pre-park drain ran while the kstack was still in use (we were
+    // standing on it) and skipped via the standing_on_zombie /
+    // on_cpu=true gates. With both gates released we can reap.
+    while (takeOwnPendingZombie()) |z| {
+        execution_context.finalizeDestroyMarkedDead(z);
+    }
     run();
 }
 
