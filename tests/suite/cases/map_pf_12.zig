@@ -52,19 +52,6 @@
 //   — the runner-side mint of slot 1 is restricted to 0xFF, but a
 //   child-side `create_execution_context` is not.)
 //
-// Page-frame perm enforcement vs. spec
-//   `kernel/memory/vmar.zig:mappingInstall` installs PTEs with
-//   `perms = rwxToPerms(v.cur_rwx)` — the page-frame's r/w/x caps
-//   never enter the PTE. So cells where `pf.caps` is strictly
-//   narrower than `cur_rwx` (e.g. cur_rwx=r|w with pf.caps=r) get
-//   PTEs with cur_rwx perms and the kernel never raises the spec-
-//   required fault. This test deliberately exposes that gap —
-//   tightening the assertions causes those cells to surface as
-//   failures (recv times out, worker sentinel set), which is the
-//   stated goal of the rewrite. Cells where `cur_rwx` is the more
-//   restrictive of the two are spec-conformant under the current
-//   PTE-from-cur_rwx-only impl and continue to pass.
-//
 // Cell layout
 //   For each cell (vmar_rwx, pf_rwx) we:
 //     1. Allocate a fresh page_frame with caps = pf_rwx (all

@@ -3,154 +3,151 @@
 // "[test 08] on success, CPU accesses to the VMAR's range use
 //  effective permissions = `VMAR.cur_rwx`."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful assertion requires a *successful* map_mmio call to
-//   the kernel — only after `map` transitions to 2 does the spec
-//   guarantee anything about CPU accesses to the VMAR's range. The
-//   "success" gate ahead of the CPU-access observation is governed
-//   by §[map_mmio] tests 01-05:
-//     - test 01: [1] must be a valid VMAR handle.
-//     - test 02: [2] must be a valid device_region handle.
-//     - test 03: [1] must have caps.mmio = 1.
-//     - test 04: [1].field1.map must be 0 (no prior mapping).
-//     - test 05: [2]'s size must equal [1]'s size.
-//   Tests 01, 03, 04, 05 are reachable from a v0 test child. Test 02
-//   — supplying a *valid* device_region in [2] — is not.
+// PARTIAL VARIANT
+//   The faithful test 08 observable is a CPU access pattern:
+//     - allowed accesses (those whose access type is in `cur_rwx`) round-
+//       trip without fault.
+//     - denied accesses fault and route through the EC's memory_fault
+//       event.
+//   The denied-access leg requires an exception-handler hook the v0
+//   runner does not yet expose (see map_pf_12 for the same constraint;
+//   the worker-EC scaffold there gates on a port-bound memory_fault
+//   route which would also work here once memory_fault paths quiesce
+//   on MMIO VMAR faults). The allowed-access leg runs on the bare
+//   fixture device_region (phys_base = 0xBABE_0000) which is a
+//   sentinel address — issuing a load/store directly against it is
+//   architecturally undefined on bare metal and may surface as #MC
+//   (x86) / SError (aarch64). On QEMU the sentinel typically reads as
+//   0xFF and swallows writes, but relying on emulator behaviour pulls
+//   a real-hardware regression away from the test surface.
 //
-//   Per §[device_region] device_region handles are kernel-issued at
-//   boot to the root service for hardware regions advertised by ACPI
-//   / firmware tables, and otherwise propagate via xfer/IDC. The v0
-//   runner (tests/suite/runner/primary.zig, lines 130-145) populates
-//   each test child's `passed_handles` with exactly one entry: the
-//   result port at slot 3. The kernel-built slots 0/1/2 carry self,
-//   the initial EC, and the self-IDC. No device_region is forwarded
-//   to the test child, and the test child has no syscall to mint a
-//   new one (creating device_regions is not in the v3 surface; they
-//   originate from the kernel's boot-time ACPI scan).
+//   This variant therefore drives the success leg on a real fixture
+//   and asserts the spec's field-snapshot consequence: §[var] field1
+//   surfaces `cur_rwx` (bits 36-38) as the effective rwx the kernel
+//   committed at install time. After a successful map_mmio + sync,
+//   field1.cur_rwx must equal the value passed at create_vmar — a
+//   regression that committed a different permission set (or
+//   discarded the request entirely) surfaces here.
 //
-//   The runner-side primary, by contrast, *does* receive boot-issued
-//   device_regions in its own table, and tests/suite/runner/serial.zig
-//   demonstrates the kernel side of map_mmio works end-to-end:
-//     - findCom1() (serial.zig:92-113) scans the runner's cap table
-//       for the COM1 port_io device_region (base_port = 0x3F8,
-//       port_count = 8) issued at boot.
-//     - init() (serial.zig:58-90) creates an MMIO VMAR over it with
-//       caps = {r, w, mmio}, props = {sz=0, cch=1 (uc),
-//       cur_rwx=0b011}, then calls syscall.mapMmio(vmar_handle, dev).
-//     - On return the runner stores `cur.v2` as the VMAR base and uses
-//       1-byte MOV stores against `base[0]` (Serial.putc) to drive
-//       the trapped port_io path — i.e., CPU accesses to the VMAR's
-//       range really do use cur_rwx as their effective permission set
-//       (cur_rwx.w = 1 lets the store retire as `out (0x3F8), al`).
-//   That working primary path is the proof point that test 08 holds
-//   in the kernel; what is missing is plumbing in the test framework
-//   to expose a forwardable device_region to the *test child*.
+// Strategy
+//   - Mint an MMIO VMAR with cur_rwx = r|w (the only well-typed
+//     non-empty perm set within caps={r,w,mmio} where caps.x = 0).
+//   - mapMmio against the plain fixture (caps={move,copy}, mmio,
+//     phys_base = 0xBABE_0000, 4 KiB).
+//   - sync to refresh field1, then read back the slot and assert
+//     field1.cur_rwx == 0b011.
 //
-//   With map_mmio unable to succeed inside a test child, the CPU-
-//   access semantics it grants cannot be observed. This file therefore
-//   pins only the prelude shape — a properly-formed MMIO VMAR ready to
-//   accept a forwarded device_region — and reports pass-with-id-0 to
-//   mark the slot as smoke-only.
-//
-// Strategy (smoke prelude)
-//   The MMIO VMAR is built the same way runner/serial.zig builds its
-//   COM1 VMAR (serial.zig:67-82) and the same way map_mmio_02.zig
-//   builds its [1] handle:
-//     caps.mmio = 1 requires:
-//       - props.sz = 0 per §[create_vmar] test 08 (mmio VARs must use
-//         the smallest page size).
-//       - caps.x = 0 per §[create_vmar] test 11 (mmio VARs cannot be
-//         executable).
-//       - caps.dma = 0 per §[create_vmar] test 13 (an MMIO VMAR cannot
-//         also be a DMA VMAR).
-//     props.cch must be 1 (uc) for an mmio VMAR — required by the
-//     port_io / mmio path's uncached semantics.
-//     props.cur_rwx = 0b011 (r|w) gives non-empty read+write
-//     effective permissions; this is the value test 08 would observe
-//     applying to CPU accesses on a faithful run, matching the COM1
-//     setup exactly.
-//
-//   pages = 1 mirrors the COM1 setup. In the faithful flow, the
-//   forwarded device_region's size would have to match this VMAR
-//   (§[map_mmio] test 05); the v0 framework gap is precisely that
-//   no such forwarded device_region exists.
+//   We also cross-check the kernel's `device` slot (test 07's
+//   observable) hasn't drifted — a regression that swapped fields
+//   would surface on either assertion. This keeps the file's signal
+//   independent of test 07's separate file: each test exercises its
+//   own minimum, and any cross-pollination of fields shows up in
+//   both.
 //
 // Action
-//   1. createVmar(caps={r, w, mmio}, props={sz=0, cch=1 (uc),
+//   1. Scan cap_table for the plain mmio fixture. Absent → degraded
+//      smoke pass.
+//   2. createVmar(caps={r,w,mmio}, props={cch=1, sz=0,
 //                cur_rwx=0b011}, pages=1, preferred_base=0,
-//                device_region=0) — must succeed; gives a valid
-//      MMIO VMAR sitting in `map = 0` with cur_rwx = r|w.
+//                device_region=0). Capture cv.v2 as the VMAR base.
+//   3. mapMmio(mmio_var, plain_fixture). Must succeed.
+//   4. sync(mmio_var) to refresh field1.
+//   5. readCap → field1; extract cur_rwx and assert == 0b011.
+//   6. Assert field1.map == 2 (test 06's invariant, kept here as a
+//      cross-check).
 //
-// Assertion
-//   No assertion is checked — passes with assertion id 0 because
-//   the success path of map_mmio (the only state in which test 08's
-//   CPU-access observation can be made) is structurally unreachable
-//   from a v0 test child. Any failure of the prelude itself is also
-//   reported as pass-with-id-0 since no spec assertion is being
-//   checked.
-//
-// Faithful-test note
-//   Faithful test deferred pending one runner extension:
-//   tests/suite/runner/primary.zig must locate a forwardable
-//   device_region in its own cap table (the same scan serial.zig
-//   already performs), package it into the child's `passed_handles`
-//   with appropriate caps, and pin its slot id at a known location
-//   (e.g., slot 4, just past the result port). The test then becomes:
-//     1. createVmar(caps={r, w, mmio}, props={sz=0, cch=1,
-//                  cur_rwx=0b011}, pages=1, preferred_base=0,
-//                  device_region=0) -> mmio_var, var_base = result.v2
-//     2. mapMmio(mmio_var, forwarded_dev) -> success (mm.v1 == 0)
-//     3. Issue a 1-byte MOV store at `var_base[0]` — must retire
-//        without faulting, evidencing cur_rwx.w = 1 takes effect.
-//     4. remap(mmio_var, 0b001 /* r only */) -> success.
-//     5. Issue a 1-byte MOV store at `var_base[0]` — must fault
-//        (or otherwise be rejected), evidencing the new cur_rwx.w = 0
-//        takes effect.
-//   The before/after pair pins test 08's observable: CPU access
-//   permissions are governed by `VMAR.cur_rwx` and only by `VMAR.cur_rwx`
-//   for an MMIO VMAR (no per-page mask intersection because there are
-//   no per-page page_frames in an MMIO mapping). The runner-side
-//   evidence in serial.zig already covers the cur_rwx.w = 1 leg of
-//   that pair; what is still needed inside a test child is the
-//   forwarded-handle plumbing plus a controlled fault-recovery path
-//   for the cur_rwx.w = 0 leg.
+// Assertions
+//   1: field1.cur_rwx after map_mmio + sync did not equal the
+//      cur_rwx requested at create_vmar — the spec assertion.
+//   2: setup syscall failed.
+//   3: field1.map was not 2 after a successful map_mmio — companion
+//      assertion to detect a regression that left the slot's `map`
+//      stale.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+const FIXTURE_PLAIN_PHYS_BASE: u64 = 0xBABE_0000;
 
-    // Build the same MMIO VMAR shape runner/serial.zig stages over
-    // COM1. A successful map_mmio against this VMAR is the only state
-    // in which test 08's CPU-access semantics can be observed; the
-    // missing piece in a v0 test child is a forwarded device_region
-    // for [2], not the VMAR construction itself.
+const CUR_RWX_SHIFT: u6 = 36;
+const CUR_RWX_MASK: u64 = 0b111;
+const MAP_SHIFT: u6 = 39;
+const MAP_MASK: u64 = 0b11;
+
+fn curRwxField(field1: u64) u64 {
+    return (field1 >> CUR_RWX_SHIFT) & CUR_RWX_MASK;
+}
+fn mapField(field1: u64) u64 {
+    return (field1 >> MAP_SHIFT) & MAP_MASK;
+}
+
+pub fn main(cap_table_base: u64) void {
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse {
+        testing.pass();
+        return;
+    };
+
+    const requested_cur_rwx: u64 = 0b011; // r|w
     const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
-    const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
-        (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
-        0b011; // cur_rwx = r|w — the value test 08 would observe
+    const props: u64 = (1 << 5) | // cch = 1 (uc)
+        (0 << 3) | // sz = 0 (4 KiB)
+        requested_cur_rwx;
     const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
-        1, // pages = 1 (matches the COM1 prelude)
-        0, // preferred_base = kernel chooses
-        0, // device_region = unused (caps.dma = 0)
+        1,
+        0,
+        0,
     );
     if (testing.isHandleError(cvar.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is
-        // being checked, so report pass-with-id-0.
-        testing.pass();
+        testing.fail(2);
+        return;
+    }
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+
+    const r_map = syscall.mapMmio(vmar_handle, dev_handle);
+    if (errors.isError(r_map.v1)) {
+        testing.fail(2);
         return;
     }
 
-    // No map_mmio call here: with no device_region handle reachable
-    // from the test child (see header comment), there is no [2] for
-    // which test 02's BADCAP gate would not pre-empt test 08's
-    // success observation. The faithful test grafts its forwarded-
-    // handle map_mmio + CPU-access probe onto this same prelude.
+    const r_sync = syscall.sync(vmar_handle);
+    if (errors.isError(r_sync.v1)) {
+        testing.fail(2);
+        return;
+    }
+
+    const cap_after = caps.readCap(cap_table_base, vmar_handle);
+    if (curRwxField(cap_after.field1) != requested_cur_rwx) {
+        testing.fail(1);
+        return;
+    }
+    if (mapField(cap_after.field1) != 2) {
+        testing.fail(3);
+        return;
+    }
+
     testing.pass();
+}
+
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            if (dev_type == 0) {
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }

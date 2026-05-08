@@ -2,102 +2,77 @@
 //
 // "[test 06] on success, [1].field1 `map` becomes 2."
 //
-// DEGRADED SMOKE VARIANT
-//   A faithful exercise of test 06 requires a *successful* map_mmio
-//   call, which the spec defines to leave [1].field1.`map` = 2. The
-//   success path needs a valid device_region handle in [2] (test 02
-//   gates BADCAP on [2] before the success leg). Per §[device_region],
-//   device_region handles are kernel-issued at boot to the root
-//   service and otherwise propagate via xfer/IDC.
-//
-//   The v0 runner (runner/primary.zig) spawns each test as a child
-//   capability domain whose `passed_handles` carry only the result
-//   port at slot 3 — no device_region is forwarded. The same
-//   `findCom1`-style scan that runner/serial.zig uses to bootstrap
-//   the primary's serial VMAR cannot succeed inside a test child,
-//   because the child's table holds self / initial_ec / self_idc /
-//   port and nothing else. With no device_region in scope, the test
-//   child cannot drive map_mmio onto the success path, so the
-//   `map -> 2` post-condition cannot be observed end-to-end here.
-//
-//   This smoke variant pins only the negative observation: a freshly
-//   constructed MMIO VMAR (caps = {r, w, mmio}) starts in `map = 0`
-//   per §[var], and a map_mmio call against it — supplying an empty
-//   slot for [2] — is rejected with E_BADCAP per test 02 of this
-//   syscall. The VMAR's `map` therefore stays at 0 across the rejected
-//   call; it never reaches 2. The smoke confirms the prelude shape
-//   the eventual faithful test will reuse (a valid MMIO VMAR in [1])
-//   but does not assert the success-leg `map -> 2` transition itself.
-//
-// Strategy (smoke prelude)
-//   §[map_mmio]'s gate order ahead of the success leg is:
+// Strategy
+//   To exercise the success leg every earlier §[map_mmio] gate must
+//   pass:
 //     - test 01 (VMAR is invalid)         — a valid MMIO VMAR is minted
 //                                           below.
-//     - test 02 (device_region BADCAP)   — only fires when [2] is
-//                                           invalid; on the success
-//                                           path [2] would be a real
-//                                           device_region.
+//     - test 02 (device_region BADCAP)   — supply the runner-forwarded
+//                                           bare fixture device_region
+//                                           (caps={move,copy}, mmio,
+//                                           phys_base=0xBABE_0000).
 //     - test 03 (caps.mmio not set)      — caps.mmio = 1 here.
 //     - test 04 (`map` already non-zero) — a freshly created MMIO
 //                                           VMAR sits in `map = 0` per
 //                                           §[var].
-//     - test 05 (size mismatch with [2]) — pre-empted by test 02 when
-//                                           [2] is empty.
-//   The MMIO VMAR is built without an actual map_mmio call. Per §[var]
-//   create_vmar requires for caps.mmio = 1: props.sz = 0 (test 08),
-//   caps.x = 0 (test 11), caps.dma = 0 (test 13), and cch = 1 (uc).
-//   The same construction is used by map_mmio_02.zig and
-//   runner/serial.zig.
+//     - test 05 (size mismatch with [2]) — the plain fixture is 4 KiB
+//                                           and the VMAR is 4 KiB.
+//
+//   With the success leg taken, §[map_mmio] test 06 requires
+//   `[1].field1.map == 2` — a subsequent cap-table refresh (any
+//   handle-taking syscall, or an explicit `sync`) must surface the
+//   updated `map` field.
+//
+//   §[var] field1 layout:
+//     page_count[0..31] | sz[32..33] | cch[34..35] |
+//     cur_rwx[36..38]   | map[39..40] | device[41..52]
 //
 // Action
-//   1. createVmar(caps={r,w,mmio}, props={sz=0, cch=1 (uc),
+//   1. Scan the cap_table for the plain mmio fixture device_region. If
+//      absent (kernel built without -Dtests_fixture_devices) →
+//      degraded smoke pass.
+//   2. createVmar(caps={r,w,mmio}, props={cch=1 (uc), sz=0,
 //                cur_rwx=0b011}, pages=1, preferred_base=0,
-//                device_region=0) — must succeed; gives a valid MMIO
-//      VMAR with `caps.mmio = 1` and `map = 0`.
-//   2. mapMmio(mmio_var, 4095) — empty slot 4095 trips test 02's
-//      E_BADCAP gate. The call returns *without* taking the success
-//      leg, so the VMAR's `map` stays at 0 rather than transitioning
-//      to 2. This is the prelude shape; the `map -> 2` observation
-//      cannot be made from the test child.
+//                device_region=0).
+//   3. mapMmio(mmio_var, plain_fixture). Must succeed.
+//   4. sync(mmio_var) to force a fresh field1 snapshot.
+//   5. readCap → field1; extract `map` and assert it equals 2.
 //
-// Assertion
-//   No assertion is checked — the success-leg `map -> 2` transition
-//   is unreachable from a v0 test child without a device_region.
-//   Passes with assertion id 0 to mark this slot as smoke-only in
-//   coverage. A failure of the prelude itself (createVmar) is also
-//   reported as pass-with-id-0 since no spec assertion is being
-//   checked.
-//
-// Faithful-test note
-//   Faithful test deferred pending a runner extension: runner/
-//   primary.zig must mint or carve a device_region whose size matches
-//   a 4 KiB MMIO VMAR and forward it to the test child via
-//   passed_handles. The action then becomes:
-//     create_vmar(caps={r,w,mmio}, props={sz=0, cch=1, cur_rwx=0b011},
-//                pages=1, preferred_base=0, device_region=0) -> mmio_var
-//     map_mmio(mmio_var, forwarded_dev) -> success
-//     <re-read field1 via the syscall's authoritative refresh
-//      side-effect (test 09) or via a follow-up syscall that
-//      surfaces field1>
-//     assert field1.map == 2
-//   Until the device_region forwarding lands, this file holds the
-//   prelude verbatim so the eventual faithful version can graft on
-//   the success-leg observation without re-deriving the inert-check
-//   matrix.
+// Assertions
+//   1: field1.map was not 2 after a successful map_mmio — the spec
+//      assertion under test (test 06).
+//   2: a setup syscall returned an error (createVmar, map_mmio, or
+//      sync) — precondition broken.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
+// Sentinel phys_base of the bare (caps={move,copy}) test-fixture mmio
+// device_region minted by the kernel at boot under
+// -Dtests_fixture_devices and forwarded to every test child by the
+// runner. Must match runner/primary.zig:FIXTURE_PLAIN_PHYS_BASE and
+// kernel/boot/userspace_init.zig:grantTestFixtureDevices.
+const FIXTURE_PLAIN_PHYS_BASE: u64 = 0xBABE_0000;
 
-    // Build a valid MMIO VMAR — caps.mmio = 1, props.sz = 0, cch = 1
-    // (uc), caps.x = 0, caps.dma = 0 — the construction §[var]
-    // requires for an MMIO VMAR. On creation the VMAR sits in `map = 0`
-    // per §[var] line 877.
+const MAP_SHIFT: u6 = 39;
+const MAP_MASK: u64 = 0b11;
+
+fn mapField(field1: u64) u64 {
+    return (field1 >> MAP_SHIFT) & MAP_MASK;
+}
+
+pub fn main(cap_table_base: u64) void {
+    const dev_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse {
+        // Degraded smoke: no fixture device, the success leg is
+        // unreachable. Pass with id 0 to mark this slot as smoke-only.
+        testing.pass();
+        return;
+    };
+
     const mmio_caps = caps.VmarCap{ .r = true, .w = true, .mmio = true };
     const props: u64 = (1 << 5) | // cch = 1 (uc) — required for mmio
         (0 << 3) | // sz = 0 (4 KiB) — required when caps.mmio = 1
@@ -105,31 +80,56 @@ pub fn main(cap_table_base: u64) void {
     const cvar = syscall.createVmar(
         @as(u64, mmio_caps.toU16()),
         props,
-        1, // pages = 1
+        1, // pages = 1 (4 KiB) — matches fixture
         0, // preferred_base = kernel chooses
         0, // device_region = unused (caps.dma = 0)
     );
     if (testing.isHandleError(cvar.v1)) {
-        // Prelude broke; smoke is moot but no spec assertion is
-        // being checked, so report pass-with-id-0.
-        testing.pass();
+        testing.fail(2);
         return;
     }
-    const mmio_var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
+    const vmar_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
-    // table layout (slots 0/1/2 are self / initial_ec / self_idc;
-    // passed_handles begin at slot 3 and only the result port lands
-    // there for tests). The map_mmio call returns E_BADCAP via test
-    // 02 without ever reaching the success leg, so the VMAR's `map`
-    // stays at 0 rather than transitioning to 2. The success leg
-    // (with a real device_region in [2]) is not reachable from the
-    // test child — see header comment.
-    const empty_slot: caps.HandleId = caps.HANDLE_TABLE_MAX - 1;
-    _ = syscall.mapMmio(mmio_var_handle, empty_slot);
+    const r_map = syscall.mapMmio(vmar_handle, dev_handle);
+    if (errors.isError(r_map.v1)) {
+        testing.fail(2);
+        return;
+    }
 
-    // No spec assertion is being checked — the `map -> 2` transition
-    // is unreachable from the v0 test child. Pass with assertion id 0
-    // to mark this slot as smoke-only in coverage.
+    const r_sync = syscall.sync(vmar_handle);
+    if (errors.isError(r_sync.v1)) {
+        testing.fail(2);
+        return;
+    }
+
+    const cap_after = caps.readCap(cap_table_base, vmar_handle);
+    if (mapField(cap_after.field1) != 2) {
+        testing.fail(1);
+        return;
+    }
+
     testing.pass();
+}
+
+// Scan the caller's cap_table for an mmio device_region whose
+// `phys_base` matches `target_phys_base`. Returns the slot id or null
+// if no matching handle is present. §[device_region] field0 layout
+// (mmio): bits 4-51 carry paddr>>12.
+fn findFixtureMmio(cap_table_base: u64, target_phys_base: u64) ?caps.HandleId {
+    var slot: u32 = 0;
+    while (slot < caps.HANDLE_TABLE_MAX) {
+        const c = caps.readCap(cap_table_base, slot);
+        if (c.handleType() == .device_region) {
+            const dev_type: u4 = @truncate(c.field0 & 0xF);
+            // mmio = 0
+            if (dev_type == 0) {
+                const base_paddr: u64 = ((c.field0 >> 4) & 0x0000_FFFF_FFFF_FFFF) << 12;
+                if (base_paddr == target_phys_base) {
+                    return @truncate(slot);
+                }
+            }
+        }
+        slot += 1;
+    }
+    return null;
 }

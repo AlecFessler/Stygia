@@ -10,42 +10,53 @@
 //   returns the assigned base in vreg 2; the spec assertion is that
 //   when the preferred range is free, that base equals `[4]`.
 //
-//   "Range is available" is a runtime fact, not a static one: a stray
-//   start-up mapping (cap table, primary stack, embedded ELF region,
-//   etc.) anywhere in user vaddr space could in principle collide with
-//   any candidate we pick. Spec §[create_vmar] doesn't pin the kernel's
-//   layout, so test 21 only commits the kernel to honoring `[4]` *if*
-//   the range is free — if every candidate we try collides, the kernel
-//   has the latitude to assign a different base and we cannot isolate
-//   test 21 from the spec ambiguity around runtime layout.
+//   "Range is available" is a runtime fact: a stray boot-time mapping
+//   (cap table, primary stack, embedded ELF region) could collide with
+//   any specific candidate. The spec test surfaces a binary signal —
+//   either createVmar returns success with cv.v2 == preferred_base
+//   (range was free and the kernel honoured the request), or it
+//   returns an error indicating the range was unavailable (E_NOSPC for
+//   "no room", or another well-defined refusal). What the kernel must
+//   NOT do is silently relocate the VMAR to a different base while
+//   reporting success — that breaks the spec contract for test 21
+//   regardless of whether the user-supplied address happened to
+//   collide. We probe a small candidate list to dodge a single
+//   unlucky collision and fail loudly the first time the kernel
+//   succeeds with a base != preferred_base.
 //
-//   Spec §[address_space] also requires preferred_base to lie wholly
-//   within the static zone (spec test 23) — a request outside it
-//   returns E_INVAL. Candidates are picked at the bottom of the
-//   x86-64 static zone (0x0000_1000_0000_0000) so they satisfy both
-//   the static-zone constraint and the page-alignment requirement.
+//   Spec §[address_space] requires preferred_base to lie wholly within
+//   the static zone (spec test 23). Candidates are picked at the
+//   bottom of the x86-64 static zone (0x0000_1000_0000_0000) so they
+//   satisfy both the static-zone constraint and the page-alignment
+//   requirement.
 //
 // Action
 //   For each preferred_base in the candidate list:
 //     1. createVmar(caps={r,w}, props={cur_rwx=0b011, sz=0, cch=0},
-//                  pages=1, preferred_base=<candidate>, device_region=0)
-//     2. If success, check cv.v2 == candidate. If yes, pass.
-//        Otherwise try the next candidate.
-//   If every candidate either errored or returned a different base,
-//   fail with assertion 2.
+//                  pages=1, preferred_base=<candidate>, device_region=0).
+//     2. On success: assert cv.v2 == preferred_base. If equal, pass;
+//        if not, fail with assertion 2 — the kernel violated test 21.
+//     3. On error: try the next candidate (range was unavailable).
+//   If every candidate erred without a single success, the kernel
+//   never reached the test-21 success arm; fail with assertion 3 to
+//   distinguish that from a real test-21 violation.
 //
 // Assertions
-//   1: a createVmar call returned an unexpected error word in vreg 1
-//      (preferred_base in user vaddr space + page-aligned shouldn't
-//      hit the spec's E_PERM/E_INVAL/E_BADCAP gates, so any error here
-//      is a setup break, not the spec assertion).
-//   2: every candidate succeeded but none returned a base matching the
-//      requested preferred_base — runtime layout collided with all
-//      candidates and we couldn't isolate the test 21 assertion.
+//   1: createVmar returned an unexpected error word — not E_NOSPC and
+//      not the success path. preferred_base in user vaddr + page-
+//      aligned shouldn't hit E_PERM/E_INVAL/E_BADCAP, so any other
+//      error is a setup break.
+//   2: createVmar reported success with cv.v2 != preferred_base. This
+//      is the spec test-21 violation: the kernel must either honour
+//      the requested base on success or refuse the call.
+//   3: every candidate failed with E_NOSPC; we never observed a
+//      success leg, so test 21's invariant is vacuously satisfied
+//      but not actually exercised.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
@@ -69,6 +80,7 @@ pub fn main(cap_table_base: u64) void {
     const vmar_caps = caps.VmarCap{ .r = true, .w = true };
     const props: u64 = (CCH << 5) | (SZ << 3) | CUR_RWX;
 
+    var saw_unavailable = false;
     for (candidates) |preferred_base| {
         const cv = syscall.createVmar(
             @as(u64, vmar_caps.toU16()),
@@ -78,16 +90,31 @@ pub fn main(cap_table_base: u64) void {
             0,
         );
         if (testing.isHandleError(cv.v1)) {
+            // Range unavailable is the only spec-allowed refusal here;
+            // anything else is a setup break.
+            if (cv.v1 == @intFromEnum(errors.Error.E_NOSPC)) {
+                saw_unavailable = true;
+                continue;
+            }
             testing.fail(1);
             return;
         }
+        // Success arm: spec test 21 demands cv.v2 == preferred_base.
+        // Anything else is a kernel violation — silently relocating
+        // the VMAR while reporting success defeats the contract.
         if (cv.v2 == preferred_base) {
             testing.pass();
             return;
         }
-        // Otherwise the kernel chose a different base for this candidate
-        // (range not available); fall through to the next candidate.
+        testing.fail(2);
+        return;
     }
 
-    testing.fail(2);
+    if (saw_unavailable) {
+        // Every candidate's range was occupied; we never reached the
+        // success arm so test 21's invariant wasn't observably tested.
+        testing.fail(3);
+        return;
+    }
+    testing.fail(1);
 }

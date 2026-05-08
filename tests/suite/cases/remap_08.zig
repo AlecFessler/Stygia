@@ -68,6 +68,11 @@
 //      the page_frame is not actually reachable through VMAR.base + 0
 //      under the initial cur_rwx, so the post-remap arm of the
 //      assertion would be vacuous even if the hook existed.
+//   3: post-remap re-read returned a value other than 0xA5. The remap
+//      must preserve the page's physical backing (and therefore its
+//      contents); a regression that rewrites PTEs against a different
+//      phys — including the phys=0 clobber a prior impl shipped —
+//      surfaces here as a sentinel mismatch.
 //
 // Faithful-test note
 //   A faithful test 08 would, for the map=1 arm, mint VARs across the
@@ -159,15 +164,25 @@ pub fn main(cap_table_base: u64) void {
     // test 07, field1.cur_rwx is now r. Per test 08 — the rule under
     // test — effective permissions on VMAR.base[0..4096] become
     // (r) ∩ (r|w) = r, so a subsequent write to VMAR.base[0] would
-    // fault. Asserting that fault requires the exception-handler hook
-    // documented in the prelude; without it, the smoke covers only
-    // the success-of-call + retained-readability arm. A regression
-    // that fails to update PTEs at all would still let remap return
-    // 0; a regression that returns an error code on a valid remap
-    // call would trip assertion 1.
+    // fault. Asserting that fault directly requires the exception-
+    // handler hook documented in the prelude. We CAN, however, assert
+    // that the remap preserves PAGE CONTENTS — a regression that
+    // re-installed the PTEs against a fresh phys (or against
+    // phys=0 — see kernel/memory/vmar.zig:remap, where an earlier
+    // version passed phys=.fromInt(0) to mapPageSized) would surface
+    // here as `dst.*` reading something other than 0xA5.
     const rr = syscall.remap(vmar_handle, 0b001);
     if (rr.v1 != 0) {
         testing.fail(1);
+        return;
+    }
+
+    // Post-remap re-read. The PTE perms changed (write dropped) but
+    // the underlying physical page is unchanged, so the byte we wrote
+    // at step 4 must still round-trip on a read.
+    const post = dst.*;
+    if (post != 0xA5) {
+        testing.fail(3);
         return;
     }
 
