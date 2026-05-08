@@ -37,15 +37,16 @@
 //   We re-issue futex_wait_val up to MAX_ATTEMPTS times. Any iteration
 //   that returns vreg 1 = &shared (the woken addr per the spec's
 //   "-> [1] addr" convention) is the spec-asserted outcome; the test
-//   passes immediately. If every iteration returns E_TIMEOUT, we
-//   treat that as a degraded smoke (the syscall may be unwired or
-//   the worker may never have been scheduled on this build) and
-//   pass with assertion id 0. Any other small (1..15) value in vreg
-//   1 — E_PERM, E_INVAL, E_BADADDR, etc. other than E_TIMEOUT —
-//   means the test's preconditions are wrong (failing for the wrong
-//   reason) and we fail with id 2. Vreg 1 carrying a non-zero,
-//   non-error value other than &shared means the kernel woke us
-//   on a different addr — strict spec violation, fail with id 3.
+//   passes immediately. If every iteration returns E_TIMEOUT, the
+//   wake never landed despite the worker hammering the address — the
+//   spec assertion under test ("returns with [1] set to that addr"
+//   when another EC calls futex_wake) was never exercised, so we fail
+//   with id 4. Any other small (1..15) value in vreg 1 — E_PERM,
+//   E_INVAL, E_BADADDR, etc. other than E_TIMEOUT — means the test's
+//   preconditions are wrong (failing for the wrong reason) and we
+//   fail with id 2. Vreg 1 carrying a non-zero, non-error value
+//   other than &shared means the kernel woke us on a different addr
+//   — strict spec violation, fail with id 3.
 //
 //   Discriminator: per §[error_codes] error codes are 1..15. The
 //   spec's "-> [1] addr" returns a user vaddr in vreg 1 on success;
@@ -97,13 +98,8 @@
 //   3: futex_wait_val returned a non-error vreg 1 that is not the
 //      watched addr (kernel woke us on a different addr — spec
 //      violation).
-//
-// Faithful-test note
-//   On builds where futex_wake is not yet wired into the kernel
-//   dispatch (or the worker's loop never gets scheduler time), every
-//   futex_wait_val attempt times out and the test degrades to a
-//   pass-with-id-0 smoke. Once both syscalls are live, the strict
-//   OK + matching-addr assertion engages automatically.
+//   4: every attempt timed out — the worker's wakes never woke this
+//      parked wait, contradicting the spec line under test.
 
 const lib = @import("lib");
 
@@ -209,10 +205,10 @@ pub fn main(cap_table_base: u64) void {
         attempt += 1;
     }
 
-    // Every attempt timed out. Degrade to smoke pass (id 0):
-    // either futex_wake is not yet wired to wake futex_wait_val
-    // waiters, or the worker EC is not getting scheduled on this
-    // build. The strict wake-on-addr assertion engages once both
-    // are live.
-    testing.pass();
+    // Exhausted retries with E_TIMEOUT every time — the worker has
+    // been hammering futex_wake on &shared the whole time, so a
+    // kernel that correctly delivers wake events to parked
+    // futex_wait_val waiters would have woken us. This is the spec
+    // line under test failing.
+    testing.fail(4);
 }
