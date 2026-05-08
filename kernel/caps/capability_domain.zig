@@ -453,7 +453,16 @@ pub fn createCapabilityDomain(
                     const src_caps_word: u16 = @truncate(src_user.word0 >> 48);
                     zag.sched.port.releaseHandle(p, src_caps_word);
                 },
-                .device_region => zag.devices.device_region.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .device_region => {
+                    // Unlink the source slot's IRQ-propagation node
+                    // before dropping the per-handle refcount; see the
+                    // matching path in `caps.capability.releaseHandle`.
+                    const dr: *zag.devices.device_region.DeviceRegion =
+                        @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    const dr_irq = dr._gen_lock.lockIrqSave(@src());
+                    zag.devices.device_region.removeHandleListNodeLocked(dr, &caller_dom.kernel_table[src_slot].dr_node);
+                    zag.devices.device_region.releaseHandleLocked(dr, dr_irq);
+                },
                 else => {},
             }
             caller_dom.user_table[src_slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
@@ -1145,9 +1154,17 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
                 const dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj_ptr));
                 const slot_irq = dr._gen_lock.lockIrqSave(@src());
                 if (dr._gen_lock.currentGen() != entry.ref.gen) {
+                    // Slab slot was already torn down by another path;
+                    // our embedded `dr_node` cannot still be on its
+                    // (non-existent) handle_list_head. Skip both the
+                    // unlink and the dec.
                     dr._gen_lock.unlockIrqRestore(slot_irq);
                     continue;
                 }
+                // Unlink before the dec so we don't leak a node whose
+                // backing handle-table memory is about to be freed by
+                // `pmm_mgr.freeBlock(deferred.kernel_buf)` below.
+                zag.devices.device_region.removeHandleListNodeLocked(dr, &entry.dr_node);
                 zag.devices.device_region.releaseHandleLocked(dr, slot_irq);
             },
             else => {},
@@ -1284,6 +1301,28 @@ fn writeHandleSlot(
     cd.kernel_table[slot].parent = .{};
     cd.kernel_table[slot].first_child = .{};
     cd.kernel_table[slot].next_sibling = .{};
+    cd.kernel_table[slot].dr_node = .{};
+
+    // Spec §[device_irq]: every domain-local copy of a device_region
+    // handle gets an IRQ-propagation list entry on the parent region.
+    // Use the embedded per-handle node so the storage tracks the slot
+    // lifetime. `field1_paddr` is the kernel physaddr of the user-table
+    // entry's `field1` slot — the futex address userspace recv-blocks
+    // on. The user_table block came from `pmm.allocBlock`, so its
+    // kernel-VA points into the physmap; `PAddr.fromVAddr(.., null)`
+    // recovers the physaddr.
+    if (obj_type == .device_region) {
+        const dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj.ptr.?));
+        const field1_va = zag.memory.address.VAddr.fromInt(
+            @intFromPtr(&cd.user_table[slot].field1),
+        );
+        const field1_paddr = zag.memory.address.PAddr.fromVAddr(field1_va, null);
+        zag.devices.device_region.appendHandleListNode(
+            dr,
+            &cd.kernel_table[slot].dr_node,
+            field1_paddr,
+        );
+    }
 }
 
 /// Reserve N contiguous free slots `[base, base+N)` and unlink each

@@ -191,14 +191,52 @@ pub const IRQ_SOURCE_NONE: u32 = std.math.maxInt(u32);
 /// Per-handle propagation entry. One node per `KernelHandle` to a
 /// device_region. `field1_paddr` is the physical address of the handle
 /// entry's `field1` slot in its owning capability domain's user_table —
-/// i.e. the futex address Spec §[device_irq] step 3 wakes on. Owned by
-/// the handle table; threaded through `next` into the parent region's
-/// `handle_list_head`. Caps module (or its stub) appends/removes nodes
-/// under `DeviceRegion._gen_lock`.
+/// i.e. the futex address Spec §[device_irq] step 3 wakes on. Embedded
+/// inside `KernelHandle` so storage is owned by the handle table itself;
+/// threaded through `next` into the parent region's `handle_list_head`.
+/// `appendHandleListNode` / `removeHandleListNode` mutate the list under
+/// `DeviceRegion._gen_lock`; `propagateIrqAndWake` / `ack` likewise take
+/// the lock when walking so a concurrent CD-destroy unlinking nodes can
+/// not yank `next` out from under the walker.
 pub const HandleListNode = extern struct {
-    field1_paddr: PAddr,
+    field1_paddr: PAddr = .{ .addr = 0 },
     next: ?*HandleListNode = null,
 };
+
+/// Insert `node` at the head of `dr.handle_list_head` and stamp its
+/// `field1_paddr` field. Called from the cap-mint path (caps module's
+/// `writeHandleSlot`) once the handle slot has been written, so the
+/// next IRQ on `dr` propagates into the new domain-local copy. Caller
+/// must NOT already hold `dr._gen_lock`.
+pub fn appendHandleListNode(
+    dr: *DeviceRegion,
+    node: *HandleListNode,
+    field1_paddr: PAddr,
+) void {
+    const irq_state = dr._gen_lock.lockIrqSave(@src());
+    defer dr._gen_lock.unlockIrqRestore(irq_state);
+    node.field1_paddr = field1_paddr;
+    node.next = dr.handle_list_head;
+    dr.handle_list_head = node;
+}
+
+/// Remove `node` from `dr.handle_list_head`. Caller must hold
+/// `dr._gen_lock` already (covers the destroyPhase2 walk where the
+/// per-slot lock is taken before dispatch). No-op if the node is not on
+/// the list — happens for free / non-device_region slots whose embedded
+/// node was never appended.
+pub fn removeHandleListNodeLocked(dr: *DeviceRegion, node: *HandleListNode) void {
+    var prev_link: *?*HandleListNode = &dr.handle_list_head;
+    while (prev_link.*) |cursor| {
+        if (cursor == node) {
+            prev_link.* = cursor.next;
+            cursor.next = null;
+            cursor.field1_paddr = .{ .addr = 0 };
+            return;
+        }
+        prev_link = &cursor.next;
+    }
+}
 
 const DeviceRegionSlab = SecureSlab(DeviceRegion, MAX_DEVICE_REGIONS);
 
@@ -419,6 +457,8 @@ pub fn findDeviceByIrqSource(irq_source: u32) ?*DeviceRegion {
 /// (the only value the syscall surface promises to report; other copies
 /// converge within a bounded delay per Spec §[device_irq]).
 pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
+    const irq_state = dr._gen_lock.lockIrqSave(@src());
+    defer dr._gen_lock.unlockIrqRestore(irq_state);
     var prior: u64 = 0;
     var cursor = dr.handle_list_head;
     while (cursor) |node| {
@@ -442,12 +482,10 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
 ///      against any of those counters.
 ///
 /// Called from per-arch ISR context. The caller must already have
-/// looked the region up via `findDeviceByIrqSource`. Does NOT take
-/// `dr._gen_lock` — the IRQ source binding is stable for the lifetime
-/// of `dr`'s entry in the IRQ table (entry installed under the lock at
-/// bind, evicted under the lock at refcount-zero teardown), and the
-/// handle list is append-mostly with futex semantics that tolerate a
-/// missed late-add wake (the next IRQ will catch it).
+/// looked the region up via `findDeviceByIrqSource`. Acquires
+/// `dr._gen_lock` for the handle-list walk so a concurrent
+/// CD-destroy `removeHandleListNodeLocked` cannot unlink a node
+/// whose `next` we're about to dereference.
 pub fn onIrq(dr: *DeviceRegion) void {
     if (dr.irq_source != IRQ_SOURCE_NONE) {
         const line: u8 = @intCast(dr.irq_source & 0xFF);
@@ -464,16 +502,16 @@ pub fn onIrq(dr: *DeviceRegion) void {
 /// via `scheduler.enqueueOnCore` -> `arch.smp.sendWakeIpi`, so this
 /// path doesn't need its own IPI fan-out.
 ///
-/// IRQ-context safety: called with IRQs masked. `futex.wake` takes
-/// `Bucket.lock` (and transitively `core_locks` / `timed_lock`) via
-/// `lockIrqSaveOrdered`, which preserves the masked state across
-/// the critical section. The same path is exercised every timer
-/// tick by `futex.expireTimedWaiters` and by `timer.zig`'s field0
-/// `futex.wake(paddr, maxInt(u32))` propagation, both of which
-/// run in IRQ context.
+/// IRQ-context safety: called with IRQs masked. The taken
+/// `dr._gen_lock` and `futex.wake`'s `Bucket.lock` (taken via
+/// `lockIrqSaveOrdered`, which preserves the masked state) both
+/// nest correctly under the existing `dr._gen_lock → futex.Bucket.lock`
+/// ordering used by `decHandleRef` / `irq_table_lock` evictions.
 ///
 /// Spec §[device_irq] steps 1+3.
 pub fn propagateIrqAndWake(dr: *DeviceRegion) void {
+    const irq_state = dr._gen_lock.lockIrqSave(@src());
+    defer dr._gen_lock.unlockIrqRestore(irq_state);
     var cursor = dr.handle_list_head;
     while (cursor) |node| {
         _ = userio.atomicAddU64Saturating(node.field1_paddr, 1, std.math.maxInt(u64));

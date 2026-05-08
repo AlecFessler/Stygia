@@ -243,12 +243,21 @@ pub const KernelHandle = extern struct {
     parent: HandleLink = .{},
     first_child: HandleLink = .{},
     next_sibling: HandleLink = .{},
+    /// Per-handle entry on the parent device_region's IRQ-propagation
+    /// list. Only populated when `Word0.typeTag(user_table[slot].word0)
+    /// == .device_region`; stays zeroed and unlinked for every other
+    /// slot type (and for free slots). Wired by `writeHandleSlot` on
+    /// mint and unlinked by the `.device_region` arm of `releaseHandle`
+    /// / destroyPhase2 before the handle table memory is freed. See
+    /// `device_region.HandleListNode`.
+    dr_node: device_region.HandleListNode = .{},
 };
 
 comptime {
-    if (@sizeOf(KernelHandle) != 88) @compileError("KernelHandle must be 88 bytes");
+    if (@sizeOf(KernelHandle) != 104) @compileError("KernelHandle must be 104 bytes");
     if (@offsetOf(KernelHandle, "ref") != 0) @compileError("KernelHandle.ref must be at offset 0");
     if (@offsetOf(KernelHandle, "parent") != 16) @compileError("KernelHandle.parent must be at offset 16");
+    if (@offsetOf(KernelHandle, "dr_node") != 88) @compileError("KernelHandle.dr_node must be at offset 88");
 }
 
 /// Reconstruct a typed `SlabRef(T)` from a kernel entry. Returns `null`
@@ -482,7 +491,16 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
         },
         .device_region => {
             const ref = typedRef(DeviceRegion, entry.*) orelse return;
-            device_region.releaseHandle(ref.ptr);
+            // Unlink this slot's IRQ-propagation node before dropping
+            // the per-handle refcount. If we win the dec-to-zero the
+            // dr slab slot is destroyed and reusing memory could
+            // re-publish a fresh DeviceRegion whose `handle_list_head`
+            // happens to match a stale node — clear the link first.
+            // `decHandleRef` expects `dr._gen_lock` held; the same
+            // lock guards both the list mutation and the dec.
+            const dr_irq = ref.ptr._gen_lock.lockIrqSave(@src());
+            device_region.removeHandleListNodeLocked(ref.ptr, &entry.dr_node);
+            device_region.releaseHandleLocked(ref.ptr, dr_irq);
         },
         .port => {
             const ref = typedRef(Port, entry.*) orelse return;
@@ -525,6 +543,11 @@ pub fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHand
     entry.parent = encodeFreeNext(holder.free_head);
     entry.first_child = .{};
     entry.next_sibling = .{};
+    // device_region IRQ-propagation node (only ever populated for
+    // `.device_region` slots): the per-type `releaseHandle` arm above
+    // already unlinked it under `dr._gen_lock`. Zero the embedded
+    // record so the slot starts clean for its next mint.
+    entry.dr_node = .{};
     holder.free_head = @as(u16, slot);
     holder.free_count += 1;
 }

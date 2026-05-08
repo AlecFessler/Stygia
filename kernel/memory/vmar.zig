@@ -445,6 +445,16 @@ pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) 
         return errors.E_BADCAP;
     const dr: *DeviceRegion = @ptrCast(@alignCast(dr_kh.ref.ptr.?));
 
+    // Spec §[port_io_virtualization] test 01: `port_io` device_regions
+    // are an x86-64-only construct (the ABI is keyed on `inb`/`outb`
+    // and friends). On every other arch, even validating the rest of
+    // the call would let the per-arch dispatch silently never wire
+    // PTEs and userspace would just take perma-faults — surface
+    // E_INVAL up front instead.
+    if (dr.device_type == .port_io and builtin.cpu.arch != .x86_64) {
+        return errors.E_INVAL;
+    }
+
     const sz_bytes = pageSizeBytes(v.sz);
     const var_size = @as(u64, v.page_count) * sz_bytes;
     // Spec §[var].map_mmio test 05: device_region size must equal VMAR
