@@ -318,3 +318,11 @@ var cached_freq_hz: ?u64 = null;
 var tsc_monotonic_ready: bool = false;
 
 pub var hpet_timer: Hpet = undefined;
+
+/// Returns the calibrated TSC frequency in Hz, or 0 if calibration has
+/// not yet completed (initMonotonicClock not run, or invariant TSC
+/// unsupported and only HPET is being used). Surfaces through the
+/// `info_cores` syscall (spec §[system_info] vreg 2 freq_hz).
+pub fn tscFreqHz() u64 {
+    return cached_freq_hz orelse 0;
+}

@@ -97,6 +97,18 @@ pub fn setConduit(c: Conduit) void {
     conduit = c;
 }
 
+/// True when PSCI is the platform power-management interface — the
+/// kernel's only route for `power_set_idle` (CPU_SUSPEND) and the
+/// system-level shutdown / reset / suspend actions on aarch64. PSCI is
+/// mandatory on the targets the kernel currently supports (the BSP /
+/// AP bring-up itself goes through PSCI CPU_ON), so by the time
+/// userspace can call `info_cores` the answer is always true. Surfaces
+/// through `info_cores` flag bit 1 (idle states supported) per spec
+/// §[system_info].
+pub fn psciAvailable() bool {
+    return true;
+}
+
 /// Perform a system-wide power action.
 /// Spec SS4.61; systems.md SS25.
 pub fn powerAction(action: PowerAction) i64 {

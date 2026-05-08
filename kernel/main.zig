@@ -96,6 +96,10 @@ fn kMain(boot_info: *BootInfo) !void {
     // tick (§2.2.34), and a HPET vm-exit there blows the wake-to-pinned
     // budget by orders of magnitude.
     arch.time.initMonotonicClock();
+    // Wall-clock anchor latches RTC against the monotonic clock once,
+    // here, while IRQs are naturally off — keeps the slow x86 CMOS
+    // UIP-clear loop out of the syscall path. Spec §[time].time_getwall.
+    zag.syscall.system.init();
     // Hang detector — start ticking once the monotonic clock is up. Until
     // armed, every detector hook is a no-op so the very-early boot path
     // doesn't trip the threshold.

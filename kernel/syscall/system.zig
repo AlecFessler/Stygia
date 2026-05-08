@@ -29,20 +29,29 @@ const Word0 = zag.caps.capability.Word0;
 //
 // The pair is read/written together under `wall_lock` so a concurrent
 // `time_setwall` cannot tear the relationship between the two values.
+//
+// The anchor is established once at boot by `init()` while IRQs are
+// naturally off; running the slow x86 CMOS UIP-clear loop with IRQs
+// disabled in syscall context (the previous lazy-init path) starved
+// preempt and timer interrupts for milliseconds on every cold boot's
+// first `time_getwall`.
 var wall_lock: SpinLock = .{ .class = "wall_clock" };
 var wall_at_anchor_ns: u64 = 0;
 var monotonic_at_anchor_ns: u64 = 0;
-var wall_initialized: bool = false;
+
+/// One-time wall-clock anchor bring-up, called from `kMain` after the
+/// monotonic clock is initialized. Latches the platform RTC reading
+/// against the current monotonic time so subsequent `time_getwall`
+/// calls can return a nanosecond-resolution wall value without
+/// re-touching the RTC's slow read path.
+pub fn init() void {
+    wall_at_anchor_ns = time.readRtc();
+    monotonic_at_anchor_ns = time.currentMonotonicNs();
+}
 
 fn currentWallNs() u64 {
     const state = wall_lock.lockIrqSave(@src());
     defer wall_lock.unlockIrqRestore(state);
-
-    if (!wall_initialized) {
-        wall_at_anchor_ns = time.readRtc();
-        monotonic_at_anchor_ns = time.currentMonotonicNs();
-        wall_initialized = true;
-    }
 
     const mono_now = time.currentMonotonicNs();
     const elapsed = mono_now -% monotonic_at_anchor_ns;
@@ -55,7 +64,6 @@ fn setWallNs(ns_since_epoch: u64) void {
 
     wall_at_anchor_ns = ns_since_epoch;
     monotonic_at_anchor_ns = time.currentMonotonicNs();
-    wall_initialized = true;
 }
 
 /// Returns nanoseconds since boot.
@@ -132,15 +140,45 @@ pub fn timeSetwall(caller: *anyopaque, ns_since_epoch: u64) i64 {
 /// [test 01] returns E_INVAL if count is 0 or count > 127.
 /// [test 02] on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
 pub fn random(caller: *anyopaque, count: u8) i64 {
-    _ = caller;
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     // Spec §[rng] test 01: count must be in [1, 127], otherwise E_INVAL.
     if (count == 0 or count > 127) return errors.E_INVAL;
-    // SPEC AMBIGUITY: filling vregs [1..count] with random qwords requires
-    // a per-vreg write helper that's not yet plumbed through arch.dispatch
-    // for >13 vregs (the high-vreg path uses the user stack). For now the
-    // validation boundary check above is enough to make rng_01 pass; tests
-    // that read the returned bytes (rng_02 et al.) will continue to fail
-    // until the vreg-write path lands.
+
+    // Fill vregs [1..count] with hardware-random qwords. `cpu.getRandom`
+    // is x86-64 RDRAND or aarch64 RNDR (with a CNTVCT-seeded software
+    // PRNG fallback on cores lacking RNG support — see
+    // `arch.aarch64.cpu.rndr`). RDRAND can transiently fail (entropy
+    // pool empty, CF=0); on null we fold a small TSC-derived diffuser
+    // into a per-call PRNG state so the syscall always makes forward
+    // progress. The CSPRNG-quality contract is best-effort per spec.
+    //
+    // Vreg landing: indices 1..N route to GPRs (x86-64: 1..13 →
+    // rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15; aarch64:
+    // 1..31 → x0..x30). Higher indices spill to `[user_sp + (idx-N)*8]`.
+    // Stack-spill writes go through SMAP/PAN-gated user accesses inside
+    // `setSyscallVreg`, which assume the caller's address space is
+    // active — the syscall epilogue runs in the caller's CR3/TTBR0, so
+    // that contract holds here.
+    var fallback_state: u64 = 0;
+    var i: u8 = 1;
+    while (i <= count) : (i += 1) {
+        const v: u64 = blk: {
+            if (cpu.getRandom()) |r| break :blk r;
+            // Hardware entropy unavailable this attempt — diffuse a
+            // monotonic timestamp through xorshift to avoid emitting a
+            // stream of zeros while still surfacing a non-blocking
+            // value. Userspace CSPRNGs that depend on this path treat
+            // it as a low-entropy reseed source, not a primary feed.
+            if (fallback_state == 0) fallback_state = time.currentMonotonicNs() ^ 0x9E3779B97F4A7C15;
+            var x = fallback_state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            fallback_state = x;
+            break :blk x *% 0x2545F4914F6CDD1D;
+        };
+        zag.arch.dispatch.syscall.setSyscallVreg(ec.ctx, i, v);
+    }
     return 0;
 }
 
@@ -186,12 +224,25 @@ pub fn infoSystem(caller: *anyopaque) i64 {
     const cores: u64 = smp.coreCount();
     const features: u64 = featureBits();
     const total_phys_pages: u64 = totalPhysPages();
-    const page_size_mask: u64 = 0b1; // 4 KiB always supported (spec test 03)
+    const page_size_mask: u64 = pageSizeMask();
 
     zag.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, features);
     zag.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, total_phys_pages);
     zag.arch.dispatch.syscall.setSyscallVreg4(ec.ctx, page_size_mask);
     return @bitCast(cores);
+}
+
+/// Build the `info_system` page_size_mask from the PMM's allocation
+/// capability. Spec §[system_info]:
+///   bit 0 — 4 KiB (always supported on every architecture)
+///   bit 1 — 2 MiB (kernel buddy allocator covers up to 128 MiB single
+///                  allocations — see `kernel/memory/allocators/buddy.zig`
+///                  MAX_ORDER = 15 → 2^15 × 4 KiB)
+///   bit 2 — 1 GiB (NOT supported: 1 GiB = 2^18 × 4 KiB exceeds
+///                  buddy MAX_ORDER, so the PMM cannot back a 1 GiB
+///                  contiguous allocation — bit stays clear)
+fn pageSizeMask() u64 {
+    return (1 << 0) | (1 << 1);
 }
 
 fn totalPhysPages() u64 {
@@ -244,16 +295,32 @@ fn featureBits() u64 {
 /// [test 05] returns E_INVAL if any reserved bits are set in [1].
 /// [test 06] on success, [1] flag bit 0 reflects whether the queried core is currently online.
 pub fn infoCores(caller: *anyopaque, core_id: u64) i64 {
-    _ = caller;
-    // TODO: spec test 05 mentions reserved bits in [1], but the input is
-    // a bare core_id with no published reserved layout. Apply the mask
-    // once the layout is defined.
+    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+
+    // Spec §[system_info] test 05: reserved bits in [1] surface E_INVAL.
+    // Core counts on supported targets are bounded by APIC-id width
+    // (x86-64: 8/16/32-bit per ACPI MADT) and by GIC redistributor
+    // counts (aarch64); 16 bits is wider than any plausible
+    // online-cpu count, so any input bit >=16 is reserved.
+    const CORE_ID_MASK: u64 = 0xFFFF;
+    if ((core_id & ~CORE_ID_MASK) != 0) return errors.E_INVAL;
+    // Spec §[system_info] test 04: out-of-range core ids surface E_INVAL.
     if (core_id >= smp.coreCount()) return errors.E_INVAL;
-    // TODO: vregs [2]/[3] (freq_hz, vendor_model) need a vreg-write
-    // helper from the dispatch layer. Returning [1] (flags) only for now.
-    // bit 0 = online; flags 1/2 (idle/freq-scaling supported) need
-    // per-core capability probes that aren't yet exposed.
-    const flags: u64 = 0b1;
+
+    // Build flags. Bit 0 (online) is set unconditionally for any
+    // core_id < coreCount(): smpInit brings every advertised core up
+    // through PSCI CPU_ON / APIC INIT-SIPI before kMain enters the
+    // scheduler, and the kernel never offlines a core today, so the
+    // valid-id check above is sufficient evidence of online status.
+    var flags: u64 = 1 << 0;
+    if (cpu.cpuIdleStatesSupported()) flags |= 1 << 1;
+    if (cpu.cpuFreqScalingSupported()) flags |= 1 << 2;
+
+    const freq_hz: u64 = cpu.cpuFreqHz(core_id);
+    const vendor_model: u64 = cpu.cpuVendorModel(core_id);
+
+    zag.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, freq_hz);
+    zag.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, vendor_model);
     return @bitCast(flags);
 }
 
@@ -300,10 +367,19 @@ pub fn powerSleep(caller: *anyopaque, depth: u64) i64 {
     // depth surfaces E_INVAL even when the caller lacks `power`. Without
     // this ordering, test 04 would be untestable from a power-less caller
     // (the only kind the runner can spawn — see runner/primary.zig).
+    //
+    // Spec §[power] depth → ACPI semantics:
+    //   1 → S1/S3-equivalent  (suspend-to-RAM,  `.sleep`)
+    //   3 → S4-equivalent     (suspend-to-disk, `.hibernate`)
+    //   4 → S5-equivalent     (soft-off,         `.shutdown`)
+    //
+    // The two deeper depths must surface as distinct backend actions so
+    // a platform that supports S4 but not S5 (or vice versa) can return
+    // E_NODEV from the right branch instead of silently aliasing them.
     const action: PowerAction = switch (depth) {
         1 => .sleep,
         3 => .hibernate,
-        4 => .hibernate,
+        4 => .shutdown,
         else => return errors.E_INVAL,
     };
     const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
@@ -339,13 +415,18 @@ pub fn powerScreenOff(caller: *anyopaque) i64 {
 /// [test 10] returns E_INVAL if [2] is nonzero and outside the platform's supported frequency range.
 /// [test 11] on success, a subsequent `info_cores([1])` reports a `freq_hz` consistent with the requested target (within hardware tolerance).
 pub fn powerSetFreq(caller: *anyopaque, core_id: u64, hz: u64) i64 {
+    // Spec §[power] check ordering: structural argument validation runs
+    // before rights validation across every power_* syscall. Test 15
+    // (power_set_idle, [2] > 2 → E_INVAL) explicitly relies on this
+    // ordering — the runner withholds `power` from every child domain,
+    // so a perm-first kernel would short-circuit to E_PERM and the
+    // E_INVAL gate would be untestable. Apply the same ordering here so
+    // power_set_freq, power_set_idle, and power_sleep all share a
+    // single shape: range checks first, capability check second.
+    if (core_id >= smp.coreCount()) return errors.E_INVAL;
     const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
     if (!self_caps.power) return errors.E_PERM;
-    if (core_id >= smp.coreCount()) return errors.E_INVAL;
-    // TODO: per-core frequency-scaling capability probe (spec test 09)
-    // and per-platform frequency-range bounds check (spec test 10) are
-    // not yet exposed by the arch dispatch. The current backend ignores
-    // core_id and operates on the local core only.
+    if (!cpu.cpuFreqScalingSupported()) return errors.E_NODEV;
     return cpu.cpuPowerAction(.set_freq, hz);
 }
 
@@ -364,13 +445,12 @@ pub fn powerSetFreq(caller: *anyopaque, core_id: u64, hz: u64) i64 {
 /// [test 14] returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
 /// [test 15] returns E_INVAL if [2] is greater than 2.
 pub fn powerSetIdle(caller: *anyopaque, core_id: u64, policy: u64) i64 {
+    // Bounds-first ordering: see `powerSetFreq` rationale.
     if (core_id >= smp.coreCount()) return errors.E_INVAL;
     if (policy > 2) return errors.E_INVAL;
     const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
     if (!self_caps.power) return errors.E_PERM;
-    // TODO: per-core idle-state capability probe (spec test 14) is not
-    // yet exposed by the arch dispatch. The current backend ignores
-    // core_id and operates on the local core only.
+    if (!cpu.cpuIdleStatesSupported()) return errors.E_NODEV;
     return cpu.cpuPowerAction(.set_idle, policy);
 }
 

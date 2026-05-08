@@ -92,6 +92,16 @@ inline fn ensureFreqCached() void {
     cached_freq_hz = readCntfrq();
 }
 
+/// Returns the architectural counter frequency in Hz (CNTFRQ_EL0).
+/// Surfaces through the `info_cores` syscall (spec §[system_info] vreg 2
+/// freq_hz). The value is the system counter rate, which on ARMv8 is
+/// the architecturally-visible time base — always non-zero on a
+/// correctly-configured platform.
+pub fn cntFreqHz() u64 {
+    ensureFreqCached();
+    return cached_freq_hz;
+}
+
 /// Virtual timer for preemption — arms a deadline interrupt via CNTV_TVAL_EL0.
 ///
 /// We use the virtual timer (INTID 27) instead of the physical timer

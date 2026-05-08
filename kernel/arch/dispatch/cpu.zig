@@ -472,6 +472,94 @@ pub fn sysInfoInit() void {
     }
 }
 
+/// Current operating frequency of the queried core in Hz, or 0 if the
+/// platform does not expose a per-core reading. Surfaces through the
+/// `info_cores` syscall (spec §[system_info] vreg 2 freq_hz).
+///
+/// x86-64: returns the calibrated invariant-TSC frequency from
+/// `arch.x64.timers.tscFreqHz()`. The TSC runs at the same rate on
+/// every core in an invariant-TSC system (Intel SDM Vol 3B §17.17.1
+/// "Invariant TSC"), so the returned value is the same regardless of
+/// `core_id`. Per-core frequency scaling (P-states) is not exposed
+/// today; the spec accepts 0 here when unreadable but the calibrated
+/// TSC rate is the most accurate platform-wide value the kernel knows.
+///
+/// aarch64: returns CNTFRQ_EL0, the architectural system-counter
+/// frequency (ARM ARM D13.8.1). Architecturally identical across cores
+/// and always non-zero on a correctly-configured platform.
+pub fn cpuFreqHz(core_id: u64) u64 {
+    _ = core_id;
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.timers.tscFreqHz(),
+        .aarch64 => aarch64.timers.cntFreqHz(),
+        else => unreachable,
+    };
+}
+
+/// Packed vendor / model identifier for the queried core. Layout follows
+/// the architecture's vendor encoding per spec §[system_info]
+/// `info_cores` vreg 3.
+///
+/// x86-64: bits [31:0] hold the family/model/stepping/type word from
+/// CPUID.01h:EAX (Intel SDM Vol 2 "CPUID — Returns Processor
+/// Identification and Feature Information"); bits [63:32] hold
+/// CPUID.01h:EBX (brand index, CLFLUSH line size, max APIC IDs,
+/// initial APIC ID). Together they form a self-contained identifier
+/// suitable for vendor/model dispatch in userspace without a separate
+/// brand-string fetch path. Same on every core in a homogeneous SMP
+/// system; the `core_id` argument is accepted for API symmetry.
+///
+/// aarch64: returns MIDR_EL1 verbatim (ARM ARM D13.2.79). MIDR_EL1
+/// packs Implementer (bits 31:24), Variant (23:20), Architecture
+/// (19:16), PartNum (15:4), Revision (3:0) — the canonical ARM
+/// processor identification register.
+pub fn cpuVendorModel(core_id: u64) u64 {
+    _ = core_id;
+    return switch (builtin.cpu.arch) {
+        .x86_64 => blk: {
+            const r = x64.cpu.cpuidRaw(0x01, 0);
+            break :blk @as(u64, r.eax) | (@as(u64, r.ebx) << 32);
+        },
+        .aarch64 => blk: {
+            var midr: u64 = undefined;
+            asm volatile ("mrs %[v], midr_el1"
+                : [v] "=r" (midr),
+            );
+            break :blk midr;
+        },
+        else => unreachable,
+    };
+}
+
+/// True when the platform supports per-core idle states beyond the
+/// architecture's baseline halt instruction. Surfaces through
+/// `info_cores` flags bit 1 (spec §[system_info]).
+///
+/// x86-64: idle states require ACPI _CST parsing or MWAIT C-state
+/// support discovery via CPUID.05h, neither of which is wired today;
+/// `power_set_idle` therefore returns E_NODEV and the advertised flag
+/// is cleared.
+///
+/// aarch64: PSCI CPU_SUSPEND backs `power_set_idle` via the firmware
+/// interface (DEN0022D §5.1.2). If PSCI initialization succeeded the
+/// platform supports idle-state entry; flag bit 1 is set.
+pub fn cpuIdleStatesSupported() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => false,
+        .aarch64 => aarch64.power.psciAvailable(),
+        else => unreachable,
+    };
+}
+
+/// True when the platform exposes a frequency-scaling control surface.
+/// Surfaces through `info_cores` flags bit 2 (spec §[system_info]).
+/// Neither x86-64 (IA32_PERF_CTL / HWP not wired) nor aarch64 (no DVFS
+/// wiring on the supported targets) currently expose set_freq, so the
+/// flag is cleared on both arches and `power_set_freq` returns E_NODEV.
+pub fn cpuFreqScalingSupported() bool {
+    return false;
+}
+
 // ── Spec v3 EC dispatch primitives ───────────────────────────────────
 // FPU-trap arming, register-bank load, and TLS-base accessors used by
 // the ExecutionContext dispatch path. Spec §[execution_context].
