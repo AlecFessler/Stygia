@@ -105,7 +105,7 @@ pub fn main(cap_table_base: u64) void {
     // bind lets the test EC issue the third-party suspend of W onto port_A
     // (§[suspend] [2] bind cap); recv lets the test EC dequeue the
     // resulting suspension event.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cpa = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cpa.v1)) {
         testing.fail(1);

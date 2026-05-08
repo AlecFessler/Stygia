@@ -194,7 +194,7 @@ pub fn main(cap_table_base: u64) void {
 
     // 1. Mint port_A with bind|recv. We don't need xfer because
     //    pair_count = 0 across this whole test.
-    const port_caps_word = caps.PortCap{ .recv = true, .bind = true };
+    const port_caps_word = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cp_a = syscall.createPort(@as(u64, port_caps_word.toU16()));
     if (testing.isHandleError(cp_a.v1)) {
         testing.fail(1);

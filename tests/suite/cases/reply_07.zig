@@ -113,7 +113,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port with bind + recv. The test EC holds the
     // only bind-cap copy for the test's duration so recv on this port
     // never observes E_CLOSED on the no-binders fallback.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

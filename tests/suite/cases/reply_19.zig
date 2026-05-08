@@ -204,6 +204,7 @@ pub fn main(cap_table_base: u64) void {
         .xfer = true,
         .recv = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const cp = syscall.createPort(@as(u64, port_caps_word.toU16()));
     if (testing.isHandleError(cp.v1)) {

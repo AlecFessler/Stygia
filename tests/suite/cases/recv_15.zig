@@ -139,7 +139,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port. bind keeps the bind refcount at 1 so
     // the recv call does not short-circuit through E_CLOSED before
     // the kernel arms the deadline; recv passes test 02's gate.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

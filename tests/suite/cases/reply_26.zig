@@ -290,6 +290,7 @@ pub fn main(cap_table_base: u64) void {
         .xfer = true,
         .recv = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const cp_a = syscall.createPort(@as(u64, port_a_caps.toU16()));
     if (testing.isHandleError(cp_a.v1)) {
@@ -300,7 +301,7 @@ pub fn main(cap_table_base: u64) void {
 
     // 2. Mint port_B with bind|recv. xfer not needed — pair_count = 0
     //    across the X→test wakeup leg.
-    const port_b_caps = caps.PortCap{ .recv = true, .bind = true };
+    const port_b_caps = caps.PortCap{ .recv = true, .bind = true, .@"suspend" = true };
     const cp_b = syscall.createPort(@as(u64, port_b_caps.toU16()));
     if (testing.isHandleError(cp_b.v1)) {
         testing.fail(2);

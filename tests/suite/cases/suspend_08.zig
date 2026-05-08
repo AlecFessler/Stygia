@@ -104,7 +104,7 @@ pub fn main(cap_table_base: u64) void {
     // included so the runner-granted port_ceiling subset check (= 0x1C
     // — xfer | recv | bind — see runner/primary.zig) accepts the cap
     // word; it isn't exercised here.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

@@ -78,7 +78,7 @@ pub fn main(cap_table_base: u64) void {
     // required to satisfy §[suspend] test 04; xfer is intentionally
     // absent so §[handle_attachments] test 01 is the live failure
     // mode when pair_count > 0.
-    const port_caps = caps.PortCap{ .bind = true };
+    const port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

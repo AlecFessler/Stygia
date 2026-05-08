@@ -66,7 +66,7 @@ pub fn main(cap_table_base: u64) void {
     // of `suspend`; recv lets it dequeue the resulting event. Caps are
     // restricted to those bits (xfer/recv/bind nibble = 0x18) to stay
     // inside the runner's port_ceiling.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

@@ -173,7 +173,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the result port. bind + recv are the minimum cap
     // set: the test EC keeps a live bind-cap holder so recv won't
     // return E_CLOSED, and recv itself requires the `recv` cap.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

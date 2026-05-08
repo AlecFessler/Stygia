@@ -151,6 +151,7 @@ pub fn main(cap_table_base: u64) void {
     const port_caps = caps.PortCap{
         .bind = true,
         .recv = true,
+        .@"suspend" = true,
     };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {

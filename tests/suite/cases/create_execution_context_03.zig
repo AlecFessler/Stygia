@@ -135,14 +135,14 @@ pub fn main(cap_table_base: u64) void {
     //   bits 24-31  cridc_ceiling      = 0x3F  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
-    //   bits 48-55  port_ceiling       = 0x1C  (matches runner)
+    //   bits 48-55  port_ceiling       = 0x5C  (matches runner)
     const ceilings_inner: u64 =
         @as(u64, 0x7F) |
         (@as(u64, 0x01FF) << 8) |
         (@as(u64, 0x3F) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
-        (@as(u64, 0x1C) << 48);
+        (@as(u64, 0x5C) << 48);
 
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 
@@ -159,6 +159,7 @@ pub fn main(cap_table_base: u64) void {
         .copy = false,
         .xfer = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const port_caps_word = port_caps_struct.toU16();
     const pf_caps_struct = caps.PfCap{

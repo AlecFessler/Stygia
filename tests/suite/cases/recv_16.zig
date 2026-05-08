@@ -163,7 +163,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port. bind keeps the test EC as a live bind-cap
     // holder so recv does not return E_CLOSED on the bind path; recv
     // gates the recv call itself. xfer is unused — no handles attached.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

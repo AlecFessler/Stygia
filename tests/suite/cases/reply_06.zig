@@ -109,7 +109,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port. bind + recv are the only caps the test
     // exercises; these stay inside the runner-granted port_ceiling
     // (xfer/recv/bind = 0x1C).
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

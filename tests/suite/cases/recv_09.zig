@@ -211,7 +211,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the receive port P. xfer is required because the
     // subsequent suspend attaches a handle (§[suspend] / §[handle_attachments]
     // test 01).
-    const port_p_caps = caps.PortCap{ .bind = true, .recv = true, .xfer = true };
+    const port_p_caps = caps.PortCap{ .bind = true, .recv = true, .xfer = true, .@"suspend" = true };
     const cp_p = syscall.createPort(@as(u64, port_p_caps.toU16()));
     if (testing.isHandleError(cp_p.v1)) {
         testing.fail(1);

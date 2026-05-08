@@ -209,7 +209,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port. bind+recv are the only caps the test
     // exercises; restricting to those keeps the runner's port_ceiling
     // (xfer/recv/bind = 0x1C) trivially satisfied.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

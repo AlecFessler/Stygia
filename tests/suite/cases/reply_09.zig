@@ -64,7 +64,7 @@ pub fn main(cap_table_base: u64) void {
     // (§[suspend] [2] cap) and recv works because the test EC holds the
     // port handle (no E_CLOSED). Restricting to {bind, recv} guarantees
     // the kernel mints the reply handle at recv time with xfer = 0.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

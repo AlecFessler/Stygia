@@ -128,7 +128,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 1: mint the port. bind keeps the port alive for the recv
     // (no E_CLOSED on the recv path); recv lets the test EC dequeue
     // the suspension event.
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

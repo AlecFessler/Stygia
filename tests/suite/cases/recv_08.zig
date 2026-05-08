@@ -71,7 +71,7 @@ const EVENT_TYPE_SUSPENSION: u64 = 4;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

@@ -87,7 +87,7 @@ pub fn main(cap_table_base: u64) void {
     // (test 04) stays inert. No other caps are load-bearing for this
     // test; the port never receives a `recv`, so its sender queue
     // simply holds the helper EC across the second call.
-    const port_caps = caps.PortCap{ .bind = true };
+    const port_caps = caps.PortCap{ .bind = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

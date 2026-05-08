@@ -64,7 +64,7 @@ const HandleId = caps.HandleId;
 
 pub fn main(cap_table_base: u64) void {
     // Step 1: mint port with bind|recv. xfer not needed (pair_count = 0).
-    const port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
         testing.fail(1);

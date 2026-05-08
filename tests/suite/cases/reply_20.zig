@@ -135,6 +135,7 @@ pub fn main(cap_table_base: u64) void {
         .xfer = true,
         .recv = true,
         .bind = true,
+        .@"suspend" = true,
     };
     const cp_recv = syscall.createPort(@as(u64, recv_port_caps.toU16()));
     if (testing.isHandleError(cp_recv.v1)) {

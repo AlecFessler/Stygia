@@ -217,7 +217,7 @@ pub fn main(cap_table_base: u64) void {
     //    the initial vm_exit + the post-reply vm_exit off the port
     //    without firing §[recv] [test 02]. Both bits live within
     //    the runner-granted port_ceiling = 0x1C (bits 2-4).
-    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
+    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cport.v1)) {
         testing.fail(1);
