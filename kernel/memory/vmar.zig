@@ -1071,7 +1071,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
         const phys_p = zag.memory.address.PAddr.fromInt(
             pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
         );
-        if (vmar_caps.dma) {
+        const map_failed = if (vmar_caps.dma) blk: {
             // caller-pinned: device ref under VMAR's gen-lock.
             const dev_ref = v.device orelse return errors.E_INVAL;
             dispatch.iommu.iommuMapPage(
@@ -1080,8 +1080,9 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
                 phys_p,
                 v.sz,
                 perms,
-            ) catch return errors.E_NOMEM;
-        } else {
+            ) catch break :blk true;
+            break :blk false;
+        } else blk: {
             dispatch.paging.mapPageSized(
                 domain.addr_space_root,
                 phys_p,
@@ -1089,7 +1090,44 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
                 v.sz,
                 v.cch,
                 perms,
-            ) catch return errors.E_NOMEM;
+            ) catch break :blk true;
+            break :blk false;
+        };
+        if (map_failed) {
+            // Roll back PTEs from earlier iterations [0..p) so a partial
+            // install never leaves dangling translations behind. After the
+            // caller drops its handle the page_frame can be freed and its
+            // physical pages handed back to PMM; a stale PTE here would be
+            // a UAF primitive. mapcnt was not yet bumped (incMapCntShim
+            // runs only after the loop) and installed_pfs[slot_reserved]
+            // was never committed, so this only undoes hardware state.
+            var u: u32 = 0;
+            while (u < p) : (u += 1) {
+                const off_u = offset + @as(u64, u) * pf_sz_bytes;
+                if (vmar_caps.dma) {
+                    // dma branch only reached if v.device is non-null —
+                    // the very first iteration above already proved it.
+                    const dev_ref = v.device.?;
+                    _ = dispatch.iommu.iommuUnmapPage(
+                        dev_ref.ptr,
+                        v.base_vaddr.addr + off_u,
+                        v.sz,
+                    );
+                    dispatch.iommu.invalidateIotlbRange(
+                        dev_ref.ptr,
+                        v.base_vaddr.addr + off_u,
+                        v.sz,
+                        1,
+                    );
+                } else {
+                    _ = dispatch.paging.unmapPageSized(
+                        domain.addr_space_root,
+                        .fromInt(v.base_vaddr.addr + off_u),
+                        v.sz,
+                    );
+                }
+            }
+            return errors.E_NOMEM;
         }
         p += 1;
     }
