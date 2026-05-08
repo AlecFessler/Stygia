@@ -110,6 +110,12 @@
 //   6: receiver syscall word's pair_count != 1.
 //   7: inserted slot's handle type is not execution_context.
 //   8: inserted slot's caps != entry.caps verbatim (0x06).
+//   9: invoking saff on the delivered handle did not return OK —
+//      proves the handle resolves to a live EC and the receiver
+//      is the new owner (not just a stale ref). Spec
+//      §[handle_attachments] requires the delivered handle to be a
+//      fully usable copy, so an op authorized by the entry's caps
+//      must succeed against it.
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -303,6 +309,21 @@ pub fn main(cap_table_base: u64) void {
     }
     if (inserted.caps() != entry_caps.toU16()) {
         testing.fail(8);
+        return;
+    }
+
+    // Step 9: liveness probe. Without an op against the delivered
+    // handle, the assertions above only inspect cap_table fields —
+    // a kernel that didn't actually bump the source EC's refcount
+    // would still pass. Invoke `affinity` (authorized by the entry's
+    // `saff` cap) on the delivered slot. The call should return OK,
+    // proving the handle resolves to a live EC and the receiver-side
+    // refcount took.
+    const inserted_slot: u12 = @intCast(tstart);
+    // affinity_mask = 1 (single-core, smallest valid mask).
+    const aff_regs = syscall.affinity(inserted_slot, 1);
+    if (aff_regs.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(9);
         return;
     }
 
