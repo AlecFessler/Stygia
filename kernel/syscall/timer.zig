@@ -1,5 +1,6 @@
 const zag = @import("zag");
 
+const capability = zag.caps.capability;
 const errors = zag.syscall.errors;
 const timer = zag.sched.timer;
 
@@ -82,6 +83,17 @@ pub fn timerArm(caller: *anyopaque, caps: u64, deadline_ns: u64, flags: u64) i64
 /// [test 09] `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
 /// [test 10] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64) i64 {
+    // Spec §[timer_rearm] [test 10]: when [1] is a valid handle, the
+    // domain-local snapshot must be refreshed regardless of which
+    // error path we take. Run the implicit-sync side effect FIRST,
+    // before any reserved-bit / deadline / flags rejection — those
+    // checks wouldn't otherwise observe the freshly-fired counter on
+    // a one-shot timer that fired between arm and rearm. `sync`
+    // returns E_BADCAP if the low-12 slot doesn't resolve, which is
+    // exactly the test 01 path the spec excludes from "valid handle"
+    // gating; we ignore the rc here and let the real validation drive
+    // the syscall return value.
+    _ = capability.sync(caller, handle & HANDLE_MASK);
     if (handle & ~HANDLE_MASK != 0) return errors.E_INVAL;
     if (flags & ~FLAGS_MASK != 0) return errors.E_INVAL;
     if (deadline_ns == 0) return errors.E_INVAL;
@@ -112,6 +124,10 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 /// [test 08] on success, after one full prior `deadline_ns` has elapsed, every domain-local copy of [1] still returns `field0 = u64::MAX` from a fresh `sync`.
 /// [test 09] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn timerCancel(caller: *anyopaque, handle: u64) i64 {
+    // Spec §[timer_cancel] [test 09]: implicit-sync side effect on
+    // every "valid handle" path including reserved-bit rejection.
+    // See `timerRearm` above for the rationale.
+    _ = capability.sync(caller, handle & HANDLE_MASK);
     if (handle & ~HANDLE_MASK != 0) return errors.E_INVAL;
     return timer.timerCancel(caller, handle);
 }

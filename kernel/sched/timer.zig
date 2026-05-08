@@ -104,8 +104,24 @@ pub const Timer = struct {
 
     /// Core whose per-core wheel currently holds this timer, or 0xFF
     /// when not queued. Set on insert, cleared on remove. Cancel uses
-    /// this to route to the right per-core lock + heap.
+    /// this to route to the right per-core lock + heap. Read with
+    /// `@atomicLoad(.acquire)` outside the wheel lock (e.g. by
+    /// `wheelRemove`'s pre-route check); writes are still serialized
+    /// under `wheel_locks[wheel_core]`.
     wheel_core: u8 = WHEEL_NO_CORE,
+
+    /// Rearm-vs-fire race counter. Bumped atomically by `popMin`
+    /// (under `wheel_locks[c]`) and by `timerRearm` (under
+    /// `_gen_lock`); read by `onFire` under `_gen_lock` to detect
+    /// rearm-between-pop-and-fire. The pop path snapshots the
+    /// post-increment value under the wheel lock and hands it to
+    /// `onFire`, which drops the fire if the snapshot disagrees with
+    /// the timer's current `pop_gen`. Closes the window where rearm
+    /// acquires `_gen_lock` after `popMin` has cleared `wheel_core`
+    /// (so `wheelRemove` is a no-op) but before the popped fire has
+    /// run — without this guard, the popped ISR would fire against
+    /// the freshly-rearmed timer's counter=0.
+    pop_gen: u64 = 0,
 };
 
 pub const Allocator = SecureSlab(Timer, 256);
@@ -149,9 +165,11 @@ pub const HeapEntry = struct {
     /// `wheelRemove` before freeing the slab slot. Heap operations
     /// (siftUp/siftDown/swap) update `wheel_idx`/`wheel_core` directly
     /// through `.ptr` because the wheel-pin invariant guarantees the
-    /// slot is alive — locking the per-Timer gen-lock here would
-    /// invert the established `t._gen_lock → wheel_locks[core]` order
-    /// (see `onFire` / `wheelInsert`) and seed an AB-BA cycle.
+    /// slot is alive. The `wheel_idx`/`wheel_core` fields are
+    /// wheel-lock-only; `_gen_lock` does not need to be held to write
+    /// them, and the wheel surface (`wheelInsert`/`wheelRemove`/
+    /// `wheelExpireDue`) drops `_gen_lock` before taking
+    /// `wheel_locks[c]` precisely to avoid coupling those two locks.
     timer: SlabRef(Timer),
 };
 
@@ -215,7 +233,11 @@ pub const TimerHeap = struct {
 
     /// Pop and return the minimum-deadline entry, or `null` if empty.
     /// Updates `wheel_idx`/`wheel_core` on the removed timer (cleared)
-    /// and on the entry swapped into the root.
+    /// and on the entry swapped into the root. Bumps the popped
+    /// timer's `pop_gen` so a concurrent `timerRearm` that sneaks
+    /// between this pop and the eventual `onFire` (rearm-vs-fire race)
+    /// observes a forward-moving counter and the in-flight fire is
+    /// rejected by `onFire`'s pop_gen recheck.
     pub fn popMin(self: *TimerHeap) ?HeapEntry {
         if (self.len == 0) return null;
         const top = self.entries[0];
@@ -223,6 +245,10 @@ pub const TimerHeap = struct {
         // duration of residency (see `HeapEntry.timer` doc comment).
         top.timer.ptr.wheel_idx = WHEEL_NOT_QUEUED;
         top.timer.ptr.wheel_core = WHEEL_NO_CORE; // caller-pinned
+        // Atomic so a concurrent `timerRearm` that races the
+        // pop-vs-fire window observes the post-increment value when it
+        // bumps `pop_gen` again under `_gen_lock`.
+        _ = @atomicRmw(u64, &top.timer.ptr.pop_gen, .Add, 1, .acq_rel);
 
         const last_idx = self.len - 1;
         self.len = last_idx;
@@ -352,6 +378,13 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
 
     const periodic_flag: bool = (flags & 1) != 0;
 
+    // Compute the first-fire deadline BEFORE locking so the locked
+    // region holds a single consistent (counter=0, armed=true,
+    // period_ns=new, deadline_ns=now+arg) snapshot — no observer can
+    // catch armed=true with a stale deadline_ns mid-rearm. `currentNs`
+    // is monotonic and lock-free, safe to call here.
+    const fire_deadline = currentNs() +| deadline_ns;
+
     const tlr = lookup.timer_ref.lockIrqSave(@src()) catch return E_BADCAP;
     const t = tlr.ptr;
     if (t.armed) wheelRemove(t);
@@ -359,6 +392,12 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
     t.armed = true;
     t.periodic = periodic_flag;
     t.period_ns = deadline_ns;
+    t.deadline_ns = fire_deadline;
+    // Bump `pop_gen` so any in-flight fire whose `popMin` already
+    // cleared `wheel_core` (rendering our `wheelRemove` above a no-op)
+    // gets rejected by `onFire`'s pop_gen recheck instead of firing
+    // against our freshly-zeroed counter.
+    _ = @atomicRmw(u64, &t.pop_gen, .Add, 1, .acq_rel);
     const timer_gen = t._gen_lock.currentGen();
     const counter = t.counter;
     const armed = t.armed;
@@ -371,22 +410,6 @@ pub fn timerRearm(caller: *anyopaque, handle: u64, deadline_ns: u64, flags: u64)
     propagateAndWake(t, timer_gen, 0);
     propagateField1(t, timer_gen, encodeField1(true, periodic_flag));
 
-    // §[timer_rearm] [test 05]: "the calling domain's copy of [1] has
-    // `field0 = 0` immediately on return". Userspace observes field0
-    // post-return, so the kernel must guarantee the first fire lands
-    // strictly after the syscall returns — i.e., at least `deadline_ns`
-    // after the rearm path's last write to the cap table. Compute the
-    // first-fire deadline AFTER propagateAndWake / propagateField1 so
-    // the propagation cost (O(MAX_DOMAINS × MAX_HANDLES_PER_DOMAIN))
-    // does not eat into the deadline. On TCG the propagation walk can
-    // exceed millisecond-scale deadlines; without this re-base the
-    // wheel inserts a timer whose deadline is already in the past and
-    // the very next wheel-expire ISR fires it before userspace can read
-    // field0.
-    const fire_deadline = currentNs() +| deadline_ns;
-    const tlr2 = lookup.timer_ref.lockIrqSave(@src()) catch return E_BADCAP;
-    tlr2.ptr.deadline_ns = fire_deadline;
-    lookup.timer_ref.unlockIrqRestore(tlr2.irq_state);
     wheelInsert(t, fire_deadline);
     return 0;
 }
@@ -585,7 +608,13 @@ fn wheelInsert(t: *Timer, deadline_ns: u64) void {
 /// the new top, which is acceptable (we'd just take one extra spurious
 /// timer interrupt at the now-stale earlier deadline).
 fn wheelRemove(t: *Timer) void {
-    const core_id = t.wheel_core;
+    // `wheel_core` is mutated under `wheel_locks[core]`, but here we
+    // read it BEFORE we know which lock to take. Use `@atomicLoad` so
+    // the read is well-defined under aarch64's weak memory ordering;
+    // the recheck under `wheel_lock` below covers the case where a
+    // concurrent `popMin`/`removeAt` raced us between this load and
+    // the lock acquire.
+    const core_id = @atomicLoad(u8, &t.wheel_core, .acquire);
     if (core_id == WHEEL_NO_CORE) return;
     if (core_id >= scheduler.MAX_CORES) return;
 
@@ -625,6 +654,7 @@ pub fn wheelExpireDue() void {
         // re-enter wheelInsert (periodic re-arm) on this same core,
         // which would deadlock if we held wheel_locks[core_id] across.
         var fire_target: ?*Timer = null;
+        var fire_pop_gen: u64 = 0;
         {
             const irq = lock.lockIrqSave(@src());
             defer lock.unlockIrqRestore(irq);
@@ -635,11 +665,13 @@ pub fn wheelExpireDue() void {
             // cleared its `wheel_idx`/`wheel_core` under `wheel_locks`.
             // The slab refcount still holds it (handles outlive wheel
             // residency); we hand the raw `*Timer` to `onFire` which
-            // takes `t._gen_lock` for the fire-side mutation under the
-            // canonical `t._gen_lock → wheel_locks` order.
+            // takes `t._gen_lock` for the fire-side mutation. Snapshot
+            // `pop_gen` under the wheel lock — `popMin` just bumped it,
+            // so this value is the unique tag for *this* fire intent.
             fire_target = popped.timer.ptr;
+            fire_pop_gen = @atomicLoad(u64, &popped.timer.ptr.pop_gen, .acquire);
         }
-        onFire(fire_target.?);
+        onFire(fire_target.?, fire_pop_gen);
     }
 
     // Re-arm to the new top if any timers remain on this core AND
@@ -661,9 +693,24 @@ pub fn wheelExpireDue() void {
 /// Increments counter (saturating at `COUNTER_CEILING`), propagates to
 /// every domain-local copy of the handle, futex-wakes each copy's
 /// `field0` paddr. Re-arms if periodic.
-pub fn onFire(t: *Timer) void {
+///
+/// `expected_pop_gen` is the snapshot of `t.pop_gen` taken under
+/// `wheel_locks[c]` immediately after `popMin` bumped it. Re-validate
+/// under `_gen_lock`: if a concurrent `timerRearm` slipped in between
+/// the pop and this fire (rearm-vs-fire race) it bumped `pop_gen` and
+/// re-inserted the timer with a fresh deadline; the popped fire is
+/// now stale and must be dropped to avoid firing against the rearmed
+/// counter=0.
+pub fn onFire(t: *Timer, expected_pop_gen: u64) void {
     t._gen_lock.lock(@src());
     if (!t.armed) {
+        t._gen_lock.unlock();
+        return;
+    }
+    if (@atomicLoad(u64, &t.pop_gen, .acquire) != expected_pop_gen) {
+        // Rearm-vs-fire: a concurrent `timerRearm` re-inserted this
+        // timer between `popMin` and now. The fresh wheel entry will
+        // expire on its own clock; drop this stale fire.
         t._gen_lock.unlock();
         return;
     }
