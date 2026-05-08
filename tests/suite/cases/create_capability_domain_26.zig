@@ -77,7 +77,18 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // checks accept the spawn, and each carries a distinct non-trivial
 // pattern so a kernel that mis-laid-out field0 would visibly fail
 // against at least one assertion.
-const CHILD_EC_INNER: u8 = 0x55; // bits 0/2/4/6 of EC inner caps
+//
+// CHILD_EC_INNER must include `susp` (bit 5), `read` (bit 6), and
+// `write` (bit 7): the runner's testing.report path suspends the
+// child's SLOT_INITIAL_EC on the result port, which §[suspend]
+// gates on `susp` on the target EC handle, and the kernel's L4
+// fast-suspend predicate additionally requires read+write set so
+// recv-time §[event_state] vregs 1..13 carry the assertion id /
+// result code back to the runner. The child mints SLOT_INITIAL_EC
+// with caps = ec_inner_ceiling per spec §[create_capability_domain]
+// [test 21] — without these bits the child silently returns from
+// `testing.report` with E_PERM and the runner times out (MISS).
+const CHILD_EC_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of EC inner caps (susp+read+write set)
 const CHILD_VMAR_INNER: u16 = 0x00AA; // strict subset of runner 0x01FF
 const CHILD_CRIDC: u8 = 0x15; // strict subset of runner 0x3F (move|crec|aqvr)
 const CHILD_IDC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
