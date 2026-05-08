@@ -27,3 +27,4 @@ zig-out/
 desktopOS/libc_smoke/libc_smoke
 desktopOS/zig_compiler/zig.elf
 slab_proof/.lake/
+.githooks/
