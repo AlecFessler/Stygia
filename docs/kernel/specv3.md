@@ -1277,6 +1277,8 @@ perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] c
 
 [test 09] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
+[test 10] when `has_threshold = 1` is set on a config and the hardware supports overflow, after the target EC has executed enough work for the configured counter to overflow past `config_threshold`, a `pmu_overflow` event is delivered per §[event_route] (delivered to the bound port if a route exists, dropped otherwise).
+
 
 ### perfmon_read
 
