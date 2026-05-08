@@ -157,34 +157,41 @@
 //   16). Our chosen set keeps cur_rwx ∈ {r, r|w, r|w|x}, all
 //   accepted by the kernel.
 //
-// Assertion id allocation (each fail() call uses an id from this
-// list so post-mortem can pin the failing cell + leg):
+// Assertion id allocation
 //
-//   1   create_page_frame failed for some cell.
-//   2   create_vmar failed for some cell.
-//   3   map_pf failed for some cell.
-//   4   allowed-read leg byte fidelity mismatch.
-//   5   allowed-write leg byte fidelity mismatch.
-//   6   denied-write leg: recv returned non-OK, non-E_TIMEOUT.
-//   7   denied-write leg: recv returned OK with event_type !=
-//       memory_fault, or subcode != invalid_write.
-//   8   denied-write leg: recv timed out AND worker_done == 1
-//       (kernel allowed the write where spec demands denial).
-//   9   denied-write leg: recv timed out AND worker_done == 0
-//       (worker neither faulted nor ran past — likely no-route
-//       fallback or scheduling stall).
-//   10  execute-leg setup (side-VMAR for code planting) failed.
-//   11  allowed-execute leg: planted code didn't return cleanly.
-//   12  denied-execute leg: recv returned non-OK, non-E_TIMEOUT.
-//   13  denied-execute leg: recv returned OK with event_type !=
-//       memory_fault, or subcode != invalid_execute.
-//   14  denied-execute leg: recv timed out AND worker_done == 1
-//       (kernel allowed execute where spec demands denial).
-//   15  denied-execute leg: recv timed out AND worker_done == 0.
-//   16  bind_event_route failed.
-//   17  create_port failed for worker scaffold.
-//   18  create_execution_context failed for worker.
-//   19  terminate(worker) failed (residue from a prior cell).
+//   The reported assertion id is `cell_index * 100 + leg_id`, so
+//   post-mortem can pin BOTH the failing cell (in [0..8] enumerating
+//   the 3×3 grid in row-major order, vmar outer, pf inner) AND the
+//   failing leg. All 9 cells exercise the kernel before the test
+//   reports; if any cell fails, the FIRST-failing cell's id is
+//   reported (the spec runner only surfaces the first fail anyway).
+//
+//   leg_id values:
+//     1   create_page_frame failed.
+//     2   create_vmar failed.
+//     3   map_pf failed.
+//     4   allowed-read leg byte fidelity mismatch.
+//     5   allowed-write leg byte fidelity mismatch.
+//     6   denied-write leg: recv returned non-OK, non-E_TIMEOUT.
+//     7   denied-write leg: recv returned OK with event_type !=
+//         memory_fault, or subcode != invalid_write.
+//     8   denied-write leg: recv timed out AND worker_done == 1
+//         (kernel allowed the write where spec demands denial).
+//     9   denied-write leg: recv timed out AND worker_done == 0
+//         (worker neither faulted nor ran past — likely no-route
+//         fallback or scheduling stall).
+//    10   execute-leg setup (side-VMAR for code planting) failed.
+//    11   allowed-execute leg: planted code didn't return cleanly.
+//    12   denied-execute leg: recv returned non-OK, non-E_TIMEOUT.
+//    13   denied-execute leg: recv returned OK with event_type !=
+//         memory_fault, or subcode != invalid_execute.
+//    14   denied-execute leg: recv timed out AND worker_done == 1
+//         (kernel allowed execute where spec demands denial).
+//    15   denied-execute leg: recv timed out AND worker_done == 0.
+//    16   bind_event_route failed.
+//    17   create_port failed for worker scaffold.
+//    18   create_execution_context failed for worker.
+//    19   terminate(worker) failed (residue from a prior cell).
 //
 // Read-leg note
 //   The "always-allowed read" arm only fires once per cell (we test
@@ -642,10 +649,25 @@ pub fn main(cap_table_base: u64) void {
         .{ RWX_RWX, RWX_RWX },
     };
 
-    var assertion: u64 = 0;
-    for (cells) |cell| {
-        if (!runCell(cell[0], cell[1], &assertion)) {
-            testing.fail(assertion);
+    // Run every cell unconditionally — early-return on first cell
+    // failure was hiding 6 of 9 cells from end-to-end coverage. Each
+    // cell's pass/fail and leg-level diagnostic id are recorded in
+    // local arrays; after the loop we surface the FIRST failing
+    // cell's `cell_index * 100 + leg_id` (spec runner only reports
+    // the first fail anyway, but all 9 cells have already exercised
+    // the kernel by the time we report).
+    var cell_passed: [cells.len]bool = @splat(false);
+    var cell_leg_id: [cells.len]u64 = @splat(0);
+
+    for (cells, 0..) |cell, i| {
+        var leg_id: u64 = 0;
+        cell_passed[i] = runCell(cell[0], cell[1], &leg_id);
+        cell_leg_id[i] = leg_id;
+    }
+
+    for (cell_passed, 0..) |ok, i| {
+        if (!ok) {
+            testing.fail(@as(u64, i) * 100 + cell_leg_id[i]);
             return;
         }
     }
