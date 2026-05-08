@@ -397,12 +397,28 @@ pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i6
 
     // Pass 2: install. All pairs are now known to be well-formed and
     // non-overlapping with each other and with prior installations.
+    // Spec §[var].map_pf is all-or-nothing: a partial install on a
+    // later-rejected pair would leave the VMAR with side-effects from
+    // earlier pairs, so on mid-stream failure we walk back every pair
+    // installed by this call and tear it down. The caller observes the
+    // VMAR's `map` field unchanged from its pre-call value.
+    const map_before = v.map;
     i = 0;
     while (i < pairs.len) {
         const offset = pairs[i];
         const pf_slot: u12 = @truncate(pairs[i + 1] & 0xFFF);
-        const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse
+        const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse {
+            // Roll back installs from [0..i) — a pf handle disappearing
+            // between Pass 1 and Pass 2 is implausible under the gen-lock
+            // bracket but the rollback path is symmetric with mappingInstall
+            // failure below.
+            var u: usize = 0;
+            while (u < i) : (u += 2) {
+                _ = mappingRemove(v, pairs[u]);
+            }
+            v.map = map_before;
             return errors.E_BADCAP;
+        };
         const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
 
         // Spec §[var].map_pf test 12: effective PTE perms must equal
@@ -416,7 +432,14 @@ pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i6
             (@as(u3, @intFromBool(pf_caps.x)) << 2);
 
         const rc = mappingInstall(v, offset, pf, pf_rwx);
-        if (rc != 0) return rc;
+        if (rc != 0) {
+            var u: usize = 0;
+            while (u < i) : (u += 2) {
+                _ = mappingRemove(v, pairs[u]);
+            }
+            v.map = map_before;
+            return rc;
+        }
 
         i += 2;
     }
@@ -483,7 +506,24 @@ pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) 
                 v.sz,
                 v.cch,
                 rwxToPerms(v.cur_rwx),
-            ) catch return errors.E_NOMEM;
+            ) catch {
+                // Roll back PTEs from earlier iterations [0..off) so a
+                // partial install doesn't leave dangling MMIO mappings
+                // visible to userspace while v.map stays at .unmapped.
+                // A subsequent mapMmio() with a different DeviceRegion
+                // would otherwise alias two phys ranges to the same
+                // VMAR base. Mirrors the mappingInstall rollback added
+                // in 725b22a26 for map_pf.
+                var u: u64 = 0;
+                while (u < off) : (u += sz_bytes) {
+                    _ = dispatch.paging.unmapPageSized(
+                        domain.addr_space_root,
+                        .fromInt(v.base_vaddr.addr + u),
+                        v.sz,
+                    );
+                }
+                return errors.E_NOMEM;
+            };
             off += sz_bytes;
         }
     }
@@ -610,19 +650,57 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
         if ((new_rwx & ~pf_intersect_rwx) != 0) return errors.E_INVAL;
     }
 
+    // Re-install each live page's PTE with the same physical backing
+    // but new effective perms. Walking `installed_pfs` keeps phys
+    // accurate for both `map = page_frame` (user-supplied PF, possibly
+    // multi-page) and `map = demand` (kernel-allocated single-page PF
+    // installed by demandAlloc). For each installed entry we know the
+    // VMAR offset and the bound PageFrame; the per-page phys is
+    // `pf.phys_base + p * pf.sz` and the per-page virt is
+    // `v.base_vaddr + entry.offset + p * pf.sz`. New perms intersect
+    // the PageFrame's caps with `new_rwx` (Spec §[var].remap test 08:
+    // effective = `new_cur_rwx ∩ page_frame.r/w/x` for map=1, or
+    // `new_cur_rwx` for map=3). For map=3 the demand-paged PF has no
+    // user-visible handle so we treat its caps as 0b111 — same as the
+    // demandAlloc path that pinned 0b111 into mappingInstall.
     const sz_bytes = pageSizeBytes(v.sz);
-    var off: u64 = 0;
-    const var_size = @as(u64, v.page_count) * sz_bytes;
-    while (off < var_size) {
-        dispatch.paging.mapPageSized(
-            domain.addr_space_root,
-            .fromInt(0),
-            .fromInt(v.base_vaddr.addr + off),
-            v.sz,
-            v.cch,
-            rwxToPerms(new_rwx),
-        ) catch {};
-        off += sz_bytes;
+    for (&v.installed_pfs) |*entry| {
+        const pf_ref = entry.pf orelse continue;
+        const pf = pf_ref.ptr;
+        // PageFrame caps for the intersection. For demand pages the
+        // PF is kernel-allocated and not in any user_table, so the
+        // lookup falls through to 0b111 (matches demandAlloc).
+        const pf_rwx_for_remap: u3 = blk: {
+            if (v.map == .demand) break :blk 0b111;
+            var i: usize = 0;
+            while (i < domain.user_table.len) : (i += 1) {
+                if (Word0.typeTag(domain.user_table[i].word0) != .page_frame) continue;
+                const kh = domain.kernel_table[i];
+                if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
+                    const pfc: PageFrameCaps = @bitCast(Word0.caps(domain.user_table[i].word0));
+                    break :blk (@as(u3, @intFromBool(pfc.r))) |
+                        (@as(u3, @intFromBool(pfc.w)) << 1) |
+                        (@as(u3, @intFromBool(pfc.x)) << 2);
+                }
+            }
+            break :blk 0b111;
+        };
+        const eff_perms = rwxToPerms(new_rwx & pf_rwx_for_remap);
+        const pf_sz_bytes = pageSizeBytes(pf.sz);
+        var p: u32 = 0;
+        while (p < pf.page_count) : (p += 1) {
+            const off_p = entry.offset + @as(u64, p) * pf_sz_bytes;
+            if (off_p + pf_sz_bytes > @as(u64, v.page_count) * sz_bytes) break;
+            const phys_p = PAddr.fromInt(pf.phys_base.addr + @as(u64, p) * pf_sz_bytes);
+            dispatch.paging.mapPageSized(
+                domain.addr_space_root,
+                phys_p,
+                .fromInt(v.base_vaddr.addr + off_p),
+                v.sz,
+                v.cch,
+                eff_perms,
+            ) catch {};
+        }
     }
     dispatch.paging.shootdownTlbRange(
         domain.addr_space_id,
@@ -971,10 +1049,21 @@ fn vaRangeAllocate(
     sz: PageSize,
     preferred_base: VAddr,
 ) ?VAddr {
-    if (preferred_base.addr != 0) return preferred_base;
-
     const sz_bytes = pageSizeBytes(sz);
     const range_bytes = @as(u64, pages) * sz_bytes;
+
+    // preferred_base path: createVmar caller asked for a specific base.
+    // Reject when the request would land on top of an eager kernel
+    // mapping (ELF segments, user stack, cap-table view) — the
+    // checkVaRangeOverlap probe in createVmar only covers
+    // `domain.vars[]`, so without this gate the static zone would let
+    // userspace mint a VMAR aliasing kernel-installed PTEs and
+    // map_pf's overlap probe (test 09) would later fire on the alias.
+    if (preferred_base.addr != 0) {
+        if (pageTableOverlaps(domain, preferred_base.addr, range_bytes, sz_bytes)) return null;
+        return preferred_base;
+    }
+
     const aslr = dispatch.paging.user_aslr;
     if (range_bytes > aslr.end - aslr.start) return null;
     const max_base = aslr.end - range_bytes;
@@ -1186,8 +1275,15 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     return 0;
 }
 
-/// Remove an installation, decrements mapcnt, tears down PTE.
+/// Remove an installation, decrements mapcnt, tears down PTE(s).
 /// Returns the removed page_frame so caller can release its handle ref.
+///
+/// `mappingInstall` writes one `installed_pfs` entry per installation
+/// but installs `pf.page_count` PTEs (one per page of the PageFrame).
+/// Symmetric removal must tear down every PTE in that span — leaving
+/// stale leaf PTEs behind would surface as a UAF primitive once the
+/// PageFrame is freed and its physical pages return to PMM (the leftover
+/// PTE still translates the user VA to the now-recycled phys).
 fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     // caller-pinned: VMAR's domain is its owner.
     const domain = v.domain.ptr;
@@ -1199,10 +1295,14 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     const vmar_caps: VmarCaps = @bitCast(caps_word);
 
     var removed: ?*PageFrame = null;
+    var pf_page_count: u32 = 1;
+    var pf_sz_bytes: u64 = pageSizeBytes(v.sz);
     for (&v.installed_pfs) |*entry| {
         if (entry.pf) |pf_ref| {
             if (entry.offset == offset) {
                 removed = pf_ref.ptr;
+                pf_page_count = pf_ref.ptr.page_count;
+                pf_sz_bytes = pageSizeBytes(pf_ref.ptr.sz);
                 entry.* = .{};
                 // PageFrame mapcnt was bumped at install;
                 // this is the matching decrement. `releaseMapping` may
@@ -1214,17 +1314,21 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
         }
     }
 
-    if (vmar_caps.dma) {
-        // caller-pinned: device ref under VMAR's gen-lock.
-        const dev_ref = v.device orelse return removed;
-        _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz);
-        dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + offset, v.sz, 1);
-    } else {
-        _ = dispatch.paging.unmapPageSized(
-            domain.addr_space_root,
-            .fromInt(v.base_vaddr.addr + offset),
-            v.sz,
-        );
+    var p: u32 = 0;
+    while (p < pf_page_count) : (p += 1) {
+        const off_p = offset + @as(u64, p) * pf_sz_bytes;
+        if (vmar_caps.dma) {
+            // caller-pinned: device ref under VMAR's gen-lock.
+            const dev_ref = v.device orelse return removed;
+            _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz);
+            dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz, 1);
+        } else {
+            _ = dispatch.paging.unmapPageSized(
+                domain.addr_space_root,
+                .fromInt(v.base_vaddr.addr + off_p),
+                v.sz,
+            );
+        }
     }
     return removed;
 }
