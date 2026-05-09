@@ -26,6 +26,7 @@ const KEntryType = fn (*BootInfo) callconv(stygia.arch.dispatch.cpu.cc()) noretu
 fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const link_base = address.AddrSpacePartition.kernel_code.start;
     const kaslr_end = address.AddrSpacePartition.kernel_code.end;
+    const window = kaslr_end - link_base;
 
     var image_end: u64 = 0;
     const num_sections = @intFromEnum(ElfSection.num_sections);
@@ -34,8 +35,33 @@ fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
         const section_end = section.vaddr + section.size;
         if (section_end > image_end) image_end = section_end;
     }
+
+    // Guard against malformed ELFs whose highest section sits below the
+    // kernel_code partition base (would underflow the size computation
+    // below) and against the empty-sections degenerate case. Either is a
+    // bootloader-caller bug, not a runtime condition we can recover from
+    // — emit a diagnostic and fall through to slide=0 so the kernel at
+    // least gets a chance to print something on the panic path.
+    if (image_end <= link_base) {
+        puts(dbg.kaslr_bad_image);
+        return 0;
+    }
     const image_size = std.mem.alignForward(u64, image_end - link_base, paging.PAGE4K);
-    const max_slide = kaslr_end - link_base - image_size;
+
+    // The kernel_code partition is currently 1 GiB on both arches (see
+    // arch.dispatch.paging.addr_space.kernel_code). When the kernel ELF
+    // grows so large that no slide fits, plain `kaslr_end - link_base
+    // - image_size` underflows and Debug-mode panics with "integer
+    // overflow" between the [STYGIA] ELF parsed and [STYGIA] KASLR
+    // slide markers — a confusing panic for what is really a "the
+    // kernel is too big for the KASLR window" condition. Surface a
+    // clearer marker and degrade to slide=0 (kernel boots at link
+    // base, no randomisation) instead of dying in the bootloader.
+    if (image_size >= window) {
+        puts(dbg.kaslr_no_room);
+        return 0;
+    }
+    const max_slide = window - image_size;
     const slide_pages = max_slide / paging.PAGE4K;
 
     _ = slide_pages;
@@ -130,6 +156,8 @@ const dbg = struct {
     const elf_parsed = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] ELF parsed\r\n");
     const kaslr1 = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR slide\r\n");
     const kaslr2 = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR reloc\r\n");
+    const kaslr_no_room = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR no room (kernel_code window full) — slide=0\r\n");
+    const kaslr_bad_image = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR malformed image (no sections above link_base) — slide=0\r\n");
     const sections = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] sections\r\n");
     const sections_done = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] mapped\r\n");
     const stack = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] stack\r\n");
