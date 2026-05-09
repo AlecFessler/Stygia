@@ -1,174 +1,131 @@
 # Zag
 
-A capability-based microkernel written in Zig, currently mid-rebuild against [spec v3](docs/kernel/specv3.md). The new kernel surface is implemented and the test runner is on its second generation; gaps are being closed test-by-test against the spec.
+Zag is a capability-based microkernel for building secure, fast, and reliable operating systems.
 
-## Architecture
+## Kernel Objects
 
-The kernel exposes a small set of typed capability objects. Userspace gets things done by holding handles to them and invoking syscalls.
+Userspace interacts with the kernel through handles to typed kernel objects. Each row links to the relevant section of [the spec](docs/kernel/specv3.md) for the full handle ABI, capability bits, and syscall surface.
 
-| Object | Role |
-|---|---|
-| **Capability Domain** | Process-equivalent. Owns a 4096-entry handle table and the static caps that gate every syscall. |
-| **Execution Context** | Thread-equivalent. Runnable, suspendable, attachable to vregs for IPC. |
-| **VMAR** (Virtual Memory Address Region) | Mapped region in a domain's address space. Backed by page frames or device regions. |
-| **Page Frame** | Contiguous physical memory, allocated and revocable. |
-| **Device Region** | MMIO/port-IO range gated by a capability. |
-| **Virtual Machine** | KVM-style guest container; vCPUs are ECs in a VM domain. |
-| **Port** | IPC endpoint. ECs suspend on it; senders deliver vreg payloads. |
-| **Event Route** | Kernel-event → port routing (faults, timers, exits). |
-| **Reply** | One-shot capability minted on suspension; resolves a waiting EC. |
-| **Timer** | Programmable one-shot/periodic wake on a port. |
+| Object | Role | Spec |
+|---|---|---|
+| **Capability Domain** | A set of capabilities usable by the execution contexts bound to the domain. The process-equivalent boundary in Zag. | [§[capability_domain]](docs/kernel/specv3.md#capability_domain-capability-domain) |
+| **Execution Context** | A schedulable unit of executable state bound to a capability domain. The thread-equivalent. | [§[execution_context]](docs/kernel/specv3.md#execution_context-execution-context) |
+| **VMAR** | A virtual memory address region: a contiguous span of virtual address space bound to a capability domain, available for demand-paged memory or for installing page frames and device regions. | [§[vmar]](docs/kernel/specv3.md#vmar-virtual-memory-address-region) |
+| **Page Frame** | A reference to physical memory. Installing the same page frame into multiple capability domains creates shared memory. | [§[page_frame]](docs/kernel/specv3.md#page_frame-page-frame) |
+| **Device Region** | A reference to a device's MMIO region or x86-64 I/O port range. Installing it into a VMAR makes the device directly accessible to execution contexts in that capability domain. | [§[device_region]](docs/kernel/specv3.md#device_region-device-region) |
+| **Virtual Machine** | A guest execution environment with its own guest physical address space. Execution contexts enter guest mode within a VM to run. | [§[virtual_machine]](docs/kernel/specv3.md#virtual_machine-virtual-machine) |
+| **Port** | A rendezvous point between a calling execution context and a receiving execution context. Used for IDC, capability transfer, and event delivery. | [§[port]](docs/kernel/specv3.md#port-port) |
+| **Reply** | A one-shot capability referencing a suspended execution context dequeued from a port by a receive. Consuming the handle is the only way to resume or abandon the suspended sender. | [§[reply]](docs/kernel/specv3.md#reply-reply) |
+| **Timer** | A kernel object that fires once or periodically. Each fire increments a u64 counter exposed in the timer's handle; userspace polls the counter or waits on it via `futex_wait_val`. | [§[timer]](docs/kernel/specv3.md#timer-timer) |
 
-Syscall ABI uses **128 virtual registers** (low ones backed by GPRs, the rest spill to the user stack), with an L4-style IPC fast path for suspend/reply that runs a 2-instruction classifier in `syscallEntry` and bypasses the Zig dispatch table for the hot rendezvous case. See [`docs/kernel/specv3.md`](docs/kernel/specv3.md) for the full spec.
+## Scope
 
-## Repo layout
+**Memory.** Demand-paged virtual memory address regions (VMARs), page table management, shared mappings (the same page frame mapped into multiple capability domains), and direct MMIO BAR mapping for userspace device access. DMA always routes through the IOMMU, so a misbehaving or compromised device cannot escape the buffer it was given.
 
-```
-kernel/                Kernel proper
-  arch/                  Arch dispatch + per-arch impls (x64, aarch64); hv/ for in-kernel hypervisor
-  boot/                  UEFI handoff + userspace bringup
-  caps/                  Capability/handle types, capability domain, derivation tree
-  devices/               Device region registry
-  hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
-  memory/                PMM, VMM, VMARs (vmar.zig), page frames, paging, fault, allocators/
-  sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU lazy save/restore, priority queue
-  syscall/               Per-object syscall handlers + dispatch
-  kprof/                 In-kernel tracing/sampling profiler + MMIO dump
-  utils/                 sync primitives, ELF, DWARF debug info, generic Range
-  zag.zig                Root module (every kernel file imports through this)
-  .dead-code-skip.txt    Hash-validated allowlist for tools/dead_code_zig
+**Scheduling.** Preemptive round-robin scheduler. Per-EC core affinities and priorities that propagate through ports and futex waitlists. Futex primitive that integrates with the scheduler so a waiter blocks rather than spins.
 
-bootloader/            UEFI bootloader (KASLR, kernel + root-service load)
+**IPC.** Capability-gated ports for suspend / receive / reply between capability domains. When the payload fits in architectural general-purpose registers and carries data only (no capability transfer), the rendezvous runs through an L4-style zero-register-copy fast path that does a direct context switch and bypasses the Zig dispatch table. Current round-trip cost is around 1,600 cycles for suspend → receive → reply on a Ryzen 9 7950X3D.
 
-libz/                  Canonical userspace library (caps.zig, errors.zig, syscall*.zig,
-                       loader.zig). Top-level — sub-projects import from here, no per-project copies.
+**Kernel-event routing.** Per-EC events (memory faults, thread faults, breakpoints, PMU overflow) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
 
-tests/
-  suite/                 Spec v3 test runner
-    runner/                primary.zig (in-kernel orchestrator) + lib.zig + start.zig + serial
-    cases/                 one ELF per spec assertion (e.g. recv_07.zig)
-    build.zig              authoritative test manifest (-Dtests=<glob> for subset builds)
-    verify_coverage.py     enforces spec ↔ test parity
-  linux_guest/           Linux VM hypervisor (the host VMM); active root service for VM testing
-  perf/                  kprof-driven kernel perf workload (idc_pp) + scripts/
-  precommit.sh           Cross-arch precommit gauntlet (also wired through .githooks/)
+**Time.** Monotonic and wall-clock primitives. Programmable one-shot and periodic timers; each fire increments a u64 counter exposed in the timer's handle, and userspace either polls the counter or waits on it via `futex_wait_val`.
 
-tools/                 Dev tooling (see Tools)
+**Virtual machines.** KVM-style guest containers. vCPUs are execution contexts in a VM-flavored capability domain; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
 
-docs/
-  kernel/                specv3.md (observable behavior — single source of truth)
-  x86/                   Intel SDM / VMX / VT-d / AMD SVM / AMD-Vi PDFs
-  aarch64/               ARM ARM, GICv3, SMMUv3, PSCI, IORT, PL011 PDFs
-  devices/               NVMe, xHCI, virtio, x550 datasheets
-  tools/                 Tool screenshots
-```
+**Performance counters.** Hardware PMU counters exposed to userspace through the perfmon syscalls (info, start, read, stop).
 
-## Test runner architecture
+**Power management.** Per-core CPU frequency and idle policy controls, plus system-wide shutdown, reboot, sleep, and screen-off.
 
-The kernel test suite runs entirely in-kernel — no host shell harness loops over QEMU boots. One QEMU boot runs the full suite via kernel SMP.
+## Tooling
 
-- The **primary** (root service, `tests/suite/runner/primary.zig`) owns all rights and drives the suite.
-- It mints a single **result port** and spawns each test as its own child capability domain, passing the port handle with `bind | xfer` caps.
-- Each test ELF is embedded into the primary at build time (`tests/suite/build.zig` is the manifest). Each test asserts spec behavior, then calls `libz.testing.report`, which suspends the initial EC on the result port with vregs encoding `{result_code, assertion_id, tag}`.
-- The kernel scheduler/SMP gives parallelism for free. The primary `recv`s suspension events and writes them into a tag-indexed table; the tag is the manifest index, so result join is order-independent.
-- A final pass over the manifest joins names with results and prints pass/fail per test plus a summary line: `[runner] N total / N pass / 0 fail / 0 miss`.
+### The Indexer
 
-Test discovery is build-time: add an ELF under `tests/suite/cases/<slug>_NN.zig`, append an entry to `test_entries` in `tests/suite/build.zig`, and the runner picks it up.
+This tool processes all compilation stages (the tokenizer, AST, and LLVM IR) and compiles them into a SQL database. Most of our other tools are built on top of this database.
 
-## Building
+### Arch Layering Tool
 
-Each root-service sub-project builds its own ELF first; the top-level kernel build references the resulting binary path through `-Dprofile=...`.
+This enforces a three-tier layering between generic kernel code, the arch dispatch layer, and architecture-specific code (x86 and ARM). Generic code must reach arch-specific code through dispatch, and arch-specific code must not reach up into dispatch.
 
-```bash
-# Kernel test suite (x86_64, default)
-cd tests/suite && zig build && cd ..        # builds root_service.elf with embedded test ELFs
-zig build -Dprofile=test                    # builds the kernel
-zig build run -Dprofile=test                # boot under QEMU/KVM, run the suite
+### CheckGenLock
 
-# Cross-arch (aarch64)
-cd tests/suite && zig build -Darch=arm && cd ..
-zig build -Darch=arm -Dprofile=test -Dkvm=false
+This is a static analyzer that enforces the correct use of the generation lock primitive in the kernel. Proper usage ensures concurrent safety and use-after-free safety for slab-backed objects. The kernel allocates all of its dynamic state out of slabs, with the page allocator itself as the only exception, so gen-lock discipline gates nearly every reference into kernel objects.
 
-# Linux guest VMM (boots Linux under Zag)
-cd tests/linux_guest && zig build && cd ..
-zig build run -Dprofile=linux_guest -Doptimize=ReleaseSafe -- -display none
-```
+### Dead Code Linter
 
-Useful build flags: `-Darch=x64|arm`, `-Dprofile=test|linux_guest`, `-Dkvm=true|false`, `-Diommu=intel|amd`, `-Dkernel_fastpath=false` (disable the L4 classifier for A/B perf comparison), `-Dkernel_profile=trace|sample` (compile in kprof; forces ReleaseFast + retains debug info), `-Demit_ir=true` (consumed by tools/indexer), `-Demit_index=true` (also rebuilds the callgraph DB).
+This ensures there is no unreachable code or unused functions left in the kernel.
 
-## Tools
+### Call Graph Tool
 
-All under [`tools/`](tools/). Each builds with `zig build` from its own directory.
-
-### callgraph DB — indexed callgraph + analyzer pipeline
-
-The kernel is indexed into a per-(arch, commit_sha) SQLite DB built by [`tools/indexer/`](tools/indexer/) and queried by two daemons. The DB carries entities, ir_calls, AST, entry points, alias chains, type refs, binary symbols + disasm + DWARF lines, and analyzer findings — one schema, every consumer.
+This provides an HTTP frontend for humans and an MCP frontend for models. It enumerates kernel entry points and traces the code flow, stripping out data to show only the control flow structure (call hierarchies, loops, and branches). It is designed to help you quickly understand how code runs before you dig into the files. It also includes features for catting source code, viewing source-to-machine code translations via DWARF info, and a trace view in the HTTP frontend.
 
 ![callgraph trace view](docs/tools/callgraph_trace_view.png)
 
-```bash
-# Build the DB after a kernel build:
-cd tools/indexer && zig build && cd ../..
-zig build -Dprofile=test -Demit_ir=true   # gives us .ll + .elf
-tools/indexer/zig-out/bin/indexer \
-    --kernel-root kernel \
-    --extra-source-root bootloader --extra-source-root tools \
-    --extra-source-root tests --extra-source-root libz \
-    --out tools/callgraph_http/test/dbs/x86_64-$(git rev-parse --short HEAD).db \
-    --arch x86_64 --commit-sha $(git rev-parse HEAD) \
-    --ir zig-out/kernel.x86_64.ll --elf zig-out/img/kernel.elf
+### GDB MCP Tool
 
-# Then either daemon — both auto-discover DBs in their --db-dir:
-cd tools/callgraph_http && zig build && ./zig-out/bin/callgraph_http \
-    --db-dir ../callgraph_http/test/dbs --port 8080   # HTTP API + browser UI
-cd tools/callgraph_mcp  && zig build && ./zig-out/bin/callgraph_mcp \
-    --db-dir ../callgraph_http/test/dbs               # stdio MCP server
-```
+A wrapper that extends GDB for worker agents. It includes Kernel Address Space Layout Randomization (KASLR) aware symbol resolution to make debugging smoother for the agents.
 
-The MCP server speaks the production `callgraph_*` tool surface (callgraph_trace, callgraph_callers, callgraph_findings, …). The HTTP server has the matching /api/* routes plus a graph view, source/diff endpoints, and `/api/findings` for analyzer output.
+### Kprof
 
-### check_arch_layering — three-tier dispatch enforcement
+The kernel includes internal trace points and a sampling profiler used during development. Kprof is excluded from the kernel binary entirely unless `-Dkernel_profile=trace|sample` is passed at build time, and is not part of the userspace surface.
 
-[`tools/check_arch_layering/`](tools/check_arch_layering/) — verifies that kernel-proper code never reaches into `zag.arch.x64`/`zag.arch.aarch64` directly (must go through `zag.arch.dispatch`), and that arch-specific code doesn't call back through `dispatch`. Gating stage in precommit.
+## Slab Allocator
 
-### check_gen_lock — SecureSlab gen-lock analyzer
+Zag allocates all dynamic kernel state from per-type slab allocators. Each slab serves a single type `T`, and slots are type-stable: once a slot is mapped, its address belongs to the same `T` for the slot's entire lifetime, regardless of how many alloc/free cycles pass through it.
 
-[`tools/check_gen_lock/`](tools/check_gen_lock/) — token-based static analyzer that enforces the kernel's generational-lock invariant: every pointer to a slab-backed object (Execution Context, Capability Domain, VMAR, Port, …) is stored as `SlabRef(T)` and every dereference goes through a `lock()`/`unlock()` bracket, with a `// caller-pinned` annotation exempting fields and `.ptr` accesses where the caller already holds a stable reference. Gating stage in precommit.
+A slab-backed object has two correctness obligations under arbitrary concurrent kernel work:
 
-### dead_code_zig — dead-code detector
+1. Multiple kernel paths can hold pointers to the same object on different cores. Every dereference must be safe regardless of how alloc and free interleave with that access.
+2. When an object is freed, every outstanding pointer to it must atomically become unusable. There are no GC sweeps and no per-pointer revocation passes.
 
-[`tools/dead_code_zig/`](tools/dead_code_zig/) — `std.zig.Tokenizer`-based dead-code finder. Comment- and string-aware, alias-chain aware (`pub const X = mod.X;` re-exports are caught when nothing consumes them). Hash-validated skip file at `kernel/.dead-code-skip.txt` whitelists hardware-spec layouts and scaffold-with-rationale entries.
+The gen-lock primitive solves both. The rest of this section walks through the primitive, the proof that it is correct, and the static analyzer that ensures the kernel uses it correctly. The slab allocator also has two additional security features (out-of-band metadata and random-walk cursors) which are described at the end.
 
-### gdb_mcp — kernel-symbol-aware gdb attach
+### GenLock
 
-[`tools/gdb_mcp/`](tools/gdb_mcp/) — MCP server backing kernel-symbol-aware gdb attachment to the QEMU stub. Symbol/field resolution is backed by the callgraph DB, so qualified Zig names like `sched.scheduler.core_states` resolve directly to (addr, size).
+Every slab-backed type embeds a 64-bit `_gen_lock` word at a fixed offset, partitioned into a 1-bit lock and a 63-bit generation counter. The counter follows a parity invariant: odd means the slot is live, even means the slot is freed. Allocation flips the gen from even to odd via a `publish` step that runs only after the caller has fully initialized `T`'s fields. Free flips it back to even, fused with the lock release. Every transition is a `setGenRelease` of a strictly larger gen than the previous one.
 
-## Local CI — `tests/precommit.sh`
+Every kernel pointer to a slab-backed object is a fat pointer (`SlabRef(T)`) carrying `*T` plus a snapshot of the generation taken when the pointer was minted. Dereference always goes through `SlabRef.lock`, which calls `GenLock.lockWithGen(expected_gen)`. That does a single atomic compare-and-swap from `(expected_gen << 1) | 0` to `(expected_gen << 1) | 1`, verifying the slot is still at the caller's expected gen and acquiring the lock bit in one indivisible step. If the slot has been freed since the pointer was minted (gen flipped to even, possibly back to a new odd for a reallocated lifetime), the CAS fails and `lock` returns `StaleHandle`. The caller never sees the slot.
 
-Cross-arch gauntlet, run by `.githooks/pre-commit` on commit. Stages run independently and failures are summarized at the end. The slow x86 Linux-guest boot is launched in the background so it overlaps with the rest of the gauntlet.
+This is what makes invalidation atomic. A single `setGenRelease(gen + 1)` on free poisons every outstanding `SlabRef` to that slot at once, with no fan-out and no synchronization beyond the store itself.
 
-| Stage | Gate |
-|---|---|
-| arch layering lint | `zag.arch.dispatch` not bypassed in either direction. |
-| dead-code detector | `tools/dead_code_zig` exits non-zero on any unwhitelisted finding. |
-| gen-lock analyzer | `tools/check_gen_lock` exits non-zero on any err-severity finding. |
-| spec ↔ test coverage | `tests/suite/verify_coverage.py` — every `[test NN]` tag in the spec must have a matching `<section>_NN.zig` and vice versa. |
-| x86_64 kernel tests | Full suite under local KVM, 3 reps. |
-| aarch64 kernel tests | Same suite, on a Pi 5 over SSH (`PI_HOST=user@ip` overridable; falls back to local TCG). 3 reps. |
-| aarch64 VM-TCG | 6 vCPU-execution tests under local TCG (Pi 5 KVM lacks gic-version=3 + nested virt). |
-| x86 linux_guest boot | KVM Linux-guest boots to userspace shell within 360s (background-launched). |
+### The Lean proof
 
-Stages below the gate but in the manual `./tests/precommit.sh` invocation: aarch64 linux_guest boot (blocked on aarch64 typed-reply parity), perf regression (`idc_pp` workload diffed against parent commit's measurement, 5% threshold; the `.zag-perf/` cache is rotated by `.githooks/post-commit`).
+The proof in [`slab_proof/`](slab_proof/) mechanises the gen-lock primitive against an x86-TSO operational memory model. The headline theorem is `durable_run_uaf_safe`: once the slot's gen has advanced past a `SlabRef`'s snapshot gen, no further trace (drains, payload stores, release-stores of higher gens, locked CAS attempts by other cores, reader unlocks) can let that ref's `lockWithGen` succeed. A stale ref is rejected at every prefix of every reachable run.
 
-```bash
-./tests/precommit.sh --git-hook   # required-only (matches the hook)
-./tests/precommit.sh              # full manual gauntlet
-```
+The proof reduces UAF safety to one obligation about the surrounding kernel: every `setGenRelease` is monotone, that is, it stores a strictly larger gen than any value previously visible at the slot's word. Every gen-bump in the implementation is structurally monotone, because it is either issued under the slot's own gen-lock at the current odd gen, or issued during the create-to-publish window held exclusive by the allocator's own spinlock. During that window the slot's gen is even, which `lockWithGen` cannot succeed against.
 
-When iterating on a subset of kernel tests, use `tests/suite/build.zig`'s `-Dtests=<list>` flag — comma-separated names or `*`-glob patterns (e.g. `cd tests/suite && zig build -Dtests='recv_*,reply_01'`). Omit the flag to embed all spec tests.
+The proof states its scope explicitly. Out of scope: u63 wraparound (over 10² years of churn at the kernel's destroy rate), and the no-gen `GenLock.lock` / `forEachAlive` reader paths whose safety rests on caller-side discipline rather than the proof. ARM64's RCsc release-acquire model is also not currently mechanised. The same Zig source compiles correctly on aarch64, but the operational argument would have to be re-stated against an axiomatic ARMv8 model. Extending the proof to ARM64 is noted future work.
 
-## Documentation
+### The static analyzer
 
-- [`docs/kernel/specv3.md`](docs/kernel/specv3.md) — observable behavior from userspace (syscalls, capabilities, error codes, limits). The single authoritative spec; rationale that doesn't belong in the spec lives in commit messages.
-- [`docs/x86/`](docs/x86/), [`docs/aarch64/`](docs/aarch64/), [`docs/devices/`](docs/devices/) — vendor reference PDFs cited from kernel hardware code.
-- [`docs/tools/`](docs/tools/) — tool screenshots.
+The proof's safety claim is conditional on the kernel using the primitive correctly. [CheckGenLock](#checkgenlock) is the static analyzer that ensures it does. It runs against the indexer database and applies six checks:
+
+1. **Slab-backed type discovery.** Types whose first field is `_gen_lock: GenLock` are tagged.
+2. **Fat-pointer invariant.** Bare `*T`, `?*T`, `[N]*T`, and `[]*T` for slab-backed `T` are violations; the only sanctioned form is `SlabRef(T)`.
+3. **`.ptr` bypass.** Any chain reaching `slabref.ptr` outside an explicit `lock()`/`unlock()` bracket is flagged. A `// caller-pinned` annotation is the explicit-exemption surface for sites that already hold a stable reference.
+4. **Per-entry bracketing.** Every access to a slab-typed local in a syscall or exception handler must be tight-preceded by a `lock` and tight-followed by an `unlock` on the same identifier.
+5. **Per-path release coverage.** For every lock acquired in an entry body, every reachable exit between the lock and its release must be covered by an explicit `unlock`, a `defer ref.unlock(...)`, or, for error exits, an `errdefer ref.unlock(...)`. `@panic` and `unreachable` impose no obligation.
+6. **IRQ-acquired lock-class discipline.** A class is IRQ-acquired iff some IRQ, NMI, or async-trap entry can transitively reach an acquire of it. Process-context acquires of an IRQ-acquired class must use the IRQ-saving variant; pairing variants must match.
+
+Checks 1 through 3 ensure every kernel pointer to a slab-backed object goes through the proven primitive at all. Checks 4 through 6 ensure the tight-bracketing and IRQ discipline that the proof's safety claim requires. Together with the proof, this closes the safety loop: the primitive is mechanically proven correct, and the analyzer mechanically enforces that the kernel uses it correctly.
+
+### Comparison to Rust
+
+Rust enforces mutual exclusion entirely at compile time. The borrow checker rules out shared mutable access by construction, and lifetimes prove that a borrow cannot outlive its referent. No runtime check is required.
+
+Zag splits the same guarantee across compile-time and runtime enforcement. The static analyzer plays the role of the borrow checker. It enforces the patterns: every pointer to a slab-backed object is a `SlabRef`, and every dereference is bracketed by `lock`/`unlock`. What Rust gets for free from lifetimes is the proof that the referent is still alive at access time. Zag cannot prove that statically, because slab slots can be freed by other cores asynchronously while a `SlabRef` is in flight. The gen-lock CAS supplies that check at runtime: the verify-and-acquire either succeeds (live, exclusive access) or returns `StaleHandle` (stale, caller does not touch the slot).
+
+The end safety property is the same. The split is between the static enforcement of pattern (you have a `SlabRef`, and you bracket every access) and the runtime check of liveness (the gen still matches).
+
+### Additional security features
+
+Beyond gen-lock, the slab allocator has two structural defenses orthogonal to the multi-pointer and invalidation safety story.
+
+**Out-of-band metadata.** The allocator's bookkeeping lives in vaddr regions separate from the slot data. Each slab class reserves three comptime regions: the dense `T`-slot array, a parallel array of `*T`, and a parallel array of `LinkPair { prev, next }` indices for the freelist. An out-of-bounds write on a slab-backed object cannot corrupt allocator state, because the metadata isn't there to corrupt.
+
+**Random-walk cursors.** The freelist is a circular doubly-linked list of indices. Two cursors (pop and push) each take a hardware-random `[-N, N]` step on every alloc and every free system-wide. The cursor walk is seeded from RDRAND/RNDR mixed with a timestamp, and `N` is fixed at compile time (256 by default). An attacker cannot predict which slot their next free-then-alloc sequence will reclaim, because the cursor state is a function of every prior alloc and free in the system.
+
+## How Zag is Developed
+
+Zag makes use of AI code generation tooling. Where Zag does not sacrifice the human touch is in design. Every core architectural decision is carefully considered and drafted into the spec. The spec drives the test suite, with the goal being to exercise and assert the correctness of every userspace-observable behavior. The spec and tests are human-driven.
+
+The kernel is split into ~30 subsystems, and each one is provided with various forms of persistent memory including a changelog and a SYSTEMS.md file that describes the subsystem. The pipeline makes use of [Steve Yegge's Beads](https://github.com/steveyegge/beads) for queue and state management. An orchestrator agent pulls beads from the queue and dispatches a worker agent. The worker first runs the precommit CI to prove a clean baseline before writing its code. On commit, precommit CI runs again, and the worker fails if anything regressed. Once clean, the commit is handed to a reviewer agent, and once passing, to a merger agent that lands it. Throughout this, agents working in a subsystem can flag bugs, which are automatically queued up as an issue bead, or feature proposals, which are *always* human reviewed since they change the spec.
