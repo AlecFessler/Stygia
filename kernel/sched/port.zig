@@ -1120,7 +1120,14 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     // a cross-core synthetic-fault handler). For the common case
     // this is a no-op since `releaseSelf` will park it.
     const cd_ref = ec.domain;
-    const cd_lr = cd_ref.lockIrqSave(@src()) catch {
+    // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
+    // `destroyPhase1`-driven `detachDyingDomainFromTree` walk (which
+    // re-locks cross-domain CDs under the same group inside
+    // `lockEntrySkip`) does not trip lockdep's same-class overlap
+    // check. Mirrors the SLOT_SELF arm of
+    // `caps.derivation.deleteAndDetach` and
+    // `caps.capability_domain.cleanupPartiallyCreatedCd`.
+    const cd_lr = cd_ref.lockOrderedIrqSave(zag.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
         // CD slab gen has moved — domain is already being torn down
         // by another path. Park the EC; the in-flight teardown will
         // reap it.
@@ -1132,8 +1139,11 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
 
     // Acquire tree_mutex to mirror the `delete(SLOT_SELF)` path
     // (caps.derivation.deleteAndDetach slot==0 arm); tree_mutex
-    // serializes against concurrent revoke/derive.
-    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSave(@src());
+    // serializes against concurrent revoke/derive. Tag with
+    // `TREE_MUTEX_GROUP` for symmetry with every other tree_mutex
+    // acquisition — mismatched ordered-group tags on the same lock
+    // would still register a phantom edge in cycle detection.
+    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), zag.caps.derivation.TREE_MUTEX_GROUP);
 
     // `releaseSelf` releases `cd._gen_lock` via `destroyLocked`
     // before returning; we restore the captured IRQ state manually
