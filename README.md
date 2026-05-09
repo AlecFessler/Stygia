@@ -129,3 +129,17 @@ Beyond gen-lock, the slab allocator has two structural defenses orthogonal to th
 Zag makes use of AI code generation tooling. Where Zag does not sacrifice the human touch is in design. Every core architectural decision is carefully considered and drafted into the spec. The spec drives the test suite, with the goal being to exercise and assert the correctness of every userspace-observable behavior. The spec and tests are human-driven.
 
 The kernel is split into ~30 subsystems, and each one is provided with various forms of persistent memory including a changelog and a SYSTEMS.md file that describes the subsystem. The pipeline makes use of [Steve Yegge's Beads](https://github.com/steveyegge/beads) for queue and state management. An orchestrator agent pulls beads from the queue and dispatches a worker agent. The worker first runs the precommit CI to prove a clean baseline before writing its code. On commit, precommit CI runs again, and the worker fails if anything regressed. Once clean, the commit is handed to a reviewer agent, and once passing, to a merger agent that lands it. Throughout this, agents working in a subsystem can flag bugs, which are automatically queued up as an issue bead, or feature proposals, which are *always* human reviewed since they change the spec.
+
+## Contributing
+
+The way Zag's kernel is developed (see [How Zag is Developed](#how-zag-is-developed)) means it doesn't really need contributors to submit code. The kernel is not going to accept external code contributions.
+
+Issue reports and bug reports are good, and feature requests are also excellent contributions.
+
+However, you can contribute code by building userspace apps. Zag is a microkernel; the operating system around it is built out of userspace processes, and that surface is open to anyone who wants to build something on top of the kernel.
+
+## License
+
+Zag is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
+
+Copyright 2026 Alec Fessler.
