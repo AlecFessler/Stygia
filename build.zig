@@ -24,19 +24,11 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
-    const desktop = Profile{
-        .root_service = "desktopOS/bin/desktopOS.elf",
-        .net = "none",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-    };
 };
 
 fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "linux_guest")) return profiles.linux_guest;
-    if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
 
     return null;
 }
@@ -403,14 +395,15 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_root_service.step);
 
     // ── QEMU ────────────────────────────────────────────────────────────
-    const wants_nvme = profile_name != null and
-        (std.mem.eql(u8, profile_name.?, "linux_guest") or
-            std.mem.eql(u8, profile_name.?, "desktop"));
-    // qemu-xhci + usb-kbd/usb-mouse so the guest's usb_driver has a
-    // controller to enumerate and a HID device to bind. Desktop only —
-    // the test/linux_guest profiles don't need user input.
-    const wants_usb = profile_name != null and
-        std.mem.eql(u8, profile_name.?, "desktop");
+    // NVMe is on by default under -Dprofile=linux_guest (guest needs a
+    // backing disk); other profiles must opt in via -Dnvme=true. The
+    // sibling Zag-desktopOS repo's `run` step passes -Dnvme=true.
+    const wants_nvme = b.option(bool, "nvme", "Attach an NVMe drive (default: on under -Dprofile=linux_guest)") orelse
+        (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest"));
+    // qemu-xhci + usb-kbd/usb-mouse so a guest USB driver has a
+    // controller to enumerate and a HID device to bind. Off by default;
+    // the sibling Zag-desktopOS repo's `run` step passes -Dusb=true.
+    const wants_usb = b.option(bool, "usb", "Attach a qemu-xhci controller + HID devices (default: off)") orelse false;
 
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)

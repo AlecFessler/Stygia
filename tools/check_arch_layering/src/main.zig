@@ -92,7 +92,6 @@ fn classifyFile(path: []const u8) FileClass {
     // Sub-projects — separate libz, separate three-tier rules don't apply.
     if (mem.startsWith(u8, path, "routerOS/")) return .out_of_scope;
     if (mem.startsWith(u8, path, "hyprvOS/")) return .out_of_scope;
-    if (mem.startsWith(u8, path, "desktopOS/")) return .out_of_scope;
 
     // Bootloader is `bootloader/`-prefixed in the DB and is generic-
     // tier from the layering POV.

@@ -24,7 +24,5 @@ tests/prof/current/
 .zig-cache/
 **/zig-out/
 zig-out/
-desktopOS/libc_smoke/libc_smoke
-desktopOS/zig_compiler/zig.elf
 slab_proof/.lake/
 .githooks/
