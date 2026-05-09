@@ -746,5 +746,57 @@ theorem reaper_phase_retired_implies_durable
     · rw [hv]; simp [Word.encode]
   · exact (hOther c hcP e he hloc).elim
 
+/-! ## §9 Asm fast-path bridge: discharge `g' > g` from a bracketing CAS
+
+`DurableAction.unlockWord c g'` carries the premise `g' > g` to model
+the kernel's asm fast-path `andq $-2, _gen_lock(%base)` — a non-LOCK#
+AND on x86, modelled here as a buffered release-store of the gen-bit-
+cleared word.  `tools/check_gen_lock`'s asm pass verifies that every
+such `andq` is *bracketed* by a prior `lock cmpxchgq` against the same
+`_gen_lock`; the bracketing CAS's success establishes the gen, and
+the andq preserves it while clearing the lock bit.
+
+In real code, the `g'` carried by the andq is exactly the gen the
+bracketing CAS observed.  Under the floor `WordGenAbove g`, the CAS's
+success forces `expected > g` (post-self-drain `mem WORD / 2 = expected`,
+and the floor says that quantity exceeds `g`).  The two lemmas below
+mechanise this chain: users no longer need to thread the `g' > g`
+obligation by hand. -/
+
+/-- The bracketing-CAS-success lemma.  A successful `lockedCas` at
+    `expected` against a state satisfying the floor `WordGenAbove g`
+    implies `expected > g`.
+
+    Discharges the `g' > g` premise of `DurableAction.unlockWord` for
+    any asm-fast-path andq whose bracketing `lock cmpxchgq` succeeded
+    under the floor — closes the prior informality where the chain had
+    to be threaded by the user. -/
+theorem unlockWord_gen_above_of_successful_cas
+    (g : Nat) (c : Core) (expected : Nat) (m : Machine)
+    (h : WordGenAbove g m)
+    (hCasOk : (Machine.lockedCas m c expected).2 = true) :
+    expected > g := by
+  have hPre := TSO.lockedCas_success_word_eq m c expected hCasOk
+  have hDrain : WordGenAbove g (Machine.drainAll m c) :=
+    durable_drainAll_preserves g c m h
+  obtain ⟨hMemD, _⟩ := hDrain
+  rw [hPre] at hMemD
+  simp [Word.encode] at hMemD
+  omega
+
+/-- Constructor-form companion of `unlockWord_gen_above_of_successful_cas`.
+    The asm fast-path's `unlockWord c expected` is admissible in
+    `DurableAction g` when paired with a successful bracketing
+    `lockedCas` at `expected` against a state satisfying the floor.
+    Plug directly into `durable_run_preserves` / `durable_run_uaf_safe`
+    via the action grammar's `unlockWord` constructor. -/
+theorem durableAction_unlockWord_of_successful_cas
+    (g : Nat) (c : Core) (expected : Nat) (m : Machine)
+    (h : WordGenAbove g m)
+    (hCasOk : (Machine.lockedCas m c expected).2 = true) :
+    DurableAction g (.unlockWord c expected) :=
+  DurableAction.unlockWord c expected
+    (unlockWord_gen_above_of_successful_cas g c expected m h hCasOk)
+
 end Invariant
 end SlabProof

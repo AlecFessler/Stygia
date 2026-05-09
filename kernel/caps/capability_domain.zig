@@ -407,7 +407,7 @@ pub fn createCapabilityDomain(
         else
             new_caps;
 
-        _ = mintHandle(
+        const new_child_slot = mintHandle(
             child_cd,
             src_kh.ref,
             src_type,
@@ -418,6 +418,30 @@ pub fn createCapabilityDomain(
             cleanupPartiallyCreatedCd(child_cd, child_ec);
             return errors.E_FULL;
         };
+
+        // Spec §[capabilities].revoke: hang the new alias under the
+        // source handle in the caller's domain so a future revoke on
+        // any ancestor of `(caller_dom, src_slot)` reaches the alias.
+        // `mintHandle` may have coalesced onto an existing slot in
+        // `child_cd`; in that case the new_child_slot is already in the
+        // tree from a prior derive and we leave it alone.
+        if (child_cd.kernel_table[new_child_slot].parent.domain.ptr == null and
+            child_cd.kernel_table[new_child_slot].first_child.domain.ptr == null and
+            child_cd.kernel_table[new_child_slot].next_sibling.domain.ptr == null)
+        {
+            const caller_ref: ErasedSlabRef = @bitCast(caller.domain);
+            const child_ref: ErasedSlabRef = .{
+                .ptr = child_cd,
+                .gen = @intCast(child_cd._gen_lock.currentGen()),
+            };
+            _ = zag.caps.derivation.derive(
+                caller_ref,
+                src_slot,
+                child_ref,
+                new_child_slot,
+                null,
+            );
+        }
 
         // For refcount-lifetime types (page_frame, timer, port,
         // device_region per spec proposal §3) the new alias is a real
@@ -668,6 +692,40 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
             0, // EC handle field0/field1 carry priority/affinity/etc.
             0, // refreshed lazily by `sync`; zero-init is fine for v0.
         ) catch return errors.E_FULL;
+
+        // Spec §[capabilities].revoke: derive the freshly-minted alias
+        // from the source handle in `target_cd` so a later revoke on
+        // any ancestor of `(target_cd, i)` reaches the new handle.
+        // mintHandle may have coalesced (the at-most-one invariant
+        // hits when `cd == target_cd` and `caller`'s self-handle in
+        // its domain already references the EC); skip the derive when
+        // the slot's links are already populated.
+        if (cd.kernel_table[new_slot].parent.domain.ptr == null and
+            cd.kernel_table[new_slot].first_child.domain.ptr == null and
+            cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
+        {
+            const target_cd_ref: ErasedSlabRef = .{
+                .ptr = target_cd,
+                .gen = @intCast(target_cd._gen_lock.currentGen()),
+            };
+            const cd_ref_local: ErasedSlabRef = .{
+                .ptr = cd,
+                .gen = @intCast(cd._gen_lock.currentGen()),
+            };
+            // Same-CD case (self-IDC): cd === target_cd, so pass `cd`
+            // as `held_dom` (the lock is held for the duration of the
+            // walk). Cross-CD case is bailed E_BADCAP above so this
+            // branch is currently unreachable, but encoded for the
+            // future when cross-CD acquire lands.
+            _ = zag.caps.derivation.derive(
+                target_cd_ref,
+                @intCast(i),
+                cd_ref_local,
+                new_slot,
+                cd,
+            );
+        }
+
         minted_slots[n] = new_slot;
         n += 1;
     }
@@ -835,6 +893,47 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
         cd.user_table[new_slot].word0 = Word0.pack(new_slot, .virtual_memory_address_region, minted_caps);
         cd.user_table[new_slot].field0 = var_field0;
         cd.user_table[new_slot].field1 = vmar_field1;
+
+        // Spec §[capabilities].revoke: derive the freshly-minted alias
+        // from the source handle in `target_cd`. Skip if `mintHandle`
+        // coalesced (slot links already populated). The source slot is
+        // the existing VMAR handle in target_cd — find it by linear
+        // scan since `vars[]` carries no slot id.
+        if (cd.kernel_table[new_slot].parent.domain.ptr == null and
+            cd.kernel_table[new_slot].first_child.domain.ptr == null and
+            cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
+        {
+            var src_slot: u12 = 0;
+            var src_found = false;
+            var k: u16 = 0;
+            while (k < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (k += 1) {
+                const ent = &target_cd.kernel_table[k];
+                if (ent.ref.ptr == null) continue;
+                if (ent.ref.ptr != @as(*anyopaque, @ptrCast(v))) continue;
+                if (Word0.typeTag(target_cd.user_table[k].word0) != .virtual_memory_address_region) continue;
+                src_slot = @intCast(k);
+                src_found = true;
+                break;
+            }
+            if (src_found) {
+                const target_cd_ref: ErasedSlabRef = .{
+                    .ptr = target_cd,
+                    .gen = @intCast(target_cd._gen_lock.currentGen()),
+                };
+                const cd_ref_local: ErasedSlabRef = .{
+                    .ptr = cd,
+                    .gen = @intCast(cd._gen_lock.currentGen()),
+                };
+                _ = zag.caps.derivation.derive(
+                    target_cd_ref,
+                    src_slot,
+                    cd_ref_local,
+                    new_slot,
+                    cd,
+                );
+            }
+        }
+
         minted_slots[n] = new_slot;
         n += 1;
     }
@@ -1054,6 +1153,17 @@ pub const DestroyDeferred = struct {
 /// `caps.derivation.tree_mutex`) BEFORE invoking `destroyPhase2`.
 pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
     zag.sched.timer.disarmTimerHandlesInDomain(cd);
+
+    // Spec §[capabilities].revoke / Lifetimes: every live handle in
+    // the dying domain may sit on the cross-domain copy-derivation
+    // tree (parent in another domain, children in another domain,
+    // siblings in another domain). Splice each one out before the
+    // kernel_table memory is freed in Phase 2; otherwise the OTHER
+    // domains hold dangling links into a freed slot. detachForDelete
+    // reparents children to grandparent so a future revoke on a
+    // surviving ancestor still reaches the orphaned subtree (Spec
+    // §[capabilities].revoke test 04 generalized to domain destroy).
+    zag.caps.derivation.detachDyingDomainFromTree(cd);
 
     // Tear down every VMAR bound to the domain. The destroy-path
     // variant clears leaf PTEs (so `freeUserAddrSpace` can distinguish

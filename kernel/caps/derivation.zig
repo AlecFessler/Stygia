@@ -61,7 +61,35 @@ const MAX_DEPTH: u32 = 1 << 20;
 /// of their work. Each per-domain access still goes through that
 /// domain's `_gen_lock` for staleness validation; the tree mutex only
 /// orders concurrent tree mutations against each other.
+///
+/// Acquired with `lockIrqSaveOrdered(TREE_MUTEX_GROUP)` everywhere it is
+/// taken: the tree spans capability domains, and call sites that mint
+/// fresh aliases (suspend/recv/reply paths in `kernel/sched/port.zig`,
+/// `acquire_ecs`/`acquire_vmars` in `capability_domain.zig`,
+/// the xfer copy/move alias path) already hold one or both relevant CD
+/// gen-locks when they need to splice the new handle into the tree.
+/// Reversing the order at every such call site would require dropping
+/// + re-acquiring CD locks (and re-validating gens). Since `tree_mutex`
+/// is a single global mutex, AB-BA on `tree_mutex` itself is impossible;
+/// the ordered tag opts out of lockdep's pair-edge cycle detection so
+/// the legitimate `(CD → tree_mutex)` derive-side acquisitions don't
+/// register a phantom inverse cycle against the `(tree_mutex → CD)`
+/// revoke/delete path.
 pub var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
+
+/// Lockdep group tag for `tree_mutex`. Non-zero opts every acquisition
+/// out of pair-edge cycle detection (see `SpinLock.lockIrqSaveOrdered`).
+/// The tree_mutex is a single global lock; serialization is sufficient.
+const TREE_MUTEX_GROUP: u32 = 0x7245_5645; // "TREVE" — derivation tree mutex
+
+/// Lockdep group tag for the per-CapabilityDomain gen-locks taken inside
+/// `lockEntrySkip`. The cross-domain tree walk legitimately holds
+/// multiple `*CapabilityDomain` gen-locks at once (a parent in domain A,
+/// a child in domain B) — same lockdep class, two instances. The
+/// `tree_mutex` outer serializer makes the same-class overlap structurally
+/// safe: only one tree mutator runs at a time. The ordered tag opts
+/// these CD acquires out of lockdep's same-class overlap check.
+const TREE_DOMAIN_GROUP: u32 = 0x5452_4544; // "TRED" — tree-walk CD lock
 
 // ── External API ─────────────────────────────────────────────────────
 
@@ -78,7 +106,7 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 
     const slot: u12 = @truncate(handle);
 
-    const tree_irq = tree_mutex.lockIrqSave(@src());
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
     const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
@@ -99,6 +127,100 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
     return 0;
 }
 
+/// Splice a freshly-minted child handle into the copy-derivation tree
+/// under an existing parent handle. Spec §[capabilities].revoke /
+/// §[capabilities].Lifetimes.
+///
+/// The child slot was already published in `child_dom`'s kernel_table by
+/// `mintHandle*`, with all three tree links zeroed. This function fixes
+/// up:
+///   - `child.parent           = (parent_dom, parent_slot)`
+///   - `child.next_sibling     = parent.first_child` (push as new head)
+///   - `parent.first_child     = (child_dom, child_slot)`
+///
+/// `held_dom` names a CD whose gen-lock the caller already holds; the
+/// helper skips the matching acquire so it doesn't deadlock against the
+/// already-held lock. Pass `null` if the caller holds neither domain's
+/// gen-lock.
+///
+/// Lock order: takes `tree_mutex` (with `TREE_MUTEX_GROUP` so the
+/// `(CD → tree_mutex)` direction registered here doesn't trip lockdep
+/// against the `(tree_mutex → CD)` direction in `revoke`/`delete`).
+/// Then acquires the parent and child CD gen-locks (skipping `held_dom`).
+///
+/// Cycle prevention: walks the parent's ancestor chain and refuses to
+/// install the link if `child` already appears as an ancestor of
+/// `parent`. Spec doesn't pin this but a corrupt or buggy mint path
+/// could otherwise create a cyclic chain that would loop revoke/delete
+/// forever. Returns `false` on cycle (link not installed; child remains
+/// a tree root) or stale source (treated as no-op — the source is gone
+/// so the alias has no live ancestor anyway).
+pub fn derive(
+    parent_dom_ref: ErasedSlabRef,
+    parent_slot: u12,
+    child_dom_ref: ErasedSlabRef,
+    child_slot: u12,
+    held_dom: ?*CapabilityDomain,
+) bool {
+    const parent_link: HandleLink = .{ .domain = parent_dom_ref, .slot = parent_slot };
+    const child_link: HandleLink = .{ .domain = child_dom_ref, .slot = child_slot };
+
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
+    defer tree_mutex.unlockIrqRestore(tree_irq);
+
+    const parent_le = lockEntrySkip(parent_link, held_dom) orelse return false;
+    defer unlockEntrySkip(parent_le, held_dom);
+
+    // Cycle check: walk parent.parent.parent... — if any ancestor names
+    // (child_dom, child_slot), refuse the link. The walk uses `held_dom`
+    // for skip-rule symmetry with the rest of the tree code.
+    if (ancestorChainContains(parent_le.entry, child_link, held_dom)) return false;
+
+    const child_le = lockEntrySkip(child_link, held_dom) orelse return false;
+    defer unlockEntrySkip(child_le, held_dom);
+
+    // The child slot was just minted; its tree links must be zero (the
+    // mint paths zero them explicitly in `writeHandleSlot`). Catch a
+    // double-derive on the same slot loud and early.
+    std.debug.assert(child_le.entry.parent.domain.ptr == null);
+    std.debug.assert(child_le.entry.first_child.domain.ptr == null);
+    std.debug.assert(child_le.entry.next_sibling.domain.ptr == null);
+
+    child_le.entry.parent = parent_link;
+    child_le.entry.next_sibling = parent_le.entry.first_child;
+    parent_le.entry.first_child = child_link;
+    return true;
+}
+
+/// Walk `start.parent.parent...` looking for a link that names `target`.
+/// Returns true if `target` is an ancestor of (or equal to) `start`.
+/// Used by `derive` to reject cycles: refusing to install
+/// `parent → child` when `child` is already an ancestor of `parent`
+/// short-circuits any subsequent revoke/delete walks that would
+/// otherwise loop forever.
+fn ancestorChainContains(
+    start: *KernelHandle,
+    target: HandleLink,
+    held: ?*CapabilityDomain,
+) bool {
+    var cur: HandleLink = start.parent;
+    var depth: u32 = 0;
+    while (cur.domain.ptr != null) {
+        std.debug.assert(depth < MAX_DEPTH);
+        if (linkMatchesLink(cur, target)) return true;
+        const cur_le = lockEntrySkip(cur, held) orelse return false;
+        const next = cur_le.entry.parent;
+        unlockEntrySkip(cur_le, held);
+        cur = next;
+        depth += 1;
+    }
+    return false;
+}
+
+inline fn linkMatchesLink(a: HandleLink, b: HandleLink) bool {
+    return a.domain.ptr == b.domain.ptr and a.slot == b.slot;
+}
+
 /// `delete` syscall driver. Spec §[capabilities].delete.
 ///
 /// Takes `tree_mutex` then the caller's domain gen-lock (matching the
@@ -116,7 +238,7 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     // against any concurrent `port.recv` (CD → ...) or other delete /
     // revoke path that takes `tree_mutex` after touching an EC.
     if (slot == 0) {
-        const tree_irq = tree_mutex.lockIrqSave(@src());
+        const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
 
         const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch {
             tree_mutex.unlockIrqRestore(tree_irq);
@@ -137,7 +259,7 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
         return 0;
     }
 
-    const tree_irq = tree_mutex.lockIrqSave(@src());
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
     const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
@@ -152,6 +274,49 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     capability.releaseHandle(cd, slot, entry);
     capability.clearAndFreeSlot(cd, slot, entry);
     return 0;
+}
+
+/// Sweep every live slot in a dying domain and detach each from the
+/// copy-derivation tree before the domain's kernel_table is freed.
+/// Used by `capability_domain.destroyPhase1` so cross-domain
+/// parent/first_child/next_sibling links spliced into the dying
+/// domain's slots are spliced out cleanly: descendants in other
+/// domains reparent to the dying-slot's grandparent, ancestors in
+/// other domains lose the dying-slot from their child list.
+///
+/// Caller has the dying domain's gen-lock; this function takes
+/// `tree_mutex` (with `TREE_MUTEX_GROUP`, opting out of the
+/// pair-edge cycle check that would otherwise complain about the
+/// `(CD → tree_mutex)` direction here vs the `(tree_mutex → CD)`
+/// direction in revoke/delete). The held CD lock is passed through to
+/// `lockEntrySkip` so the walk never re-acquires it on cross-domain
+/// links that loop back to the dying domain.
+///
+/// Note: this only patches the tree links. The dying domain's slots
+/// are NOT released here (per-type release happens in `destroyPhase2`'s
+/// existing kernel_table walk for refcount-lifetime objects); we just
+/// rewrite the cross-domain links so other domains' tree views stay
+/// consistent.
+pub fn detachDyingDomainFromTree(cd: *CapabilityDomain) void {
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
+    defer tree_mutex.unlockIrqRestore(tree_irq);
+
+    var slot_idx: u16 = 0;
+    while (slot_idx < capability.MAX_HANDLES_PER_DOMAIN) : (slot_idx += 1) {
+        const entry = &cd.kernel_table[slot_idx];
+        if (entry.ref.ptr == null) continue;
+        // Slot is live. If it has any tree link (parent / sibling /
+        // child) pointing OUT of this domain, the link must be
+        // unwoven before the kernel_table memory disappears.
+        // detachForDelete handles same-domain links via the
+        // `entry_dom` skip rule and resets entry's own links to .{}.
+        const has_tree_links =
+            entry.parent.domain.ptr != null or
+            entry.first_child.domain.ptr != null or
+            entry.next_sibling.domain.ptr != null;
+        if (!has_tree_links) continue;
+        detachForDelete(cd, @intCast(slot_idx), entry);
+    }
 }
 
 /// Detach `entry` from the copy-derivation tree. Reparents `entry`'s
@@ -245,7 +410,7 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
     const same_held = held != null and link.domain.ptr == @as(*anyopaque, @ptrCast(held.?));
     var irq_state: u64 = 0;
     const dom: *CapabilityDomain = if (same_held) held.? else blk: {
-        const lr = link.domain.lockTypedIrqSave(CapabilityDomain) catch return null;
+        const lr = link.domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch return null;
         irq_state = lr.irq_state;
         break :blk lr.ptr;
     };
@@ -295,7 +460,7 @@ fn popSibling(head: *HandleLink, caller_dom: *CapabilityDomain) ?HandleLink {
     const same_caller = popped.domain.ptr == @as(*anyopaque, @ptrCast(caller_dom));
     var popped_irq_state: u64 = 0;
     const dom: *CapabilityDomain = if (same_caller) caller_dom else blk: {
-        const lr = popped.domain.lockTypedIrqSave(CapabilityDomain) catch {
+        const lr = popped.domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch {
             head.* = .{};
             return null;
         };
@@ -332,7 +497,7 @@ fn releaseSubtree(root: HandleLink, caller_dom: *CapabilityDomain) void {
     const same_caller = root.domain.ptr == @as(*anyopaque, @ptrCast(caller_dom));
     var root_irq_state: u64 = 0;
     const dom: *CapabilityDomain = if (same_caller) caller_dom else blk: {
-        const lr = root.domain.lockTypedIrqSave(CapabilityDomain) catch return;
+        const lr = root.domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch return;
         root_irq_state = lr.irq_state;
         break :blk lr.ptr;
     };

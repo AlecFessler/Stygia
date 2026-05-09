@@ -858,6 +858,23 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
             0,
             0,
         );
+
+        // Spec §[capabilities].revoke: hang the new alias in the
+        // sender's domain under the source handle in the caller's
+        // (replier's) domain. The sender's CD lock is held; pass it
+        // as `held_dom` so `derive` doesn't re-acquire and deadlock.
+        const caller_dom_ref: capability.ErasedSlabRef = @bitCast(caller.domain);
+        const sender_dom_ref_for_derive: capability.ErasedSlabRef = .{
+            .ptr = sender_cd,
+            .gen = @intCast(sender_cd._gen_lock.currentGen()),
+        };
+        _ = zag.caps.derivation.derive(
+            caller_dom_ref,
+            stash.src_slot,
+            sender_dom_ref_for_derive,
+            target_slot,
+            sender_cd,
+        );
     }
     sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
@@ -1567,6 +1584,26 @@ fn deliverEvent(
                 0,
                 0,
             );
+
+            // Spec §[capabilities].revoke: hang the new alias in the
+            // receiver's domain under the source handle in the sender's
+            // domain so a future revoke on any ancestor of
+            // `(sender.domain, entry.src_slot)` reaches the alias. The
+            // receiver's CD `dom` is held; we pass it as `held_dom` to
+            // skip the re-acquire inside `derive`.
+            const sender_dom_ref: capability.ErasedSlabRef = @bitCast(sender.domain);
+            const dom_ref: capability.ErasedSlabRef = .{
+                .ptr = dom,
+                .gen = @intCast(dom._gen_lock.currentGen()),
+            };
+            _ = zag.caps.derivation.derive(
+                sender_dom_ref,
+                entry.src_slot,
+                dom_ref,
+                target_slot,
+                dom,
+            );
+
             k += 1;
         }
 

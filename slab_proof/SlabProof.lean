@@ -88,19 +88,38 @@ on them.  The proof does not establish them — they are facts about
 the surrounding kernel that must hold for the mechanized theorems
 to apply to the running primitive.
 
+The headline `durable_run_uaf_safe` reduces UAF safety to *gen
+monotonicity*: every WORD-write that occurs after the original ref's
+destroy carries a strictly larger gen.  The proof mechanises one
+direction of this — given the `WordGenAbove g` floor and the
+`DurableAction g` grammar (which carries the `g' > g` premise on
+every WORD-store constructor), the floor is preserved across any
+trace.  What the proof does *not* establish is that every real
+WORD-write satisfies that premise; that follows from the surrounding
+kernel lifecycle (A4 below), and is the obligation a user discharges
+when they apply the theorem.
+
   A1. **Slot-address stability.**  The proof models WORD as a fixed
       `Loc : Nat` whose `mem` is total and unconditionally readable.
       The Zig `lockWithGen` dereferences `&self.word` on every CAS,
       and on the failure path (`secure_slab.zig:178`) issues a plain
       monotonic load from the same address.  For these loads to be
       sound — i.e. not themselves UAF — the slot's vaddr must remain
-      mapped, and the `_gen_lock` field must remain at the same
-      offset, for the lifetime of any outstanding stale ref.  The
-      `SecureSlab` allocator structurally guarantees this: slots are
-      allocated from a comptime-reserved demand-paged region, never
-      returned to a global allocator, and `_gen_lock` is at offset 0
-      of every slab-backed T (enforced by `validateT`).  This proof
-      assumes that structural guarantee; it does not prove it.
+      mapped, and the `_gen_lock.word` field must live at a stable
+      address for the lifetime of any outstanding stale ref.  The
+      `SecureSlab` allocator structurally guarantees both: slots
+      are allocated from a comptime-reserved demand-paged region
+      (never returned to a global allocator), and `_gen_lock`'s
+      offset within T is a comptime constant — Zig is free to
+      reorder fields for packing, but the offset is identical for
+      every slot of the same T and never changes across the slot's
+      lifetime.  `validateT` enforces the *type-level* preconditions
+      that make this work (`_gen_lock: GenLock` field exists,
+      `@alignOf(T) ≥ 8`, `@sizeOf(T) % @alignOf(T) = 0`).  The
+      proof's `WORD : Loc := 0` is a stand-in for the slot's word
+      location; offset-zero is not load-bearing.  Cross-slot
+      disjointness (`MultiSlot.different_slot_mem_disjoint`) follows
+      from distinct slot bases plus the comptime-fixed offset.
 
   A2. **Gen-counter non-wrap.**  The proof works in `Nat`; the real
       word uses `u63`, wrapping at 2⁶³.  Two distinct logical
@@ -117,6 +136,35 @@ to apply to the running primitive.
       ARM64 backend the right barriers), but the operational proof
       argument would have to be re-stated against an axiomatic
       ARMv8 memory model.
+
+  A4. **Lock-holder discipline for `setGenRelease`.**  Every
+      `setGenRelease(new_gen)` on a slab-backed slot is issued under
+      one of two disciplines:
+        (a) the issuer holds the slot's gen-lock at `new_gen − 1`
+            (which is therefore odd and matches the current visible
+            gen) — this is the destroy / `bumpDeadGenLocked` path
+            (`secure_slab.zig:482-508, 520-574`);
+        (b) the slot is currently at an even gen and is held
+            exclusive by the allocator's `SecureSlab.lock` spinlock
+            between `create` and `publish` (`secure_slab.zig:431-469`)
+            — `lockWithGen` cannot succeed on an even-gen slot, so
+            no concurrent reader can enter the critical section
+            during this window.
+
+      Together these guarantee that the `new_gen` argument is
+      strictly larger than every previously visible gen for that
+      slot — i.e. *gen monotonicity*, the obligation that
+      `DurableAction g`'s `g' > g` premise demands.  The proof
+      reduces UAF safety to this property; A4 is what makes the
+      reduction discharge against the running kernel.
+
+      A4 is *not* mechanised here.  Its content is enforced by the
+      structural shape of `destroy` / `destroyLocked` /
+      `bumpDeadGenLocked` (each takes the lock at `expected_gen`
+      before bumping) and `create` / `publish` (held under
+      `SecureSlab.lock`, on a slot whose gen is even).  Any future
+      caller that issues `setGenRelease` outside these paths breaks
+      A4 and falls outside the proof's safety claim.
 
 Scope carve-outs (NOT covered by the safety claim)
 --------------------------------------------------
