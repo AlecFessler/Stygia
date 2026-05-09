@@ -369,6 +369,15 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                 switch (entry) {
                     .local_apic => |la| {
                         if (la.flags & 0x1 == 0) continue;
+                        // Firmware MADTs are untrusted input: a corrupt or
+                        // oversized table enumerating > MAX_CORES enabled
+                        // local APICs would otherwise overflow the static
+                        // lapics_array and corrupt the next file-scope
+                        // global. Clamp silently — apic.lapics is the only
+                        // surface other subsystems read, and truncation is
+                        // strictly safer than the alternative of bringing
+                        // up cores whose per-cpu state doesn't exist.
+                        if (lapics_count >= MAX_CORES) continue;
                         lapics_array[lapics_count] = la;
                         lapics_count += 1;
                     },
