@@ -347,11 +347,13 @@ fn preloadValue(cfg: PmuCounterConfig) u64 {
     return span - clamped;
 }
 
-/// PMC index reserved for kprof sample-mode. Userspace PMU sessions
-/// still start at counter 0, so sample mode and userspace PMU can't
-/// run concurrently — sample mode is a kernel debug build, not a
-/// production feature.
-const KPROF_SAMPLE_PMC: u8 = 0;
+/// PMC index reserved for kprof sample-mode. Userspace `perfmon_start`
+/// allocates from PMC0 upward, so sample mode claims the top slot of
+/// AMD's 6 extended PMCs (0xC001_0200..0xC001_020B) — same top-of-range
+/// strategy as trace mode (`KPROF_PMC_CYCLES/CACHE_MISSES/BRANCH_MISSES`
+/// at 3/4/5). Sample and trace modes are mutually exclusive build modes
+/// (`-Dkernel_profile={sample,trace}`), so sample reuses slot 5 here.
+const KPROF_SAMPLE_PMC: u8 = 5;
 
 /// Program `KPROF_SAMPLE_PMC` for cycle-overflow sampling and flip the
 /// LAPIC LVT PerfMon entry to NMI delivery so the PMI fires even when
@@ -413,10 +415,10 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
     out[2] = cpu.rdmsr(perfctrMsr(KPROF_PMC_BRANCH_MISSES)) & COUNTER_MASK;
 }
 
-/// Called from the NMI handler. Reads PMC 0 — if it's below the
-/// preload value, the counter wrapped past 2^48 and fired an NMI that
-/// belongs to kprof; in that case we rearm with a fresh preload and
-/// return true. Otherwise the NMI is for someone else.
+/// Called from the NMI handler. Reads `KPROF_SAMPLE_PMC` — if it's
+/// below the preload value, the counter wrapped past 2^48 and fired
+/// an NMI that belongs to kprof; in that case we rearm with a fresh
+/// preload and return true. Otherwise the NMI is for someone else.
 ///
 /// The LAPIC auto-sets the LVT PerfMon mask bit (bit 16) when it
 /// delivers a PerfMon interrupt (Intel SDM Vol 3 §10.5.1 — AMD LAPIC
