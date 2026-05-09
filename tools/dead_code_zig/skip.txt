@@ -730,9 +730,9 @@ libz/libc/src/malloc.zig:200-200    sha256:1703e602f024f442829fdc1cb7d1ee7ff0802
 libz/libc/src/malloc.zig:201-201    sha256:b36c9398aff028c2e7a5f200902cacd2c7009111e1881aa5b09887374139e210
 libz/libc/src/malloc.zig:202-202    sha256:9d765358ee3640e9f09cdfc3659e800464c0a46b6bdb415a694047e310a742e5
 libz/libc/src/malloc.zig:203-203    sha256:3ebe7bd5358cec069e77197f9dde623ad140dee4d9782dfc9f75ee80b1c21a2b
-libz/libc/src/posix_io.zig:22-22    sha256:421245cf3f427ddcdbc39541803da88c724f35c3bd10099ee946b97cc49b618f
-libz/libc/src/posix_io.zig:23-23    sha256:fd4703eaab56e51b264d8c0b34b60ad3dfa9d65ab4d574384c36bd8562421086
-libz/libc/src/posix_io.zig:25-25    sha256:22d0cb7ad1aad083b74be1c5bf2179a74492c9f632ecbc5cd58a189fcccf9892
+libz/libc/src/posix_io.zig:22-22    sha256:59e5146e952befadb833a6b0ab4eade77fcd6acd36ee1a1fdc46ef782198756c
+libz/libc/src/posix_io.zig:23-23    sha256:afb5480e8a6d840320c560da323ceee4c818207bf3187e823f51c6e31ed58e70
+libz/libc/src/posix_io.zig:25-25    sha256:5aedfb9e86b27ae567eca7edf561004120ef75b4eba9b8fb19a3d61189bb33a2
 libz/libc/src/posix_io.zig:185-185    sha256:28e66f44c5c2d4b97f85387decc565a73fe806c475290aa89fb2b246257d9efd
 memory/vmar.zig:59-59    sha256:b63b3474139e834c1dd6b31fdd21a07e9d1b3f64bf4f196460cd3e60415888d0
 memory/vmar.zig:60-60    sha256:1a593cece0a5140d2b360ae4915a82ff8887ead91f3d1898efa77566950bceae
