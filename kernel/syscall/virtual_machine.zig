@@ -31,6 +31,14 @@ const INJECT_IRQ_ASSERT_MASK: u64 = 0x1;
 const VM_CEILING_FIELD0_SHIFT: u6 = 48;
 const VM_CEILING_MASK: u64 = 0xFF;
 
+/// Bit position of `restart_policy_ceiling.vm_restart_max` within
+/// self-handle `field1`. Per §[capability_domain] Self handle layout
+/// (matches §[create_capability_domain] `[3] ceilings_outer`):
+/// `restart_policy_ceiling` occupies field1 bits 16-31, with
+/// `vm_restart_max` at bit 23 of field1 (= bit 7 of the 16-bit
+/// restart_policy_ceiling sub-word).
+const VM_RESTART_MAX_FIELD1_SHIFT: u6 = 23;
+
 /// Allocates a VM with its own guest physical address space and
 /// initializes kernel-emulated LAPIC/IOAPIC state. vCPUs are created
 /// separately via `create_vcpu`.
@@ -79,6 +87,9 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     const self_word0 = cd.user_table[0].word0;
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(self_word0));
     const vm_ceiling: u16 = @truncate((cd.user_table[0].field0 >> VM_CEILING_FIELD0_SHIFT) & VM_CEILING_MASK);
+    // `vm_restart_max` is a single bit; read as u1 for the > comparison
+    // against the requested `restart_policy` (also 1 bit).
+    const vm_restart_max: u1 = @truncate((cd.user_table[0].field1 >> VM_RESTART_MAX_FIELD1_SHIFT) & 0x1);
 
     const pf_slot: u12 = @truncate(policy_page_frame);
     const pf_resolved = capability.resolveHandleOnDomain(cd, pf_slot, .page_frame) != null;
@@ -87,16 +98,27 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 
     if (!self_caps.crvm) return errors.E_PERM;
 
-    // vm_ceiling occupies bits 40-47 of self field0 (per the
-    // §[create_capability_domain] [2] ceilings_inner layout); the
-    // requested caps word is the 16-bit cap layout from §[virtual_machine].
-    // The ceiling gates `policy` (bit 0); `restart_policy` is gated
-    // separately by restart_policy_ceiling per §[restart_semantics] and
-    // is enforced inside the caps layer.
+    // The requested caps word is the 16-bit cap layout from
+    // §[virtual_machine]: bit 0 = `policy`, bit 1 = `restart_policy`.
+    // `vm_ceiling` (self-handle field0 bits 48-55 per §[capability_domain]
+    // Self handle layout) gates only `policy`; `restart_policy` is gated
+    // separately by `restart_policy_ceiling.vm_restart_max` per
+    // §[restart_semantics] test 04 — enforced just below in the same
+    // shape as `ec_restart_max` in `kernel/syscall/execution_context.zig`.
     const requested: u16 = @truncate(caps);
     const requested_policy = requested & 0x1;
     const ceiling_policy = vm_ceiling & 0x1;
     if (requested_policy & ~ceiling_policy != 0) return errors.E_PERM;
+
+    // Spec §[restart_semantics] test 04: returns E_PERM if
+    // `caps.restart_policy = 1` and the calling domain's
+    // `restart_policy_ceiling.vm_restart_max = 0`. Mirrors the
+    // `ec_restart_max` enforcement at `execution_context.zig` (caller's
+    // `restart_policy_ceiling` is the authoritative gate regardless of
+    // whether the new handle is minted in the caller's own table — VM
+    // handles are non-transferable so there is no second domain).
+    const requested_restart_policy: u1 = @truncate((requested >> 1) & 0x1);
+    if (requested_restart_policy > vm_restart_max) return errors.E_PERM;
 
     if (!pf_resolved) return errors.E_BADCAP;
 
