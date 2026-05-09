@@ -1,7 +1,9 @@
 const std = @import("std");
 
 const Profile = struct {
-    root_service: []const u8,
+    /// Path to the root service ELF. `null` means the profile is
+    /// generic and the caller must supply `-Droot-service=<path>`.
+    root_service: ?[]const u8,
     net: []const u8,
     kvm: bool,
     use_llvm: bool,
@@ -24,17 +26,29 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
+    /// Generic profile for booting an external root service. Caller
+    /// MUST pass `-Droot-service=<path>`; the profile only supplies
+    /// the other defaults (LLVM backend on, KVM on, intel IOMMU,
+    /// user-mode networking, headless display).
+    const app = Profile{
+        .root_service = null,
+        .net = "user",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
 };
 
 fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "linux_guest")) return profiles.linux_guest;
+    if (std.mem.eql(u8, name, "app")) return profiles.app;
 
     return null;
 }
 
 pub fn build(b: *std.Build) void {
-    const profile_name = b.option([]const u8, "profile", "Build profile: test, linux_guest (sets defaults for other flags)");
+    const profile_name = b.option([]const u8, "profile", "Build profile: test, linux_guest, app (sets defaults for other flags; app requires -Droot-service)");
     const profile = if (profile_name) |name| getProfile(name) else null;
 
     const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse
@@ -51,7 +65,7 @@ pub fn build(b: *std.Build) void {
             (if (std.mem.eql(u8, target_arch, "arm") and std.mem.eql(u8, profile_name orelse "", "linux_guest"))
                 "tests/linux_guest/bin/linux_guest-arm.elf"
             else
-                p.root_service)
+                p.root_service orelse @panic("-Dprofile=app requires -Droot-service=<path>"))
         else
             "tests/suite/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse

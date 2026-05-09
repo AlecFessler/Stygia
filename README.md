@@ -36,6 +36,104 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 **Power management.** Per-core CPU frequency and idle policy controls, plus system-wide shutdown, reboot, sleep, and screen-off.
 
+## Status
+
+Zag implements spec v3 in full. The kernel test suite has 485 spec tests, one ELF per spec assertion. As of this writing the suite passes 485/485 on x86_64 across three repetitions; on aarch64 the current count is 480/485, with five outstanding misses on the Pi 5 KVM run.
+
+Zag can host Linux as a guest VM, but currently only in the specific bundled configuration shipped under `tests/linux_guest/assets/` (a particular bzImage and initramfs). Running arbitrary Linux kernel builds as guests is unspecified work that will require non-trivial extension to the userspace VMM, the kernel's VM-extensions surface, or both.
+
+## Building
+
+The kernel boots a single user-supplied ELF as its root service. The build is two-stage: build a root service ELF, then build the kernel pointing at it.
+
+### Build and run the test suite
+
+```bash
+cd tests/suite && zig build && cd ..        # produces tests/suite/bin/root_service.elf
+zig build run -Dprofile=test                # build the kernel and boot it under QEMU/KVM
+```
+
+The `test` profile sets the root service path and other defaults. The in-kernel runner prints per-test pass/fail lines plus a final summary like `[runner] N total / N pass / 0 fail / 0 miss`.
+
+For aarch64 (KVM is unavailable for aarch64 guests on most x86 dev hosts, so fall back to TCG):
+
+```bash
+cd tests/suite && zig build -Darch=arm && cd ..
+zig build run -Darch=arm -Dprofile=test -Dkvm=false
+```
+
+### Install your own root service
+
+A root service is a freestanding ELF that imports [`libz`](libz/) and uses whichever syscalls it needs. The `app` profile boots one:
+
+```bash
+zig build run -Dprofile=app -Droot-service=path/to/your_root.elf
+```
+
+The profile sets sensible defaults (LLVM backend, KVM on, intel IOMMU, user-mode networking, headless display). Override individual flags with `-Dkvm`, `-Diommu`, `-Dnet`, `-Ddisplay`, `-Darch`, etc. See `tests/suite/runner/` and `tests/linux_guest/vmm/` for working examples of root services.
+
+### Boot Linux as a guest VM
+
+The `tests/linux_guest` directory contains a userspace VMM that boots the bundled Linux image:
+
+```bash
+cd tests/linux_guest && zig build && cd ..
+zig build run -Dprofile=linux_guest
+```
+
+### Build with kprof
+
+Kprof (the kernel-internal tracing and sampling profiler) is excluded from the kernel binary by default. To compile it in, pass `-Dkernel_profile=trace` or `-Dkernel_profile=sample`:
+
+```bash
+zig build run -Dprofile=test -Dkernel_profile=trace      # trace every kprof event
+zig build run -Dprofile=test -Dkernel_profile=sample     # PMU-driven sampling
+```
+
+Both modes force a `ReleaseFast` build and retain debug info for symbolization.
+
+## Repo Layout
+
+```
+kernel/                Kernel proper
+  arch/                  Arch dispatch (dispatch/) + per-arch backends (x64, aarch64)
+  boot/                  UEFI handoff and userspace bringup
+  caps/                  Capability and handle types, capability domain
+  devices/               Device region registry
+  hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
+  kprof/                 In-kernel tracing and sampling profiler
+  memory/                PMM, VMM, VMARs, page frames, paging, allocators/ (SecureSlab lives here)
+  sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU
+  syscall/               Per-object syscall handlers and dispatch
+  utils/                 Sync primitives, ELF and DWARF debug info, generic Range
+  zag.zig                Root module (every kernel file imports through this)
+
+bootloader/            UEFI bootloader (KASLR, kernel + root-service load)
+
+libz/                  Userspace library (caps, errors, syscall*, loader, libc compat)
+
+slab_proof/            Lean proof of GenLock + SecureSlab safety
+
+tests/
+  suite/                 Spec test runner
+    runner/              In-kernel orchestrator + libz testing helpers
+    cases/               One ELF per spec assertion (recv_07.zig, etc.)
+    build.zig            Authoritative test manifest (-Dtests=<glob> for subsets)
+    verify_coverage.py   Spec to test parity check
+  linux_guest/           Linux VMM root service (with bundled bzImage + initramfs)
+  perf/                  kprof-driven perf workload (idc_pp) + scripts/
+  precommit.sh           Cross-arch precommit gauntlet
+
+tools/                 Dev tooling (see the Tooling section)
+
+docs/
+  kernel/                specv3.md (single source of truth) + systems.md
+  x86/                   Intel SDM, VMX, VT-d, AMD SVM, AMD-Vi PDFs
+  aarch64/               ARM ARM, GICv3, SMMUv3, PSCI, IORT, PL011 PDFs
+  devices/               NVMe, xHCI, virtio, x550 datasheets
+  tools/                 Tool screenshots
+```
+
 ## Tooling
 
 ### The Indexer
