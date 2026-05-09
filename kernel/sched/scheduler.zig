@@ -558,8 +558,15 @@ pub fn run() noreturn {
 /// PerCore.current_ec) to "no EC dispatched" state, swaps rsp to the
 /// park kstack top, then sti+hlt. On IRQ-driven wake jumps back into
 /// `run()` via the exported entry symbol — the original caller's call
-/// frame is abandoned (we are noreturn). See `PerCore.park_stack`.
-fn parkAndAwaitIRQ() noreturn {
+/// frame is abandoned. See `PerCore.park_stack`.
+///
+/// Returns early WITHOUT parking when a peer race-enqueued work between
+/// `run()`'s queue check and our lock-protected re-check of the same
+/// queue (see "lost-wake race" below). Caller (`run()`) loops and
+/// re-runs `dequeueOrIdle`, which now sees the raced-in EC and
+/// dispatches it via the normal path. Hence `void` rather than
+/// `noreturn`.
+fn parkAndAwaitIRQ() void {
     const core: u8 = @truncate(arch.smp.coreID());
     const park_top = (&core_states[core]).park_stack.top.addr;
     if (park_top == 0) @panic("parkAndAwaitIRQ: park_stack not initialized");
@@ -601,12 +608,83 @@ fn parkAndAwaitIRQ() noreturn {
     };
     (&core_states[core]).post_park_clear_on_cpu = prev_ec_to_clear;
 
+    // ── lost-wake race window ────────────────────────────────────────
+    //
+    // Without the lock-protected re-check below, this sequence loses a
+    // wakeup at smp=4 once per ~5-10 reps on terminate/affinity/yield
+    // batches. The original signature is "core 0 has 2 RDY ECs in its
+    // run_queue, current_ec=null, all 4 cores parked" with no further
+    // LAPIC ticks for the rest of the run.
+    //
+    //   T0: this core's `dequeueOrIdle()` returned null (lock taken+dropped).
+    //   T1: peer P calls `enqueueOnCore(this_core, ec)`:
+    //         - takes core_locks[this_core]
+    //         - run_queue.enqueue(ec)
+    //         - reads `current_ec` slot — STILL the stale prev_ref
+    //           (this core hasn't published null yet)
+    //         - drops the lock
+    //         - sees `target_current_ptr != null` → "busy" branch
+    //         - if `ec.priority <= prev.priority` → no IPI sent
+    //   T2: this core writes `current_ec = null` (no lock)
+    //   T3: this core sti+hlt — never wakes because no IPI is coming
+    //       and no prior caller re-armed our LAPIC for a near-future
+    //       fire (the peer's enqueue path doesn't re-arm; only our
+    //       own schedTimerHandler does, and we're parked).
+    //
+    // The fix: publish `current_ec = null` UNDER core_locks[this_core]
+    // and re-check the run queue in the same critical section. If a
+    // peer raced an enqueue in, signal "abandon park" to the caller
+    // (`run()`) by returning early; the caller's loop re-runs
+    // `dequeueOrIdle` and dispatches via the normal path. If we still
+    // see an empty queue, the next enqueue will observe the published
+    // null and send the wake IPI, which delivers when sti runs in the
+    // arch trampoline below.
+    //
+    // The drain above runs OUTSIDE the lock (finalize takes its own
+    // CD/port locks; nesting them under core_locks would seed an
+    // out-of-class acquire). We re-drain post-wake in the asm landing
+    // pad anyway, so any zombie posted between the pre-park drain and
+    // the lock acquire below gets reaped on the next wake — what
+    // matters at THIS instant is that the run-queue check and the
+    // current_ec-null publish are atomic.
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+    // Use `dequeueOrIdleLocked` rather than a raw `isEmpty` check: the
+    // queue may contain `.exited` ECs that yieldTo's race-prone re-enqueue
+    // window dropped in (a yieldTo that read `state == .running` from a
+    // racing terminate's pre-flip can re-enqueue an EC after the second
+    // sweep, leaving it dangling). dequeue filters those — if we bailed on
+    // a queue containing only stale entries, `run()` would loop right back
+    // through dequeueOrIdle, see only filterable junk, and re-park,
+    // burning CPU on a tight cycle until the queue is cleaned out.
+    if (dequeueOrIdleLocked(core)) |raced_in| {
+        // Peer race: an EC landed in our queue between `run()`'s
+        // `dequeueOrIdle()` and now. Bail park, dispatch directly under
+        // the lock release. post_park_clear_on_cpu is consumed by the
+        // asm landing pad which we're NOT going through, so reset it
+        // — a future genuine park will overwrite it. We have NOT yet
+        // mutated the per-core caches (parkPerCoreCaches hasn't run);
+        // current_ec stays whatever it was, and the next switchTo's
+        // prev clear will handle on_cpu correctly.
+        (&core_states[core]).post_park_clear_on_cpu = null;
+        lock.unlockIrqRestore(irq);
+        switchTo(raced_in);
+        // switchTo is conventionally noreturn (loadEcContextAndReturn);
+        // it can return only via the vCPU-loop empty-queue exit, in
+        // which case current_ec is null and the per-core caches are
+        // already in the parked-stack state. Returning to our caller
+        // (`run()`) then re-runs the queue check; if still empty the
+        // next iteration calls back into us with a clean state.
+        return;
+    }
+
     // Update per-core caches FIRST while still on the caller's stack.
     // After the rsp swap below, locals on this stack frame go
     // unreferenced; the outer noreturn semantics make abandonment
     // safe.
     arch.cpu.parkPerCoreCaches(core, park_top);
     (&core_states[core]).current_ec = null;
+    lock.unlockIrqRestore(irq);
 
     arch.cpu.parkAndAwaitIRQ(park_top);
 }
