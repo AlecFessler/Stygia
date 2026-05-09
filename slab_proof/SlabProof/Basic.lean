@@ -2,7 +2,7 @@
 SlabProof.Basic
 ===============
 
-Mechanized safety proof for the Zag GenLock + SecureSlab two-phase
+Mechanized safety proof for the Stygia GenLock + SecureSlab two-phase
 allocate / publish protocol under x86-TSO.
 
 Concrete artifact under proof: `kernel/memory/allocators/secure_slab.zig`

@@ -1,19 +1,19 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.dispatch.cpu;
-const errors = zag.syscall.errors;
-const iommu = zag.arch.dispatch.iommu;
-const pmu = zag.arch.dispatch.pmu;
-const smp = zag.arch.dispatch.smp;
-const sync = zag.utils.sync;
-const time = zag.arch.dispatch.time;
-const vm = zag.arch.dispatch.vm;
+const cpu = stygia.arch.dispatch.cpu;
+const errors = stygia.syscall.errors;
+const iommu = stygia.arch.dispatch.iommu;
+const pmu = stygia.arch.dispatch.pmu;
+const smp = stygia.arch.dispatch.smp;
+const sync = stygia.utils.sync;
+const time = stygia.arch.dispatch.time;
+const vm = stygia.arch.dispatch.vm;
 
-const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const PowerAction = cpu.PowerAction;
 const SpinLock = sync.spin_lock.SpinLock;
-const Word0 = zag.caps.capability.Word0;
+const Word0 = stygia.caps.capability.Word0;
 
 // ── Wall-clock state ─────────────────────────────────────────────────
 //
@@ -177,7 +177,7 @@ pub fn random(caller: *anyopaque, count: u8) i64 {
             fallback_state = x;
             break :blk x *% 0x2545F4914F6CDD1D;
         };
-        zag.arch.dispatch.syscall.setSyscallVreg(ec.ctx, i, v);
+        stygia.arch.dispatch.syscall.setSyscallVreg(ec.ctx, i, v);
     }
     return 0;
 }
@@ -226,9 +226,9 @@ pub fn infoSystem(caller: *anyopaque) i64 {
     const total_phys_pages: u64 = totalPhysPages();
     const page_size_mask: u64 = pageSizeMask();
 
-    zag.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, features);
-    zag.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, total_phys_pages);
-    zag.arch.dispatch.syscall.setSyscallVreg4(ec.ctx, page_size_mask);
+    stygia.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, features);
+    stygia.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, total_phys_pages);
+    stygia.arch.dispatch.syscall.setSyscallVreg4(ec.ctx, page_size_mask);
     return @bitCast(cores);
 }
 
@@ -251,7 +251,7 @@ fn totalPhysPages() u64 {
     // available; otherwise fall back to a conservative non-zero
     // sentinel so the test contract holds even in environments where
     // pmm hasn't surfaced a total.
-    const n = zag.memory.pmm.totalPageCount();
+    const n = stygia.memory.pmm.totalPageCount();
     if (n != 0) return n;
     return 1;
 }
@@ -319,8 +319,8 @@ pub fn infoCores(caller: *anyopaque, core_id: u64) i64 {
     const freq_hz: u64 = cpu.cpuFreqHz(core_id);
     const vendor_model: u64 = cpu.cpuVendorModel(core_id);
 
-    zag.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, freq_hz);
-    zag.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, vendor_model);
+    stygia.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, freq_hz);
+    stygia.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, vendor_model);
     return @bitCast(flags);
 }
 

@@ -1,7 +1,7 @@
 //! gdb MCP daemon entry point.
 //!
 //! Persistent gdb subprocess driven from Claude Code over stdio JSON-RPC.
-//! Targets the Zag kernel running under qemu's gdb stub. Pairs with a
+//! Targets the Stygia kernel running under qemu's gdb stub. Pairs with a
 //! callgraph DB (built by tools/indexer) for symbol/field-offset resolution
 //! so the daemon never has to fight gdb's Zig namespace handling.
 //!

@@ -1,12 +1,12 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const bump = zag.memory.allocators.bump;
-const debug = zag.utils.sync.debug;
+const arch = stygia.arch.dispatch;
+const bump = stygia.memory.allocators.bump;
+const debug = stygia.utils.sync.debug;
 
-const Range = zag.utils.range.Range;
-const SpinLock = zag.utils.sync.SpinLock;
+const Range = stygia.utils.range.Range;
+const SpinLock = stygia.utils.sync.SpinLock;
 const SrcLoc = debug.SrcLoc;
 
 const INVALID_INDEX: u32 = std.math.maxInt(u32);

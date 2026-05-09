@@ -1,13 +1,13 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const BootInfo = zag.boot.protocol.BootInfo;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VAddr = zag.memory.address.VAddr;
+const BootInfo = stygia.boot.protocol.BootInfo;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VAddr = stygia.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
 

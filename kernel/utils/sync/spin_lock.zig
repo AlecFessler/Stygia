@@ -1,8 +1,8 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const debug = zag.utils.sync.debug;
+const arch = stygia.arch.dispatch;
+const debug = stygia.utils.sync.debug;
 
 const SrcLoc = debug.SrcLoc;
 

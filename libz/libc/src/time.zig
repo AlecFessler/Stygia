@@ -8,7 +8,7 @@
 // integer regardless — we just deterministically pick the earliest
 // representable timestamp.
 //
-// Once Zag's userspace timer object lands a syscall, all of this gets
+// Once Stygia's userspace timer object lands a syscall, all of this gets
 // wired through it.
 
 const Timespec = extern struct { sec: i64, nsec: i64 };

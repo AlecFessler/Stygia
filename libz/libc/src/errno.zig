@@ -6,7 +6,7 @@
 // just returns its address.
 //
 // Errno values match Linux numerics — that's what the patched
-// stdlib's lib/std/os/zag.zig re-exports through `linux.E`, and
+// stdlib's lib/std/os/stygia.zig re-exports through `linux.E`, and
 // what the libc-shaped consumers (LLVM, libc++) compare against.
 
 var errno_storage: c_int = 0;

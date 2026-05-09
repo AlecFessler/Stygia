@@ -1,35 +1,35 @@
 //! Arch-layering analyzer over the per-(arch, commit_sha) callgraph DB.
 //!
 //! Replaces the grep-based `stage_arch_layering_lint` in tests/precommit.sh
-//! with a token-aware analyzer. The Zag kernel has a strict three-tier
+//! with a token-aware analyzer. The Stygia kernel has a strict three-tier
 //! dispatch architecture documented in CLAUDE.md:
 //!
-//!     generic kernel code  ↔  zag.arch.dispatch  ↔  zag.arch.{x64,aarch64}
+//!     generic kernel code  ↔  stygia.arch.dispatch  ↔  stygia.arch.{x64,aarch64}
 //!         (kernel/**)         (kernel/arch/dispatch/)   (kernel/arch/x64/, kernel/arch/aarch64/)
 //!
 //! Two violations:
 //!
 //!   1. Up-leak — code under kernel/arch/x64/ or kernel/arch/aarch64/
-//!      reaches into `zag.arch.dispatch.*`. Arch implementations live
+//!      reaches into `stygia.arch.dispatch.*`. Arch implementations live
 //!      *underneath* the dispatch boundary, so a backend reaching upward
 //!      means the boundary is being inverted.
 //!
 //!   2. Down-leak — code outside kernel/arch/ reaches into
-//!      `zag.arch.x64.*` or `zag.arch.aarch64.*`. Generic code must
-//!      traverse `zag.arch.dispatch.*` to reach the per-arch backend.
+//!      `stygia.arch.x64.*` or `stygia.arch.aarch64.*`. Generic code must
+//!      traverse `stygia.arch.dispatch.*` to reach the per-arch backend.
 //!
 //! ─── What this analyzer catches ────────────────────────────────────────
 //!
 //!   • Direct chain references in any context (file-level decls, function
 //!     bodies, struct-field initializers, anywhere else).
-//!     e.g. `const t = zag.arch.dispatch.time;` from arch/x64/.
-//!     e.g. `lapic: zag.arch.x64.kvm.lapic.Lapic = .{},` from kernel/capdom/.
+//!     e.g. `const t = stygia.arch.dispatch.time;` from arch/x64/.
+//!     e.g. `lapic: stygia.arch.x64.kvm.lapic.Lapic = .{},` from kernel/capdom/.
 //!
 //!   • Single-step alias expansion. Given a file-local
-//!     `const NAME = zag.arch[.<seg>...]` decl, any later chain rooted at
+//!     `const NAME = stygia.arch[.<seg>...]` decl, any later chain rooted at
 //!     NAME is re-expanded and checked against the rules.
 //!     e.g.
-//!         const arch = zag.arch;
+//!         const arch = stygia.arch;
 //!         const dispatch = arch.dispatch.cpu;   ← still flagged under x64/
 //!
 //! ─── What this analyzer punts on ───────────────────────────────────────
@@ -47,15 +47,15 @@
 //!   • Index files that re-export `pub const dispatch = @import(...);` —
 //!     since `kernel/arch/arch.zig` itself sits under `arch/`, its
 //!     re-exports are unconstrained. A generic-side use of
-//!     `zag.arch.x64.foo` is still caught at the use-site (the chain
-//!     starts at `zag.arch`).
+//!     `stygia.arch.x64.foo` is still caught at the use-site (the chain
+//!     starts at `stygia.arch`).
 //!
-//!   • `@import("zag")` rebound to a non-`zag` name. The chain detector
-//!     keys on the literal identifier `zag`; a file that does
-//!     `const z = @import("zag"); const t = z.arch.x64.foo;` would slip
-//!     through. The Zag style mandates `const zag = @import("zag");` so
+//!   • `@import("stygia")` rebound to a non-`stygia` name. The chain detector
+//!     keys on the literal identifier `stygia`; a file that does
+//!     `const z = @import("stygia"); const t = z.arch.x64.foo;` would slip
+//!     through. The Stygia style mandates `const stygia = @import("stygia");` so
 //!     this is acceptable in practice; future hardening could record any
-//!     `const X = @import("zag")` and treat X as a synonym.
+//!     `const X = @import("stygia")` and treat X as a synonym.
 
 const std = @import("std");
 const mem = std.mem;
@@ -70,12 +70,12 @@ const FileClass = enum {
     /// `kernel/arch/dispatch/*` — the boundary itself; may reach into
     /// either backend, may reach generic. No layering check applies.
     dispatch,
-    /// `kernel/arch/x64/**` — must not reach `zag.arch.dispatch.*`.
+    /// `kernel/arch/x64/**` — must not reach `stygia.arch.dispatch.*`.
     arch_x64,
     /// `kernel/arch/aarch64/**` — same constraint as `arch_x64`.
     arch_aarch64,
     /// `kernel/**` (excluding `kernel/arch/**`) and `bootloader/**` —
-    /// must not reach `zag.arch.x64.*` or `zag.arch.aarch64.*`.
+    /// must not reach `stygia.arch.x64.*` or `stygia.arch.aarch64.*`.
     generic,
     /// Tests, redteam, tools, and sub-projects (routerOS/hyprvOS) — not
     /// subject to the kernel's three-tier rule. Skipped entirely.
@@ -128,16 +128,16 @@ const FileRow = struct {
 };
 
 // Maps a file-local alias name to the prefix-path it expands to,
-// where the prefix is rooted at `zag`. Only aliases whose RHS chain
-// starts at `zag` and never breaks out of the chain are recorded; this
+// where the prefix is rooted at `stygia`. Only aliases whose RHS chain
+// starts at `stygia` and never breaks out of the chain are recorded; this
 // keeps the reasoning sound (every use of NAME re-expands to the same
 // dotted path).
 const Alias = struct {
     /// Local identifier (LHS of the `const NAME = ...` decl).
     name: []const u8,
-    /// Dotted segments after `zag.`. e.g. `["arch","dispatch"]` for
-    /// `const arch_disp = zag.arch.dispatch;`. May be empty for
-    /// `const z = zag;` (records that `z.arch.dispatch.*` is also a
+    /// Dotted segments after `stygia.`. e.g. `["arch","dispatch"]` for
+    /// `const arch_disp = stygia.arch.dispatch;`. May be empty for
+    /// `const z = stygia;` (records that `z.arch.dispatch.*` is also a
     /// chain we have to check).
     segments: []const []const u8,
 };
@@ -153,9 +153,9 @@ const Finding = struct {
     byte_start: u32,
     severity: Severity,
     /// The fully-expanded chain we found, joined with `.`. Always
-    /// starts with `zag.arch.<dispatch|x64|aarch64>...`.
+    /// starts with `stygia.arch.<dispatch|x64|aarch64>...`.
     chain: []const u8,
-    /// "direct" (user wrote the literal `zag.arch.<...>` chain) or
+    /// "direct" (user wrote the literal `stygia.arch.<...>` chain) or
     /// "alias:<name>" (the chain came from expanding a file-local
     /// alias).
     via: []const u8,
@@ -265,22 +265,22 @@ fn extractChain(a: Allocator, toks: []const Token, anchor_i: usize) !Chain {
 // ─── Alias collection (single-step) ───────────────────────────────────
 
 /// Recognize  `const NAME = <chain>;`  where <chain> is anchored at the
-/// identifier `zag` and consists of `identifier ('.' identifier)*`. Any
-/// non-`zag`-anchored RHS, any `@import(...)` call, and any chain that
+/// identifier `stygia` and consists of `identifier ('.' identifier)*`. Any
+/// non-`stygia`-anchored RHS, any `@import(...)` call, and any chain that
 /// breaks the `period identifier` pattern is rejected (returns null).
 ///
-/// Returned alias.segments holds the dotted suffix after `zag` (so
-/// `const a = zag;` yields `[]`, `const a = zag.arch;` yields `["arch"]`,
-/// `const a = zag.arch.dispatch;` yields `["arch","dispatch"]`).
+/// Returned alias.segments holds the dotted suffix after `stygia` (so
+/// `const a = stygia;` yields `[]`, `const a = stygia.arch;` yields `["arch"]`,
+/// `const a = stygia.arch.dispatch;` yields `["arch","dispatch"]`).
 fn parseAliasDecl(a: Allocator, toks: []const Token, decl_i: usize) !?Alias {
     // Expected token shape:
-    //   keyword_const  identifier  equal  identifier("zag")  (period identifier)*  semicolon
+    //   keyword_const  identifier  equal  identifier("stygia")  (period identifier)*  semicolon
     if (decl_i + 4 >= toks.len) return null;
     if (!mem.eql(u8, toks[decl_i].kind, "keyword_const")) return null;
     if (!mem.eql(u8, toks[decl_i + 1].kind, "identifier")) return null;
     if (!mem.eql(u8, toks[decl_i + 2].kind, "equal")) return null;
     if (!mem.eql(u8, toks[decl_i + 3].kind, "identifier")) return null;
-    if (!mem.eql(u8, toks[decl_i + 3].text, "zag")) return null;
+    if (!mem.eql(u8, toks[decl_i + 3].text, "stygia")) return null;
 
     const name = toks[decl_i + 1].text;
 
@@ -307,15 +307,15 @@ fn parseAliasDecl(a: Allocator, toks: []const Token, decl_i: usize) !?Alias {
 const Policy = struct {
     cls: FileClass,
 
-    /// Apply layering rules to a fully-expanded chain rooted at `zag`.
-    /// `zag_segments` is the path *after* the leading `zag` — e.g.
-    /// `["arch","dispatch","time"]` for `zag.arch.dispatch.time`.
+    /// Apply layering rules to a fully-expanded chain rooted at `stygia`.
+    /// `stygia_segments` is the path *after* the leading `stygia` — e.g.
+    /// `["arch","dispatch","time"]` for `stygia.arch.dispatch.time`.
     /// Returns the violation kind (or null if clean).
-    fn check(self: Policy, zag_segments: []const []const u8) ?Severity {
+    fn check(self: Policy, stygia_segments: []const []const u8) ?Severity {
         // Need at least `arch.<something>` to matter.
-        if (zag_segments.len < 2) return null;
-        if (!mem.eql(u8, zag_segments[0], "arch")) return null;
-        const second = zag_segments[1];
+        if (stygia_segments.len < 2) return null;
+        if (!mem.eql(u8, stygia_segments[0], "arch")) return null;
+        const second = stygia_segments[1];
 
         switch (self.cls) {
             .arch_x64, .arch_aarch64 => {
@@ -349,24 +349,24 @@ fn scanFile(
     const toks = try loadFileTokens(a, db, file.id);
     if (toks.len == 0) return;
 
-    // Pass 1: collect file-local aliases that root at `zag`.
+    // Pass 1: collect file-local aliases that root at `stygia`.
     var aliases: std.StringHashMap(Alias) = .init(a);
     {
         var i: usize = 0;
         while (i < toks.len) : (i += 1) {
             // Only treat `const` decls at brace_depth==0 as alias decls?
             // The DB token table doesn't expose brace_depth on every row
-            // here (we didn't fetch it), and Zag style mandates all
+            // here (we didn't fetch it), and Stygia style mandates all
             // `const` imports/aliases sit at file scope anyway. Treating
-            // every `const NAME = zag…;` as an alias is safe — a
-            // function-local rebinding of `zag` is rare and would
+            // every `const NAME = stygia…;` as an alias is safe — a
+            // function-local rebinding of `stygia` is rare and would
             // simply mean we expand more chains, which never produces
             // a *false* positive (the expanded chain still has to
-            // start with `zag`).
+            // start with `stygia`).
             if (!mem.eql(u8, toks[i].kind, "keyword_const")) continue;
             const alias = try parseAliasDecl(a, toks, i) orelse continue;
-            // Don't re-record `zag` itself.
-            if (mem.eql(u8, alias.name, "zag")) continue;
+            // Don't re-record `stygia` itself.
+            if (mem.eql(u8, alias.name, "stygia")) continue;
             try aliases.put(alias.name, alias);
         }
     }
@@ -376,7 +376,7 @@ fn scanFile(
     // a chain we already started earlier). Also skip anchors that are
     // the LHS of a `const NAME = ...` decl — those are *defining* the
     // name, not *using* it, and the RHS will be scanned on its own
-    // anchor (`zag`) so the chain still gets flagged.
+    // anchor (`stygia`) so the chain still gets flagged.
     var i: usize = 0;
     while (i < toks.len) : (i += 1) {
         if (!mem.eql(u8, toks[i].kind, "identifier")) continue;
@@ -390,36 +390,36 @@ fn scanFile(
 
         const anchor_text = toks[i].text;
 
-        // Direct chain rooted at `zag`.
-        var zag_suffix: ?[]const []const u8 = null;
+        // Direct chain rooted at `stygia`.
+        var stygia_suffix: ?[]const []const u8 = null;
         var via_label: []const u8 = "direct";
 
-        if (mem.eql(u8, anchor_text, "zag")) {
+        if (mem.eql(u8, anchor_text, "stygia")) {
             const chain = try extractChain(a, toks, i);
-            zag_suffix = chain.segments[1..]; // drop leading `zag`
+            stygia_suffix = chain.segments[1..]; // drop leading `stygia`
         } else if (aliases.get(anchor_text)) |alias| {
             // Aliased chain. Expand: alias.segments ++ remainder.
             const chain = try extractChain(a, toks, i);
-            // alias.segments is the suffix-after-zag the alias represents.
+            // alias.segments is the suffix-after-stygia the alias represents.
             // chain.segments[0] is the anchor (== alias.name); discard.
             const remainder = chain.segments[1..];
             var combined: ArrayList([]const u8) = .{};
             try combined.appendSlice(a, alias.segments);
             try combined.appendSlice(a, remainder);
-            zag_suffix = try combined.toOwnedSlice(a);
+            stygia_suffix = try combined.toOwnedSlice(a);
             via_label = try std.fmt.allocPrint(a, "alias:{s}", .{anchor_text});
         } else {
             continue;
         }
 
-        const segs = zag_suffix.?;
+        const segs = stygia_suffix.?;
         const sev_opt = policy.check(segs);
         if (sev_opt == null) continue;
         const sev = sev_opt.?;
 
-        // Build display chain: `zag.<seg1>.<seg2>...` (no trailing dot).
+        // Build display chain: `stygia.<seg1>.<seg2>...` (no trailing dot).
         var chain_buf: ArrayList(u8) = .{};
-        try chain_buf.appendSlice(a, "zag");
+        try chain_buf.appendSlice(a, "stygia");
         for (segs) |s| {
             try chain_buf.append(a, '.');
             try chain_buf.appendSlice(a, s);
@@ -559,9 +559,9 @@ pub fn main() !void {
                 \\Reads the per-(arch, commit_sha) callgraph DB and reports any
                 \\violation of the kernel's three-tier dispatch rule:
                 \\  - arch-specific code (kernel/arch/{x64,aarch64}/) reaching
-                \\    into zag.arch.dispatch.* (UP-LEAK).
+                \\    into stygia.arch.dispatch.* (UP-LEAK).
                 \\  - generic code (kernel/**, bootloader/**) reaching into
-                \\    zag.arch.{x64,aarch64}.* (DOWN-LEAK).
+                \\    stygia.arch.{x64,aarch64}.* (DOWN-LEAK).
                 \\
                 \\Findings are also written to lint_finding (analyzer='arch_layering').
                 \\Exits 1 when any violation is found, 0 otherwise.

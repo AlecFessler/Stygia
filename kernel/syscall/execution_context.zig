@@ -1,12 +1,12 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const capability_domain = zag.caps.capability_domain;
-const errors = zag.syscall.errors;
-const execution_context = zag.sched.execution_context;
-const kprof = zag.kprof.trace_id;
-const scheduler = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const capability_domain = stygia.caps.capability_domain;
+const errors = stygia.syscall.errors;
+const execution_context = stygia.sched.execution_context;
+const kprof = stygia.kprof.trace_id;
+const scheduler = stygia.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
@@ -14,7 +14,7 @@ const EcCaps = execution_context.EcCaps;
 const ExecutionContext = execution_context.ExecutionContext;
 const IdcCaps = capability_domain.IdcCaps;
 const Priority = execution_context.Priority;
-const VAddr = zag.memory.address.VAddr;
+const VAddr = stygia.memory.address.VAddr;
 const Word0 = capability.Word0;
 
 /// `caps` argument layout for `create_execution_context`: bits 0-33 valid

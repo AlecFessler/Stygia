@@ -1,4 +1,4 @@
-/* Zag callgraph explorer — Trace mode.
+/* Stygia callgraph explorer — Trace mode.
  *
  * Renders the same /api/graph data as Graph mode but as recursively-nested
  * boxes (Nassi-Shneiderman style, extended across function-call boundaries).
@@ -148,10 +148,10 @@
   }
 
   /** Strip the kernel-root prefix from a path so it displays as
-   *  `proc/process.zig:705` rather than `/home/alec/Zag/kernel/proc/...`.
+   *  `proc/process.zig:705` rather than `/home/alec/Stygia/kernel/proc/...`.
    *
    *  Heuristic: find the LAST `/kernel/` substring and strip everything up
-   *  to and including it. Works for absolute paths originating in the Zag
+   *  to and including it. Works for absolute paths originating in the Stygia
    *  worktree as well as relative paths that already start with `kernel/`.
    *  Limitation: a source path with `/kernel/` baked in further down (e.g.
    *  some forwarded shim file) would be over-stripped, but in practice the

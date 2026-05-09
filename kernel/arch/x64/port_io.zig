@@ -38,17 +38,17 @@
 //! returns `E_PERM` which `fault.handlePageFault` routes as
 //! `memory_fault`.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const mmio_decode = zag.arch.x64.mmio_decode;
-const paging_mod = zag.arch.x64.paging;
-const port = zag.sched.port;
-const scheduler = zag.sched.scheduler;
+const cpu = stygia.arch.x64.cpu;
+const mmio_decode = stygia.arch.x64.mmio_decode;
+const paging_mod = stygia.arch.x64.paging;
+const port = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
 
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VAddr = zag.memory.address.VAddr;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VAddr = stygia.memory.address.VAddr;
 
 /// `thread_fault` sub-code for unsupported MOV forms (LOCK, 8-byte,
 /// IN/OUT named mnemonics, undecodable bytes). Spec §[event_type] row

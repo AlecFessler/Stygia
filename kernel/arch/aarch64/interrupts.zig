@@ -51,9 +51,9 @@
 //! - ARM ARM D13.2.127: SPSR_EL1
 //! - ARM IHI 0055: AAPCS64 (calling convention)
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.aarch64.cpu;
+const cpu = stygia.arch.aarch64.cpu;
 
 pub const Registers = extern struct {
     x0: u64,

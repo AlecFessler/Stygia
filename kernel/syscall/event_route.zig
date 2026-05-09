@@ -1,9 +1,9 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const capability = zag.caps.capability;
-const errors = zag.syscall.errors;
-const execution_context = zag.sched.execution_context;
-const port_mod = zag.sched.port;
+const capability = stygia.caps.capability;
+const errors = stygia.syscall.errors;
+const execution_context = stygia.sched.execution_context;
+const port_mod = stygia.sched.port;
 
 const EcCaps = execution_context.EcCaps;
 const EventType = execution_context.EventType;

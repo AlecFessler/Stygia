@@ -25,16 +25,16 @@
 //! no queued events.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const arch_syscall = zag.arch.dispatch.syscall;
-const capability = zag.caps.capability;
-const capability_domain = zag.caps.capability_domain;
-const errors = zag.syscall.errors;
-const execution_context = zag.sched.execution_context;
-const kprof = zag.kprof.trace_id;
-const scheduler = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const arch_syscall = stygia.arch.dispatch.syscall;
+const capability = stygia.caps.capability;
+const capability_domain = stygia.caps.capability_domain;
+const errors = stygia.syscall.errors;
+const execution_context = stygia.sched.execution_context;
+const kprof = stygia.kprof.trace_id;
+const scheduler = stygia.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const EcCaps = execution_context.EcCaps;
@@ -42,12 +42,12 @@ const EcQueue = scheduler.EcQueue;
 const ErasedSlabRef = capability.ErasedSlabRef;
 const EventType = execution_context.EventType;
 const ExecutionContext = execution_context.ExecutionContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const KernelHandle = capability.KernelHandle;
-const Refcount = zag.utils.refcount.Refcount;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
+const Refcount = stygia.utils.refcount.Refcount;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const SpinLock = stygia.utils.sync.SpinLock;
 const Word0 = capability.Word0;
 
 // ── Timed recv waiters ───────────────────────────────────────────────
@@ -298,9 +298,9 @@ pub const Allocator = SecureSlab(Port, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -868,7 +868,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
             .ptr = sender_cd,
             .gen = @intCast(sender_cd._gen_lock.currentGen()),
         };
-        _ = zag.caps.derivation.derive(
+        _ = stygia.caps.derivation.derive(
             caller_dom_ref,
             stash.src_slot,
             sender_dom_ref_for_derive,
@@ -1127,7 +1127,7 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     // check. Mirrors the SLOT_SELF arm of
     // `caps.derivation.deleteAndDetach` and
     // `caps.capability_domain.cleanupPartiallyCreatedCd`.
-    const cd_lr = cd_ref.lockOrderedIrqSave(zag.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
+    const cd_lr = cd_ref.lockOrderedIrqSave(stygia.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
         // CD slab gen has moved — domain is already being torn down
         // by another path. Park the EC; the in-flight teardown will
         // reap it.
@@ -1143,7 +1143,7 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     // `TREE_MUTEX_GROUP` for symmetry with every other tree_mutex
     // acquisition — mismatched ordered-group tags on the same lock
     // would still register a phantom edge in cycle detection.
-    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), zag.caps.derivation.TREE_MUTEX_GROUP);
+    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), stygia.caps.derivation.TREE_MUTEX_GROUP);
 
     // `releaseSelf` releases `cd._gen_lock` via `destroyLocked`
     // before returning; we restore the captured IRQ state manually
@@ -1152,7 +1152,7 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     const deferred = capability_domain.releaseSelf(cd);
     arch.cpu.restoreInterrupts(cd_irq_state);
 
-    zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+    stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
 
     capability_domain.destroyPhase2(deferred);
 }
@@ -1557,14 +1557,14 @@ fn deliverEvent(
             // the receiver's freshly minted handle.
             switch (entry.obj_type) {
                 .page_frame => {
-                    const pf: *zag.memory.page_frame.PageFrame =
+                    const pf: *stygia.memory.page_frame.PageFrame =
                         @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    zag.memory.page_frame.incHandleRef(pf) catch unreachable;
+                    stygia.memory.page_frame.incHandleRef(pf) catch unreachable;
                 },
                 .timer => {
-                    const t: *zag.sched.timer.Timer =
+                    const t: *stygia.sched.timer.Timer =
                         @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    zag.sched.timer.incHandleRef(t) catch unreachable;
+                    stygia.sched.timer.incHandleRef(t) catch unreachable;
                 },
                 .port => {
                     const alias_p: *Port = @ptrCast(@alignCast(entry.obj_ref.ptr.?));
@@ -1573,9 +1573,9 @@ fn deliverEvent(
                     onHandleAcquire(alias_p, entry.caps) catch unreachable;
                 },
                 .device_region => {
-                    const dr: *zag.devices.device_region.DeviceRegion =
+                    const dr: *stygia.devices.device_region.DeviceRegion =
                         @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    zag.devices.device_region.incHandleRef(dr) catch unreachable;
+                    stygia.devices.device_region.incHandleRef(dr) catch unreachable;
                 },
                 else => {},
             }
@@ -1606,7 +1606,7 @@ fn deliverEvent(
                 .ptr = dom,
                 .gen = @intCast(dom._gen_lock.currentGen()),
             };
-            _ = zag.caps.derivation.derive(
+            _ = stygia.caps.derivation.derive(
                 sender_dom_ref,
                 entry.src_slot,
                 dom_ref,
@@ -1653,19 +1653,19 @@ fn deliverEvent(
                     // copy/move-alias `move=1` arm in
                     // capability_domain.zig:444-467.
                     switch (entry.obj_type) {
-                        .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
-                        .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
+                        .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
+                        .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
                         .port => {
                             const sp: *Port = @ptrCast(@alignCast(src_entry.ref.ptr.?));
                             const src_caps_word: u16 = @truncate(Word0.caps(dom.user_table[src_slot].word0));
                             releaseHandle(sp, src_caps_word);
                         },
                         .device_region => {
-                            const sdr: *zag.devices.device_region.DeviceRegion =
+                            const sdr: *stygia.devices.device_region.DeviceRegion =
                                 @ptrCast(@alignCast(src_entry.ref.ptr.?));
                             const sdr_irq = sdr._gen_lock.lockIrqSave(@src());
-                            zag.devices.device_region.removeHandleListNodeLocked(sdr, &dom.kernel_table[src_slot].dr_node);
-                            zag.devices.device_region.releaseHandleLocked(sdr, sdr_irq);
+                            stygia.devices.device_region.removeHandleListNodeLocked(sdr, &dom.kernel_table[src_slot].dr_node);
+                            stygia.devices.device_region.releaseHandleLocked(sdr, sdr_irq);
                         },
                         else => {},
                     }

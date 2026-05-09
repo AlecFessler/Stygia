@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) void {
         } else if (arch == .aarch64) {
             // TODO: also drop neon for aarch64 — needs the bootloader
             // path debugged first (initial attempt boot-faults in
-            // firmware between [ZAG] stack and [ZAG] exit BS). For now
+            // firmware between [STYGIA] stack and [STYGIA] exit BS). For now
             // leave NEON enabled on aarch64 so the bootloader still
             // works; lazy-FPU correctness still holds because the
             // kernel save/restore asm runs unconditionally and the
@@ -200,8 +200,8 @@ pub fn build(b: *std.Build) void {
         }
         break :blk s;
     };
-    const zag_mod = b.addModule("zag", .{
-        .root_source_file = b.path("kernel/zag.zig"),
+    const stygia_mod = b.addModule("stygia", .{
+        .root_source_file = b.path("kernel/stygia.zig"),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
@@ -211,9 +211,9 @@ pub fn build(b: *std.Build) void {
         }),
         .optimize = optimize,
     });
-    zag_mod.omit_frame_pointer = false;
-    zag_mod.red_zone = false;
-    zag_mod.addImport("zag", zag_mod);
+    stygia_mod.omit_frame_pointer = false;
+    stygia_mod.red_zone = false;
+    stygia_mod.addImport("stygia", stygia_mod);
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
@@ -226,7 +226,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
     build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
     const build_opts_mod = build_opts.createModule();
-    zag_mod.addImport("build_options", build_opts_mod);
+    stygia_mod.addImport("build_options", build_opts_mod);
 
     const kprof_mod = b.createModule(.{
         .root_source_file = b.path("kernel/kprof/kprof.zig"),
@@ -241,9 +241,9 @@ pub fn build(b: *std.Build) void {
     });
     kprof_mod.omit_frame_pointer = false;
     kprof_mod.red_zone = false;
-    kprof_mod.addImport("zag", zag_mod);
+    kprof_mod.addImport("stygia", stygia_mod);
     kprof_mod.addImport("build_options", build_opts_mod);
-    zag_mod.addImport("kprof", kprof_mod);
+    stygia_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
     const embedded_wf = b.addWriteFiles();
@@ -274,7 +274,7 @@ pub fn build(b: *std.Build) void {
         }),
         .optimize = optimize,
     });
-    zag_mod.addImport("embedded_bins", embedded_bins_mod);
+    stygia_mod.addImport("embedded_bins", embedded_bins_mod);
 
     // ── Bootloader ──────────────────────────────────────────────────────
     const loader_name = if (arch == .x86_64) "BOOTX64.EFI" else "BOOTAA64.EFI";
@@ -300,7 +300,7 @@ pub fn build(b: *std.Build) void {
             loader.name,
         }),
     );
-    loader.root_module.addImport("zag", zag_mod);
+    loader.root_module.addImport("stygia", stygia_mod);
     install_loader.step.dependOn(&loader.step);
     b.getInstallStep().dependOn(&install_loader.step);
 
@@ -336,7 +336,7 @@ pub fn build(b: *std.Build) void {
     kernel.entry = .{ .symbol_name = "kEntry" };
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
-    kernel.root_module.addImport("zag", zag_mod);
+    kernel.root_module.addImport("stygia", stygia_mod);
     const linker_script = if (arch == .x86_64)
         "kernel/linker-x86.ld"
     else
@@ -411,12 +411,12 @@ pub fn build(b: *std.Build) void {
     // ── QEMU ────────────────────────────────────────────────────────────
     // NVMe is on by default under -Dprofile=linux_guest (guest needs a
     // backing disk); other profiles must opt in via -Dnvme=true. The
-    // sibling Zag-desktopOS repo's `run` step passes -Dnvme=true.
+    // sibling Stygia-desktopOS repo's `run` step passes -Dnvme=true.
     const wants_nvme = b.option(bool, "nvme", "Attach an NVMe drive (default: on under -Dprofile=linux_guest)") orelse
         (profile_name != null and std.mem.eql(u8, profile_name.?, "linux_guest"));
     // qemu-xhci + usb-kbd/usb-mouse so a guest USB driver has a
     // controller to enumerate and a HID device to bind. Off by default;
-    // the sibling Zag-desktopOS repo's `run` step passes -Dusb=true.
+    // the sibling Stygia-desktopOS repo's `run` step passes -Dusb=true.
     const wants_usb = b.option(bool, "usb", "Attach a qemu-xhci controller + HID devices (default: off)") orelse false;
 
     const qemu_cmdline = if (arch == .aarch64) blk: {
@@ -463,7 +463,7 @@ pub fn build(b: *std.Build) void {
         const qemu_nvme_args: []const u8 = if (wants_nvme)
             b.fmt(
                 \\-drive file={s}/nvme.img,format=raw,if=none,id=nvme0,cache=writethrough \
-                \\-device nvme,drive=nvme0,serial=zagdisk0
+                \\-device nvme,drive=nvme0,serial=stygiadisk0
             , .{b.install_path})
         else
             "";

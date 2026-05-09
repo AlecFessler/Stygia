@@ -5,12 +5,12 @@
 // uses small inline loops rather than std.mem indirection so that
 // LLVM's inliner sees them at the call site, and so this file does
 // not transitively pull in std.fs / std.posix / std.debug (which
-// have unimplemented entry points on Zag).
+// have unimplemented entry points on Stygia).
 
 // ── memory ────────────────────────────────────────────────────────
 
 // IMPORTANT: do NOT use Zig's @memcpy/@memset in these exports. The
-// no-LLVM backend on x86_64-zag-none lowers @memcpy/@memset to CALLs
+// no-LLVM backend on x86_64-stygia-none lowers @memcpy/@memset to CALLs
 // to libc's memcpy/memset, which would recurse infinitely back here
 // and blow the stack. Hand-rolled byte loops are the only safe shape.
 

@@ -8,18 +8,18 @@
 //! follow-up wave that wires GICv3 emulation.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const hyp = zag.arch.aarch64.hyp;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const vgic = zag.arch.aarch64.hv.vgic;
-const vm_hw = zag.arch.aarch64.vm;
+const hyp = stygia.arch.aarch64.hyp;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const vgic = stygia.arch.aarch64.hv.vgic;
+const vm_hw = stygia.arch.aarch64.vm;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const FxsaveArea = vm_hw.FxsaveArea;
 const GuestState = vm_hw.GuestState;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 const VmExitInfo = vm_hw.VmExitInfo;
 
 pub const VcpuArchState = struct {

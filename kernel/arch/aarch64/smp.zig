@@ -38,24 +38,24 @@
 //! - ARM ARM D13.2.136: TTBR0_EL1, TTBR1_EL1
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
 // Module aliases — alphabetical
-const aarch64_paging = zag.arch.aarch64.paging;
-const cpu = zag.arch.aarch64.cpu;
-const gic = zag.arch.aarch64.gic;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const power = zag.arch.aarch64.power;
-const sched = zag.sched.scheduler;
-const stack_mod = zag.memory.stack;
+const aarch64_paging = stygia.arch.aarch64.paging;
+const cpu = stygia.arch.aarch64.cpu;
+const gic = stygia.arch.aarch64.gic;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const power = stygia.arch.aarch64.power;
+const sched = stygia.sched.scheduler;
+const stack_mod = stygia.memory.stack;
 
 // Type aliases — alphabetical
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
 const PageEntry = aarch64_paging.PageEntry;
-const VAddr = zag.memory.address.VAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Maximum number of cores supported.
 const MAX_CORES: usize = 256;

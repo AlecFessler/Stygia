@@ -9,22 +9,22 @@
 //! `*ExecutionContext` internally.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const capability = zag.syscall.capability;
-const capability_domain = zag.syscall.capability_domain;
-const errors = zag.syscall.errors;
-const event_route = zag.syscall.event_route;
-const execution_context = zag.syscall.execution_context;
-const futex = zag.syscall.futex;
-const kprof = zag.kprof.trace_id;
-const page_frame = zag.syscall.page_frame;
-const port = zag.syscall.port;
-const reply = zag.syscall.reply;
-const system = zag.syscall.system;
-const timer = zag.syscall.timer;
-const vmar = zag.syscall.vmar;
-const virtual_machine = zag.syscall.virtual_machine;
+const capability = stygia.syscall.capability;
+const capability_domain = stygia.syscall.capability_domain;
+const errors = stygia.syscall.errors;
+const event_route = stygia.syscall.event_route;
+const execution_context = stygia.syscall.execution_context;
+const futex = stygia.syscall.futex;
+const kprof = stygia.kprof.trace_id;
+const page_frame = stygia.syscall.page_frame;
+const port = stygia.syscall.port;
+const reply = stygia.syscall.reply;
+const system = stygia.syscall.system;
+const timer = stygia.syscall.timer;
+const vmar = stygia.syscall.vmar;
+const virtual_machine = stygia.syscall.virtual_machine;
 
 pub const SyscallNum = enum(u64) {
     @"suspend" = 14,
@@ -476,7 +476,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // Stop-the-world quiesce + dump. IPIs every other core to
             // park, drains in-flight emits, dumps every CPU's log to
             // serial in core-id order, then halts. Doesn't return.
-            zag.kprof.dump.end(.root_exit);
+            stygia.kprof.dump.end(.root_exit);
             break :blk 0;
         },
     };

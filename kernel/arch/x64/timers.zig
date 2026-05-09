@@ -1,12 +1,12 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const interrupts = zag.arch.x64.interrupts;
-const timer_mod = zag.arch.timer;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const interrupts = stygia.arch.x64.interrupts;
+const timer_mod = stygia.arch.timer;
 
-const Timer = zag.arch.timer.Timer;
-const VAddr = zag.memory.address.VAddr;
+const Timer = stygia.arch.timer.Timer;
+const VAddr = stygia.memory.address.VAddr;
 
 var tsc_timer_instance: Tsc = undefined;
 var lapic_timer_instance: Lapic = undefined;

@@ -1,28 +1,28 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const device_region = zag.devices.device_region;
-const exceptions = zag.arch.x64.exceptions;
-const fpu = zag.sched.fpu;
-const futex = zag.sched.futex;
-const gdt = zag.arch.x64.gdt;
-const idt = zag.arch.x64.idt;
-const interrupts = zag.arch.x64.interrupts;
-const kprof = zag.kprof.trace_id;
-const kprof_dump = zag.kprof.dump;
-const kprof_log = zag.kprof.log;
-const paging_mod = zag.arch.x64.paging;
-const port = zag.sched.port;
-const sched = zag.sched.scheduler;
-const timer_wheel = zag.sched.timer;
-const timers = zag.arch.x64.timers;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const device_region = stygia.devices.device_region;
+const exceptions = stygia.arch.x64.exceptions;
+const fpu = stygia.sched.fpu;
+const futex = stygia.sched.futex;
+const gdt = stygia.arch.x64.gdt;
+const idt = stygia.arch.x64.idt;
+const interrupts = stygia.arch.x64.interrupts;
+const kprof = stygia.kprof.trace_id;
+const kprof_dump = stygia.kprof.dump;
+const kprof_log = stygia.kprof.log;
+const paging_mod = stygia.arch.x64.paging;
+const port = stygia.sched.port;
+const sched = stygia.sched.scheduler;
+const timer_wheel = stygia.sched.timer;
+const timers = stygia.arch.x64.timers;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GateType = zag.arch.x64.idt.GateType;
-const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const SpinLock = zag.utils.sync.SpinLock;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GateType = stygia.arch.x64.idt.GateType;
+const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 /// 16 IRQ lines (vectors 32-47) — legacy ISA IRQs remapped above the 32 exception
 /// vectors reserved by the architecture.
@@ -265,7 +265,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // path: 1 atomic load + 1 TSC read + 1 compare when nothing is
     // wrong. NB: the all-cores-idle path is intentionally not reached
     // from here (current_ec != null inside any tick).
-    zag.utils.hang_detector.tickCheck();
+    stygia.utils.hang_detector.tickCheck();
 
     // No periodic debug print here. The runner emits its own per-batch
     // heartbeat over COM1, and any kernel-side periodic `serial.print`
@@ -328,7 +328,7 @@ pub fn programIoapicNmi(gsi: u32, bsp_apic_id: u32) bool {
 
 /// Maximum IOAPIC redirection-table entry index. The legacy ISA-era
 /// IOAPIC exposes 24 entries (pins 0..23); modern chips can expose up
-/// to 240 but Zag's testbed targets the ISA layout, and out-of-range
+/// to 240 but Stygia's testbed targets the ISA layout, and out-of-range
 /// `irq_line` values would write into unrelated IOAPIC registers. The
 /// gate here is defensive in depth: callers should already have mapped
 /// device IRQs through a vector→GSI translation that yields a sane

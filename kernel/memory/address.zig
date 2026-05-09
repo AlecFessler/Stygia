@@ -1,9 +1,9 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 
-const Range = zag.utils.range.Range;
+const Range = stygia.utils.range.Range;
 
 const PAGE4K: u64 = 0x1000;
 const PAGE1G: u64 = 0x40000000;

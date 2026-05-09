@@ -9,12 +9,12 @@
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ZAG_ROOT="$(cd -- "$HERE/../../.." && pwd)"
+STYGIA_ROOT="$(cd -- "$HERE/../../.." && pwd)"
 
 if [[ $# -ge 1 ]]; then
     DB_PATH="$1"
 else
-    DB_PATH="$(ls "$ZAG_ROOT"/tools/callgraph_http/test/dbs/x86_64-*.db 2>/dev/null | head -1 || true)"
+    DB_PATH="$(ls "$STYGIA_ROOT"/tools/callgraph_http/test/dbs/x86_64-*.db 2>/dev/null | head -1 || true)"
 fi
 
 if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
@@ -23,9 +23,9 @@ if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
     exit 2
 fi
 
-CALLGRAPH_BIN="$ZAG_ROOT/tools/callgraph_mcp/zig-out/bin/callgraph_mcp"
+CALLGRAPH_BIN="$STYGIA_ROOT/tools/callgraph_mcp/zig-out/bin/callgraph_mcp"
 if [[ ! -x "$CALLGRAPH_BIN" ]]; then
-    (cd "$ZAG_ROOT/tools/callgraph_mcp" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
+    (cd "$STYGIA_ROOT/tools/callgraph_mcp" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 DB_SHA="$(sqlite3 "$DB_PATH" "SELECT value FROM meta WHERE key='commit_sha'" 2>/dev/null || echo unknown)"
@@ -61,7 +61,7 @@ JSON
 OUT_FILE="$(mktemp)"
 trap 'rm -f "$REQ_FILE" "$OUT_FILE"' EXIT
 
-"$CALLGRAPH_BIN" --db "$DB_PATH" --git-root "$ZAG_ROOT" < "$REQ_FILE" > "$OUT_FILE" 2>/tmp/callgraph_mcp_smoke.err
+"$CALLGRAPH_BIN" --db "$DB_PATH" --git-root "$STYGIA_ROOT" < "$REQ_FILE" > "$OUT_FILE" 2>/tmp/callgraph_mcp_smoke.err
 
 # Tools 1..15: each must have id:N with "result", not "error".
 fail=0

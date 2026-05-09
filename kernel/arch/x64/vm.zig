@@ -3,13 +3,13 @@
 /// Detects CPU vendor at boot via CPUID and dispatches all VM operations
 /// to the appropriate backend. Follows the same pattern as iommu.zig
 /// (Intel VT-d vs AMD-Vi runtime dispatch).
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const svm = zag.arch.x64.amd.svm;
-const vmx = zag.arch.x64.intel.vmx;
+const cpu = stygia.arch.x64.cpu;
+const svm = stygia.arch.x64.amd.svm;
+const vmx = stygia.arch.x64.intel.vmx;
 
-const PAddr = zag.memory.address.PAddr;
+const PAddr = stygia.memory.address.PAddr;
 
 /// Full x64 guest register state snapshot.
 pub const GuestState = extern struct {

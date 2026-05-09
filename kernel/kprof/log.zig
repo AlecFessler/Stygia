@@ -19,9 +19,9 @@
 
 const mode = @import("mode.zig");
 const record_mod = @import("record.zig");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 
 const Record = record_mod.Record;
 

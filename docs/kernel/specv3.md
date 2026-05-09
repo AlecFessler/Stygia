@@ -1,4 +1,4 @@
-# Zag Microkernel Specification v3.0
+# Stygia Microkernel Specification v3.0
 
 ## §[scope] Scope
 

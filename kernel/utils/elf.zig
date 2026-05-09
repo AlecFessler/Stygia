@@ -1,11 +1,11 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
 const elf = std.elf;
-const paging = zag.memory.paging;
+const paging = stygia.memory.paging;
 
 const Dwarf = std.debug.Dwarf;
-const VAddr = zag.memory.address.VAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 pub const ElfSection = enum {
     text,

@@ -1,7 +1,7 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const paging = zag.memory.paging;
+const paging = stygia.memory.paging;
 const uefi = std.os.uefi;
 
 pub const PageAllocator = struct {

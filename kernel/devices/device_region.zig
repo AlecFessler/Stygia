@@ -5,19 +5,19 @@
 //! §[port_io_virtualization].
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const futex = zag.sched.futex;
-const irq = zag.arch.dispatch.irq;
-const secure_slab = zag.memory.allocators.secure_slab;
-const userio = zag.arch.dispatch.userio;
+const arch = stygia.arch.dispatch;
+const futex = stygia.sched.futex;
+const irq = stygia.arch.dispatch.irq;
+const secure_slab = stygia.memory.allocators.secure_slab;
+const userio = stygia.arch.dispatch.userio;
 
 const GenLock = secure_slab.GenLock;
-const PAddr = zag.memory.address.PAddr;
-const Refcount = zag.utils.refcount.Refcount;
+const PAddr = stygia.memory.address.PAddr;
+const Refcount = stygia.utils.refcount.Refcount;
 const SecureSlab = secure_slab.SecureSlab;
-const SpinLock = zag.utils.sync.SpinLock;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 /// Maximum concurrently-live DeviceRegion slabs. Sized for the
 /// boot-time device enumerators (PCI BARs, framebuffer, IOAPIC) that
@@ -320,9 +320,9 @@ pub fn forEachBootGrant(
 }
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     device_region_slab = DeviceRegionSlab.init(data_range, ptrs_range, links_range);
     slab_initialized = true;

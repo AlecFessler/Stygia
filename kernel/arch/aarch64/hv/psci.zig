@@ -15,9 +15,9 @@
 //! - Arm DEN 0022F: Arm Power State Coordination Interface (PSCI)
 //! - Arm DEN 0028D: SMC Calling Convention (SMCCC)
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const vm_hw = zag.arch.aarch64.vm;
+const vm_hw = stygia.arch.aarch64.vm;
 
 const GuestState = vm_hw.GuestState;
 

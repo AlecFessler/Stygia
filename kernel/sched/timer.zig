@@ -8,23 +8,23 @@
 //! last handle drops the kernel cancels (if armed) and reclaims state.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const futex = zag.sched.futex;
-const scheduler = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const futex = stygia.sched.futex;
+const scheduler = stygia.sched.scheduler;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const PAddr = zag.memory.address.PAddr;
-const Refcount = zag.utils.refcount.Refcount;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const PAddr = stygia.memory.address.PAddr;
+const Refcount = stygia.utils.refcount.Refcount;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 /// Cap bits in `Capability.word0[48..63]` for timer handles.
 /// Spec §[timer] cap layout.
@@ -52,11 +52,11 @@ pub const COUNTER_CEILING: u64 = std.math.maxInt(u64) - 1;
 /// success discriminator. Mirror the values from `syscall.errors`
 /// rather than re-declaring negatives (which crossed wires with
 /// userspace expecting the spec-positive values).
-const E_PERM: i64 = zag.syscall.errors.E_PERM;
-const E_BADCAP: i64 = zag.syscall.errors.E_BADCAP;
-const E_INVAL: i64 = zag.syscall.errors.E_INVAL;
-const E_NOMEM: i64 = zag.syscall.errors.E_NOMEM;
-const E_FULL: i64 = zag.syscall.errors.E_FULL;
+const E_PERM: i64 = stygia.syscall.errors.E_PERM;
+const E_BADCAP: i64 = stygia.syscall.errors.E_BADCAP;
+const E_INVAL: i64 = stygia.syscall.errors.E_INVAL;
+const E_NOMEM: i64 = stygia.syscall.errors.E_NOMEM;
+const E_FULL: i64 = stygia.syscall.errors.E_FULL;
 
 /// Reserved-bit masks for the public ABI.
 const TIMER_CAPS_RESERVED_MASK: u64 = 0xFFFF_FFFF_FFFF_0000;
@@ -128,9 +128,9 @@ pub const Allocator = SecureSlab(Timer, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -351,7 +351,7 @@ pub fn timerArm(caller: *anyopaque, caps: u64, deadline_ns: u64, flags: u64) i64
         .gen = @intCast(t._gen_lock.currentGen()),
     };
 
-    const slot = zag.caps.capability_domain.mintHandle(
+    const slot = stygia.caps.capability_domain.mintHandle(
         caller_domain,
         ref,
         .timer,
@@ -367,7 +367,7 @@ pub fn timerArm(caller: *anyopaque, caps: u64, deadline_ns: u64, flags: u64) i64
     // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
     // tag in bits 12..15 disambiguates a real handle word from the
     // small-positive error range 1..15.
-    return @intCast(zag.caps.capability.Word0.pack(slot, .timer, requested_caps));
+    return @intCast(stygia.caps.capability.Word0.pack(slot, .timer, requested_caps));
 }
 
 /// `timer_rearm` syscall handler. Spec §[timer].
@@ -525,7 +525,7 @@ pub fn incHandleRef(t: *Timer) error{BadCap}!void {
 /// deleted.
 pub fn disarmTimerHandlesInDomain(cd: *CapabilityDomain) void {
     var slot: u16 = 3;
-    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+    while (slot < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) {
         const entry = &cd.kernel_table[slot];
         const obj_ptr = entry.ref.ptr orelse {
             slot += 1;
@@ -781,7 +781,7 @@ fn propagateAndWake(t: *Timer, gen: u63, value: u64) void {
         .timer_ref = SlabRef(Timer).init(t, gen),
         .value = value,
     };
-    zag.caps.capability_domain.slab_instance.forEachAlive(
+    stygia.caps.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField0Visitor,
     );
@@ -795,7 +795,7 @@ fn propagateField1(t: *Timer, gen: u63, value: u64) void {
         .timer_ref = SlabRef(Timer).init(t, gen),
         .value = value,
     };
-    zag.caps.capability_domain.slab_instance.forEachAlive(
+    stygia.caps.capability_domain.slab_instance.forEachAlive(
         &ctx,
         propagateField1Visitor,
     );
@@ -832,7 +832,7 @@ fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) b
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
     const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;
-    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+    while (slot < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) {
         const entry = &cd.kernel_table[slot];
         if (entry.ref.ptr) |obj_ptr| {
             // Identity match requires both ptr and gen — without the
@@ -862,7 +862,7 @@ fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) b
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
     const timer_gen: u32 = ctx.timer_ref.gen;
     var slot: u16 = 0;
-    while (slot < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) {
+    while (slot < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) {
         const entry = &cd.kernel_table[slot];
         if (entry.ref.ptr) |obj_ptr| {
             if (obj_ptr == timer_ptr and entry.ref.gen == timer_gen) {

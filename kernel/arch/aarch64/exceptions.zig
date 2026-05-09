@@ -42,31 +42,31 @@
 //! - ARM ARM D13.2.37: ESR_EL1
 //! - ARM ARM D13.2.40: FAR_EL1
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.aarch64.cpu;
-const device_region = zag.devices.device_region;
-const fpu = zag.sched.fpu;
-const futex = zag.sched.futex;
-const gic = zag.arch.aarch64.gic;
-const interrupts = zag.arch.aarch64.interrupts;
-const kprof = zag.kprof.trace_id;
-const kprof_dump = zag.kprof.dump;
-const pmu = zag.arch.aarch64.pmu;
-const port = zag.sched.port;
-const scheduler = zag.sched.scheduler;
-const serial = zag.arch.aarch64.serial;
-const sync_debug = zag.utils.sync.debug;
-const syscall_dispatch = zag.syscall.dispatch;
-const timer_wheel = zag.sched.timer;
-const timers = zag.arch.aarch64.timers;
-const vmar = zag.memory.vmar;
+const cpu = stygia.arch.aarch64.cpu;
+const device_region = stygia.devices.device_region;
+const fpu = stygia.sched.fpu;
+const futex = stygia.sched.futex;
+const gic = stygia.arch.aarch64.gic;
+const interrupts = stygia.arch.aarch64.interrupts;
+const kprof = stygia.kprof.trace_id;
+const kprof_dump = stygia.kprof.dump;
+const pmu = stygia.arch.aarch64.pmu;
+const port = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
+const serial = stygia.arch.aarch64.serial;
+const sync_debug = stygia.utils.sync.debug;
+const syscall_dispatch = stygia.syscall.dispatch;
+const timer_wheel = stygia.sched.timer;
+const timers = stygia.arch.aarch64.timers;
+const vmar = stygia.memory.vmar;
 
-const VAddr = zag.memory.address.VAddr;
+const VAddr = stygia.memory.address.VAddr;
 
-const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const PageFaultContext = zag.arch.aarch64.interrupts.PageFaultContext;
+const ArchCpuContext = stygia.arch.aarch64.interrupts.ArchCpuContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const PageFaultContext = stygia.arch.aarch64.interrupts.PageFaultContext;
 
 /// ARM ARM D13.2.37 -- ESR_EL1 Exception Class field, bits [31:26].
 /// Identifies the reason for the exception that was taken to EL1.
@@ -648,7 +648,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
             };
-            zag.memory.fault.handlePageFault(&pf_ctx);
+            stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
         .instruction_abort_lower_el => {
@@ -662,7 +662,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
             };
-            zag.memory.fault.handlePageFault(&pf_ctx);
+            stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
         .pc_alignment => {
@@ -712,7 +712,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             ctx.elr_el1 += 4;
             const ec_ptr = scheduler.currentEc() orelse
                 @panic("wfi trap with no current EC");
-            zag.sched.execution_context.parkIdleWait(ec_ptr);
+            stygia.sched.execution_context.parkIdleWait(ec_ptr);
             cpu.enableInterrupts();
             scheduler.run();
         },
@@ -721,7 +721,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // ARM ARM D13.2.40 — Trapped MSR/MRS/SYS access (a system
             // register that is accessible at EL0 but configured to trap
             // via SCTLR_EL1 / CPACR_EL1 / etc.). Currently nothing in
-            // Zag programs such traps, so any hit here is unexpected;
+            // Stygia programs such traps, so any hit here is unexpected;
             // surface as a protection fault.
             //
             // (`mrs x, MPIDR_EL1` from EL0 is UNDEFINED — not "trapped"
@@ -890,7 +890,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .rip = ctx.elr_el1,
                 .user_ctx = null,
             };
-            zag.memory.fault.handlePageFault(&pf_ctx);
+            stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
         .instruction_abort_same_el => {
@@ -904,7 +904,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .rip = ctx.elr_el1,
                 .user_ctx = null,
             };
-            zag.memory.fault.handlePageFault(&pf_ctx);
+            stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
         else => {

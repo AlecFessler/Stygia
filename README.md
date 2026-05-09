@@ -1,6 +1,6 @@
-# Zag
+# Stygia
 
-Zag is a capability-based microkernel for building secure, fast, and reliable operating systems.
+Stygia is a capability-based microkernel for building secure, fast, and reliable operating systems.
 
 ## Kernel Objects
 
@@ -8,7 +8,7 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 | Object | Role | Spec |
 |---|---|---|
-| **Capability Domain** | A set of capabilities usable by the execution contexts bound to the domain. The process-equivalent boundary in Zag. | [§[capability_domain]](docs/kernel/specv3.md#capability_domain-capability-domain) |
+| **Capability Domain** | A set of capabilities usable by the execution contexts bound to the domain. The process-equivalent boundary in Stygia. | [§[capability_domain]](docs/kernel/specv3.md#capability_domain-capability-domain) |
 | **Execution Context** | A schedulable unit of executable state bound to a capability domain. The thread-equivalent. | [§[execution_context]](docs/kernel/specv3.md#execution_context-execution-context) |
 | **VMAR** | A virtual memory address region: a contiguous span of virtual address space bound to a capability domain, available for demand-paged memory or for installing page frames and device regions. | [§[vmar]](docs/kernel/specv3.md#vmar-virtual-memory-address-region) |
 | **Page Frame** | A reference to physical memory. Installing the same page frame into multiple capability domains creates shared memory. | [§[page_frame]](docs/kernel/specv3.md#page_frame-page-frame) |
@@ -38,9 +38,9 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 ## Status
 
-Zag implements spec v3 in full. The kernel test suite has 485 spec tests, one ELF per spec assertion. As of this writing the suite passes 485/485 on x86_64 across three repetitions; on aarch64 the current count is 480/485, with five outstanding misses on the Pi 5 KVM run.
+Stygia implements spec v3 in full. The kernel test suite has 485 spec tests, one ELF per spec assertion. As of this writing the suite passes 485/485 on x86_64 across three repetitions; on aarch64 the current count is 480/485, with five outstanding misses on the Pi 5 KVM run.
 
-Zag can host Linux as a guest VM, but currently only in the specific bundled configuration shipped under `tests/linux_guest/assets/` (a particular bzImage and initramfs). Running arbitrary Linux kernel builds as guests is unspecified work that will require non-trivial extension to the userspace VMM, the kernel's VM-extensions surface, or both.
+Stygia can host Linux as a guest VM, but currently only in the specific bundled configuration shipped under `tests/linux_guest/assets/` (a particular bzImage and initramfs). Running arbitrary Linux kernel builds as guests is unspecified work that will require non-trivial extension to the userspace VMM, the kernel's VM-extensions surface, or both.
 
 ## Building
 
@@ -106,7 +106,7 @@ kernel/                Kernel proper
   sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU
   syscall/               Per-object syscall handlers and dispatch
   utils/                 Sync primitives, ELF and DWARF debug info, generic Range
-  zag.zig                Root module (every kernel file imports through this)
+  stygia.zig                Root module (every kernel file imports through this)
 
 bootloader/            UEFI bootloader (KASLR, kernel + root-service load)
 
@@ -168,7 +168,7 @@ The kernel includes internal trace points and a sampling profiler used during de
 
 ## Slab Allocator
 
-Zag allocates all dynamic kernel state from per-type slab allocators. Each slab serves a single type `T`, and slots are type-stable: once a slot is mapped, its address belongs to the same `T` for the slot's entire lifetime, regardless of how many alloc/free cycles pass through it.
+Stygia allocates all dynamic kernel state from per-type slab allocators. Each slab serves a single type `T`, and slots are type-stable: once a slot is mapped, its address belongs to the same `T` for the slot's entire lifetime, regardless of how many alloc/free cycles pass through it.
 
 A slab-backed object has two correctness obligations under arbitrary concurrent kernel work:
 
@@ -210,7 +210,7 @@ Checks 1 through 3 ensure every kernel pointer to a slab-backed object goes thro
 
 Rust enforces mutual exclusion entirely at compile time. The borrow checker rules out shared mutable access by construction, and lifetimes prove that a borrow cannot outlive its referent. No runtime check is required.
 
-Zag splits the same guarantee across compile-time and runtime enforcement. The static analyzer plays the role of the borrow checker. It enforces the patterns: every pointer to a slab-backed object is a `SlabRef`, and every dereference is bracketed by `lock`/`unlock`. What Rust gets for free from lifetimes is the proof that the referent is still alive at access time. Zag cannot prove that statically, because slab slots can be freed by other cores asynchronously while a `SlabRef` is in flight. The gen-lock CAS supplies that check at runtime: the verify-and-acquire either succeeds (live, exclusive access) or returns `StaleHandle` (stale, caller does not touch the slot).
+Stygia splits the same guarantee across compile-time and runtime enforcement. The static analyzer plays the role of the borrow checker. It enforces the patterns: every pointer to a slab-backed object is a `SlabRef`, and every dereference is bracketed by `lock`/`unlock`. What Rust gets for free from lifetimes is the proof that the referent is still alive at access time. Stygia cannot prove that statically, because slab slots can be freed by other cores asynchronously while a `SlabRef` is in flight. The gen-lock CAS supplies that check at runtime: the verify-and-acquire either succeeds (live, exclusive access) or returns `StaleHandle` (stale, caller does not touch the slot).
 
 The end safety property is the same. The split is between the static enforcement of pattern (you have a `SlabRef`, and you bracket every access) and the runtime check of liveness (the gen still matches).
 
@@ -222,22 +222,22 @@ Beyond gen-lock, the slab allocator has two structural defenses orthogonal to th
 
 **Random-walk cursors.** The freelist is a circular doubly-linked list of indices. Two cursors (pop and push) each take a hardware-random `[-N, N]` step on every alloc and every free system-wide. The cursor walk is seeded from RDRAND/RNDR mixed with a timestamp, and `N` is fixed at compile time (256 by default). An attacker cannot predict which slot their next free-then-alloc sequence will reclaim, because the cursor state is a function of every prior alloc and free in the system.
 
-## How Zag is Developed
+## How Stygia is Developed
 
-Zag makes use of AI code generation tooling. Where Zag does not sacrifice the human touch is in design. Every core architectural decision is carefully considered and drafted into the spec. The spec drives the test suite, with the goal being to exercise and assert the correctness of every userspace-observable behavior. The spec and tests are human-driven.
+Stygia makes use of AI code generation tooling. Where Stygia does not sacrifice the human touch is in design. Every core architectural decision is carefully considered and drafted into the spec. The spec drives the test suite, with the goal being to exercise and assert the correctness of every userspace-observable behavior. The spec and tests are human-driven.
 
 The kernel is split into ~30 subsystems, and each one is provided with various forms of persistent memory including a changelog and a SYSTEMS.md file that describes the subsystem. The pipeline makes use of [Steve Yegge's Beads](https://github.com/steveyegge/beads) for queue and state management. An orchestrator agent pulls beads from the queue and dispatches a worker agent. The worker first runs the precommit CI to prove a clean baseline before writing its code. On commit, precommit CI runs again, and the worker fails if anything regressed. Once clean, the commit is handed to a reviewer agent, and once passing, to a merger agent that lands it. Throughout this, agents working in a subsystem can flag bugs, which are automatically queued up as an issue bead, or feature proposals, which are *always* human reviewed since they change the spec.
 
 ## Contributing
 
-The way Zag's kernel is developed (see [How Zag is Developed](#how-zag-is-developed)) means it doesn't really need contributors to submit code. The kernel is not going to accept external code contributions.
+The way Stygia's kernel is developed (see [How Stygia is Developed](#how-stygia-is-developed)) means it doesn't really need contributors to submit code. The kernel is not going to accept external code contributions.
 
 Issue reports and bug reports are good, and feature requests are also excellent contributions.
 
-However, you can contribute code by building userspace apps. Zag is a microkernel; the operating system around it is built out of userspace processes, and that surface is open to anyone who wants to build something on top of the kernel.
+However, you can contribute code by building userspace apps. Stygia is a microkernel; the operating system around it is built out of userspace processes, and that surface is open to anyone who wants to build something on top of the kernel.
 
 ## License
 
-Zag is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
+Stygia is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
 
 Copyright 2026 Alec Fessler.

@@ -6,9 +6,9 @@
 //! in spec-v3 yet — when they land they will read this `bus_freq_hz`
 //! and the per-core MSRs documented in Intel SDM Vol 3 §15.7-§15.8.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
+const cpu = stygia.arch.x64.cpu;
 
 /// Fallback bus frequency when `CPUID.16h` does not advertise a value.
 /// 100 MHz matches the external bus clock on every mainstream Intel part

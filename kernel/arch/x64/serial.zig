@@ -1,8 +1,8 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const sync = zag.utils.sync;
+const cpu = stygia.arch.x64.cpu;
+const sync = stygia.utils.sync;
 
 /// Standard ISA I/O base addresses for COM1-COM4.
 /// These are the conventional PC/AT port assignments for 16550-compatible UARTs.

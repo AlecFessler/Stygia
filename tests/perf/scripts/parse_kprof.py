@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post-processor for the Zag kernel `[KPROF]` profiling dump format.
+"""Post-processor for the Stygia kernel `[KPROF]` profiling dump format.
 
 Reads a serial capture (file path or `-` for stdin), filters to lines
 beginning with `[KPROF]`, parses them into records, and reports either

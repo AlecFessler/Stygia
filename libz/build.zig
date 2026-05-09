@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
         // single_threaded keeps Zig's std lib from emitting TLS
         // references (__tls_get_addr) that would otherwise show up as
         // unresolved externals — we don't have a userspace TLS runtime
-        // in Zag, and libz wrappers don't need any thread-local state.
+        // in Stygia, and libz wrappers don't need any thread-local state.
         .single_threaded = true,
     });
 

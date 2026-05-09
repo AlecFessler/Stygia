@@ -1,32 +1,32 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const ctx_trace = zag.utils.ctx_trace;
-const hang_detector = zag.utils.hang_detector;
-const hpet_watchdog = zag.arch.x64.hpet_watchdog;
-const pf_log = zag.utils.pf_log;
-const execution_context = zag.sched.execution_context;
-const fpu = zag.sched.fpu;
-const gdt = zag.arch.x64.gdt;
-const idt = zag.arch.x64.idt;
-const interrupts = zag.arch.x64.interrupts;
-const kprof = zag.kprof.trace_id;
-const kprof_sample = zag.kprof.sample;
-const mmio_decode = zag.arch.x64.mmio_decode;
-const paging_mod = zag.arch.x64.paging;
-const port = zag.sched.port;
-const scheduler = zag.sched.scheduler;
-const serial = zag.arch.x64.serial;
-const vmar = zag.memory.vmar;
+const cpu = stygia.arch.x64.cpu;
+const ctx_trace = stygia.utils.ctx_trace;
+const hang_detector = stygia.utils.hang_detector;
+const hpet_watchdog = stygia.arch.x64.hpet_watchdog;
+const pf_log = stygia.utils.pf_log;
+const execution_context = stygia.sched.execution_context;
+const fpu = stygia.sched.fpu;
+const gdt = stygia.arch.x64.gdt;
+const idt = stygia.arch.x64.idt;
+const interrupts = stygia.arch.x64.interrupts;
+const kprof = stygia.kprof.trace_id;
+const kprof_sample = stygia.kprof.sample;
+const mmio_decode = stygia.arch.x64.mmio_decode;
+const paging_mod = stygia.arch.x64.paging;
+const port = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
+const serial = stygia.arch.x64.serial;
+const vmar = stygia.memory.vmar;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GateType = zag.arch.x64.idt.GateType;
-const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
-const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const VMAR = zag.memory.vmar.VMAR;
-const VAddr = zag.memory.address.VAddr;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GateType = stygia.arch.x64.idt.GateType;
+const PageFaultContext = stygia.arch.x64.interrupts.PageFaultContext;
+const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
+const VMAR = stygia.memory.vmar.VMAR;
+const VAddr = stygia.memory.address.VAddr;
 
 /// thread_fault sub-codes for exception-derived faults (spec §[event_type]
 /// row 2). Values are local to this file; the spec leaves sub-code
@@ -284,7 +284,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 @panic("user exception with no current EC");
             // Diag: print vector + RIP + first byte at RIP for any user fault.
             // Helps catch silent EC terminations from `unreachable` (#UD)
-            // and other faults during in-Zag compiler bring-up.
+            // and other faults during in-Stygia compiler bring-up.
             // caller-pinned: ec is currentEc() running on this core; its
             // domain SlabRef stays valid for the fault handler's duration.
             const dom_root = ec.domain.ptr.addr_space_root;
@@ -499,7 +499,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .rip = ctx.rip,
         .user_ctx = if (from_user) ctx else null,
     };
-    zag.memory.fault.handlePageFault(&pf_ctx);
+    stygia.memory.fault.handlePageFault(&pf_ctx);
 
     // Resume snapshot. If `handlePageFault` yielded to another EC the
     // resumed RIP is for THAT EC; if it returned to the faulter the

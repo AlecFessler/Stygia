@@ -1,11 +1,11 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const ctx_trace = zag.utils.ctx_trace;
-const debug_info = zag.utils.debug_info;
-const ec_log = zag.utils.ec_log;
-const pf_log = zag.utils.pf_log;
+const arch = stygia.arch.dispatch;
+const ctx_trace = stygia.utils.ctx_trace;
+const debug_info = stygia.utils.debug_info;
+const ec_log = stygia.utils.ec_log;
+const pf_log = stygia.utils.pf_log;
 
 /// Kernel panic handler.
 ///
@@ -42,7 +42,7 @@ pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OW
 /// any subsequent call from a DIFFERENT core returns false. Repeat calls
 /// from the SAME core (e.g. fault-handler print → `@panic`) return true.
 pub fn claimPanic() bool {
-    const self_core: u32 = @truncate(zag.arch.dispatch.smp.coreID());
+    const self_core: u32 = @truncate(stygia.arch.dispatch.smp.coreID());
     const prev = panic_owner.cmpxchgStrong(
         PANIC_OWNER_NONE,
         self_core,

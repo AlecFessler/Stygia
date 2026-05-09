@@ -1,12 +1,12 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const paging = zag.memory.paging;
-const sched = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const paging = stygia.memory.paging;
+const sched = stygia.sched.scheduler;
 
-const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
-const SpinLock = zag.utils.sync.SpinLock;
+const BuddyAllocator = stygia.memory.allocators.buddy.BuddyAllocator;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 const MAX_CORES = 64;
 const CACHE_REFILL_ORDER: u4 = 4;

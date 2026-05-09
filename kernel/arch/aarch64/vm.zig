@@ -480,7 +480,7 @@ inline fn readIdAa64Pfr0() u64 {
 ///      EL2 is implemented (1 = AArch64 only, 2 = AArch64 + AArch32).
 ///   2. Initialize the VMID allocator (see `stage2.zig`).
 ///
-/// We deliberately do NOT consult ID_AA64MMFR1_EL1.VH here. The Zag
+/// We deliberately do NOT consult ID_AA64MMFR1_EL1.VH here. The Stygia
 /// kernel itself runs at EL1 (entered at EL1 by PSCI), so we never use
 /// VHE to host the kernel itself; we only care that stage-2 translation
 /// and EL2 routing are available. EL2-without-VHE works for our needs.

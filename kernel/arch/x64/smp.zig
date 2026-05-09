@@ -1,26 +1,26 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
 const trampoline_code = @import("embedded_bins").trampoline;
 
-const apic = zag.arch.x64.apic;
-const arch_paging = zag.arch.x64.paging;
-const cpu = zag.arch.x64.cpu;
-const exceptions = zag.arch.x64.exceptions;
-const gdt = zag.arch.x64.gdt;
-const idt = zag.arch.x64.idt;
-const interrupts = zag.arch.x64.interrupts;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const sched = zag.sched.scheduler;
-const serial = zag.arch.x64.serial;
-const stack_mod = zag.memory.stack;
-const timers = zag.arch.x64.timers;
+const apic = stygia.arch.x64.apic;
+const arch_paging = stygia.arch.x64.paging;
+const cpu = stygia.arch.x64.cpu;
+const exceptions = stygia.arch.x64.exceptions;
+const gdt = stygia.arch.x64.gdt;
+const idt = stygia.arch.x64.idt;
+const interrupts = stygia.arch.x64.interrupts;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const sched = stygia.sched.scheduler;
+const serial = stygia.arch.x64.serial;
+const stack_mod = stygia.memory.stack;
+const timers = stygia.arch.x64.timers;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 const TrampolineParams = extern struct {
     cr3: u64,
@@ -85,7 +85,7 @@ pub fn smpInit() !void {
     @memcpy(dest[0..trampoline_code.len], trampoline_code);
 
     const params: *TrampolineParams = @ptrFromInt(trampoline_virt.addr + params_offset);
-    params.cr3 = zag.arch.x64.paging.getAddrSpaceRoot().addr;
+    params.cr3 = stygia.arch.x64.paging.getAddrSpaceRoot().addr;
     params.entry_point = @intFromPtr(&coreInit);
 
     const bsp_id = apic.rawApicId();
@@ -122,7 +122,7 @@ pub fn smpInit() !void {
             continue;
         }
 
-        params.stack_top = zag.memory.address.alignStack(ap_stack.top).addr;
+        params.stack_top = stygia.memory.address.alignStack(ap_stack.top).addr;
 
         const expected = cores_online.load(.acquire);
         // Intel SDM Vol 3A, §11.4.4, Table 11-1: send INIT IPI, wait 10 ms,

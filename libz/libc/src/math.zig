@@ -241,7 +241,7 @@ export fn erff(x: f32) callconv(.c) f32 {
     return @floatCast(erf(@floatCast(x)));
 }
 
-// ── Long-double aliases (treat as f64 on Zag-target since LLVM's
+// ── Long-double aliases (treat as f64 on Stygia-target since LLVM's
 //    host libstdc++ build defaults to `long double = double`) ──────
 
 export fn frexpl(x: f64, exp_out: *c_int) callconv(.c) f64 {

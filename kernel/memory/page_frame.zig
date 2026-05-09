@@ -8,24 +8,24 @@
 //! pool.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const capability_domain = zag.caps.capability_domain;
-const errors = zag.syscall.errors;
-const pmm = zag.memory.pmm;
-const vmar = zag.memory.vmar;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const capability_domain = stygia.caps.capability_domain;
+const errors = stygia.syscall.errors;
+const pmm = stygia.memory.pmm;
+const vmar = stygia.memory.vmar;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const PAddr = zag.memory.address.PAddr;
-const Refcount = zag.utils.refcount.Refcount;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const VAddr = zag.memory.address.VAddr;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const PAddr = stygia.memory.address.PAddr;
+const Refcount = stygia.utils.refcount.Refcount;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Page size encoding (immutable per page frame). Same enum used by
 /// VMAR — re-exported for convenience.
@@ -79,9 +79,9 @@ pub const Allocator = SecureSlab(PageFrame, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }

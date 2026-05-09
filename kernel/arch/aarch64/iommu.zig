@@ -11,12 +11,12 @@
 //! SMMUv2/v3 driver lands, replace this with an `active_type`-style
 //! switch matching `arch/x64/iommu.zig`.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
-const VmarPageSize = zag.memory.vmar.PageSize;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const SpecDeviceRegion = stygia.devices.device_region.DeviceRegion;
+const VmarPageSize = stygia.memory.vmar.PageSize;
 
 /// No SMMU active — no-op success. Matches the x64 `.none` arm's
 /// behavior when neither VT-d nor AMD-Vi is present: the dma path

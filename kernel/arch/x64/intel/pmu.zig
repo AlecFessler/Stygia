@@ -19,16 +19,16 @@
 //!     - IA32_PERF_GLOBAL_STATUS (MSR 0x38E)
 //!     - IA32_PERF_GLOBAL_OVF_CTRL (MSR 0x390)
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const idt = zag.arch.x64.idt;
-const interrupts = zag.arch.x64.interrupts;
-const pmu_facade = zag.arch.x64.pmu;
-const pmu_sched = zag.syscall.pmu;
-const port_mod = zag.sched.port;
-const scheduler = zag.sched.scheduler;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const idt = stygia.arch.x64.idt;
+const interrupts = stygia.arch.x64.interrupts;
+const pmu_facade = stygia.arch.x64.pmu;
+const pmu_sched = stygia.syscall.pmu;
+const port_mod = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
@@ -160,7 +160,7 @@ pub fn init() void {
     idt.openInterruptGate(
         PMI_VECTOR,
         interrupts.stubs[PMI_VECTOR],
-        zag.arch.x64.gdt.KERNEL_CODE_OFFSET,
+        stygia.arch.x64.gdt.KERNEL_CODE_OFFSET,
         .ring_0,
         .interrupt_gate,
     );

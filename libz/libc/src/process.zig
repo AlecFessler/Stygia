@@ -124,7 +124,7 @@ export fn uname(buf: ?*anyopaque) callconv(.c) c_int {
     const arr: [*]u8 = @ptrCast(buf.?);
     var i: usize = 0;
     while (i < 65 * 6) : (i += 1) arr[i] = 0;
-    const sysname = "Zag";
+    const sysname = "Stygia";
     @memcpy(arr[0..sysname.len], sysname);
     @memcpy(arr[65 .. 65 + 4], "node");
     @memcpy(arr[130 .. 130 + 5], "0.1.0");

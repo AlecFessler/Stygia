@@ -22,11 +22,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VAddr = zag.memory.address.VAddr;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VAddr = stygia.memory.address.VAddr;
 
 /// True when the target CPU advertises the ARMv8.1 PAN (Privileged
 /// Access Never) feature. Cortex-A72 is ARMv8.0 and lacks PAN; the
@@ -140,7 +140,7 @@ fn prngNext() u64 {
 /// software PRNG seeded from CNTVCT_EL0 on cores that lack the feature.
 /// ARM ARM C5.2.14: RNDR returns NZCV.Z=1 on entropy exhaustion.
 /// Feature detection: ID_AA64ISAR0_EL1 bits [63:60] (RNDR field) >= 1.
-/// The Cortex-A72/A76 cores Zag currently targets do not implement RNG,
+/// The Cortex-A72/A76 cores Stygia currently targets do not implement RNG,
 /// so the PRNG path is the common case on our reference hardware.
 pub fn rndr() ?u64 {
     // Feature detection: ID_AA64ISAR0_EL1 bits [63:60] (RNDR field). A
@@ -436,8 +436,8 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // the read-modify-write against remote postZombie writers; we drop
     // the lock before finalize so its own locks aren't nested.
     {
-        const cid: u8 = @truncate(zag.arch.aarch64.gic.coreID());
-        const sched_mod = zag.sched.scheduler;
+        const cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
+        const sched_mod = stygia.sched.scheduler;
         while (true) {
             const zombie_to_reap: ?*ExecutionContext = blk: {
                 const lock = &sched_mod.core_locks[cid];
@@ -462,7 +462,7 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
                 break :blk null;
             };
             const z = zombie_to_reap orelse break;
-            zag.sched.execution_context.finalizeDestroyMarkedDead(z);
+            stygia.sched.execution_context.finalizeDestroyMarkedDead(z);
         }
     }
 
@@ -478,8 +478,8 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // arch/x64/interrupts.zig switchTo.
     const dom = ec.domain.ptr;
     const new_root = dom.addr_space_root;
-    if (new_root.addr != zag.arch.aarch64.paging.getAddrSpaceRoot().addr) {
-        zag.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
+    if (new_root.addr != stygia.arch.aarch64.paging.getAddrSpaceRoot().addr) {
+        stygia.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
     }
 
     // Spec §[syscall_abi]: flush the recv-deferred syscall word into
@@ -493,12 +493,12 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // saved frame so ERET surfaces it. Mirrors arch/x64/interrupts.zig
     // switchTo.
     if (ec.pending_event_word_valid) {
-        zag.arch.aarch64.interrupts.writeUserSyscallWord(ec.ctx, ec.pending_event_word);
+        stygia.arch.aarch64.interrupts.writeUserSyscallWord(ec.ctx, ec.pending_event_word);
         ec.pending_event_word = 0;
         ec.pending_event_word_valid = false;
 
         if (ec.pending_event_rip_valid) {
-            zag.arch.aarch64.interrupts.writeUserVreg14(ec.ctx, ec.pending_event_rip);
+            stygia.arch.aarch64.interrupts.writeUserVreg14(ec.ctx, ec.pending_event_rip);
             ec.pending_event_rip = 0;
             ec.pending_event_rip_valid = false;
         }
@@ -526,13 +526,13 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
 /// address. SPSR.M selects the post-ERET exception level (ARM ARM
 /// DDI 0487 §D1.10.1).
 pub fn prepareEcContext(
-    kstack_top: zag.memory.address.VAddr,
-    ustack_top: ?zag.memory.address.VAddr,
-    entry: zag.memory.address.VAddr,
+    kstack_top: stygia.memory.address.VAddr,
+    ustack_top: ?stygia.memory.address.VAddr,
+    entry: stygia.memory.address.VAddr,
     arg: u64,
-) *zag.arch.aarch64.interrupts.ArchCpuContext {
+) *stygia.arch.aarch64.interrupts.ArchCpuContext {
     @setRuntimeSafety(false);
-    const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
+    const ArchCpuContext = stygia.arch.aarch64.interrupts.ArchCpuContext;
 
     // Place the frame at `kstack_top - 288`, matching the layout the
     // exception trampoline produces on subsequent kernel entries
@@ -580,9 +580,9 @@ pub fn prepareEcContext(
 /// `prepareEcContext` left the frame in EL1h kernel-mode shape) and the
 /// caller is wiring in the user stack and entry afterward.
 pub fn patchUserModeIretFrame(
-    ctx: *zag.arch.aarch64.interrupts.ArchCpuContext,
-    entry: zag.memory.address.VAddr,
-    user_stack_top: zag.memory.address.VAddr,
+    ctx: *stygia.arch.aarch64.interrupts.ArchCpuContext,
+    entry: stygia.memory.address.VAddr,
+    user_stack_top: stygia.memory.address.VAddr,
     arg: u64,
 ) void {
     ctx.elr_el1 = entry.addr;

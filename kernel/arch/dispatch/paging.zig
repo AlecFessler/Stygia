@@ -1,18 +1,18 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const MappingKind = zag.memory.address.MappingKind;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageSize = zag.memory.paging.PageSize;
-const Range = zag.utils.range.Range;
-const VAddr = zag.memory.address.VAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
-const VmarCacheType = zag.memory.vmar.CacheType;
+const MappingKind = stygia.memory.address.MappingKind;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageSize = stygia.memory.paging.PageSize;
+const Range = stygia.utils.range.Range;
+const VAddr = stygia.memory.address.VAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
+const VmarCacheType = stygia.memory.vmar.CacheType;
 
 // ── Address Space Layout ────────────────────────────────────────────────
 // Architecture-specific virtual address space boundaries. These define

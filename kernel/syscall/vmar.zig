@@ -1,13 +1,13 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const capability = zag.caps.capability;
-const errors = zag.syscall.errors;
-const kprof = zag.kprof.trace_id;
-const vmar = zag.memory.vmar;
+const capability = stygia.caps.capability;
+const errors = stygia.syscall.errors;
+const kprof = stygia.kprof.trace_id;
+const vmar = stygia.memory.vmar;
 
-const CapabilityDomainCaps = zag.caps.capability_domain.CapabilityDomainCaps;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VmarCaps = zag.memory.vmar.VmarCaps;
+const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VmarCaps = stygia.memory.vmar.VmarCaps;
 const Word0 = capability.Word0;
 
 /// Self-handle slot. Spec §[capability_domain]: slot 0 is reserved for

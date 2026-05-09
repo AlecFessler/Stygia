@@ -1,7 +1,7 @@
 //! aarch64 EL2 → EL1 drop for the UEFI bootloader.
 //!
 //! When QEMU is invoked with `-M virt,virtualization=on -bios AAVMF`,
-//! AAVMF boots and runs its entire DXE/BDS phase at EL2. Our Zag UEFI
+//! AAVMF boots and runs its entire DXE/BDS phase at EL2. Our Stygia UEFI
 //! bootloader is therefore called at EL2 and inherits an EL2 MMU
 //! (SCTLR_EL2.M=1, TTBR0_EL2 identity-mapping firmware + the loaded
 //! bootloader image). If we simply `br kEntry` into the kernel from
@@ -9,7 +9,7 @@
 //!
 //!   (a) kEntry lives at a TTBR1 high VA; TTBR1_EL1 is not consulted
 //!       by the EL2 translation regime, so the fetch faults.
-//!   (b) The Zag kernel unconditionally assumes it runs at EL1 and
+//!   (b) The Stygia kernel unconditionally assumes it runs at EL1 and
 //!       operates TTBR0/TTBR1_EL1, SCTLR_EL1, MAIR_EL1, CPACR_EL1,
 //!       VBAR_EL1 — none of which govern an EL2 MMU.
 //!
@@ -290,7 +290,7 @@ pub fn dropToEl1(hyp_vbar: u64) void {
         //
         // Low 16 bits transfer directly. Extract PS from [18:16] of
         // TCR_EL2 and place it at [34:32] of TCR_EL1. OR in the
-        // standard kernel TTBR1 configuration (same values the Zag
+        // standard kernel TTBR1 configuration (same values the Stygia
         // kernel would write via enableKernelTranslation()):
         //   T1SZ  = 16
         //   IRGN1 = 0b01 (WB-WA)

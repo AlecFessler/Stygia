@@ -36,13 +36,13 @@
 //! pointer in a register before the `call`.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 const build_options = @import("build_options");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 const builtin = @import("builtin");
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 
 pub const enabled: bool = build_options.kernel_ec_log;
 

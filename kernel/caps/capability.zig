@@ -21,20 +21,20 @@
 //! (via the kernel-side R/W view of the same physical pages) when an
 //! object's kernel-mutable snapshot changes (e.g. EC priority).
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability_domain = zag.caps.capability_domain;
-const derivation = zag.caps.derivation;
-const device_region = zag.devices.device_region;
-const errors = zag.syscall.errors;
-const execution_context = zag.sched.execution_context;
-const page_frame = zag.memory.page_frame;
-const port = zag.sched.port;
-const secure_slab = zag.memory.allocators.secure_slab;
-const timer = zag.sched.timer;
-const vmar = zag.memory.vmar;
-const virtual_machine = zag.hv.virtual_machine;
+const arch = stygia.arch.dispatch;
+const capability_domain = stygia.caps.capability_domain;
+const derivation = stygia.caps.derivation;
+const device_region = stygia.devices.device_region;
+const errors = stygia.syscall.errors;
+const execution_context = stygia.sched.execution_context;
+const page_frame = stygia.memory.page_frame;
+const port = stygia.sched.port;
+const secure_slab = stygia.memory.allocators.secure_slab;
+const timer = stygia.sched.timer;
+const vmar = stygia.memory.vmar;
+const virtual_machine = stygia.hv.virtual_machine;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;

@@ -7,11 +7,11 @@
 //! Slab-allocated so ECs that never call perfmon don't carry the
 //! per-counter buffers as inline bloat.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const PmuState = zag.arch.dispatch.pmu.PmuState;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const PmuState = stygia.arch.dispatch.pmu.PmuState;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
 
 /// Maximum hardware PMU counters the state struct accommodates.
 /// Common architectures expose 4-8 general-purpose counters; this
@@ -48,9 +48,9 @@ pub const Allocator = SecureSlab(PerfmonState, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }

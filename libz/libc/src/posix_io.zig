@@ -1,32 +1,32 @@
-// posix_io — file I/O wrappers over zag_fs_* extern hooks.
+// posix_io — file I/O wrappers over stygia_fs_* extern hooks.
 //
 // The consuming binary (cross-compiled Zig+LLVM, statically linked
-// with libc.a) provides the zag_fs_* implementations talking to the
+// with libc.a) provides the stygia_fs_* implementations talking to the
 // SQL-FS server over IPC. Phase 4c.5 wires these.
 //
 // Until then, calls return -1 with errno=ENOSYS for ops that don't
-// have a zag_fs_* extern; the linker still resolves cleanly because
+// have a stygia_fs_* extern; the linker still resolves cleanly because
 // extern declarations don't require runtime defs at libc.a build time.
 
 extern fn __errno_location() callconv(.c) *c_int;
 
-extern fn zag_fs_openat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, flags: u32, mode: u32) callconv(.c) i64;
-extern fn zag_fs_mkdirat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) c_int;
-extern fn zag_fs_unlinkat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize) callconv(.c) c_int;
-extern fn zag_fs_statat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaque) callconv(.c) c_int;
-extern fn zag_fs_read(fd: i32, buf_ptr: [*]u8, buf_len: usize, offset: i64) callconv(.c) i64;
-extern fn zag_fs_close(fd: i32) callconv(.c) i32;
-extern fn zag_fs_fstat(fd: i32, stat_out: *anyopaque) callconv(.c) i32;
+extern fn stygia_fs_openat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, flags: u32, mode: u32) callconv(.c) i64;
+extern fn stygia_fs_mkdirat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) c_int;
+extern fn stygia_fs_unlinkat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize) callconv(.c) c_int;
+extern fn stygia_fs_statat(dir_fd: c_int, path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaque) callconv(.c) c_int;
+extern fn stygia_fs_read(fd: i32, buf_ptr: [*]u8, buf_len: usize, offset: i64) callconv(.c) i64;
+extern fn stygia_fs_close(fd: i32) callconv(.c) i32;
+extern fn stygia_fs_fstat(fd: i32, stat_out: *anyopaque) callconv(.c) i32;
 // Extensions (consumer must provide; first cut from stdio path).
-extern fn zag_fs_write(fd: i32, buf_ptr: [*]const u8, buf_len: usize, offset: i64) callconv(.c) i64;
-extern fn zag_fs_stat(path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaque) callconv(.c) i32;
-extern fn zag_fs_unlink(path_ptr: [*]const u8, path_len: usize) callconv(.c) i32;
-extern fn zag_fs_lseek(fd: i32, offset: i64, whence: c_int) callconv(.c) i64;
-extern fn zag_fs_mkdir(path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) i32;
-extern fn zag_fs_truncate(path_ptr: [*]const u8, path_len: usize, size: i64) callconv(.c) i32;
-extern fn zag_fs_ftruncate(fd: i32, size: i64) callconv(.c) i32;
+extern fn stygia_fs_write(fd: i32, buf_ptr: [*]const u8, buf_len: usize, offset: i64) callconv(.c) i64;
+extern fn stygia_fs_stat(path_ptr: [*]const u8, path_len: usize, stat_out: *anyopaque) callconv(.c) i32;
+extern fn stygia_fs_unlink(path_ptr: [*]const u8, path_len: usize) callconv(.c) i32;
+extern fn stygia_fs_lseek(fd: i32, offset: i64, whence: c_int) callconv(.c) i64;
+extern fn stygia_fs_mkdir(path_ptr: [*]const u8, path_len: usize, mode: u32) callconv(.c) i32;
+extern fn stygia_fs_truncate(path_ptr: [*]const u8, path_len: usize, size: i64) callconv(.c) i32;
+extern fn stygia_fs_ftruncate(fd: i32, size: i64) callconv(.c) i32;
 
-extern fn zag_write_console(buf: [*]const u8, count: usize) callconv(.c) usize;
+extern fn stygia_write_console(buf: [*]const u8, count: usize) callconv(.c) usize;
 
 const ENOSYS: c_int = 38;
 const EBADF: c_int = 9;
@@ -51,7 +51,7 @@ pub fn openatImpl(path: [*:0]const u8, flags: u32, mode: u32) c_int {
 
 pub fn openatAtImpl(dir_fd: c_int, path: [*:0]const u8, flags: u32, mode: u32) c_int {
     const len = pathLen(path);
-    const rc = zag_fs_openat(dir_fd, path, len, flags, mode);
+    const rc = stygia_fs_openat(dir_fd, path, len, flags, mode);
     if (rc < 0) {
         __errno_location().* = @intCast(-rc);
         return -1;
@@ -80,7 +80,7 @@ export fn __openat_2(dir_fd: c_int, path: [*:0]const u8, flags: c_int) callconv(
 export fn close(fd: c_int) callconv(.c) c_int {
     if (fd < 0) return fail(EBADF);
     if (fd <= 2) return 0; // stdin/stdout/stderr
-    return zag_fs_close(fd);
+    return stygia_fs_close(fd);
 }
 
 // ── read / write ──────────────────────────────────────────────────
@@ -89,7 +89,7 @@ const Iovec = extern struct { base: [*]u8, len: usize };
 const IovecConst = extern struct { base: [*]const u8, len: usize };
 
 pub fn readAt(fd: c_int, buf: [*]u8, n: usize, offset: i64) isize {
-    const rc = zag_fs_read(fd, buf, n, offset);
+    const rc = stygia_fs_read(fd, buf, n, offset);
     if (rc < 0) {
         __errno_location().* = @intCast(-rc);
         return -1;
@@ -99,7 +99,7 @@ pub fn readAt(fd: c_int, buf: [*]u8, n: usize, offset: i64) isize {
 
 pub fn writeAt(fd: c_int, buf: [*]const u8, n: usize, offset: i64) isize {
     if (fd == 1 or fd == 2) {
-        const written = zag_write_console(buf, n);
+        const written = stygia_write_console(buf, n);
         const signed: isize = @bitCast(written);
         if (signed < 0) {
             __errno_location().* = @intCast(-signed);
@@ -107,7 +107,7 @@ pub fn writeAt(fd: c_int, buf: [*]const u8, n: usize, offset: i64) isize {
         }
         return @intCast(written);
     }
-    const rc = zag_fs_write(fd, buf, n, offset);
+    const rc = stygia_fs_write(fd, buf, n, offset);
     if (rc < 0) {
         __errno_location().* = @intCast(-rc);
         return -1;
@@ -169,7 +169,7 @@ export fn lseek(fd: c_int, offset: i64, whence: c_int) callconv(.c) i64 {
         __errno_location().* = 29; // ESPIPE
         return -1;
     }
-    const rc = zag_fs_lseek(fd, offset, whence);
+    const rc = stygia_fs_lseek(fd, offset, whence);
     if (rc < 0) {
         __errno_location().* = @intCast(-rc);
         return -1;
@@ -185,11 +185,11 @@ export fn lseek64(fd: c_int, offset: i64, whence: c_int) callconv(.c) i64 {
 const Stat = extern struct { _padding: [144]u8 = @splat(0) };
 
 export fn stat(path: [*:0]const u8, st: *Stat) callconv(.c) c_int {
-    return zag_fs_statat(-100, path, pathLen(path), st);
+    return stygia_fs_statat(-100, path, pathLen(path), st);
 }
 export fn fstatat(dir_fd: c_int, path: [*:0]const u8, st: *Stat, flags: c_int) callconv(.c) c_int {
     _ = flags;
-    return zag_fs_statat(dir_fd, path, pathLen(path), st);
+    return stygia_fs_statat(dir_fd, path, pathLen(path), st);
 }
 export fn stat64(path: [*:0]const u8, st: *Stat) callconv(.c) c_int {
     return stat(path, st);
@@ -201,7 +201,7 @@ export fn lstat64(path: [*:0]const u8, st: *Stat) callconv(.c) c_int {
     return stat(path, st);
 }
 export fn fstat(fd: c_int, st: *Stat) callconv(.c) c_int {
-    return zag_fs_fstat(fd, st);
+    return stygia_fs_fstat(fd, st);
 }
 export fn fstat64(fd: c_int, st: *Stat) callconv(.c) c_int {
     return fstat(fd, st);
@@ -247,10 +247,10 @@ export fn fchown(fd: c_int, uid: c_uint, gid: c_uint) callconv(.c) c_int {
     return 0;
 }
 export fn truncate(path: [*:0]const u8, size: i64) callconv(.c) c_int {
-    return zag_fs_truncate(path, pathLen(path), size);
+    return stygia_fs_truncate(path, pathLen(path), size);
 }
 export fn ftruncate(fd: c_int, size: i64) callconv(.c) c_int {
-    return zag_fs_ftruncate(fd, size);
+    return stygia_fs_ftruncate(fd, size);
 }
 export fn ftruncate64(fd: c_int, size: i64) callconv(.c) c_int {
     return ftruncate(fd, size);
@@ -259,11 +259,11 @@ export fn ftruncate64(fd: c_int, size: i64) callconv(.c) c_int {
 // ── path manipulation ─────────────────────────────────────────────
 
 export fn unlink(path: [*:0]const u8) callconv(.c) c_int {
-    return zag_fs_unlinkat(-100, path, pathLen(path));
+    return stygia_fs_unlinkat(-100, path, pathLen(path));
 }
 export fn unlinkat(dir_fd: c_int, path: [*:0]const u8, flags: c_int) callconv(.c) c_int {
     _ = flags;
-    return zag_fs_unlinkat(dir_fd, path, pathLen(path));
+    return stygia_fs_unlinkat(dir_fd, path, pathLen(path));
 }
 export fn remove(path: [*:0]const u8) callconv(.c) c_int {
     return unlink(path);
@@ -307,17 +307,17 @@ export fn realpath(path: [*:0]const u8, resolved: ?[*]u8) callconv(.c) ?[*:0]u8 
 }
 
 export fn mkdir(path: [*:0]const u8, mode: c_uint) callconv(.c) c_int {
-    return zag_fs_mkdirat(-100, path, pathLen(path), mode);
+    return stygia_fs_mkdirat(-100, path, pathLen(path), mode);
 }
 export fn mkdirat(dir_fd: c_int, path: [*:0]const u8, mode: c_uint) callconv(.c) c_int {
-    return zag_fs_mkdirat(dir_fd, path, pathLen(path), mode);
+    return stygia_fs_mkdirat(dir_fd, path, pathLen(path), mode);
 }
 export fn mknod(path: [*:0]const u8, mode: c_uint, dev: u64) callconv(.c) c_int {
     _ = .{ path, mode, dev };
     return fail(ENOSYS);
 }
 
-// ── directory enumeration — stub-ENOSYS until zag_fs_dir extern lands ──
+// ── directory enumeration — stub-ENOSYS until stygia_fs_dir extern lands ──
 
 export fn opendir(path: [*:0]const u8) callconv(.c) ?*anyopaque {
     _ = path;

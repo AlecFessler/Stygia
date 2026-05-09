@@ -19,10 +19,10 @@ const log_mod = @import("log.zig");
 const mode = @import("mode.zig");
 const record_mod = @import("record.zig");
 const trace_id_mod = @import("trace_id.zig");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const debug_info = zag.utils.debug_info;
+const arch = stygia.arch.dispatch;
+const debug_info = stygia.utils.debug_info;
 
 const Record = record_mod.Record;
 

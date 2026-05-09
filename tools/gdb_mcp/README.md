@@ -1,6 +1,6 @@
 # gdb_mcp
 
-Persistent gdb session for debugging the Zag kernel under qemu's gdb stub.
+Persistent gdb session for debugging the Stygia kernel under qemu's gdb stub.
 Drives a single long-lived `gdb -interpreter=mi3` subprocess via stdio
 JSON-RPC, with symbol and struct-field resolution backed by the callgraph
 SQLite DB built by `tools/indexer`. The DB is the workaround for gdb's
@@ -30,9 +30,9 @@ Add to `~/.claude.json` under `mcpServers`:
 ```json
 "gdb": {
   "type": "stdio",
-  "command": "/home/alec/Zag/tools/gdb_mcp/zig-out/bin/gdb_mcp",
+  "command": "/home/alec/Stygia/tools/gdb_mcp/zig-out/bin/gdb_mcp",
   "args": [
-    "--db-dir", "/home/alec/Zag/tools/callgraph_http/test/dbs"
+    "--db-dir", "/home/alec/Stygia/tools/callgraph_http/test/dbs"
   ],
   "env": {}
 }
@@ -54,7 +54,7 @@ CLI args:
 
 2. **Start a session:**
    ```
-   gdb_start { elf: "/home/alec/Zag/zig-out/bin/kernel.elf" }
+   gdb_start { elf: "/home/alec/Stygia/zig-out/bin/kernel.elf" }
    ```
    Default target is `:1234`. Pass `target: "none"` to spawn gdb without
    connecting (useful for sanity-checking symbol resolution).

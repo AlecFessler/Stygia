@@ -1,6 +1,6 @@
 # check_gen_lock (Zig)
 
-Static analyzer for SecureSlab gen-lock coverage on the Zag microkernel
+Static analyzer for SecureSlab gen-lock coverage on the Stygia microkernel
 tree. Port of `tools/check_gen_lock.py` to Zig, backed by
 `std.zig.Tokenizer` so the analyzer sees real tokens (strings, comments,
 paren depth, brace depth) instead of raw source text.

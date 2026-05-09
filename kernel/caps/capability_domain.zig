@@ -22,31 +22,31 @@
 //! paths.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const elf_util = zag.utils.elf;
-const errors = zag.syscall.errors;
-const execution_context_mod = zag.sched.execution_context;
-const pmm = zag.memory.pmm;
-const scheduler = zag.sched.scheduler;
-const userspace_init = zag.boot.userspace_init;
+const arch = stygia.arch.dispatch;
+const elf_util = stygia.utils.elf;
+const errors = stygia.syscall.errors;
+const execution_context_mod = stygia.sched.execution_context;
+const pmm = stygia.memory.pmm;
+const scheduler = stygia.sched.scheduler;
+const userspace_init = stygia.boot.userspace_init;
 
-const Capability = zag.caps.capability.Capability;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const KernelHandle = zag.caps.capability.KernelHandle;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const ParsedElf = zag.utils.elf.ParsedElf;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VMAR = zag.memory.vmar.VMAR;
-const VAddr = zag.memory.address.VAddr;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
-const Word0 = zag.caps.capability.Word0;
+const Capability = stygia.caps.capability.Capability;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const KernelHandle = stygia.caps.capability.KernelHandle;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const ParsedElf = stygia.utils.elf.ParsedElf;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const VMAR = stygia.memory.vmar.VMAR;
+const VAddr = stygia.memory.address.VAddr;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
+const Word0 = stygia.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for the capability_domain
 /// self-handle (slot 0). Spec §[capability_domain] self handle.
@@ -80,8 +80,8 @@ pub const IdcCaps = packed struct(u16) {
     _reserved: u10 = 0,
 };
 
-const MAX_HANDLES_PER_DOMAIN = zag.caps.capability.MAX_HANDLES_PER_DOMAIN;
-const FREE_LIST_TAIL = zag.caps.capability.FREE_LIST_TAIL;
+const MAX_HANDLES_PER_DOMAIN = stygia.caps.capability.MAX_HANDLES_PER_DOMAIN;
+const FREE_LIST_TAIL = stygia.caps.capability.FREE_LIST_TAIL;
 
 /// Start of the per-domain VMAR bump-allocator range. Placed at 64 GiB
 /// so it lives above the boot path's hand-mapped text/data/stack/
@@ -192,9 +192,9 @@ pub const Allocator = SecureSlab(CapabilityDomain, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -242,7 +242,7 @@ pub fn createCapabilityDomain(
 
     // Resolve the ELF page frame in the caller's table. Spec §[14].
     const pf_slot: u12 = @truncate(elf_pf & 0xFFF);
-    const pf_kh = zag.caps.capability.resolveHandleOnDomain(
+    const pf_kh = stygia.caps.capability.resolveHandleOnDomain(
         caller_dom,
         pf_slot,
         .page_frame,
@@ -304,7 +304,7 @@ pub fn createCapabilityDomain(
     // this re-mirror the child's iret epilogue's stack pop faults on
     // the kernel stack VA).
     const child_root_virt = VAddr.fromPAddr(child_cd.addr_space_root, null);
-    zag.arch.dispatch.paging.copyKernelMappings(child_root_virt);
+    stygia.arch.dispatch.paging.copyKernelMappings(child_root_virt);
 
     // Past this point, every error must tear `child_cd` down. The CD's
     // gen-lock is published-live (alloc returned successfully), so a
@@ -348,7 +348,7 @@ pub fn createCapabilityDomain(
     };
 
     // Patch the initial EC's iret frame for user-mode dispatch.
-    zag.arch.dispatch.cpu.patchUserModeIretFrame(
+    stygia.arch.dispatch.cpu.patchUserModeIretFrame(
         child_ec.ctx,
         slid_entry,
         VAddr.fromInt(layout.stack_top),
@@ -391,7 +391,7 @@ pub fn createCapabilityDomain(
         const new_caps: u16 = @truncate((entry >> 16) & 0xFFFF);
         const move = ((entry >> 32) & 0x1) != 0;
 
-        const src_kh = zag.caps.capability.resolveHandleOnDomain(
+        const src_kh = stygia.caps.capability.resolveHandleOnDomain(
             caller_dom,
             src_slot,
             null,
@@ -434,7 +434,7 @@ pub fn createCapabilityDomain(
                 .ptr = child_cd,
                 .gen = @intCast(child_cd._gen_lock.currentGen()),
             };
-            _ = zag.caps.derivation.derive(
+            _ = stygia.caps.derivation.derive(
                 caller_ref,
                 src_slot,
                 child_ref,
@@ -454,22 +454,22 @@ pub fn createCapabilityDomain(
         // unreachable.
         switch (src_type) {
             .page_frame => {
-                const alias_pf: *zag.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                zag.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
+                const alias_pf: *stygia.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                stygia.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
             },
             .timer => {
-                const alias_t: *zag.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                zag.sched.timer.incHandleRef(alias_t) catch unreachable;
+                const alias_t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                stygia.sched.timer.incHandleRef(alias_t) catch unreachable;
             },
             .port => {
-                const alias_p: *zag.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                const alias_p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
                 const port_irq = alias_p._gen_lock.lockIrqSave(@src());
                 defer alias_p._gen_lock.unlockIrqRestore(port_irq);
-                zag.sched.port.onHandleAcquire(alias_p, new_caps) catch unreachable;
+                stygia.sched.port.onHandleAcquire(alias_p, new_caps) catch unreachable;
             },
             .device_region => {
-                const alias_dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                zag.devices.device_region.incHandleRef(alias_dr) catch unreachable;
+                const alias_dr: *stygia.devices.device_region.DeviceRegion = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                stygia.devices.device_region.incHandleRef(alias_dr) catch unreachable;
             },
             else => {},
         }
@@ -479,22 +479,22 @@ pub fn createCapabilityDomain(
             // The alias bump above is the new owner's ref; the caller's
             // old handle goes away, so balance with a matching release.
             switch (src_type) {
-                .page_frame => zag.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
-                .timer => zag.sched.timer.decHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
                 .port => {
-                    const p: *zag.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    const p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
                     const src_caps_word: u16 = @truncate(src_user.word0 >> 48);
-                    zag.sched.port.releaseHandle(p, src_caps_word);
+                    stygia.sched.port.releaseHandle(p, src_caps_word);
                 },
                 .device_region => {
                     // Unlink the source slot's IRQ-propagation node
                     // before dropping the per-handle refcount; see the
                     // matching path in `caps.capability.releaseHandle`.
-                    const dr: *zag.devices.device_region.DeviceRegion =
+                    const dr: *stygia.devices.device_region.DeviceRegion =
                         @ptrCast(@alignCast(src_kh.ref.ptr.?));
                     const dr_irq = dr._gen_lock.lockIrqSave(@src());
-                    zag.devices.device_region.removeHandleListNodeLocked(dr, &caller_dom.kernel_table[src_slot].dr_node);
-                    zag.devices.device_region.releaseHandleLocked(dr, dr_irq);
+                    stygia.devices.device_region.removeHandleListNodeLocked(dr, &caller_dom.kernel_table[src_slot].dr_node);
+                    stygia.devices.device_region.releaseHandleLocked(dr, dr_irq);
                 },
                 else => {},
             }
@@ -547,7 +547,7 @@ pub fn createCapabilityDomain(
     return @intCast(Word0.pack(idc_slot, .capability_domain, caller_cridc));
 }
 
-inline fn pageFrameSizeBytes(sz: zag.memory.vmar.PageSize) u64 {
+inline fn pageFrameSizeBytes(sz: stygia.memory.vmar.PageSize) u64 {
     return switch (sz) {
         .sz_4k => 0x1000,
         .sz_2m => 0x200000,
@@ -579,9 +579,9 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     // `cd._gen_lock`. Mirrors the SLOT_SELF arm in
     // `caps.derivation.deleteAndDetach` and the fault-path SLOT_SELF
     // teardown in `port.fireMemoryFault`.
-    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSaveOrdered(
+    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(
         @src(),
-        zag.caps.derivation.TREE_MUTEX_GROUP,
+        stygia.caps.derivation.TREE_MUTEX_GROUP,
     );
 
     // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
@@ -589,8 +589,8 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     // under the same group inside `lockEntrySkip`) does not trip
     // lockdep's same-class overlap check. See
     // `caps.derivation.TREE_DOMAIN_GROUP` doc comment.
-    const lr = cd_ref.lockOrderedIrqSave(zag.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
-        zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+    const lr = cd_ref.lockOrderedIrqSave(stygia.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
+        stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
         return;
     };
     // destroyPhase1 runs under cd._gen_lock and ends by releasing it
@@ -601,7 +601,7 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     const deferred = destroyPhase1(cd, null);
     arch.cpu.restoreInterrupts(lr.irq_state);
 
-    zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+    stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
 
     destroyPhase2(deferred);
 }
@@ -673,7 +673,7 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     {
         var j: u16 = 0;
         var caller_seen: bool = false;
-        while (j < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (j += 1) {
+        while (j < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (j += 1) {
             const tag = Word0.typeTag(target_cd.user_table[j].word0);
             if (tag != .execution_context) continue;
             const ec_ptr = target_cd.kernel_table[j].ref.ptr orelse continue;
@@ -696,7 +696,7 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
     var seen_caller: bool = false;
 
     var i: u16 = 0;
-    while (i < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
+    while (i < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
         const tag = Word0.typeTag(target_cd.user_table[i].word0);
         if (tag != .execution_context) continue;
         const ec_ref = target_cd.kernel_table[i].ref;
@@ -739,7 +739,7 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
             // walk). Cross-CD case is bailed E_BADCAP above so this
             // branch is currently unreachable, but encoded for the
             // future when cross-CD acquire lands.
-            _ = zag.caps.derivation.derive(
+            _ = stygia.caps.derivation.derive(
                 target_cd_ref,
                 @intCast(i),
                 cd_ref_local,
@@ -882,7 +882,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
         if (n >= minted_slots.len) break;
 
         const var_field0: u64 = v.base_vaddr.addr;
-        const vmar_field1: u64 = zag.memory.vmar.packField1(
+        const vmar_field1: u64 = stygia.memory.vmar.packField1(
             v.page_count,
             v.sz,
             v.cch,
@@ -928,7 +928,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
             var src_slot: u12 = 0;
             var src_found = false;
             var k: u16 = 0;
-            while (k < zag.caps.capability.MAX_HANDLES_PER_DOMAIN) : (k += 1) {
+            while (k < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (k += 1) {
                 const ent = &target_cd.kernel_table[k];
                 if (ent.ref.ptr == null) continue;
                 if (ent.ref.ptr != @as(*anyopaque, @ptrCast(v))) continue;
@@ -946,7 +946,7 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
                     .ptr = cd,
                     .gen = @intCast(cd._gen_lock.currentGen()),
                 };
-                _ = zag.caps.derivation.derive(
+                _ = stygia.caps.derivation.derive(
                     target_cd_ref,
                     src_slot,
                     cd_ref_local,
@@ -1037,11 +1037,11 @@ pub fn allocCapabilityDomain(
     // spec and are NOT on the free list.
     var i: u16 = 3;
     while (i < MAX_HANDLES_PER_DOMAIN - 1) {
-        kernel_table[i].parent = zag.caps.capability.encodeFreeNext(i + 1);
+        kernel_table[i].parent = stygia.caps.capability.encodeFreeNext(i + 1);
         i += 1;
     }
     kernel_table[MAX_HANDLES_PER_DOMAIN - 1].parent =
-        zag.caps.capability.encodeFreeNext(zag.caps.capability.FREE_LIST_TAIL);
+        stygia.caps.capability.encodeFreeNext(stygia.caps.capability.FREE_LIST_TAIL);
     cd.free_head = 3;
     cd.free_count = MAX_HANDLES_PER_DOMAIN - 3;
     cd.var_count = 0;
@@ -1182,7 +1182,7 @@ pub const DestroyDeferred = struct {
 /// `lockEntrySkip` (also `TREE_DOMAIN_GROUP`) trip lockdep's
 /// same-class overlap check.
 pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
-    zag.sched.timer.disarmTimerHandlesInDomain(cd);
+    stygia.sched.timer.disarmTimerHandlesInDomain(cd);
 
     // Spec §[capabilities].revoke / Lifetimes: every live handle in
     // the dying domain may sit on the cross-domain copy-derivation
@@ -1193,7 +1193,7 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
     // reparents children to grandparent so a future revoke on a
     // surviving ancestor still reaches the orphaned subtree (Spec
     // §[capabilities].revoke test 04 generalized to domain destroy).
-    zag.caps.derivation.detachDyingDomainFromTree(cd);
+    stygia.caps.derivation.detachDyingDomainFromTree(cd);
 
     // Tear down every VMAR bound to the domain. The destroy-path
     // variant clears leaf PTEs (so `freeUserAddrSpace` can distinguish
@@ -1209,7 +1209,7 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
             continue;
         };
         // caller-pinned: VMAR's domain.ptr is cd; we hold cd._gen_lock.
-        zag.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
+        stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
     }
 
     const cd_gen = cd._gen_lock.currentGen();
@@ -1252,7 +1252,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
-    zag.sched.execution_context.destroyEcsInDomain(
+    stygia.sched.execution_context.destroyEcsInDomain(
         deferred.cd_ref,
         deferred.cd_addr_space_root,
         deferred.caller_ec,
@@ -1276,7 +1276,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         // freed (Phase 1 ran `destroyLocked`) and we only use the raw
         // pointer value as a key, never deref it.
         const cd_for_identity = deferred.cd_ref.ptr;
-        zag.sched.execution_context.destroyExecutionContextLocked(
+        stygia.sched.execution_context.destroyExecutionContextLocked(
             caller_ref.ptr,
             deferred.cd_addr_space_root,
             cd_for_identity,
@@ -1284,7 +1284,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     }
 
     if (deferred.vm_ref) |vm_slab_ref| {
-        zag.hv.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
+        stygia.hv.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
     }
 
     // Walk slots [3..MAX) and apply per-handle release semantics for
@@ -1312,35 +1312,35 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         const tag = Word0.typeTag(user_table[slot].word0);
         switch (tag) {
             .page_frame => {
-                const pf: *zag.memory.page_frame.PageFrame = @ptrCast(@alignCast(obj_ptr));
+                const pf: *stygia.memory.page_frame.PageFrame = @ptrCast(@alignCast(obj_ptr));
                 const slot_irq = pf._gen_lock.lockIrqSave(@src());
                 if (pf._gen_lock.currentGen() != entry.ref.gen) {
                     pf._gen_lock.unlockIrqRestore(slot_irq);
                     continue;
                 }
-                zag.memory.page_frame.releaseHandleLocked(pf, slot_irq);
+                stygia.memory.page_frame.releaseHandleLocked(pf, slot_irq);
             },
             .timer => {
-                const t: *zag.sched.timer.Timer = @ptrCast(@alignCast(obj_ptr));
+                const t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(obj_ptr));
                 const slot_irq = t._gen_lock.lockIrqSave(@src());
                 if (t._gen_lock.currentGen() != entry.ref.gen) {
                     t._gen_lock.unlockIrqRestore(slot_irq);
                     continue;
                 }
-                zag.sched.timer.decHandleRefLocked(t, slot_irq);
+                stygia.sched.timer.decHandleRefLocked(t, slot_irq);
             },
             .port => {
-                const p: *zag.sched.port.Port = @ptrCast(@alignCast(obj_ptr));
+                const p: *stygia.sched.port.Port = @ptrCast(@alignCast(obj_ptr));
                 const slot_irq = p._gen_lock.lockIrqSave(@src());
                 if (p._gen_lock.currentGen() != entry.ref.gen) {
                     p._gen_lock.unlockIrqRestore(slot_irq);
                     continue;
                 }
                 const caps_word = Word0.caps(user_table[slot].word0);
-                zag.sched.port.releaseHandleLocked(p, caps_word, slot_irq);
+                stygia.sched.port.releaseHandleLocked(p, caps_word, slot_irq);
             },
             .device_region => {
-                const dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj_ptr));
+                const dr: *stygia.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj_ptr));
                 const slot_irq = dr._gen_lock.lockIrqSave(@src());
                 if (dr._gen_lock.currentGen() != entry.ref.gen) {
                     // Slab slot was already torn down by another path;
@@ -1353,8 +1353,8 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
                 // Unlink before the dec so we don't leak a node whose
                 // backing handle-table memory is about to be freed by
                 // `pmm_mgr.freeBlock(deferred.kernel_buf)` below.
-                zag.devices.device_region.removeHandleListNodeLocked(dr, &entry.dr_node);
-                zag.devices.device_region.releaseHandleLocked(dr, slot_irq);
+                stygia.devices.device_region.removeHandleListNodeLocked(dr, &entry.dr_node);
+                stygia.devices.device_region.releaseHandleLocked(dr, slot_irq);
             },
             else => {},
         }
@@ -1370,8 +1370,8 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // pages into user space at `table_base`) are skipped via the
     // [user_buf_phys, user_buf_phys + USER_TABLE_BYTES) range so the
     // wholesale freeBlock below isn't double-freeing them.
-    const user_buf_phys = zag.memory.address.PAddr.fromVAddr(
-        zag.memory.address.VAddr.fromInt(@intFromPtr(deferred.user_buf)),
+    const user_buf_phys = stygia.memory.address.PAddr.fromVAddr(
+        stygia.memory.address.VAddr.fromInt(@intFromPtr(deferred.user_buf)),
         null,
     );
     arch.paging.freeUserAddrSpace(
@@ -1393,9 +1393,9 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
     if (cd.free_count == 0) return null;
     const head = cd.free_head;
-    if (head == zag.caps.capability.FREE_LIST_TAIL) return null;
+    if (head == stygia.caps.capability.FREE_LIST_TAIL) return null;
     const slot: u12 = @truncate(head);
-    const next = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+    const next = stygia.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
     cd.free_head = next;
     cd.free_count -= 1;
     return slot;
@@ -1501,12 +1501,12 @@ fn writeHandleSlot(
     // kernel-VA points into the physmap; `PAddr.fromVAddr(.., null)`
     // recovers the physaddr.
     if (obj_type == .device_region) {
-        const dr: *zag.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj.ptr.?));
-        const field1_va = zag.memory.address.VAddr.fromInt(
+        const dr: *stygia.devices.device_region.DeviceRegion = @ptrCast(@alignCast(obj.ptr.?));
+        const field1_va = stygia.memory.address.VAddr.fromInt(
             @intFromPtr(&cd.user_table[slot].field1),
         );
-        const field1_paddr = zag.memory.address.PAddr.fromVAddr(field1_va, null);
-        zag.devices.device_region.appendHandleListNode(
+        const field1_paddr = stygia.memory.address.PAddr.fromVAddr(field1_va, null);
+        stygia.devices.device_region.appendHandleListNode(
             dr,
             &cd.kernel_table[slot].dr_node,
             field1_paddr,
@@ -1561,17 +1561,17 @@ pub fn allocContiguousFreeSlots(cd: *CapabilityDomain, n: u8) !u12 {
 fn unlinkFreeSlot(cd: *CapabilityDomain, slot: u12) void {
     const slot_u16: u16 = slot;
     if (cd.free_head == slot_u16) {
-        cd.free_head = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+        cd.free_head = stygia.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
         cd.free_count -= 1;
         return;
     }
     var prev: u16 = cd.free_head;
-    while (prev != zag.caps.capability.FREE_LIST_TAIL) {
+    while (prev != stygia.caps.capability.FREE_LIST_TAIL) {
         const prev_idx: u12 = @truncate(prev);
-        const next = zag.caps.capability.decodeFreeNext(cd.kernel_table[prev_idx].parent);
+        const next = stygia.caps.capability.decodeFreeNext(cd.kernel_table[prev_idx].parent);
         if (next == slot_u16) {
-            const after = zag.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
-            cd.kernel_table[prev_idx].parent = zag.caps.capability.encodeFreeNext(after);
+            const after = stygia.caps.capability.decodeFreeNext(cd.kernel_table[slot].parent);
+            cd.kernel_table[prev_idx].parent = stygia.caps.capability.encodeFreeNext(after);
             cd.free_count -= 1;
             return;
         }
@@ -1682,9 +1682,9 @@ pub fn releaseSelf(cd: *CapabilityDomain) DestroyDeferred {
     //
     // Capture the caller EC BEFORE `parkSelfFaulted` clears it from
     // `current_ec`; the phase-2 EC walk must skip this EC.
-    const caller_ec = zag.sched.scheduler.currentEc();
+    const caller_ec = stygia.sched.scheduler.currentEc();
     if (caller_ec) |ec| {
-        zag.sched.execution_context.parkSelfFaulted(ec);
+        stygia.sched.execution_context.parkSelfFaulted(ec);
     }
     return destroyPhase1(cd, caller_ec);
 }

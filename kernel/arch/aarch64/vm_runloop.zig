@@ -10,15 +10,15 @@
 //! `sched.port.fireVmExit`.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const hv_vcpu = zag.arch.aarch64.hv.vcpu;
-const hv_vm = zag.arch.aarch64.hv.vm;
-const hyp = zag.arch.aarch64.hyp;
-const kprof = zag.kprof.trace_id;
-const psci = zag.arch.aarch64.hv.psci;
-const vgic = zag.arch.aarch64.hv.vgic;
-const vm_hw = zag.arch.aarch64.vm;
+const hv_vcpu = stygia.arch.aarch64.hv.vcpu;
+const hv_vm = stygia.arch.aarch64.hv.vm;
+const hyp = stygia.arch.aarch64.hyp;
+const kprof = stygia.kprof.trace_id;
+const psci = stygia.arch.aarch64.hv.psci;
+const vgic = stygia.arch.aarch64.hv.vgic;
+const vm_hw = stygia.arch.aarch64.vm;
 
 /// GICv3 PPI 27 = virtual timer (CNTV) interrupt. Linux's arm_arch_timer
 /// driver wires `arch_timer_handler_virt` to PPI 27 by default.
@@ -29,14 +29,14 @@ const CNTV_CTL_ENABLE: u64 = 1 << 0;
 const CNTV_CTL_IMASK: u64 = 1 << 1;
 const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
-const PAddr = zag.memory.address.PAddr;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const PAddr = stygia.memory.address.PAddr;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 const VmExitInfo = vm_hw.VmExitInfo;
 
 /// VM-exit delivery descriptor returned by `enterGuest`. Mirror of the
-/// dispatch-tier alias in `zag.arch.dispatch.vm.VmExitDelivery` — the
+/// dispatch-tier alias in `stygia.arch.dispatch.vm.VmExitDelivery` — the
 /// type lives here so the dispatch layer remains a pure aliasing shim.
 /// Layout follows spec §[vm_exit_state] aarch64 sub-codes.
 pub const VmExitDelivery = struct {
@@ -562,7 +562,7 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
     gs.cntkctl_el1 = snap.cntkctl_el1;
     gs.cntvoff_el2 = snap.cntvoff_el2;
 
-    if (snap.exit_subcode == zag.hv.virtual_machine.INITIAL_STATE_SUBCODE) return;
+    if (snap.exit_subcode == stygia.hv.virtual_machine.INITIAL_STATE_SUBCODE) return;
     arch_state.started = true;
 }
 

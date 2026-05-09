@@ -1,8 +1,8 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
 pub fn coreCount() u64 {
     return switch (builtin.cpu.arch) {

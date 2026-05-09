@@ -1,14 +1,14 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const paging = zag.arch.dispatch.paging;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const paging = stygia.arch.dispatch.paging;
+const x64 = stygia.arch.x64;
 
-const PmuCounterConfig = zag.syscall.pmu.PmuCounterConfig;
-const PmuInfo = zag.syscall.pmu.PmuInfo;
-const PmuSample = zag.syscall.pmu.PmuSample;
+const PmuCounterConfig = stygia.syscall.pmu.PmuCounterConfig;
+const PmuInfo = stygia.syscall.pmu.PmuInfo;
+const PmuSample = stygia.syscall.pmu.PmuSample;
 
 // --- PMU (performance monitoring unit) dispatch (systems.md §arch-interface, §pmu) ---
 
@@ -19,8 +19,8 @@ pub const PmuState = switch (builtin.cpu.arch) {
 };
 
 /// Compile-time ceiling on the number of counter slots in `PmuSample`.
-/// Duplicated from `zag.syscall.pmu.MAX_COUNTERS` so the arch dispatch
-/// layer does not force its callers to pull in `zag.syscall.pmu` just to
+/// Duplicated from `stygia.syscall.pmu.MAX_COUNTERS` so the arch dispatch
+/// layer does not force its callers to pull in `stygia.syscall.pmu` just to
 /// size a stack buffer.
 pub fn pmuInit() void {
     switch (builtin.cpu.arch) {
@@ -92,7 +92,7 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
 ///
 /// A caller is still responsible for being reasonable about the
 /// address — this helper assumes the kernel half of virtual memory
-/// is fully mapped on the current core (which is true for Zag: kernel
+/// is fully mapped on the current core (which is true for Stygia: kernel
 /// code + stacks + physmap are all pre-mapped by boot and never torn
 /// down). It does not probe the page tables.
 pub fn readKernelU64Safe(addr: u64) ?u64 {

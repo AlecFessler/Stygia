@@ -9,27 +9,27 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const dispatch = zag.arch.dispatch;
-const errors = zag.syscall.errors;
-const scheduler = zag.sched.scheduler;
-const secure_slab = zag.memory.allocators.secure_slab;
+const dispatch = stygia.arch.dispatch;
+const errors = stygia.syscall.errors;
+const scheduler = stygia.sched.scheduler;
+const secure_slab = stygia.memory.allocators.secure_slab;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const GenLock = secure_slab.GenLock;
-const KernelHandle = zag.caps.capability.KernelHandle;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
+const KernelHandle = stygia.caps.capability.KernelHandle;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const PageFrameCaps = stygia.memory.page_frame.PageFrameCaps;
 const SecureSlab = secure_slab.SecureSlab;
 const SlabRef = secure_slab.SlabRef;
-const VAddr = zag.memory.address.VAddr;
-const Word0 = zag.caps.capability.Word0;
+const VAddr = stygia.memory.address.VAddr;
+const Word0 = stygia.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for VMAR handles.
 /// Spec §[var] cap layout.
@@ -169,9 +169,9 @@ pub const Allocator = SecureSlab(VMAR, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -256,7 +256,7 @@ pub fn createVmar(
         const kh = lookupHandle(domain, slot, .device_region) orelse
             return errors.E_BADCAP;
         const cap_bits: u16 = Word0.caps(domain.user_table[slot].word0);
-        const dr_caps: zag.devices.device_region.DeviceRegionCaps = @bitCast(cap_bits);
+        const dr_caps: stygia.devices.device_region.DeviceRegionCaps = @bitCast(cap_bits);
         if (!dr_caps.dma) return errors.E_PERM;
         dev_ptr = @ptrCast(@alignCast(kh.ref.ptr.?));
     }
@@ -264,13 +264,13 @@ pub fn createVmar(
     const base = vaRangeAllocate(domain, @intCast(pages), sz, base_in) orelse
         return errors.E_NOSPC;
 
-    const overlap = zag.caps.capability_domain.checkVaRangeOverlap(domain, base, @as(u64, @intCast(pages)) * sz_bytes);
+    const overlap = stygia.caps.capability_domain.checkVaRangeOverlap(domain, base, @as(u64, @intCast(pages)) * sz_bytes);
     if (overlap != 0) return overlap;
 
     const v = allocVmar(domain, base, @intCast(pages), sz, cch, cur_rwx, dev_ptr) catch
         return errors.E_NOMEM;
 
-    const append_rc = zag.caps.capability_domain.appendVar(domain, v);
+    const append_rc = stygia.caps.capability_domain.appendVar(domain, v);
     if (append_rc != 0) {
         destroyVmar(v);
         return append_rc;
@@ -288,7 +288,7 @@ pub fn createVmar(
     const field0: u64 = base.addr;
     const field1: u64 = packField1(@intCast(pages), sz, cch, cur_rwx, .unmapped, dev_id_at_create);
     const handle_caps: u16 = @truncate(caps);
-    const slot = zag.caps.capability_domain.mintHandle(
+    const slot = stygia.caps.capability_domain.mintHandle(
         domain,
         .{ .ptr = v, .gen = @intCast(v._gen_lock.currentGen()) },
         .virtual_memory_address_region,
@@ -974,7 +974,7 @@ pub fn destroyVmar(v: *VMAR) void {
             v.page_count,
         );
     }
-    zag.caps.capability_domain.removeVar(domain, v);
+    stygia.caps.capability_domain.removeVar(domain, v);
     slab_instance.destroy(v, gen) catch {};
 }
 
@@ -1005,7 +1005,7 @@ pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
         }
         for (&v.installed_pfs) |*entry| {
             if (entry.pf) |pf_ref| {
-                zag.memory.page_frame.releaseMapping(pf_ref.ptr);
+                stygia.memory.page_frame.releaseMapping(pf_ref.ptr);
             }
             entry.* = .{};
         }
@@ -1020,7 +1020,7 @@ pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
             off += sz_bytes;
         }
     }
-    zag.caps.capability_domain.removeVar(domain, v);
+    stygia.caps.capability_domain.removeVar(domain, v);
     slab_instance.destroy(v, gen) catch {};
 }
 
@@ -1204,7 +1204,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     var p: u32 = 0;
     while (p < pf.page_count) {
         const off_p = offset + @as(u64, p) * pf_sz_bytes;
-        const phys_p = zag.memory.address.PAddr.fromInt(
+        const phys_p = stygia.memory.address.PAddr.fromInt(
             pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
         );
         const map_failed = if (vmar_caps.dma) blk: {
@@ -1308,7 +1308,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
                 // this is the matching decrement. `releaseMapping` may
                 // run destroyPageFrame inline if the last handle has
                 // also been released.
-                zag.memory.page_frame.releaseMapping(pf_ref.ptr);
+                stygia.memory.page_frame.releaseMapping(pf_ref.ptr);
                 break;
             }
         }
@@ -1360,7 +1360,7 @@ fn demandAlloc(v: *VMAR, offset: u64) i64 {
         if (entry.pf != null and entry.offset == offset) return 0;
     }
 
-    const pf = zag.memory.page_frame.allocForDemand(v.sz) catch return errors.E_NOMEM;
+    const pf = stygia.memory.page_frame.allocForDemand(v.sz) catch return errors.E_NOMEM;
 
     // Demand-paged PFs are kernel-allocated with no user-visible handle (spec
     // §[snapshot]); spec §[var] demand transition: effective perms = VMAR.cur_rwx.
@@ -1369,14 +1369,14 @@ fn demandAlloc(v: *VMAR, offset: u64) i64 {
     if (rc != 0) {
         // mappingInstall failed before bumping mapcnt; drop the
         // kernel's handle ref to release the PF back to PMM.
-        zag.memory.page_frame.releaseHandle(pf);
+        stygia.memory.page_frame.releaseHandle(pf);
         return rc;
     }
 
     // Spec §[snapshot]: demand pages have no user-visible handle, so
     // drop the refcount=1 we got from allocForDemand. mapcnt=1 keeps
     // the PF alive until `unmap` runs.
-    zag.memory.page_frame.releaseHandle(pf);
+    stygia.memory.page_frame.releaseHandle(pf);
     return 0;
 }
 
@@ -1526,7 +1526,7 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
     // leak the test runner trips on at N>1.
     for (&v.installed_pfs) |*entry| {
         if (entry.pf) |pf_ref| {
-            zag.memory.page_frame.releaseMapping(pf_ref.ptr);
+            stygia.memory.page_frame.releaseMapping(pf_ref.ptr);
         }
         entry.* = .{};
     }
@@ -1581,6 +1581,6 @@ fn decodePortIoFault(
     // servicing; its kernel stack is the running stack and its bound
     // domain is alive across this handler.
     const ec = scheduler.currentEc() orelse return errors.E_BADADDR;
-    return zag.arch.dispatch.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev);
+    return stygia.arch.dispatch.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev);
 }
 

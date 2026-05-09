@@ -1,12 +1,12 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const gdt = zag.arch.x64.gdt;
-const interrupts = zag.arch.x64.interrupts;
+const gdt = stygia.arch.x64.gdt;
+const interrupts = stygia.arch.x64.interrupts;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VAddr = zag.memory.address.VAddr;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VAddr = stygia.memory.address.VAddr;
 
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3

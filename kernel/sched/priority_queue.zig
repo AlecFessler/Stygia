@@ -1,7 +1,7 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 
 pub fn PriorityQueue(
     comptime T: type,

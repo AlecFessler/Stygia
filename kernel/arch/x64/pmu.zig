@@ -9,20 +9,20 @@
 //! detection, and thin dispatch wrappers. The actual MSR-level logic lives
 //! in `intel/pmu.zig` and `amd/pmu.zig`.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const amd_pmu = zag.arch.x64.amd.pmu;
-const cpu = zag.arch.x64.cpu;
-const intel_pmu = zag.arch.x64.intel.pmu;
-const pmu_sched = zag.syscall.pmu;
+const amd_pmu = stygia.arch.x64.amd.pmu;
+const cpu = stygia.arch.x64.cpu;
+const intel_pmu = stygia.arch.x64.intel.pmu;
+const pmu_sched = stygia.syscall.pmu;
 
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuInfo = pmu_sched.PmuInfo;
 const PmuSample = pmu_sched.PmuSample;
 
 /// Per-arch alias for the generic compile-time ceiling. See
-/// `zag.syscall.pmu.MAX_COUNTERS` for the rationale.
+/// `stygia.syscall.pmu.MAX_COUNTERS` for the rationale.
 pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
 const default_config: PmuCounterConfig = .{

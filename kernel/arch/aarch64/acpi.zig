@@ -20,20 +20,20 @@
 //! - ACPI 6.5, Section 5.2.32: SPCR
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64_paging = zag.arch.aarch64.paging;
-const gic = zag.arch.aarch64.gic;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const power = zag.arch.aarch64.power;
-const rtc = zag.arch.aarch64.rtc;
-const serial = zag.arch.aarch64.serial;
-const smp = zag.arch.aarch64.smp;
+const aarch64_paging = stygia.arch.aarch64.paging;
+const gic = stygia.arch.aarch64.gic;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const power = stygia.arch.aarch64.power;
+const rtc = stygia.arch.aarch64.rtc;
+const serial = stygia.arch.aarch64.serial;
+const smp = stygia.arch.aarch64.smp;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Map an MMIO region as Device memory into the kernel's physmap range
 /// (TTBR1). Returns the physmap VA that corresponds to `phys_start`.

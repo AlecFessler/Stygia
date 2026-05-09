@@ -14,7 +14,7 @@
 //     - Reserved-bit check (test 05): we pass core_id == cores. So
 //       long as cores fits in the defined low bits of [1], no
 //       reserved bit is set. The spec doesn't pin the width of the
-//       core_id field, but on any platform Zag targets cores is small
+//       core_id field, but on any platform Stygia targets cores is small
 //       (< 64), so the value is well below any plausible reserved
 //       region and below 2^32.
 //

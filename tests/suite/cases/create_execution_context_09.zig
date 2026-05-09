@@ -20,7 +20,7 @@
 //   E_INVAL.
 //
 //   As a defensive paranoia check, `cores` is asserted to be <= 63 so
-//   that bit `cores` actually fits in a u64. On any platform Zag
+//   that bit `cores` actually fits in a u64. On any platform Stygia
 //   targets this holds trivially; if it ever fails the harness reports
 //   an assertion id rather than silently miscompiling the shift.
 //

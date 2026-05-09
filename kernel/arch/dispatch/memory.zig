@@ -1,8 +1,8 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
 /// Zero a 4 KiB page at `ptr` without first reading its contents into cache.
 /// This is the PMM-free fast path: pages being returned to the free pool

@@ -2,33 +2,33 @@
 //! capability domain. See docs/kernel/specv3.md §[execution_context].
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const errors = zag.syscall.errors;
-const memory_init = zag.memory.init;
-const paging_consts = zag.memory.paging;
-const perfmon_mod = zag.sched.perfmon;
-const pmm = zag.memory.pmm;
-const scheduler = zag.sched.scheduler;
-const stack = zag.memory.stack;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const errors = stygia.syscall.errors;
+const memory_init = stygia.memory.init;
+const paging_consts = stygia.memory.paging;
+const perfmon_mod = stygia.sched.perfmon;
+const pmm = stygia.memory.pmm;
+const scheduler = stygia.sched.scheduler;
+const stack = stygia.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const KernelHandle = zag.caps.capability.KernelHandle;
-const PAddr = zag.memory.address.PAddr;
-const PerfmonState = zag.sched.perfmon.PerfmonState;
-const Port = zag.sched.port.Port;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const Stack = zag.memory.stack.Stack;
-const VAddr = zag.memory.address.VAddr;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
-const WaitNode = zag.sched.futex.WaitNode;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const KernelHandle = stygia.caps.capability.KernelHandle;
+const PAddr = stygia.memory.address.PAddr;
+const PerfmonState = stygia.sched.perfmon.PerfmonState;
+const Port = stygia.sched.port.Port;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const Stack = stygia.memory.stack.Stack;
+const VAddr = stygia.memory.address.VAddr;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
+const WaitNode = stygia.sched.futex.WaitNode;
 
 /// Upper bound on simultaneous futex wait addresses for a single EC.
 /// Mirrors `futex.MAX_FUTEX_ADDRS` (the public spec ceiling) so each
@@ -521,9 +521,9 @@ pub const Allocator = SecureSlab(ExecutionContext, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -728,14 +728,14 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // `finalizeDestroyMarkedDead` unmaps the kstack pages, which
     // would leave the futex bucket queues holding pointers into
     // unmapped memory and fault the next `wake()` walk.
-    zag.sched.futex.cancelWait(ec);
-    if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
+    stygia.sched.futex.cancelWait(ec);
+    if (ec.recv_deadline_ns != 0) stygia.sched.port.cancelRecvDeadline(ec);
 
     // Clear any per-core `last_fpu_owner` slot still naming this EC —
     // otherwise the next FP-disabled trap on that core would
     // `fpuSave(&ec.fpu_state)` into a slab slot we're about to gen-
     // bump and (eventually) recycle to another EC.
-    zag.sched.fpu.clearFromLastFpuOwner(ec);
+    stygia.sched.fpu.clearFromLastFpuOwner(ec);
 
     for (&ec.event_routes) |*slot_ptr| slot_ptr.* = null;
 
@@ -1087,7 +1087,7 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
         return errors.E_NOMEM;
     };
 
-    var decoded: [perfmon_mod.MAX_COUNTERS]zag.syscall.pmu.PmuCounterConfig = undefined;
+    var decoded: [perfmon_mod.MAX_COUNTERS]stygia.syscall.pmu.PmuCounterConfig = undefined;
     var active_mask: u8 = 0;
     var threshold_mask: u8 = 0;
 
@@ -1193,7 +1193,7 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     if (target_ec == caller) {
         arch.pmu.pmuSave(&ps.arch_state);
     }
-    var sample: zag.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
+    var sample: stygia.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
     arch.pmu.pmuRead(&ps.arch_state, &sample);
     if (target_ec == caller) {
         arch.pmu.pmuRestore(&ps.arch_state);
@@ -1388,7 +1388,7 @@ pub fn suspendOnPort(
     // path so it can take the receiver's CD lock without inverting the
     // canonical CD → Port order. On `false` it leaves Port held.
     if (port.waiter_kind == .receivers) {
-        if (zag.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr, irq_state)) {
+        if (stygia.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr, irq_state)) {
             const core_id: u8 = @truncate(arch.smp.coreID());
             if (scheduler.coreCurrentIs(core_id, ec)) {
                 scheduler.clearCurrentEc(core_id);
@@ -1455,13 +1455,13 @@ pub fn abandonPendingReply(ec: *ExecutionContext) void {
             defer dom_ref.unlockIrqRestore(domlr.irq_state);
             const slot = ec.pending_reply_slot;
             const word0 = dom.user_table[slot].word0;
-            const tag = zag.caps.capability.Word0.typeTag(word0);
+            const tag = stygia.caps.capability.Word0.typeTag(word0);
             if (tag == .reply) {
-                const caps_u16 = zag.caps.capability.Word0.caps(word0);
-                var rc: zag.sched.port.ReplyCaps = @bitCast(caps_u16);
+                const caps_u16 = stygia.caps.capability.Word0.caps(word0);
+                var rc: stygia.sched.port.ReplyCaps = @bitCast(caps_u16);
                 rc.abandoned = true;
                 const new_caps: u16 = @bitCast(rc);
-                dom.user_table[slot].word0 = zag.caps.capability.Word0.pack(slot, .reply, new_caps);
+                dom.user_table[slot].word0 = stygia.caps.capability.Word0.pack(slot, .reply, new_caps);
             }
         } else |_| {}
     }
@@ -1711,9 +1711,9 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
             port_ref.unlockIrqRestore(plr.irq_state);
         }
     }
-    zag.sched.futex.cancelWait(ec);
-    if (ec.recv_deadline_ns != 0) zag.sched.port.cancelRecvDeadline(ec);
-    zag.sched.fpu.clearFromLastFpuOwner(ec);
+    stygia.sched.futex.cancelWait(ec);
+    if (ec.recv_deadline_ns != 0) stygia.sched.port.cancelRecvDeadline(ec);
+    stygia.sched.fpu.clearFromLastFpuOwner(ec);
 
     // Spec §[port] lifetime: each kernel-held event route increments
     // the destination port's bind_refcount; the matching dec runs
@@ -1726,7 +1726,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
             slot.* = null;
             continue;
         };
-        zag.sched.port.decBindRef(port_lr.ptr);
+        stygia.sched.port.decBindRef(port_lr.ptr);
         port_ref.unlockIrqRestore(port_lr.irq_state);
         slot.* = null;
     }
@@ -1750,7 +1750,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 cursor = &node.vcpu_list_next;
             }
             ec.vcpu_list_next = null;
-            zag.sched.port.decBindRef(p);
+            stygia.sched.port.decBindRef(p);
             port_ref.unlockIrqRestore(plr.irq_state);
         } else |_| {}
         ec.exit_port = null;

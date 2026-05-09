@@ -25,7 +25,7 @@
 //      `OUTS` instruction against the VMAR's virtual range from the
 //      test child. The test child runs in CPL3 (userspace), and on
 //      x86-64 the named string/port mnemonics are CPL-gated by
-//      IOPL. The Zag kernel does not grant IOPL to user processes,
+//      IOPL. The Stygia kernel does not grant IOPL to user processes,
 //      so any `in`/`out`/`ins`/`outs` issued by this ELF would be
 //      rejected by the CPU itself with a #GP delivered as a
 //      thread_fault before the page-fault handler that backs the

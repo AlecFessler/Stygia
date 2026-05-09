@@ -1,14 +1,14 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const address = zag.memory.address;
-const arch = zag.arch.dispatch;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
+const address = stygia.memory.address;
+const arch = stygia.arch.dispatch;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
 
-const PAddr = zag.memory.address.PAddr;
-const SpinLock = zag.utils.sync.SpinLock;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const SpinLock = stygia.utils.sync.SpinLock;
+const VAddr = stygia.memory.address.VAddr;
 
 const STACK_RANGE_START: u64 = address.KernelVA.kernel_stacks.start;
 const STACK_RANGE_END: u64 = address.KernelVA.kernel_stacks.end;

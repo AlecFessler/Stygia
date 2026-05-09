@@ -1,22 +1,22 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const hv = zag.arch.aarch64.hv;
+const hv = stygia.arch.aarch64.hv;
 const hv_vcpu = hv.vcpu;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const serial = zag.arch.aarch64.serial;
-const stage2_mod = zag.arch.aarch64.stage2;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const serial = stygia.arch.aarch64.serial;
+const stage2_mod = stygia.arch.aarch64.stage2;
 const vgic_mod = hv.vgic;
-const vm_hw = zag.arch.aarch64.vm;
+const vm_hw = stygia.arch.aarch64.vm;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const VAddr = zag.memory.address.VAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const VAddr = stygia.memory.address.VAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 
 // PL011 IPA range Linux's amba-pl011 driver is wired to in our minimal
 // FDT. Inline-handling stage-2 faults on this page in the kernel keeps
@@ -277,7 +277,7 @@ pub fn invalidateStage2Range(
 /// bits [40..63] of the u64 vreg. Per §[vm_set_policy] test 04 these
 /// must be zero on entry; reject E_INVAL otherwise.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
-    const errors = zag.syscall.errors;
+    const errors = stygia.syscall.errors;
 
     // Spec §[vm_set_policy] aarch64 layout: kind 0 = id_reg_responses
     // (max MAX_ID_REG_RESPONSES), kind 1 = sysreg_policies (max
@@ -385,7 +385,7 @@ pub fn vmPolicyFor(vm: *VirtualMachine) ?*const vm_hw.VmPolicy {
 /// pending state into the guest's CPU interface (via list-register
 /// programming on stage-2 entry) is the vCPU run loop's responsibility.
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
-    const errors = zag.syscall.errors;
+    const errors = stygia.syscall.errors;
     if (irq_num >= vgic_mod.TOTAL_DIST_INTIDS)
         return errors.E_INVAL;
 

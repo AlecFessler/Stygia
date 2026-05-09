@@ -16,14 +16,14 @@
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ZAG_ROOT="$(cd -- "$HERE/../../.." && pwd)"
+STYGIA_ROOT="$(cd -- "$HERE/../../.." && pwd)"
 PORT="${CALLGRAPH_HTTP_PORT:-18190}"
 
 if [[ $# -ge 1 ]]; then
     DB_PATH="$1"
     DB_DIR="$(dirname "$DB_PATH")"
 else
-    DB_DIR="$ZAG_ROOT/tools/callgraph_http/test/dbs"
+    DB_DIR="$STYGIA_ROOT/tools/callgraph_http/test/dbs"
     DB_PATH="$(ls "$DB_DIR"/x86_64-*.db 2>/dev/null | head -1 || true)"
 fi
 
@@ -33,19 +33,19 @@ if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
     exit 2
 fi
 
-HEAD_SHA="$(cd "$ZAG_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+HEAD_SHA="$(cd "$STYGIA_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
 DB_SHA="$(sqlite3 "$DB_PATH" "SELECT value FROM meta WHERE key='commit_sha'" 2>/dev/null || echo unknown)"
 
-CALLGRAPH_BIN="$ZAG_ROOT/tools/callgraph_http/zig-out/bin/callgraph_http"
+CALLGRAPH_BIN="$STYGIA_ROOT/tools/callgraph_http/zig-out/bin/callgraph_http"
 if [[ ! -x "$CALLGRAPH_BIN" ]]; then
-    (cd "$ZAG_ROOT/tools/callgraph_http" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
+    (cd "$STYGIA_ROOT/tools/callgraph_http" && zig build) >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 echo "smoke: DB=$DB_PATH (sha=$DB_SHA)"
 echo "       repo HEAD=$HEAD_SHA"
 echo "       port=$PORT"
 
-"$CALLGRAPH_BIN" --db-dir "$DB_DIR" --port "$PORT" --git-root "$ZAG_ROOT" >/tmp/callgraph_http_smoke.log 2>&1 &
+"$CALLGRAPH_BIN" --db-dir "$DB_DIR" --port "$PORT" --git-root "$STYGIA_ROOT" >/tmp/callgraph_http_smoke.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
@@ -73,7 +73,7 @@ probe() {
 
 # A first git-tracked file is needed for diff_hunks; pick the top one
 # from the head commit.
-DIFF_PATH="$(cd "$ZAG_ROOT" && git show --pretty='' --name-only "$DB_SHA" 2>/dev/null | head -1 || echo build.zig)"
+DIFF_PATH="$(cd "$STYGIA_ROOT" && git show --pretty='' --name-only "$DB_SHA" 2>/dev/null | head -1 || echo build.zig)"
 # Spaces only — slashes go raw, the server's query-string parser handles them.
 DIFF_PATH_ENC="$(printf '%s' "$DIFF_PATH" | sed 's| |%20|g')"
 

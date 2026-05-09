@@ -3,9 +3,9 @@
 /// APIC registers are memory-mapped at base 0xFEE00000, 4 KiB region.
 /// All registers are 32-bit, aligned on 128-bit (16-byte) boundaries.
 /// Table 13-1: Local APIC Register Address Map.
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const Ioapic = zag.arch.x64.hv.ioapic.Ioapic;
+const Ioapic = stygia.arch.x64.hv.ioapic.Ioapic;
 
 // Register offsets from APIC base (Table 13-1)
 const REG_ID: u32 = 0x020; // Local APIC ID Register -- R/W

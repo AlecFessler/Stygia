@@ -1,11 +1,11 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const elf = zag.utils.elf;
+const elf = stygia.utils.elf;
 
-const PAddr = zag.memory.address.PAddr;
-const ParsedElf = zag.utils.elf.ParsedElf;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const ParsedElf = stygia.utils.elf.ParsedElf;
+const VAddr = stygia.memory.address.VAddr;
 
 pub var global_ptr: ?*std.debug.Dwarf = null;
 pub var kaslr_slide: u64 = 0;
@@ -18,7 +18,7 @@ pub var kaslr_slide: u64 = 0;
 /// region so the dwarf parse has no runtime allocator dependency —
 /// the kernel heap is gone.
 ///
-/// Size is a tuned constant: dwarf indexes for the current Zag kernel
+/// Size is a tuned constant: dwarf indexes for the current Stygia kernel
 /// fit comfortably under 2 MiB. If the kernel grows past the budget,
 /// `Dwarf.open` returns OutOfMemory and `init()` returns without
 /// setting `global_ptr`, degrading panic output to raw addresses

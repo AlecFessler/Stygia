@@ -1,10 +1,10 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const paging = zag.arch.x64.paging;
+const cpu = stygia.arch.x64.cpu;
+const paging = stygia.arch.x64.paging;
 
-const SpinLock = zag.utils.sync.SpinLock;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 /// Bitmap-based PCID (Process Context Identifier) allocator.
 ///

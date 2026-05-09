@@ -132,8 +132,8 @@ pub fn handle(state: *GuestState) void {
         },
         // Processor brand string (3 leaves)
         0x80000002 => {
-            // "Zag Virtual CP"
-            state.rax = 0x2067615A; // "Zag "
+            // "Stygia Virtual CP"
+            state.rax = 0x2067615A; // "Stygia "
             state.rbx = 0x74726956; // "Virt"
             state.rcx = 0x206C6175; // "ual "
             state.rdx = 0x00005043; // "CP\0\0"

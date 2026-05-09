@@ -1,14 +1,14 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const vm_hw = zag.arch.x64.vm;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const vm_hw = stygia.arch.x64.vm;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
 const FxsaveArea = vm_hw.FxsaveArea;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 const VmExitInfo = vm_hw.VmExitInfo;
 
 /// Per-vCPU arch state. Lives in a single 4 KiB page allocated by

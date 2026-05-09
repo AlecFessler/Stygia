@@ -1,6 +1,6 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
+const cpu = stygia.arch.x64.cpu;
 
 const E_OK: i64 = 0;
 const E_NODEV: i64 = -13;

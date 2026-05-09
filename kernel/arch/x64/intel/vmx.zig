@@ -4,19 +4,19 @@
 /// Handles VMXON/VMXOFF, VMCS allocation and management, VM entry/exit,
 /// and EPT (Extended Page Tables) setup.
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const gdt = zag.arch.x64.gdt;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const vm_mod = zag.arch.x64.vm;
+const cpu = stygia.arch.x64.cpu;
+const gdt = stygia.arch.x64.gdt;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const vm_mod = stygia.arch.x64.vm;
 
 const GuestException = vm_mod.GuestException;
 const GuestInterrupt = vm_mod.GuestInterrupt;
 const GuestState = vm_mod.GuestState;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 const VmExitInfo = vm_mod.VmExitInfo;
 
 // ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ pub fn perCoreInit() void {
     rev_ptr.* = vmx_revision_id;
 
     const phys = pageToPhys(page);
-    const core_id = zag.arch.x64.apic.coreID();
+    const core_id = stygia.arch.x64.apic.coreID();
     vmxon_regions[core_id] = phys;
 
     asm volatile (
@@ -572,7 +572,7 @@ fn initVmcs(ept_root_phys: PAddr) void {
     vmcsWrite(HOST_GS_BASE, cpu.rdmsr(IA32_GS_BASE));
 
     // Host TR base — read from the GDT TSS descriptor
-    const core_id = zag.arch.x64.apic.coreID();
+    const core_id = stygia.arch.x64.apic.coreID();
     vmcsWrite(HOST_TR_BASE, @intFromPtr(gdt.coreTss(core_id)));
 
     // Host GDTR/IDTR base — read via SGDT/SIDT
@@ -1220,7 +1220,7 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
 /// VMX transitions; SDM 28.3.3.1). VPID is currently not enabled, which
 /// changes linear/combined mapping invalidation but not EPT-only mappings.
 ///
-/// Caller contract (per Zag's current hv architecture, see
+/// Caller contract (per Stygia's current hv architecture, see
 /// `kernel/arch/x64/hv/vm.zig` and `guest_memory.zig`):
 ///
 ///   1. `guest_mem.deinit` teardown path — called only from `Vm.destroy`,

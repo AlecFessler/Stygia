@@ -51,10 +51,10 @@ fn writeHeader(buf: []u8, sig: *const [4]u8, length: u32, revision: u8) void {
     writeU32(buf, 4, length);
     buf[8] = revision;
     buf[9] = 0; // checksum — filled in after table is complete
-    @memcpy(buf[10..16], "ZAGVMM");
-    @memcpy(buf[16..24], "ZAGKERML");
+    @memcpy(buf[10..16], "STYGIA");
+    @memcpy(buf[16..24], "STYGIAVM");
     writeU32(buf, 24, 1); // OEM revision
-    @memcpy(buf[28..32], "ZAG ");
+    @memcpy(buf[28..32], "STYG");
     writeU32(buf, 32, 1); // ASL compiler revision
 }
 
@@ -80,7 +80,7 @@ fn finalizeChecksum(buf: []u8, length: u32) void {
 noinline fn buildRsdp() void {
     @memset(&rsdp_buf, 0);
     @memcpy(rsdp_buf[0..8], "RSD PTR ");
-    @memcpy(rsdp_buf[9..15], "ZAGVMM");
+    @memcpy(rsdp_buf[9..15], "STYGIA");
     rsdp_buf[15] = 2; // Revision 2 (ACPI 2.0+)
     writeU32(&rsdp_buf, 16, 0); // RsdtAddress — 0, Linux uses XSDT for rev 2
     writeU32(&rsdp_buf, 20, 36); // Length
@@ -367,7 +367,7 @@ noinline fn buildFadt() void {
     writeGas(buf[208..], 0, 0, 0, 0, 0);
 
     // Hypervisor Vendor Identity (offset 268, 8 bytes) — ACPI 6.0+
-    @memcpy(buf[268..276], "ZAGVMM\x00\x00");
+    @memcpy(buf[268..276], "STYGIA\x00\x00");
 
     finalizeChecksum(buf, FADT_TOTAL_LEN);
 }

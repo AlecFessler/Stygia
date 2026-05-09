@@ -25,9 +25,9 @@
 const log = @import("log.zig");
 const mode = @import("mode.zig");
 const record = @import("record.zig");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 
 const Kind = record.Kind;
 
@@ -84,7 +84,7 @@ pub fn onNmi(ip: u64, fp: u64) bool {
     //
     // Every dereference goes through `arch.pmu.readKernelU64Safe`, which
     // rejects null, unaligned, and non-kernel-half addresses. That is
-    // sufficient defense — Zag maps the entire kernel half on boot
+    // sufficient defense — Stygia maps the entire kernel half on boot
     // and never unmaps it at runtime, so any address passing those
     // checks is safely readable from NMI context.
     var cur_fp: u64 = fp;

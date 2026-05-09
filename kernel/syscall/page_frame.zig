@@ -1,6 +1,6 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const page_frame = zag.memory.page_frame;
+const page_frame = stygia.memory.page_frame;
 
 /// Allocates physical memory and returns a page frame handle.
 ///

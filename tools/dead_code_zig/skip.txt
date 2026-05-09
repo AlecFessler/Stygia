@@ -570,18 +570,18 @@ sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193
 #   * libz/libc/src/libc.zig (panic) — std.debug.no_panic override so
 #     debug-mode safety checks compile cleanly without dragging in
 #     Zig's stack-trace machinery (selfExePath et al. don't exist on
-#     Zag).
+#     Stygia).
 #   * libz/libc/src/malloc.zig (MallInfo2 fields) — glibc-shaped
 #     mallinfo2() return struct; layout-bearing for ABI compat even
 #     though we always return zeros.
 #   * libz/libc/src/posix_io.zig (Stat._padding) — opaque stat-buffer
 #     padding sized to glibc layout; the kernel writes the meaningful
-#     bytes via `zag_fs_stat`.
+#     bytes via `stygia_fs_stat`.
 #   * libz/libc/src/process.zig (Rusage._padding) — opaque rusage
 #     padding sized to glibc layout for getrusage() ABI compat.
 #   * libz/libc/src/signal.zig (SIG_IGN, SIG_ERR) — POSIX-defined
 #     sentinels exposed for signal-handler registration even though
-#     Zag never delivers signals.
+#     Stygia never delivers signals.
 #
 arch/aarch64/hyp.zig:170-170    sha256:153daade694ad96a9fca6919baa75c118017af8e5440161e2f66eb3fc1dd01b2
 arch/aarch64/hyp.zig:171-171    sha256:9bca0ec231de07d5eb6c433ba69cb3a1ce8922eef3d83911efa5c9124c0d7704
@@ -696,11 +696,11 @@ libz/syscall_aarch64.zig:37-37    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78
 libz/syscall_aarch64_extern.zig:37-37    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
 libz/syscall_x64.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
 libz/syscall_x64_extern.zig:27-27    sha256:146ff037f7b2bcac98a5b1fbec03a1354b62a78dd6ca37848b8c6afb86aff52f
-arch/aarch64/exceptions.zig:84-84    sha256:00f74004fe5d6c96c4716a834c046dd0a9ea15dbfd77faa570ccbd8e0bd865d6
-arch/aarch64/exceptions.zig:86-86    sha256:915bb4d3f09477295e9a515b896a7996b6e9e9df97e6595e4b29f3d221074b0a
-arch/aarch64/exceptions.zig:88-88    sha256:38a8c4a782ab95a230659d945f14cc0af263ed65dbf0d43f2632852679539666
-arch/aarch64/exceptions.zig:90-90    sha256:3d0d714c72873450f8491720de4ee87265c0c93f98d75299ee35b10b840faa54
-arch/aarch64/exceptions.zig:118-118    sha256:e0b170ed7d51ca8f27daa29bcd13f3eaa1f15cdcfc70945b4a014b5ca6def279
+arch/aarch64/exceptions.zig:85-85    sha256:00f74004fe5d6c96c4716a834c046dd0a9ea15dbfd77faa570ccbd8e0bd865d6
+arch/aarch64/exceptions.zig:87-87    sha256:915bb4d3f09477295e9a515b896a7996b6e9e9df97e6595e4b29f3d221074b0a
+arch/aarch64/exceptions.zig:89-89    sha256:38a8c4a782ab95a230659d945f14cc0af263ed65dbf0d43f2632852679539666
+arch/aarch64/exceptions.zig:91-91    sha256:3d0d714c72873450f8491720de4ee87265c0c93f98d75299ee35b10b840faa54
+arch/aarch64/exceptions.zig:119-119    sha256:e0b170ed7d51ca8f27daa29bcd13f3eaa1f15cdcfc70945b4a014b5ca6def279
 arch/aarch64/hv/vgic.zig:60-60    sha256:7f6f557989fe5304344e8c094e2c998134fe93337eca5e181bbb6a6ab9b9942a
 arch/aarch64/hv/vgic.zig:62-62    sha256:7188c0104a4965589ef0679720da09a354b428e9c15f2b68cc396bf7117908ae
 arch/aarch64/hv/vgic.zig:64-64    sha256:9331cef17b97876cabbcc55b2266185af481fc25a63663123e3e08aa4376451b

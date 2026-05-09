@@ -10,27 +10,27 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const ec_log = zag.utils.ec_log;
-const execution_context = zag.sched.execution_context;
-const kprof = zag.kprof.trace_id;
-const port_mod = zag.sched.port;
-const stack_mod = zag.memory.stack;
+const arch = stygia.arch.dispatch;
+const ec_log = stygia.utils.ec_log;
+const execution_context = stygia.sched.execution_context;
+const kprof = stygia.kprof.trace_id;
+const port_mod = stygia.sched.port;
+const stack_mod = stygia.memory.stack;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const Priority = zag.sched.execution_context.Priority;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
-const Stack = zag.memory.stack.Stack;
-const VAddr = zag.memory.address.VAddr;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Priority = stygia.sched.execution_context.Priority;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const SpinLock = stygia.utils.sync.SpinLock;
+const Stack = stygia.memory.stack.Stack;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Intrusive priority queue of ECs, linked through the EC's `next`
 /// field and ordered by `priority`. Shared by per-core run queues and
 /// port wait queues. Futex buckets use a separate WaitNode-based queue
 /// (see sched/futex.zig).
-pub const EcQueue = zag.sched.priority_queue.PriorityQueue(
+pub const EcQueue = stygia.sched.priority_queue.PriorityQueue(
     ExecutionContext,
     "next",
     "priority",
@@ -218,17 +218,17 @@ pub fn perCoreInit() void {
     const park = stack_mod.createKernel() catch @panic("park kstack alloc failed");
     var page_addr: u64 = park.base.addr;
     while (page_addr < park.top.addr) {
-        const pmm_mgr = if (zag.memory.pmm.global_pmm) |*p| p else @panic("park kstack: pmm not ready");
-        const page = pmm_mgr.create(zag.memory.paging.PageMem(.page4k)) catch @panic("park kstack: pmm OOM");
-        const phys = zag.memory.address.PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+        const pmm_mgr = if (stygia.memory.pmm.global_pmm) |*p| p else @panic("park kstack: pmm not ready");
+        const page = pmm_mgr.create(stygia.memory.paging.PageMem(.page4k)) catch @panic("park kstack: pmm OOM");
+        const phys = stygia.memory.address.PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         arch.paging.mapPage(
-            zag.memory.init.kernel_addr_space_root,
+            stygia.memory.init.kernel_addr_space_root,
             phys,
             VAddr.fromInt(page_addr),
             .{ .read = true, .write = true },
             .kernel_data,
         ) catch @panic("park kstack: map failed");
-        page_addr += zag.memory.paging.PAGE4K;
+        page_addr += stygia.memory.paging.PAGE4K;
     }
     (&core_states[core]).park_stack = park;
 
@@ -318,7 +318,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
             // prior `consumeReply`'s reply-time values.
             @memset(std.mem.asBytes(&current.ctx.regs), 0);
             break :blk arch.vm.VmExitDelivery{
-                .subcode = zag.hv.virtual_machine.INITIAL_STATE_SUBCODE,
+                .subcode = stygia.hv.virtual_machine.INITIAL_STATE_SUBCODE,
                 .payload = .{ 0, 0, 0 },
             };
         };
@@ -991,6 +991,6 @@ fn pickCoreForAffinity(affinity: u64) u8 {
 /// safely FXRSTOR from a fresh buffer. Delegates to `sched.fpu` which
 /// owns the per-arch mailbox protocol.
 pub fn migrateFlush(ec: *ExecutionContext) void {
-    zag.sched.fpu.migrateFlush(ec);
+    stygia.sched.fpu.migrateFlush(ec);
 }
 

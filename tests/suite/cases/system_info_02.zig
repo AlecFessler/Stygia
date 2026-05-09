@@ -14,7 +14,7 @@
 //
 //     - The runner targets QEMU images that always boot with at least
 //       a few hundred MiB of RAM. Even on the smallest sane platform
-//       Zag targets, total_phys_pages must be strictly positive (a
+//       Stygia targets, total_phys_pages must be strictly positive (a
 //       zero-page system could not have loaded the kernel that just
 //       returned this value).
 //     - It must also fit in a u64 by construction; any value the

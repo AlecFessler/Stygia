@@ -1,8 +1,8 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
 /// Mask an IRQ line at the interrupt controller. `irq_line` is the
 /// kernel-internal IRQ-source key (the value `device_region.irq_source`

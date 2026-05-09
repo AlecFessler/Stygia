@@ -19,7 +19,7 @@
 #
 # Env knobs:
 #   PI_HOST=user@ip      # override Pi SSH target
-#   PI_REMOTE_DIR=path   # override Pi-side artifact dir (default \$HOME/zag-test)
+#   PI_REMOTE_DIR=path   # override Pi-side artifact dir (default \$HOME/stygia-test)
 
 set -u
 
@@ -31,7 +31,7 @@ case "${1:-}" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ZAG_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+STYGIA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
 # Stays as a relative path so both ssh-shell-expansion contexts
@@ -40,7 +40,7 @@ PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
 # to the same place. Don't add a leading $HOME or `~` here — scp
 # wouldn't expand `$HOME` (no remote shell) and `~` only works
 # unquoted, which would break the ssh contexts.
-PI_REMOTE_DIR="${PI_REMOTE_DIR:-zag-test}"
+PI_REMOTE_DIR="${PI_REMOTE_DIR:-stygia-test}"
 
 FAILURES=()
 
@@ -83,13 +83,13 @@ stage_arch_layering_lint() {
     echo "=================================================="
     echo "[0] Arch layering lint (token-aware analyzer)"
     echo "=================================================="
-    if ! (cd "$ZAG_ROOT/tools/check_arch_layering" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tools/check_arch_layering" && zig build 2>&1); then
         FAILURES+=("arch-layering analyzer build")
         return 1
     fi
     ensure_callgraph_db || return 1
-    local analyzer="$ZAG_ROOT/tools/check_arch_layering/zig-out/bin/check_arch_layering"
-    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB"); then
+    local analyzer="$STYGIA_ROOT/tools/check_arch_layering/zig-out/bin/check_arch_layering"
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB"); then
         FAILURES+=("arch layering lint")
         return 1
     fi
@@ -98,32 +98,32 @@ stage_arch_layering_lint() {
 # Build the per-(arch, commit_sha) callgraph DB if it isn't present yet.
 # Both the dead-code analyzer and the gen-lock analyzer read from it.
 ensure_callgraph_db() {
-    if ! (cd "$ZAG_ROOT/tools/indexer" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tools/indexer" && zig build 2>&1); then
         FAILURES+=("callgraph indexer build")
         return 1
     fi
     local sha
-    sha="$(cd "$ZAG_ROOT" && git rev-parse --short HEAD)"
-    CALLGRAPH_DB="$ZAG_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
+    sha="$(cd "$STYGIA_ROOT" && git rev-parse --short HEAD)"
+    CALLGRAPH_DB="$STYGIA_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
     if [[ -f "$CALLGRAPH_DB" ]]; then return 0; fi
     # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
     # build left an ARM ELF in zig-out/, the indexer's objdump pass would
     # fail silently and produce an empty bin_inst table.
     local need_rebuild=0
-    if [[ ! -f "$ZAG_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$ZAG_ROOT/zig-out/bin/kernel.elf" ]]; then
+    if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$STYGIA_ROOT/zig-out/bin/kernel.elf" ]]; then
         need_rebuild=1
-    elif ! file "$ZAG_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
+    elif ! file "$STYGIA_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
         echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
         need_rebuild=1
     fi
     if [[ $need_rebuild -eq 1 ]]; then
         echo "  building kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
-        if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
+        if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
             FAILURES+=("kernel build for IR/ELF")
             return 1
         fi
     fi
-    if ! (cd "$ZAG_ROOT" && tools/indexer/zig-out/bin/indexer \
+    if ! (cd "$STYGIA_ROOT" && tools/indexer/zig-out/bin/indexer \
         --kernel-root kernel \
         --extra-source-root bootloader \
         --extra-source-root tools \
@@ -144,17 +144,17 @@ stage_dead_code_report() {
     echo "=================================================="
     echo "[0b] Dead-code detector (gating)"
     echo "=================================================="
-    if ! (cd "$ZAG_ROOT/tools/dead_code_zig" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tools/dead_code_zig" && zig build 2>&1); then
         FAILURES+=("dead-code detector build")
         return 1
     fi
-    if ! bash "$ZAG_ROOT/tools/dead_code_zig/test/run_tests.sh"; then
+    if ! bash "$STYGIA_ROOT/tools/dead_code_zig/test/run_tests.sh"; then
         FAILURES+=("dead-code fixture suite")
         return 1
     fi
     ensure_callgraph_db || return 1
-    local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$ZAG_ROOT/tools/dead_code_zig/skip.txt"); then
+    local detector="$STYGIA_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
+    if ! (cd "$STYGIA_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$STYGIA_ROOT/tools/dead_code_zig/skip.txt"); then
         FAILURES+=("dead-code findings")
         return 1
     fi
@@ -165,20 +165,20 @@ stage_gen_lock_analyzer() {
     echo "=================================================="
     echo "[0c] Gen-lock analyzer (fat-pointer invariants)"
     echo "=================================================="
-    if ! (cd "$ZAG_ROOT/tools/check_gen_lock" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tools/check_gen_lock" && zig build 2>&1); then
         FAILURES+=("gen-lock analyzer build")
         return 1
     fi
     # Self-tests for the analyzer first — a regression in the analyzer
     # itself silently weakens every kernel finding it produces, so gate
     # on the fixture suite before turning it loose on the real DB.
-    if ! bash "$ZAG_ROOT/tools/check_gen_lock/tests/run_tests.sh"; then
+    if ! bash "$STYGIA_ROOT/tools/check_gen_lock/tests/run_tests.sh"; then
         FAILURES+=("gen-lock analyzer self-tests")
         return 1
     fi
     ensure_callgraph_db || return 1
-    local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
-    if ! (cd "$ZAG_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
+    local analyzer="$STYGIA_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
         FAILURES+=("gen-lock analyzer findings")
         return 1
     fi
@@ -199,7 +199,7 @@ stage_verify_coverage() {
 }
 
 clean_nvvars() {
-    local nv="$ZAG_ROOT/zig-out/img/NvVars"
+    local nv="$STYGIA_ROOT/zig-out/img/NvVars"
     if [[ -f "$nv" ]] && [[ "$(stat -c %U "$nv" 2>/dev/null)" == "root" ]]; then
         rm -f "$nv"
     fi
@@ -219,7 +219,7 @@ stage_x86_kernel_tests() {
     fi
 
     echo "Building x86 kernel..."
-    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test); then
+    if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test); then
         FAILURES+=("x86 kernel build")
         return 1
     fi
@@ -231,7 +231,7 @@ stage_x86_kernel_tests() {
         echo "Boot ${rep}/3 under QEMU+KVM..."
         local qemu_log
         qemu_log=$(mktemp)
-        if ! (cd "$ZAG_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
+        if ! (cd "$STYGIA_ROOT" && timeout 240 zig build run -Dprofile=test) > "$qemu_log" 2>&1; then
             echo "[FAIL] qemu run ${rep}/3 failed or timed out"
             echo "--- last 30 lines of QEMU output ---"
             tail -30 "$qemu_log"
@@ -287,9 +287,9 @@ run_aarch64_tcg_3reps() {
     local fat
     fat=$(mktemp -d)
     mkdir -p "$fat/img/efi/boot"
-    cp "$ZAG_ROOT/zig-out/img/kernel.elf" "$fat/img/"
+    cp "$STYGIA_ROOT/zig-out/img/kernel.elf" "$fat/img/"
     cp "$SCRIPT_DIR/suite/bin/root_service.elf" "$fat/img/"
-    cp "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
+    cp "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
 
     local rep
     for rep in 1 2 3; do
@@ -369,7 +369,7 @@ stage_aarch64_vm_tests_tcg() {
         return 1
     fi
     echo "Building aarch64 kernel..."
-    if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=test); then
+    if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 vm-tests kernel build")
         return 1
     fi
@@ -389,7 +389,7 @@ stage_aarch64_kernel_tests_pi() {
     fi
 
     echo "Building aarch64 kernel..."
-    if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=test); then
+    if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 kernel build")
         return 1
     fi
@@ -407,12 +407,12 @@ stage_aarch64_kernel_tests_pi() {
         FAILURES+=("ssh mkdir on Pi")
         return 1
     fi
-    if ! scp -q "$ZAG_ROOT/zig-out/img/kernel.elf" \
+    if ! scp -q "$STYGIA_ROOT/zig-out/img/kernel.elf" \
         "$PI_HOST:$PI_REMOTE_DIR/img/kernel.elf"; then
         FAILURES+=("scp kernel.elf to Pi")
         return 1
     fi
-    if ! scp -q "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
+    if ! scp -q "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
         "$PI_HOST:$PI_REMOTE_DIR/img/efi/boot/BOOTAA64.EFI"; then
         FAILURES+=("scp BOOTAA64.EFI to Pi")
         return 1
@@ -476,18 +476,18 @@ stage_linux_guest_x86_boot() {
     clean_nvvars
 
     # ReleaseSafe: Debug mode triggers a known LAPIC MMIO codegen issue.
-    if ! (cd "$ZAG_ROOT/tests/linux_guest" && zig build); then
+    if ! (cd "$STYGIA_ROOT/tests/linux_guest" && zig build); then
         FAILURES+=("linux_guest build")
         return 1
     fi
-    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe); then
+    if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe); then
         FAILURES+=("linux_guest kernel build")
         return 1
     fi
 
     local qemu_log
     qemu_log=$(mktemp)
-    (cd "$ZAG_ROOT" && timeout 360 zig build run -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe -- -display none) \
+    (cd "$STYGIA_ROOT" && timeout 360 zig build run -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe -- -display none) \
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
@@ -541,16 +541,16 @@ stage_linux_guest_aarch64_boot() {
     echo "=================================================="
     # TCG, not KVM-on-Pi: the Pi 5 does not expose nested virt, and Pi
     # KVM only supports gic-version=2 while our driver is GICv3. The
-    # aarch64 linux_guest path puts Zag at EL2, so it has to run under
+    # aarch64 linux_guest path puts Stygia at EL2, so it has to run under
     # TCG with `virtualization=on`. The aarch64 kernel test suite still
     # runs on Pi KVM (stage 2) because those tests don't take the
     # kernel into EL2.
 
-    if ! (cd "$ZAG_ROOT/tests/linux_guest" && zig build -Darch=arm); then
+    if ! (cd "$STYGIA_ROOT/tests/linux_guest" && zig build -Darch=arm); then
         FAILURES+=("aarch64 linux_guest build")
         return 1
     fi
-    if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=linux_guest -Dkvm=false -Doptimize=ReleaseSafe); then
+    if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=linux_guest -Dkvm=false -Doptimize=ReleaseSafe); then
         FAILURES+=("aarch64 linux_guest kernel build")
         return 1
     fi
@@ -560,9 +560,9 @@ stage_linux_guest_aarch64_boot() {
     local fat
     fat=$(mktemp -d)
     mkdir -p "$fat/img/efi/boot"
-    cp "$ZAG_ROOT/zig-out/img/kernel.elf" "$fat/img/"
-    cp "$ZAG_ROOT/tests/linux_guest/bin/linux_guest-arm.elf" "$fat/img/root_service.elf"
-    cp "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
+    cp "$STYGIA_ROOT/zig-out/img/kernel.elf" "$fat/img/"
+    cp "$STYGIA_ROOT/tests/linux_guest/bin/linux_guest-arm.elf" "$fat/img/root_service.elf"
+    cp "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" "$fat/img/efi/boot/"
 
     local qemu_log
     qemu_log=$(mktemp)
@@ -613,21 +613,21 @@ stage_linux_guest_aarch64_boot() {
 #
 # Compares idc_pp roundtrip-cycle median against the parent commit's
 # stored measurement. Fails if current is >5% slower. On pass (or
-# bootstrap), writes .zag-perf/_pending.json which the post-commit hook
-# at .githooks/post-commit renames to .zag-perf/<new_sha>.json.
+# bootstrap), writes .stygia-perf/_pending.json which the post-commit hook
+# at .githooks/post-commit renames to .stygia-perf/<new_sha>.json.
 stage_perf_regression() {
     echo ""
     echo "=================================================="
     echo "[5] Perf regression (idc_pp, threshold 5%)"
     echo "=================================================="
-    local perf_dir="$ZAG_ROOT/.zag-perf"
+    local perf_dir="$STYGIA_ROOT/.stygia-perf"
     mkdir -p "$perf_dir"
 
-    if ! (cd "$ZAG_ROOT/tests/perf" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tests/perf" && zig build 2>&1); then
         FAILURES+=("perf workload build")
         return 1
     fi
-    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test \
+    if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test \
         -Dkernel_profile=trace -Doptimize=ReleaseFast \
         -Droot-service=tests/perf/bin/root_service.elf 2>&1); then
         FAILURES+=("perf kernel build")
@@ -641,7 +641,7 @@ stage_perf_regression() {
     # kprof dump in the log). Treat a captured `[KPROF] done` marker
     # as success regardless of the bash exit code; only fall through
     # to FAIL when the marker is absent.
-    (cd "$ZAG_ROOT" && timeout 120 zig build run -Dprofile=test \
+    (cd "$STYGIA_ROOT" && timeout 120 zig build run -Dprofile=test \
         -Dkernel_profile=trace -Doptimize=ReleaseFast \
         -Droot-service=tests/perf/bin/root_service.elf -- -display none) \
         > "$qemu_log" 2>&1 || true
@@ -654,7 +654,7 @@ stage_perf_regression() {
     fi
 
     local current="$perf_dir/_pending.json"
-    if ! python3 "$ZAG_ROOT/tests/perf/scripts/parse_kprof.py" \
+    if ! python3 "$STYGIA_ROOT/tests/perf/scripts/parse_kprof.py" \
         "$qemu_log" --json > "$current" 2>/dev/null; then
         echo "[FAIL] parse_kprof.py failed"
         rm -f "$qemu_log" "$current"
@@ -664,14 +664,14 @@ stage_perf_regression() {
     rm -f "$qemu_log"
 
     local parent_sha
-    parent_sha="$(cd "$ZAG_ROOT" && git rev-parse HEAD 2>/dev/null)"
+    parent_sha="$(cd "$STYGIA_ROOT" && git rev-parse HEAD 2>/dev/null)"
     local parent_file="$perf_dir/${parent_sha}.json"
     if [[ ! -f "$parent_file" ]]; then
         echo "[BOOTSTRAP] no measurement for parent commit ${parent_sha:0:8}; storing current as new baseline"
         return 0
     fi
 
-    if ! python3 "$ZAG_ROOT/tests/perf/scripts/compare_baseline.py" \
+    if ! python3 "$STYGIA_ROOT/tests/perf/scripts/compare_baseline.py" \
         "$parent_file" "$current" --threshold 0.05; then
         FAILURES+=("perf regression vs parent commit")
         return 1

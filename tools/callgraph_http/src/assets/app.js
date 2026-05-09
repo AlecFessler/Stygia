@@ -1,4 +1,4 @@
-/* Zag callgraph explorer — Phase 1 frontend.
+/* Stygia callgraph explorer — Phase 1 frontend.
  *
  * Vanilla JS. Pulls /api/graph, lets the user pick an entry point, BFS-walks
  * callees down to a depth, and renders the result with Cytoscape.js. Click a

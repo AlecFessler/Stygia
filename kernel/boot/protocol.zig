@@ -1,13 +1,13 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const paging = zag.memory.paging;
+const paging = stygia.memory.paging;
 const uefi = std.os.uefi;
 
 const ConfigurationTable = uefi.tables.ConfigurationTable;
 const Guid = uefi.Guid;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 pub const MMapEntryType = enum {
     acpi,

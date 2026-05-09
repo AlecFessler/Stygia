@@ -1,31 +1,31 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const address = zag.memory.address;
-const arch = zag.arch.dispatch;
-const boot = zag.boot;
-const capability_domain_mod = zag.caps.capability_domain;
-const dev_region_mod = zag.devices.device_region;
-const execution_context_mod = zag.sched.execution_context;
+const address = stygia.memory.address;
+const arch = stygia.arch.dispatch;
+const boot = stygia.boot;
+const capability_domain_mod = stygia.caps.capability_domain;
+const dev_region_mod = stygia.devices.device_region;
+const execution_context_mod = stygia.sched.execution_context;
 const KA = address.KernelVA.KernelAllocators;
-const page_frame_mod = zag.memory.page_frame;
-const paging = zag.memory.paging;
-const perfmon_mod = zag.sched.perfmon;
-const pmm = zag.memory.pmm;
-const port_mod = zag.sched.port;
-const timer_mod = zag.sched.timer;
-const vmar_mod = zag.memory.vmar;
-const virtual_machine_mod = zag.hv.virtual_machine;
+const page_frame_mod = stygia.memory.page_frame;
+const paging = stygia.memory.paging;
+const perfmon_mod = stygia.sched.perfmon;
+const pmm = stygia.memory.pmm;
+const port_mod = stygia.sched.port;
+const timer_mod = stygia.sched.timer;
+const vmar_mod = stygia.memory.vmar;
+const virtual_machine_mod = stygia.hv.virtual_machine;
 
-const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
-const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const MMap = zag.boot.protocol.MMap;
-const MMapEntry = zag.boot.protocol.MMapEntry;
-const PAddr = zag.memory.address.PAddr;
-const PhysicalMemoryManager = zag.memory.pmm.PhysicalMemoryManager;
-const Range = zag.utils.range.Range;
-const VAddr = zag.memory.address.VAddr;
+const BuddyAllocator = stygia.memory.allocators.buddy.BuddyAllocator;
+const BumpAllocator = stygia.memory.allocators.bump.BumpAllocator;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const MMap = stygia.boot.protocol.MMap;
+const MMapEntry = stygia.boot.protocol.MMapEntry;
+const PAddr = stygia.memory.address.PAddr;
+const PhysicalMemoryManager = stygia.memory.pmm.PhysicalMemoryManager;
+const Range = stygia.utils.range.Range;
+const VAddr = stygia.memory.address.VAddr;
 
 pub var kernel_addr_space_root: PAddr = undefined;
 

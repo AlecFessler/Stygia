@@ -1,18 +1,18 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const arch_paging = zag.arch.x64.paging;
-const cpu = zag.arch.x64.cpu;
-const device_region = zag.devices.device_region;
-const iommu = zag.arch.x64.iommu;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const timers = zag.arch.x64.timers;
+const apic = stygia.arch.x64.apic;
+const arch_paging = stygia.arch.x64.paging;
+const cpu = stygia.arch.x64.cpu;
+const device_region = stygia.devices.device_region;
+const iommu = stygia.arch.x64.iommu;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const timers = stygia.arch.x64.timers;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 const ValidationError = error{
     InvalidSignature,
@@ -396,7 +396,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                             ioapic_perms,
                             .kernel_mmio,
                         );
-                        zag.arch.x64.irq.setIoapicBase(ioapic_virt.addr);
+                        stygia.arch.x64.irq.setIoapicBase(ioapic_virt.addr);
                     },
                     .int_src_override => |_| {},
                     .lapic_nmi => |_| {},

@@ -28,14 +28,14 @@
 //!   - 102142 §4            "Stage 2 translation"
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const vm = zag.arch.aarch64.vm;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const vm = stygia.arch.aarch64.vm;
 
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 // ===========================================================================
 // Stage-2 translation table
@@ -102,7 +102,7 @@ pub const Stage2MemAttr = enum(u4) {
 };
 
 /// Well-known guest-physical MMIO windows for the "virt" machine layout
-/// Zag's VMM currently exposes to guests. Used by `stage2MemAttrForIpa`
+/// Stygia's VMM currently exposes to guests. Used by `stage2MemAttrForIpa`
 /// to pick Device-nGnRnE for pages the VMM is going to emulate. This is
 /// intentionally a closed enumeration — any VMM-specific device memory
 /// the user wires up through `vm_guest_map` still lands as Normal WB
@@ -425,7 +425,7 @@ pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
 /// `TLBI IPAS2E1IS, <ipa>>>12` is the architectural instruction for
 /// stage-2 invalidation (ARM ARM K.a D7.7 "TLB maintenance
 /// instructions"), but it is EL2-only: executing it from EL1 is
-/// UNDEFINED and would trap. The Zag kernel runs at EL1, so we route
+/// UNDEFINED and would trap. The Stygia kernel runs at EL1, so we route
 /// through the `hvc_tlbi_ipa` hyp stub (HypCallId.tlbi_ipa) which
 /// executes the full
 ///     dsb ishst ; tlbi ipas2e1is ; dsb ish ; tlbi vmalle1is ; dsb ish ; isb

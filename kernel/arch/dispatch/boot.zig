@@ -1,10 +1,10 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const PAddr = zag.memory.address.PAddr;
+const PAddr = stygia.memory.address.PAddr;
 
 pub fn init() void {
     switch (builtin.cpu.arch) {

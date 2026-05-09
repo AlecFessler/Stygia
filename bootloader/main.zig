@@ -3,25 +3,25 @@ const el2_drop = @import("aarch64_el2_drop.zig");
 const fs_mod = @import("fs.zig");
 const page_allocator = @import("page_allocator.zig");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const address = zag.memory.address;
-const boot_protocol = zag.boot.protocol;
-const elf = zag.utils.elf;
-const paging = zag.memory.paging;
+const arch = stygia.arch.dispatch;
+const address = stygia.memory.address;
+const boot_protocol = stygia.boot.protocol;
+const elf = stygia.utils.elf;
+const paging = stygia.memory.paging;
 const std_elf = std.elf;
 const uefi = std.os.uefi;
 
 const BootInfo = boot_protocol.BootInfo;
 const ElfSection = elf.ElfSection;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
 const PageAllocator = page_allocator.PageAllocator;
-const ParsedElf = zag.utils.elf.ParsedElf;
-const VAddr = zag.memory.address.VAddr;
+const ParsedElf = stygia.utils.elf.ParsedElf;
+const VAddr = stygia.memory.address.VAddr;
 
-const KEntryType = fn (*BootInfo) callconv(zag.arch.dispatch.cpu.cc()) noreturn;
+const KEntryType = fn (*BootInfo) callconv(stygia.arch.dispatch.cpu.cc()) noreturn;
 
 fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const link_base = address.AddrSpacePartition.kernel_code.start;
@@ -121,20 +121,20 @@ fn puts(msg: [*:0]const u16) void {
 }
 
 const dbg = struct {
-    const boot_start = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] boot start\r\n");
-    const page_tables = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] page tables\r\n");
-    const physmap = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] physmap\r\n");
-    const loading = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] loading files\r\n");
-    const kernel_elf = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] kernel.elf\r\n");
-    const rs_elf = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] root_service\r\n");
-    const elf_parsed = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] ELF parsed\r\n");
-    const kaslr1 = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] KASLR slide\r\n");
-    const kaslr2 = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] KASLR reloc\r\n");
-    const sections = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] sections\r\n");
-    const sections_done = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] mapped\r\n");
-    const stack = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] stack\r\n");
-    const exit_bs = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] exit BS\r\n");
-    const jump = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] jump\r\n");
+    const boot_start = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] boot start\r\n");
+    const page_tables = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] page tables\r\n");
+    const physmap = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] physmap\r\n");
+    const loading = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] loading files\r\n");
+    const kernel_elf = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] kernel.elf\r\n");
+    const rs_elf = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] root_service\r\n");
+    const elf_parsed = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] ELF parsed\r\n");
+    const kaslr1 = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR slide\r\n");
+    const kaslr2 = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] KASLR reloc\r\n");
+    const sections = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] sections\r\n");
+    const sections_done = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] mapped\r\n");
+    const stack = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] stack\r\n");
+    const exit_bs = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] exit BS\r\n");
+    const jump = std.unicode.utf8ToUtf16LeStringLiteral("[STYGIA] jump\r\n");
 };
 
 pub fn main() uefi.Status {

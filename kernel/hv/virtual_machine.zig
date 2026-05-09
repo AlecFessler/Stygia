@@ -9,34 +9,34 @@
 //! `_gen_lock`.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const arch_smp = zag.arch.dispatch.smp;
-const capability = zag.caps.capability;
-const cd_mod = zag.caps.capability_domain;
-const ec_mod = zag.sched.execution_context;
-const errors = zag.syscall.errors;
-const page_frame_mod = zag.memory.page_frame;
-const port_mod = zag.sched.port;
-const vm_dispatch = zag.arch.dispatch.vm;
+const arch = stygia.arch.dispatch;
+const arch_smp = stygia.arch.dispatch.smp;
+const capability = stygia.caps.capability;
+const cd_mod = stygia.caps.capability_domain;
+const ec_mod = stygia.sched.execution_context;
+const errors = stygia.syscall.errors;
+const page_frame_mod = stygia.memory.page_frame;
+const port_mod = stygia.sched.port;
+const vm_dispatch = stygia.arch.dispatch.vm;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
-const KernelHandle = zag.caps.capability.KernelHandle;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const PageFrameCaps = zag.memory.page_frame.PageFrameCaps;
-const Port = zag.sched.port.Port;
-const Priority = zag.sched.execution_context.Priority;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VAddr = zag.memory.address.VAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
-const Word0 = zag.caps.capability.Word0;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
+const KernelHandle = stygia.caps.capability.KernelHandle;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const PageFrameCaps = stygia.memory.page_frame.PageFrameCaps;
+const Port = stygia.sched.port.Port;
+const Priority = stygia.sched.execution_context.Priority;
+const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const VAddr = stygia.memory.address.VAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
+const Word0 = stygia.caps.capability.Word0;
 
 /// Cap bits in `Capability.word0[48..63]` for VM handles.
 /// Spec §[virtual_machine]: bit 0 = `policy`, bit 1 = `restart_policy`;
@@ -114,9 +114,9 @@ pub const Allocator = SecureSlab(VirtualMachine, 256);
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
-    data_range: zag.utils.range.Range,
-    ptrs_range: zag.utils.range.Range,
-    links_range: zag.utils.range.Range,
+    data_range: stygia.utils.range.Range,
+    ptrs_range: stygia.utils.range.Range,
+    links_range: stygia.utils.range.Range,
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
@@ -677,8 +677,8 @@ pub fn guestPhysToHost(vm: *const VirtualMachine, gpa: u64, len: usize) ?[*]u8 {
         const offset = gpa - inst.guest_addr;
         if (offset >= region_size) continue;
         if (region_size - offset < @as(u64, len)) continue;
-        const host_pa = zag.memory.address.PAddr.fromInt(pf.phys_base.addr + offset);
-        const host_va = zag.memory.address.VAddr.fromPAddr(host_pa, null);
+        const host_pa = stygia.memory.address.PAddr.fromInt(pf.phys_base.addr + offset);
+        const host_va = stygia.memory.address.VAddr.fromPAddr(host_pa, null);
         return @ptrFromInt(host_va.addr);
     }
     return null;

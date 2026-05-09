@@ -6,25 +6,25 @@
 
 extern fn __cxa_finalize(dso: ?*anyopaque) callconv(.c) void;
 
-extern fn zag_exit(status: u8) callconv(.c) noreturn;
+extern fn stygia_exit(status: u8) callconv(.c) noreturn;
 
 // ── exit / abort / _Exit ─────────────────────────────────────────
 
 export fn exit(status: c_int) callconv(.c) noreturn {
     __cxa_finalize(null);
-    zag_exit(@truncate(@as(c_uint, @bitCast(status))));
+    stygia_exit(@truncate(@as(c_uint, @bitCast(status))));
 }
 
 export fn _Exit(status: c_int) callconv(.c) noreturn {
-    zag_exit(@truncate(@as(c_uint, @bitCast(status))));
+    stygia_exit(@truncate(@as(c_uint, @bitCast(status))));
 }
 
 export fn _exit(status: c_int) callconv(.c) noreturn {
-    zag_exit(@truncate(@as(c_uint, @bitCast(status))));
+    stygia_exit(@truncate(@as(c_uint, @bitCast(status))));
 }
 
 export fn abort() callconv(.c) noreturn {
-    zag_exit(0x7f); // 127 = "abort signal" by convention.
+    stygia_exit(0x7f); // 127 = "abort signal" by convention.
 }
 
 // ── abs / labs / llabs ───────────────────────────────────────────

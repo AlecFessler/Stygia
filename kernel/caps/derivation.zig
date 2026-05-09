@@ -36,18 +36,18 @@
 //! port to a handful of clients), so for now we accept the linear cost.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const capability_domain = zag.caps.capability_domain;
-const errors = zag.syscall.errors;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const capability_domain = stygia.caps.capability_domain;
+const errors = stygia.syscall.errors;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const ErasedSlabRef = capability.ErasedSlabRef;
 const HandleLink = capability.HandleLink;
 const KernelHandle = capability.KernelHandle;
-const SpinLock = zag.utils.sync.SpinLock;
+const SpinLock = stygia.utils.sync.SpinLock;
 
 /// Defensive bound on tree-walk depth. Caps both the max depth a single
 /// tree can reach and the sibling-chain length we will scan before

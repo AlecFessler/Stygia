@@ -13,7 +13,7 @@
 // mandates at least PTHREAD_KEYS_MAX (512) keys. We pick 64 for
 // minimal storage; bump if a real workload trips it.
 //
-// When Zag grows real ECs-as-threads + an FS-base set primitive,
+// When Stygia grows real ECs-as-threads + an FS-base set primitive,
 // this whole file gets replaced with futex-backed primitives. Until
 // then: keep the surface, drop the work.
 

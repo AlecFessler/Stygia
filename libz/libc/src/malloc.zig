@@ -1,7 +1,7 @@
 // malloc — best-fit heap allocator backed by a single VMAR reservation.
 //
 // On first call the heap reserves a single VMAR region via
-// zag_mmap_anon (64 MiB by default — kernel buddy MAX_ORDER caps a
+// stygia_mmap_anon (64 MiB by default — kernel buddy MAX_ORDER caps a
 // single contiguous reservation at 128 MiB and demandAlloc isn't yet
 // wired, so the page_frame is currently eager) and hands it to a
 // HeapAllocator instance ported from the kernel (libz/libc/src/heap/).
@@ -20,7 +20,7 @@
 const std = @import("std");
 const heap_alloc = @import("heap/heap_alloc.zig");
 
-extern fn zag_mmap_anon(pages: usize) callconv(.c) u64;
+extern fn stygia_mmap_anon(pages: usize) callconv(.c) u64;
 extern fn __errno_location() callconv(.c) *c_int;
 
 const PAGE: usize = 4096;
@@ -54,11 +54,11 @@ fn ensureInit() void {
         @panic("libc heap: slab init failed");
 
     // Reserve a contiguous VMAR for the heap. The current
-    // zag_mmap_anon eagerly allocates a page_frame; kernel buddy
+    // stygia_mmap_anon eagerly allocates a page_frame; kernel buddy
     // MAX_ORDER caps a single page_frame at 128 MiB. 64 MiB keeps
     // a comfortable margin and is plenty for self-hosted compiles.
     const pages = HEAP_RESERVATION_BYTES / PAGE;
-    const va = zag_mmap_anon(pages);
+    const va = stygia_mmap_anon(pages);
     if (va == 0) @panic("libc heap: VMAR reservation failed");
 
     const reserve_start: u64 = va;

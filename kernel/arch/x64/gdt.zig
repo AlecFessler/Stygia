@@ -1,16 +1,16 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch_paging = zag.arch.x64.paging;
-const cpu = zag.arch.x64.cpu;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const stack_mod = zag.memory.stack;
+const arch_paging = stygia.arch.x64.paging;
+const cpu = stygia.arch.x64.cpu;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const stack_mod = stygia.memory.stack;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const VAddr = zag.memory.address.VAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Intel SDM Vol 3A §3.5.1 — GDTR holds base address and limit of the GDT.
 const GdtPtr = packed struct {

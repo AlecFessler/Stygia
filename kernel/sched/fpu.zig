@@ -21,14 +21,14 @@
 //!
 //! Spec §[execution_context] lazy FPU.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const kprof = zag.kprof.trace_id;
-const scheduler = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const kprof = stygia.kprof.trace_id;
+const scheduler = stygia.sched.scheduler;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 
 /// Called from the arch-specific FP-trap handler (#NM on x64,
 /// ESR_EL1.EC=0x07 on aarch64). Swaps FPU state ownership on this core

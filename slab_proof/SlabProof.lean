@@ -1,5 +1,5 @@
 /-
-SlabProof — top-level safety theorem for Zag's GenLock + SecureSlab
+SlabProof — top-level safety theorem for Stygia's GenLock + SecureSlab
 ====================================================================
 
 Safety artifact for `kernel/memory/allocators/secure_slab.zig`.
@@ -34,7 +34,7 @@ Layered structure:
                        fail strictly more conservative than strong CAS;
                        all safety theorems transfer.
 
-Build: `cd /home/alec/Zag/slab_proof && lake build`.
+Build: `cd /home/alec/Stygia/slab_proof && lake build`.
 
 Reviewer items 1-3 (Core/Loc lift, buffered release, N-payload
 publication) closed in v2.  Items 4 (run-invariant), 5 (SlabRef), 6

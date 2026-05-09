@@ -13,13 +13,13 @@ BEGIN;
 
 -- ── files ─────────────────────────────────────────────────────────────────
 INSERT INTO file (id, path, sha256, size, source) VALUES
- (1, '/home/alec/Zag/kernel/syscall/dispatch.zig',
+ (1, '/home/alec/Stygia/kernel/syscall/dispatch.zig',
     x'00000000000000000000000000000000000000000000000000000000000000aa',
     280,
     'const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const vmm = zag.memory.vmm;
+const vmm = stygia.memory.vmm;
 
 pub fn sysOpen(path: []const u8) !u32 {
     // dispatch into the VMM
@@ -33,7 +33,7 @@ pub fn boot() void {
     }
 }
 '),
- (2, '/home/alec/Zag/kernel/memory/vmm.zig',
+ (2, '/home/alec/Stygia/kernel/memory/vmm.zig',
     x'00000000000000000000000000000000000000000000000000000000000000bb',
     180,
     'const std = @import("std");

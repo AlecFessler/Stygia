@@ -15,13 +15,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const execution_context = zag.sched.execution_context;
-const scheduler = zag.sched.scheduler;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const State = zag.sched.execution_context.State;
+const arch = stygia.arch.dispatch;
+const execution_context = stygia.sched.execution_context;
+const scheduler = stygia.sched.scheduler;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const State = stygia.sched.execution_context.State;
 
 /// 4s of no-newline-progress = hang. Used as a backstop only — the
 /// primary detector on this branch is `allCoresIdle()` driven from the

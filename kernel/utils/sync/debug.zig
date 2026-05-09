@@ -18,9 +18,9 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 const core = @import("debug_core.zig");
 
 pub const SrcLoc = core.SrcLoc;

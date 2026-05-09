@@ -1,7 +1,7 @@
-// libz/libc — minimal C-ABI compatibility layer for Zag userspace.
+// libz/libc — minimal C-ABI compatibility layer for Stygia userspace.
 //
 // This file is the root of the static archive that Zig+LLVM (cross-
-// compiled for x86_64-zag-none) links against. Each submodule emits
+// compiled for x86_64-stygia-none) links against. Each submodule emits
 // a focused subset of the libc surface via `comptime` `@export` blocks.
 //
 // Sub-module layout:
@@ -18,7 +18,7 @@
 // Override std's default panic so debug-mode safety checks (integer
 // overflow, bounds, etc.) compile cleanly. The stock defaultPanic
 // pulls in dumpStackTrace → selfExePath, neither of which the
-// patched stdlib supports on Zag. For a static-archive that's never
+// patched stdlib supports on Stygia. For a static-archive that's never
 // invoked from Zig's own runtime, panics being abort()-shaped is
 // fine — the consuming C/C++ code has its own crash machinery.
 pub const panic = std.debug.no_panic;

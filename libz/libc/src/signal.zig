@@ -1,6 +1,6 @@
 // signal — stub layer.
 //
-// Zag has no signal delivery; consumers register handlers (LLVM crash
+// Stygia has no signal delivery; consumers register handlers (LLVM crash
 // reporter installs SIGSEGV/SIGABRT) but they never fire. We accept
 // the registrations so initialization succeeds, then ignore.
 //

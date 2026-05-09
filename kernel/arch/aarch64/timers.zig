@@ -39,12 +39,12 @@
 //! - ARM ARM D11.2: The Generic Timer
 //! - ARM ARM D13.8: Generic Timer registers
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.aarch64.cpu;
-const timer_mod = zag.arch.timer;
+const cpu = stygia.arch.aarch64.cpu;
+const timer_mod = stygia.arch.timer;
 
-const Timer = zag.arch.timer.Timer;
+const Timer = stygia.arch.timer.Timer;
 
 var preemption_timer_instance: PreemptionTimer = undefined;
 var monotonic_clock_instance: MonotonicClock = undefined;

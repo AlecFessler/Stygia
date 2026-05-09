@@ -2,7 +2,7 @@
 //
 // The cross-compiled Zig+LLVM is statically linked. dlopen returns
 // NULL (no shared object loading), dlsym likewise. dl_iterate_phdr
-// could in principle walk our own ELF (the Zag-target binary's PHDR
+// could in principle walk our own ELF (the Stygia-target binary's PHDR
 // table is at AUXV AT_PHDR / AT_PHNUM if we wired one), but for now
 // returns 0 immediately so libgcc/libunwind treat us as no-modules.
 //

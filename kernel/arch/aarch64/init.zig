@@ -15,11 +15,11 @@
 //! - ARM ARM D13.2.131: TCR_EL1
 //! - ARM ARM D13.2.97: MAIR_EL1
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const exceptions = zag.arch.aarch64.exceptions;
-const paging = zag.arch.aarch64.paging;
-const serial = zag.arch.aarch64.serial;
+const exceptions = stygia.arch.aarch64.exceptions;
+const paging = stygia.arch.aarch64.paging;
+const serial = stygia.arch.aarch64.serial;
 
 /// BSP early-boot initialization. Called once from dispatch.init() before
 /// the scheduler runs.

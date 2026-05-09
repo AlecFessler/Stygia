@@ -1,23 +1,23 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const address = zag.memory.address;
-const arch = zag.arch.dispatch;
-const kprof = zag.kprof.trace_id;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const pf_log = zag.utils.pf_log;
-const port = zag.sched.port;
-const scheduler = zag.sched.scheduler;
-const stack_mod = zag.memory.stack;
-const sync_debug = zag.utils.sync.debug;
-const vmar = zag.memory.vmar;
+const address = stygia.memory.address;
+const arch = stygia.arch.dispatch;
+const kprof = stygia.kprof.trace_id;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const pf_log = stygia.utils.pf_log;
+const port = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
+const stack_mod = stygia.memory.stack;
+const sync_debug = stygia.utils.sync.debug;
+const vmar = stygia.memory.vmar;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFaultContext = zag.arch.dispatch.cpu.PageFaultContext;
-const VAddr = zag.memory.address.VAddr;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFaultContext = stygia.arch.dispatch.cpu.PageFaultContext;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Memory-fault sub-code carried in the event payload alongside
 /// `EventType.memory_fault` per spec §[event_type] table 1840 ("invalid
@@ -200,7 +200,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         }
     }
     if (rc != 0) {
-        const subcode = if (rc == zag.syscall.errors.E_BADADDR)
+        const subcode = if (rc == stygia.syscall.errors.E_BADADDR)
             MemoryFaultSubcode.unmapped
         else
             accessSubcode(is_write, is_exec);

@@ -1,10 +1,10 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const capability = zag.caps.capability;
-const capability_domain = zag.caps.capability_domain;
-const errors = zag.syscall.errors;
-const execution_context = zag.sched.execution_context;
-const kprof = zag.kprof.trace_id;
+const capability = stygia.caps.capability;
+const capability_domain = stygia.caps.capability_domain;
+const errors = stygia.syscall.errors;
+const execution_context = stygia.sched.execution_context;
+const kprof = stygia.kprof.trace_id;
 
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
 const ExecutionContext = execution_context.ExecutionContext;

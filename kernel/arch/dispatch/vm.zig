@@ -1,15 +1,15 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const VmarPageSize = zag.memory.vmar.PageSize;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const VmarPageSize = stygia.memory.vmar.PageSize;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 
 // Generic-kernel-facing VM dispatch. Arch-internal primitives (guest-page
 // mapping, interrupt injection, world-switch, sysreg passthrough, etc.)

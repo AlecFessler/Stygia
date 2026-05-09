@@ -1,11 +1,11 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const interrupts = zag.arch.x64.interrupts;
+const cpu = stygia.arch.x64.cpu;
+const interrupts = stygia.arch.x64.interrupts;
 
-const LocalApic = zag.arch.x64.acpi.LocalApic;
-const VAddr = zag.memory.address.VAddr;
+const LocalApic = stygia.arch.x64.acpi.LocalApic;
+const VAddr = stygia.memory.address.VAddr;
 
 // ── Register offsets (xAPIC MMIO) ────────────────────────────────
 
@@ -238,7 +238,7 @@ pub fn armTscDeadline(deadline_tsc: u64) void {
 /// (`getPreemptionTimer().armInterruptTimer`), so the LAPIC vs.
 /// TSC-deadline split stays in one place.
 pub fn armDeadline(deadline_ns: u64) void {
-    const timers = zag.arch.x64.timers;
+    const timers = stygia.arch.x64.timers;
     const preemption = timers.getPreemptionTimer();
     const monotonic = timers.getMonotonicClock();
     const now_ns = monotonic.now();

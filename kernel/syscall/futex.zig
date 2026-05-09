@@ -1,20 +1,20 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const errors = zag.syscall.errors;
-const futex = zag.sched.futex;
-const kprof = zag.kprof.trace_id;
-const paging = zag.arch.dispatch.paging;
+const errors = stygia.syscall.errors;
+const futex = stygia.sched.futex;
+const kprof = stygia.kprof.trace_id;
+const paging = stygia.arch.dispatch.paging;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const PAddr = zag.memory.address.PAddr;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VAddr = zag.memory.address.VAddr;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const PAddr = stygia.memory.address.PAddr;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Per-call address ceiling. Mirrors
 /// `execution_context.MAX_FUTEX_ADDRS_PER_EC` so the per-EC scratch
 /// storage that backs decoded pairs can never be overrun.
-const MAX_PAIRS: usize = zag.sched.execution_context.MAX_FUTEX_ADDRS_PER_EC;
+const MAX_PAIRS: usize = stygia.sched.execution_context.MAX_FUTEX_ADDRS_PER_EC;
 
 /// Resolve `vaddr` in `caller`'s capability domain to a physical address.
 /// Returns null when the address is unmapped. Holds the domain `_gen_lock`
@@ -54,7 +54,7 @@ fn readSelfHasFutWake(domain_ref: SlabRef(CapabilityDomain)) bool {
     const lr = domain_ref.lockIrqSave(@src()) catch return false;
     const dom = lr.ptr;
     defer domain_ref.unlockIrqRestore(lr.irq_state);
-    const caps_word: u16 = zag.caps.capability.Word0.caps(dom.user_table[0].word0);
+    const caps_word: u16 = stygia.caps.capability.Word0.caps(dom.user_table[0].word0);
     return (caps_word & (1 << 11)) != 0;
 }
 

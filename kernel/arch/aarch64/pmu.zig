@@ -28,22 +28,22 @@
 //! is dropped the guest panics on the first `probe()` access, which is the
 //! intended loud failure mode rather than a silent zero-counter report.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const gic = zag.arch.aarch64.gic;
-const pmu_sched = zag.syscall.pmu;
-const port_mod = zag.sched.port;
-const scheduler = zag.sched.scheduler;
+const gic = stygia.arch.aarch64.gic;
+const pmu_sched = stygia.syscall.pmu;
+const port_mod = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
 
-const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
-const GenLock = zag.memory.allocators.secure_slab.GenLock;
+const ArchCpuContext = stygia.arch.aarch64.interrupts.ArchCpuContext;
+const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
 const PmuInfo = pmu_sched.PmuInfo;
 const PmuSample = pmu_sched.PmuSample;
 
 /// Per-arch alias for the generic compile-time ceiling. See
-/// `zag.syscall.pmu.MAX_COUNTERS` for the rationale.
+/// `stygia.syscall.pmu.MAX_COUNTERS` for the rationale.
 pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
 /// GIC INTID used by the PMU overflow interrupt on aarch64.

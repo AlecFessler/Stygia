@@ -28,12 +28,12 @@
 
 const build_options = @import("build_options");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const irq = zag.arch.x64.irq;
-const timers = zag.arch.x64.timers;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const irq = stygia.arch.x64.irq;
+const timers = stygia.arch.x64.timers;
 
 pub const enabled: bool = build_options.kernel_hang_watchdog;
 
@@ -112,7 +112,7 @@ var armed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 pub fn init() void {
     if (!enabled) return;
 
-    const serial = zag.arch.x64.serial;
+    const serial = stygia.arch.x64.serial;
     serial.printRaw("[hpet-wdg] init begin\n");
 
     const hpet = &timers.hpet_timer;

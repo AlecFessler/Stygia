@@ -166,8 +166,8 @@ fn resolveChain(
     //    `@import("…")` alias the indexer didn't resolve. Prefer the
     //    entity whose qname has the fewest "extra" segments. Retry
     //    by trimming a leading segment so chains like
-    //    `[zag, arch, aarch64, paging]` resolve to `arch.aarch64.paging`
-    //    (where `zag` is a build.zig module pointing at the kernel root).
+    //    `[stygia, arch, aarch64, paging]` resolve to `arch.aarch64.paging`
+    //    (where `stygia` is a build.zig module pointing at the kernel root).
     var trim: usize = 0;
     while (trim + 1 < chain.len) : (trim += 1) {
         const sub = chain[trim..];

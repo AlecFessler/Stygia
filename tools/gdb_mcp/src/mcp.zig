@@ -14,7 +14,7 @@ const SERVER_INFO_JSON = "{\"name\":\"gdb-mcp\",\"version\":\"0.1.0\"}";
 const CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
 
 const INSTRUCTIONS =
-    "Persistent gdb session for the Zag kernel under qemu's gdb stub. " ++
+    "Persistent gdb session for the Stygia kernel under qemu's gdb stub. " ++
     "Symbol/field resolution is backed by the callgraph DB (tools/indexer), " ++
     "so qualified Zig names like `sched.scheduler.core_states` resolve " ++
     "directly to (addr, size) without fighting gdb's namespace handling. " ++

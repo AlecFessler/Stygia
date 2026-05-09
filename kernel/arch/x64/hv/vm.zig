@@ -1,21 +1,21 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const ioapic_mod = zag.arch.x64.hv.ioapic;
-const mmio_decode = zag.arch.x64.mmio_decode;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const vm_hw = zag.arch.x64.vm;
+const ioapic_mod = stygia.arch.x64.hv.ioapic;
+const mmio_decode = stygia.arch.x64.mmio_decode;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const vm_hw = stygia.arch.x64.vm;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const Ioapic = zag.arch.x64.hv.ioapic.Ioapic;
-const Lapic = zag.arch.x64.hv.lapic.Lapic;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageFrame = zag.memory.page_frame.PageFrame;
-const VAddr = zag.memory.address.VAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Ioapic = stygia.arch.x64.hv.ioapic.Ioapic;
+const Lapic = stygia.arch.x64.hv.lapic.Lapic;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageFrame = stygia.memory.page_frame.PageFrame;
+const VAddr = stygia.memory.address.VAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 
 /// Per-VM emulated-device state held inline on `VirtualMachine.arch_devices`.
 /// On x86-64 this is the kernel-emulated LAPIC + IOAPIC pair; the run-loop
@@ -237,7 +237,7 @@ pub fn invalidateStage2Range(
 /// — bits [8..63] of the u64 vreg are reserved and must be zero per
 /// §[vm_set_policy] test 04.
 pub fn applyVmPolicyTable(vm: *VirtualMachine, kind: u8, count: u8, entries: []const u64) i64 {
-    const errors = zag.syscall.errors;
+    const errors = stygia.syscall.errors;
 
     // Spec §[vm_set_policy] test 03: count > MAX_<kind> ⇒ E_INVAL.
     const max: u32 = switch (kind) {
@@ -350,7 +350,7 @@ pub fn tryHandleMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys
 }
 
 fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
-    const arch_state = zag.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
     const gs = &arch_state.guest_state;
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
@@ -365,7 +365,7 @@ fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: 
 }
 
 fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
-    const arch_state = zag.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
+    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
     const gs = &arch_state.guest_state;
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
@@ -381,7 +381,7 @@ fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys:
 
 pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
     if (irq_num >= ioapic_mod.NUM_REDIR_ENTRIES)
-        return zag.syscall.errors.E_INVAL;
+        return stygia.syscall.errors.E_INVAL;
     const irq_pin: u5 = @intCast(irq_num);
     if (assert) {
         vm.arch_devices.ioapic.assertIrq(irq_pin);

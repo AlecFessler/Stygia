@@ -1,4 +1,4 @@
-//! linux_guest — VMM for booting Linux on Zag.
+//! linux_guest — VMM for booting Linux on Stygia.
 //!
 //! Spec-v3 port. The lifecycle:
 //!   1. Discover COM1 device_region (log.init).

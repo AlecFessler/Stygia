@@ -8,23 +8,23 @@
 //! folds that into the spec-v3 §[vm_exit_state] sub-code + 3-vreg
 //! payload the scheduler hands to `sched.port.fireVmExit`.
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
-const hv_vcpu = zag.arch.x64.hv.vcpu;
-const hv_vm = zag.arch.x64.hv.vm;
-const kprof = zag.kprof.trace_id;
-const mmio_decode = zag.arch.x64.mmio_decode;
-const timers = zag.arch.x64.timers;
-const vm_hw = zag.arch.x64.vm;
+const cpu = stygia.arch.x64.cpu;
+const hv_vcpu = stygia.arch.x64.hv.vcpu;
+const hv_vm = stygia.arch.x64.hv.vm;
+const kprof = stygia.kprof.trace_id;
+const mmio_decode = stygia.arch.x64.mmio_decode;
+const timers = stygia.arch.x64.timers;
+const vm_hw = stygia.arch.x64.vm;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const GuestState = vm_hw.GuestState;
-const PAddr = zag.memory.address.PAddr;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const PAddr = stygia.memory.address.PAddr;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 
 /// VM-exit delivery descriptor returned by `enterGuest`. Mirror of the
-/// dispatch-tier alias in `zag.arch.dispatch.vm.VmExitDelivery` — the
+/// dispatch-tier alias in `stygia.arch.dispatch.vm.VmExitDelivery` — the
 /// type lives here in the x64 backend so the dispatch layer remains a
 /// pure aliasing shim and arch-specific code doesn't need to import
 /// dispatch. Layout follows spec §[vm_exit_state] x86-64 sub-codes.
@@ -498,7 +498,7 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
     // supplied real guest state. Leave `started = false` so the next
     // switchTo synthesizes another initial vm_exit instead of attempting
     // VMRUN with whatever zero/garbage values landed in GuestState.
-    if (snap.exit_subcode == zag.hv.virtual_machine.INITIAL_STATE_SUBCODE) return;
+    if (snap.exit_subcode == stygia.hv.virtual_machine.INITIAL_STATE_SUBCODE) return;
     arch_state.started = true;
 }
 
@@ -626,7 +626,7 @@ pub fn populateVmExitVregsIfStarted(
     receiver.pending_event_rip_valid = false;
 }
 
-fn deliverPendingInterrupts(vm_ptr: *zag.hv.virtual_machine.VirtualMachine, gs: *vm_hw.GuestState) void {
+fn deliverPendingInterrupts(vm_ptr: *stygia.hv.virtual_machine.VirtualMachine, gs: *vm_hw.GuestState) void {
     // Skip if guest interrupts are masked. On AMD, also skip if a prior
     // EVENTINJ is still pending (the guest hasn't entered yet).
     if ((gs.rflags & (1 << 9)) == 0) return;
@@ -641,7 +641,7 @@ fn deliverPendingInterrupts(vm_ptr: *zag.hv.virtual_machine.VirtualMachine, gs: 
     vm_ptr.arch_devices.lapic.acceptInterrupt(vector);
 }
 
-fn ctrlPhysFor(vm_ptr: *zag.hv.virtual_machine.VirtualMachine) ?PAddr {
+fn ctrlPhysFor(vm_ptr: *stygia.hv.virtual_machine.VirtualMachine) ?PAddr {
     const erased = vm_ptr.arch_state orelse return null;
     const cell: *hv_vm.CtrlStateCell = @ptrCast(@alignCast(erased));
     return cell.ctrl_phys;

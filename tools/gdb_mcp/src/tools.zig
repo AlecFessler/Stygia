@@ -791,7 +791,7 @@ pub const Registry = struct {
         // Best-effort cleanup of any orphan gdb processes spawned by a
         // previous gdb_mcp instance that died ungracefully (sigkill,
         // crashed Claude Code session, etc.).
-        const orphans_killed = pkillOrphanGdbs(al, "/home/alec/Zag/zig-out/bin/kernel.elf");
+        const orphans_killed = pkillOrphanGdbs(al, "/home/alec/Stygia/zig-out/bin/kernel.elf");
         try std.fmt.format(out.writer(al), "orphan gdb processes killed: {d}\n", .{orphans_killed});
     }
 

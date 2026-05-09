@@ -1,7 +1,7 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Write a u64 to a physical address via the kernel physmap. Used by
 /// kernel-side propagators of handle field0/field1 updates that must

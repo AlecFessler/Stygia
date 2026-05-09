@@ -1,7 +1,7 @@
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const capability = zag.caps.capability;
-const errors = zag.syscall.errors;
+const capability = stygia.caps.capability;
+const errors = stygia.syscall.errors;
 
 const HANDLE_MASK: u64 = 0xFFF;
 const CAPS_MASK: u64 = 0xFFFF;

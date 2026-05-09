@@ -1,10 +1,10 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const Timer = zag.arch.timer.Timer;
+const Timer = stygia.arch.timer.Timer;
 
 /// Read the CPU cycle counter. `serialized=true` uses LFENCE (x86) or a
 /// full ISB before read so prior instructions finish before the counter

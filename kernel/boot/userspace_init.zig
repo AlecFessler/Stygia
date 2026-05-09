@@ -1,25 +1,25 @@
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const capdom = zag.caps.capability_domain;
-const elf_util = zag.utils.elf;
-const execution_context = zag.sched.execution_context;
-const paging_consts = zag.memory.paging;
-const pmm = zag.memory.pmm;
-const sched = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const capdom = stygia.caps.capability_domain;
+const elf_util = stygia.utils.elf;
+const execution_context = stygia.sched.execution_context;
+const paging_consts = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
+const sched = stygia.sched.scheduler;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const EcCaps = zag.sched.execution_context.EcCaps;
-const ErasedSlabRef = zag.caps.capability.ErasedSlabRef;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const PAddr = zag.memory.address.PAddr;
-const ParsedElf = zag.utils.elf.ParsedElf;
-const Priority = zag.sched.execution_context.Priority;
-const VAddr = zag.memory.address.VAddr;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const EcCaps = stygia.sched.execution_context.EcCaps;
+const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const PAddr = stygia.memory.address.PAddr;
+const ParsedElf = stygia.utils.elf.ParsedElf;
+const Priority = stygia.sched.execution_context.Priority;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Cap word minted on the root capability domain's slot-0 self-handle.
 /// Spec §[capability_domain] self-handle cap layout — every privilege the
@@ -61,7 +61,7 @@ const ROOT_EC_CAPS = EcCaps{
 
 /// Pages reserved for the per-EC user stack created by
 /// create_capability_domain. 16 pages (64 KiB) is the spec default
-/// and the right size for nearly every userspace task. The in-Zag
+/// and the right size for nearly every userspace task. The in-Stygia
 /// self-hosted Zig compiler's recursive AstGen / Sema descent for
 /// std-sized files needs more headroom — that's a per-process opt-in
 /// (TODO: surface via a `create_capability_domain` argument or via
@@ -324,7 +324,7 @@ pub fn loadElfSegments(
             // entry point faults. Walk every segment's per-page span
             // and OR the perms here so the eventual mapPage call
             // installs the merged perms.
-            const page_perms = unionPagePerms(elf_bytes, target_vaddr.addr, slide) catch zag.memory.address.MemoryPerms{
+            const page_perms = unionPagePerms(elf_bytes, target_vaddr.addr, slide) catch stygia.memory.address.MemoryPerms{
                 .read = true,
                 .write = writable,
                 .exec = executable,
@@ -387,12 +387,12 @@ fn unionPagePerms(
     elf_bytes: []const u8,
     page_va: u64,
     slide: u64,
-) !zag.memory.address.MemoryPerms {
+) !stygia.memory.address.MemoryPerms {
     const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
     var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
     const hdr = try std.elf.Header.read(&rd);
 
-    var perms = zag.memory.address.MemoryPerms{ .read = true };
+    var perms = stygia.memory.address.MemoryPerms{ .read = true };
     var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
     while (try phdr_itr.next()) |phdr| {
         if (phdr.p_type != std.elf.PT_LOAD) continue;
@@ -646,19 +646,19 @@ fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
         root_cd,
         PAddr.fromInt(TEST_DMA_IRQ_BASE),
         TEST_DMA_IRQ_SIZE,
-        zag.devices.device_region.DeviceRegionCaps{
+        stygia.devices.device_region.DeviceRegionCaps{
             .move = true,
             .copy = true,
             .dma = true,
             .irq = true,
         },
-        zag.devices.device_region.PciAddress.make(0xCA, 0x1F, 0x7),
+        stygia.devices.device_region.PciAddress.make(0xCA, 0x1F, 0x7),
     );
     mintTestFixtureMmio(
         root_cd,
         PAddr.fromInt(TEST_PLAIN_BASE),
         TEST_PLAIN_SIZE,
-        zag.devices.device_region.DeviceRegionCaps{
+        stygia.devices.device_region.DeviceRegionCaps{
             .move = true,
             .copy = true,
         },
@@ -670,10 +670,10 @@ fn mintTestFixtureMmio(
     root_cd: *CapabilityDomain,
     phys_base: PAddr,
     size: u64,
-    dr_caps: zag.devices.device_region.DeviceRegionCaps,
-    pci: zag.devices.device_region.PciAddress,
+    dr_caps: stygia.devices.device_region.DeviceRegionCaps,
+    pci: stygia.devices.device_region.PciAddress,
 ) void {
-    const dr = zag.devices.device_region.registerMmioPci(phys_base, size, pci) catch {
+    const dr = stygia.devices.device_region.registerMmioPci(phys_base, size, pci) catch {
         arch.boot.print("[boot] WARNING: test-fixture MMIO registerMmio failed\n", .{});
         return;
     };
@@ -692,7 +692,7 @@ fn mintTestFixtureMmio(
     _ = capdom.mintHandle(
         root_cd,
         erased,
-        zag.caps.capability.CapabilityType.device_region,
+        stygia.caps.capability.CapabilityType.device_region,
         @bitCast(dr_caps),
         field0,
         0,
@@ -702,10 +702,10 @@ fn mintTestFixtureMmio(
 }
 
 fn grantBootDevices(root_cd: *CapabilityDomain) void {
-    zag.devices.device_region.forEachBootGrant(root_cd, mintBootDevice);
+    stygia.devices.device_region.forEachBootGrant(root_cd, mintBootDevice);
 }
 
-fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.DeviceRegion) void {
+fn mintBootDevice(root_cd: *CapabilityDomain, dr: *stygia.devices.device_region.DeviceRegion) void {
     // field0 layout per spec §[device_region]:
     //   port_io:     bits 0-3 dev_type=1, bits 4-19 base_port, bits 20-35 port_count
     //   mmio:        bits 0-3 dev_type=0, bits 4-51 paddr>>12, bits 52-63 size_pages
@@ -737,7 +737,7 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.Dev
     }
     // Grant move/copy/dma/irq so the root service can delegate freely
     // to drivers and create DMA VMARs for them.
-    const dr_caps = zag.devices.device_region.DeviceRegionCaps{
+    const dr_caps = stygia.devices.device_region.DeviceRegionCaps{
         .move = true,
         .copy = true,
         .dma = true,
@@ -750,7 +750,7 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *zag.devices.device_region.Dev
     _ = capdom.mintHandle(
         root_cd,
         erased,
-        zag.caps.capability.CapabilityType.device_region,
+        stygia.caps.capability.CapabilityType.device_region,
         @bitCast(dr_caps),
         field0,
         field1,
@@ -776,7 +776,7 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
     //   bits 20-35 port_count (16-bit)
     const COM1_BASE: u16 = 0x3F8;
     const COM1_COUNT: u16 = 8;
-    const dr = zag.devices.device_region.registerPortIo(COM1_BASE, COM1_COUNT) catch {
+    const dr = stygia.devices.device_region.registerPortIo(COM1_BASE, COM1_COUNT) catch {
         arch.boot.print("[boot] WARNING: COM1 registerPortIo failed; serial disabled\n", .{});
         return;
     };
@@ -787,14 +787,14 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
     const dr_caps: u16 = 0; // No move/copy/dma/irq required; runner only
                              //   needs the slot to exist for map_mmio.
 
-    const erased: zag.caps.capability.ErasedSlabRef = .{
+    const erased: stygia.caps.capability.ErasedSlabRef = .{
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
     _ = capdom.mintHandle(
         root_cd,
         erased,
-        zag.caps.capability.CapabilityType.device_region,
+        stygia.caps.capability.CapabilityType.device_region,
         dr_caps,
         field0,
         0,
@@ -813,7 +813,7 @@ fn grantPl011(root_cd: *CapabilityDomain) void {
     //   bits 52-63  size_pages
     const PL011_BASE: u64 = 0x0900_0000;
     const PL011_SIZE: u64 = 0x1000;
-    const dr = zag.devices.device_region.registerMmio(PAddr.fromInt(PL011_BASE), PL011_SIZE) catch {
+    const dr = stygia.devices.device_region.registerMmio(PAddr.fromInt(PL011_BASE), PL011_SIZE) catch {
         arch.boot.print("[boot] WARNING: PL011 registerMmio failed; serial disabled\n", .{});
         return;
     };
@@ -823,14 +823,14 @@ fn grantPl011(root_cd: *CapabilityDomain) void {
         ((PL011_SIZE >> 12) << 52);
     const dr_caps: u16 = 0;
 
-    const erased: zag.caps.capability.ErasedSlabRef = .{
+    const erased: stygia.caps.capability.ErasedSlabRef = .{
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
     _ = capdom.mintHandle(
         root_cd,
         erased,
-        zag.caps.capability.CapabilityType.device_region,
+        stygia.caps.capability.CapabilityType.device_region,
         dr_caps,
         field0,
         0,

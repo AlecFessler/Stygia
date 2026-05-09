@@ -8,7 +8,7 @@
 //   architecture (x86-64 today, aarch64 planned) must therefore return
 //   success and report at minimum 4 KiB physical page allocation
 //   support — bit 0 of [4] page_size_mask. The hardware architectures
-//   Zag targets all have 4 KiB as their base page size, and the kernel
+//   Stygia targets all have 4 KiB as their base page size, and the kernel
 //   PMM allocates in 4 KiB units, so bit 0 must be set unconditionally.
 //
 //   Other bits of page_size_mask (bit 1 = 2 MiB, bit 2 = 1 GiB) are

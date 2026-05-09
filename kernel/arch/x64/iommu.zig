@@ -1,13 +1,13 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const vi = zag.arch.x64.amd.vi;
-const vtd = zag.arch.x64.intel.vtd;
+const vi = stygia.arch.x64.amd.vi;
+const vtd = stygia.arch.x64.intel.vtd;
 
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const SpecDeviceRegion = zag.devices.device_region.DeviceRegion;
-const VmarPageSize = zag.memory.vmar.PageSize;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const SpecDeviceRegion = stygia.devices.device_region.DeviceRegion;
+const VmarPageSize = stygia.memory.vmar.PageSize;
 
 const IommuType = enum {
     none,

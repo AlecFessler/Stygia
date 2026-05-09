@@ -1,30 +1,30 @@
 const build_options = @import("build_options");
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const ctx_trace = zag.utils.ctx_trace;
-const gdt = zag.arch.x64.gdt;
-const idt = zag.arch.x64.idt;
-const kprof = zag.kprof.trace_id;
-const paging = zag.arch.x64.paging;
-const scheduler = zag.sched.scheduler;
-const sync_debug = zag.utils.sync.debug;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const ctx_trace = stygia.utils.ctx_trace;
+const gdt = stygia.arch.x64.gdt;
+const idt = stygia.arch.x64.idt;
+const kprof = stygia.kprof.trace_id;
+const paging = stygia.arch.x64.paging;
+const scheduler = stygia.sched.scheduler;
+const sync_debug = stygia.utils.sync.debug;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
-const CapabilityType = zag.caps.capability.CapabilityType;
-const EcQueue = zag.sched.scheduler.EcQueue;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const CapabilityType = stygia.caps.capability.CapabilityType;
+const EcQueue = stygia.sched.scheduler.EcQueue;
 const EcQueueLevel = @typeInfo(@FieldType(EcQueue, "levels")).array.child;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const InterruptHandler = idt.interruptHandler;
-const KernelHandle = zag.caps.capability.KernelHandle;
-const Port = zag.sched.port.Port;
-const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const ReplyCaps = zag.sched.port.ReplyCaps;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VAddr = zag.memory.address.VAddr;
-const WaiterKind = zag.sched.port.WaiterKind;
+const KernelHandle = stygia.caps.capability.KernelHandle;
+const Port = stygia.sched.port.Port;
+const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
+const ReplyCaps = stygia.sched.port.ReplyCaps;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const VAddr = stygia.memory.address.VAddr;
+const WaiterKind = stygia.sched.port.WaiterKind;
 
 pub const ArchCpuContext = cpu.Context;
 
@@ -279,8 +279,8 @@ pub fn initSyscallScratch(core_id: u64) void {
     scratch.per_core_ptr = @intFromPtr(&scheduler.core_states[core_id]);
     scratch.tss_rsp0_ptr = @intFromPtr(&gdt.coreTss(core_id).rsp0);
     scratch.pcid_enabled = if (cpu.pcid_enabled) 1 else 0;
-    scratch.timed_recv_waiters_ptr = @intFromPtr(&zag.sched.port.timed_recv_waiters);
-    scratch.timed_recv_lock_ptr = @intFromPtr(&zag.sched.port.timed_recv_lock);
+    scratch.timed_recv_waiters_ptr = @intFromPtr(&stygia.sched.port.timed_recv_waiters);
+    scratch.timed_recv_lock_ptr = @intFromPtr(&stygia.sched.port.timed_recv_lock);
     scratch.core_lock_ptr = @intFromPtr(&scheduler.core_locks[core_id]);
     scratch.core_id = @intCast(core_id);
     cpu.wrmsr(ia32_kernel_gs_base, @intFromPtr(scratch));
@@ -328,7 +328,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     var args: [127]u64 = .{0} ** 127;
     cpu.stac();
     syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
-    const max_vreg: u8 = zag.syscall.dispatch.expectedMaxVreg(syscall_word);
+    const max_vreg: u8 = stygia.syscall.dispatch.expectedMaxVreg(syscall_word);
     if (max_vreg > 13) {
         var i: u8 = 14;
         while (i <= max_vreg) : (i += 1) {
@@ -354,7 +354,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     ctx_trace.mark(caller, .slowpath_save);
 
     const dispatch_len: usize = @max(@as(usize, max_vreg), 13);
-    const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..dispatch_len]);
+    const ret = stygia.syscall.dispatch.dispatch(caller, syscall_word, args[0..dispatch_len]);
 
     // Only commit the syscall return into the saved frame if the
     // dispatched handler did NOT park `caller`. A handler that suspends
@@ -434,7 +434,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 ///
 /// All syscalls currently route through the slow path: a 176-byte
 /// `cpu.Context` save, followed by the generic `syscallDispatch`
-/// trampoline into `zag.syscall.dispatch`, then iretq. The slow path
+/// trampoline into `stygia.syscall.dispatch`, then iretq. The slow path
 /// preserves vregs 1-13 (= rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
 /// r12, r13, r14, r15) across the call by saving them into the
 /// Context frame on entry and restoring them on exit, so any handler
@@ -819,8 +819,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .kh_size = @sizeOf(KernelHandle),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
                 .port_lock_off = @offsetOf(Port, "_gen_lock"),
             },
         ) ++
@@ -1147,8 +1147,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
                 // EC._gen_lock is NOT at offset 0: ExecutionContext is a
                 // plain (auto-reordered) struct and `fpu_state: [576]u8
                 // align(64)` lands first. Use the comptime offset so the
@@ -1185,9 +1185,9 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .w0_const = (@as(u64, @as(u16, @bitCast(ReplyCaps{ .move = true, .xfer = true }))) << 48) | (@as(u64, @intFromEnum(CapabilityType.reply)) << 12),
-                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
-                .f0_off = @offsetOf(zag.caps.capability.Capability, "field0"),
-                .f1_off = @offsetOf(zag.caps.capability.Capability, "field1"),
+                .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
+                .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
+                .f1_off = @offsetOf(stygia.caps.capability.Capability, "field1"),
             },
         ) ++
         std.fmt.comptimePrint(
@@ -1259,8 +1259,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .state_susp = @intFromEnum(zag.sched.execution_context.State.suspended_on_port),
-                .event_susp = @intFromEnum(zag.sched.execution_context.EventType.suspension),
+                .state_susp = @intFromEnum(stygia.sched.execution_context.State.suspended_on_port),
+                .event_susp = @intFromEnum(stygia.sched.execution_context.EventType.suspension),
                 .state_off = @offsetOf(ExecutionContext, "state"),
                 .event_off = @offsetOf(ExecutionContext, "event_type"),
                 .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
@@ -1342,16 +1342,16 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .state_run = @intFromEnum(zag.sched.execution_context.State.running),
-                .event_none = @intFromEnum(zag.sched.execution_context.EventType.none),
+                .state_run = @intFromEnum(stygia.sched.execution_context.State.running),
+                .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
                 .state_off = @offsetOf(ExecutionContext, "state"),
                 .event_off = @offsetOf(ExecutionContext, "event_type"),
                 .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
                 .deadline_off = @offsetOf(ExecutionContext, "recv_deadline_ns"),
                 .pew_valid_off = @offsetOf(ExecutionContext, "pending_event_word_valid"),
                 .per_valid_off = @offsetOf(ExecutionContext, "pending_event_rip_valid"),
-                .trw_max = zag.sched.port.MAX_TIMED_RECV_WAITERS,
-                .lock_state_off = @offsetOf(zag.utils.sync.spin_lock.SpinLock, "state"),
+                .trw_max = stygia.sched.port.MAX_TIMED_RECV_WAITERS,
+                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
                 .sc_lock_ptr = Offsets.sc_timed_recv_lock_ptr,
                 .sc_waiters_ptr = Offsets.sc_timed_recv_waiters_ptr,
             },
@@ -1431,12 +1431,12 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(zag.memory.stack.Stack, "top"),
-                .fpu_owner_off = @offsetOf(zag.sched.scheduler.PerCore, "last_fpu_owner"),
-                .fpu_armed_off = @offsetOf(zag.sched.scheduler.PerCore, "fpu_trap_armed"),
-                .cur_ec_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 16,
+                .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
+                .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
+                .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
+                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
                 // Same EC._gen_lock-vs-offset-0 trap as the mint above:
                 // fpu_state pushes _gen_lock past offset 0; the comptime
                 // offset is the only safe way to read the gen-lock word.
@@ -1485,7 +1485,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\shlq $32, %%rcx
         ++ std.fmt.comptimePrint(
             "\nmovabsq ${d}, %%r11\norq %%r11, %%rcx\n",
-            .{@as(u64, @intFromEnum(zag.sched.execution_context.EventType.suspension)) << 44},
+            .{@as(u64, @intFromEnum(stygia.sched.execution_context.EventType.suspension)) << 44},
         ) ++
         \\movq %%gs:64, %%r11
         \\shlq $49, %%r11
@@ -1754,9 +1754,9 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .kh_size = @sizeOf(KernelHandle),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
-                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
+                .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
                 .type_reply = @intFromEnum(CapabilityType.reply),
                 // ReplyCaps lives in word0[48..63]; abandoned is bit 3 of
                 // ReplyCaps → word0 bit 51. `testq` can't take a 64-bit
@@ -1839,15 +1839,15 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
+                .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
                 .type_port = @intFromEnum(CapabilityType.port),
                 .recv_bit = 48 + 3,
                 .xfer_bit = 48 + 2,
                 .kh_size = @sizeOf(KernelHandle),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
-                .wk_senders = @intFromEnum(zag.sched.port.WaiterKind.senders),
-                .waiter_kind_off = @offsetOf(zag.sched.port.Port, "waiter_kind"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
+                .wk_senders = @intFromEnum(stygia.sched.port.WaiterKind.senders),
+                .waiter_kind_off = @offsetOf(stygia.sched.port.Port, "waiter_kind"),
             },
         ) ++
 
@@ -1966,11 +1966,11 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
-                .w0_off = @offsetOf(zag.caps.capability.Capability, "word0"),
-                .f0_off = @offsetOf(zag.caps.capability.Capability, "field0"),
-                .f1_off = @offsetOf(zag.caps.capability.Capability, "field1"),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(zag.caps.capability.ErasedSlabRef, "gen"),
+                .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
+                .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
+                .f1_off = @offsetOf(stygia.caps.capability.Capability, "field1"),
+                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
                 .par0 = @offsetOf(KernelHandle, "parent") + 0,
                 .par1 = @offsetOf(KernelHandle, "parent") + 8,
                 .par2 = @offsetOf(KernelHandle, "parent") + 16,
@@ -2044,8 +2044,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .state_run = @intFromEnum(zag.sched.execution_context.State.running),
-                .event_none = @intFromEnum(zag.sched.execution_context.EventType.none),
+                .state_run = @intFromEnum(stygia.sched.execution_context.State.running),
+                .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
                 .state_off = @offsetOf(ExecutionContext, "state"),
                 .event_off = @offsetOf(ExecutionContext, "event_type"),
                 .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
@@ -2241,12 +2241,12 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{
                 .sc_core_lock = Offsets.sc_core_lock_ptr,
                 .sc_per_core = Offsets.sc_per_core_ptr,
-                .lock_state_off = @offsetOf(zag.utils.sync.spin_lock.SpinLock, "state"),
-                .state_ready = @intFromEnum(zag.sched.execution_context.State.ready),
+                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
+                .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
                 .state_off = @offsetOf(ExecutionContext, "state"),
                 .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
                 .priority_off = @offsetOf(ExecutionContext, "priority"),
-                .run_queue_off = @offsetOf(zag.sched.scheduler.PerCore, "run_queue"),
+                .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
                 .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
                 .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
                 .ec_next_off = @offsetOf(ExecutionContext, "next"),
@@ -2460,20 +2460,20 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .port_lock_off = @offsetOf(zag.sched.port.Port, "_gen_lock"),
-                .waiters_off = @offsetOf(zag.sched.port.Port, "waiters"),
-                .waiter_kind_off = @offsetOf(zag.sched.port.Port, "waiter_kind"),
-                .wk_recv = @intFromEnum(zag.sched.port.WaiterKind.receivers),
-                .wk_senders = @intFromEnum(zag.sched.port.WaiterKind.senders),
+                .port_lock_off = @offsetOf(stygia.sched.port.Port, "_gen_lock"),
+                .waiters_off = @offsetOf(stygia.sched.port.Port, "waiters"),
+                .waiter_kind_off = @offsetOf(stygia.sched.port.Port, "waiter_kind"),
+                .wk_recv = @intFromEnum(stygia.sched.port.WaiterKind.receivers),
+                .wk_senders = @intFromEnum(stygia.sched.port.WaiterKind.senders),
                 .priority_off = @offsetOf(ExecutionContext, "priority"),
                 .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
                 .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
                 .ec_next_off = @offsetOf(ExecutionContext, "next"),
                 .state_off = @offsetOf(ExecutionContext, "state"),
-                .state_susp = @intFromEnum(zag.sched.execution_context.State.suspended_on_port),
-                .state_ready = @intFromEnum(zag.sched.execution_context.State.ready),
+                .state_susp = @intFromEnum(stygia.sched.execution_context.State.suspended_on_port),
+                .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
                 .event_off = @offsetOf(ExecutionContext, "event_type"),
-                .event_none = @intFromEnum(zag.sched.execution_context.EventType.none),
+                .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
                 .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
                 .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
                 .prh_off = @offsetOf(ExecutionContext, "pending_reply_holder"),
@@ -2484,10 +2484,10 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
                 .recv_xfer_off = @offsetOf(ExecutionContext, "recv_port_xfer"),
                 .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .lock_state_off = @offsetOf(zag.utils.sync.spin_lock.SpinLock, "state"),
+                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
                 .sc_core_lock_late = Offsets.sc_core_lock_ptr,
                 .sc_per_core_late = Offsets.sc_per_core_ptr,
-                .run_queue_off = @offsetOf(zag.sched.scheduler.PerCore, "run_queue"),
+                .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
             },
         ) ++
 
@@ -2553,12 +2553,12 @@ pub export fn syscallEntry() callconv(.naked) void {
             .{
                 .ut_off = @offsetOf(CapabilityDomain, "user_table"),
                 .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(zag.memory.stack.Stack, "top"),
-                .fpu_owner_off = @offsetOf(zag.sched.scheduler.PerCore, "last_fpu_owner"),
-                .fpu_armed_off = @offsetOf(zag.sched.scheduler.PerCore, "fpu_trap_armed"),
-                .cur_ec_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(zag.sched.scheduler.PerCore, "current_ec") + 16,
+                .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
+                .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
+                .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
+                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .sc_cur_gen = Offsets.sc_current_ec_gen,
                 .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
@@ -2645,7 +2645,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         ) ++
         std.fmt.comptimePrint(
             "\nmovq ${d}, %%rax\n",
-            .{@as(u64, @bitCast(zag.syscall.errors.E_TERM))},
+            .{@as(u64, @bitCast(stygia.syscall.errors.E_TERM))},
         ) ++
         \\movq %%gs:16, %%rcx
         \\movq %%gs:24, %%r11
@@ -2818,7 +2818,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
                 break :blk null;
             };
             const z = zombie_to_reap orelse break;
-            zag.sched.execution_context.finalizeDestroyMarkedDead(z);
+            stygia.sched.execution_context.finalizeDestroyMarkedDead(z);
         }
     }
 

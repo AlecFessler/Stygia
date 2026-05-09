@@ -1,7 +1,7 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
+const cpu = stygia.arch.x64.cpu;
 
 /// Read the CMOS RTC and return Unix nanoseconds since 1970-01-01T00:00:00Z.
 ///

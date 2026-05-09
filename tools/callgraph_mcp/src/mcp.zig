@@ -17,7 +17,7 @@ const SERVER_INFO_JSON = "{\"name\":\"callgraph-mcp\",\"version\":\"0.1.0\"}";
 const CAPABILITIES_JSON = "{\"tools\":{\"listChanged\":false},\"logging\":{}}";
 
 const INSTRUCTIONS =
-    "Callgraph index for the Zag kernel — SQLite-backed view over " ++
+    "Callgraph index for the Stygia kernel — SQLite-backed view over " ++
     "the per-(arch, commit_sha) DB built by tools/indexer. Provides " ++
     "structured queries over entities, ir_calls, entry points, AST, " ++
     "binaries, DWARF lines, and analyzer findings (lint_finding). " ++
@@ -40,7 +40,7 @@ const TOOLS_JSON =
     \\  {"name":"callgraph_src_bin_at","description":"Source line → emitted instructions. file basename match against dwarf_line, then bin_inst over the joined ranges.","inputSchema":{"type":"object","properties":{"at":{"type":"string"}},"required":["at"],"additionalProperties":false}},
     \\  {"name":"callgraph_bin_dataflow_reg","description":"Linear scan of bin_inst over a fn's address range; regex over operands extracts register tokens. stop_at_call defaults true.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"reg":{"type":"string"},"stop_at_call":{"type":"boolean"}},"required":["name","reg"],"additionalProperties":false}},
     \\  {"name":"callgraph_bin_addr2line","description":"Floor lookup — dwarf_line WHERE addr_lo <= ? ORDER BY addr_lo DESC LIMIT 1; symbol via bin_symbol.","inputSchema":{"type":"object","properties":{"addr":{"type":"string"}},"required":["addr"],"additionalProperties":false}},
-    \\  {"name":"callgraph_commits","description":"Recent commits in the Zag repo. One commit per line: `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits older than the `-Demit_ir` build option. Limit defaults to 30 (max 500). Shells out to `git log` against the daemon's repo root.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false}},
+    \\  {"name":"callgraph_commits","description":"Recent commits in the Stygia repo. One commit per line: `<short_sha>  <iso8601_date>  <subject>` with a trailing `  [stale]` marker on commits older than the `-Demit_ir` build option. Limit defaults to 30 (max 500). Shells out to `git log` against the daemon's repo root.","inputSchema":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":false}},
     \\  {"name":"callgraph_findings","description":"Query the lint_finding table populated by analyzer passes (genlock, dead_code). Filters: analyzer / rule / severity / file (path GLOB). One line per finding: `<analyzer>  [<severity>]  <rule>  <file>:<line>  <message>`. Useful for asking 'what dead code does X module have?' without re-running the analyzer.","inputSchema":{"type":"object","properties":{"analyzer":{"type":"string"},"rule":{"type":"string"},"severity":{"type":"string"},"file":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":2000}},"additionalProperties":false}}
     \\]
 ;

@@ -1,11 +1,11 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const x64 = zag.arch.x64;
+const x64 = stygia.arch.x64;
 
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const VAddr = zag.memory.address.VAddr;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const VAddr = stygia.memory.address.VAddr;
 
 /// Emulate a userspace MOV that page-faulted on a port-IO MMIO VMAR.
 /// Spec §[port_io_virtualization] tests 04-11.

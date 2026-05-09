@@ -46,13 +46,13 @@
 //! it could not afford to spill).
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 const build_options = @import("build_options");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 const builtin = @import("builtin");
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 
 pub const enabled: bool = build_options.kernel_ctx_trace;
 
@@ -207,7 +207,7 @@ fn markImpl(ec: *ExecutionContext, event: Event) void {
 }
 
 fn ringIndexOf(ec: *ExecutionContext) ?u32 {
-    const slab = &zag.sched.execution_context.slab_instance;
+    const slab = &stygia.sched.execution_context.slab_instance;
     const data_base = slab.data_base;
     const ec_addr = @intFromPtr(ec);
     if (ec_addr < data_base) return null;
@@ -436,7 +436,7 @@ fn dumpAllRingsToSerialImpl() void {
 
     arch.boot.printRaw("\n===== ctx_trace ring dump (all live ECs) =====\n");
 
-    const slab = &zag.sched.execution_context.slab_instance;
+    const slab = &stygia.sched.execution_context.slab_instance;
     const total = @atomicLoad(u32, &slab.count_total, .acquire);
     var i: u32 = 0;
     while (i < total) {

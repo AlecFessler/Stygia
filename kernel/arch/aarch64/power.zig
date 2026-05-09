@@ -28,9 +28,9 @@
 //! - ARM DEN 0022D: PSCI 1.1 Specification
 //! - ACPI 6.5, Section 5.2.9: FADT ARM Boot Architecture Flags
 
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.aarch64.cpu;
+const cpu = stygia.arch.aarch64.cpu;
 
 // --- PSCI return codes (DEN0022D, Table 6) ---
 

@@ -1,9 +1,9 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const cpu = zag.arch.x64.cpu;
+const cpu = stygia.arch.x64.cpu;
 
-const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
 
 /// Intel SDM Vol 3A, Table 3-2 — System-Segment and Gate-Descriptor Types.
 /// In IA-32e mode: 0xE = 64-bit Interrupt Gate, 0xF = 64-bit Trap Gate.

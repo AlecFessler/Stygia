@@ -2,7 +2,7 @@
 //!
 //! Emits a DTB compliant with Devicetree Specification v0.4 §5 "Flattened
 //! Devicetree (DTB) Format". The output is just enough to let a Linux
-//! arm64 kernel come up on top of Zag's aarch64 VM layer:
+//! arm64 kernel come up on top of Stygia's aarch64 VM layer:
 //!
 //!   /                       (compatible "linux,dummy-virt")
 //!   /chosen                 (bootargs + initrd range)

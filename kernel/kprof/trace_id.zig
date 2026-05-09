@@ -1,8 +1,8 @@
 const mode = @import("mode.zig");
 const record = @import("record.zig");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
+const arch = stygia.arch.dispatch;
 const log = @import("log.zig");
 
 /// Central registry of every kernel tracepoint.

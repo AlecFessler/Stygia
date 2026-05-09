@@ -13,9 +13,9 @@
 //! - ACPI 6.5, Section 5.2.32: SPCR
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const sync = zag.utils.sync;
+const sync = stygia.utils.sync;
 
 /// PL011 register offsets from base address.
 /// DDI0183G Section 3.2, Table 3-1.

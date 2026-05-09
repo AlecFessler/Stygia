@@ -12,12 +12,12 @@
 /// Guest virtual -> physical translation via the guest's CR3 page-table
 /// walk; guest physical memory is read through the kernel physmap (SMAP
 /// does not gate kernel-mode VAs).
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const virtual_machine = zag.hv.virtual_machine;
+const virtual_machine = stygia.hv.virtual_machine;
 
-const GuestState = zag.arch.x64.vm.GuestState;
-const VirtualMachine = zag.hv.virtual_machine.VirtualMachine;
+const GuestState = stygia.arch.x64.vm.GuestState;
+const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {

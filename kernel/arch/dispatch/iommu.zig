@@ -1,13 +1,13 @@
 const builtin = @import("builtin");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64 = zag.arch.aarch64;
-const x64 = zag.arch.x64;
+const aarch64 = stygia.arch.aarch64;
+const x64 = stygia.arch.x64;
 
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
 
 /// True when an IOMMU is present and providing DMA remapping for this
 /// kernel build. On x86-64 this is VT-d or AMD-Vi having latched a

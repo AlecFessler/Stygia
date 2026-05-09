@@ -1,18 +1,18 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const capability = zag.caps.capability;
-const cpu = zag.arch.dispatch.cpu;
-const device_region = zag.devices.device_region;
-const errors = zag.syscall.errors;
-const port = zag.sched.port;
+const arch = stygia.arch.dispatch;
+const capability = stygia.caps.capability;
+const cpu = stygia.arch.dispatch.cpu;
+const device_region = stygia.devices.device_region;
+const errors = stygia.syscall.errors;
+const port = stygia.sched.port;
 
-const CapabilityDomain = zag.caps.capability_domain.CapabilityDomain;
+const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;
-const PAddr = zag.memory.address.PAddr;
+const PAddr = stygia.memory.address.PAddr;
 const ReplyCaps = port.ReplyCaps;
 const Word0 = capability.Word0;
 

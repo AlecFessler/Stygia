@@ -4,9 +4,9 @@
 ///   IOREGSEL at 0xFEC00000 (selects register index)
 ///   IOWIN at 0xFEC00010 (reads/writes selected register)
 /// Section 3.0: Register Description.
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const Lapic = zag.arch.x64.hv.lapic.Lapic;
+const Lapic = stygia.arch.x64.hv.lapic.Lapic;
 
 // Memory-mapped register offsets (Table 1)
 const IOREGSEL_OFF: u32 = 0x00;

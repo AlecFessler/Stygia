@@ -11,19 +11,19 @@
 //! they would if every bucket reached for the same EC link slot.
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const arch_syscall = zag.arch.dispatch.syscall;
-const errors = zag.syscall.errors;
-const sched = zag.sched.scheduler;
+const arch = stygia.arch.dispatch;
+const arch_syscall = stygia.arch.dispatch.syscall;
+const errors = stygia.syscall.errors;
+const sched = stygia.sched.scheduler;
 
-const ExecutionContext = zag.sched.execution_context.ExecutionContext;
-const PAddr = zag.memory.address.PAddr;
-const Priority = zag.sched.execution_context.Priority;
-const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
-const VAddr = zag.memory.address.VAddr;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const PAddr = stygia.memory.address.PAddr;
+const Priority = stygia.sched.execution_context.Priority;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
+const SpinLock = stygia.utils.sync.SpinLock;
+const VAddr = stygia.memory.address.VAddr;
 
 const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
@@ -48,7 +48,7 @@ pub const WaitNode = struct {
     priority: Priority,
 };
 
-const WaitNodePriorityQueue = zag.sched.priority_queue.PriorityQueue(
+const WaitNodePriorityQueue = stygia.sched.priority_queue.PriorityQueue(
     WaitNode,
     "next",
     "priority",

@@ -1,22 +1,22 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
-const interrupts = zag.arch.x64.interrupts;
-const kprof = zag.kprof.trace_id;
-const paging = zag.memory.paging;
-const physmap = zag.memory.address.AddrSpacePartition.physmap;
-const pmm = zag.memory.pmm;
+const apic = stygia.arch.x64.apic;
+const cpu = stygia.arch.x64.cpu;
+const interrupts = stygia.arch.x64.interrupts;
+const kprof = stygia.kprof.trace_id;
+const paging = stygia.memory.paging;
+const physmap = stygia.memory.address.AddrSpacePartition.physmap;
+const pmm = stygia.memory.pmm;
 
-const MappingKind = zag.memory.address.MappingKind;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const PageSize = zag.memory.paging.PageSize;
-const SpinLock = zag.utils.sync.SpinLock;
-const VAddr = zag.memory.address.VAddr;
-const VmarCacheType = zag.memory.vmar.CacheType;
-const VmarPageSize = zag.memory.vmar.PageSize;
+const MappingKind = stygia.memory.address.MappingKind;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const PageSize = stygia.memory.paging.PageSize;
+const SpinLock = stygia.utils.sync.SpinLock;
+const VAddr = stygia.memory.address.VAddr;
+const VmarCacheType = stygia.memory.vmar.CacheType;
+const VmarPageSize = stygia.memory.vmar.PageSize;
 
 /// First user-mappable virtual address. The NULL guard `[0, 0x1000)` is
 /// reserved by spec §[address_space] so that NULL dereferences always

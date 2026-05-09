@@ -16,17 +16,17 @@
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ZAG_ROOT="$(cd -- "$HERE/../../.." && pwd)"
+STYGIA_ROOT="$(cd -- "$HERE/../../.." && pwd)"
 
-INDEXER="$ZAG_ROOT/tools/indexer/zig-out/bin/indexer"
-ANALYZER="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
+INDEXER="$STYGIA_ROOT/tools/indexer/zig-out/bin/indexer"
+ANALYZER="$STYGIA_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
 
 if [[ ! -x "$INDEXER" ]]; then
-    (cd "$ZAG_ROOT/tools/indexer" && zig build) >&2 \
+    (cd "$STYGIA_ROOT/tools/indexer" && zig build) >&2 \
         || { echo "indexer build failed" >&2; exit 2; }
 fi
 if [[ ! -x "$ANALYZER" ]]; then
-    (cd "$ZAG_ROOT/tools/dead_code_zig" && zig build) >&2 \
+    (cd "$STYGIA_ROOT/tools/dead_code_zig" && zig build) >&2 \
         || { echo "analyzer build failed" >&2; exit 2; }
 fi
 

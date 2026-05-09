@@ -6,7 +6,7 @@ MNT="/mnt/desktopOS"
 REPO_ROOT="$(dirname "$0")/.."
 BOOT_EFI="$REPO_ROOT/zig-out/img/efi/boot/BOOTX64.EFI"
 KERNEL="$REPO_ROOT/zig-out/img/kernel.elf"
-ROOT_SVC="$REPO_ROOT/../Zag-desktopOS/bin/desktopOS.elf"
+ROOT_SVC="$REPO_ROOT/../Stygia-desktopOS/bin/desktopOS.elf"
 
 for f in "$BOOT_EFI" "$KERNEL" "$ROOT_SVC"; do
     if [ ! -f "$f" ]; then

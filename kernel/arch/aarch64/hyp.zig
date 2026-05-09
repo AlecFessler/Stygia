@@ -24,18 +24,18 @@
 //!   - 102142 §2.3        "Entry to and exit from a guest"
 
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const aarch64_paging = zag.arch.aarch64.paging;
-const gic = zag.arch.aarch64.gic;
-const memory_init = zag.memory.init;
-const stage2 = zag.arch.aarch64.stage2;
-const vm = zag.arch.aarch64.vm;
+const aarch64_paging = stygia.arch.aarch64.paging;
+const gic = stygia.arch.aarch64.gic;
+const memory_init = stygia.memory.init;
+const stage2 = stygia.arch.aarch64.stage2;
+const vm = stygia.arch.aarch64.vm;
 
 const FxsaveArea = vm.FxsaveArea;
 const GuestState = vm.GuestState;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 const VmExitInfo = vm.VmExitInfo;
 
 // ===========================================================================

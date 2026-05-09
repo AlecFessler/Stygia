@@ -1,23 +1,23 @@
 const std = @import("std");
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch = zag.arch.dispatch;
-const debug_info = zag.utils.debug_info;
-const kprof_log = zag.kprof.log;
-const memory = zag.memory.init;
-const sched = zag.sched.scheduler;
-const userspace_init = zag.boot.userspace_init;
+const arch = stygia.arch.dispatch;
+const debug_info = stygia.utils.debug_info;
+const kprof_log = stygia.kprof.log;
+const memory = stygia.memory.init;
+const sched = stygia.sched.scheduler;
+const userspace_init = stygia.boot.userspace_init;
 
-const BootInfo = zag.boot.protocol.BootInfo;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
+const BootInfo = stygia.boot.protocol.BootInfo;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
 
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
     ret_addr: ?usize,
 ) noreturn {
-    zag.panic.panic(msg, error_return_trace, ret_addr);
+    stygia.panic.panic(msg, error_return_trace, ret_addr);
 }
 
 // Override compiler-rt's `memset` (which on aarch64 is implemented with
@@ -68,9 +68,9 @@ export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
     unreachable;
 }
 
-fn grantBootFramebuffer(fb: zag.boot.protocol.Framebuffer) void {
+fn grantBootFramebuffer(fb: stygia.boot.protocol.Framebuffer) void {
     if (fb.size == 0) return;
-    const dr = zag.devices.device_region.registerFramebuffer(
+    const dr = stygia.devices.device_region.registerFramebuffer(
         fb.base,
         fb.size,
         fb.width,
@@ -81,7 +81,7 @@ fn grantBootFramebuffer(fb: zag.boot.protocol.Framebuffer) void {
         arch.boot.print("[boot] WARNING: framebuffer registerFramebuffer failed\n", .{});
         return;
     };
-    zag.devices.device_region.appendBootGrant(dr);
+    stygia.devices.device_region.appendBootGrant(dr);
 }
 
 fn kMain(boot_info: *BootInfo) !void {
@@ -99,11 +99,11 @@ fn kMain(boot_info: *BootInfo) !void {
     // Wall-clock anchor latches RTC against the monotonic clock once,
     // here, while IRQs are naturally off — keeps the slow x86 CMOS
     // UIP-clear loop out of the syscall path. Spec §[time].time_getwall.
-    zag.syscall.system.init();
+    stygia.syscall.system.init();
     // Hang detector — start ticking once the monotonic clock is up. Until
     // armed, every detector hook is a no-op so the very-early boot path
     // doesn't trip the threshold.
-    zag.utils.hang_detector.arm();
+    stygia.utils.hang_detector.arm();
     // Optional HPET-NMI watchdog. When `-Dkernel_hang_watchdog=true`,
     // programs HPET timer 0 in periodic FSB-NMI mode (~500 ms) so the
     // detector dump still fires when every core is parked in a user-
@@ -121,7 +121,7 @@ fn kMain(boot_info: *BootInfo) !void {
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
     try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
     try arch.smp.smpInit();
-    zag.utils.sync.debug.markSmpReady();
+    stygia.utils.sync.debug.markSmpReady();
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();

@@ -13,18 +13,18 @@
 /// device lazily provisions a root/context entry pair plus a fresh
 /// second-stage PML4 and stashes that state on the DeviceRegion's
 /// `iommu_state` slot.
-const zag = @import("zag");
+const stygia = @import("stygia");
 
-const arch_paging = zag.arch.x64.paging;
-const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
+const arch_paging = stygia.arch.x64.paging;
+const memory_init = stygia.memory.init;
+const paging = stygia.memory.paging;
+const pmm = stygia.memory.pmm;
 
-const DeviceRegion = zag.devices.device_region.DeviceRegion;
-const MemoryPerms = zag.memory.address.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
-const VmarPageSize = zag.memory.vmar.PageSize;
+const DeviceRegion = stygia.devices.device_region.DeviceRegion;
+const MemoryPerms = stygia.memory.address.MemoryPerms;
+const PAddr = stygia.memory.address.PAddr;
+const VAddr = stygia.memory.address.VAddr;
+const VmarPageSize = stygia.memory.vmar.PageSize;
 
 const MMIO_PERMS: MemoryPerms = .{ .read = true, .write = true };
 
@@ -153,7 +153,7 @@ const PerDevice = struct {
     provisioned: bool = false,
 };
 
-const MAX_PER_DEVICE: usize = zag.devices.device_region.MAX_DEVICE_REGIONS;
+const MAX_PER_DEVICE: usize = stygia.devices.device_region.MAX_DEVICE_REGIONS;
 var per_device_pool: [MAX_PER_DEVICE]PerDevice = [_]PerDevice{.{}} ** MAX_PER_DEVICE;
 var per_device_used: usize = 0;
 
