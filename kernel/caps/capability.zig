@@ -140,26 +140,12 @@ pub const ErasedSlabRef = extern struct {
     gen: u32 = 0,
     _pad: u32 = 0,
 
-    /// Reconstitute a typed `SlabRef(T)` and acquire its gen-lock.
-    /// Returns `StaleHandle` if the slot has been freed since this
-    /// reference was minted, or null on a structurally-empty link
-    /// IRQ-saving typed lock. Reconstructs the typed `SlabRef(T)` from
-    /// the erased fat pointer, then takes its gen-lock with IRQs masked.
-    /// Caller pairs with `unlockTypedIrqRestore` and threads the
-    /// returned IRQ state back.
-    pub fn lockTypedIrqSave(self: ErasedSlabRef, comptime T: type) secure_slab.AccessError!struct { ptr: *T, irq_state: u64 } {
-        const raw = self.ptr orelse return error.StaleHandle;
-        const ref = secure_slab.SlabRef(T){
-            .ptr = @ptrCast(@alignCast(raw)),
-            .gen = self.gen,
-            ._pad = self._pad,
-        };
-        const lr = try ref.lockIrqSave(@src());
-        return .{ .ptr = lr.ptr, .irq_state = lr.irq_state };
-    }
-
-    /// `lockTypedIrqSave` variant that tags the lockdep entry with a
-    /// non-zero `ordered_group`. The tag opts out of same-class overlap
+    /// Reconstitute a typed `SlabRef(T)` from the erased fat pointer
+    /// and acquire its gen-lock with a non-zero `ordered_group` tag,
+    /// IRQs masked. Returns `StaleHandle` if the slot has been freed
+    /// since this reference was minted.
+    ///
+    /// The `ordered_group` tag opts out of same-class overlap
     /// detection (lockdep treats every instance in the same group as
     /// disjoint for the duration of the held window) so callers that
     /// legitimately hold multiple `SlabRef(T)` locks of the same T at
@@ -167,7 +153,16 @@ pub const ErasedSlabRef = extern struct {
     /// `caps/derivation.zig` holds two `*CapabilityDomain` gen-locks
     /// under `tree_mutex` — don't trip the lockdep guard. Caller is
     /// responsible for ensuring an outer serializer (here, `tree_mutex`)
-    /// makes the same-class overlap structurally safe.
+    /// makes the same-class overlap structurally safe. Caller pairs
+    /// with `unlockTypedIrqRestore` and threads the returned IRQ state
+    /// back.
+    ///
+    /// The plain (`ordered_group=0`) variant intentionally is not
+    /// exposed here — every CD-lock acquire on the tree-mutation paths
+    /// goes through `TREE_DOMAIN_GROUP`. Adding a non-ordered variant
+    /// would risk callers mixing plain and ordered acquires on the
+    /// same class, which lockdep rejects via `acquireOn`'s
+    /// `held.ordered_group != ordered_group` clause.
     pub fn lockTypedIrqSaveOrdered(
         self: ErasedSlabRef,
         comptime T: type,
@@ -183,8 +178,10 @@ pub const ErasedSlabRef = extern struct {
         return .{ .ptr = lr.ptr, .irq_state = lr.irq_state };
     }
 
-    /// Release the lock acquired via `lockTypedIrqSave`. Restores the
-    /// captured IRQ state.
+    /// Release the lock acquired via `lockTypedIrqSaveOrdered`.
+    /// Restores the captured IRQ state. Pairs with the lock-side
+    /// regardless of which `ordered_group` was passed there — release
+    /// looks the held entry up by lock_ptr, not by group tag.
     pub fn unlockTypedIrqRestore(self: ErasedSlabRef, comptime T: type, irq_state: u64) void {
         const raw = self.ptr orelse return;
         const ref = secure_slab.SlabRef(T){

@@ -573,7 +573,26 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     _ = partial_ec; // covered by destroyEcsInDomain's slab-walk match
     const cd_gen = cd._gen_lock.currentGen();
     const cd_ref: SlabRef(CapabilityDomain) = .{ .ptr = cd, .gen = @intCast(cd_gen) };
-    const lr = cd_ref.lockIrqSave(@src()) catch return;
+
+    // `destroyPhase1` invariant: caller holds `tree_mutex` (so
+    // `detachDyingDomainFromTree`'s tree walk runs under it) AND
+    // `cd._gen_lock`. Mirrors the SLOT_SELF arm in
+    // `caps.derivation.deleteAndDetach` and the fault-path SLOT_SELF
+    // teardown in `port.fireMemoryFault`.
+    const tree_irq = zag.caps.derivation.tree_mutex.lockIrqSaveOrdered(
+        @src(),
+        zag.caps.derivation.TREE_MUTEX_GROUP,
+    );
+
+    // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
+    // `detachDyingDomainFromTree` walk (which re-locks cross-domain CDs
+    // under the same group inside `lockEntrySkip`) does not trip
+    // lockdep's same-class overlap check. See
+    // `caps.derivation.TREE_DOMAIN_GROUP` doc comment.
+    const lr = cd_ref.lockOrderedIrqSave(zag.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
+        zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+        return;
+    };
     // destroyPhase1 runs under cd._gen_lock and ends by releasing it
     // via destroyLocked (gen flips to even). Restore IRQ state
     // manually because the deferred unlockIrqRestore would assert on
@@ -581,6 +600,9 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     // in derivation.deleteAndDetach.
     const deferred = destroyPhase1(cd, null);
     arch.cpu.restoreInterrupts(lr.irq_state);
+
+    zag.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+
     destroyPhase2(deferred);
 }
 
@@ -1144,13 +1166,21 @@ pub const DestroyDeferred = struct {
     caller_ec: ?SlabRef(ExecutionContext),
 };
 
-/// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller.
-/// Disarms every Timer reachable through the domain's handle table,
-/// snapshots all cd.* fields the phase-2 tear-down needs, and releases
-/// the CD slab slot via `destroyLocked` (clears the lock bit + bumps
-/// gen → even in one store). On return the CD's `_gen_lock` is no
-/// longer held — the caller MUST drop any other locks (notably
-/// `caps.derivation.tree_mutex`) BEFORE invoking `destroyPhase2`.
+/// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller
+/// AND with `caps.derivation.tree_mutex` held by the caller. Disarms
+/// every Timer reachable through the domain's handle table, snapshots
+/// all cd.* fields the phase-2 tear-down needs, and releases the CD
+/// slab slot via `destroyLocked` (clears the lock bit + bumps gen →
+/// even in one store). On return the CD's `_gen_lock` is no longer
+/// held — the caller MUST drop `tree_mutex` (and any other locks)
+/// BEFORE invoking `destroyPhase2`.
+///
+/// The caller's `cd._gen_lock` MUST be acquired with
+/// `caps.derivation.TREE_DOMAIN_GROUP` (and `tree_mutex` with
+/// `caps.derivation.TREE_MUTEX_GROUP`). Without those tags,
+/// `detachDyingDomainFromTree`'s cross-domain CD acquires inside
+/// `lockEntrySkip` (also `TREE_DOMAIN_GROUP`) trip lockdep's
+/// same-class overlap check.
 pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
     zag.sched.timer.disarmTimerHandlesInDomain(cd);
 
@@ -1612,9 +1642,13 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
 }
 
 /// Phase-1 entry for SLOT_SELF tear-down. The caller
-/// (`caps.derivation.deleteAndDetach`) holds `tree_mutex` and the CD's
-/// `_gen_lock`; this returns a `DestroyDeferred` capturing the work
-/// the caller must finish via `destroyPhase2` AFTER releasing both.
+/// (`caps.derivation.deleteAndDetach` SLOT_SELF arm, or
+/// `port.fireMemoryFault`'s no-route destroy) holds `tree_mutex`
+/// (`TREE_MUTEX_GROUP`) and the CD's `_gen_lock`
+/// (`TREE_DOMAIN_GROUP`); this returns a `DestroyDeferred`
+/// capturing the work the caller must finish via `destroyPhase2`
+/// AFTER releasing both. See `destroyPhase1` for the lockdep-group
+/// requirement and rationale.
 ///
 /// `delete(SLOT_SELF)` runs on an EC bound to the very domain being
 /// destroyed (commonly the initial EC, which on test ELFs falls

@@ -80,7 +80,12 @@ pub var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
 /// Lockdep group tag for `tree_mutex`. Non-zero opts every acquisition
 /// out of pair-edge cycle detection (see `SpinLock.lockIrqSaveOrdered`).
 /// The tree_mutex is a single global lock; serialization is sufficient.
-const TREE_MUTEX_GROUP: u32 = 0x7245_5645; // "TREVE" — derivation tree mutex
+///
+/// Exported so external callers that hold `tree_mutex` across calls into
+/// `destroyPhase1` (e.g. `cleanupPartiallyCreatedCd`) can match this
+/// group; mismatched ordered-group tags on the same lock would still
+/// register a phantom edge in the cycle-detection registry.
+pub const TREE_MUTEX_GROUP: u32 = 0x7245_5645; // "TREVE" — derivation tree mutex
 
 /// Lockdep group tag for the per-CapabilityDomain gen-locks taken inside
 /// `lockEntrySkip`. The cross-domain tree walk legitimately holds
@@ -89,7 +94,16 @@ const TREE_MUTEX_GROUP: u32 = 0x7245_5645; // "TREVE" — derivation tree mutex
 /// `tree_mutex` outer serializer makes the same-class overlap structurally
 /// safe: only one tree mutator runs at a time. The ordered tag opts
 /// these CD acquires out of lockdep's same-class overlap check.
-const TREE_DOMAIN_GROUP: u32 = 0x5452_4544; // "TRED" — tree-walk CD lock
+///
+/// Exported so call sites that take the *first* CD gen-lock of a tree
+/// mutation (revoke / delete / cleanupPartiallyCreatedCd / fault-path
+/// SLOT_SELF teardown) can tag it with the same group. Without that, the
+/// inner cross-domain CD acquire inside `lockEntrySkip` (this group) and
+/// an outer un-grouped CD acquire (`ordered_group=0`) form a same-class
+/// pair the lockdep checker rejects via `acquireOn`'s
+/// `held.ordered_group != ordered_group` clause — both sides of the
+/// pair must agree on the group for the opt-out to apply.
+pub const TREE_DOMAIN_GROUP: u32 = 0x5452_4544; // "TRED" — tree-walk CD lock
 
 // ── External API ─────────────────────────────────────────────────────
 
@@ -109,7 +123,11 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
     const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
+    // Tag the caller-domain acquire with `TREE_DOMAIN_GROUP` so the
+    // sibling-chain walk's cross-domain CD acquires (also `TREE_DOMAIN_GROUP`)
+    // don't trip lockdep's same-class overlap check. See
+    // `TREE_DOMAIN_GROUP` doc comment for why both sides must agree.
+    const cd_lr = caller_domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch
         return errors.E_BADCAP;
     const cd = cd_lr.ptr;
     defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
@@ -240,7 +258,12 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     if (slot == 0) {
         const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
 
-        const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch {
+        // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
+        // `destroyPhase1`-driven `detachDyingDomainFromTree` walk (which
+        // re-locks cross-domain CDs under the same group inside
+        // `lockEntrySkip`) does not trip lockdep's same-class overlap
+        // check.
+        const cd_lr = caller_domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch {
             tree_mutex.unlockIrqRestore(tree_irq);
             return errors.E_BADCAP;
         };
@@ -262,7 +285,10 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const cd_lr = caller_domain.lockTypedIrqSave(CapabilityDomain) catch
+    // Tag the caller-domain acquire with `TREE_DOMAIN_GROUP` so
+    // `detachForDelete`'s cross-domain CD acquires (also under that
+    // group) don't trip lockdep's same-class overlap check.
+    const cd_lr = caller_domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch
         return errors.E_BADCAP;
     const cd = cd_lr.ptr;
     defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
@@ -284,13 +310,16 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
 /// domains reparent to the dying-slot's grandparent, ancestors in
 /// other domains lose the dying-slot from their child list.
 ///
-/// Caller has the dying domain's gen-lock; this function takes
-/// `tree_mutex` (with `TREE_MUTEX_GROUP`, opting out of the
-/// pair-edge cycle check that would otherwise complain about the
-/// `(CD → tree_mutex)` direction here vs the `(tree_mutex → CD)`
-/// direction in revoke/delete). The held CD lock is passed through to
-/// `lockEntrySkip` so the walk never re-acquires it on cross-domain
-/// links that loop back to the dying domain.
+/// **Caller holds `tree_mutex`** (acquired with `TREE_MUTEX_GROUP`)
+/// AND the dying domain's gen-lock. Both invariants are documented on
+/// `destroyPhase1`. The walk's per-link `lockEntrySkip` re-locks
+/// cross-domain CDs under `TREE_DOMAIN_GROUP`; the caller's CD lock
+/// must therefore also be tagged with `TREE_DOMAIN_GROUP` (see
+/// `cleanupPartiallyCreatedCd`, the SLOT_SELF arm of `deleteAndDetach`,
+/// and the fault-path SLOT_SELF teardown in `port.fireMemoryFault`).
+/// The held CD lock is passed through to `lockEntrySkip` so the walk
+/// never re-acquires it on cross-domain links that loop back to the
+/// dying domain.
 ///
 /// Note: this only patches the tree links. The dying domain's slots
 /// are NOT released here (per-type release happens in `destroyPhase2`'s
@@ -298,9 +327,6 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
 /// rewrite the cross-domain links so other domains' tree views stay
 /// consistent.
 pub fn detachDyingDomainFromTree(cd: *CapabilityDomain) void {
-    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
-    defer tree_mutex.unlockIrqRestore(tree_irq);
-
     var slot_idx: u16 = 0;
     while (slot_idx < capability.MAX_HANDLES_PER_DOMAIN) : (slot_idx += 1) {
         const entry = &cd.kernel_table[slot_idx];
