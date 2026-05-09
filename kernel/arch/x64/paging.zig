@@ -77,52 +77,90 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 /// Two shootdown modes co-exist on top of the same lock + descriptor:
 ///
 ///   1. **Synchronous** (`flushRemotePcid`, `shootdownTlbRange`): the
-///      initiator holds `shootdown_lock`, publishes the request descriptor
-///      (kind/addr/pcid), arms `shootdown_acks_remaining = remote_count`,
-///      fans out IPIs, then spins on `shootdown_acks_remaining == 0`
-///      before releasing the lock or publishing the next descriptor. The
-///      remote IPI handler performs the requested invalidation and
-///      decrements the counter. This is the Linux-style "send-then-wait"
-///      pattern — without it, a per-page loop that overwrites the shared
-///      descriptor between IPIs leaves remote cores executing INVPCID
-///      against the *next* descriptor instead of the one they were
-///      summoned for, leaking stale TLB entries (cross-core UAF on
-///      unmap+free races). Both syscall-side teardown paths run with
-///      interrupts enabled, so the wait is safe.
+///      initiator holds `shootdown_lock`, publishes the request
+///      descriptor (kind/addr/pcid), bumps `sync_arm_gen` to a fresh
+///      value, fans out IPIs, then spins until every remote core's
+///      `core_acked_gen[i] >= sync_arm_gen` before releasing the lock
+///      or publishing the next descriptor. The remote IPI handler
+///      performs the requested invalidation and stores the current
+///      `sync_arm_gen` into its own `core_acked_gen[my_core]` slot.
+///      This is the Linux-style "send-then-wait" pattern — without
+///      it, a per-page loop that overwrites the shared descriptor
+///      between IPIs leaves remote cores executing INVPCID against
+///      the *next* descriptor instead of the one they were summoned
+///      for, leaking stale TLB entries (cross-core UAF on unmap+free
+///      races). Both syscall-side teardown paths run with interrupts
+///      enabled, so the wait is safe.
 ///
-///   2. **Fire-and-forget** (`flushRemoteTlb`, single-page): the initiator
-///      holds the lock, publishes a `.invlpg_no_ack` descriptor, fans
-///      out IPIs, releases the lock. The handler INVLPGs but does NOT
-///      decrement `shootdown_acks_remaining`, so a later synchronous
-///      initiator's wait is not falsely satisfied by these strangler
-///      IPIs. This mode is used by `unmapPage`'s kernel-stack teardown,
-///      which is reachable from `finalizeDestroyMarkedDead` inside the
-///      IRQ-disabled scheduler critical section (`yieldTo`,
-///      `parkAndAwaitIRQ`). A synchronous wait there would be a hard
-///      deadlock — two cores both calling `unmapPage` with IRQs off
-///      would each spin on `shootdown_lock` waiting for the other's
-///      ack while neither can process the other's IPI. The
-///      pre-existing UAF window described in `unmapPage`'s body
-///      remains for this single-page kernel-side path.
+///   2. **Fire-and-forget** (`flushRemoteTlb`, single-page): the
+///      initiator holds the lock, publishes a `.invlpg_no_ack`
+///      descriptor (does NOT bump `sync_arm_gen`), fans out IPIs,
+///      releases the lock. The handler INVLPGs and updates its
+///      `core_acked_gen` slot to whatever `sync_arm_gen` it observes;
+///      because the no-ack path never bumps the gen, that store is
+///      idempotent against the most recent sync arm and cannot
+///      satisfy a *future* sync arm's wait. This mode is used by
+///      `unmapPage`'s kernel-stack teardown, which is reachable from
+///      `finalizeDestroyMarkedDead` inside the IRQ-disabled scheduler
+///      critical section (`yieldTo`, `parkAndAwaitIRQ`). A synchronous
+///      wait there would be a hard deadlock — two cores both calling
+///      `unmapPage` with IRQs off would each spin on `shootdown_lock`
+///      waiting for the other's ack while neither can process the
+///      other's IPI. The pre-existing UAF window described in
+///      `unmapPage`'s body remains for this single-page kernel-side
+///      path.
+///
+/// ## Why per-core gen tracking instead of a shared decrement counter
+///
+/// The earlier design used `shootdown_acks_remaining: u32` which the
+/// handler decremented exactly once per IPI. That design was wrong
+/// when the no-ack and sync paths interleaved: the handler reads
+/// `shootdown_kind` at *service time*, not at IPI dispatch time. A
+/// stale fire-and-forget IPI pending in a remote core's IRR (because
+/// the remote had IRQs masked at dispatch) might be serviced AFTER a
+/// subsequent sync arm has rewritten `shootdown_kind` from
+/// `invlpg_no_ack` to `invlpg` / `invpcid_addr`. The handler then sees
+/// the new kind, decrements the counter — but that counter belongs to
+/// the *new* arm, not the one the IPI was sent for. Each affected
+/// remote contributed one extra decrement per arm, underflowing
+/// `acks_remaining` past zero (observed: `0xFFFFFFFE` in gdb under
+/// `vmar.unmapAll`, which interleaves both modes within a single
+/// syscall window — `flushRemoteTlb` per page in `unmapPage`, then
+/// `shootdownTlbRange` over the whole range). The sync initiator's
+/// `!= 0` spin on the underflowed counter never terminated, hanging
+/// CPU0 in `waitForShootdownAcks` while every other core was halted
+/// in `parkAndAwaitIRQ` (the `pending_zombies=1` / RDY-EC-not-stolen
+/// dump pattern from t5r).
+///
+/// The fix is to make ack tracking idempotent and per-core: each sync
+/// arm advances `sync_arm_gen` (a monotonic u64), and the handler
+/// stores that gen into its own slot. A duplicate or stale handler
+/// run just re-stores the same value (or a stale lower one — masked
+/// by max-store semantics in the wait loop). Underflow is impossible
+/// because we never decrement; double-acking is harmless because the
+/// store is idempotent within an arm.
 var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
-/// Shootdown request kind:
+/// Shootdown request kind. Selects which invalidation primitive the
+/// handler runs (INVLPG vs INVPCID type 0/1). Note the kind no longer
+/// drives the ack-vs-no-ack decision — that's controlled by whether
+/// the initiator bumped `sync_arm_gen`.
 ///   - .invlpg          → INVLPG `shootdown_addr` (flushes every PCID +
 ///                        globals at this VA on the remote core). Used
-///                        by the synchronous fan-outs below — handler
-///                        decrements `shootdown_acks_remaining`.
+///                        by `shootdownTlbRange` when PCID is disabled.
 ///   - .invpcid_single  → INVPCID type 1 against `shootdown_pcid`
-///                        (every linear address, single PCID). Sync.
+///                        (every linear address, single PCID). Used by
+///                        `flushRemotePcid`.
 ///   - .invpcid_addr    → INVPCID type 0 against `(shootdown_pcid,
 ///                        shootdown_addr)` (one VA, one PCID — used by
 ///                        the range walk so remote cores only pay for
-///                        the address space being torn down). Sync.
-///   - .invlpg_no_ack   → like .invlpg but the IPI handler does NOT
-///                        decrement the ack counter. Used by the
-///                        fire-and-forget kernel-side unmap path
-///                        (`flushRemoteTlb`, called from IRQ-disabled
-///                        scheduler contexts where waiting would
-///                        deadlock — see that function's doc).
+///                        the address space being torn down).
+///   - .invlpg_no_ack   → INVLPG (kernel-side fire-and-forget). The
+///                        kind no longer affects the handler's ack
+///                        path — the per-core gen store is
+///                        unconditional. Retained as a distinct enum
+///                        value so callers and tooling can still see
+///                        the publication intent in a debugger.
 const ShootdownKind = enum(u8) {
     invlpg = 0,
     invpcid_single = 1,
@@ -131,16 +169,38 @@ const ShootdownKind = enum(u8) {
 };
 var shootdown_kind: u8 = @intFromEnum(ShootdownKind.invlpg);
 var shootdown_pcid: u16 = 0;
-/// Per-shootdown remaining-ack counter. The initiator stores
-/// `remote_count` here before fanning out IPIs, then waits for it to
-/// drain to zero. Each IPI handler decrements it (release semantics)
-/// after completing the invalidation so the initiator's acquire-load
-/// observes the completed flush, not just the published request.
-var shootdown_acks_remaining: u32 = 0;
 
-/// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`, performs
-/// the requested invalidation, then signals completion by decrementing
-/// `shootdown_acks_remaining`.
+/// MAX_CORES on x86_64. Mirrors `gdt.MAX_CORES`, `acpi.MAX_CORES`, and
+/// `intel.vmx.MAX_CORES`; kept local so the shootdown ack-tracking
+/// arrays don't reach across files for a constant.
+const MAX_CORES: usize = 64;
+
+/// Monotonic generation counter for synchronous shootdown arms. Bumped
+/// by `flushRemotePcid` and each iteration of `shootdownTlbRange` while
+/// `shootdown_lock` is held. Sync initiators wait for every remote
+/// core's `core_acked_gen[i]` to catch up to the value they observed
+/// post-bump; remote handlers store the current `sync_arm_gen` into
+/// their own slot after performing the invalidation, regardless of
+/// kind. `flushRemoteTlb` (no-ack mode) deliberately does NOT bump
+/// this — its IPIs cannot satisfy a future sync arm's wait because
+/// the gen they'd store is `<=` whatever a future sync arm publishes.
+var sync_arm_gen: u64 = 0;
+/// Per-core last-acked sync_arm_gen. Each remote core stores its own
+/// slot from inside `tlbShootdownHandler` after the invalidation
+/// completes; sync initiators spin until every remote slot reaches
+/// the gen they bumped to. Idempotent — stale handler runs just
+/// re-store the same (or smaller) value, and the wait loop checks
+/// `>= expected_gen`.
+var core_acked_gen: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
+
+/// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`,
+/// performs the requested invalidation, then signals completion by
+/// storing the current `sync_arm_gen` into this core's
+/// `core_acked_gen` slot. The store is unconditional: a fire-and-
+/// forget IPI from `flushRemoteTlb` is harmless because that path
+/// never bumps `sync_arm_gen`, so the value stored here will be
+/// `<=` whatever any future sync arm publishes (and a sync waiter
+/// only completes when every remote's slot is `>=` the new gen).
 ///
 /// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID (types 0 and 1).
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
@@ -174,36 +234,58 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
         },
         else => {
             // .invlpg or .invlpg_no_ack — both perform the same
-            // INVLPG; only the ack-decrement decision below differs.
+            // INVLPG. The kind no longer changes the ack path; that's
+            // unified into the unconditional `core_acked_gen` store
+            // below.
             cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
         },
     }
-    if (kind != @intFromEnum(ShootdownKind.invlpg_no_ack)) {
-        _ = @atomicRmw(u32, &shootdown_acks_remaining, .Sub, 1, .release);
-    }
+    // Acknowledge the most recently published sync arm. Done
+    // unconditionally — see the design note at the top of the file.
+    // Acquire-load of `sync_arm_gen` pairs with the release-store in
+    // `bumpSyncArmGen`, so we observe the descriptor that triggered
+    // this IPI (or a later one — both are safe).
+    const gen = @atomicLoad(u64, &sync_arm_gen, .acquire);
+    const my_core = apic.coreID();
+    @atomicStore(u64, &core_acked_gen[my_core], gen, .release);
 }
 
-/// Wait for the most recent shootdown fan-out to complete (every remote
-/// core has executed its invalidation and decremented the ack counter).
+/// Bump `sync_arm_gen` and return the new value. Called by sync
+/// initiators while holding `shootdown_lock` and after publishing the
+/// descriptor (`shootdown_kind`/`shootdown_addr`/`shootdown_pcid`) so
+/// the release-store ordering pins the descriptor publication ahead
+/// of the IPIs that observe the new gen. The returned value is the
+/// gen the wait loop expects every remote core to reach.
+inline fn bumpSyncArmGen() u64 {
+    return @atomicRmw(u64, &sync_arm_gen, .Add, 1, .release) + 1;
+}
+
+/// Wait until every remote core has acked the sync arm at
+/// `expected_gen` by storing it into its `core_acked_gen` slot.
 /// Caller must hold `shootdown_lock`.
 ///
-/// While spinning we explicitly keep interrupts in the caller's pre-call
-/// state — we deliberately do NOT toggle them on/off here, because
-/// callers from inside `switchTo`-style critical sections rely on the
-/// outer IRQ-off invariant being preserved across our call. The IPI
-/// handler runs CPU-side with auto-cli (Intel SDM Vol 3A §6.8.1) and
-/// only touches `shootdown_acks_remaining` plus the local TLB, so it
-/// is safe even when nested inside other kernel critical sections on
-/// the *remote* cores.
-inline fn waitForShootdownAcks() void {
-    while (@atomicLoad(u32, &shootdown_acks_remaining, .acquire) != 0) {
-        asm volatile ("pause" ::: .{ .memory = true });
+/// While spinning we explicitly keep interrupts in the caller's
+/// pre-call state — we deliberately do NOT toggle them on/off here,
+/// because callers from inside `switchTo`-style critical sections
+/// rely on the outer IRQ-off invariant being preserved across our
+/// call. The IPI handler runs CPU-side with auto-cli (Intel SDM Vol
+/// 3A §6.8.1) and only touches `core_acked_gen[my_core]` plus the
+/// local TLB, so it is safe even when nested inside other kernel
+/// critical sections on the *remote* cores.
+inline fn waitForShootdownAcks(expected_gen: u64, self_id: u64, core_count: u64) void {
+    var i: u64 = 0;
+    while (i < core_count) : (i += 1) {
+        if (i == self_id) continue;
+        while (@atomicLoad(u64, &core_acked_gen[i], .acquire) < expected_gen) {
+            asm volatile ("pause" ::: .{ .memory = true });
+        }
     }
 }
 
 /// Send the shootdown IPI to every remote core. Caller must hold
-/// `shootdown_lock` and have armed `shootdown_acks_remaining` to the
-/// expected ack count.
+/// `shootdown_lock`; for sync arms the caller has also bumped
+/// `sync_arm_gen` (via `bumpSyncArmGen`) to the value the wait loop
+/// will expect every remote's `core_acked_gen[i]` to reach.
 inline fn fanoutShootdownIpis(self_id: u64) void {
     const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
     for (apic.lapics.?, 0..) |la, i| {
@@ -242,12 +324,15 @@ fn flushRemoteTlb(virt_addr: u64) void {
     shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
-    // .invlpg_no_ack: handler will INVLPG but NOT decrement
-    // `shootdown_acks_remaining`. This matters because we don't wait
-    // here, so a later synchronous initiator (`flushRemotePcid` /
-    // `shootdownTlbRange`) could otherwise see its acks counter
-    // decremented by our straggler IPIs and falsely believe its
-    // shootdown completed.
+    // Fire-and-forget: publish the descriptor and fan out, but do NOT
+    // bump `sync_arm_gen` and do NOT wait. A handler running for this
+    // IPI will store whatever `sync_arm_gen` it currently observes
+    // into its `core_acked_gen` slot — that store is `<=` the value
+    // any future sync arm will publish, so it cannot prematurely
+    // satisfy that arm's wait. The `.invlpg_no_ack` kind selects the
+    // INVLPG path in the handler dispatch (same as `.invlpg`); the
+    // distinct enum value is preserved as a publication-intent marker
+    // visible in a debugger.
     @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invlpg_no_ack), .release);
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);
 
@@ -277,10 +362,13 @@ pub fn flushRemotePcid(pcid: u16) void {
 
     @atomicStore(u16, &shootdown_pcid, pcid, .release);
     @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invpcid_single), .release);
-    @atomicStore(u32, &shootdown_acks_remaining, @intCast(core_count - 1), .release);
+    // Publish a fresh sync-arm gen AFTER the descriptor so handlers
+    // observing the new gen also observe the descriptor that
+    // triggered them.
+    const expected_gen = bumpSyncArmGen();
 
     fanoutShootdownIpis(self_id);
-    waitForShootdownAcks();
+    waitForShootdownAcks(expected_gen, self_id, core_count);
 }
 
 /// Page-table entry for 4-level paging.
@@ -1065,10 +1153,12 @@ pub fn shootdownTlbRange(
         const va = virt.addr + @as(u64, j) * paging.PAGE4K;
         @atomicStore(u64, &shootdown_addr, va, .release);
         @atomicStore(u8, &shootdown_kind, @intFromEnum(kind), .release);
-        @atomicStore(u32, &shootdown_acks_remaining, remote_count, .release);
+        // Bump the sync-arm gen AFTER publishing the descriptor so a
+        // handler observing the new gen also observes (va, kind).
+        const expected_gen = bumpSyncArmGen();
 
         fanoutShootdownIpis(self_id);
-        waitForShootdownAcks();
+        waitForShootdownAcks(expected_gen, self_id, core_count);
     }
 }
 
