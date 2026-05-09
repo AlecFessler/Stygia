@@ -1115,6 +1115,16 @@ fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     port.fireThreadFault(ec, @intFromEnum(subcode), payload);
     cpu.enableInterrupts();
     scheduler.yieldTo(null);
+    // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`) cleared
+    // this core's `current_ec`; if `yieldTo` couldn't dispatch fresh
+    // work, ERET back through `exceptionTrampoline` would surface the
+    // now-stale faulting user context, re-fault on the same PC, and
+    // re-enter `handleSyncLowerEl` with `currentEc() == null` — hitting
+    // the panic above. Hand off to `scheduler.run()` (noreturn) — it
+    // idles via WFI until an IRQ delivers more work, at which point
+    // dispatch resets SP and abandons this kernel-stack frame.
+    // Mirrors arch/x64/exceptions.zig user-exception handler tail.
+    if (scheduler.currentEc() == null) scheduler.run();
 }
 
 /// Look up the running EC, fire a `breakpoint` event with `subcode`,
@@ -1125,4 +1135,12 @@ fn deliverBreakpoint(subcode: BreakpointSubcode) void {
     port.fireBreakpoint(ec, @intFromEnum(subcode));
     cpu.enableInterrupts();
     scheduler.yieldTo(null);
+    // Same post-yieldTo guard as `deliverThreadFault`. `fireBreakpoint`'s
+    // no-route fallback does NOT park (it just drops the event), so
+    // currentEc() stays valid in the no-route case; but the routed-
+    // delivery path suspends the EC via `port.deliverEvent`, clearing
+    // `current_ec` on this core. Without this guard a routed delivery
+    // followed by an empty run queue would ERET back to a stale user
+    // PC and re-fault.
+    if (scheduler.currentEc() == null) scheduler.run();
 }
