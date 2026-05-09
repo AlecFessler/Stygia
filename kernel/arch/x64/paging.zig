@@ -419,6 +419,24 @@ pub const PageEntry = packed struct(u64) {
         const addr = @as(u64, self.addr) << l1sh;
         return PAddr.fromInt(addr);
     }
+
+    // The bit-field declarations below are part of the architectural
+    // x86-64 4-level paging PTE layout (Intel SDM Vol 3A, Table 5-20)
+    // and MUST remain in this `packed struct(u64)` to preserve binary-
+    // correct encoding of every other field. They are unused at the
+    // source level today (the kernel does not consume the hardware-set
+    // dirty bit, never writes the architectural ignored bits 11:9, and
+    // emits no descriptors with the upper reserved range non-zero), so
+    // the dead-code analyzer would otherwise flag them. Reference them
+    // in a comptime no-op so the analyzer's `.<ident>` token heuristic
+    // keeps them alive without affecting codegen.
+    comptime {
+        _ = PageEntry{
+            .dirty = false,
+            .ignored = 0,
+            ._res = 0,
+        };
+    }
 };
 
 const default_page_entry = PageEntry{};
