@@ -179,6 +179,24 @@ pub const PageEntry = packed struct(u64) {
         const addr = @as(u64, self.addr) << l0sh;
         return PAddr.fromInt(addr);
     }
+
+    // The bit-field declarations below are part of the architectural
+    // ARMv8 VMSAv8-64 PTE layout (ARM ARM D5.3, Table D5-15) and MUST
+    // remain in this `packed struct(u64)` to preserve binary-correct
+    // encoding of every other field. They are unused at the source
+    // level today (the kernel runs entirely at non-secure EL1, never
+    // touches PBHA/SW bits, and emits no descriptors with bit 63 set),
+    // so the dead-code analyzer would otherwise flag them. Reference
+    // them in a comptime no-op so the analyzer's `.<ident>` token
+    // heuristic keeps them alive without affecting codegen.
+    comptime {
+        _ = PageEntry{
+            .ns = false,
+            ._sw = 0,
+            ._ignored = 0,
+            ._res1 = false,
+        };
+    }
 };
 
 const default_page_entry = PageEntry{};
