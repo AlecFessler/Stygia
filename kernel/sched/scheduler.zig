@@ -435,7 +435,17 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         }
     }
     const next = if (target) |t| blk: {
-        if (t.state == .ready and state.run_queue.remove(t)) break :blk t;
+        if (t.state == .ready and state.run_queue.remove(t)) {
+            // Same kstack-livesness rationale as dequeueOrIdleLocked's
+            // stamp: we are committing `t` to dispatch on this core
+            // under core_locks[core]. A cross-core terminate(t) that
+            // races after we drop the lock must observe
+            // `t.last_dispatched_core == core` to defer the reap to
+            // this core's pending_zombie column rather than inline-
+            // free t's kstack while we're about to land on it.
+            t.last_dispatched_core = core;
+            break :blk t;
+        }
         break :blk dequeueOrIdleLocked(core);
     } else dequeueOrIdleLocked(core);
     lock.unlockIrqRestore(irq);
@@ -656,11 +666,71 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         // `setCurrentEc`'s `SlabRef.init`, and the EC is reaped via the
         // pending_zombie path on its running core anyway.
         if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        // Stamp `last_dispatched_core` here, while still holding
+        // `core_locks[core]`, so a cross-core `terminate(ec)` that lands
+        // AFTER our dequeue but BEFORE our `setCurrentEc` finds the
+        // correct value rather than the stale `LAST_DISPATCHED_NEVER`
+        // sentinel. See "kstack-livesness ordering" below.
+        //
+        // ── kstack-livesness ordering ──────────────────────────────────
+        //
+        // Without this stamp, the slow-path race is:
+        //
+        //   core A: dequeueOrIdle()       → takes core_locks[A]
+        //   core A: state.run_queue.dequeue() → ec
+        //   core A: drops core_locks[A]
+        //   core A: <window — has not yet called setCurrentEc>
+        //   core B: terminate(ec) runs:
+        //     - removeFromQueue sweeps every core's queue under that
+        //       core's lock; ec is in NONE (A already dequeued it).
+        //     - state = .exited; second sweep — still nothing.
+        //     - bumpDeadGenLocked flips gen to even.
+        //     - reads ec.last_dispatched_core == LAST_DISPATCHED_NEVER
+        //     - calls finalizeDestroyMarkedDead(ec) INLINE
+        //         → stack.destroyKernel frees ec.kernel_stack pages.
+        //   core A: setCurrentEc(A, ec) → loadEcContextAndReturn(ec)
+        //            → arch.switchTo writes TSS.RSP0 = ec.kernel_stack.top,
+        //              jmps to ec.ctx → iretq onto FREED kstack
+        //              → iretq #GP at batch 168 (smp=4 reproducer).
+        //
+        // The fix: stamp last_dispatched_core under core_locks[core], so
+        // that terminate's `removeFromQueue` sweep (which serializes
+        // through that same lock) cannot read the stamp until after our
+        // dequeue commit. Once stamped, terminate's last_dispatched_core
+        // read in the post-bumpGen branch sees `core` and posts the
+        // zombie to core A's pending_zombie column — A's next switchTo
+        // (or park-drain) reaps it AFTER A has moved off the kstack.
+        //
+        // The terminate-path read of `last_dispatched_core` happens after
+        // the `removeFromQueue` second sweep + bumpGen. Both halves are
+        // synchronised against this stamp via core_locks[core]: the
+        // removeFromQueue sweep takes core_locks[i] for every i in turn,
+        // so by the time terminate gets to the post-bumpGen branch, every
+        // core's lock has been acquired-and-released, publishing this
+        // stamp via the lock release.
+        //
+        // Stamping here is a "floor" for last_dispatched_core: it may
+        // be overwritten by setCurrentEc (slow path) or by FP step-14 /
+        // R-14 (IPC fast path) when the EC actually lands on a different
+        // core later. That's fine — last_dispatched_core has only one
+        // monotone safety property: "names a core whose pending_zombie
+        // column is a safe place to defer this EC's reap." Any core that
+        // has held the EC's kstack alive (via dequeue or actual rsp use)
+        // satisfies that.
+        //
+        // Note: the slow-path scheduler.switchTo's vCPU loop may dequeue
+        // an EC, fire its synthetic vm_exit, re-suspend it on its
+        // exit_port, and then dequeue another — never actually using the
+        // first EC's kstack as rsp. The stamp on the first vCPU EC still
+        // names this core; that's fine (false-positive zombie post → one
+        // extra reap pass, no correctness impact).
+        ec.last_dispatched_core = core;
         return ec;
     }
     if (state.idle_ec) |idle_ref| {
         // caller-pinned: per-core idle EC is allocated at perCoreInit and
         // never freed — it's the dispatch-of-last-resort target.
+        idle_ref.ptr.last_dispatched_core = core;
         return idle_ref.ptr;
     }
     return null;
