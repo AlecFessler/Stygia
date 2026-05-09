@@ -69,10 +69,8 @@
 #   * sched/port.zig (firePmuOverflow)                 — pmu_overflow event
 #     route fire helper; aarch64/pmu.zig and the PMU-overflow ISR path call
 #     it once that bring-up lands.
-#   * syscall/errors.zig (E_AGAIN, E_REFUSED)          — spec-mandated
-#     error codes (E_AGAIN: POSIX-shape, future blocking syscalls;
-#     E_REFUSED: spec error code 13 reserved for capability-refused
-#     conditions, no kernel returner yet).
+#   * syscall/errors.zig (E_REFUSED) — spec error code 13 reserved
+#     for capability-refused conditions, no kernel returner yet.
 #   * sched/priority_queue.zig (enqueueFront) — generic re-queue
 #     helper documented for IPC cap-transfer rollback (kept until that
 #     rollback path lands).
@@ -528,7 +526,6 @@ boot/protocol.zig:57-57    sha256:704f6312b332cf2d95fabe4f419334f9438ca77561dace
 memory/address.zig:20-20    sha256:5abbb83340208253017811184884be23726d822f6848b62c87cac3ac71445c93
 memory/address.zig:21-21    sha256:bce4c96ffefdf149ec92b480a1f56f0c9fe16d2cb9ef6a368c7af83739f5ef2b
 sched/execution_context.zig:87-87    sha256:e5983cd3656442de0e35dfc267cc1d51de18fa89dcea1b5c2b441ac6af1544e2
-syscall/errors.zig:32-32    sha256:36ce65a4f62c0caeda3db2c60a9f6e4817b110816a0e11c86fdf2e7ac3bbd758
 sched/priority_queue.zig:127-127    sha256:27f2135bfbc5b2a2b459bc660b80e23885193dfd895100a573c934231dcc5261
 
 # ── Recovery merge (c94aea42) additions ──────────────────────────────────
@@ -711,19 +708,12 @@ arch/aarch64/hv/vgic.zig:66-66    sha256:0e7316b84ea4c8fd93b2bda47ff7ce981ea4f4e
 arch/aarch64/hv/vgic.zig:86-86    sha256:dc9c0ea83d4e7988d2756de4500152c2ba8b16523d629aaf2bd7b62fab7d01de
 arch/aarch64/hv/vgic.zig:116-116    sha256:1f4c4cdc92abdc11f56ea1ed3417f821e091bfe5d4cd9288403a4965d303b991
 arch/aarch64/hv/vgic.zig:172-172    sha256:4893f40e3781eb896c82d046a08067a11e35cdf2f1dfaf26fea90b8db6676413
-arch/aarch64/vm_runloop.zig:68-68    sha256:51b9437cc28611bc8f3f397e4831477368042d5d19583cd14cd2590a45aa33b4
-arch/aarch64/vm_runloop.zig:337-337    sha256:57a5ffa3e095df05b6b3333871aba1c1b3e25ab3dbf1d492f154c2cc2b122f57
-arch/aarch64/vm_runloop.zig:349-349    sha256:1eac3819cb204c86a7d80f714ac54fe201deb807cea39674e49e43f29ebe7e09
 arch/x64/amd/svm.zig:133-133    sha256:213b00fb03a7fae04cbe34ab40dfd8217182293490d32b8438468c0cc79612b1
 arch/x64/amd/svm.zig:134-134    sha256:711dd8733ad9d012714d6cc9436389097b12438757690bdef5b1b0170fdc0528
 arch/x64/intel/pmu.zig:60-60    sha256:cb9e29acb1faa46e5f2c8c242d098c4bb57e89f3c230ab528fecf0ecb9a0d4ad
-arch/x64/paging.zig:193-193    sha256:fc91793fdd16e16fd796fb663baa55df949318fec9d9699cca408e0fda9c5289
-arch/x64/paging.zig:203-203    sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
-arch/x64/paging.zig:207-207    sha256:ee63e68a0c34e2ae771f4998068e775be14527b8bf3727283d78e79f1e7d1066
 arch/x64/vm.zig:199-199    sha256:76724d4459dfb677471389c98badc276cc06a5c42e7f866a66ae8377468c10c2
 arch/x64/vm.zig:205-205    sha256:8603838db7be95f29842a5dbef63af828b2f6a48925f329fe088debd92d7b882
 arch/x64/vm.zig:298-298    sha256:d9ed2e44dd9572bc36ff175bf5375ca0fd2b0912ac999f12ec26e76b1e7c247d
-arch/x64/vm_runloop.zig:335-335    sha256:01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
 devices/device_region.zig:155-155    sha256:fe64efefeb5ac550ee67faa7afcbca162aa3ecdd1515d4982fb95b86a2c431d6
 libz/caps.zig:244-244    sha256:f85fd26e8d6ba4fc94091a496d493bbba90a48bda54e25164e14e2b1ec51137f
 libz/caps.zig:283-283    sha256:c2304d2c52288db068904835eea06f0a4f595b48a1d4656d9d6a4c898f2ecc7e
@@ -753,3 +743,7 @@ memory/vmar.zig:157-157    sha256:104afe2ff16d45b15efd44554aa8a38aa207e26b86f240
 arch/x64/irq.zig:65-65    sha256:cb15abec79ad3b2cd846db5d225a1695efac93c3f1132eb6fe26a63e6633008c
 arch/x64/irq.zig:73-73    sha256:43842cd016338453efd1203cc84cb6691c420d1f3da18b9ae49ded4bdd3829d8
 syscall/errors.zig:26-26    sha256:ba2a3dac72e117a85289669cf4f73431090c145fead19595927b0981a30cf3e3
+arch/aarch64/vm_runloop.zig:58-58    sha256:51b9437cc28611bc8f3f397e4831477368042d5d19583cd14cd2590a45aa33b4
+arch/aarch64/vm_runloop.zig:346-346    sha256:a1903fbfe775e65ba24f4ec25e581572229400769d4501fecbae33dbd304b1f4
+arch/aarch64/vm_runloop.zig:358-358    sha256:ecef1f28bbddb8a4ab075372a91da468019da8d073bb77ae8391b4701c661a72
+arch/x64/vm_runloop.zig:334-334    sha256:c3e78392222ead648841450e2705106ce1c9079fb447198afc871a3411081225

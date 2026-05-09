@@ -26,8 +26,3 @@ pub const E_PERM: i64 = 12;
 pub const E_REFUSED: i64 = 13;
 pub const E_TERM: i64 = 14;
 pub const E_TIMEOUT: i64 = 15;
-// E_AGAIN is kernel-internal — not a spec error code, used in the
-// futex fast path to signal value-mismatch retry. Higher than the
-// spec range so it cannot collide with a spec-defined error returned
-// directly to userspace.
-pub const E_AGAIN: i64 = 16;

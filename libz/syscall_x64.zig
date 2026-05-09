@@ -346,11 +346,6 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
     };
 }
 
-// Reply + atomic recv-on-port — bare. Wraps issueRawCaptureWord.
-pub fn replyRecvAsm(word: u64) RecvReturn {
-    return issueRawCaptureWord(word, .{});
-}
-
 // Reply + attachments + atomic recv-on-port. Combines the wide
 // attachment-write path with the post-syscall vreg-0 readback.
 //

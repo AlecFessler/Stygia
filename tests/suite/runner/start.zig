@@ -96,16 +96,35 @@ fn bootstrapLibz(cap_table_base: u64) void {
     const pf_handle: u64 = @as(u64, cap.id());
     const page_count: u64 = @as(u64, @truncate(cap.field0 & 0xFFFF_FFFF));
 
-    // createVmar(caps={r,x}, props={cur_rwx=r|x, sz=0}, pages=page_count,
+    // createVmar(caps={r,w,x}, props={cur_rwx=r|w|x, sz=0}, pages=page_count,
     //           preferred_base=LIBZ_SLIDE, device_region=0)
     //
-    // libz.elf is built with read-only PT_LOADs only after pre-link
-    // (no writable .data referenced by syscall wrappers), so R+X is
-    // sufficient. Pinning preferred_base = LIBZ_SLIDE is what makes
-    // the runner's pre-applied RELATIVE relocs land correctly.
-    const vmar_caps = lib.caps.VmarCap{ .r = true, .x = true };
+    // The R+W is required because libz.so carries a writable scratch
+    // buffer (`stack_vreg_buf` in libz/syscall_x64.zig and the
+    // `_arm` twin in syscall_aarch64.zig) that the slow-path syscall
+    // wrappers @memset on every >11-vreg call. Mapping libz R+X-only
+    // would fault the first such syscall (e.g. perfmon_read_05's
+    // perfmonStart with num_configs == num_counters spills config[11..]
+    // through this buffer).
+    //
+    // Caveat (KNOWN STRUCTURAL ISSUE — tracked as a follow-up
+    // proposal): libz is staged once into a shared page_frame and
+    // mapPf'd identically into every test domain, so writable libz
+    // .bss aliases across concurrently-running test ECs under the
+    // runner's BATCH=4. Two test ECs landing in `stagestackVregBuf`
+    // simultaneously can race on `stack_vreg_buf`. Empirically
+    // un-triggered across 1455 test runs (485 tests x 3 reps) on x86_64,
+    // but the structural fix is to either (a) move the scratch buffer
+    // into a per-EC private writable page mapped at start.zig boot,
+    // or (b) rewrite issueRawWithSlots to use a stack-local buffer
+    // (currently blocked on x86_64 inline-asm register pressure with
+    // 13 tied vreg inputs + 13 tied outputs).
+    //
+    // Pinning preferred_base = LIBZ_SLIDE is what makes the runner's
+    // pre-applied RELATIVE relocs land correctly.
+    const vmar_caps = lib.caps.VmarCap{ .r = true, .w = true, .x = true };
     const var_caps_word: u64 = @as(u64, vmar_caps.toU16());
-    const props: u64 = 0b101; // cur_rwx = r|x
+    const props: u64 = 0b111; // cur_rwx = r|w|x
 
     const cvar = lib.syscall.issueReg(.create_vmar, 0, .{
         .v1 = var_caps_word,

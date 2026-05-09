@@ -20,8 +20,6 @@ const psci = zag.arch.aarch64.hv.psci;
 const vgic = zag.arch.aarch64.hv.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 
-const VAddr = zag.memory.address.VAddr;
-
 /// GICv3 PPI 27 = virtual timer (CNTV) interrupt. Linux's arm_arch_timer
 /// driver wires `arch_timer_handler_virt` to PPI 27 by default.
 const VTIMER_PPI: u32 = 27;

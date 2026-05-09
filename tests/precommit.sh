@@ -154,7 +154,7 @@ stage_dead_code_report() {
     fi
     ensure_callgraph_db || return 1
     local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$ZAG_ROOT/kernel/.dead-code-skip.txt"); then
+    if ! (cd "$ZAG_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$ZAG_ROOT/tools/dead_code_zig/skip.txt"); then
         FAILURES+=("dead-code findings")
         return 1
     fi

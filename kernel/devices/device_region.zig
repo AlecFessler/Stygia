@@ -251,6 +251,11 @@ var slab_initialized: bool = false;
 /// the recycled occupant's `handle_list_head`. With the snapshot the
 /// ISR's `lockWithGen` rejects the stale gen and drops the IRQ silently.
 const IrqTableEntry = extern struct {
+    // caller-pinned: bare `?*DeviceRegion` is intentional. The entry
+    // captures (region_ptr, gen) at bind time; the ISR validates via
+    // `lockWithGenIrqSave(gen)` before dereferencing, dropping the IRQ
+    // silently on stale-gen. SlabRef's acquire-time pairing doesn't fit
+    // this snapshot semantics — see the IrqSnapshot doc comment below.
     region: ?*DeviceRegion = null,
     gen: u32 = 0,
 };
@@ -261,6 +266,9 @@ const IrqTableEntry = extern struct {
 /// silently on `StaleHandle` (the slot was destroyed and possibly
 /// recycled between resolve and acquire).
 pub const IrqSnapshot = struct {
+    // caller-pinned: bare `*DeviceRegion` mirrors IrqTableEntry — the
+    // snapshot is paired with `gen` and validated via
+    // `lockWithGenIrqSave(gen)` at the next acquire. Same rationale.
     region: *DeviceRegion,
     gen: u32,
 };

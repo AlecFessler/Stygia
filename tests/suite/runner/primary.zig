@@ -401,7 +401,15 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     const child_libz_caps = caps.PfCap{
         .move = false,
         .r = true,
-        .w = false,
+        // libz carries a writable scratch buffer (`stack_vreg_buf` in
+        // libz/syscall_x64.zig + the `_arm` twin) that the slow-path
+        // syscall wrappers @memset on every >11-vreg call. Without `w`
+        // the child's mapPf intersects (cur_rwx ∩ pf_rwx) down to R+X
+        // and the first such syscall (e.g. perfmon_read_05) faults
+        // inside @memset. See start.zig for the structural-fix caveat
+        // (libz pf is shared across all test domains, so writable libz
+        // .bss aliases across ECs).
+        .w = true,
         .x = true,
     };
     // Per §[create_capability_domain] passed-handle entry encoding

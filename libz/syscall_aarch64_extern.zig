@@ -483,10 +483,6 @@ pub fn replyTransferVmExitAsm(word: u64, attachments_ptr: [*]const u64, n: u64, 
     };
 }
 
-pub fn replyRecvAsm(word: u64) RecvReturn {
-    return issueRawCaptureWord(word, .{});
-}
-
 pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;

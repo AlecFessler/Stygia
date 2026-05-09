@@ -75,6 +75,7 @@ const ExceptionClass = enum(u6) {
     wf_trapped = 0x01,
     sve_simd_fp_access = 0x07, // ARM ARM D13.2.37 — Access to FP/Advanced SIMD/SVE
     svc_aarch64 = 0x15,
+    msr_mrs_sys_trapped = 0x18, // ARM ARM D13.2.37 — MSR/MRS/SYS trap (e.g. EL0 MRS MPIDR_EL1)
     instruction_abort_lower_el = 0x20,
     instruction_abort_same_el = 0x21,
     pc_alignment = 0x22,
@@ -716,13 +717,59 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             scheduler.run();
         },
 
+        .msr_mrs_sys_trapped => {
+            // ARM ARM D13.2.40 — Trapped MSR/MRS/SYS access (a system
+            // register that is accessible at EL0 but configured to trap
+            // via SCTLR_EL1 / CPACR_EL1 / etc.). Currently nothing in
+            // Zag programs such traps, so any hit here is unexpected;
+            // surface as a protection fault.
+            //
+            // (`mrs x, MPIDR_EL1` from EL0 is UNDEFINED — not "trapped"
+            // — and lands in the `.unknown` arm below where we handle it
+            // by emulating the read.)
+            deliverThreadFault(.protection_fault, ctx.elr_el1);
+        },
+
         .unknown => {
-            // ARM ARM D13.2.37: EC=0x00 is taken for truly unallocated
-            // instruction encodings, which includes `udf` (permanently-
-            // undefined) and other UNDEFINED encodings that ARM treats
-            // as an undefined-instruction exception. This is the direct
-            // aarch64 analogue of x86 #UD (invalid opcode), so report
-            // it as `illegal_instruction` per spec §[event_type].
+            // ARM ARM D13.2.37: EC=0x00 is taken for unallocated /
+            // UNDEFINED instruction encodings, which includes:
+            //   * `udf` (permanently-undefined) — true illegal_instruction.
+            //   * `mrs x, MPIDR_EL1` from EL0 — RW at EL1, RO at EL2/EL3,
+            //     UNDEFINED at EL0 (D17.2.99). Linux exposes MPIDR to
+            //     userspace by emulating the read here; the in-kernel
+            //     testing harness's `currentCoreId()` relies on it
+            //     (spec §[affinity] tests 05/06 issue
+            //     `mrs x, MPIDR_EL1` to verify the kernel honoured an
+            //     `affinity` syscall by re-pinning the EC).
+            //
+            // Walk: peek the instruction at ELR_EL1, check the
+            // `mrs x<rt>, MPIDR_EL1` bit pattern, emulate. Anything else
+            // surfaces as `illegal_instruction` per spec §[event_type].
+            //
+            // `mrs <Xt>, MPIDR_EL1` encoding (ARM ARM C6.2.187):
+            //   bits 31..0 : 1101 0101 0011 1000 0000 0000 101 <Rt:5>
+            //              = 0xD538_0000 | (Rt << 0)  with mask 0xFFFF_FFE0
+            // So a u32 instruction word `& 0xFFFF_FFE0 == 0xD538_0000`
+            // names this exact MRS; the low 5 bits select Rt (0..31).
+            const elr = ctx.elr_el1;
+            cpu.panDisable();
+            const insn: u32 = @as(*const u32, @ptrFromInt(elr)).*;
+            cpu.panEnable();
+            const MPIDR_MRS_BASE: u32 = 0xD538_0000;
+            const MPIDR_MRS_MASK: u32 = 0xFFFF_FFE0;
+            if ((insn & MPIDR_MRS_MASK) == MPIDR_MRS_BASE) {
+                const rt: u8 = @truncate(insn & 0x1F);
+                var mpidr: u64 = undefined;
+                asm volatile ("mrs %[v], mpidr_el1"
+                    : [v] "=r" (mpidr),
+                );
+                if (rt < 31) {
+                    const regs_ptr: [*]u64 = @ptrCast(&ctx.regs);
+                    regs_ptr[rt] = mpidr;
+                } // rt == 31 (xzr): result discarded.
+                ctx.elr_el1 += 4; // skip the emulated instruction
+                return;
+            }
             deliverThreadFault(.illegal_instruction, ctx.elr_el1);
         },
 

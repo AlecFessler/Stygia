@@ -339,10 +339,6 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
 // vregs 32..127 at [sp + 8..768]), zero it so the kernel reads 0 for
 // vregs we don't explicitly set, write the attachment u64s into the
 // high band, drop the syscall word at [sp+0], and `svc #0`.
-pub fn replyRecvAsm(word: u64) RecvReturn {
-    return issueRawCaptureWord(word, .{});
-}
-
 pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;

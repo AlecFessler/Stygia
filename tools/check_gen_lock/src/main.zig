@@ -1066,6 +1066,111 @@ fn checkPtrBypasses(
     _ = db;
 }
 
+// ── Check 3b: gen-lock word direct mutation outside GenLock methods ────
+//
+// The proof's TSO action grammar (assumption A4 in
+// `slab_proof/SlabProof.lean`) requires that the only writer to
+// `<slab>._gen_lock.word` is `GenLock`'s own `setGenRelease` /
+// `lockWithGen*` / `unlock*` methods. Any other site that issues an
+// atomic-mutating store on `<chain>._gen_lock.word.<mut>(...)` invalidates
+// the proof's invariants.
+//
+// This is a token-level pattern check on stripped source: scan for the
+// literal substring `_gen_lock.word.` and, when followed by an atomic-
+// mutating method name (store / fetchAdd / fetchSub / swap / cmpxchgWeak
+// / cmpxchgStrong / fetchAnd / fetchOr / fetchXor / fetchMin / fetchMax),
+// emit a finding.
+//
+// Reads (`.load`) are intentionally not flagged — `currentGen()`-equivalent
+// snapshot reads are part of the documented public surface of GenLock.
+//
+// Exemption: `secure_slab.zig` itself, where GenLock's own methods live.
+
+const WordStoreFinding = struct {
+    file_path: []const u8,
+    line: u32,
+    method: []const u8,
+    context: []const u8,
+};
+
+const WORD_STORE_EXEMPT_FILES = [_][]const u8{
+    "kernel/memory/allocators/secure_slab.zig",
+};
+
+const WORD_MUT_METHODS = [_][]const u8{
+    "store",
+    "swap",
+    "fetchAdd",
+    "fetchSub",
+    "fetchAnd",
+    "fetchOr",
+    "fetchXor",
+    "fetchMin",
+    "fetchMax",
+    "cmpxchgWeak",
+    "cmpxchgStrong",
+    "rmw",
+};
+
+fn checkWordStoreOutsideGenLock(
+    st: *State,
+    findings: *ArrayList(WordStoreFinding),
+) !void {
+    const a = st.arena.allocator();
+    const NEEDLE = "_gen_lock.word.";
+    for (st.files.items) |f| {
+        if (inList(f.path, &WORD_STORE_EXEMPT_FILES)) continue;
+        const src = f.source;
+        // Walk lines so we can strip `//`-comments and report line numbers.
+        var line_no: u32 = 1;
+        var line_start: usize = 0;
+        var i: usize = 0;
+        while (i <= src.len) : (i += 1) {
+            const at_eol = (i == src.len) or (src[i] == '\n');
+            if (!at_eol) continue;
+            const raw_line = src[line_start..i];
+            const stripped_line = blk: {
+                if (mem.indexOf(u8, raw_line, "//")) |idx| break :blk raw_line[0..idx];
+                break :blk raw_line;
+            };
+            var p: usize = 0;
+            while (p + NEEDLE.len < stripped_line.len) : (p += 1) {
+                if (stripped_line[p] != '_') continue;
+                if (!mem.startsWith(u8, stripped_line[p..], NEEDLE)) continue;
+                // Require an ident-ending boundary before the underscore so we
+                // don't fire on `__gen_lock` etc.
+                if (p > 0) {
+                    const pc = stripped_line[p - 1];
+                    if (isIdentChar(pc)) {
+                        // Continue scanning past this position.
+                        continue;
+                    }
+                }
+                // Method name follows immediately after NEEDLE.
+                const method_start = p + NEEDLE.len;
+                var q: usize = method_start;
+                while (q < stripped_line.len and isIdentChar(stripped_line[q])) q += 1;
+                if (q == method_start) continue;
+                if (q >= stripped_line.len or stripped_line[q] != '(') continue;
+                const method = stripped_line[method_start..q];
+                if (!inList(method, &WORD_MUT_METHODS)) continue;
+                const method_dup = try a.dupe(u8, method);
+                const ctx_dup = try a.dupe(u8, trimAscii(stripped_line));
+                try findings.append(st.gpa, .{
+                    .file_path = f.path,
+                    .line = line_no,
+                    .method = method_dup,
+                    .context = ctx_dup,
+                });
+                // Don't double-fire on the same line for the same chain.
+                p = q;
+            }
+            line_no += 1;
+            line_start = i + 1;
+        }
+    }
+}
+
 // ── Check 4+5: per-entry release coverage via AST walk ─────────────────
 //
 // For each entry-point fn, we load its AST subtree (descendants of the
@@ -2025,6 +2130,11 @@ pub fn main() !u8 {
     defer ptr_findings.deinit(gpa);
     try checkPtrBypasses(&db, &st, &ptr_findings);
 
+    // ── `_gen_lock.word.<mut>(...)` outside GenLock check ──────────────
+    var word_store_findings: ArrayList(WordStoreFinding) = .empty;
+    defer word_store_findings.deinit(gpa);
+    try checkWordStoreOutsideGenLock(&st, &word_store_findings);
+
     // ── Per-entry release coverage ─────────────────────────────────────
     var release_findings: ArrayList(ReleaseFinding) = .empty;
     defer release_findings.deinit(gpa);
@@ -2395,6 +2505,22 @@ pub fn main() !u8 {
     }
     if (!skip_bypass) total_errs += @intCast(ptr_findings.items.len);
 
+    // _gen_lock.word.<mut> outside GenLock (rule = "word_store_outside_genlock").
+    const skip_word_store = if (args.rule_filter) |rf|
+        !mem.eql(u8, rf, "word_store_outside_genlock")
+    else
+        false;
+    if (!skip_word_store and word_store_findings.items.len > 0) {
+        try w.writeAll("\n");
+        try w.print("Gen-lock word direct mutation ({d} sites):\n", .{word_store_findings.items.len});
+        for (word_store_findings.items) |f| {
+            try w.print("  [ERR ] {s}:{d}  _gen_lock.word.{s}(...)  →  use `GenLock.setGenRelease` / `lockWithGen*` / `unlock*`\n", .{ f.file_path, f.line, f.method });
+            const trunc_len = @min(f.context.len, 120);
+            try w.print("         {s}\n", .{f.context[0..trunc_len]});
+        }
+    }
+    if (!skip_word_store) total_errs += @intCast(word_store_findings.items.len);
+
     // Pre-tally IRQ + asm findings so the Summary line reflects everything.
     const skip_asm_pre = if (args.rule_filter) |rf|
         !(mem.startsWith(u8, rf, "asm_"))
@@ -2414,6 +2540,7 @@ pub fn main() !u8 {
     try w.print("         {d} slab-backed types discovered\n", .{st.slab_types.count()});
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_findings.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_findings.items.len});
+    try w.print("         {d} gen-lock word direct mutations\n", .{word_store_findings.items.len});
     try w.print("         {d} inline-asm gen-lock violations\n", .{asm_findings.items.len});
 
     // IRQ-discipline output.

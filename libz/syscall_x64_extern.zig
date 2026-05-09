@@ -496,11 +496,6 @@ pub fn replyTransferVmExitAsm(word: u64, attachments_ptr: [*]const u64, n: u64, 
     };
 }
 
-// Reply + atomic recv-on-port — bare. Wraps issueRawCaptureWord.
-pub fn replyRecvAsm(word: u64) RecvReturn {
-    return issueRawCaptureWord(word, .{});
-}
-
 // Reply + attachments + atomic recv-on-port. Combines the wide
 // attachment-write path with post-syscall vreg-0 readback.
 //

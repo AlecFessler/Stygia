@@ -476,8 +476,8 @@ fn updateSkipEntry(a: Allocator, raw_arg: []const u8, skip_file: []const u8, db:
     return 0;
 }
 
-fn defaultSkipPath(a: Allocator, repo_root: []const u8, target_rel: []const u8) ![]u8 {
-    return joinPath(a, &.{ repo_root, target_rel, ".dead-code-skip.txt" });
+fn defaultSkipPath(a: Allocator, repo_root: []const u8) ![]u8 {
+    return joinPath(a, &.{ repo_root, "tools", "dead_code_zig", "skip.txt" });
 }
 
 // -----------------------------------------------------------------
@@ -855,7 +855,7 @@ pub fn main() !void {
     const skip_path = if (skip_override) |p|
         if (std.fs.path.isAbsolute(p)) try g_arena.dupe(u8, p) else try joinPath(g_arena, &.{ repo_root, p })
     else
-        try defaultSkipPath(g_arena, repo_root, target_name);
+        try defaultSkipPath(g_arena, repo_root);
 
     if (update_arg) |arg| {
         const rc = try updateSkipEntry(g_arena, arg, skip_path, &db);

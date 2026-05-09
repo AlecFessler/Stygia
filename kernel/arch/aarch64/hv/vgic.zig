@@ -171,16 +171,6 @@ pub const Vgic = extern struct {
         _ = @atomicRmw(u32, &self.pending[word], .And, ~(@as(u32, 1) << bit), .release);
     }
 
-    /// Read the current pending state of `intid`. Used by the vCPU
-    /// run loop to populate list-registers on stage-2 entry.
-    pub fn isPending(self: *const Vgic, intid: u16) bool {
-        if (intid >= TOTAL_DIST_INTIDS) return false;
-        const word: u16 = intid / 32;
-        const bit: u5 = @truncate(intid % 32);
-        const w = @atomicLoad(u32, &self.pending[word], .acquire);
-        return (w & (@as(u32, 1) << bit)) != 0;
-    }
-
     /// Atomically clear the pending bit for `intid` and return whether
     /// it was set before the clear. Used by the vCPU run loop to claim
     /// a pending interrupt for delivery without losing wakeups from a
