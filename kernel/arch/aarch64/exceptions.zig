@@ -746,16 +746,26 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // `mrs x<rt>, MPIDR_EL1` bit pattern, emulate. Anything else
             // surfaces as `illegal_instruction` per spec §[event_type].
             //
-            // `mrs <Xt>, MPIDR_EL1` encoding (ARM ARM C6.2.187):
+            // `mrs <Xt>, MPIDR_EL1` encoding. The MRS-to-system-register
+            // template is (ARM ARM C6.2.MRS):
+            //   1101 0101 001 L o0 op1[2:0] CRn[3:0] CRm[3:0] op2[2:0] Rt[4:0]
+            // L=1 (read), o0=1 iff op0=3. MPIDR_EL1 is op0=3 op1=0 CRn=c0
+            // CRm=c0 op2=5 (ARM ARM D17.2.99), so op2 fills bits[7:5]=101
+            // and the fixed prefix is:
             //   bits 31..0 : 1101 0101 0011 1000 0000 0000 101 <Rt:5>
-            //              = 0xD538_0000 | (Rt << 0)  with mask 0xFFFF_FFE0
-            // So a u32 instruction word `& 0xFFFF_FFE0 == 0xD538_0000`
+            //              = 0xD538_00A0 | Rt          with mask 0xFFFF_FFE0
+            // So a u32 instruction word `& 0xFFFF_FFE0 == 0xD538_00A0`
             // names this exact MRS; the low 5 bits select Rt (0..31).
+            //
+            // op2 is load-bearing: op2=0 is MIDR_EL1's encoding (0xD538_0000),
+            // not MPIDR_EL1's. A constant of 0xD538_0000 here matches the
+            // wrong system register and the EL0 MPIDR_EL1 read falls through
+            // to illegal_instruction.
             const elr = ctx.elr_el1;
             cpu.panDisable();
             const insn: u32 = @as(*const u32, @ptrFromInt(elr)).*;
             cpu.panEnable();
-            const MPIDR_MRS_BASE: u32 = 0xD538_0000;
+            const MPIDR_MRS_BASE: u32 = 0xD538_00A0;
             const MPIDR_MRS_MASK: u32 = 0xFFFF_FFE0;
             if ((insn & MPIDR_MRS_MASK) == MPIDR_MRS_BASE) {
                 const rt: u8 = @truncate(insn & 0x1F);
