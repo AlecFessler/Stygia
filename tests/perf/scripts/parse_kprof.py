@@ -169,6 +169,44 @@ def parse_session(stream: Iterable[str]) -> Session | None:
                     branch_misses=parse_int(kv.get("bmiss", "0")),
                 )
                 session.records.append(rec)
+            elif verb == "r":
+                # Compact positional record line emitted by `dump.zig`'s
+                # tight-loop dump path. Field order:
+                #   trace mode:  cpu(d) tsc(x) kind(d) id(d) ip(x) arg(x) cyc(d) cmiss(d) bmiss(d) sym(s)
+                #   sample mode: cpu(d) tsc(x) kind(d) id(d) ip(x) arg(x) sym(s)
+                # The PMU triple (cyc/cmiss/bmiss) is present iff the
+                # kernel was built with `-Dkernel_profile=trace` (sample-
+                # mode records are 32 B and have no counter snapshot).
+                # The trailing `sym` is whatever `getSymbolName(ip - kaslr)`
+                # resolved to, or `?` when debug info isn't loaded /
+                # the address is outside the kernel image; this parser
+                # ignores it (the json/summary report doesn't show
+                # symbols), but `flamegraph.py` uses it.
+                fields = rest.split()
+                if len(fields) < 7:
+                    warn(f"short compact rec line: {line!r}")
+                    continue
+                # Detect mode by field count: trace=10 fields, sample=7.
+                if len(fields) >= 10:
+                    cycles = int(fields[6], 10)
+                    cache_misses = int(fields[7], 10)
+                    branch_misses = int(fields[8], 10)
+                else:
+                    cycles = 0
+                    cache_misses = 0
+                    branch_misses = 0
+                rec = Record(
+                    cpu=int(fields[0], 10),
+                    tsc=int(fields[1], 16),
+                    kind=int(fields[2], 10),
+                    id=int(fields[3], 10),
+                    ip=int(fields[4], 16),
+                    arg=int(fields[5], 16),
+                    cycles=cycles,
+                    cache_misses=cache_misses,
+                    branch_misses=branch_misses,
+                )
+                session.records.append(rec)
             elif verb == "done":
                 session.done = True
             else:

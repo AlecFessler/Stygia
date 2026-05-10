@@ -35,6 +35,9 @@ from typing import IO, Iterable
 
 
 KPROF_PREFIX = "[KPROF] "
+# Verbose key=value record line. Kept for back-compat with dumps captured
+# before the compact-record format landed; the kernel emits the compact
+# `[KPROF] r ...` form today (see `kernel/kprof/dump.zig`).
 REC_RE = re.compile(
     r"^\[KPROF\] rec "
     r"cpu=(?P<cpu>\d+) "
@@ -44,6 +47,35 @@ REC_RE = re.compile(
     r"ip=0x(?P<ip>[0-9a-fA-F]+) "
     r"arg=0x(?P<arg>[0-9a-fA-F]+) "
     r"sym=(?P<sym>\S+)\s*$"
+)
+# Compact positional record line. Field order matches `dump.zig`'s
+# emit format:
+#   trace mode:  cpu(d) tsc(x) kind(d) id(d) ip(x) arg(x) cyc(d) cmiss(d) bmiss(d) sym(s)
+#   sample mode: cpu(d) tsc(x) kind(d) id(d) ip(x) arg(x) sym(s)
+# This script only consumes `cpu`, `kind`, `arg`, and `sym`; the PMU
+# fields are intentionally not captured here.
+COMPACT_REC_RE_TRACE = re.compile(
+    r"^\[KPROF\] r "
+    r"(?P<cpu>\d+) "
+    r"(?P<tsc>[0-9a-fA-F]+) "
+    r"(?P<kind>\d+) "
+    r"(?P<id>\d+) "
+    r"(?P<ip>[0-9a-fA-F]+) "
+    r"(?P<arg>[0-9a-fA-F]+) "
+    r"(?P<cyc>\d+) "
+    r"(?P<cmiss>\d+) "
+    r"(?P<bmiss>\d+) "
+    r"(?P<sym>\S+)\s*$"
+)
+COMPACT_REC_RE_SAMPLE = re.compile(
+    r"^\[KPROF\] r "
+    r"(?P<cpu>\d+) "
+    r"(?P<tsc>[0-9a-fA-F]+) "
+    r"(?P<kind>\d+) "
+    r"(?P<id>\d+) "
+    r"(?P<ip>[0-9a-fA-F]+) "
+    r"(?P<arg>[0-9a-fA-F]+) "
+    r"(?P<sym>\S+)\s*$"
 )
 
 KIND_SAMPLE = 4
@@ -78,7 +110,14 @@ def parse_stacks(stream: IO[str]) -> list[list[str]]:
     for line in stream:
         if not line.startswith(KPROF_PREFIX):
             continue
-        m = REC_RE.match(line.rstrip("\r\n"))
+        stripped = line.rstrip("\r\n")
+        # Try the compact format first (it's what the kernel emits today);
+        # fall back to the verbose key=value form for older captured dumps.
+        m = (
+            COMPACT_REC_RE_TRACE.match(stripped)
+            or COMPACT_REC_RE_SAMPLE.match(stripped)
+            or REC_RE.match(stripped)
+        )
         if m is None:
             continue
 

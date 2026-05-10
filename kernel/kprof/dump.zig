@@ -45,7 +45,7 @@ fn dumpOneLog(cpu: usize) void {
         const sym = resolveSym(slot.ip);
         if (comptime mode.trace_enabled) {
             arch.boot.print(
-                "[KPROF] rec cpu={d} tsc={d} kind={d} id={d} ip=0x{x} arg=0x{x} cyc={d} cmiss={d} bmiss={d} sym={s}\n",
+                "[KPROF] r {d} {x} {d} {d} {x} {x} {d} {d} {d} {s}\n",
                 .{
                     slot.cpu,
                     slot.tsc,
@@ -61,7 +61,7 @@ fn dumpOneLog(cpu: usize) void {
             );
         } else {
             arch.boot.print(
-                "[KPROF] rec cpu={d} tsc={d} kind={d} id={d} ip=0x{x} arg=0x{x} sym={s}\n",
+                "[KPROF] r {d} {x} {d} {d} {x} {x} {s}\n",
                 .{
                     slot.cpu,
                     slot.tsc,
