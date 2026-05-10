@@ -20,6 +20,7 @@ const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const NOT_IN_RUN_QUEUE = stygia.sched.execution_context.NOT_IN_RUN_QUEUE;
 const Priority = stygia.sched.execution_context.Priority;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
@@ -429,6 +430,13 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
                 (core < 64 and (cur.affinity & (@as(u64, 1) << @truncate(core))) != 0);
             if (local_allowed or state.run_queue.isEmpty()) {
                 state.run_queue.enqueue(cur);
+                // Publish queue residency under `core_locks[core]` so
+                // `removeFromQueue` can target this lock directly
+                // instead of sweeping all 64 cores. `.release` pairs
+                // with the `.acquire` load in `removeFromQueue`; the
+                // queue link write above happens-before any reader
+                // that observes a non-sentinel value here.
+                cur.current_queue_core.store(core, .release);
             } else {
                 deferred_cross_core = cur;
             }
@@ -444,6 +452,12 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
             // this core's pending_zombie column rather than inline-
             // free t's kstack while we're about to land on it.
             t.last_dispatched_core = core;
+            // Clear queue residency: `t` is leaving the run queue and
+            // about to be dispatched. Without this clear a subsequent
+            // `removeFromQueue(t)` could target the now-empty core's
+            // lock and remove(t) would no-op — harmless, but wastes a
+            // lock acquire. Mirrors the dequeueOrIdleLocked clear.
+            t.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
             break :blk t;
         }
         break :blk dequeueOrIdleLocked(core);
@@ -738,6 +752,14 @@ fn dequeueOrIdle() ?*ExecutionContext {
 fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
     while (state.run_queue.dequeue()) |ec| {
+        // Clear queue residency on every popped EC, regardless of
+        // whether we end up dispatching it or skipping it as stale —
+        // either way it is no longer linked into any run queue.
+        // Performed under `core_locks[core]` so a concurrent
+        // `removeFromQueue` reader that observed a stale `core`
+        // residency hint and is now waiting on this lock will see the
+        // cleared sentinel after acquiring.
+        ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
         // A cross-core terminate can flip an EC's state to .exited and
         // bump its slab gen between `enqueue` and `dequeue`. Drop those:
         // dispatching them would assert on the even gen in
@@ -837,6 +859,11 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     (&core_states[core]).run_queue.enqueue(ec);
+    // Publish queue residency under the target core's lock so a
+    // racing `removeFromQueue(ec)` from a third core can target the
+    // right lock instead of sweeping all 64. `.release` pairs with
+    // the `.acquire` load in `removeFromQueue`.
+    ec.current_queue_core.store(core, .release);
     // Snapshot the target's current EC before deciding whether to
     // wake / preempt. Reading the remote core's `current_ec` is a racy
     // hint — the worst case if it changes after we decide is a spurious
@@ -883,14 +910,51 @@ pub fn enqueue(ec: *ExecutionContext) void {
     enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
 }
 
-/// Remove `ec` from whichever queue it currently occupies. Used by
-/// terminate, priority change (reinsert), affinity change (migrate).
+/// Remove `ec` from whichever per-core run queue it currently occupies.
+/// Used by terminate / suspendOnPort / destroyExecutionContextLocked.
+///
+/// Fast path (bd-mlpx / bd-vzdh): consult `ec.current_queue_core` —
+/// the per-EC residency hint Zig enqueue/dequeue/remove sites maintain
+/// under `core_locks[core]` — and target only that one core's lock
+/// when the hint is non-sentinel. This drops the per-call cost from
+/// `MAX_CORES = 64` lock acquires down to one for the EC-not-in-queue
+/// case (terminate / paired post-`.exited` sweep / destroyPhase2 reap
+/// on faulted ECs, the bd-vzdh contention scenario), eliminating the
+/// O(MAX_CORES) cache-line bouncing that compounded into ~2.5 s of
+/// LAPIC-tick suppression under SMP=4 concurrent CD destroys.
+///
+/// Fallback (`current_queue_core == NOT_IN_RUN_QUEUE`): sweep all 64
+/// per-core locks. Required because the IPC fast-path asm in
+/// `arch/x64/interrupts.zig` (R13 main + R13 fallback) enqueues a
+/// freshly-replied receiver onto the local run queue without writing
+/// `current_queue_core`. ECs in that window read the sentinel but
+/// genuinely live in some queue — the legacy sweep finds them. The
+/// bd-vzdh storm scenario does not enter this path: faulted ECs are
+/// dispatched via the slow path, never the IPC fast path, so the
+/// hint stays accurate for them.
 pub fn removeFromQueue(ec: *ExecutionContext) void {
+    const hint = ec.current_queue_core.load(.acquire);
+    if (hint < MAX_CORES) {
+        const lock = &core_locks[hint];
+        const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        const removed = (&core_states[hint]).run_queue.remove(ec);
+        if (removed) {
+            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+        }
+        lock.unlockIrqRestore(irq);
+        if (removed) return;
+        // Hint was stale (EC migrated between our load and our lock
+        // acquire, or the asm fast-path put it in a different queue).
+        // Fall through to the legacy sweep.
+    }
     var i: u8 = 0;
     while (i < MAX_CORES) {
         const lock = &core_locks[i];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
         const removed = (&core_states[i]).run_queue.remove(ec);
+        if (removed) {
+            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+        }
         lock.unlockIrqRestore(irq);
         if (removed) return;
         i += 1;

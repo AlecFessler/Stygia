@@ -88,6 +88,15 @@ pub const Priority = enum(u2) {
     realtime = 3,
 };
 
+/// Sentinel for `ExecutionContext.current_queue_core` — EC is not in any
+/// per-core run queue. Same encoding rationale as `LAST_DISPATCHED_NEVER`:
+/// `0xFF` is outside the valid `0..63` core-id range, so a single byte
+/// doubles as a "no queue" signal. Defined past `Priority` so the
+/// dead-code skip.txt SHA pin on `Priority.high` (line 87,
+/// `tools/dead_code_zig/skip.txt:528`) stays valid; the constant
+/// itself is logically a sibling of `LAST_DISPATCHED_NEVER`.
+pub const NOT_IN_RUN_QUEUE: u8 = 0xFF;
+
 /// Lifecycle state. An EC is in at most one queue at a time; the state
 /// names which one (or none, when running or exited).
 pub const State = enum {
@@ -229,6 +238,31 @@ pub const ExecutionContext = struct {
     /// Never reset back to the sentinel — once dispatched, the kstack-in-
     /// use risk is owned by the most recent core indefinitely.
     last_dispatched_core: u8 = LAST_DISPATCHED_NEVER,
+
+    /// Hint for `scheduler.removeFromQueue`: the core whose run queue
+    /// currently holds this EC, or `NOT_IN_RUN_QUEUE` (`0xFF`) when the
+    /// EC is not in any per-core run queue. Maintained at every Zig
+    /// run-queue mutation site in `sched/scheduler.zig` under the
+    /// matching `core_locks[core]`, and on the `removeFromQueue`
+    /// success path itself.
+    ///
+    /// The IPC fast-path asm in `arch/x64/interrupts.zig` (R13 main
+    /// branch and R13 fallback) bypasses this maintenance: it enqueues
+    /// a freshly-replied receiver onto the local run queue without
+    /// writing this field. To stay correct against that population,
+    /// `removeFromQueue` falls back to the legacy 64-way per-core
+    /// sweep when the field reads `NOT_IN_RUN_QUEUE`. The bd-vzdh /
+    /// bd-wrg8 contention scenario (destroyExecutionContextLocked on
+    /// faulted ECs that never touched the IPC fast path) tracks
+    /// correctly via this field and exits O(1) without entering the
+    /// fallback.
+    ///
+    /// Read with `.acquire`, written with `.release`, so the queue
+    /// linkage written under `core_locks[core]` immediately before
+    /// the field write is visible to any reader that observes a non-
+    /// sentinel value.
+    current_queue_core: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(NOT_IN_RUN_QUEUE),
 
     // ── Futex wait state — meaningful iff state == .futex_wait ────────
 
@@ -1580,6 +1614,10 @@ pub fn allocExecutionContext(
     ec.affinity = affinity;
     ec.state = .ready;
     ec.last_dispatched_core = LAST_DISPATCHED_NEVER;
+    // Slab-zero would leave `current_queue_core` at `0x00`, which is a
+    // valid core id. Stamp the sentinel explicitly so a freshly-allocated
+    // EC isn't mistaken for "in core 0's run queue" by `removeFromQueue`.
+    ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
     ec.entry_point = entry;
     if (vm) |v| ec.vm = SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen());
     if (exit_port) |p| ec.exit_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
