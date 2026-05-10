@@ -449,14 +449,21 @@ fn smpInitFull() !void {
 /// from EL1; the trampoline detects EL2 at entry and drops to EL1h via
 /// ERET before programming any EL1 sysreg.
 ///
-/// The trampoline:
-/// 1. Drops to EL1h if still at EL2.
-/// 2. Loads all boot params from the struct at PA in x0.
-/// 3. Configures MAIR, TCR, TTBR0 (identity mapping), TTBR1 (kernel),
-///    VBAR, TLB, CPACR, I-cache.
-/// 4. Enables the MMU via SCTLR_EL1.
-/// 5. Sets SP and branches to secondarySetup at its kernel VA.
-fn secondaryEntry() callconv(.naked) noreturn {
+/// **Page-alignment is load-bearing.** With MMU off the AP fetches each
+/// instruction from the trampoline's *physical* address. The kernel ELF
+/// is loaded by the bootloader one 4 KiB code page at a time, and
+/// individual `RuntimeServicesCode` page allocations are NOT physically
+/// contiguous — adjacent kernel-VA pages map to arbitrary, unrelated
+/// PAs. If the trampoline crosses a kernel-VA page boundary, the AP's
+/// instruction fetch past that boundary lands on whatever PA happens to
+/// hold the *next* kernel page, which decodes as garbage (typically
+/// `udf #0`) and the AP wedges silently before VBAR_EL1 is installed.
+/// Same constraint as `.hyp_vectors` / `.hyp_text`
+/// (kernel/linker-aarch64.ld: "Crossing a page boundary would make any
+/// cross-page PC-relative branch land on a non-contiguous PA"). Force
+/// 4 KiB alignment and keep the body under 4 KiB so the entire
+/// trampoline lives in the page that `entry_paddr` points at.
+fn secondaryEntry() align(4096) callconv(.naked) noreturn {
     asm volatile (
     // x0 = PA of SecondaryBootParams (from PSCI context_id).
     // MMU is off — all memory access uses physical addresses and is
