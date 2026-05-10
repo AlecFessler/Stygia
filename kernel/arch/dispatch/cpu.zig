@@ -389,6 +389,53 @@ pub fn fpuClearTrap() void {
     }
 }
 
+/// IPI-transport mailbox owned by the per-arch CPU module and read by
+/// `kernel/sched/fpu.zig`'s cross-core flush protocol. The struct shape
+/// (a `requested_thread` slot plus a `done` flag, with the per-arch
+/// `ackDone` accessor) is defined identically by `arch.x64.cpu` and
+/// `arch.aarch64.cpu`; the type-alias re-export here lets generic-tier
+/// code spell the type without naming a per-arch module. See
+/// `subsystems/fpu/SYSTEMS.md` "Cross-core migration: flush IPI protocol"
+/// for the wire format.
+pub const FpuFlushMailbox = switch (builtin.cpu.arch) {
+    .x86_64 => x64.cpu.FpuFlushMailbox,
+    .aarch64 => aarch64.cpu.FpuFlushMailbox,
+    else => @compileError("unsupported arch"),
+};
+
+/// Per-arch accessor for the FPU-flush IPI mailbox indexed by *target*
+/// core (the core whose hardware will receive the IPI and run the
+/// FXSAVE / `stp q*` save). The mailbox storage lives in the per-arch
+/// CPU module's `fpu_flush_mailbox: [64]FpuFlushMailbox` array; this
+/// dispatch entry exists so `kernel/sched/fpu.zig` does not need to
+/// reach across the dispatch tier into `arch.x64.cpu` / `arch.aarch64
+/// .cpu` directly.
+pub inline fn fpuFlushMailbox(core: u8) *FpuFlushMailbox {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => &x64.cpu.fpu_flush_mailbox[core],
+        .aarch64 => &aarch64.cpu.fpu_flush_mailbox[core],
+        else => @compileError("unsupported arch"),
+    };
+}
+
+/// Send the lazy-FPU flush IPI to `core`. x86-64 raises the dedicated
+/// IDT vector `IntVecs.fpu_flush` via the LAPIC; aarch64 raises SGI 2
+/// via the GIC (see `subsystems/fpu/SYSTEMS.md` "Cross-core migration:
+/// flush IPI protocol"). Both wire to the in-IRQ-context handler that
+/// reads the EC pointer from `fpuFlushMailbox(core)` and calls
+/// `fpu.flushIpiHandler`.
+pub inline fn sendFpuFlushIpi(core: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.sendIpiToCore(
+            core,
+            @intFromEnum(x64.interrupts.IntVecs.fpu_flush),
+        ),
+        .aarch64 => aarch64.gic.sendIpiToCore(core, 2),
+        else => @compileError("unsupported arch"),
+    }
+}
+
+
 // --- Power / shutdown / entropy ----------------------------------------
 
 pub const PowerAction = switch (builtin.cpu.arch) {
