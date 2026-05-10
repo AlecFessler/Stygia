@@ -74,6 +74,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
+    const gdbstub = b.option(bool, "gdbstub", "Enable QEMU gdbstub on port 1234 (-s) for `zig build run` (default: off; off avoids port collisions when multiple qemu instances run concurrently)") orelse false;
     const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (consumed by tools/indexer)") orelse false;
     const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) callgraph SQLite DB to tools/callgraph_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
     const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the callgraph DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
@@ -492,6 +493,7 @@ pub fn build(b: *std.Build) void {
         else
             \\-net none
         ;
+        const qemu_gdbstub_args: []const u8 = if (gdbstub) "-s" else "";
         break :blk b.fmt(
             \\exec qemu-system-x86_64 \
             \\ -m 4G \
@@ -500,7 +502,7 @@ pub fn build(b: *std.Build) void {
             \\ -serial mon:stdio \
             \\ -display {s} \
             \\ -no-reboot \
-            \\ -s \
+            \\ {s} \
             \\ {s} \
             \\ {s} \
             \\ {s} \
@@ -508,7 +510,7 @@ pub fn build(b: *std.Build) void {
             \\ {s} \
             \\ {s} \
             \\ -smp cores=4
-        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_nvme_args, qemu_usb_args });
+        , .{ b.install_path, out_dir, display_type, qemu_gdbstub_args, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_nvme_args, qemu_usb_args });
     };
 
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
