@@ -83,7 +83,13 @@ class Session:
     names: dict[int, str] = field(default_factory=dict)
     records: list[Record] = field(default_factory=list)
     cpu_blocks: dict[int, CpuBlock] = field(default_factory=dict)
+    # `done` is the dumper's "workload reached the dump path" marker —
+    # emitted before the per-CPU record dump in kernel/kprof/dump.zig.
+    # `eof` is the post-dump terminator; absence means the per-CPU dump
+    # was truncated (qemu SIGTERMed mid-record under host contention,
+    # for example).
     done: bool = False
+    eof: bool = False
 
 
 def warn(msg: str) -> None:
@@ -209,6 +215,8 @@ def parse_session(stream: Iterable[str]) -> Session | None:
                 session.records.append(rec)
             elif verb == "done":
                 session.done = True
+            elif verb == "eof":
+                session.eof = True
             else:
                 warn(f"unknown verb: {verb!r}")
         except (KeyError, ValueError) as exc:
@@ -512,7 +520,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     if not session.done:
-        warn("missing [KPROF] done line — output may be truncated")
+        warn("missing [KPROF] done line — workload did not reach the dump path")
+    elif not session.eof:
+        warn("missing [KPROF] eof line — per-CPU record dump was truncated")
 
     if mode_flag == "--raw":
         report_raw(session)

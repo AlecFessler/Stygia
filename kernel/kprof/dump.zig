@@ -130,12 +130,16 @@ pub fn end(reason: EndReason) void {
     inline for (@typeInfo(trace_id_mod.TraceId).@"enum".fields) |f| {
         arch.boot.print("[KPROF] name id={d} name={s}\n", .{ f.value, f.name });
     }
+    // [KPROF] done lands here (not after the per-CPU sweep) so the
+    // runner's grep is contention-independent. See subsystems/kprof/
+    // SYSTEMS.md "Emission order" for the full rationale.
+    arch.boot.print("[KPROF] done\n", .{});
     var cpu: usize = 0;
     while (cpu < log_mod.n_cpus) {
         dumpOneLog(cpu);
         cpu += 1;
     }
-    arch.boot.print("[KPROF] done\n", .{});
+    arch.boot.print("[KPROF] eof\n", .{});
 
     @atomicStore(u32, &log_mod.dump_done, 1, .release);
     arch.cpu.halt();
