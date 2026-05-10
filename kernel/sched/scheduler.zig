@@ -418,17 +418,21 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         if (cur.state == .running) {
             cur.state = .ready;
             // Honor affinity. If `cur` is no longer allowed on this
-            // core (e.g. setAffinity excluded it mid-quantum) hand it
-            // off to a satisfying core — but only when the local
-            // queue has a replacement to dispatch. Without one, a
-            // local re-enqueue is the safe fallback (the next preempt
-            // with a non-empty queue migrates it; the explicit
-            // `setAffinity`-side reposition also catches the case
-            // when callers change affinity from off-core). `affinity
-            // == 0` is the spec "any core" sentinel.
+            // core (e.g. `setAffinity` excluded it mid-quantum) hand it
+            // off to a satisfying core unconditionally — even when the
+            // local queue is empty. An empty-queue local re-enqueue is
+            // a trap: `dequeueOrIdleLocked` below would re-pick `cur`
+            // and `switchTo(cur)` would dispatch it on the same
+            // excluded core, defeating the affinity mask (and there is
+            // no other migration trigger — `setAffinity` writes the
+            // mask without repositioning, and `preempt` re-enters this
+            // same path). The cross-core handoff also requires a fall-
+            // through to `run()` in the empty-no-`next` arm below; see
+            // that comment for the kstack-livesness rationale.
+            // `affinity == 0` is the spec "any core" sentinel.
             const local_allowed = cur.affinity == 0 or
                 (core < 64 and (cur.affinity & (@as(u64, 1) << @truncate(core))) != 0);
-            if (local_allowed or state.run_queue.isEmpty()) {
+            if (local_allowed) {
                 state.run_queue.enqueue(cur);
                 // Publish queue residency under `core_locks[core]` so
                 // `removeFromQueue` can target this lock directly
@@ -478,6 +482,25 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         switchTo(n);
         return;
     }
+
+    // No `next` after a cross-core handoff: `cur` was migrated to a
+    // satisfying core, and the local run queue had no replacement
+    // (and no `idle_ec`). Returning normally here would let the caller
+    // (yield syscall epilogue, timer-IRQ epilogue, fault path, ...)
+    // iretq through `cur`'s saved iret frame, resuming `cur` in user
+    // mode on THIS excluded core — at the same time the satisfying
+    // core picks `cur` up via `loadEcContextAndReturn` and iretqs
+    // through the same frame. Two cores executing `cur` in user mode
+    // simultaneously: catastrophic.
+    //
+    // Abandon the local kernel frame by entering `run()` — the
+    // scheduler loop will dispatch any racing-in EC or park this core
+    // on its dedicated park kstack. `cur` resumes only on the remote
+    // core, with the OK syscall return value already stamped into
+    // `cur.ctx` (see `setSyscallReturn` in `syscall/execution_context
+    // .zig::yield`). `run()` is `noreturn` so the caller's frame is
+    // never re-entered.
+    if (deferred_cross_core != null) run();
 
     // Empty queue and no idle EC. Clear `current_ec` and re-point the
     // per-core caches (gs:0 kernel_rsp, TSS.RSP0) at this core's park

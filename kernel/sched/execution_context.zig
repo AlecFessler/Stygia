@@ -986,8 +986,10 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
 /// it is currently parked or running on an excluded core is not yet
 /// implemented; the affinity field is updated unconditionally so the
 /// next enqueue picks it up via `yieldTo`'s affinity-aware re-enqueue
-/// branch (which moves a `.running` EC off a forbidden core when the
-/// local queue has a replacement to dispatch).
+/// branch (which always hands a `.running` EC off a forbidden core,
+/// falling through to `run()` when the local queue has no
+/// replacement so the local frame is not iretq'd through `cur`'s
+/// saved frame while the remote core dispatches it).
 pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
