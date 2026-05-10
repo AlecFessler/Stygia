@@ -39,6 +39,12 @@ pub fn allocate() ?u16 {
     const irq_state = lock.lockIrqSave(@src());
     defer lock.unlockIrqRestore(irq_state);
 
+    // Drain pcids whose remote INVPCID acks have all landed since the
+    // last allocate. Their bitmap bits become available for re-use
+    // here. Cheap when the pending list is empty (one atomic load per
+    // word, `word_count` words total).
+    drainPendingFree();
+
     var scanned: u16 = 0;
     var w: u16 = hint;
     while (scanned < word_count) {
@@ -59,41 +65,81 @@ pub fn free(id: u16) void {
     std.debug.assert(id != 0);
     std.debug.assert(id < pcid_count);
 
-    // Flush remote cores' TLB entries for this PCID before recycling.
+    // Queue remote INVPCID broadcasts for this PCID before recycling.
     // A core that previously ran the dying domain may still hold stale
     // PCID-tagged entries; if the PCID is reused for a new domain
-    // before those clear naturally, the new domain's user-half VAs
-    // can resolve to the dying domain's freed physical pages —
-    // particularly dangerous now that the destroy path returns those
-    // pages to PMM via `freeUserAddrSpace` (vs the prior leak-style
-    // teardown that left them quiescent). See SDM Vol 2A INVPCID type
-    // 1 (single-PCID, all addresses).
+    // before those clear naturally, the new domain's user-half VAs can
+    // resolve to the dying domain's freed physical pages — particularly
+    // dangerous now that the destroy path returns those pages to PMM
+    // via `freeUserAddrSpace` (vs the prior leak-style teardown that
+    // left them quiescent). See SDM Vol 2A INVPCID type 1 (single-PCID,
+    // all addresses).
+    //
+    // `flushRemotePcid` is fire-and-forget: it marks `id` pending in
+    // `paging.pcid_pending_free_mask` and (on smp>1) queues per-core
+    // INVPCIDs, then returns immediately. The bitmap bit is not
+    // cleared until every remote core has acked the shootdown — either
+    // here (fast path) if every ack lands before this call returns, or
+    // by `allocate`'s drain pass on a later call. Synchronously
+    // waiting here would deadlock under smp destroy storms because
+    // callers (caps' `destroyPhase2`) hold a local IRQ-off window and
+    // could not deliver each other's IPIs.
     paging.flushRemotePcid(id);
     invalidateTlb(id);
 
-    const irq_state = lock.lockIrqSave(@src());
-    defer lock.unlockIrqRestore(irq_state);
+    // Fast path: if every remote has already acked (always true on
+    // smp=1, often true on smp>1 with idle peers), finalize the free
+    // here so the bitmap bit returns to the pool without waiting for
+    // the next allocate's drain. Race-safe because we re-check both
+    // gates under the allocator lock — a concurrent `allocate`'s drain
+    // (or another `flushRemotePcid` arm in the rare wraparound) would
+    // have cleared `pcid_pending_free_mask`, and we treat that as
+    // "the drain already handled this entry."
+    if (paging.pcidAcksRemaining(id) == 0) {
+        const irq_state = lock.lockIrqSave(@src());
+        defer lock.unlockIrqRestore(irq_state);
+        const w: u16 = id / word_bits;
+        const b: u6 = @intCast(id % word_bits);
+        const bit_mask = @as(u64, 1) << b;
+        const pf = paging.pcidPendingFreeMaskWord(w);
+        if ((pf & bit_mask) == 0) return; // drain already collected this id
+        if (paging.pcidAcksRemaining(id) != 0) return; // raced with a fresh arm
+        paging.clearPcidPendingFreeBit(id);
+        std.debug.assert((bitmap[w] & bit_mask) != 0);
+        bitmap[w] &= ~bit_mask;
+        if (w < hint) hint = w;
+    }
+}
 
-    const w: u16 = id / word_bits;
-    const b: u6 = @intCast(id % word_bits);
-    const mask = @as(u64, 1) << b;
-    std.debug.assert((bitmap[w] & mask) != 0);
-    bitmap[w] &= ~mask;
-    if (w < hint) hint = w;
+/// Drain pcids whose remote INVPCID acks have all landed, returning
+/// their bitmap bits to the free pool. Caller must hold `lock`. Called
+/// from `allocate` before each scan.
+fn drainPendingFree() void {
+    var w: u16 = 0;
+    while (w < word_count) : (w += 1) {
+        var pf = paging.pcidPendingFreeMaskWord(w);
+        while (pf != 0) {
+            const b: u6 = @intCast(@ctz(pf));
+            const id: u16 = @as(u16, w) * word_bits + @as(u16, b);
+            const bit_mask = @as(u64, 1) << b;
+            if (paging.pcidAcksRemaining(id) == 0) {
+                paging.clearPcidPendingFreeBit(id);
+                std.debug.assert((bitmap[w] & bit_mask) != 0);
+                bitmap[w] &= ~bit_mask;
+                if (w < hint) hint = w;
+            }
+            pf &= ~bit_mask;
+        }
+    }
 }
 
 /// Invalidate every TLB entry tagged with `id` on the local core. Called
-/// by `free` before the id returns to the bitmap so a future owner of the
-/// same id does not inherit stale mappings.
+/// by `free` for the freeing core's TLB; remote cores' TLBs are flushed
+/// asynchronously through `paging.flushRemotePcid` (fire-and-forget; the
+/// allocator's drain pass gates re-allocation on every remote ack).
 ///
 /// Uses INVPCID type 1 (single PCID, all addresses). Intel SDM Vol 2A —
 /// INVPCID; Vol 3A §5.10.4.1.
-///
-/// TODO: SMP shootdown. Other cores may still hold TLB entries for `id`
-/// from prior runs of the dying process. Until the existing per-page IPI
-/// shootdown is extended with a per-PCID variant, recycling a freed PCID
-/// onto a different core can read a stale mapping. The current
-/// single-core / pinned-process workloads are correct.
 fn invalidateTlb(id: u16) void {
     if (!cpu.pcid_enabled) return;
     const desc: [2]u64 align(16) = .{ @as(u64, id) & 0xFFF, 0 };

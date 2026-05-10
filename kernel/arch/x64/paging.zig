@@ -74,12 +74,12 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 /// to Multiple Processors" requires software to broadcast invalidations to
 /// every logical processor that may have cached the old translation.
 ///
-/// Two shootdown modes co-exist on top of the same lock + descriptor:
+/// Three shootdown modes co-exist on top of `shootdown_lock`:
 ///
-///   1. **Synchronous** (`flushRemotePcid`, `shootdownTlbRange`): the
-///      initiator holds `shootdown_lock`, publishes the request
-///      descriptor (kind/addr/pcid), bumps `sync_arm_gen` to a fresh
-///      value, fans out IPIs, then spins until every remote core's
+///   1. **Synchronous descriptor** (`shootdownTlbRange`): the initiator
+///      holds `shootdown_lock`, publishes the request descriptor
+///      (kind/addr/pcid), bumps `sync_arm_gen` to a fresh value, fans
+///      out IPIs, then spins until every remote core's
 ///      `core_acked_gen[i] >= sync_arm_gen` before releasing the lock
 ///      or publishing the next descriptor. The remote IPI handler
 ///      performs the requested invalidation and stores the current
@@ -89,11 +89,11 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///      between IPIs leaves remote cores executing INVPCID against
 ///      the *next* descriptor instead of the one they were summoned
 ///      for, leaking stale TLB entries (cross-core UAF on unmap+free
-///      races). Both syscall-side teardown paths run with interrupts
-///      enabled, so the wait is safe.
+///      races). The syscall-side range-teardown path runs with
+///      interrupts enabled, so the wait is safe.
 ///
-///   2. **Fire-and-forget** (`flushRemoteTlb`, single-page): the
-///      initiator holds the lock, publishes a `.invlpg_no_ack`
+///   2. **Fire-and-forget descriptor** (`flushRemoteTlb`, single-page):
+///      the initiator holds the lock, publishes a `.invlpg_no_ack`
 ///      descriptor (does NOT bump `sync_arm_gen`), fans out IPIs,
 ///      releases the lock. The handler INVLPGs and updates its
 ///      `core_acked_gen` slot to whatever `sync_arm_gen` it observes;
@@ -109,6 +109,19 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///      other's IPI. The pre-existing UAF window described in
 ///      `unmapPage`'s body remains for this single-page kernel-side
 ///      path.
+///
+///   3. **Fire-and-forget per-PCID queue** (`flushRemotePcid`): same
+///      IRQ-off-deadlock concern as mode (2), but PCID free has the
+///      additional Invariant 3 constraint (a recycled PCID must not
+///      inherit stale TLB entries on any core), so the descriptor's
+///      "stale handler reads new descriptor" hazard from
+///      back-to-back arms cannot just be tolerated as a wasted INVLPG.
+///      Instead the protocol uses a per-(core, pcid) bitmap that
+///      survives across descriptor multiplexing (a stale IPI from arm
+///      A drains arm A's bit on this core regardless of what arm B has
+///      published since), with the allocator's bitmap-clear gated on
+///      every remote ack landing. See the `Fire-and-forget per-PCID
+///      shootdown queue` block further down.
 ///
 /// ## Why per-core gen tracking instead of a shared decrement counter
 ///
@@ -193,6 +206,135 @@ var sync_arm_gen: u64 = 0;
 /// `>= expected_gen`.
 var core_acked_gen: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 
+// ── Fire-and-forget per-PCID shootdown queue ────────────────────────────
+//
+// `flushRemotePcid` cannot use the descriptor-and-wait pattern of the
+// other sync paths above. It is reachable from `pcid.free` →
+// `freeAddrSpaceId` → `caps.destroyPhase2`, which masks IRQs across the
+// entire phase-2 body so the dying domain's frame cannot be preempted
+// and abandoned. With smp ≥ 2 and a destroy storm, two cores can be
+// inside `destroyPhase2` simultaneously; each spinning in
+// `waitForShootdownAcks` cannot deliver the other's INVPCID IPI — hard
+// SMP deadlock (bd-vzdh, 2026-05-10). Same hazard class as the
+// `flushRemoteTlb` comment above, but PCID-free has the extra constraint
+// of Invariant 3 (a recycled PCID must not inherit stale TLB entries on
+// any core), so we cannot simply fire-and-forget and call it done.
+//
+// The fix replaces the synchronous wait with a deferred-ack protocol:
+//
+//   1. `flushRemotePcid` marks the freed PCID's bit in each remote core's
+//      `per_core_pcid_pending` row, sets `pcid_acks_remaining[pcid]` to
+//      a one-bit-per-remote-core mask, sets the pcid's bit in
+//      `pcid_pending_free_mask`, then fans out IPIs without waiting.
+//   2. The IPI handler (after its existing descriptor dispatch)
+//      atomically swaps its row of `per_core_pcid_pending` to zero,
+//      issues INVPCID type 1 for each set bit, and clears its core's
+//      bit in `pcid_acks_remaining[pcid]`.
+//   3. The PCID-bitmap allocator (`pcid.allocate`) drains the pending-
+//      free list before each allocation: any pcid with
+//      `pcid_acks_remaining == 0` has been flushed on every remote core
+//      and may safely be returned to the bitmap.
+//
+// The pending bitmap is keyed per-(core, pcid) rather than the existing
+// shared descriptor because two free()s back-to-back would otherwise
+// race on the descriptor — the second's publish would overwrite the
+// first's pcid before stale handlers (on cores that were IRQ-off during
+// the first fanout) had a chance to read it. A shared descriptor only
+// works when the protocol holds the lock through the wait, which is
+// exactly what destroyPhase2's IRQ-off window forbids.
+//
+// Sizing: 4096 PCIDs / 64 = 64 u64s per core; 64 cores → 32 KiB BSS for
+// `per_core_pcid_pending`. `pcid_acks_remaining` is 4096 × 8 = 32 KiB.
+// `pcid_pending_free_mask` is 64 × 8 = 512 B. ~64 KiB total.
+
+/// Number of u64 words to cover all 4096 possible PCIDs as a bitmap.
+/// Mirrors the `pcid_count` / `word_bits` arithmetic in `pcid.zig`; the
+/// constants must agree (the bitmap key is a raw PCID id with no remap).
+const PCID_PENDING_WORDS: usize = 4096 / 64;
+
+/// Per-(core, pcid) pending-INVPCID bitmap. Producer: `flushRemotePcid`
+/// (sets bits while holding `shootdown_lock`). Consumer: the IPI handler
+/// on the remote core atomic-swaps its row to zero and INVPCIDs every
+/// bit observed.
+var per_core_pcid_pending: [MAX_CORES][PCID_PENDING_WORDS]u64 =
+    [_][PCID_PENDING_WORDS]u64{[_]u64{0} ** PCID_PENDING_WORDS} ** MAX_CORES;
+
+/// Per-pcid mask of remote cores whose `per_core_pcid_pending` bit for
+/// this pcid has not yet been cleared by a handler. Bit `i` set ⇒ core
+/// `i` still owes an INVPCID ack. Set by `flushRemotePcid` to the
+/// running-cores mask (excluding self); cleared bit-by-bit by the
+/// handler. When this reaches zero the pcid is fully drained on every
+/// remote core; the allocator's drain pass then clears the bitmap bit.
+var pcid_acks_remaining: [4096]u64 = [_]u64{0} ** 4096;
+
+/// Bitmap of pcids that are pending-free (awaiting drain). Set by
+/// `flushRemotePcid`, cleared by the allocator's drain pass once
+/// `pcid_acks_remaining[id]` has dropped to zero. Distinguishes
+/// "currently allocated by a live domain" from "pending-free, drainable"
+/// — the allocator's bitmap bit alone cannot tell them apart.
+var pcid_pending_free_mask: [PCID_PENDING_WORDS]u64 =
+    [_]u64{0} ** PCID_PENDING_WORDS;
+
+/// Drain this core's pending-INVPCID row. Called from the IPI handler
+/// after the descriptor-dispatched invalidation. Atomically swaps the
+/// row to zero so we observe a stable snapshot, then INVPCIDs each set
+/// bit and clears our core's bit in the per-pcid acks-remaining mask.
+/// Producers that set new bits between our swap and the per-pcid mask
+/// clear will be picked up by the next IPI delivery (every
+/// `flushRemotePcid` arm sends a fresh IPI before releasing the
+/// shootdown lock).
+fn drainLocalPendingPcid(my_core: u64) void {
+    const my_bit: u64 = @as(u64, 1) << @intCast(my_core);
+    var w: usize = 0;
+    while (w < PCID_PENDING_WORDS) : (w += 1) {
+        const word = @atomicRmw(u64, &per_core_pcid_pending[my_core][w], .Xchg, 0, .acq_rel);
+        if (word == 0) continue;
+        var bits = word;
+        while (bits != 0) {
+            const b: u6 = @intCast(@ctz(bits));
+            const id: u16 = @intCast(w * 64 + @as(usize, b));
+            if (cpu.pcid_enabled) {
+                // Sequential field stores avoid any aggregate movups
+                // codegen (the kernel build has SSE disabled —
+                // `+soft_float-sse-sse2`).
+                var desc: [2]u64 align(16) = undefined;
+                desc[0] = @as(u64, id) & 0xFFF;
+                desc[1] = 0;
+                asm volatile ("invpcid (%[desc]), %[type]"
+                    :
+                    : [desc] "r" (&desc),
+                      [type] "r" (@as(u64, 1)),
+                    : .{ .memory = true });
+            }
+            _ = @atomicRmw(u64, &pcid_acks_remaining[id], .And, ~my_bit, .release);
+            bits &= ~(@as(u64, 1) << b);
+        }
+    }
+}
+
+/// Read a word of `pcid_pending_free_mask` for the allocator's drain
+/// pass. `pcid.allocate` iterates all words and looks for set bits whose
+/// `pcid_acks_remaining` has reached zero.
+pub fn pcidPendingFreeMaskWord(w_idx: u16) u64 {
+    return @atomicLoad(u64, &pcid_pending_free_mask[w_idx], .acquire);
+}
+
+/// Read `pcid_acks_remaining[id]`. Zero ⇒ every remote core has flushed
+/// its TLB entries tagged with `id` since the last `flushRemotePcid(id)`,
+/// so the id may safely be returned to the allocator's bitmap.
+pub fn pcidAcksRemaining(id: u16) u64 {
+    return @atomicLoad(u64, &pcid_acks_remaining[id], .acquire);
+}
+
+/// Atomically clear `id`'s bit in `pcid_pending_free_mask`. Called by
+/// the allocator's drain pass once a pending-free pcid has had every
+/// remote ack land.
+pub fn clearPcidPendingFreeBit(id: u16) void {
+    const w_idx: usize = @as(usize, id) / 64;
+    const b: u6 = @intCast(@as(usize, id) % 64);
+    _ = @atomicRmw(u64, &pcid_pending_free_mask[w_idx], .And, ~(@as(u64, 1) << b), .release);
+}
+
 /// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`,
 /// performs the requested invalidation, then signals completion by
 /// storing the current `sync_arm_gen` into this core's
@@ -205,6 +347,7 @@ var core_acked_gen: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 /// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID (types 0 and 1).
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     kprof.point(.tlb_shootdown, 0);
+    const my_core = apic.coreID();
     const kind = @atomicLoad(u8, &shootdown_kind, .acquire);
     switch (kind) {
         @intFromEnum(ShootdownKind.invpcid_single) => {
@@ -240,13 +383,19 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
             cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
         },
     }
+    // Drain any pending fire-and-forget per-PCID INVPCIDs queued by
+    // `flushRemotePcid`. Decoupled from `shootdown_kind` because PCID
+    // free is reachable from IRQ-off destroy critical sections, where
+    // the descriptor-and-wait protocol would deadlock; the per-(core,
+    // pcid) bitmap lets the producer fire-and-forget without losing
+    // shootdowns to descriptor multiplexing across back-to-back arms.
+    drainLocalPendingPcid(my_core);
     // Acknowledge the most recently published sync arm. Done
     // unconditionally — see the design note at the top of the file.
     // Acquire-load of `sync_arm_gen` pairs with the release-store in
     // `bumpSyncArmGen`, so we observe the descriptor that triggered
     // this IPI (or a later one — both are safe).
     const gen = @atomicLoad(u64, &sync_arm_gen, .acquire);
-    const my_core = apic.coreID();
     @atomicStore(u64, &core_acked_gen[my_core], gen, .release);
 }
 
@@ -339,7 +488,7 @@ fn flushRemoteTlb(virt_addr: u64) void {
     fanoutShootdownIpis(self_id);
 }
 
-/// Broadcast a per-PCID TLB invalidation to every remote core. Used by
+/// Queue a per-PCID TLB invalidation for every remote core. Used by
 /// `pcid.free` so a recycled PCID does not inherit stale TLB entries on
 /// cores that previously ran the dying domain. Without this, a CD whose
 /// PCID gets reused by a new domain may resolve user-half VAs to the
@@ -347,28 +496,74 @@ fn flushRemoteTlb(virt_addr: u64) void {
 /// owner — visible as random user faults / corruption mid-rep on
 /// SMP > 1 once the test runner starts recycling PCIDs.
 ///
+/// Fire-and-forget: marks `pcid` pending on every remote core's
+/// `per_core_pcid_pending` row, sets `pcid_acks_remaining[pcid]` to the
+/// running-cores mask (excluding self), sets the pending-free bit, and
+/// fans out IPIs without spinning. Reachable from `pcid.free` →
+/// `freeAddrSpaceId` → `caps.destroyPhase2`'s IRQ-off window, where a
+/// synchronous wait deadlocks under smp ≥ 2 destroy storms (bd-vzdh).
+/// The PCID does not return to `pcid.allocate`'s bitmap until every
+/// remote core has serviced its queued INVPCID and cleared its bit in
+/// `pcid_acks_remaining[pcid]` — the allocator's drain pass enforces
+/// that gate, preserving Invariant 3 (PCID free order vs. recycled-id
+/// stale-TLB UAF).
+///
 /// Intel SDM Vol 2A INVPCID, Vol 3A §5.10.1: type 1 (single-context
 /// invalidation) flushes every TLB entry tagged with the descriptor's
 /// PCID at all linear addresses; retains entries tagged with other
 /// PCIDs and global entries (kernel mappings).
 pub fn flushRemotePcid(pcid: u16) void {
+    const w_idx: usize = @as(usize, pcid) / 64;
+    const bit_pos: u6 = @intCast(@as(usize, pcid) % 64);
+    const bit_mask: u64 = @as(u64, 1) << bit_pos;
+
     const core_count = apic.coreCount();
-    if (core_count <= 1) return;
+    if (core_count <= 1) {
+        // No remotes ⇒ no IPI to send. Mark pending-free with zero
+        // outstanding acks so `pcid.free`'s fast path / `pcid.allocate`'s
+        // drain can finalize the bitmap clear uniformly across smp=1
+        // and smp>1.
+        _ = @atomicRmw(u64, &pcid_pending_free_mask[w_idx], .Or, bit_mask, .release);
+        return;
+    }
 
     const self_id = apic.coreID();
+
+    // Build the running-remote-cores mask. `apic.lapics.?` enumerates
+    // every booted core including self; exclude self.
+    var remote_mask: u64 = 0;
+    for (apic.lapics.?, 0..) |_, i| {
+        if (i == self_id) continue;
+        remote_mask |= @as(u64, 1) << @intCast(i);
+    }
+    if (remote_mask == 0) {
+        _ = @atomicRmw(u64, &pcid_pending_free_mask[w_idx], .Or, bit_mask, .release);
+        return;
+    }
 
     shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
-    @atomicStore(u16, &shootdown_pcid, pcid, .release);
-    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.invpcid_single), .release);
-    // Publish a fresh sync-arm gen AFTER the descriptor so handlers
-    // observing the new gen also observe the descriptor that
-    // triggered them.
-    const expected_gen = bumpSyncArmGen();
+    // Order matters under concurrent handler runs (a stale IPI from a
+    // prior arm racing with this publish):
+    //   (1) acks_remaining first — establishes the per-pcid mask before
+    //       any handler can observe and clear its bit.
+    //   (2) per-core pending bits — once visible, a handler running
+    //       (for our or any other IPI) may drain and clear acks.
+    //   (3) pending_free bit — the allocator-drain gate. Must follow
+    //       acks_remaining so a concurrent drain reading
+    //       pending_free=set then loading acks_remaining sees the
+    //       non-zero mask (release/acquire across handlers' atomicAnd).
+    //   (4) IPI fanout — wakes remote handlers; subsequent handler runs
+    //       will service whatever is in their pending row.
+    @atomicStore(u64, &pcid_acks_remaining[pcid], remote_mask, .release);
+    for (apic.lapics.?, 0..) |_, i| {
+        if (i == self_id) continue;
+        _ = @atomicRmw(u64, &per_core_pcid_pending[i][w_idx], .Or, bit_mask, .release);
+    }
+    _ = @atomicRmw(u64, &pcid_pending_free_mask[w_idx], .Or, bit_mask, .release);
 
     fanoutShootdownIpis(self_id);
-    waitForShootdownAcks(expected_gen, self_id, core_count);
 }
 
 /// Page-table entry for 4-level paging.
