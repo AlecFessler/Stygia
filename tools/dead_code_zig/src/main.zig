@@ -30,6 +30,68 @@
 //! Skip-file workflow ports verbatim from the old tool. Hash bytes come
 //! from `file.source` so the analyzer is reproducible against an archived
 //! DB without needing the matching git checkout.
+//!
+//! Skip-file format
+//! ----------------
+//!
+//! Two anchor forms are supported. The symbol form is canonical; the
+//! line-range form is preserved for legacy entries during migration but
+//! is structurally fragile (see bd-Zag-Subsystems-Agents-na6c).
+//!
+//!   1. Symbol-anchored (preferred):
+//!        entity:<file_path>::<qualified_name>    sha256:<hex>
+//!
+//!      `<file_path>` is the DB-canonical path (matches `file.path`,
+//!      e.g. `arch/x64/apic.zig` or `libz/caps.zig`). `<qualified_name>`
+//!      is the entity's `entity.qualified_name` column value (dotted
+//!      module path, e.g. `kprof.dump.EndReason.oneshot`). The hash is
+//!      over the entity's normalized source span (see Normalization
+//!      below). Survives edits that shift the entity's line position;
+//!      invalidates only on rename or content-mutation.
+//!
+//!   2. Line-range (legacy):
+//!        <relpath>:<start>-<end>    sha256:<hex>
+//!
+//!      `<end>` may be the literal `end` for "to EOF". Hash is over the
+//!      raw line bytes (joined by `\n`, terminating `\n`). Brittle in
+//!      both directions: any upstream edit that shifts subsequent line
+//!      numbers invalidates the SHA pin even when the anchored content
+//!      is byte-identical, and any whitespace tweak on an anchored line
+//!      invalidates it even when the entity is unchanged. Use SAS for
+//!      new entries.
+//!
+//! Entity-content normalization (symbol form only)
+//! -----------------------------------------------
+//!
+//! The hash bytes for a symbol-anchored entry are derived from
+//! `file.source[def_byte_start..def_byte_end]` after the following
+//! transformations, applied in order:
+//!
+//!   1. End-of-line normalization: `\r\n` and bare `\r` → `\n`.
+//!   2. End-of-line `//` comments stripped (with `"…"` string-literal
+//!      awareness; `\\` escape inside strings respected). Doc comments
+//!      (`///`, `//!`) are stripped along with regular `//` comments —
+//!      the principle is that comment churn must not invalidate the
+//!      anchor.
+//!   3. Trailing whitespace per line stripped (including the strip
+//!      introduced by step 2).
+//!   4. Empty lines dropped EVERYWHERE (not just trailing). Without
+//!      this, adding a comment-only line inside a multi-line entity
+//!      body would leave a residual empty line and change the hash —
+//!      which would defeat the "comment churn must not invalidate"
+//!      rule. With it, both the comment and the now-empty line drop out
+//!      together.
+//!   5. Lines joined with single `\n`. No terminating newline.
+//!
+//! The hash is then `sha256(normalized_bytes)`. This makes the anchor
+//! invariant to: comment additions/removals, trailing-whitespace edits,
+//! CRLF/LF flips, and trailing-blank-line nudges. It still detects:
+//! renames, value changes, signature changes, body refactors.
+//!
+//! Lookup matching: a symbol-anchored entry suppresses any finding whose
+//! `(file_path, qualified_name)` matches the entry. No line arithmetic
+//! involved, so upstream comment / declaration / blank-line shifts do
+//! not invalidate the suppression.
 
 const std = @import("std");
 const fs = std.fs;
@@ -46,21 +108,42 @@ const sqlite = @import("sqlite.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const SkipStatus = enum {
-    /// Hash matches stored value — findings inside this range are silently dropped.
+    /// Hash matches stored value — findings covered by this entry are silently dropped.
     hit,
-    /// Hash mismatch — the range has drifted since last review.
+    /// Hash mismatch — the entity's normalized content (or the line range
+    /// for legacy entries) has drifted since last review.
     invalidated,
-    /// Range refers to a file that no longer exists (in the DB).
+    /// Anchor target no longer resolves: file absent from the DB
+    /// (line_range form) or no entity matches `(file_path, qualified_name)`
+    /// (symbol form).
     missing,
     /// Range bounds are out of order, zero, or extend past EOF when end is numeric.
+    /// (line_range form only.)
     bad_range,
 };
 
+const SkipKind = enum {
+    /// Legacy `<file>:<start>-<end>` anchor. Brittle to upstream line
+    /// shifts AND to whitespace edits on the anchored lines themselves.
+    /// Preserved for migration; new entries should use `.symbol`.
+    line_range,
+    /// `entity:<file>::<qname>` anchor. Survives any edit that doesn't
+    /// rename the entity or alter its normalized content.
+    symbol,
+};
+
 const SkipEntry = struct {
-    rel_path: []const u8,
-    start_line: u32,
-    end_line: u32,
-    end_is_eof: bool,
+    kind: SkipKind,
+    /// .line_range: target-relative or DB-canonical path (resolved at
+    ///              validation time via resolveSkipDbPaths).
+    /// .symbol:     DB-canonical path (matches `file.path`).
+    file_path: []const u8,
+    /// .line_range only.
+    start_line: u32 = 0,
+    end_line: u32 = 0,
+    end_is_eof: bool = false,
+    /// .symbol only — `entity.qualified_name`.
+    qualified_name: []const u8 = "",
     stored_hash: []const u8,
     current_hash: []const u8 = "",
     status: SkipStatus = .hit,
@@ -108,6 +191,123 @@ fn hexEncode(digest: [Sha256.digest_length]u8, out: *[Sha256.digest_length * 2]u
         out[i * 2] = tab[b >> 4];
         out[i * 2 + 1] = tab[b & 0x0f];
     }
+}
+
+/// Normalize an entity's def-span content per the rules in the top-of-file
+/// doc comment, then return its sha256 as 64-char lowercase hex. Used by
+/// symbol-anchored skip entries; keeps the hash invariant to comment churn,
+/// trailing-whitespace edits, CRLF/LF flips, and trailing-blank-line nudges.
+///
+/// `body` is the raw bytes of `file.source[def_byte_start..def_byte_end]`.
+fn hashEntityContent(a: Allocator, body: []const u8) ![Sha256.digest_length * 2]u8 {
+    var buf: ArrayList(u8) = .{};
+    defer buf.deinit(a);
+
+    // Collect normalized lines into `lines`, then drop trailing blanks
+    // and join with `\n` (no terminating newline).
+    var lines: ArrayList([]u8) = .{};
+    defer {
+        for (lines.items) |s| a.free(s);
+        lines.deinit(a);
+    }
+
+    var i: usize = 0;
+    while (i <= body.len) {
+        // Slice one logical line, advancing past the EOL.
+        var line_end = i;
+        while (line_end < body.len and body[line_end] != '\n' and body[line_end] != '\r') {
+            line_end += 1;
+        }
+        const raw_line = body[i..line_end];
+
+        var next = line_end;
+        if (next < body.len) {
+            if (body[next] == '\r') {
+                next += 1;
+                if (next < body.len and body[next] == '\n') next += 1;
+            } else if (body[next] == '\n') {
+                next += 1;
+            }
+        }
+
+        // Strip end-of-line `//` comment (string-aware).
+        var code_end: usize = raw_line.len;
+        var in_string = false;
+        var in_char = false;
+        var k: usize = 0;
+        while (k < raw_line.len) : (k += 1) {
+            const ch = raw_line[k];
+            if (!in_string and !in_char and ch == '/' and k + 1 < raw_line.len and raw_line[k + 1] == '/') {
+                code_end = k;
+                break;
+            }
+            if (!in_char and ch == '"') {
+                in_string = !in_string;
+            } else if (!in_string and ch == '\'') {
+                in_char = !in_char;
+            } else if ((in_string or in_char) and ch == '\\' and k + 1 < raw_line.len) {
+                k += 1; // skip escaped char
+            }
+        }
+
+        var trimmed = raw_line[0..code_end];
+        // Strip trailing whitespace (introduced by code or unmasked by
+        // comment strip).
+        while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == ' ' or trimmed[trimmed.len - 1] == '\t')) {
+            trimmed = trimmed[0 .. trimmed.len - 1];
+        }
+
+        if (trimmed.len > 0) {
+            const owned = try a.dupe(u8, trimmed);
+            try lines.append(a, owned);
+        }
+
+        if (next == i and i >= body.len) break;
+        i = next;
+        if (i == body.len) {
+            // Trailing newline at EOF — exit; an empty final line wouldn't
+            // contribute under the drop-empty rule above anyway.
+            break;
+        }
+    }
+
+    // Join with `\n`.
+    for (lines.items, 0..) |s, idx| {
+        if (idx > 0) try buf.append(a, '\n');
+        try buf.appendSlice(a, s);
+    }
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(buf.items, &digest, .{});
+    var hex: [Sha256.digest_length * 2]u8 = undefined;
+    hexEncode(digest, &hex);
+    return hex;
+}
+
+/// Resolve `(file_path, qualified_name)` to a unique entity row. Returns
+/// the entity's def-span byte content (newly allocated) on hit; null on
+/// miss. The DB's UNIQUE constraint is `(module_id, kind, qualified_name)`,
+/// so two entities can share a `(file_path, qualified_name)` only across
+/// `kind` (rare; e.g. a const struct + a field with the same name as the
+/// struct on the same line). When that happens we pick the first row, which
+/// is sufficient for the skip-list's "is this entity unchanged?" question
+/// since renaming or mutating either entity will move def_byte_{start,end}.
+fn fetchEntityBody(a: Allocator, db: *sqlite.Db, file_path: []const u8, qname: []const u8) !?[]u8 {
+    var stmt = try db.prepare(
+        \\SELECT substr(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start)
+        \\FROM entity e
+        \\JOIN file f ON f.id = e.def_file_id
+        \\WHERE f.path = ? AND e.qualified_name = ?
+        \\ORDER BY e.id LIMIT 1
+    , a);
+    defer stmt.finalize();
+    try stmt.bindText(1, file_path);
+    try stmt.bindText(2, qname);
+    if (try stmt.step()) {
+        const blob = stmt.columnBlob(0) orelse return null;
+        return try a.dupe(u8, blob);
+    }
+    return null;
 }
 
 /// Hash the line range `[start..end]` (1-indexed, inclusive). End-of-line
@@ -187,6 +387,33 @@ fn parseSkipLine(a: Allocator, raw: []const u8) !?SkipEntry {
     var right = line[split..];
     while (right.len > 0 and (right[0] == ' ' or right[0] == '\t')) right = right[1..];
 
+    const sha_prefix = "sha256:";
+    if (!mem.startsWith(u8, right, sha_prefix)) return error.SkipEntryMalformed;
+    const hex = right[sha_prefix.len..];
+    if (hex.len != Sha256.digest_length * 2) return error.SkipEntryMalformed;
+    for (hex) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return error.SkipEntryMalformed;
+    }
+    const stored = try a.dupe(u8, hex);
+
+    const sym_prefix = "entity:";
+    if (mem.startsWith(u8, left, sym_prefix)) {
+        // entity:<file>::<qname>
+        const body = left[sym_prefix.len..];
+        const sep = mem.indexOf(u8, body, "::") orelse return error.SkipEntryMalformed;
+        const file_path = body[0..sep];
+        const qname = body[sep + 2 ..];
+        if (file_path.len == 0 or qname.len == 0) return error.SkipEntryMalformed;
+        return SkipEntry{
+            .kind = .symbol,
+            .file_path = try a.dupe(u8, file_path),
+            .qualified_name = try a.dupe(u8, qname),
+            .stored_hash = stored,
+        };
+    }
+
+    // Legacy line-range form.
     const colon = mem.lastIndexOfScalar(u8, left, ':') orelse return error.SkipEntryMalformed;
     const rel_path = try a.dupe(u8, left[0..colon]);
     const range = left[colon + 1 ..];
@@ -204,18 +431,9 @@ fn parseSkipLine(a: Allocator, raw: []const u8) !?SkipEntry {
         end_line = std.fmt.parseInt(u32, end_str, 10) catch return error.SkipEntryMalformed;
     }
 
-    const prefix = "sha256:";
-    if (!mem.startsWith(u8, right, prefix)) return error.SkipEntryMalformed;
-    const hex = right[prefix.len..];
-    if (hex.len != Sha256.digest_length * 2) return error.SkipEntryMalformed;
-    for (hex) |c| {
-        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
-        if (!ok) return error.SkipEntryMalformed;
-    }
-    const stored = try a.dupe(u8, hex);
-
     return SkipEntry{
-        .rel_path = rel_path,
+        .kind = .line_range,
+        .file_path = rel_path,
         .start_line = start_line,
         .end_line = end_line,
         .end_is_eof = end_is_eof,
@@ -269,26 +487,43 @@ fn loadSkipFile(a: Allocator, path: []const u8, db: *sqlite.Db) !void {
     }
 }
 
-/// Compute current_hash for an entry from `file.source` in the DB.
+/// Compute current_hash for an entry against the DB's file/entity tables
+/// and set `entry.status` accordingly.
 fn validateSkipEntry(a: Allocator, entry: *SkipEntry, db: *sqlite.Db) !void {
-    const candidates = try resolveSkipDbPaths(a, entry.rel_path);
-    for (candidates) |cand| {
-        const src = try fetchFileSource(a, db, cand);
-        if (src) |bytes| {
-            const hex_opt = try hashLineRange(a, bytes, entry.start_line, entry.end_line, entry.end_is_eof);
-            if (hex_opt) |hex_buf| {
+    switch (entry.kind) {
+        .line_range => {
+            const candidates = try resolveSkipDbPaths(a, entry.file_path);
+            for (candidates) |cand| {
+                const src = try fetchFileSource(a, db, cand);
+                if (src) |bytes| {
+                    const hex_opt = try hashLineRange(a, bytes, entry.start_line, entry.end_line, entry.end_is_eof);
+                    if (hex_opt) |hex_buf| {
+                        const hex = try a.dupe(u8, &hex_buf);
+                        entry.current_hash = hex;
+                        entry.status = if (mem.eql(u8, hex, entry.stored_hash)) .hit else .invalidated;
+                    } else {
+                        entry.current_hash = "";
+                        entry.status = .bad_range;
+                    }
+                    return;
+                }
+            }
+            entry.current_hash = "";
+            entry.status = .missing;
+        },
+        .symbol => {
+            const body = try fetchEntityBody(a, db, entry.file_path, entry.qualified_name);
+            if (body) |bytes| {
+                const hex_buf = try hashEntityContent(a, bytes);
                 const hex = try a.dupe(u8, &hex_buf);
                 entry.current_hash = hex;
                 entry.status = if (mem.eql(u8, hex, entry.stored_hash)) .hit else .invalidated;
             } else {
                 entry.current_hash = "";
-                entry.status = .bad_range;
+                entry.status = .missing;
             }
-            return;
-        }
+        },
     }
-    entry.current_hash = "";
-    entry.status = .missing;
 }
 
 fn fetchFileSource(a: Allocator, db: *sqlite.Db, path: []const u8) !?[]u8 {
@@ -302,9 +537,14 @@ fn fetchFileSource(a: Allocator, db: *sqlite.Db, path: []const u8) !?[]u8 {
     return null;
 }
 
-/// True iff a `hit` skip entry covers `(rel_path, line)`.
-fn skipCovers(rel_path: []const u8, line: u32) bool {
-    var rel = rel_path;
+/// True iff a `hit` skip entry covers the given finding. `file_path` is
+/// the DB-canonical path (as stored in `Finding.file_path`); `qname` is
+/// the entity's qualified_name.
+fn skipCovers(file_path: []const u8, line: u32, qname: []const u8) bool {
+    // Normalize the line-range comparison path to drop a leading
+    // `<g_target_rel>/` prefix when present (legacy entries are written
+    // target-relative).
+    var rel = file_path;
     if (g_target_rel.len > 0 and mem.startsWith(u8, rel, g_target_rel) and
         rel.len > g_target_rel.len and rel[g_target_rel.len] == '/')
     {
@@ -312,10 +552,19 @@ fn skipCovers(rel_path: []const u8, line: u32) bool {
     }
     for (g_skip_entries.items) |e| {
         if (e.status != .hit) continue;
-        if (!mem.eql(u8, e.rel_path, rel)) continue;
-        if (line < e.start_line) continue;
-        if (!e.end_is_eof and line > e.end_line) continue;
-        return true;
+        switch (e.kind) {
+            .line_range => {
+                if (!mem.eql(u8, e.file_path, rel)) continue;
+                if (line < e.start_line) continue;
+                if (!e.end_is_eof and line > e.end_line) continue;
+                return true;
+            },
+            .symbol => {
+                if (!mem.eql(u8, e.file_path, file_path)) continue;
+                if (!mem.eql(u8, e.qualified_name, qname)) continue;
+                return true;
+            },
+        }
     }
     return false;
 }
@@ -325,40 +574,39 @@ fn reportSkipDiagnostics() !bool {
     var any = false;
     var buf: [1024]u8 = undefined;
     for (g_skip_entries.items) |e| {
+        if (e.status == .hit) continue;
+        any = true;
+        const anchor = try formatSkipAnchor(&buf, e);
         switch (e.status) {
-            .hit => continue,
+            .hit => unreachable,
             .invalidated => {
-                any = true;
-                const end_str: ?[]const u8 = if (e.end_is_eof) "end" else null;
-                const msg1 = if (end_str) |es|
-                    try std.fmt.bufPrint(&buf, "INVALIDATED: {s}:{d}-{s}\n", .{ e.rel_path, e.start_line, es })
-                else
-                    try std.fmt.bufPrint(&buf, "INVALIDATED: {s}:{d}-{d}\n", .{ e.rel_path, e.start_line, e.end_line });
+                var b2: [1024]u8 = undefined;
+                const msg1 = try std.fmt.bufPrint(&b2, "INVALIDATED: {s}\n", .{anchor});
                 _ = stderr.write(msg1) catch {};
-                const msg2 = try std.fmt.bufPrint(&buf, "  stored:  sha256:{s}\n", .{e.stored_hash});
+                var b3: [256]u8 = undefined;
+                const msg2 = try std.fmt.bufPrint(&b3, "  stored:  sha256:{s}\n", .{e.stored_hash});
                 _ = stderr.write(msg2) catch {};
-                const msg3 = try std.fmt.bufPrint(&buf, "  current: sha256:{s}\n", .{e.current_hash});
+                var b4: [256]u8 = undefined;
+                const msg3 = try std.fmt.bufPrint(&b4, "  current: sha256:{s}\n", .{e.current_hash});
                 _ = stderr.write(msg3) catch {};
-                const msg4 = if (end_str) |es|
-                    try std.fmt.bufPrint(&buf, "  The whitelisted range has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}:{d}-{s}` to refresh.\n", .{ e.rel_path, e.start_line, es })
-                else
-                    try std.fmt.bufPrint(&buf, "  The whitelisted range has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}:{d}-{d}` to refresh.\n", .{ e.rel_path, e.start_line, e.end_line });
+                var b5: [1024]u8 = undefined;
+                const msg4 = switch (e.kind) {
+                    .line_range => try std.fmt.bufPrint(&b5, "  The whitelisted range has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}` to refresh.\n", .{anchor}),
+                    .symbol => try std.fmt.bufPrint(&b5, "  The entity's normalized content has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}` to refresh.\n", .{anchor}),
+                };
                 _ = stderr.write(msg4) catch {};
             },
             .missing => {
-                any = true;
-                const msg = if (e.end_is_eof)
-                    try std.fmt.bufPrint(&buf, "MISSING: {s}:{d}-end\n  File not found under {s}/. Remove the entry or restore the file.\n", .{ e.rel_path, e.start_line, g_target_rel })
-                else
-                    try std.fmt.bufPrint(&buf, "MISSING: {s}:{d}-{d}\n  File not found under {s}/. Remove the entry or restore the file.\n", .{ e.rel_path, e.start_line, e.end_line, g_target_rel });
+                var b2: [1024]u8 = undefined;
+                const msg = switch (e.kind) {
+                    .line_range => try std.fmt.bufPrint(&b2, "MISSING: {s}\n  File not found under {s}/. Remove the entry or restore the file.\n", .{ anchor, g_target_rel }),
+                    .symbol => try std.fmt.bufPrint(&b2, "MISSING: {s}\n  No entity matches that (file, qualified_name) in the DB. Remove the entry or update its qname.\n", .{anchor}),
+                };
                 _ = stderr.write(msg) catch {};
             },
             .bad_range => {
-                any = true;
-                const msg = if (e.end_is_eof)
-                    try std.fmt.bufPrint(&buf, "BAD-RANGE: {s}:{d}-end\n  Range invalid (file empty or start past EOF).\n", .{ e.rel_path, e.start_line })
-                else
-                    try std.fmt.bufPrint(&buf, "BAD-RANGE: {s}:{d}-{d}\n  Range invalid (start > end, start == 0, or end past EOF).\n", .{ e.rel_path, e.start_line, e.end_line });
+                var b2: [1024]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&b2, "BAD-RANGE: {s}\n  Range invalid (start > end, start == 0, or end past EOF).\n", .{anchor});
                 _ = stderr.write(msg) catch {};
             },
         }
@@ -366,61 +614,109 @@ fn reportSkipDiagnostics() !bool {
     return any;
 }
 
-/// Implement `--update-skip <rel-path>:<start>-<end>`. Reads the source from
-/// the DB, computes a fresh hash, and writes/updates the entry in the
+/// Format an entry's anchor (the part before `sha256:`) into `buf`, returning
+/// the slice. Used for diagnostic messages and `--update-skip` echo.
+fn formatSkipAnchor(buf: []u8, e: SkipEntry) ![]u8 {
+    return switch (e.kind) {
+        .line_range => if (e.end_is_eof)
+            try std.fmt.bufPrint(buf, "{s}:{d}-end", .{ e.file_path, e.start_line })
+        else
+            try std.fmt.bufPrint(buf, "{s}:{d}-{d}", .{ e.file_path, e.start_line, e.end_line }),
+        .symbol => try std.fmt.bufPrint(buf, "entity:{s}::{s}", .{ e.file_path, e.qualified_name }),
+    };
+}
+
+/// Implement `--update-skip <anchor>`. The anchor may be either a legacy
+/// line-range form (`<rel-path>:<start>-<end>`) or a symbol-anchored form
+/// (`entity:<file>::<qname>`). Reads the source/entity content from the DB,
+/// computes a fresh normalized hash, and writes/updates the entry in the
 /// on-disk skip file.
 fn updateSkipEntry(a: Allocator, raw_arg: []const u8, skip_file: []const u8, db: *sqlite.Db) !u8 {
     const stderr = std.fs.File.stderr();
 
-    const colon = mem.lastIndexOfScalar(u8, raw_arg, ':') orelse {
-        _ = stderr.write("--update-skip: expected <rel-path>:<start>-<end>\n") catch {};
-        return 2;
-    };
-    const rel_path = raw_arg[0..colon];
-    const range = raw_arg[colon + 1 ..];
-    const dash = mem.indexOfScalar(u8, range, '-') orelse {
-        _ = stderr.write("--update-skip: expected <start>-<end>\n") catch {};
-        return 2;
-    };
-    const start_str = range[0..dash];
-    const end_str = range[dash + 1 ..];
-    const start_line = std.fmt.parseInt(u32, start_str, 10) catch {
-        _ = stderr.write("--update-skip: bad start line\n") catch {};
-        return 2;
-    };
-    var end_line: u32 = 0;
-    var end_is_eof = false;
-    if (mem.eql(u8, end_str, "end")) {
-        end_is_eof = true;
-    } else {
-        end_line = std.fmt.parseInt(u32, end_str, 10) catch {
-            _ = stderr.write("--update-skip: bad end line (expected number or 'end')\n") catch {};
+    var left_buf: [1024]u8 = undefined;
+    var hex_holder: [Sha256.digest_length * 2]u8 = undefined;
+
+    const left = blk: {
+        const sym_prefix = "entity:";
+        if (mem.startsWith(u8, raw_arg, sym_prefix)) {
+            // Symbol-anchored form.
+            const body = raw_arg[sym_prefix.len..];
+            const sep = mem.indexOf(u8, body, "::") orelse {
+                _ = stderr.write("--update-skip: expected entity:<file>::<qname>\n") catch {};
+                return 2;
+            };
+            const file_path = body[0..sep];
+            const qname = body[sep + 2 ..];
+            if (file_path.len == 0 or qname.len == 0) {
+                _ = stderr.write("--update-skip: empty file or qname in entity:<file>::<qname>\n") catch {};
+                return 2;
+            }
+            const ent_body = (try fetchEntityBody(a, db, file_path, qname)) orelse {
+                var b: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&b, "--update-skip: no entity found in DB for {s}::{s}\n", .{ file_path, qname }) catch return 2;
+                _ = stderr.write(msg) catch {};
+                return 2;
+            };
+            hex_holder = try hashEntityContent(a, ent_body);
+            break :blk try std.fmt.bufPrint(&left_buf, "entity:{s}::{s}", .{ file_path, qname });
+        }
+
+        // Legacy line-range form.
+        const colon = mem.lastIndexOfScalar(u8, raw_arg, ':') orelse {
+            _ = stderr.write("--update-skip: expected <rel-path>:<start>-<end> or entity:<file>::<qname>\n") catch {};
             return 2;
         };
-    }
-
-    // Hash the current file content from the DB.
-    const candidates = try resolveSkipDbPaths(a, rel_path);
-    var src_opt: ?[]u8 = null;
-    for (candidates) |cand| {
-        if (try fetchFileSource(a, db, cand)) |bytes| {
-            src_opt = bytes;
-            break;
+        const rel_path = raw_arg[0..colon];
+        const range = raw_arg[colon + 1 ..];
+        const dash = mem.indexOfScalar(u8, range, '-') orelse {
+            _ = stderr.write("--update-skip: expected <start>-<end>\n") catch {};
+            return 2;
+        };
+        const start_str = range[0..dash];
+        const end_str = range[dash + 1 ..];
+        const start_line = std.fmt.parseInt(u32, start_str, 10) catch {
+            _ = stderr.write("--update-skip: bad start line\n") catch {};
+            return 2;
+        };
+        var end_line: u32 = 0;
+        var end_is_eof = false;
+        if (mem.eql(u8, end_str, "end")) {
+            end_is_eof = true;
+        } else {
+            end_line = std.fmt.parseInt(u32, end_str, 10) catch {
+                _ = stderr.write("--update-skip: bad end line (expected number or 'end')\n") catch {};
+                return 2;
+            };
         }
-    }
-    const text = src_opt orelse {
-        var buf: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "--update-skip: file not found in DB: {s}\n", .{rel_path}) catch return 2;
-        _ = stderr.write(msg) catch {};
-        return 2;
+
+        const candidates = try resolveSkipDbPaths(a, rel_path);
+        var src_opt: ?[]u8 = null;
+        for (candidates) |cand| {
+            if (try fetchFileSource(a, db, cand)) |bytes| {
+                src_opt = bytes;
+                break;
+            }
+        }
+        const text = src_opt orelse {
+            var b: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&b, "--update-skip: file not found in DB: {s}\n", .{rel_path}) catch return 2;
+            _ = stderr.write(msg) catch {};
+            return 2;
+        };
+
+        const hex_opt = try hashLineRange(a, text, start_line, end_line, end_is_eof);
+        hex_holder = hex_opt orelse {
+            _ = stderr.write("--update-skip: invalid range for that file\n") catch {};
+            return 2;
+        };
+        break :blk if (end_is_eof)
+            try std.fmt.bufPrint(&left_buf, "{s}:{d}-end", .{ rel_path, start_line })
+        else
+            try std.fmt.bufPrint(&left_buf, "{s}:{d}-{d}", .{ rel_path, start_line, end_line });
     };
 
-    const hex_opt = try hashLineRange(a, text, start_line, end_line, end_is_eof);
-    const hex_buf = hex_opt orelse {
-        _ = stderr.write("--update-skip: invalid range for that file\n") catch {};
-        return 2;
-    };
-    const new_hex = &hex_buf;
+    const new_hex = &hex_holder;
 
     // Read existing skip-file content (or empty if absent).
     var existing: []u8 = "";
@@ -433,12 +729,6 @@ fn updateSkipEntry(a: Allocator, raw_arg: []const u8, skip_file: []const u8, db:
         error.FileNotFound => existing = "",
         else => return err,
     }
-
-    var left_buf: [512]u8 = undefined;
-    const left = if (end_is_eof)
-        try std.fmt.bufPrint(&left_buf, "{s}:{d}-end", .{ rel_path, start_line })
-    else
-        try std.fmt.bufPrint(&left_buf, "{s}:{d}-{d}", .{ rel_path, start_line, end_line });
 
     var out: ArrayList(u8) = .{};
     var replaced = false;
@@ -487,6 +777,192 @@ fn updateSkipEntry(a: Allocator, raw_arg: []const u8, skip_file: []const u8, db:
     const stdout = std.fs.File.stdout();
     _ = stdout.write(msg) catch {};
     return 0;
+}
+
+/// Implement `--rewrite-skip`. Reads every line of the on-disk skip file,
+/// transforms each legacy `<file>:<start>-<end>` entry into one or more
+/// `entity:<file>::<qname>` entries (one per matching DB entity), preserves
+/// comments and blank lines, and rewrites the file in place.
+///
+/// Already-symbol entries pass through with their stored hash recomputed
+/// against the current DB content (so the rewrite also serves as a "rehash
+/// every entry" pass for the post-edit DB).
+///
+/// Legacy entries with NO matching entity in the line range are dropped
+/// with a stderr warning. These were already silent no-ops at the analyzer
+/// level (the line referred to nothing the analyzer would emit a finding
+/// for), so dropping them is safe; if the worker had intended to suppress
+/// a real entity, the analyzer will surface it on the next run and a
+/// fresh symbol-anchored entry can be added.
+fn rewriteSkipFile(a: Allocator, skip_file: []const u8, db: *sqlite.Db) !u8 {
+    const stderr = std.fs.File.stderr();
+
+    // Read existing content (or fail loudly — there's no useful "rewrite"
+    // to perform when the file is absent).
+    const sf = fs.openFileAbsolute(skip_file, .{}) catch |err| {
+        var b: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&b, "--rewrite-skip: failed to open {s}: {s}\n", .{ skip_file, @errorName(err) }) catch return 2;
+        _ = stderr.write(msg) catch {};
+        return 2;
+    };
+    defer sf.close();
+    const sst = try sf.stat();
+    const existing = try a.alloc(u8, sst.size);
+    _ = try sf.readAll(existing);
+
+    var out: ArrayList(u8) = .{};
+    var line_no: u32 = 0;
+    var rewrote: u32 = 0;
+    var rehashed: u32 = 0;
+    var dropped: u32 = 0;
+
+    var it = mem.splitScalar(u8, existing, '\n');
+    var first_line = true;
+    var produced_anchors: std.StringHashMapUnmanaged(void) = .empty;
+
+    while (it.next()) |raw| {
+        line_no += 1;
+        const line = raw;
+
+        // Preserve comments and blank lines verbatim. Detect by parsing:
+        // anything that doesn't yield a SkipEntry (and isn't malformed)
+        // is a comment/blank — emit verbatim. Malformed entries we also
+        // pass through (with a stderr warning) to keep the rewrite
+        // non-destructive.
+        const parsed = parseSkipLine(a, line) catch |err| {
+            var b: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&b, "--rewrite-skip: {s}:{d}: malformed (kept verbatim): {s}\n", .{ skip_file, line_no, @errorName(err) }) catch null;
+            if (msg) |m| _ = stderr.write(m) catch {};
+            try emitLineVerbatim(a, &out, line, &first_line);
+            continue;
+        };
+
+        if (parsed == null) {
+            try emitLineVerbatim(a, &out, line, &first_line);
+            continue;
+        }
+        const entry = parsed.?;
+
+        switch (entry.kind) {
+            .symbol => {
+                // Recompute the hash against the current DB; if the entity
+                // is gone, drop with warning.
+                const body = try fetchEntityBody(a, db, entry.file_path, entry.qualified_name);
+                if (body == null) {
+                    var b: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&b, "--rewrite-skip: dropping entry for missing entity: {s}::{s}\n", .{ entry.file_path, entry.qualified_name }) catch null;
+                    if (msg) |m| _ = stderr.write(m) catch {};
+                    dropped += 1;
+                    continue;
+                }
+                const hex_buf = try hashEntityContent(a, body.?);
+                try emitSymbolEntry(a, &out, entry.file_path, entry.qualified_name, &hex_buf, &first_line, &produced_anchors);
+                rehashed += 1;
+            },
+            .line_range => {
+                // Find every entity whose def_line falls in the range AND
+                // whose def_byte_end stays within the file. Emit one symbol
+                // entry per matched entity.
+                const candidates = try resolveSkipDbPaths(a, entry.file_path);
+                var resolved_path: ?[]const u8 = null;
+                for (candidates) |cand| {
+                    var s = try db.prepare("SELECT 1 FROM file WHERE path = ? LIMIT 1", a);
+                    defer s.finalize();
+                    try s.bindText(1, cand);
+                    if (try s.step()) {
+                        resolved_path = cand;
+                        break;
+                    }
+                }
+                if (resolved_path == null) {
+                    var b: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&b, "--rewrite-skip: dropping entry for missing file: {s}\n", .{entry.file_path}) catch null;
+                    if (msg) |m| _ = stderr.write(m) catch {};
+                    dropped += 1;
+                    continue;
+                }
+
+                const end_line: u32 = if (entry.end_is_eof) std.math.maxInt(u32) else entry.end_line;
+                var ent_stmt = try db.prepare(
+                    \\SELECT e.qualified_name,
+                    \\       substr(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start),
+                    \\       f.path
+                    \\FROM entity e
+                    \\JOIN file f ON f.id = e.def_file_id
+                    \\WHERE f.path = ? AND e.def_line BETWEEN ? AND ?
+                    \\ORDER BY e.def_byte_start, e.id
+                , a);
+                defer ent_stmt.finalize();
+                try ent_stmt.bindText(1, resolved_path.?);
+                try ent_stmt.bindInt(2, @intCast(entry.start_line));
+                try ent_stmt.bindInt(3, @intCast(end_line));
+
+                var matched: u32 = 0;
+                while (try ent_stmt.step()) {
+                    const qname = ent_stmt.columnText(0) orelse continue;
+                    const body = ent_stmt.columnBlob(1) orelse continue;
+                    const file_path = ent_stmt.columnText(2) orelse continue;
+                    const hex_buf = try hashEntityContent(a, body);
+                    try emitSymbolEntry(a, &out, file_path, qname, &hex_buf, &first_line, &produced_anchors);
+                    matched += 1;
+                }
+
+                if (matched == 0) {
+                    var b: [512]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&b, "--rewrite-skip: dropping line-range entry with no matching entity: {s}:{d}-{d}\n", .{ entry.file_path, entry.start_line, entry.end_line }) catch null;
+                    if (msg) |m| _ = stderr.write(m) catch {};
+                    dropped += 1;
+                } else {
+                    rewrote += 1;
+                }
+            },
+        }
+    }
+
+    // Trailing newline parity with the reader: write back exactly what we
+    // accumulated. parseSkipLine + the verbatim path keep the file's
+    // newline-terminated convention intact.
+    const tmp_path = try std.fmt.allocPrint(a, "{s}.tmp", .{skip_file});
+    {
+        const wf = try fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        defer wf.close();
+        try wf.writeAll(out.items);
+    }
+    try fs.renameAbsolute(tmp_path, skip_file);
+
+    var sb: [256]u8 = undefined;
+    const summary = std.fmt.bufPrint(&sb, "rewrite-skip: rewrote {d} legacy entries, rehashed {d} symbol entries, dropped {d} unmatched\n", .{ rewrote, rehashed, dropped }) catch return 0;
+    const stdout = std.fs.File.stdout();
+    _ = stdout.write(summary) catch {};
+    return 0;
+}
+
+fn emitLineVerbatim(a: Allocator, out: *ArrayList(u8), line: []const u8, first_line: *bool) !void {
+    if (!first_line.*) try out.append(a, '\n');
+    first_line.* = false;
+    try out.appendSlice(a, line);
+}
+
+fn emitSymbolEntry(
+    a: Allocator,
+    out: *ArrayList(u8),
+    file_path: []const u8,
+    qname: []const u8,
+    hex: *const [Sha256.digest_length * 2]u8,
+    first_line: *bool,
+    seen: *std.StringHashMapUnmanaged(void),
+) !void {
+    var key_buf: [1024]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}::{s}", .{ file_path, qname }) catch return;
+    if (seen.contains(key)) return; // dedupe across multiple line-range matches
+    const owned_key = try a.dupe(u8, key);
+    try seen.put(a, owned_key, {});
+
+    if (!first_line.*) try out.append(a, '\n');
+    first_line.* = false;
+    var line_buf: [1024]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(&line_buf, "entity:{s}::{s}    sha256:{s}", .{ file_path, qname, hex });
+    try out.appendSlice(a, formatted);
 }
 
 fn defaultSkipPath(a: Allocator, repo_root: []const u8) ![]u8 {
@@ -846,6 +1322,7 @@ pub fn main() !void {
     var target_name: []const u8 = "kernel";
     var skip_override: ?[]const u8 = null;
     var update_arg: ?[]const u8 = null;
+    var rewrite_skip = false;
 
     while (args_it.next()) |a| {
         if (mem.eql(u8, a, "--db")) {
@@ -868,14 +1345,17 @@ pub fn main() !void {
             skip_override = try g_arena.dupe(u8, v);
         } else if (mem.eql(u8, a, "--update-skip")) {
             const v = args_it.next() orelse {
-                _ = std.fs.File.stderr().write("--update-skip requires <rel-path>:<start>-<end>\n") catch {};
+                _ = std.fs.File.stderr().write("--update-skip requires <rel-path>:<start>-<end> or entity:<file>::<qname>\n") catch {};
                 std.process.exit(2);
             };
             update_arg = try g_arena.dupe(u8, v);
+        } else if (mem.eql(u8, a, "--rewrite-skip")) {
+            rewrite_skip = true;
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
             const stdout = std.fs.File.stdout();
             _ = stdout.write(
-                \\usage: dead_code_zig --db <path> [--db <path>...] [--target <name>] [--skip <path>] [--update-skip <rel>:<start>-<end>]
+                \\usage: dead_code_zig --db <path> [--db <path>...] [--target <name>] [--skip <path>]
+                \\                     [--update-skip <anchor>] [--rewrite-skip]
                 \\
                 \\Reads the per-(arch, commit_sha) callgraph DB and reports unused decls in the target dir.
                 \\
@@ -883,6 +1363,20 @@ pub fn main() !void {
                 \\augment the alive-set by qualified_name (used to cover the
                 \\cross-arch precision gap when the primary is x86_64-only).
                 \\All DBs must share the same meta.commit_sha.
+                \\
+                \\Skip-file anchor forms (see top of src/main.zig for spec):
+                \\  symbol:  entity:<file>::<qualified_name>    sha256:<hex>
+                \\  legacy:  <relpath>:<start>-<end>            sha256:<hex>
+                \\
+                \\`--update-skip <anchor>` recomputes the SHA for one entry
+                \\(adding it if missing); `<anchor>` accepts either form.
+                \\
+                \\`--rewrite-skip` migrates every legacy line-range entry in
+                \\the skip file to symbol form, emitting one `entity:` line
+                \\per matched DB entity. Entries without a matching entity
+                \\are dropped (with a stderr warning) since they had become
+                \\silent no-ops anyway. Run once after a kernel structural
+                \\change resettles the layout.
                 \\
             ) catch {};
             std.process.exit(0);
@@ -948,6 +1442,11 @@ pub fn main() !void {
         std.process.exit(rc);
     }
 
+    if (rewrite_skip) {
+        const rc = try rewriteSkipFile(g_arena, skip_path, &db);
+        std.process.exit(rc);
+    }
+
     try loadSkipFile(g_arena, skip_path, &db);
 
     // Scan summary stderr line (mirrors old tool's "Scanning N source files...").
@@ -1008,7 +1507,7 @@ pub fn main() !void {
     var current_file: []const u8 = "";
     var current_file_open = false;
     for (findings) |f| {
-        if (skipCovers(f.file_path, f.line)) continue;
+        if (skipCovers(f.file_path, f.line, f.qname)) continue;
         if (alt_alive.contains(f.qname)) continue;
         // Display paths with the target prefix (matches the old tool's
         // repo-relative output format) when the DB stores target-rooted
@@ -1096,7 +1595,7 @@ fn writeFindingsToDb(
     defer ins.finalize();
 
     for (findings) |f| {
-        if (skipCovers(f.file_path, f.line)) continue;
+        if (skipCovers(f.file_path, f.line, f.qname)) continue;
         if (alt_alive.contains(f.qname)) continue;
 
         const rule = if (mem.eql(u8, f.kind_label, "FIELD"))

@@ -1,0 +1,10 @@
+# Symbol-anchored skip entry for symbolHit — hash matches the entity's
+# normalized def-span (just `symbolHit`). Suppression should hit,
+# regardless of how many lines of doc comment precede the EndReason
+# decl. This is the structural fix for bd-Zag-Subsystems-Agents-na6c.
+entity:main.zig::main.EndReason.symbolHit    sha256:3d548da3547b4c16469f167ccf4a264780e0dfa139b81eca4a86c6017702cb48
+
+# Symbol-anchored skip entry for legacyDead with a deliberately wrong
+# hash. The analyzer should mark it INVALIDATED on stderr and NOT
+# suppress the variant, so legacyDead surfaces as UNUSED.
+entity:main.zig::main.EndReason.legacyDead    sha256:0000000000000000000000000000000000000000000000000000000000000000

@@ -60,8 +60,22 @@ for fixture_dir in "$HERE"/fixtures/*/; do
         continue
     fi
 
+    # Pass --skip when the fixture provides a per-fixture skip file. Two
+    # accepted locations: <fixture>/skip.txt (preferred for new fixtures)
+    # and <fixture>/kernel/.dead-code-skip.txt (legacy convention). The
+    # analyzer's defaultSkipPath resolves against cwd to a location no
+    # fixture supplies, so without --skip the skip file is silently
+    # ignored — pre-bd-na6c, fixture 02 was passing only because
+    # `deadConst` is reported regardless of skip-list state.
+    skip_args=()
+    if [[ -f "$fixture_dir/skip.txt" ]]; then
+        skip_args=(--skip "$fixture_dir/skip.txt")
+    elif [[ -f "$fixture_dir/kernel/.dead-code-skip.txt" ]]; then
+        skip_args=(--skip "$fixture_dir/kernel/.dead-code-skip.txt")
+    fi
+
     # Run analyzer; strip line numbers + paths, keep only "UNUSED <KIND>: <name>".
-    actual="$(cd "$fixture_dir" && "$ANALYZER" --db "$db" --target kernel 2>/dev/null \
+    actual="$(cd "$fixture_dir" && "$ANALYZER" --db "$db" --target kernel "${skip_args[@]}" 2>/dev/null \
         | grep '^  UNUSED' \
         | sed -E 's/^  (UNUSED [A-Z]+: [^ ]+).*/\1/' \
         | sort -u)"
@@ -82,7 +96,7 @@ for fixture_dir in "$HERE"/fixtures/*/; do
     # alive_named, so the qname-keyed alt filter is a no-op and output
     # must match single-DB. Guards against regressions in the alt-DB
     # plumbing (arg parsing, qname extraction, hash lookup).
-    multi="$(cd "$fixture_dir" && "$ANALYZER" --db "$db" --db "$db" --target kernel 2>/dev/null \
+    multi="$(cd "$fixture_dir" && "$ANALYZER" --db "$db" --db "$db" --target kernel "${skip_args[@]}" 2>/dev/null \
         | grep '^  UNUSED' \
         | sed -E 's/^  (UNUSED [A-Z]+: [^ ]+).*/\1/' \
         | sort -u)"
