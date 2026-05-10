@@ -747,3 +747,5 @@ arch/aarch64/vm_runloop.zig:58-58    sha256:51b9437cc28611bc8f3f397e483147736804
 arch/aarch64/vm_runloop.zig:346-346    sha256:a1903fbfe775e65ba24f4ec25e581572229400769d4501fecbae33dbd304b1f4
 arch/aarch64/vm_runloop.zig:358-358    sha256:ecef1f28bbddb8a4ab075372a91da468019da8d073bb77ae8391b4701c661a72
 arch/x64/vm_runloop.zig:334-334    sha256:c3e78392222ead648841450e2705106ce1c9079fb447198afc871a3411081225
+# bd-Zag-Subsystems-Agents-i86b — transient; remove when bd-Zag-Subsystems-Agents-ibaf lands and consumes fpuFlushMailbox via the dispatch facade
+arch/dispatch/cpu.zig:413-413    sha256:23d4fa4a81d6a3b9a33b60a49fc2817a0b80daceebedf4f1cb28d3e7a714fd7e
