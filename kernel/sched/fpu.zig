@@ -21,7 +21,6 @@
 //!
 //! Spec §[execution_context] lazy FPU.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const stygia = @import("stygia");
 
@@ -188,42 +187,6 @@ const FlushSlot = struct {
 
 var flush_slot_state: [scheduler.MAX_CORES]FlushSlot = [_]FlushSlot{.{}} ** scheduler.MAX_CORES;
 
-/// Per-arch accessor for the IPI-transport mailbox. Owned by
-/// `arch-x64-core` / `arch-aarch64-core`; we read its `requested_thread`
-/// and `done` fields here. Indexed by *target* core (the core whose
-/// hardware will receive the IPI and run the FXSAVE).
-inline fn archFlushMailbox(core: u8) *ArchFpuFlushMailbox {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => &stygia.arch.x64.cpu.fpu_flush_mailbox[core],
-        .aarch64 => &stygia.arch.aarch64.cpu.fpu_flush_mailbox[core],
-        else => unreachable,
-    };
-}
-
-const ArchFpuFlushMailbox = switch (builtin.cpu.arch) {
-    .x86_64 => stygia.arch.x64.cpu.FpuFlushMailbox,
-    .aarch64 => stygia.arch.aarch64.cpu.FpuFlushMailbox,
-    else => unreachable,
-};
-
-/// Send the lazy-FPU flush IPI to `target_core`. x86-64 uses the
-/// dedicated IDT vector `IntVecs.fpu_flush`; aarch64 uses SGI 2.
-/// Both wire into the same in-IRQ-context handler that calls
-/// `flushIpiHandler` after reading the EC pointer from the mailbox.
-inline fn sendFpuFlushIpi(target_core: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            const vec = @intFromEnum(stygia.arch.x64.interrupts.IntVecs.fpu_flush);
-            stygia.arch.x64.apic.sendIpiToCore(target_core, vec);
-        },
-        .aarch64 => {
-            // SGI 2 — see arch/aarch64/exceptions.zig dispatchIrq.
-            stygia.arch.aarch64.gic.sendIpiToCore(target_core, 2);
-        },
-        else => unreachable,
-    }
-}
-
 /// Inner save: if this core still owns `ec`'s regs, FXSAVE them into
 /// `ec.fpu_state` and clear the per-core slot. Always clears
 /// `ec.last_fpu_core` so the EC's next dispatch on any core treats its
@@ -282,7 +245,7 @@ fn drainLocalFlush(local_core: u8) void {
 
     // Atomic claim of the arch mailbox slot. First-claimer wins; losers
     // see null and bail. This makes inline-service-vs-IDT-fire safe.
-    const arch_mailbox = archFlushMailbox(local_core);
+    const arch_mailbox = arch.cpu.fpuFlushMailbox(local_core);
     const opaque_ptr = @atomicRmw(?*anyopaque, &arch_mailbox.requested_thread, .Xchg, null, .acq_rel) orelse return;
     const ec: *ExecutionContext = @ptrCast(@alignCast(opaque_ptr));
 
@@ -365,11 +328,11 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // `done = true` via `ackDone` after our handler returns; nothing
     // in this protocol reads it, but we keep the wrapper's existing
     // contract intact.
-    const arch_mailbox = archFlushMailbox(src_core);
+    const arch_mailbox = arch.cpu.fpuFlushMailbox(src_core);
     @atomicStore(?*anyopaque, &arch_mailbox.requested_thread, ec, .release);
     slot.request_seq.store(my_seq, .release);
 
-    sendFpuFlushIpi(src_core);
+    arch.cpu.sendFpuFlushIpi(src_core);
 
     // Spin on our seq's completion. Inline-service own slot to break
     // symmetric-flush deadlock. The spin terminates as soon as the
