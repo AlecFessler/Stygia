@@ -33,6 +33,37 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STYGIA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ── Per-worktree Zig global cache ─────────────────────────────────────
+#
+# Every `zig build` invocation in this gauntlet — and there are ~19 of
+# them across the stages (kernel + tools/* + tests/suite + tests/perf +
+# tests/linux_guest, x64 and arm) — would otherwise share the user's
+# default global cache at `~/.cache/zig/`. With the orchestrator running
+# up to 3 worker dispatches in parallel, multiple gauntlets fire `zig
+# build` concurrently against the same module-hash directories in that
+# global cache, racing on hash-dir creation and producing intermittent
+# non-zero exits. The most visible failure was `ensure_callgraph_db`'s
+# "kernel build for IR/ELF" stage flapping on N≥3 concurrent gauntlets.
+#
+# Pinning $ZIG_GLOBAL_CACHE_DIR to a worktree-local path gives each
+# gauntlet its own private cache; child `zig build` processes inherit
+# the env var, so this single export covers every invocation in the
+# gauntlet without per-call shell prefixing. `.zig-cache/` (with and
+# without `**/`) is already in .gitignore at project root so the
+# directory never shows up in `git status`.
+#
+# Cost: each worktree's first gauntlet pays a cold-cache rebuild cost
+# (no sharing with `~/.cache/zig/`). Subsequent runs in the same
+# worktree warm-cache normally. Disk: each worktree's cache pulls in
+# all of std + every kernel module touched by the gauntlet — expect a
+# few hundred MB per worktree.
+#
+# Scope: the export only affects child processes of this script.
+# Interactive `zig build` outside the gauntlet keeps using
+# `~/.cache/zig/` via Zig's default. This intentionally does not blow
+# away the existing user cache.
+export ZIG_GLOBAL_CACHE_DIR="$STYGIA_ROOT/.zig-cache"
+
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
 # Stays as a relative path so both ssh-shell-expansion contexts
 # (`cd $PI_REMOTE_DIR …`) and scp destinations (`host:$PI_REMOTE_DIR/x`,
