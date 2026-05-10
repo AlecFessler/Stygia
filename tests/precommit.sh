@@ -149,6 +149,43 @@ run_stage() {
     "stage_$name" || true
 }
 
+# ── Pre-stage suite warmup ────────────────────────────────────────────
+#
+# The kernel build's default install step has a hard dependency on
+# tests/suite/bin/root_service.elf: build.zig's install_root_service step
+# (`addInstallFile` from `tests/suite/bin/root_service.elf`) is wired into
+# `b.getInstallStep()`, so any `zig build -Dprofile=test ...` invocation
+# that runs the install step errors out with FileNotFound on a worktree
+# where that artifact hasn't been built yet.
+#
+# The artifact is normally produced by stages [1]/[2]/[2a]'s
+# `cd tests/suite && rm -rf bin/ && zig build` step, but the analyzer
+# stages [0]/[0b]/[0c] run first and call ensure_callgraph_db which
+# triggers the kernel build before any of those stages get the chance.
+# On a freshly-cloned worktree this races: the analyzer-stage kernel
+# build hits FileNotFound and the analyzer never runs.
+#
+# Fix: prebuild the suite if root_service.elf isn't present, before any
+# stage runs. The build is no-op on warm worktrees (file exists check)
+# and only pays the full cost on the very first gauntlet run after a
+# fresh checkout. Stages [1]/[2]/[2a] still rm -rf bin/ and rebuild with
+# their per-stage -Dtests/-Dtests_exclude knobs, so the warmup is purely
+# throwaway from their perspective — but it satisfies the install-step's
+# existence check on first-run-from-clean worktrees.
+ensure_suite_root_service_elf() {
+    if [[ -f "$SCRIPT_DIR/suite/bin/root_service.elf" ]]; then
+        return 0
+    fi
+    echo ""
+    echo "=================================================="
+    echo "[warmup] Building tests/suite/bin/root_service.elf"
+    echo "=================================================="
+    if ! (cd "$SCRIPT_DIR/suite" && zig build); then
+        FAILURES+=("warmup: tests/suite root_service build")
+        return 1
+    fi
+}
+
 # ── Stage runners ─────────────────────────────────────────────────────
 
 stage_arch_layering_lint() {
@@ -777,6 +814,8 @@ stage_perf_regression() {
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────────
+
+ensure_suite_root_service_elf || true
 
 run_stage arch_layering_lint
 run_stage dead_code_report
