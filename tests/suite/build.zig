@@ -739,6 +739,12 @@ pub fn build(b: *std.Build) void {
         "Comma-separated list of test names or glob-style patterns (e.g. recv_01,recv_*) to embed in the runner manifest. Omit to embed all tests.",
     );
 
+    const tests_exclude = b.option(
+        []const u8,
+        "tests_exclude",
+        "Comma-separated list of test names or glob-style patterns to drop from the manifest (applied after -Dtests). Used by precommit.sh to skip the TCG-bound hv-prefix subset in the stage [2/4] TCG fallback path; canonical TCG VM coverage runs in stage [2a/4].",
+    );
+
     // Number of times the runner replays the embedded test list per
     // boot. With N>1 the runner iterates the manifest N times back-
     // to-back, clearing its result table between runs and printing a
@@ -784,6 +790,45 @@ pub fn build(b: *std.Build) void {
         }
     } else {
         selected.appendSlice(&test_entries) catch @panic("OOM seeding default test list");
+    }
+
+    if (tests_exclude) |raw| {
+        if (raw.len == 0) {
+            @panic("-Dtests_exclude requires at least one test name or pattern");
+        }
+        var patterns = std.array_list.Managed([]const u8).init(b.allocator);
+        defer patterns.deinit();
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |piece| {
+            const trimmed = std.mem.trim(u8, piece, " \t");
+            if (trimmed.len == 0) {
+                @panic("-Dtests_exclude contains an empty entry (check for stray commas)");
+            }
+            patterns.append(trimmed) catch @panic("OOM building -Dtests_exclude pattern list");
+        }
+        var write_idx: usize = 0;
+        for (selected.items) |t| {
+            var skip = false;
+            for (patterns.items) |pat| {
+                if (patternMatches(pat, t.name)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (!skip) {
+                selected.items[write_idx] = t;
+                write_idx += 1;
+            }
+        }
+        selected.shrinkRetainingCapacity(write_idx);
+        if (selected.items.len == 0) {
+            const msg = std.fmt.allocPrint(
+                b.allocator,
+                "-Dtests_exclude={s}: every selected test was excluded",
+                .{raw},
+            ) catch "-Dtests_exclude: every selected test was excluded";
+            @panic(msg);
+        }
     }
     const selected_entries = selected.items;
 
