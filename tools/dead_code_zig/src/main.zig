@@ -11,8 +11,21 @@
 //!   * `file.source` — full file bytes for skip-range hashing.
 //!
 //! Behavior matches the previous binary on `kernel/`, `routerOS/`,
-//! `hyprvOS/`, `bootloader/`. CLI is now `--db <path> --target <name>`;
+//! `hyprvOS/`, `bootloader/`. CLI is `--db <path> --target <name>`;
 //! the positional form is removed (DB-only mode is a hard break).
+//!
+//! `--db` is repeatable. The first is the **primary**: skip-file
+//! resolution, target-file scoping, and `lint_finding` writeback all
+//! happen against it. Each additional `--db` is treated as an
+//! **alt** DB whose alive-set augments the primary's. A finding is
+//! emitted only when the entity is dead under EVERY DB's alive-set
+//! (matched by `qualified_name`). This closes the cross-arch precision
+//! gap: the per-pre-commit `x86_64-<sha>.db` cannot see aarch64 IR /
+//! entry_reaches, so aarch64-only-reachable code falsely scored "dead"
+//! under the lone x86_64 alive-set; passing the matching aarch64 DB as
+//! a second `--db` lets its `ir_call` closure cover those entities.
+//! All alt DBs must share the primary's `meta.commit_sha` (the
+//! qualified-name match presumes one source-tree snapshot).
 //!
 //! Skip-file workflow ports verbatim from the old tool. Hash bytes come
 //! from `file.source` so the analyzer is reproducible against an archived
@@ -488,6 +501,11 @@ const Finding = struct {
     file_path: []const u8,
     name: []const u8,
     parent: ?[]const u8,
+    /// Full `entity.qualified_name`. Used as the cross-DB matching key
+    /// when alt DBs augment the primary's alive-set — qnames are stable
+    /// across the per-(arch, sha) DBs since the AST/walk passes are
+    /// arch-agnostic.
+    qname: []const u8,
     line: u32,
     kind_label: []const u8,
     byte_start: u32,
@@ -495,6 +513,192 @@ const Finding = struct {
     entity_id: i64,
     file_id: i64,
 };
+
+/// Body of the alive-named CTE chain — shared between the findings query
+/// (which prepends `target_files` and selects entities NOT in alive_named)
+/// and `loadAliveQnames` (which selects DISTINCT qualified_names of every
+/// alive entity for cross-DB augmentation). Callers prepare an
+/// `entity_simple_name` temp table before referencing this; both
+/// `field_names` and `alive_named` join against it.
+const ALIVE_NAMED_CTES =
+    \\  field_names(name) AS (
+    \\    SELECT DISTINCT t2.text
+    \\      FROM token t1
+    \\      JOIN token t2 ON t2.file_id = t1.file_id AND t2.idx = t1.idx + 1
+    \\     WHERE t1.kind = 'period' AND t2.kind = 'identifier'
+    \\  ),
+    \\  alive(id) AS (
+    \\      -- Seed: entry-point closure (kernel-only, IR-derived).
+    \\      SELECT entity_id FROM entry_reaches
+    \\    UNION
+    \\      -- Seed: panic, main, every export fn, anything in tests/redteam.
+    \\      SELECT e.id FROM entity e
+    \\        LEFT JOIN file f ON f.id = e.def_file_id
+    \\       WHERE e.kind = 'fn'
+    \\         AND (e.qualified_name = 'panic'
+    \\              OR e.qualified_name LIKE '%.panic'
+    \\              OR e.qualified_name = 'main'
+    \\              OR e.qualified_name LIKE '%.main')
+    \\    UNION
+    \\      -- Seed: anything defined in a tests/ or redteam/ file is alive.
+    \\      SELECT e.id FROM entity e
+    \\        JOIN file f ON f.id = e.def_file_id
+    \\       WHERE f.path GLOB '*/tests/*' OR f.path GLOB '*/redteam/*'
+    \\    UNION
+    \\      -- Seed: any const whose definition contains `@import(` —
+    \\      -- import aliases are always alive (the prior tool tracked
+    \\      -- them as a distinct kind that was promoted to alive
+    \\      -- whenever ANY use of the alias name resolved through it).
+    \\      SELECT e.id FROM entity e
+    \\        JOIN file f ON f.id = e.def_file_id
+    \\       WHERE e.kind IN ('const','var')
+    \\         AND INSTR(SUBSTR(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start), '@import(') > 0
+    \\    UNION
+    \\      -- Seed: `export` decls (linker / asm consumers).
+    \\      SELECT e.id FROM entity e
+    \\        JOIN file f ON f.id = e.def_file_id
+    \\       WHERE INSTR(SUBSTR(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start), 'export ') > 0
+    \\    UNION
+    \\      -- Closure: alias targets. Forward-only — `pub const X = a.b.C;`
+    \\      -- means using X also uses C, but using C doesn't pull in
+    \\      -- every alias of C (the legacy tool only marks the chain
+    \\      -- HEAD via an explicit `markLive` per use, not the inverse).
+    \\      SELECT a.target_entity_id FROM const_alias a JOIN alive ON a.entity_id = alive.id
+    \\    UNION
+    \\      -- Closure: type references (struct field types, fn params, returns).
+    \\      SELECT etr.referred_entity_id FROM entity_type_ref etr JOIN alive ON etr.referrer_entity_id = alive.id
+    \\    UNION
+    \\      -- Closure: ir_call edges out of any alive fn (catches
+    \\      -- non-entry-rooted cross-target paths via direct calls).
+    \\      SELECT c.callee_entity_id FROM ir_call c JOIN alive ON c.caller_entity_id = alive.id
+    \\        WHERE c.callee_entity_id IS NOT NULL
+    \\          AND c.call_kind IN ('direct','dispatch_x64','dispatch_aarch64')
+    \\  ),
+    \\  alive_named(id) AS (
+    \\      SELECT id FROM alive
+    \\    UNION
+    \\      -- Field-name heuristic: `.<ident>` mention anywhere keeps
+    \\      -- struct fields, variants, and methods alive.
+    \\      SELECT esn.entity_id FROM entity_simple_name esn
+    \\        JOIN entity e ON e.id = esn.entity_id
+    \\        JOIN field_names fn ON fn.name = esn.name
+    \\       WHERE e.kind IN ('field','variant','fn')
+    \\    UNION
+    \\      -- Bare-identifier mention heuristic for `pub` top-level
+    \\      -- decls and types/fns/namespaces. The prior tool resolved
+    \\      -- chains semantically per-file via @import edges; we
+    \\      -- approximate with bare-name token presence anywhere
+    \\      -- outside the def itself. Causes some false-negative
+    \\      -- divergence vs legacy on routerOS/hyprvOS where two
+    \\      -- different `pub fn foo` decls share the same simple
+    \\      -- name (one in tree, one in tests/libz).
+    \\      SELECT esn.entity_id FROM entity_simple_name esn
+    \\        JOIN entity e ON e.id = esn.entity_id
+    \\       WHERE (e.kind IN ('type','fn','namespace')
+    \\              OR (e.kind IN ('const','var') AND e.is_pub = 1))
+    \\         AND EXISTS (
+    \\           SELECT 1 FROM token t
+    \\            WHERE t.kind = 'identifier'
+    \\              AND t.text = esn.name
+    \\              AND (t.file_id <> e.def_file_id
+    \\                   OR t.byte_start < e.def_byte_start
+    \\                   OR t.byte_start >= e.def_byte_end)
+    \\              -- Exclude tokens that fall inside ANY OTHER entity's
+    \\              -- def span with the same simple name. Without this,
+    \\              -- two trees that each define `pub const Foo` keep
+    \\              -- each other's def-site token alive as a "use" —
+    \\              -- a homonym false-negative the legacy tool didn't
+    \\              -- have because it tracked decls per-file.
+    \\              AND NOT EXISTS (
+    \\                SELECT 1 FROM entity e2
+    \\                  JOIN entity_simple_name esn2 ON esn2.entity_id = e2.id
+    \\                 WHERE esn2.name = esn.name
+    \\                   AND e2.def_file_id = t.file_id
+    \\                   AND t.byte_start >= e2.def_byte_start
+    \\                   AND t.byte_start < e2.def_byte_end
+    \\              )
+    \\         )
+    \\    UNION
+    \\      SELECT esn.entity_id FROM entity_simple_name esn
+    \\        JOIN entity e ON e.id = esn.entity_id
+    \\       WHERE e.kind IN ('const','var')
+    \\         AND e.is_pub = 0
+    \\         AND EXISTS (
+    \\           SELECT 1 FROM token t
+    \\            WHERE t.kind = 'identifier'
+    \\              AND t.text = esn.name
+    \\              AND t.file_id = e.def_file_id
+    \\              AND (t.byte_start < e.def_byte_start
+    \\                   OR t.byte_start >= e.def_byte_end)
+    \\         )
+    \\  )
+;
+
+/// Populate the `entity_simple_name` temp table both query paths use
+/// (alive_named's heuristics join through it). Idempotent across calls
+/// in case a caller invokes both `collectFindings` and
+/// `loadAliveQnames` on the same connection.
+fn setupEntitySimpleName(a: Allocator, db: *sqlite.Db) !void {
+    try db.exec("CREATE TEMP TABLE IF NOT EXISTS entity_simple_name (entity_id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    // If the table already has rows we're done — second invocation on
+    // the same connection (e.g. `--update-skip` then findings) skips the
+    // expensive re-scan.
+    {
+        var s = try db.prepare("SELECT 1 FROM entity_simple_name LIMIT 1", a);
+        defer s.finalize();
+        if (try s.step()) return;
+    }
+    var sel = try db.prepare("SELECT id, qualified_name FROM entity", a);
+    defer sel.finalize();
+    var ins = try db.prepare("INSERT INTO entity_simple_name (entity_id, name) VALUES (?, ?)", a);
+    defer ins.finalize();
+    while (try sel.step()) {
+        const id = sel.columnInt(0);
+        const qname = sel.columnText(1) orelse continue;
+        const simple = if (mem.lastIndexOfScalar(u8, qname, '.')) |i| qname[i + 1 ..] else qname;
+        try ins.bindInt(1, id);
+        try ins.bindText(2, simple);
+        _ = try ins.step();
+        _ = sqlite.c.sqlite3_reset(ins.raw);
+        _ = sqlite.c.sqlite3_clear_bindings(ins.raw);
+    }
+    try db.exec("CREATE INDEX IF NOT EXISTS entity_simple_name_idx ON entity_simple_name(name)");
+}
+
+/// Run the alive-named CTE on `db` and insert every alive entity's
+/// qualified_name into `out`. Used to merge alt-arch DBs' alive-sets
+/// into the primary analyzer's "is this entity actually used anywhere"
+/// decision, by qname (since entity IDs are not stable across DBs but
+/// qnames are).
+fn loadAliveQnames(
+    a: Allocator,
+    db: *sqlite.Db,
+    out: *std.StringHashMapUnmanaged(void),
+) !void {
+    try setupEntitySimpleName(a, db);
+    const sql = "WITH RECURSIVE\n" ++ ALIVE_NAMED_CTES ++
+        "\nSELECT DISTINCT e.qualified_name FROM alive_named JOIN entity e ON e.id = alive_named.id";
+    var stmt = try db.prepare(sql, a);
+    defer stmt.finalize();
+    while (try stmt.step()) {
+        const qname = stmt.columnText(0) orelse continue;
+        if (out.contains(qname)) continue;
+        const dup = try a.dupe(u8, qname);
+        try out.put(a, dup, {});
+    }
+}
+
+/// Read a single `meta` row's value, NULL when absent.
+fn fetchMeta(a: Allocator, db: *sqlite.Db, key: []const u8) !?[]u8 {
+    var stmt = try db.prepare("SELECT value FROM meta WHERE key = ?", a);
+    defer stmt.finalize();
+    try stmt.bindText(1, key);
+    if (try stmt.step()) {
+        const v = stmt.columnText(0) orelse return null;
+        return try a.dupe(u8, v);
+    }
+    return null;
+}
 
 fn kindLabel(kind: []const u8) []const u8 {
     if (mem.eql(u8, kind, "fn")) return "FUNCTION";
@@ -515,24 +719,7 @@ fn collectFindings(
     // Precompute entity simple-names into a temp table so the alive-set
     // query can join against them without resorting to non-portable string
     // ops (SQLite has no `reverse` / "find-last-of" builtin).
-    try db.exec("CREATE TEMP TABLE entity_simple_name (entity_id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
-    {
-        var s = try db.prepare("SELECT id, qualified_name FROM entity", a);
-        defer s.finalize();
-        var ins = try db.prepare("INSERT INTO entity_simple_name (entity_id, name) VALUES (?, ?)", a);
-        defer ins.finalize();
-        while (try s.step()) {
-            const id = s.columnInt(0);
-            const qname = s.columnText(1) orelse continue;
-            const simple = if (mem.lastIndexOfScalar(u8, qname, '.')) |i| qname[i + 1 ..] else qname;
-            try ins.bindInt(1, id);
-            try ins.bindText(2, simple);
-            _ = try ins.step();
-            _ = sqlite.c.sqlite3_reset(ins.raw);
-            _ = sqlite.c.sqlite3_clear_bindings(ins.raw);
-        }
-    }
-    try db.exec("CREATE INDEX entity_simple_name_idx ON entity_simple_name(name)");
+    try setupEntitySimpleName(a, db);
 
     // Materialize the per-target file scope into a temp table. The path
     // scheme is asymmetric: the kernel walker is rooted at `--kernel-root
@@ -581,125 +768,13 @@ fn collectFindings(
         try db.exec(sentinel);
     }
 
-    const sql =
-        \\WITH RECURSIVE
+    const sql = "WITH RECURSIVE\n" ++
         \\  target_files(id) AS (
         \\    SELECT id FROM target_files_tmp
         \\  ),
-        \\  field_names(name) AS (
-        \\    SELECT DISTINCT t2.text
-        \\      FROM token t1
-        \\      JOIN token t2 ON t2.file_id = t1.file_id AND t2.idx = t1.idx + 1
-        \\     WHERE t1.kind = 'period' AND t2.kind = 'identifier'
-        \\  ),
-        \\  ident_mentions(text) AS (
-        \\    SELECT DISTINCT text FROM token WHERE kind = 'identifier'
-        \\  ),
-        \\  alive(id) AS (
-        \\      -- Seed: entry-point closure (kernel-only, IR-derived).
-        \\      SELECT entity_id FROM entry_reaches
-        \\    UNION
-        \\      -- Seed: panic, main, every export fn, anything in tests/redteam.
-        \\      SELECT e.id FROM entity e
-        \\        LEFT JOIN file f ON f.id = e.def_file_id
-        \\       WHERE e.kind = 'fn'
-        \\         AND (e.qualified_name = 'panic'
-        \\              OR e.qualified_name LIKE '%.panic'
-        \\              OR e.qualified_name = 'main'
-        \\              OR e.qualified_name LIKE '%.main')
-        \\    UNION
-        \\      -- Seed: anything defined in a tests/ or redteam/ file is alive.
-        \\      SELECT e.id FROM entity e
-        \\        JOIN file f ON f.id = e.def_file_id
-        \\       WHERE f.path GLOB '*/tests/*' OR f.path GLOB '*/redteam/*'
-        \\    UNION
-        \\      -- Seed: any const whose definition contains `@import(` —
-        \\      -- import aliases are always alive (the prior tool tracked
-        \\      -- them as a distinct kind that was promoted to alive
-        \\      -- whenever ANY use of the alias name resolved through it).
-        \\      SELECT e.id FROM entity e
-        \\        JOIN file f ON f.id = e.def_file_id
-        \\       WHERE e.kind IN ('const','var')
-        \\         AND INSTR(SUBSTR(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start), '@import(') > 0
-        \\    UNION
-        \\      -- Seed: `export` decls (linker / asm consumers).
-        \\      SELECT e.id FROM entity e
-        \\        JOIN file f ON f.id = e.def_file_id
-        \\       WHERE INSTR(SUBSTR(f.source, e.def_byte_start + 1, e.def_byte_end - e.def_byte_start), 'export ') > 0
-        \\    UNION
-        \\      -- Closure: alias targets. Forward-only — `pub const X = a.b.C;`
-        \\      -- means using X also uses C, but using C doesn't pull in
-        \\      -- every alias of C (the legacy tool only marks the chain
-        \\      -- HEAD via an explicit `markLive` per use, not the inverse).
-        \\      SELECT a.target_entity_id FROM const_alias a JOIN alive ON a.entity_id = alive.id
-        \\    UNION
-        \\      -- Closure: type references (struct field types, fn params, returns).
-        \\      SELECT etr.referred_entity_id FROM entity_type_ref etr JOIN alive ON etr.referrer_entity_id = alive.id
-        \\    UNION
-        \\      -- Closure: ir_call edges out of any alive fn (catches
-        \\      -- non-entry-rooted cross-target paths via direct calls).
-        \\      SELECT c.callee_entity_id FROM ir_call c JOIN alive ON c.caller_entity_id = alive.id
-        \\        WHERE c.callee_entity_id IS NOT NULL
-        \\          AND c.call_kind IN ('direct','dispatch_x64','dispatch_aarch64')
-        \\  ),
-        \\  alive_named(id) AS (
-        \\      SELECT id FROM alive
-        \\    UNION
-        \\      -- Field-name heuristic: `.<ident>` mention anywhere keeps
-        \\      -- struct fields, variants, and methods alive.
-        \\      SELECT esn.entity_id FROM entity_simple_name esn
-        \\        JOIN entity e ON e.id = esn.entity_id
-        \\        JOIN field_names fn ON fn.name = esn.name
-        \\       WHERE e.kind IN ('field','variant','fn')
-        \\    UNION
-        \\      -- Bare-identifier mention heuristic for `pub` top-level
-        \\      -- decls and types/fns/namespaces. The prior tool resolved
-        \\      -- chains semantically per-file via @import edges; we
-        \\      -- approximate with bare-name token presence anywhere
-        \\      -- outside the def itself. Causes some false-negative
-        \\      -- divergence vs legacy on routerOS/hyprvOS where two
-        \\      -- different `pub fn foo` decls share the same simple
-        \\      -- name (one in tree, one in tests/libz).
-        \\      SELECT esn.entity_id FROM entity_simple_name esn
-        \\        JOIN entity e ON e.id = esn.entity_id
-        \\       WHERE (e.kind IN ('type','fn','namespace')
-        \\              OR (e.kind IN ('const','var') AND e.is_pub = 1))
-        \\         AND EXISTS (
-        \\           SELECT 1 FROM token t
-        \\            WHERE t.kind = 'identifier'
-        \\              AND t.text = esn.name
-        \\              AND (t.file_id <> e.def_file_id
-        \\                   OR t.byte_start < e.def_byte_start
-        \\                   OR t.byte_start >= e.def_byte_end)
-        \\              -- Exclude tokens that fall inside ANY OTHER entity's
-        \\              -- def span with the same simple name. Without this,
-        \\              -- two trees that each define `pub const Foo` keep
-        \\              -- each other's def-site token alive as a "use" —
-        \\              -- a homonym false-negative the legacy tool didn't
-        \\              -- have because it tracked decls per-file.
-        \\              AND NOT EXISTS (
-        \\                SELECT 1 FROM entity e2
-        \\                  JOIN entity_simple_name esn2 ON esn2.entity_id = e2.id
-        \\                 WHERE esn2.name = esn.name
-        \\                   AND e2.def_file_id = t.file_id
-        \\                   AND t.byte_start >= e2.def_byte_start
-        \\                   AND t.byte_start < e2.def_byte_end
-        \\              )
-        \\         )
-        \\    UNION
-        \\      SELECT esn.entity_id FROM entity_simple_name esn
-        \\        JOIN entity e ON e.id = esn.entity_id
-        \\       WHERE e.kind IN ('const','var')
-        \\         AND e.is_pub = 0
-        \\         AND EXISTS (
-        \\           SELECT 1 FROM token t
-        \\            WHERE t.kind = 'identifier'
-        \\              AND t.text = esn.name
-        \\              AND t.file_id = e.def_file_id
-        \\              AND (t.byte_start < e.def_byte_start
-        \\                   OR t.byte_start >= e.def_byte_end)
-        \\         )
-        \\  )
+        \\
+    ++ ALIVE_NAMED_CTES ++
+        \\
         \\SELECT e.id, e.kind, e.qualified_name, e.def_line, e.def_byte_start, f.path,
         \\       e.def_byte_end, f.id
         \\FROM entity e
@@ -743,6 +818,7 @@ fn collectFindings(
             .file_path = try a.dupe(u8, path),
             .name = try a.dupe(u8, name),
             .parent = if (display_parent) |p| try a.dupe(u8, p) else null,
+            .qname = try a.dupe(u8, qname),
             .line = line,
             .kind_label = kindLabel(kind),
             .byte_start = byte_start,
@@ -766,7 +842,7 @@ pub fn main() !void {
     var args_it = std.process.args();
     _ = args_it.next();
 
-    var db_path: ?[]const u8 = null;
+    var db_paths: std.ArrayList([]const u8) = .empty;
     var target_name: []const u8 = "kernel";
     var skip_override: ?[]const u8 = null;
     var update_arg: ?[]const u8 = null;
@@ -777,7 +853,7 @@ pub fn main() !void {
                 _ = std.fs.File.stderr().write("--db requires a path\n") catch {};
                 std.process.exit(2);
             };
-            db_path = try g_arena.dupe(u8, v);
+            try db_paths.append(g_arena, try g_arena.dupe(u8, v));
         } else if (mem.eql(u8, a, "--target")) {
             const v = args_it.next() orelse {
                 _ = std.fs.File.stderr().write("--target requires a name\n") catch {};
@@ -799,9 +875,14 @@ pub fn main() !void {
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
             const stdout = std.fs.File.stdout();
             _ = stdout.write(
-                \\usage: dead_code_zig --db <path> [--target <name>] [--skip <path>] [--update-skip <rel>:<start>-<end>]
+                \\usage: dead_code_zig --db <path> [--db <path>...] [--target <name>] [--skip <path>] [--update-skip <rel>:<start>-<end>]
                 \\
                 \\Reads the per-(arch, commit_sha) callgraph DB and reports unused decls in the target dir.
+                \\
+                \\`--db` is repeatable. The first is the primary; additional DBs
+                \\augment the alive-set by qualified_name (used to cover the
+                \\cross-arch precision gap when the primary is x86_64-only).
+                \\All DBs must share the same meta.commit_sha.
                 \\
             ) catch {};
             std.process.exit(0);
@@ -813,10 +894,12 @@ pub fn main() !void {
         }
     }
 
-    if (db_path == null) {
+    if (db_paths.items.len == 0) {
         _ = std.fs.File.stderr().write("--db is required\n") catch {};
         std.process.exit(2);
     }
+    const primary_db_path = db_paths.items[0];
+    const alt_db_paths = db_paths.items[1..];
 
     // Only `kernel` is supported. The non-kernel trees (routerOS,
     // hyprvOS, bootloader) compile separately, so the indexer doesn't
@@ -838,8 +921,11 @@ pub fn main() !void {
 
     g_target_rel = target_name;
 
-    // Open DB.
-    var db = sqlite.Db.openReadOnly(db_path.?, g_arena) catch |err| {
+    // Open primary DB. The primary determines target_files scope, owns
+    // the skip-file resolution, and is the writeback target for
+    // lint_finding rows. Alt DBs (if any) are opened separately below
+    // for their alive-set qnames only.
+    var db = sqlite.Db.openReadOnly(primary_db_path, g_arena) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "failed to open DB: {s}\n", .{@errorName(err)}) catch "DB open error\n";
         _ = std.fs.File.stderr().write(msg) catch {};
@@ -878,6 +964,38 @@ pub fn main() !void {
         }
     }
 
+    // Augment with alt-DB alive qnames. A finding is suppressed if the
+    // entity's qualified_name is alive in ANY of the supplied DBs —
+    // the primary alone underestimates aliveness when it's an x86_64
+    // DB and an aarch64-only path keeps the entity reachable.
+    var alt_alive: std.StringHashMapUnmanaged(void) = .empty;
+    if (alt_db_paths.len > 0) {
+        const primary_sha = (try fetchMeta(g_arena, &db, "commit_sha")) orelse "";
+        for (alt_db_paths) |alt_path| {
+            var alt_db = sqlite.Db.openReadOnly(alt_path, g_arena) catch |err| {
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "failed to open alt DB {s}: {s}\n", .{ alt_path, @errorName(err) }) catch "alt DB open error\n";
+                _ = std.fs.File.stderr().write(msg) catch {};
+                std.process.exit(2);
+            };
+            defer alt_db.close();
+            const alt_sha = (try fetchMeta(g_arena, &alt_db, "commit_sha")) orelse "";
+            if (!mem.eql(u8, primary_sha, alt_sha)) {
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf,
+                    "alt DB commit_sha mismatch: primary={s} alt={s} (path: {s})\n",
+                    .{ primary_sha, alt_sha, alt_path },
+                ) catch "alt DB commit_sha mismatch\n";
+                _ = std.fs.File.stderr().write(msg) catch {};
+                std.process.exit(2);
+            }
+            try loadAliveQnames(g_arena, &alt_db, &alt_alive);
+        }
+        var nbuf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&nbuf, "  augmenting alive-set with {d} alt DB(s); {d} cross-arch alive qnames\n", .{ alt_db_paths.len, alt_alive.count() });
+        _ = std.fs.File.stderr().write(msg) catch {};
+    }
+
     const findings = try collectFindings(g_arena, &db, target_name);
 
     // Render: group by file, drop skip-covered, match old format.
@@ -891,6 +1009,7 @@ pub fn main() !void {
     var current_file_open = false;
     for (findings) |f| {
         if (skipCovers(f.file_path, f.line)) continue;
+        if (alt_alive.contains(f.qname)) continue;
         // Display paths with the target prefix (matches the old tool's
         // repo-relative output format) when the DB stores target-rooted
         // paths. If the DB already has the prefix, don't double it.
@@ -930,9 +1049,11 @@ pub fn main() !void {
     // Persist findings into lint_finding so downstream tooling (callgraph_http
     // /api/findings, callgraph_mcp callgraph_findings, CI dashboards) can
     // query them by SQL. We close the read-only handle and re-open R/W to
-    // write the rows; SQLite WAL mode allows concurrent readers.
+    // write the rows; SQLite WAL mode allows concurrent readers. Writeback
+    // applies the same alt-alive filter as the stdout render, so the DB
+    // and the CLI agree on what's actually dead.
     db.close();
-    writeFindingsToDb(g_arena, db_path.?, findings, target_name) catch |err| {
+    writeFindingsToDb(g_arena, primary_db_path, findings, target_name, &alt_alive) catch |err| {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "warning: failed to write lint_finding rows: {s}\n", .{@errorName(err)}) catch "warning: lint_finding write failed\n";
         _ = std.fs.File.stderr().write(msg) catch {};
@@ -946,6 +1067,7 @@ fn writeFindingsToDb(
     db_path: []const u8,
     findings: []const Finding,
     target: []const u8,
+    alt_alive: *const std.StringHashMapUnmanaged(void),
 ) !void {
     var rwdb = try sqlite.Db.openReadWrite(db_path, a);
     defer rwdb.close();
@@ -975,6 +1097,7 @@ fn writeFindingsToDb(
 
     for (findings) |f| {
         if (skipCovers(f.file_path, f.line)) continue;
+        if (alt_alive.contains(f.qname)) continue;
 
         const rule = if (mem.eql(u8, f.kind_label, "FIELD"))
             "unused_field"

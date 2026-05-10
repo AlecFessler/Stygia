@@ -67,17 +67,37 @@ for fixture_dir in "$HERE"/fixtures/*/; do
         | sort -u)"
     expected_sorted="$(sort -u "$expected")"
 
-    if [[ "$actual" == "$expected_sorted" ]]; then
-        echo "PASS $fixture_name"
-        pass=$((pass+1))
-    else
+    if [[ "$actual" != "$expected_sorted" ]]; then
         echo "FAIL $fixture_name"
         echo "    expected:"
         printf '%s\n' "$expected_sorted" | sed 's/^/      /'
         echo "    got:"
         printf '%s\n' "$actual" | sed 's/^/      /'
         fail=$((fail+1))
+        continue
     fi
+
+    # Multi-DB smoke: passing the same DB twice augments the alive-set
+    # with itself. Every alive qname is already covered by the primary's
+    # alive_named, so the qname-keyed alt filter is a no-op and output
+    # must match single-DB. Guards against regressions in the alt-DB
+    # plumbing (arg parsing, qname extraction, hash lookup).
+    multi="$(cd "$fixture_dir" && "$ANALYZER" --db "$db" --db "$db" --target kernel 2>/dev/null \
+        | grep '^  UNUSED' \
+        | sed -E 's/^  (UNUSED [A-Z]+: [^ ]+).*/\1/' \
+        | sort -u)"
+    if [[ "$actual" != "$multi" ]]; then
+        echo "FAIL $fixture_name (multi-db idempotency)"
+        echo "    single-db:"
+        printf '%s\n' "$actual" | sed 's/^/      /'
+        echo "    multi-db (--db x --db x):"
+        printf '%s\n' "$multi" | sed 's/^/      /'
+        fail=$((fail+1))
+        continue
+    fi
+
+    echo "PASS $fixture_name"
+    pass=$((pass+1))
 done
 
 echo ""
