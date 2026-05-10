@@ -205,7 +205,8 @@ stage_arch_layering_lint() {
     fi
 }
 
-# Build the per-(arch, commit_sha) callgraph DBs if they aren't present yet.
+# Build the per-(arch, commit_sha, working_tree_hash) callgraph DBs if
+# they aren't present yet.
 #
 # Produces both x86_64 and aarch64 DBs in tools/callgraph_http/test/dbs/.
 # Both are exposed as $CALLGRAPH_DB and $CALLGRAPH_DB_AARCH64 so callers
@@ -224,15 +225,54 @@ stage_arch_layering_lint() {
 # expected. If a future analyzer needs aarch64 bin_inst rows, extending
 # bin_pass for aarch64 ELF disasm is a kernel-tooling concern (file a
 # separate bd).
+#
+# The working_tree_hash suffix on each arch's DB filename makes the cache
+# honest about uncommitted edits. Pre-c70g the cache keyed only on HEAD:
+# a worker running the gauntlet pre-commit got a cache hit on the last-
+# committed-source DB even when their on-disk source had moved past it,
+# and source-content-sensitive analyzers (dead_code_zig.validateSkipEntry's
+# sha256-anchored skip.txt check) ran against stale .source rows. Item-14
+# violations were structurally invisible at the worker and cycle-1 reviewer
+# pre-commit gates; only the merger's post-rebase run (which moves HEAD →
+# new filename → cache miss) caught them. Hashing the indexer's source-
+# root view of the working tree into the key forces a cache miss on any
+# uncommitted content change while letting multiple analyzer stages within
+# a single dirty state share one DB. The suffix is applied to BOTH arches
+# (per a332's dual-arch plumbing) so the aarch64 alive-set is also fresh
+# on every dirty iteration. See bd-Zag-Subsystems-Agents-c70g.
 ensure_callgraph_db() {
     if ! (cd "$STYGIA_ROOT/tools/indexer" && zig build 2>&1); then
         FAILURES+=("callgraph indexer build")
         return 1
     fi
-    local sha
+    local sha tree_hash suffix
     sha="$(cd "$STYGIA_ROOT" && git rev-parse --short HEAD)"
-    CALLGRAPH_DB="$STYGIA_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
-    CALLGRAPH_DB_AARCH64="$STYGIA_ROOT/tools/callgraph_http/test/dbs/aarch64-${sha}.db"
+    # Hash the diff against HEAD plus the content of every untracked-
+    # but-not-ignored file under the indexer's source roots
+    # (kernel/, bootloader/, tools/, tests/, libz/). Restricting to
+    # those roots keeps the hash stable across gauntlet runs that touch
+    # untracked artifacts elsewhere — notably .stygia-perf/_pending.json
+    # written by stage [5] — so two clean-tree gauntlets share the same
+    # cached DB.
+    tree_hash=$(
+        cd "$STYGIA_ROOT" && {
+            git diff HEAD -- kernel bootloader tools tests libz
+            git ls-files --others --exclude-standard -- \
+                kernel bootloader tools tests libz \
+                | while IFS= read -r f; do
+                    [[ -f "$f" ]] && cat -- "$f"
+                done
+        } | sha256sum | cut -c1-12
+    )
+    # sha256 of empty input is e3b0c44298fc... — clean tree → omit the
+    # suffix so existing on-HEAD-clean caches still hit.
+    if [[ "$tree_hash" == "e3b0c44298fc" ]]; then
+        suffix=""
+    else
+        suffix="-${tree_hash}"
+    fi
+    CALLGRAPH_DB="$STYGIA_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}${suffix}.db"
+    CALLGRAPH_DB_AARCH64="$STYGIA_ROOT/tools/callgraph_http/test/dbs/aarch64-${sha}${suffix}.db"
 
     # ── x86_64 DB ────────────────────────────────────────────────────
     if [[ ! -f "$CALLGRAPH_DB" ]]; then
