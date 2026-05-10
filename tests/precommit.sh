@@ -205,8 +205,25 @@ stage_arch_layering_lint() {
     fi
 }
 
-# Build the per-(arch, commit_sha) callgraph DB if it isn't present yet.
-# Both the dead-code analyzer and the gen-lock analyzer read from it.
+# Build the per-(arch, commit_sha) callgraph DBs if they aren't present yet.
+#
+# Produces both x86_64 and aarch64 DBs in tools/callgraph_http/test/dbs/.
+# Both are exposed as $CALLGRAPH_DB and $CALLGRAPH_DB_AARCH64 so callers
+# can opt into either or both.
+#
+# Today only the dead-code analyzer (stage_dead_code_report) consumes the
+# aarch64 DB — the arch-layering and gen-lock analyzers are x86_64-only
+# semantics and pass just $CALLGRAPH_DB. Future stages that need
+# cross-arch alive-set coverage can read $CALLGRAPH_DB_AARCH64 directly.
+#
+# The aarch64 DB skips the indexer's --elf argument: tools/indexer/src/
+# bin_pass.zig hardcodes `objdump -M intel`, so an aarch64 ELF would
+# silently fail at the bin pass. The dead-code analyzer's alive-set CTE
+# only needs entry_reaches + ir_call rows (both populated from --ir), so
+# Stage 4 in the indexer logs as "skipped (no --elf argument)" — that is
+# expected. If a future analyzer needs aarch64 bin_inst rows, extending
+# bin_pass for aarch64 ELF disasm is a kernel-tooling concern (file a
+# separate bd).
 ensure_callgraph_db() {
     if ! (cd "$STYGIA_ROOT/tools/indexer" && zig build 2>&1); then
         FAILURES+=("callgraph indexer build")
@@ -215,37 +232,75 @@ ensure_callgraph_db() {
     local sha
     sha="$(cd "$STYGIA_ROOT" && git rev-parse --short HEAD)"
     CALLGRAPH_DB="$STYGIA_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}.db"
-    if [[ -f "$CALLGRAPH_DB" ]]; then return 0; fi
-    # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
-    # build left an ARM ELF in zig-out/, the indexer's objdump pass would
-    # fail silently and produce an empty bin_inst table.
-    local need_rebuild=0
-    if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$STYGIA_ROOT/zig-out/bin/kernel.elf" ]]; then
-        need_rebuild=1
-    elif ! file "$STYGIA_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
-        echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
-        need_rebuild=1
-    fi
-    if [[ $need_rebuild -eq 1 ]]; then
-        echo "  building kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
-        if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
-            FAILURES+=("kernel build for IR/ELF")
+    CALLGRAPH_DB_AARCH64="$STYGIA_ROOT/tools/callgraph_http/test/dbs/aarch64-${sha}.db"
+
+    # ── x86_64 DB ────────────────────────────────────────────────────
+    if [[ ! -f "$CALLGRAPH_DB" ]]; then
+        # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
+        # build left an ARM ELF in zig-out/, the indexer's objdump pass would
+        # fail silently and produce an empty bin_inst table.
+        local need_rebuild_x86=0
+        if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$STYGIA_ROOT/zig-out/bin/kernel.elf" ]]; then
+            need_rebuild_x86=1
+        elif ! file "$STYGIA_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
+            echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
+            need_rebuild_x86=1
+        fi
+        if [[ $need_rebuild_x86 -eq 1 ]]; then
+            echo "  building x86_64 kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
+            if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
+                FAILURES+=("kernel build for IR/ELF (x86_64)")
+                return 1
+            fi
+        fi
+        if ! (cd "$STYGIA_ROOT" && tools/indexer/zig-out/bin/indexer \
+            --kernel-root kernel \
+            --extra-source-root bootloader \
+            --extra-source-root tools \
+            --extra-source-root tests \
+            --extra-source-root libz \
+            --out "$CALLGRAPH_DB" \
+            --arch x86_64 \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --ir zig-out/kernel.x86_64.ll \
+            --elf zig-out/bin/kernel.elf 2>&1); then
+            FAILURES+=("callgraph DB build (x86_64)")
             return 1
         fi
     fi
-    if ! (cd "$STYGIA_ROOT" && tools/indexer/zig-out/bin/indexer \
-        --kernel-root kernel \
-        --extra-source-root bootloader \
-        --extra-source-root tools \
-        --extra-source-root tests \
-        --extra-source-root libz \
-        --out "$CALLGRAPH_DB" \
-        --arch x86_64 \
-        --commit-sha "$(git rev-parse HEAD)" \
-        --ir zig-out/kernel.x86_64.ll \
-        --elf zig-out/bin/kernel.elf 2>&1); then
-        FAILURES+=("callgraph DB build")
-        return 1
+
+    # ── aarch64 DB ───────────────────────────────────────────────────
+    if [[ ! -f "$CALLGRAPH_DB_AARCH64" ]]; then
+        # The aarch64 kernel test stage [2/4] currently builds without
+        # -Demit_ir=true, so the .ll file isn't amortized — this is the
+        # first/only aarch64 IR-emit invocation per gauntlet. Cost: one
+        # extra ~30-60s build on cold worktree cache; warm-cache subsequent
+        # gauntlets in the same worktree reuse it via the per-worktree
+        # ZIG_GLOBAL_CACHE_DIR pin.
+        if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.aarch64.ll" ]]; then
+            echo "  building aarch64 kernel with -Darch=arm -Demit_ir=true (needed by indexer)"
+            if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test -Demit_ir=true 2>&1); then
+                FAILURES+=("kernel build for IR (aarch64)")
+                return 1
+            fi
+        fi
+        # No --elf for aarch64: bin_pass is x86-only (see function header
+        # comment). Indexer's stage 4 logs "skipped (no --elf argument)";
+        # entry_reaches + ir_call (the only tables the dead-code alive-set
+        # augmentation reads) come from --ir.
+        if ! (cd "$STYGIA_ROOT" && tools/indexer/zig-out/bin/indexer \
+            --kernel-root kernel \
+            --extra-source-root bootloader \
+            --extra-source-root tools \
+            --extra-source-root tests \
+            --extra-source-root libz \
+            --out "$CALLGRAPH_DB_AARCH64" \
+            --arch aarch64 \
+            --commit-sha "$(git rev-parse HEAD)" \
+            --ir zig-out/kernel.aarch64.ll 2>&1); then
+            FAILURES+=("callgraph DB build (aarch64)")
+            return 1
+        fi
     fi
 }
 
@@ -264,7 +319,18 @@ stage_dead_code_report() {
     fi
     ensure_callgraph_db || return 1
     local detector="$STYGIA_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
-    if ! (cd "$STYGIA_ROOT" && "$detector" --db "$CALLGRAPH_DB" --target kernel --skip "$STYGIA_ROOT/tools/dead_code_zig/skip.txt"); then
+    # Pass both arches' DBs: the analyzer treats the first as the primary
+    # (skip-file resolution + lint_finding writeback) and unions every
+    # subsequent --db's alive-set by qualified_name. Without the aarch64
+    # DB the analyzer falsely flags entities that are dead under x86_64
+    # entry_reaches but alive under aarch64 (e.g. arch-specific dispatch
+    # arms, kprof per-arch trace shims). bd-Zag-Subsystems-Agents-l82
+    # landed the multi-DB plumbing; this stage finally feeds it both.
+    if ! (cd "$STYGIA_ROOT" && "$detector" \
+        --db "$CALLGRAPH_DB" \
+        --db "$CALLGRAPH_DB_AARCH64" \
+        --target kernel \
+        --skip "$STYGIA_ROOT/tools/dead_code_zig/skip.txt"); then
         FAILURES+=("dead-code findings")
         return 1
     fi
