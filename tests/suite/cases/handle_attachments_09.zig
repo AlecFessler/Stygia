@@ -20,13 +20,17 @@
 //   honored (move=1 needs `move`; move=0 needs `copy`).
 //
 //   Vreg layout for N=2: per §[handle_attachments] entries occupy
-//   `[128-N..127]`, so vreg 126 and vreg 127. Per the §[syscall_abi]
-//   stack-vreg formula, vreg N at `[user_sp + (N-13)*8]`. After the
-//   syscall-word push, the offsets become 904 (vreg 126) and 912
-//   (vreg 127). The hand-rolled asm reserves 912 bytes for the
-//   high-vreg pad, writes both pair words at offsets 896 and 904
-//   pre-push (which become 904 and 912 post-push), pushes the
-//   syscall word, syscalls, and unwinds.
+//   `[128-N..127]`, so vreg 126 and vreg 127. Per §[syscall_abi]'s
+//   per-arch vreg-ABI, vreg N (firstStackVreg() ≤ N ≤ 127) lives at
+//   `[user_sp + (N - firstStackVreg() + 1) * 8]` at syscall time.
+//   firstStackVreg() is comptime per arch — 14 on x86-64 (vregs 1..13
+//   = GPRs), 32 on aarch64 (vregs 1..31 = x0..x30). So the entry
+//   offsets diverge per arch and the inline asm must comptime-derive
+//   them rather than hardcode either side's numbers; the kernel
+//   reader (kernel/syscall/port.zig:validatePairEntries) uses the
+//   same formula via cpu.firstStackVreg(), so deriving the writer
+//   offsets the same way keeps reader and writer locked together
+//   even if the ABI changes.
 //
 //   Per the spec, source-slot clear runs at recv time. After recv()
 //   returns, `readCap` on the move=1 source slot must show an empty
@@ -72,6 +76,7 @@
 //   9: move=0 source slot empty after recv (copy was treated as move).
 
 const builtin = @import("builtin");
+const std = @import("std");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -89,12 +94,40 @@ fn dummyEntry() callconv(.c) noreturn {
     }
 }
 
-// Issue suspend with two attachments at vregs 126 and 127. Layout:
-//   - subq $912 reserves 912 bytes for vregs 14..127 (114 * 8).
-//   - pre-push: pair_v126 at 896(rsp), pair_v127 at 904(rsp). After
-//     pushq rcx the addresses shift by 8 → vreg 126 lands at 904
-//     ((126-13)*8) and vreg 127 at 912 ((127-13)*8). Perfect.
-//   - addq $920 unwinds (912 reserved + 8 word push).
+// firstStackVreg per arch, mirroring kernel/arch/dispatch/cpu.zig:firstStackVreg().
+// The kernel reader (kernel/syscall/port.zig:validatePairEntries) reads vreg N at
+// `[user_sp + (N - firstStackVreg() + 1) * 8]`; the writer here MUST place
+// entries at the same offset or the reader sees uninitialized stack.
+const first_stack_vreg: u64 = switch (builtin.cpu.arch) {
+    .x86_64 => 14,
+    .aarch64 => 32,
+    else => @compileError("unsupported arch"),
+};
+
+// Post-syscall-prologue offsets of the pair-entry vregs from user SP. On both
+// arches the syscall-time SP points at the syscall word (vreg 0); high vregs
+// land at `(N - first_stack_vreg + 1) * 8`. x86-64 reaches that SP via
+// `subq $reserved; ...; pushq word`; aarch64 reaches it via
+// `sub sp, sp, #(reserved); str word, [sp, #0]`.
+const v126_off: u64 = (126 - first_stack_vreg + 1) * 8;
+const v127_off: u64 = (127 - first_stack_vreg + 1) * 8;
+
+// x86-64 stack-frame sizing.
+//   - Pre-push reservation must cover vreg 127's post-push slot. After `pushq`,
+//     a write that landed at `(N-13)*8` post-push was written at `(N-13)*8 - 8`
+//     pre-push (relative to the pre-push rsp).
+//   - Total stack delta = pre-push reservation + 8 (the word push).
+const x64_pre_push_reserve: u64 = v127_off; // 912 (= (127-14+1)*8)
+const x64_pre_push_v126_off: u64 = v126_off - 8; // 896
+const x64_pre_push_v127_off: u64 = v127_off - 8; // 904
+const x64_total_unwind: u64 = x64_pre_push_reserve + 8; // 920
+
+// aarch64 stack-frame sizing.
+//   - sp must remain 16-byte aligned across the syscall (AArch64 PCS).
+//   - Reservation must cover vreg 127's slot at offset v127_off plus the 8-byte
+//     entry itself; round up to a multiple of 16.
+const arm_reserve: u64 = (v127_off + 8 + 15) & ~@as(u64, 15); // 784 (= round_up_16(776))
+
 fn suspendWithTwoAttachmentsX64(
     word: u64,
     w_handle: u64,
@@ -103,13 +136,19 @@ fn suspendWithTwoAttachmentsX64(
     pair_v127: u64,
 ) u64 {
     var ret_v1: u64 = undefined;
-    asm volatile (
-        \\ subq $912, %%rsp
-        \\ movq %%rsi, 896(%%rsp)
-        \\ movq %%rdx, 904(%%rsp)
-        \\ pushq %%rcx
-        \\ syscall
-        \\ addq $920, %%rsp
+    asm volatile (std.fmt.comptimePrint(
+            \\ subq ${[reserve]d}, %%rsp
+            \\ movq %%rsi, {[pre_v126]d}(%%rsp)
+            \\ movq %%rdx, {[pre_v127]d}(%%rsp)
+            \\ pushq %%rcx
+            \\ syscall
+            \\ addq ${[unwind]d}, %%rsp
+        , .{
+            .reserve = x64_pre_push_reserve,
+            .pre_v126 = x64_pre_push_v126_off,
+            .pre_v127 = x64_pre_push_v127_off,
+            .unwind = x64_total_unwind,
+        })
         : [ret] "={rax}" (ret_v1),
         : [word] "{rcx}" (word),
           [v1in] "{rax}" (w_handle),
@@ -120,10 +159,6 @@ fn suspendWithTwoAttachmentsX64(
     return ret_v1;
 }
 
-// AArch64 has a parallel layout: vreg 14 at [sp + 0] *post* word
-// store, vreg N at [sp + (N-14)*8 + 8]. We reserve 912 bytes,
-// write the word at offset 0 and pair entries at offsets that
-// correspond to vregs 126 and 127.
 fn suspendWithTwoAttachmentsArm(
     word: u64,
     w_handle: u64,
@@ -132,18 +167,22 @@ fn suspendWithTwoAttachmentsArm(
     pair_v127: u64,
 ) u64 {
     var ret_v1: u64 = undefined;
-    // Layout after `sub sp, #912`:
-    //   - sp+0    = word (vreg 0)
-    //   - sp+8..  = vregs 14..  per (N-13)*8 in the v0 ABI.
-    // vreg 126 → sp+904, vreg 127 → sp+912. We reserved 912 so 912
-    // is one slot past — bump reservation to 920 to fit vreg 127.
-    asm volatile (
-        \\ sub sp, sp, #920
-        \\ str %[v126], [sp, #904]
-        \\ str %[v127], [sp, #912]
-        \\ str %[word], [sp]
-        \\ svc #0
-        \\ add sp, sp, #920
+    // Layout after `sub sp, sp, #arm_reserve`:
+    //   - sp+0       = word (vreg 0)
+    //   - sp+v126_off = pair_v126 (vreg 126)
+    //   - sp+v127_off = pair_v127 (vreg 127)
+    asm volatile (std.fmt.comptimePrint(
+            \\ sub sp, sp, #{[reserve]d}
+            \\ str %[v126], [sp, #{[v126]d}]
+            \\ str %[v127], [sp, #{[v127]d}]
+            \\ str %[word], [sp]
+            \\ svc #0
+            \\ add sp, sp, #{[reserve]d}
+        , .{
+            .reserve = arm_reserve,
+            .v126 = v126_off,
+            .v127 = v127_off,
+        })
         : [ret] "={x0}" (ret_v1),
         : [word] "r" (word),
           [v1in] "{x0}" (w_handle),
