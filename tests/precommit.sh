@@ -727,7 +727,13 @@ stage_linux_guest_x86_boot() {
 
     local qemu_log
     qemu_log=$(mktemp)
-    (cd "$STYGIA_ROOT" && PATH="$QEMU_SHIM_PATH" timeout 360 zig build run -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe -- -display none) \
+    # setsid + process-group kill: each linux_guest stage runs in its own
+    # session/PGID so the [3/4] cleanup reaps ONLY this stage's qemu (and
+    # its zig-build / timeout parents), not any other worktree's qemu of
+    # the same arch. The previous `pkill -f "qemu-system-x86_64"` matched
+    # host-wide and could SIGTERM a parallel worker's in-flight reproducer
+    # mid-rep (bd-Zag-Subsystems-Agents-l2wf).
+    setsid bash -c "cd \"$STYGIA_ROOT\" && PATH=\"$QEMU_SHIM_PATH\" timeout 360 zig build run -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe -- -display none" \
         > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
@@ -755,8 +761,9 @@ stage_linux_guest_x86_boot() {
         sleep 1
     done
 
-    kill -TERM "$qemu_pid" 2>/dev/null || true
-    pkill -f "qemu-system-x86_64" 2>/dev/null || true
+    kill -TERM -- "-$qemu_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL -- "-$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
 
     if [[ $found -eq 1 ]]; then
@@ -806,7 +813,10 @@ stage_linux_guest_aarch64_boot() {
 
     local qemu_log
     qemu_log=$(mktemp)
-    timeout 600 qemu-system-aarch64 \
+    # setsid + process-group kill: see x86 stage comment. Wrapping qemu
+    # in its own session means cleanup reaps only this stage's qemu, not
+    # any other worktree's aarch64 qemu (bd-Zag-Subsystems-Agents-l2wf).
+    setsid timeout 600 qemu-system-aarch64 \
         -M virt,gic-version=3,virtualization=on -m 2G \
         -bios /usr/share/AAVMF/AAVMF_CODE.fd \
         -serial stdio -display none -no-reboot \
@@ -828,8 +838,9 @@ stage_linux_guest_aarch64_boot() {
         sleep 1
     done
 
-    kill -TERM "$qemu_pid" 2>/dev/null || true
-    pkill -f "qemu-system-aarch64" 2>/dev/null || true
+    kill -TERM -- "-$qemu_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL -- "-$qemu_pid" 2>/dev/null || true
     wait "$qemu_pid" 2>/dev/null || true
 
     if [[ $found -eq 1 ]]; then
