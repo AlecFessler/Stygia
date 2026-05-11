@@ -500,7 +500,39 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // `cur.ctx` (see `setSyscallReturn` in `syscall/execution_context
     // .zig::yield`). `run()` is `noreturn` so the caller's frame is
     // never re-entered.
-    if (deferred_cross_core != null) run();
+    //
+    // Null out THIS core's `current_ec` first. `enqueueOnCore` already
+    // posted `cur` to the satisfying core's run queue; this core no
+    // longer dispatches `cur`. Leaving the stale ref in the slot is a
+    // torn-state hazard against both consumers `run()` will reach:
+    //
+    //   - `parkAndAwaitIRQ` reads `current_ec` to stash
+    //     `post_park_clear_on_cpu`. Gated on `last_dispatched_core ==
+    //     core`, which is still true here until the satisfying core's
+    //     `setCurrentEc` updates it. The wake-landing-pad then stores
+    //     `cur.on_cpu = false` AFTER the satisfying core's
+    //     `interrupts.switchTo` set `on_cpu = true` for its dispatch
+    //     of `cur` — leaving `cur` reapable while it is running in
+    //     user mode on the satisfying core. A subsequent terminate of
+    //     `cur` would pass the `on_cpu=false` reap gate and unmap a
+    //     live kstack.
+    //   - `scheduler.switchTo` for any race-in EC reads the same stale
+    //     prev_ref and the same `last_dispatched_core == core` branch
+    //     clears `cur.on_cpu`, with the identical race.
+    //
+    // Single-writer-per-core invariant for `current_ec` permits this
+    // unlocked write (see invariant 2 in subsystems/scheduler/SYSTEMS
+    // .md). `cur.on_cpu` is intentionally not touched — it stays true
+    // across the migration boundary; the satisfying core's switchTo
+    // is the next legitimate writer. Arch-side caches (gs:0 kernel_rsp,
+    // TSS.RSP0) are updated by `parkAndAwaitIRQ.parkPerCoreCaches` or
+    // by the destination EC's `interrupts.switchTo` along whichever
+    // `run()` branch fires; no caller-side ring transition happens
+    // before then.
+    if (deferred_cross_core != null) {
+        clearCurrentEc(core);
+        run();
+    }
 
     // Empty queue and no idle EC. Clear `current_ec` and re-point the
     // per-core caches (gs:0 kernel_rsp, TSS.RSP0) at this core's park
