@@ -1188,8 +1188,18 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
         arch.pmu.pmuStart(&ps.arch_state, decoded[0..pair_count]) catch {
             program_err = true;
         };
+        // `pmuStart` programmed THIS core's counter file, so this core
+        // now owns the EC's live counts. Claim the handoff token or the
+        // next `switchTo` would decline to save them (see
+        // `scheduler.pmuSwitch`) and the first quantum's counts would be
+        // dropped on the EC's next dispatch.
+        ps.hw_core = @truncate(arch.smp.coreID());
     } else {
         arch.pmu.pmuConfigureState(&ps.arch_state, decoded[0..pair_count]);
+        // State-only stamp — no hardware was touched, so `arch_state`
+        // stays authoritative until the target is dispatched and
+        // `pmuSwitch` restores it.
+        ps.hw_core = null;
     }
     target_ref.unlockIrqRestore(target_irq_state);
     if (program_err) return errors.E_INVAL;
@@ -1246,16 +1256,34 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
 
     // For the calling EC the hardware counters are running live; the
     // cached `ps.arch_state.values` was last refreshed by the most
-    // recent context switch out and is stale by the duration of the
-    // current quantum. Snapshot the live MSRs into the state, read,
-    // and restore so the counters keep accumulating after the read.
-    if (target_ec == caller) {
+    // recent context switch out (`scheduler.pmuSwitch`) and is stale by
+    // the duration of the current quantum. Snapshot the live registers
+    // into the state, read, and restore so the counters keep
+    // accumulating after the read. IRQs are masked for the whole window
+    // by the gen-lock acquires above, so the EC cannot migrate between
+    // the save and the restore.
+    //
+    // The `hw_core` gate on the save is load-bearing. Not every
+    // dispatch runs `scheduler.pmuSwitch`: the x86 IPC fast path
+    // (arch/x64/interrupts.zig step 14) updates `PerCore.current_ec` in
+    // asm and returns to the receiver without going through
+    // `scheduler.switchTo`, so an EC can be running on a core whose
+    // register file was never loaded with its counts. Sampling the
+    // hardware there would return an unrelated EC's counters — or zero
+    // on a core that never programmed the PMU — which is exactly the
+    // backwards-counter failure this is all guarding against. When we
+    // do not own the registers the cached values stay authoritative;
+    // the restore below then adopts the counters onto this core (where
+    // the EC is demonstrably running) so counting resumes from them.
+    const this_core: u8 = @truncate(arch.smp.coreID());
+    if (target_ec == caller and ps.hw_core == this_core) {
         arch.pmu.pmuSave(&ps.arch_state);
     }
     var sample: stygia.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
     arch.pmu.pmuRead(&ps.arch_state, &sample);
     if (target_ec == caller) {
         arch.pmu.pmuRestore(&ps.arch_state);
+        ps.hw_core = this_core;
     }
 
     // Spec ABI: vregs [1..num_counters] = counter values, [num_counters + 1] = ts.
@@ -1338,6 +1366,9 @@ fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     } else {
         arch.pmu.pmuClearState(&ps.arch_state);
     }
+    // Counting is off either way, so no core's register file holds
+    // this EC's counts any more.
+    ps.hw_core = null;
     ps.active_counters = 0;
     ps.has_threshold = 0;
     ps_ref.unlockIrqRestore(ps_irq_state);
@@ -1940,6 +1971,7 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
         }
     }
     pending.ptr.has_threshold = 0;
+    pending.ptr.hw_core = null;
     pending.ptr.arch_state.num_counters = 0;
     {
         var i: usize = 0;
@@ -1953,9 +1985,27 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
 }
 
 /// Free `perfmon_state` on perfmon_stop or implicit on EC destroy.
+///
+/// The destroy path can reach here with counting still enabled — an EC
+/// terminated mid-quantum never runs the `perfmon_stop` that would
+/// disarm the hardware. If THIS core is the one holding the EC's live
+/// counts (`hw_core`), disarm them before the slot goes away, so a
+/// threshold-armed counter can't keep running and fire a PMI against
+/// whatever EC is dispatched next. A remote `hw_core` is left alone:
+/// its register file belongs to that core, and `pmiHandler`'s
+/// no-perfmon-state path already clears and masks a stray overflow
+/// there.
 fn releasePerfmonState(ec: *ExecutionContext) void {
     const ref = ec.perfmon_state orelse return;
     ec.perfmon_state = null;
+    // caller-pinned: `ec` is locked by the caller and `ref` is its own
+    // state slot, about to be destroyed with this same (ptr, gen) pair.
+    if (ref.ptr.hw_core) |core| {
+        if (core == @as(u8, @truncate(arch.smp.coreID()))) {
+            arch.pmu.pmuStop(&ref.ptr.arch_state);
+            ref.ptr.hw_core = null;
+        }
+    }
     perfmon_mod.slab_instance.destroy(ref.ptr, ref.gen) catch {};
 }
 

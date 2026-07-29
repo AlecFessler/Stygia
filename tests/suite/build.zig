@@ -753,6 +753,60 @@ pub fn build(b: *std.Build) void {
     // iteration counts without paying kernel-build / boot cost per rep.
     const repeat = b.option(u32, "repeat", "Number of times to replay the test manifest per boot (default 1)") orelse 1;
 
+    // Debug aid for lost-result bugs (stygia-ojs): when a batch drain
+    // hits its recv timeout, freeze instead of carrying on, so the
+    // machine stays live and inspectable over the qemu gdb stub at the
+    // instant of the loss.
+    //
+    // A MISS otherwise self-erases as evidence: the runner records the
+    // test `.not_run`, finishes the remaining batches, prints a normal
+    // summary and powers off, so by the time you see "MISS x" the
+    // kernel state that explains it is gone. Freezing keeps the lost
+    // EC, its port and the per-core state exactly as they were —
+    // the same technique that cracked stygia-3ys from a live corpse.
+    //
+    // OFF by default and deliberately so: it converts a MISS from "one
+    // failed test" into "this boot never terminates", which is right
+    // for a debugging loop and wrong for CI. Nothing about pass/fail
+    // adjudication changes — this only affects what happens AFTER a
+    // result has already been declared lost.
+    const halt_on_miss = b.option(
+        bool,
+        "halt_on_miss",
+        "On a batch recv timeout, freeze the runner instead of continuing, so the corpse stays inspectable over the gdb stub (default false)",
+    ) orelse false;
+
+    // In-flight test count for the runner's spawn/drain interleave.
+    //
+    // This was a hardcoded `const BATCH: usize = 4` in primary.zig,
+    // with a comment recording that 4 is not a taste choice but a
+    // workaround: at 16 the runner wedges in the spawn loop around
+    // iteration 432 (stygia-utf). Hoisting it to a build option makes
+    // that wall A/B-testable without editing test code, and lets the
+    // suite be run at higher concurrency deliberately — at BATCH=4 the
+    // kernel is never exercised above ~4 concurrent test domains, which
+    // is a permanent blind spot for contention bugs.
+    // Default 16. It was 4 for as long as the stygia-utf wall stood; at
+    // 16 the runner used to wedge in the spawn loop around iteration
+    // 432. That wall is gone (485/485 at 16, batches run clean through
+    // 480..485 where they previously stopped at 416..432), most likely
+    // because stygia-ds6 removed the lockdep `class_table` self-deadlock
+    // — the failure scaled with concurrency and the original filing
+    // already suspected "lockdep stacks, IRQ-handler depth tables".
+    //
+    // 16 is chosen for CONTENTION, not speed: the wall-clock difference
+    // is only ~6% (5.53s vs 5.90s over 3 runs each), because most of a
+    // run is boot and fixed overhead. What it buys is exercising the
+    // kernel at 16 concurrent test domains instead of 4, which is where
+    // scheduler/slab/lock contention bugs actually live. At 4 the suite
+    // structurally could not reach that regime at all.
+    const batch = b.option(
+        u32,
+        "batch",
+        "Concurrent in-flight tests in the runner's spawn/drain interleave (default 16; use -Dbatch=4 for the historical low-contention behaviour)",
+    ) orelse 16;
+    if (batch == 0) @panic("-Dbatch must be >= 1");
+
     // Build the filtered list of test entries up front. The same
     // selection drives both per-test ELF builds and the manifest the
     // primary runner iterates.
@@ -806,11 +860,26 @@ pub fn build(b: *std.Build) void {
             }
             patterns.append(trimmed) catch @panic("OOM building -Dtests_exclude pattern list");
         }
+        // Track per-pattern hit counts so a pattern that excludes
+        // NOTHING is reported. `patternMatches` does an EXACT compare
+        // when the pattern has no '*', so the natural-looking
+        // `-Dtests_exclude=create_vcpu_,map_guest_` silently excludes
+        // zero tests — the prefixes need a trailing '*'. That failure is
+        // invisible (a pattern matching nothing is not an error, and the
+        // suite still builds and passes) and cost real debugging time:
+        // an "aarch64 427-test" run was actually the full 485 set,
+        // including the hv groups the exclusion was meant to drop.
+        // Don't hard-error — excluding a group that legitimately doesn't
+        // exist on this arch is a valid invocation — but say so.
+        var hits = std.array_list.Managed(usize).init(b.allocator);
+        defer hits.deinit();
+        hits.appendNTimes(0, patterns.items.len) catch @panic("OOM building exclude hit counters");
         var write_idx: usize = 0;
         for (selected.items) |t| {
             var skip = false;
-            for (patterns.items) |pat| {
+            for (patterns.items, 0..) |pat, pi| {
                 if (patternMatches(pat, t.name)) {
+                    hits.items[pi] += 1;
                     skip = true;
                     break;
                 }
@@ -818,6 +887,16 @@ pub fn build(b: *std.Build) void {
             if (!skip) {
                 selected.items[write_idx] = t;
                 write_idx += 1;
+            }
+        }
+        for (patterns.items, hits.items) |pat, n| {
+            if (n == 0) {
+                std.log.warn(
+                    "-Dtests_exclude: pattern '{s}' matched no test — it excluded nothing. " ++
+                        "Bare prefixes need a trailing '*' (e.g. '{s}*'); without a '*' the " ++
+                        "pattern is compared for exact equality.",
+                    .{ pat, pat },
+                );
             }
         }
         selected.shrinkRetainingCapacity(write_idx);
@@ -989,6 +1068,16 @@ pub fn build(b: *std.Build) void {
     manifest.writer().print(
         "pub const repeat: u32 = {d};\n",
         .{repeat},
+    ) catch unreachable;
+    // Comptime corpse-preservation flag; see the -Dhalt_on_miss option.
+    manifest.writer().print(
+        "pub const halt_on_miss: bool = {};\n",
+        .{halt_on_miss},
+    ) catch unreachable;
+    // Comptime spawn/drain batch width; see the -Dbatch option.
+    manifest.writer().print(
+        "pub const batch: u32 = {d};\n",
+        .{batch},
     ) catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 

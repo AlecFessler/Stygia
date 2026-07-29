@@ -1043,13 +1043,45 @@ pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
 /// Common dispatch for `fire*`. Looks up `ec.event_routes[event_type]`;
 /// if bound, suspends `ec` on the port. Returns true iff the suspend was
 /// performed; false leaves the caller to apply the no-route fallback.
+/// Why `fireRouted` declined to deliver an event. The no-route
+/// fallbacks are drastic — `fireMemoryFault` destroys the whole
+/// capability domain, `fireThreadFault` parks the EC as `.exited` — and
+/// three unrelated conditions funnel into them through a single
+/// `return false`. stygia-ojs was unattributable for exactly that
+/// reason: a bound route whose port slot had been recycled was
+/// indistinguishable from a domain that never bound one.
+pub const NoRouteReason = enum(u8) {
+    /// The event type maps to no route slot at all.
+    no_slot,
+    /// `ec.event_routes[slot]` is null — nothing ever bound, or a
+    /// `removeEventRoute` cleared it before the fault fired.
+    unbound,
+    /// A route WAS bound, but the Port it names now carries a different
+    /// slab generation: the Port was freed (and possibly recycled)
+    /// between `bind_event_route` and the fault.
+    port_stale,
+};
+
+pub const NoRouteInfo = struct {
+    reason: NoRouteReason = .no_slot,
+    /// Generation the route recorded at bind time (`port_stale` only).
+    expected_gen: u64 = 0,
+    /// The Port gen-lock word as observed at fault time (`port_stale`
+    /// only). Bit 0 is the lock bit; `word >> 1` is the live gen.
+    current_word: u64 = 0,
+};
+
 fn fireRouted(
     ec: *ExecutionContext,
     event: EventType,
     subcode: u8,
     addr: u64,
+    info: *NoRouteInfo,
 ) bool {
-    const slot_idx = execution_context.eventRouteSlot(event) orelse return false;
+    const slot_idx = execution_context.eventRouteSlot(event) orelse {
+        info.* = .{ .reason = .no_slot };
+        return false;
+    };
     // Snapshot `ec.event_routes[slot_idx]` under `ec._gen_lock` — the
     // optional `SlabRef(Port)` is two words (ptr + gen) and an in-flight
     // `installEventRoute`/`removeEventRoute` writer (see lines 967/989)
@@ -1061,8 +1093,18 @@ fn fireRouted(
     const ec_irq = ec._gen_lock.lockIrqSave(@src());
     const route_ref_opt = ec.event_routes[slot_idx];
     ec._gen_lock.unlockIrqRestore(ec_irq);
-    const route_ref = route_ref_opt orelse return false;
-    const route_lr = route_ref.lockIrqSave(@src()) catch return false;
+    const route_ref = route_ref_opt orelse {
+        info.* = .{ .reason = .unbound };
+        return false;
+    };
+    const route_lr = route_ref.lockIrqSave(@src()) catch {
+        info.* = .{
+            .reason = .port_stale,
+            .expected_gen = route_ref.gen,
+            .current_word = route_ref.ptr._gen_lock.word.load(.monotonic),
+        };
+        return false;
+    };
     const port_ptr = route_lr.ptr;
     // `suspendOnPort` is responsible for releasing `port_ptr._gen_lock`
     // (it must drop Port before any receiver-CD acquisition to honor the
@@ -1109,8 +1151,82 @@ fn fireRouted(
 /// future caller arrives with the CD lock held, `lockIrqSave` would
 /// dead-spin — hence the explicit lock-state contract documented on
 /// each call site under fault.zig / arch/*/exceptions.zig.
+/// Announce that `ec` took a fault with no event route bound, and is
+/// therefore about to be parked (`parkSelfFaulted`) or have its domain
+/// torn down. Both fallbacks were previously SILENT, which made this the
+/// hardest possible failure to diagnose: `parkSelfFaulted` sets
+/// `state = .exited`, clears `on_cpu` and drops the EC from
+/// `current_ec`, so an EC that dies here leaves behind exactly the same
+/// corpse as one that exited normally, and any result it owed its
+/// caller simply never arrives.
+///
+/// That is precisely how stygia-ojs presented: a test EC vanished
+/// mid-run, the harness reported "MISS <test> (no result delivered)",
+/// and the post-mortem state was indistinguishable from a clean exit.
+/// Printing here costs nothing on a healthy system — a no-route fault
+/// means an EC is dying unannounced, which is never routine — and turns
+/// a silent disappearance into an attributable event.
+///
+/// Uses the raw lock-free writer: this runs on the fault path, which may
+/// hold locks the normal printer takes.
+fn reportNoRouteFault(
+    ec: *ExecutionContext,
+    kind: []const u8,
+    subcode: u8,
+    payload: u64,
+    info: NoRouteInfo,
+) void {
+    arch.boot.printRaw("[NOROUTE] ");
+    arch.boot.printRaw(kind);
+    arch.boot.printRaw(" ec=0x");
+    printHex64(@intFromPtr(ec));
+    arch.boot.printRaw(" subcode=");
+    printHex64(subcode);
+    arch.boot.printRaw(" payload=0x");
+    printHex64(payload);
+    // Which of the three no-route conditions fired. `port_stale` means
+    // the domain DID bind a route and the kernel dropped the event
+    // anyway — a kernel bug, not a userspace omission.
+    arch.boot.printRaw(" why=");
+    arch.boot.printRaw(switch (info.reason) {
+        .no_slot => "no_slot",
+        .unbound => "unbound",
+        .port_stale => "port_stale",
+    });
+    if (info.reason == .port_stale) {
+        arch.boot.printRaw(" bound_gen=");
+        printHex64(info.expected_gen);
+        arch.boot.printRaw(" port_word=0x");
+        printHex64(info.current_word);
+        arch.boot.printRaw(" (live_gen=");
+        printHex64(info.current_word >> 1);
+        arch.boot.printRaw(")");
+    }
+    arch.boot.printRaw(" — EC parked, result (if any) will never be delivered\n");
+}
+
+fn printHex64(n: u64) void {
+    var buf: [16]u8 = undefined;
+    var i: usize = buf.len;
+    var v = n;
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+    } else {
+        while (v != 0) {
+            i -= 1;
+            const d: u8 = @intCast(v & 0xF);
+            buf[i] = if (d < 10) d + '0' else d - 10 + 'a';
+            v >>= 4;
+        }
+    }
+    arch.boot.printRaw(buf[i..]);
+}
+
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
-    if (fireRouted(ec, .memory_fault, subcode, fault_addr)) return;
+    var info: NoRouteInfo = .{};
+    if (fireRouted(ec, .memory_fault, subcode, fault_addr, &info)) return;
+    reportNoRouteFault(ec, "memory_fault", subcode, fault_addr, info);
 
     // No-route destroy. Park the EC first so it leaves the dispatch
     // queue, then run the standard CD self-destruct via `releaseSelf`.
@@ -1160,7 +1276,9 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
 /// Fire a thread_fault event. Fallback on no route: park the EC so the
 /// same fault doesn't loop forever.
 pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
-    if (fireRouted(ec, .thread_fault, subcode, payload)) return;
+    var info: NoRouteInfo = .{};
+    if (fireRouted(ec, .thread_fault, subcode, payload, &info)) return;
+    reportNoRouteFault(ec, "thread_fault", subcode, payload, info);
     // No-route fallback. Earlier this called `execution_context.terminate(
     // ec, 0)`, but `terminate(caller, target)` resolves `target` as a
     // handle in the caller's table — slot 0 is the SELF capability_domain
@@ -1180,7 +1298,8 @@ pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
 
 /// Fire a breakpoint event. Fallback: drop, advance past trap, resume.
 pub fn fireBreakpoint(ec: *ExecutionContext, subcode: u8) void {
-    if (fireRouted(ec, .breakpoint, subcode, 0)) return;
+    var info: NoRouteInfo = .{};
+    if (fireRouted(ec, .breakpoint, subcode, 0, &info)) return;
     // No-route fallback: drop the event and let `ec` resume. The
     // arch-specific helper that advances past the trap instruction
     // lives in arch.dispatch.cpu — until that one-byte INT3 advance is
@@ -1191,7 +1310,8 @@ pub fn fireBreakpoint(ec: *ExecutionContext, subcode: u8) void {
 /// Fire a pmu_overflow event. Fallback: drop, EC continues running.
 pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
     const subcode: u8 = @truncate(counter_idx);
-    if (fireRouted(ec, .pmu_overflow, subcode, counter_idx)) return;
+    var info: NoRouteInfo = .{};
+    if (fireRouted(ec, .pmu_overflow, subcode, counter_idx, &info)) return;
     // No-route fallback: silently drop. The EC keeps running and the
     // counter has already been re-armed by the arch ISR.
 }

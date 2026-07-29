@@ -2213,8 +2213,20 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\.Lreply_have_core:
             \\
             \\movq %%gs:32, %%rcx
-            \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
             \\movb $0, {[on_cpu_off]d}(%%rcx)
+            \\# stygia-qbx: do NOT stamp .ready over .exited. A peer core
+            \\# can terminate this caller while it is mid-reply; stamping
+            \\# unconditionally resurrects it AND erases the `.exited`
+            \\# marker that dequeueOrIdleLocked filters on, so a dead EC
+            \\# gets dispatched in the window before bumpDeadGenLocked
+            \\# flips the gen. Checked under the core lock we just took,
+            \\# so this agrees with scheduler.enqueueOnCore's gate rather
+            \\# than racing it. on_cpu is cleared either way — the EC is
+            \\# leaving this core regardless, and leaving it set strands
+            \\# the zombie reap.
+            \\cmpb ${[state_exited]d}, {[state_off]d}(%%rcx)
+            \\je .Lreply_R13_unlock
+            \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
             \\
             \\movzbq {[priority_off]d}(%%rcx), %%r11
             \\shlq $4, %%r11
@@ -2233,6 +2245,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
             \\movq $0, {[ec_next_off]d}(%%rcx)
             \\
+            \\.Lreply_R13_unlock:
             \\movq %%gs:{[sc_core_lock]d}, %%rcx
             \\movl $0, {[lock_state_off]d}(%%rcx)
             \\jmp .Lreply_R13_done
@@ -2243,6 +2256,7 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .sc_per_core = Offsets.sc_per_core_ptr,
                 .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
                 .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
+                .state_exited = @intFromEnum(stygia.sched.execution_context.State.exited),
                 .state_off = @offsetOf(ExecutionContext, "state"),
                 .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
                 .priority_off = @offsetOf(ExecutionContext, "priority"),

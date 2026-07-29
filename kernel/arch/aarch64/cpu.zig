@@ -464,6 +464,42 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
             const z = zombie_to_reap orelse break;
             stygia.sched.execution_context.finalizeDestroyMarkedDead(z);
         }
+
+        // Publish "this EC's kernel stack is live on a CPU" (stygia-3ys).
+        //
+        // This write was MISSING on aarch64 entirely. Every `on_cpu =
+        // true` writer lived under arch/x64 (`interrupts.zig` :1399,
+        // :2535, :2875); aarch64 only ever READ the flag — the reap gate
+        // ten lines above — and cleared it (scheduler's switchTo
+        // prev-clear and `post_park_clear_on_cpu`). So on aarch64 the
+        // flag was false for every EC, always, and that gate never once
+        // fired.
+        //
+        // With the gate dead, the only surviving protections in the reap
+        // loop are `standing_on_zombie` (compares the LOCAL core's sp)
+        // and `ec == z` (the EC being dispatched right now). Neither
+        // says anything about a REMOTE core that is currently executing
+        // on the zombie's kernel stack. So core A could finalize a
+        // zombie — unmapping and recycling its kstack — while core B was
+        // running on it. Observed exactly that in the stygia-3ys corpse:
+        // CPU#1 and CPU#2 stack pointers 1408 bytes apart inside one
+        // 64 KiB EC kstack, CPU#1's frames shredded (class=0x8,
+        // ordered_group=0xFFFF0000, a return address pointing into
+        // CPU#2's exception frame), and CPU#2 then panicking out of
+        // handleSyncCurrentEl with "kernel page fault on user VA with no
+        // current EC" — the last domino, not the bug.
+        //
+        // Ordering mirrors x64 `interrupts.zig:2875`: `setCurrentEc` has
+        // already run in `scheduler.switchTo`, so `current_ec` names
+        // `ec` before the flag goes up; a remote terminate therefore
+        // sees a consistent (current_ec, on_cpu) pair. `.release` pairs
+        // with the reaper's `.acquire` load.
+        //
+        // The clear side already existed on aarch64 (it lives in the
+        // shared scheduler), which is why this was easy to miss: all the
+        // machinery for retiring the flag was present and correct, and
+        // only the arch-local raise was absent.
+        ec.on_cpu.store(true, .release);
     }
 
     // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half

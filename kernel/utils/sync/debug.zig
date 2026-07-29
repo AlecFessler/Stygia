@@ -112,6 +112,38 @@ pub fn acquire(
     // stack rolls forward and obscures the situation.
     const in_irq = irq_depth.inIrq(@intCast(core_id));
     const irqs_enabled = arch.cpu.interruptsEnabled();
+
+    // The detector's own bookkeeping runs with IRQs MASKED. Sample
+    // `irqs_enabled` above, before masking — it is the classification
+    // input, and reading it after would report state 2 (lockIrqSave) for
+    // every caller and silently retire the IRQ-mode check entirely.
+    //
+    // Masking here closes the exact deadlock this detector exists to
+    // find, sitting inside the detector itself. `class_table.lock` and
+    // `pair_registry.lock` are two global locks that EVERY SpinLock
+    // acquire funnels through, and they were taken with whatever IRQ
+    // state the caller had. So:
+    //
+    //   1. process context, IRQs enabled, takes `foo.lock()`
+    //   2. -> debug.acquire -> checkIrqModeOn takes `class_table.lock`
+    //   3. a timer tick lands on THIS core, inside that window
+    //   4. the handler (e.g. port.expireTimedRecvWaiters ->
+    //      timed_recv_lock.lockIrqSave) reaches debug.acquire ->
+    //      checkIrqModeOn -> spins on `class_table.lock`
+    //
+    // Step 4 waits on a lock held by the code it interrupted, which can
+    // never resume: an unbreakable same-core self-deadlock with IRQs
+    // masked. Both stygia-3ys corpses show precisely this — cores parked
+    // in `ClassTable.acquireLock` reached from `expireTimedRecvWaiters`
+    // in the tick handler. Masking makes step 3 impossible.
+    //
+    // It also makes the per-core held stack genuinely single-writer.
+    // Without it an IRQ handler's `acquireOn` could push onto
+    // `held_stacks[core_id]` while an interrupted `releaseOn` was
+    // mid-shift, corrupting entries and producing phantom cycle panics.
+    const irq_state = arch.cpu.saveAndDisableInterrupts();
+    defer arch.cpu.restoreInterrupts(irq_state);
+
     const irq_outcome = checkIrqModeOn(&class_table, class, in_irq, irqs_enabled, src);
     if (irq_outcome.result != .ok) {
         handleOutcome(irq_outcome, core_id, lock_ptr, class, src);
@@ -127,6 +159,11 @@ pub fn release(lock_ptr: *const anyopaque) void {
     const core_id = arch.smp.coreID();
     if (core_id >= MAX_CORES) return;
     const stack = &held_stacks[@intCast(core_id)];
+    // Masked for the same reason as `acquire`: `releaseOn` shifts the
+    // per-core held stack down in place, and an IRQ handler that pushed
+    // onto that stack mid-shift would clobber an entry being moved.
+    const irq_state = arch.cpu.saveAndDisableInterrupts();
+    defer arch.cpu.restoreInterrupts(irq_state);
     _ = releaseOn(stack, lock_ptr);
 }
 

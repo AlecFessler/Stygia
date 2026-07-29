@@ -1265,6 +1265,34 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
             }
             return errors.E_NOMEM;
         }
+
+        // This physical page just became reachable by instruction fetch
+        // in a user address space. On a non-coherent I-cache (aarch64)
+        // that requires maintenance; without it the frame can still hold
+        // I-cache lines from a PREVIOUS owner, because page frames are
+        // recycled and the PMM's zero-fill is a DATA-side write that
+        // does not evict them. The new owner would then fetch the old
+        // domain's instructions — wrong execution and a cross-domain
+        // information leak (stygia-ojs).
+        //
+        // Done per page inside the loop rather than once for the whole
+        // frame so a partial install that rolls back above never leaves
+        // a page half-synced, and so the range we touch is exactly the
+        // range we mapped.
+        //
+        // Addressed through the physmap alias: `dc cvau` / `ic ivau`
+        // work on the physical line behind whatever VA is supplied, so
+        // the user's address space need not be active here. No-op on
+        // x86-64.
+        //
+        // This covers only what the KERNEL put in the page. Code that
+        // USERSPACE writes afterwards is the writer's responsibility —
+        // SCTLR_EL1.UCI is enabled (see `arch.aarch64.init`) so EL0 can
+        // issue the required `dc cvau` / `ic ivau` itself.
+        if (perms.exec) {
+            const kva = stygia.memory.address.VAddr.fromPAddr(phys_p, null);
+            dispatch.cpu.syncInstructionCacheRange(kva.addr, pf_sz_bytes);
+        }
         p += 1;
     }
     v.installed_pfs[slot_reserved.?] = .{

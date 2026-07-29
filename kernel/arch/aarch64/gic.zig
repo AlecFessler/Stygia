@@ -996,9 +996,21 @@ pub fn sendIpiToCore(core_id: u64, vector: u8) void {
 }
 
 /// Scheduler-rearm IPI uses SGI 0. SGIs 0-15 are the software-generated
-/// band on ARM; 0 is reserved here for the scheduler and 1 for the
-/// kprof-dump broadcast.
-const sched_sgi_id: u8 = 0;
+/// band on ARM. Current allocation — keep this list authoritative, a
+/// duplicate here is a silent cross-subsystem aliasing bug (a wake once
+/// shared INTID 2 with the FPU flush and so ran the wrong handler):
+///
+///   0  scheduler rearm / preempt   `sendSchedulerIpi`
+///   1  kprof-dump broadcast        `arch.dispatch.cpu` dump fan-out
+///   2  lazy-FPU cross-core flush   `arch.dispatch.cpu.sendFpuFlushIpi`
+///   3  cross-core idle wake        `arch.dispatch.smp.sendWakeIpi`
+///   7  BSP broadcast sched tick    `SGI_BCAST_TICK`
+pub const sched_sgi_id: u8 = 0;
+
+/// Cross-core idle-wake IPI. Deliberately its OWN INTID with a handler
+/// that does nothing but return — see `exceptions.dispatchIrq` case 3
+/// for why the wake must not dispatch.
+pub const wake_sgi_id: u8 = 3;
 
 /// Send the scheduler-rearm IPI to `core_id`. Encapsulates the SGI id
 /// so callers don't have to know which id the scheduler listens on.

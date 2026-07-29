@@ -164,9 +164,12 @@
 //         memory_fault, or subcode != invalid_write.
 //     8   denied-write leg: recv timed out AND worker_done == 1
 //         (kernel allowed the write where spec demands denial).
-//     9   denied-write leg: recv timed out AND worker_done == 0
-//         (worker neither faulted nor ran past — likely no-route
-//         fallback or scheduling stall).
+//     9   denied-write leg: recv timed out, worker_done == 0, but the
+//         worker DID start (worker_started == 1) — it ran and then
+//         neither faulted-with-delivery nor ran past. No-route fallback
+//         on the fault, or a hang at the access itself. See id 19 for
+//         the scheduling-stall half, which this used to be conflated
+//         with.
 //    10   execute-leg setup (side-VMAR for code planting) failed.
 //    11   allowed-execute leg: planted code didn't return cleanly.
 //    12   denied-execute leg: recv returned non-OK, non-E_TIMEOUT.
@@ -174,11 +177,20 @@
 //         memory_fault, or subcode != invalid_execute.
 //    14   denied-execute leg: recv timed out AND worker_done == 1
 //         (kernel allowed execute where spec demands denial).
-//    15   denied-execute leg: recv timed out AND worker_done == 0.
+//    15   denied-execute leg: recv timed out, worker_done == 0, worker
+//         DID start. See id 21 for the never-dispatched half.
 //    16   bind_event_route failed.
 //    17   create_port failed for worker scaffold.
 //    18   create_execution_context failed for worker.
 //    19   terminate(worker) failed (residue from a prior cell).
+//    20   denied-write leg: recv timed out AND the worker EC never
+//         executed its first instruction (worker_started == 0). The
+//         create_execution_context call returned a handle, so this is
+//         not a creation failure: the EC was never dispatched for the
+//         whole 30 s recv window. Nothing about the mapping under test
+//         can produce that, so a 20 indicts the scheduler, not the
+//         fault path. Split out of id 9 (stygia-ojs).
+//    21   denied-execute leg: same as 20 for the execute leg (was 15).
 //
 // Read-leg note
 //   The "always-allowed read" arm only fires once per cell (we test
@@ -221,10 +233,46 @@ var worker_address: u64 = 0;
 var worker_kind: u8 = 0; // 0 = read, 1 = write, 2 = execute
 var worker_go: u32 = 0;
 var worker_done: u32 = 0;
+// Set by the worker before it does anything else, so a timeout can tell
+// "the worker EC never executed a single instruction" (a kernel
+// scheduling stall — the EC was created but never dispatched) from "the
+// worker ran and then died or hung at the access itself". Legs 9 and 15
+// conflated those two, and the distinction picks out which subsystem is
+// at fault: the scheduler or the fault-routing path.
+var worker_started: u32 = 0;
 
 const KIND_READ: u8 = 0;
 const KIND_WRITE: u8 = 1;
 const KIND_EXECUTE: u8 = 2;
+
+// §[create_execution_context] [1] bits 32-33 carry the new EC's
+// scheduling priority (0..3, bounded by the domain's `pri` ceiling).
+//
+// This MUST be set explicitly. `caps.EcCap` is a packed u16, so
+// `EcCap.toU16()` can only ever populate bits 0-15 — priority lives 32
+// bits above anything that struct can express. Passing a bare cap word
+// therefore requests priority 0 = `idle`, the LOWEST band, which is
+// almost never what a caller means.
+//
+// That silent default is what stygia-ojs actually was. The worker EC was
+// created at `idle` while the test EC that spawns it runs at `normal`
+// (createCapabilityDomain gives every child domain's initial EC
+// `.normal`). The kernel schedules strict-priority — spec §[priority]
+// and §[futex_wake] specify highest-first with FIFO only within a band,
+// and define no aging — and `affinity = 0` places the worker on the
+// CREATING core, where it cannot migrate. So with any `normal` EC
+// runnable on that core the `idle` worker is never dispatched: under
+// -Dbatch=16 the worker never executed a single instruction inside the
+// 30 s recv window (assertion 20), while uncontended it ran instantly
+// and the test passed 50/50.
+//
+// Requesting `normal` makes the worker a scheduling peer of the test EC
+// that waits on it, which is what every leg here assumes. It does not
+// soften any assertion: the denied-access legs still require the kernel
+// to raise memory_fault with the right subcode, and a kernel that
+// wrongly PERMITS the access still fails via worker_done == 1
+// (assertions 8 / 14).
+const PRIORITY_NORMAL: u64 = 1 << 32;
 
 fn cpuPause() void {
     switch (builtin.cpu.arch) {
@@ -243,6 +291,8 @@ fn cpuHalt() void {
 }
 
 fn workerEntry() callconv(.c) noreturn {
+    // Announce that we were dispatched at all, before the spin below.
+    @atomicStore(u32, &worker_started, 1, .release);
     // Spin until the test EC has bound the route and set the kind.
     while (@atomicLoad(u32, &worker_go, .acquire) == 0) cpuPause();
 
@@ -316,6 +366,44 @@ fn plantReturn(dst: [*]volatile u8) void {
             dst[1] = 0x03;
             dst[2] = 0x5F;
             dst[3] = 0xD6;
+            // Publish the instruction to the instruction stream.
+            //
+            // aarch64 I-cache and D-cache are NOT coherent (unlike
+            // x86-64, where the single byte above is immediately
+            // fetchable). The architecture makes the WRITER of
+            // instructions responsible for the maintenance, and no
+            // kernel-side action can substitute: `mappingInstall`'s
+            // map-time `syncInstructionCacheRange` runs before these
+            // stores exist. Without this sequence the fetch at
+            // `cell.base` below returns stale bytes — all-zero, which
+            // decodes as `udf #0` — and the resulting EC=0x00 raises
+            // thread_fault(illegal_instruction). The test EC binds no
+            // thread_fault route for itself, so it hit the no-route
+            // fallback and died unreported: `MISS map_pf_12`. That was
+            // stygia-ojs's isolated (uncontended) signature, 100%
+            // reproducible on Pi 5 KVM.
+            //
+            // This does not soften the assertion. Step 6 is testing
+            // whether the kernel's effective-rwx intersection lets the
+            // fetch happen at all; a kernel that wrongly denied execute
+            // still raises an instruction abort (EC=0x20 -> memory_fault),
+            // which still fails the test. Cache maintenance only removes
+            // an architectural precondition the x86 path gets for free.
+            //
+            // ARM ARM B2.4.4 (ordering of instruction fetch) and D4.4.8:
+            //   DC CVAU -> DSB ISH -> IC IVAU -> DSB ISH -> ISB.
+            // These are EL0-executable only because the kernel sets
+            // SCTLR_EL1.UCI (see arch/aarch64/init.zig).
+            const addr: u64 = @intFromPtr(dst);
+            asm volatile (
+                \\dc cvau, %[a]
+                \\dsb ish
+                \\ic ivau, %[a]
+                \\dsb ish
+                \\isb
+                :
+                : [a] "r" (addr),
+                : .{ .memory = true });
         },
         else => @compileError("unsupported arch"),
     }
@@ -324,7 +412,8 @@ fn plantReturn(dst: [*]volatile u8) void {
 const RecvOutcome = enum {
     fault_delivered,
     timeout_worker_survived, // kernel allowed; spec violation
-    timeout_worker_stuck, // worker neither faulted nor ran past
+    timeout_worker_stuck, // worker ran, then neither faulted nor ran past
+    timeout_worker_never_started, // worker EC never dispatched at all
     other_error,
 };
 
@@ -336,6 +425,7 @@ const RecvResult = struct {
 
 fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
     @atomicStore(u32, &worker_done, 0, .release);
+    @atomicStore(u32, &worker_started, 0, .release);
     @atomicStore(u32, &worker_go, 0, .release);
     @atomicStore(u64, &worker_address, addr, .release);
     @atomicStore(u8, &worker_kind, kind, .release);
@@ -356,7 +446,7 @@ fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
         .bind = true,
     };
     const cec = syscall.createExecutionContext(
-        @as(u64, w_caps.toU16()),
+        @as(u64, w_caps.toU16()) | PRIORITY_NORMAL,
         @intFromPtr(&workerEntry),
         1, // stack_pages
         0, // target = self
@@ -396,6 +486,12 @@ fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
     } else if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
         if (@atomicLoad(u32, &worker_done, .acquire) == 1) {
             result = .{ .outcome = .timeout_worker_survived, .subcode = 0, .error_v1 = 0 };
+        } else if (@atomicLoad(u32, &worker_started, .acquire) == 0) {
+            // The worker EC was created successfully (create_execution_context
+            // returned a handle) but never executed its first instruction in
+            // the whole recv window. Nothing about the mapping under test can
+            // cause that — it is a dispatch failure.
+            result = .{ .outcome = .timeout_worker_never_started, .subcode = 0, .error_v1 = 0 };
         } else {
             result = .{ .outcome = .timeout_worker_stuck, .subcode = 0, .error_v1 = 0 };
         }
@@ -537,6 +633,12 @@ fn runCell(vmar_rwx: u3, pf_rwx: u3, failed_assertion: *u64) bool {
                 _ = syscall.delete(pf_handle);
                 return false;
             },
+            .timeout_worker_never_started => {
+                failed_assertion.* = 20;
+                _ = syscall.delete(cell.handle);
+                _ = syscall.delete(pf_handle);
+                return false;
+            },
             .other_error => {
                 // Distinguish "wrong event/subcode" (which surfaces
                 // as outcome=.other_error with error_v1 == 0) from
@@ -590,6 +692,12 @@ fn runCell(vmar_rwx: u3, pf_rwx: u3, failed_assertion: *u64) bool {
             .fault_delivered => {},
             .timeout_worker_survived => {
                 failed_assertion.* = 14;
+                _ = syscall.delete(cell.handle);
+                _ = syscall.delete(pf_handle);
+                return false;
+            },
+            .timeout_worker_never_started => {
+                failed_assertion.* = 21;
                 _ = syscall.delete(cell.handle);
                 _ = syscall.delete(pf_handle);
                 return false;

@@ -421,6 +421,60 @@ clean_nvvars() {
     fi
 }
 
+# Refuse to boot an arch-MIXED image.
+#
+# `zig-out/img/` is not cleaned when the target arch changes, and the root
+# build COPIES tests/suite/bin/root_service.elf rather than re-deriving it.
+# So an aarch64 build followed by an x86 build leaves an x86-64 kernel.elf
+# beside an ARM aarch64 root_service.elf (plus a stale BOOTAA64.EFI). Every
+# build exits 0 and nothing else detects it. This gauntlet alternates arches
+# (the indexer stage builds -Darch=arm), and an interactive build in the same
+# checkout can interleave too.
+#
+# The resulting boot failure looks exactly like a kernel scheduler bug and is
+# NOT one — the loader jumps into a zeroed page, whose 00 00 bytes decode as
+# `add %al,(%rax)` with rax=0:
+#
+#   [USR-PF] rip=0x...901 addr=0x0 err=0x6 w=true x=false no-vmar
+#   [USR-PF] insn=00 00 00 00 ...
+#   [HANG] core=0 ... state=RUN on_cpu=1 ; all run_queues empty, ONE live EC
+#
+# That is the signature filed as stygia-gms ("pristine main wedges at boot
+# under concurrent-gauntlet contention"), which this check would have
+# classified instantly. See tests/precommit.sh:285 for the same guard already
+# applied to zig-out/bin/kernel.elf for the indexer's benefit.
+#
+# $1 = expected arch as `file` spells it: "x86-64" or "ARM aarch64"
+verify_image_arch() {
+    local want="$1"
+    local bad=0 f got
+    for f in "$STYGIA_ROOT/zig-out/img/kernel.elf" \
+             "$STYGIA_ROOT/zig-out/img/root_service.elf"; do
+        if [[ ! -f "$f" ]]; then
+            echo "  [arch-guard] missing: $f"
+            bad=1
+            continue
+        fi
+        got=$(file -b "$f" | grep -oE "x86-64|ARM aarch64" | head -1)
+        if [[ "$got" != "$want" ]]; then
+            echo "  [arch-guard] $f is '${got:-unknown}', expected '$want'"
+            bad=1
+        fi
+    done
+    # A leftover bootloader for the other arch is the same staleness tell.
+    case "$want" in
+        "x86-64")      [[ -f "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" ]] && {
+                           echo "  [arch-guard] stale BOOTAA64.EFI in an x86 image"; bad=1; } ;;
+        "ARM aarch64") [[ -f "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTX64.EFI" ]] && {
+                           echo "  [arch-guard] stale BOOTX64.EFI in an aarch64 image"; bad=1; } ;;
+    esac
+    if [[ "$bad" != 0 ]]; then
+        echo "  [arch-guard] zig-out/img is arch-mixed — 'rm -rf zig-out' and rebuild."
+        return 1
+    fi
+    return 0
+}
+
 stage_x86_kernel_tests() {
     echo ""
     echo "=================================================="
@@ -437,6 +491,11 @@ stage_x86_kernel_tests() {
     echo "Building x86 kernel..."
     if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test); then
         FAILURES+=("x86 kernel build")
+        return 1
+    fi
+
+    if ! verify_image_arch "x86-64"; then
+        FAILURES+=("x86 image is arch-mixed (see arch-guard output)")
         return 1
     fi
 

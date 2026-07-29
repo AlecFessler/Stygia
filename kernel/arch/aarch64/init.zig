@@ -61,6 +61,10 @@ pub fn init() void {
     // and the §6.8 alignment_fault behaviour cannot be exercised.
     // ARM ARM D13.2.118.
     enableSpAlignmentChecks();
+    // Let EL0 perform the cache maintenance the architecture REQUIRES of
+    // anyone who writes instructions. Without this, self-modifying code
+    // and JITs are impossible on this kernel — see below.
+    enableEl0CacheMaintenance();
     // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
     // and redistributor base addresses come from MADT, which has not
     // been parsed yet at this point.
@@ -82,6 +86,41 @@ fn armFpTrapEl0() void {
     asm volatile ("msr cpacr_el1, %[v]"
         :
         : [v] "r" (cpacr),
+    );
+    asm volatile ("isb");
+}
+
+/// Set SCTLR_EL1.UCI (bit 26), which permits EL0 to execute the
+/// cache-maintenance instructions `DC CVAU`, `DC CIVAC`, `DC CVAC` and
+/// `IC IVAU`. With UCI clear (the reset state, and what this kernel used
+/// to run with) those instructions TRAP from EL0.
+///
+/// Why that matters (stygia-ojs). aarch64 I and D caches are not
+/// coherent, so publishing freshly written instructions requires
+/// `DC CVAU -> DSB ISH -> IC IVAU -> DSB ISH -> ISB` after the stores.
+/// Only the writer can do it — the kernel cannot, because userspace's
+/// stores happen after any map-time maintenance the kernel performs. So
+/// with UCI clear there was NO mechanism, kernel-side or user-side, to
+/// make user-written code executable: every JIT, trampoline, or
+/// self-modifying sequence was silently unsupported, and the observable
+/// symptom was an instruction fetch returning stale bytes (zeros decode
+/// as `udf #0`, i.e. an undefined-instruction abort).
+///
+/// Granting this to EL0 is the standard arrangement — Linux sets UCI
+/// unconditionally for the same reason. It exposes no kernel memory:
+/// these ops act on the caller's own translation regime by VA, and a VA
+/// the caller cannot access faults exactly as a normal access would.
+///
+/// ARM ARM D13.2.118 (SCTLR_EL1), D4.4.8 (cache maintenance at EL0).
+fn enableEl0CacheMaintenance() void {
+    var sctlr: u64 = undefined;
+    asm volatile ("mrs %[v], sctlr_el1"
+        : [v] "=r" (sctlr),
+    );
+    sctlr |= (1 << 26);
+    asm volatile ("msr sctlr_el1, %[v]"
+        :
+        : [v] "r" (sctlr),
     );
     asm volatile ("isb");
 }

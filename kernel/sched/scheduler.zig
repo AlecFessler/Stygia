@@ -22,6 +22,7 @@ const stack_mod = stygia.memory.stack;
 
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const NOT_IN_RUN_QUEUE = stygia.sched.execution_context.NOT_IN_RUN_QUEUE;
+const PerfmonState = stygia.sched.perfmon.PerfmonState;
 const Priority = stygia.sched.execution_context.Priority;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
@@ -205,6 +206,44 @@ pub const PerCore = struct {
     /// is exactly what this clear releases). The carried gen is a
     /// parity-correct placeholder for SlabRef constructor compatibility.
     post_park_clear_on_cpu: ?SlabRef(ExecutionContext) = null,
+
+    /// True when this core's most recent dispatch decision — taken
+    /// under `core_locks[core]` inside `dequeueOrIdleLocked` — found
+    /// nothing to run, i.e. the core is heading for (or already
+    /// sitting in) its idle park.
+    ///
+    /// This exists because `enqueueOnCore`'s wake decision cannot use
+    /// `current_ec` alone. `current_ec` is cleared by the parking core
+    /// AFTER it has dropped `core_locks[core]` (see `yieldTo`'s
+    /// empty-queue arm and `run`'s park fall-through, both of which
+    /// need the old value for their disowned-EC bookkeeping first), so
+    /// there is a window in which the core has committed to parking but
+    /// its slot still names the EC it was running. An `enqueueOnCore`
+    /// landing in that window reads a non-null `current_ec`, concludes
+    /// "target is busy, it will pick the EC up at its next reschedule",
+    /// skips the wake IPI — and the target then parks forever with a
+    /// `.ready` EC sitting in its queue. The EC is never dispatched and
+    /// whatever was waiting on it (a test result, an IPC reply) never
+    /// arrives. Nothing else necessarily disturbs that core: futex
+    /// wakes and affinity-0 enqueues both prefer the *local* core, so
+    /// an idle core can stay untargeted indefinitely.
+    ///
+    /// Publishing the parking decision under the same lock that guards
+    /// the run queue closes the window in both directions:
+    ///   - enqueuer wins the lock: it queues the EC before the parking
+    ///     decision is made, so `dequeueOrIdleLocked` returns that EC
+    ///     and the core never parks.
+    ///   - parker wins the lock: `idle_parked` is already true when the
+    ///     enqueuer reads it, so the wake IPI is sent. A wake that
+    ///     arrives before the core reaches its `wfi`/`hlt` is not lost —
+    ///     both arch park paths sleep with the IRQ masked-but-pending
+    ///     wake semantics documented at `arch.cpu.parkAndAwaitIRQ`.
+    ///
+    /// Cleared at every dispatch commitment (both `dequeueOrIdleLocked`
+    /// success returns and `yieldTo`'s explicit-target arm), all under
+    /// `core_locks[core]`. A stale `true` would only cost a spurious
+    /// wake IPI, never correctness.
+    idle_parked: bool = false,
 };
 
 /// Per-core scheduler state. Indexed by core id (APIC ID on x86-64,
@@ -291,6 +330,92 @@ pub fn perCoreInit() void {
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
+
+/// The EC's `PerfmonState` if perfmon is armed on it and the slab slot
+/// still names the generation the EC's ref was minted against. Null
+/// when perfmon was never started, was stopped, or the state has been
+/// released underneath us (EC destroy).
+inline fn livePerfmonState(ec: *ExecutionContext) ?*PerfmonState {
+    const ref = ec.perfmon_state orelse return null;
+    // caller-pinned: the gen compare below IS the liveness check — we
+    // cannot take the gen-lock here because `pmuSwitch` runs in the
+    // dispatch path with IRQs masked and no lock-order slot. A stale
+    // gen means the slot was freed and we skip it entirely.
+    if (ref.ptr._gen_lock.currentGen() != @as(u64, ref.gen)) return null;
+    return ref.ptr;
+}
+
+/// Hand the per-core PMU counter file from the outgoing EC to `next`.
+/// Called from `switchTo` while `current_ec` still names the outgoing
+/// EC, i.e. before `setCurrentEc`.
+///
+/// The PMU register file is per-core hardware, but `perfmon_read`
+/// reports counts per EC: it samples the live registers via `pmuSave`
+/// and spec §[execution_context].perfmon_read requires each counter to
+/// be "greater than or equal to the value returned by the prior
+/// perfmon_read on that target". With no context-switch handoff, an EC
+/// that migrates between two reads samples the DESTINATION core's
+/// register file — another thread's counts, or zero on a core that
+/// never programmed the PMU at all (PMCR_EL0.E clear on aarch64,
+/// IA32_PERF_GLOBAL_CTRL clear on x86) — and the second read comes back
+/// below the first. That is the `perfmon_read_06` aid=5 "cycles ran
+/// backward" failure seen on Pi 5 KVM.
+///
+/// `pmuRestore` reprograms the event selectors and writes the EC's
+/// saved values back into the hardware counters, so counts accumulate
+/// across cores; `pmuSave` reads them back out and disables counting.
+/// Pairing them here gives the invariant the spec wants: while an EC
+/// with perfmon armed is running, its core's counters hold values >=
+/// the EC's saved values, and the saved values only ever move forward.
+///
+/// `PerfmonState.hw_core` is the ownership token. It is needed because
+/// `current_ec` can name an EC that has since migrated (see the
+/// `on_cpu` clear in `switchTo`): saving that EC would capture THIS
+/// core's unrelated counters into a state its new core is actively
+/// driving, moving the saved values backwards — the very bug we are
+/// closing. Only the core that last restored the EC may save it.
+///
+/// Not every switch-away runs through here: the escape-to-`run()` and
+/// park paths clear `current_ec` without a `switchTo`, so an EC parked
+/// that way leaves its counters enabled on the core until something
+/// else restores over them. That loses the counts of the final quantum
+/// but cannot violate monotonicity, because the EC's next dispatch
+/// re-`pmuRestore`s from its own saved values on whatever core it
+/// lands on.
+fn pmuSwitch(core: u8, next: *ExecutionContext) void {
+    const state = &core_states[core];
+
+    const next_ps = livePerfmonState(next);
+    var prev_ps: ?*PerfmonState = null;
+    if (state.current_ec) |prev_ref| {
+        // caller-pinned: identity read of this core's own `current_ec`
+        // slot, gen-checked before the deref.
+        if (prev_ref.ptr._gen_lock.currentGen() == @as(u64, prev_ref.gen)) {
+            prev_ps = livePerfmonState(prev_ref.ptr);
+        }
+    }
+
+    // Fast path: no perfmon anywhere near this dispatch. Every context
+    // switch in a system that never called `perfmon_start` lands here,
+    // so it must not touch the PMU registers (each is a trap-and-emulate
+    // exit under KVM on aarch64).
+    if (prev_ps == null and next_ps == null) return;
+
+    if (prev_ps) |ps| {
+        // `ps != next_ps` skips the pointless save/restore round trip
+        // when the same EC is being re-dispatched on the same core.
+        if (ps.hw_core == core and ps != next_ps) {
+            arch.pmu.pmuSave(&ps.arch_state);
+            ps.hw_core = null;
+        }
+    }
+    if (next_ps) |ps| {
+        if (ps.hw_core != core) {
+            arch.pmu.pmuRestore(&ps.arch_state);
+            ps.hw_core = core;
+        }
+    }
+}
 
 /// Context switch to `ec` on the current core. Saves outgoing EC's
 /// state to its `ctx`, swaps address space (if domain changed),
@@ -391,6 +516,20 @@ pub fn switchTo(ec: *ExecutionContext) void {
             if (park_top != 0) {
                 arch.cpu.parkPerCoreCaches(core, park_top);
             }
+            // `dequeueOrIdle` above set `idle_parked` because it found
+            // nothing to run — but this is the one exit from a dispatch
+            // decision that does NOT lead to a park. We return into
+            // `yieldTo`, which either escapes to `run()` (whose own
+            // `dequeueOrIdle` re-establishes the flag correctly) or
+            // iretqs back to the caller's user mode, leaving this core
+            // busy. Clearing here is right for both: a stale `true` on
+            // a running core makes every `enqueueOnCore` targeting it
+            // send a wake IPI, and on x86 that vector IS the scheduler
+            // vector (`IntVecs.sched` — see `arch.smp.sendWakeIpi`), so
+            // the "wake" preempts an EC that was running fine. That
+            // shows up as latency, e.g. `timer_rearm_09`'s 5 ms
+            // arm-then-observe window closing late.
+            (&core_states[core]).idle_parked = false;
             return;
         };
         current = next;
@@ -420,6 +559,14 @@ pub fn switchTo(ec: *ExecutionContext) void {
             prev_ref.ptr.on_cpu.store(false, .release);
         }
     }
+    // Same clear, for the case where `current_ec` was already nulled by a
+    // park that a dispatching IRQ handler then escaped without reaching
+    // `scheduler_run_after_park`. Without this the flag is stranded set
+    // forever — see `consumePostParkClear` (stygia-7jm).
+    consumePostParkClear(core, current);
+    // Hand the per-core PMU counter file over before `current_ec` is
+    // rewritten — `pmuSwitch` reads the slot to find the outgoing EC.
+    pmuSwitch(core, current);
     setCurrentEc(core, current);
     current.state = .running;
     kprof.point(.dispatch, @intFromPtr(current));
@@ -506,6 +653,10 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
             t.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
             // Locked dispatch commitment — see PerCore.committed_ec.
             state.committed_ec = t;
+            // This arm dispatches without consulting
+            // `dequeueOrIdleLocked`, so clear the park flag here too —
+            // see PerCore.idle_parked.
+            state.idle_parked = false;
             break :blk t;
         }
         break :blk dequeueOrIdleLocked(core);
@@ -872,7 +1023,29 @@ fn parkAndAwaitIRQ() void {
     // safe.
     arch.cpu.parkPerCoreCaches(core, park_top);
     (&core_states[core]).current_ec = null;
-    lock.unlockIrqRestore(irq);
+    // Drop the lock but deliberately do NOT restore the caller's IRQ
+    // state — everything from here to `arch.cpu.parkAndAwaitIRQ` is a
+    // straight line into a noreturn primitive that requires IRQs MASKED
+    // on entry and does its own controlled unmask (x86 `sti; hlt; cli`
+    // relies on the STI interrupt shadow, which exists only if IF was 0;
+    // aarch64 sleeps masked then unmasks for exactly one instruction —
+    // 1bbcbbf7d mechanism 7).
+    //
+    // `irq` was captured by `lockIrqSaveOrdered`, so restoring it means
+    // restoring whatever the caller had. Several callers reach `run()`
+    // with IRQs already ENABLED — `arch/aarch64/exceptions.zig`'s EL0
+    // `wfi` trap does a literal `cpu.enableInterrupts(); scheduler.run();`
+    // (and the x86 #GP-on-`hlt` and port-IO paths do the same). Restoring
+    // there reopens the exact lost-wake hole the masked-park idiom
+    // closes: a wake IPI delivered between here and the halt is taken,
+    // EOI'd and CONSUMED, after which the halt sleeps with `ec` sitting
+    // `.ready` in this core's queue and nothing left to poke us.
+    //
+    // Discarding the saved state is sound precisely because this path
+    // never returns: the park primitive tail-jumps to
+    // `scheduler_run_after_park`, which re-enters `run()` under the same
+    // masked contract.
+    lock.unlock();
 
     // Detach from whatever user translation root the last dispatch
     // left loaded and publish "no user root" BEFORE halting. A parked
@@ -891,6 +1064,72 @@ fn parkAndAwaitIRQ() void {
     arch.cpu.parkAndAwaitIRQ(park_top);
 }
 
+/// Consume this core's pending post-park `on_cpu` clear, if any.
+///
+/// `parkAndAwaitIRQ` stashes the previously dispatched EC here because it
+/// nulls `current_ec` before halting, which leaves `switchTo`'s
+/// "current_ec → new" prev-clear edge nothing to clear from.
+///
+/// The subtlety — and the bug this function exists to close (stygia-7jm)
+/// — is that the asm landing pad `scheduler_run_after_park` is reached
+/// ONLY IF the handler for the waking IRQ RETURNS. The park primitive is
+/// a straight line (`sti; hlt; cli; jmp scheduler_run_after_park` on x86,
+/// `wfi; daifclr; isb; daifset; b scheduler_run_after_park` on aarch64),
+/// so any handler that dispatches instead of returning skips the trailing
+/// branch entirely. Handlers that do exactly that:
+///
+///   * the x86 wake IPI, which IS `IntVecs.sched` (`arch.smp.sendWakeIpi`)
+///     — its handler ends in `preempt()` → `switchTo` →
+///     `loadEcContextAndReturn`, noreturn;
+///   * the per-core timer tick on EITHER arch, which can land in the
+///     unmask window and likewise end in `preempt()`.
+///
+/// So this is not specific to the wake vector, and not specific to x86.
+/// When the branch is skipped, the previously dispatched EC keeps
+/// `on_cpu = true` forever: `finalizeDestroyMarkedDead` skips ECs with
+/// that flag set, so its zombie is never reaped, its slab slot leaks, and
+/// a peer's `postZombie` spins waiting for a drain that will never
+/// happen. Worse, the next park overwrites the slot, so the clear is lost
+/// permanently rather than merely deferred.
+///
+/// Calling this from every dispatch-commitment point makes the invariant
+/// independent of which return path the waking handler happens to take.
+/// (The aarch64 wake was additionally given its own non-dispatching SGI —
+/// see `arch.dispatch.smp` — but that only covers the wake, not the tick.)
+///
+/// Safe at any dispatch commit, for the same reason the landing pad is:
+/// `parkPerCoreCaches` ran BEFORE the park primitive, so TSS.RSP0 already
+/// names the park kstack, and the primitive's rsp swap moved us off the
+/// prev EC's kstack — an IRQ taken in the halt window is therefore
+/// already running on the park kstack, not on prev's.
+///
+/// `incoming` is the EC about to be dispatched, if any, so we never clear
+/// the flag of the EC we are in the middle of scheduling.
+fn consumePostParkClear(core: u8, incoming: ?*const ExecutionContext) void {
+    const state_ptr = &core_states[core];
+    const prev_ref = state_ptr.post_park_clear_on_cpu orelse return;
+    state_ptr.post_park_clear_on_cpu = null;
+
+    if (incoming) |inc| {
+        if (prev_ref.ptr == inc) return;
+    }
+    // Same discipline as `switchTo`'s prev clear: only clear when this
+    // core is still the EC's `last_dispatched_core`. The EC may have
+    // migrated during the park (the new core's `setCurrentEc` bumps
+    // `last_dispatched_core` but cannot reach back into our slot); that
+    // core now owns its `on_cpu` lifecycle, and clearing it here would
+    // let its reaper finalize an EC that is actively running — unmapping
+    // a kstack still named by the live TSS.RSP0.
+    if (prev_ref.ptr.last_dispatched_core != core) return;
+
+    // caller-pinned: single-producer/single-consumer slot written by this
+    // same core in `parkAndAwaitIRQ` immediately before the park
+    // primitive. The EC slab slot cannot have been freed in the park
+    // window because `finalizeDestroyMarkedDead` skips ECs with
+    // on_cpu=true, and that flag is exactly what this clear releases.
+    prev_ref.ptr.on_cpu.store(false, .release);
+}
+
 /// Asm landing pad after `parkAndAwaitIRQ`'s wake: rsp is on the park
 /// kstack, IRQs are masked. Re-enter `run()` to re-check the queue.
 /// `run()` is noreturn so the call never returns; the pushed return
@@ -898,21 +1137,11 @@ fn parkAndAwaitIRQ() void {
 export fn scheduler_run_after_park() callconv(.c) noreturn {
     const core: u8 = @truncate(arch.smp.coreID());
     // Clear the previously-dispatched EC's `on_cpu` flag now that we
-    // are on the park kstack. TSS.RSP0 was repointed by parkPerCoreCaches
-    // before sti+hlt, and the rsp swap moved us off the prev EC's kstack
-    // entirely — neither hardware nor any code on this core references
-    // the prev kstack. Clearing on_cpu unblocks `takeOwnPendingZombie`
-    // for any zombie that pinned this slot during the park.
-    const state_ptr = &core_states[core];
-    if (state_ptr.post_park_clear_on_cpu) |prev_ref| {
-        // caller-pinned: single-producer/single-consumer slot written by
-        // this same core in `parkAndAwaitIRQ` immediately before sti+hlt.
-        // The EC slab slot cannot have been freed in the park window
-        // because `finalizeDestroyMarkedDead` skips ECs with on_cpu=true,
-        // and that flag is exactly what this clear is about to release.
-        prev_ref.ptr.on_cpu.store(false, .release);
-        state_ptr.post_park_clear_on_cpu = null;
-    }
+    // are on the park kstack. Clearing on_cpu unblocks
+    // `takeOwnPendingZombie` for any zombie that pinned this slot during
+    // the park. This is the normal consumer; see `consumePostParkClear`
+    // for why it cannot be the only one.
+    consumePostParkClear(core, null);
     // Re-drain pending_zombie now that the prev EC's on_cpu is false.
     // The pre-park drain ran while the kstack was still in use (we were
     // standing on it) and skipped via the standing_on_zombie /
@@ -1044,6 +1273,7 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         // PerCore.committed_ec). The dispatch path clears it after
         // the root load+publish.
         state.committed_ec = ec;
+        state.idle_parked = false;
         return ec;
     }
     if (state.idle_ec) |idle_ref| {
@@ -1051,8 +1281,14 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         // never freed — it's the dispatch-of-last-resort target.
         idle_ref.ptr.last_dispatched_core = core;
         state.committed_ec = idle_ref.ptr;
+        state.idle_parked = false;
         return idle_ref.ptr;
     }
+    // Nothing to run: the caller parks this core. Publish that decision
+    // under `core_locks[core]` so a concurrent `enqueueOnCore` knows to
+    // send the wake IPI even though `current_ec` has not been cleared
+    // yet. See `PerCore.idle_parked`.
+    state.idle_parked = true;
     return null;
 }
 
@@ -1062,10 +1298,13 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
 /// futex wake, timer fires, and the boot path.
 ///
 /// Wake / preempt policy after queueing:
-///   - target idle (no `current_ec`) and target != self: send wake IPI
-///     so the parked `hlt` exits and `run` re-runs `dequeueOrIdle`.
+///   - target idle (no `current_ec`) or parking (`idle_parked`, set
+///     under this same lock) and target != self: send wake IPI so the
+///     parked `hlt`/`wfi` exits and `run` re-runs `dequeueOrIdle`.
 ///   - target current EC outranks `ec`: nothing to do — `ec` waits its
-///     turn.
+///     turn. Only sound because `idle_parked` was checked first: a
+///     target that has committed to parking still names its last EC in
+///     `current_ec`, and trusting that alone strands `ec` forever.
 ///   - `ec` outranks target's current EC: send a scheduler IPI to the
 ///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
 ///     it's IF-gated and fires once the caller exits its current IRQ /
@@ -1074,10 +1313,37 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
 ///     and a context-switch via `loadEcContextAndReturn` would strand
 ///     it.
 pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
-    ec.state = .ready;
-
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+
+    // Validate, and perform the `.ready` transition, INSIDE the target
+    // core's lock (stygia-qbx).
+    //
+    // This used to be an unconditional `ec.state = .ready;` as the
+    // function's first statement — before the lock was even taken — so
+    // every caller resurrected a terminated EC by construction. The
+    // damage is not merely that a dead EC gets queued: it is that the
+    // stamp DESTROYS THE EVIDENCE the dispatch-side filter keys on.
+    // `dequeueOrIdleLocked` rejects on `state == .exited`, even gen, or a
+    // dead domain ref; overwriting `.exited` with `.ready` means that in
+    // the window after `terminate` sets `.exited` but before
+    // `bumpDeadGenLocked` flips the gen, all three filter conditions read
+    // healthy and a terminated EC is dispatched.
+    //
+    // Rejecting is safe for every caller: none legitimately enqueues an
+    // `.exited` EC. Callers enqueue from `.futex_wait` (futex wake),
+    // `.suspended_on_port` (port reply/resume), `.running` (yieldTo
+    // re-enqueue), or a freshly created `.ready` EC.
+    //
+    // The even-gen check covers the case where the slot was already
+    // released — the caller holds a bare `*ExecutionContext`, so this is
+    // the only life-cycle signal available here.
+    if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) {
+        lock.unlockIrqRestore(irq);
+        return;
+    }
+    ec.state = .ready;
+
     (&core_states[core]).run_queue.enqueue(ec);
     // Publish queue residency under the target core's lock so a
     // racing `removeFromQueue(ec)` from a third core can target the
@@ -1089,6 +1355,13 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     // hint — the worst case if it changes after we decide is a spurious
     // wake or a missed preempt that the next preempt tick covers.
     const target_current = (&core_states[core]).current_ec;
+    // Read the target's parking decision under the SAME lock that just
+    // published `ec` into its queue. `current_ec` alone is not enough:
+    // a core that has already committed to parking still names its last
+    // EC there until after it drops this lock, and treating that as
+    // "busy, it will pick `ec` up later" strands `ec` on a core that
+    // never wakes. See `PerCore.idle_parked`.
+    const target_parked = (&core_states[core]).idle_parked;
     lock.unlockIrqRestore(irq);
 
     const self_core: u8 = @truncate(arch.smp.coreID());
@@ -1101,17 +1374,32 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     else
         null;
 
-    if (target_current_ptr == null) {
-        // Idle target. Local self-wake is unnecessary — the caller is
-        // running, not halted; the run loop will pick up `ec` on the
-        // next dispatch.
+    // Wake and preempt are independent decisions; evaluate both.
+    //
+    // Wake: the target is idle, or has committed to parking and is
+    // merely still carrying a stale `current_ec`. Either way the only
+    // thing that will make it look at its queue again is a wake.
+    //
+    // Local self-wake is unnecessary — the caller is running, not
+    // halted. That holds for the parked case too: an IRQ handler that
+    // wakes a core out of its park (timer tick → `expireTimedWaiters`,
+    // futex wake with affinity 0) runs on that core and returns through
+    // the park loop, which re-runs `dequeueOrIdle` and finds `ec`.
+    if (target_current_ptr == null or target_parked) {
         if (core != self_core) arch.smp.sendWakeIpi(core);
-        return;
     }
 
-    // Target is busy. Decide whether `ec` should preempt the running EC.
+    // Preempt: deliberately NOT an `else` on the wake above. A core can
+    // resume without re-running `dequeueOrIdleLocked` (`switchTo`'s
+    // vCPU-empty return unwinds through `yieldTo` back to user mode),
+    // leaving `idle_parked` stale-true while it is genuinely busy.
+    // Folding the preempt into the wake's `else` would swallow the
+    // priority decision in exactly that case and delay a higher-
+    // priority EC by up to a full quantum. A wake IPI to a running core
+    // does not reschedule; only the scheduler IPI does.
+    //
     // caller-pinned: snapshot ptr; race-tolerant priority compare.
-    const cur = target_current_ptr.?;
+    const cur = target_current_ptr orelse return;
     if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
 
     // Same-core higher-pri: send a LAPIC self-IPI (deferred until the

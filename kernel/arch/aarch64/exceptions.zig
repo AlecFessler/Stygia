@@ -1018,6 +1018,31 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             }
             slot.ackDone();
         },
+        // SGI 3 — cross-core idle wake (`arch.dispatch.smp.sendWakeIpi`).
+        // Intentionally EMPTY. The wake's entire job is to make a parked
+        // core's `wfi` retire; `cpu.parkAndAwaitIRQ` then falls through
+        // to `b scheduler_run_after_park`, which re-runs `run()` and
+        // picks up the freshly enqueued EC.
+        //
+        // This handler must RETURN. Do not route the wake to SGI 0 or
+        // otherwise call into `scheduler.preempt()` here. `parkAndAwaitIRQ`
+        // takes its IRQ inside the single-instruction `msr daifclr, #2`
+        // window between the `wfi` and the `b`, and
+        // `scheduler_run_after_park` is the ONLY writer that clears the
+        // previously-dispatched EC's `on_cpu` (by then `current_ec` is
+        // already null, so `switchTo`'s prev-clear edge has nothing to
+        // clear from — see the `post_park_clear_on_cpu` comment in
+        // `sched.scheduler.parkAndAwaitIRQ`). A handler that dispatches
+        // never returns, so the `b` is never reached, and that EC's
+        // `on_cpu` is stranded `true` forever: `finalizeDestroyMarkedDead`
+        // skips on_cpu=true, its zombie is never reaped, `postZombie`
+        // spins, and the slab slot leaks. The next park overwrites
+        // `post_park_clear_on_cpu`, losing the clear permanently.
+        //
+        // A wake is sent precisely because work was just enqueued, so a
+        // dispatching handler would hit that path on nearly every wake
+        // rather than rarely.
+        3 => {},
         gic.SGI_BCAST_TICK => {
             kprof.enter(.sched_tick);
             defer kprof.exit(.sched_tick);

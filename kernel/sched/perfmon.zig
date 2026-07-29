@@ -37,6 +37,21 @@ pub const PerfmonState = struct {
     /// (matches the `has_threshold` bit in the original config_event).
     has_threshold: u8 = 0,
 
+    /// Core whose PMU counter file currently holds this EC's live
+    /// counts, or null when the values in `arch_state.values` are
+    /// authoritative and no core's hardware is driving them.
+    ///
+    /// The PMU register file is per-core hardware, so an EC that
+    /// migrates must carry its counts with it — `scheduler.pmuSwitch`
+    /// saves the outgoing EC's counters and restores the incoming EC's
+    /// on every dispatch. This field is the ownership token for that
+    /// handoff: only the core named here may `pmuSave` into
+    /// `arch_state`, which stops a core that dispatched this EC in the
+    /// past (and still names it in a stale `current_ec` slot) from
+    /// overwriting the values with its own unrelated counter file. See
+    /// `scheduler.pmuSwitch` for the full rationale.
+    hw_core: ?u8 = null,
+
     /// Arch PMU control state — MSR snapshots, hardware counter
     /// assignment, sub-counter event-select encodings. Carried inline
     /// because the kernel has no general-purpose heap; the only

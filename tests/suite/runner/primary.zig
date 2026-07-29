@@ -25,6 +25,8 @@
 //     initial_ec_affinity` (added in this commit) is the substrate
 //     this design needs.
 
+const std = @import("std");
+
 const lib = @import("lib");
 const embedded_tests = @import("embedded_tests");
 const libz_loader = @import("libz_loader");
@@ -50,6 +52,18 @@ pub const RUNNER_STATIC = true;
 // cost on top. Overhead-free when the batch finishes early; only
 // costs extra wall-clock on a genuine hang.
 const RECV_TIMEOUT_NS: u64 = 30_000_000_000;
+
+// stygia-ojs post-timeout probe budget. On a batch recv timeout the
+// runner re-arms recv with a deliberately tiny deadline and then with
+// second-scale ones, purely to classify WHY the deadline was hit. See
+// `probeAfterTimeout` in the batch loop. PROBE_FAST_NS is far shorter
+// than any plausible test body, so a delivery on the fast probe means
+// the event was ALREADY sitting in the port when the 30 s recv returned
+// E_TIMEOUT — i.e. the kernel lost the receiver's wake rather than the
+// sender failing to produce a result.
+const PROBE_FAST_NS: u64 = 1_000_000;
+const PROBE_SLOW_NS: u64 = 1_000_000_000;
+const PROBE_SLOW_ROUNDS: usize = 5;
 
 // Tag magic. The build emits each test ELF with `test_tag.TAG =
 // TAG_MAGIC | manifest_index`. Tests that explicitly suspend their
@@ -190,16 +204,21 @@ pub fn main(cap_table_base: u64) void {
     // bursts. Spec doesn't forbid batched orchestration; the kernel
     // sees identical per-test syscalls regardless of batching.
     //
-    // BATCH=4 (vs BATCH=16) is empirically required to clear the spawn
-    // loop past iter ~432. With BATCH=16 the runner deadlocks in the
-    // spawn-loop body before recv ever drains the batch — the failure
-    // surfaces as no `spawned 16/16` print after `[runner] batch 416..432`
-    // (kernel still ticking, runner EC parked). The exact contention
-    // hasn't been pinpointed; it is independent of the per-domain
-    // resource leak fixed by `disarmTimerHandlesInDomain` — that fix
-    // is correct on its own merits but does NOT lift the BATCH=16
-    // wall.
-    const BATCH: usize = 4;
+    // Default 4. Historically 4 was required to clear the spawn loop
+    // past iter ~432: at 16 the runner wedged in the spawn-loop body
+    // before recv ever drained the batch, surfacing as no
+    // `spawned 16/16` print after `[runner] batch 416..432` with the
+    // kernel still ticking and the runner EC parked (stygia-utf). The
+    // contention was never pinpointed, and it is independent of the
+    // per-domain resource leak fixed by `disarmTimerHandlesInDomain`.
+    //
+    // Now set by `-Dbatch=N` so the wall can be re-tested without
+    // editing test code. Note "runner EC parked, kernel still ticking"
+    // is the exact signature `parkSelfFaulted` leaves behind on an
+    // unrouted fault — which `[NOROUTE]` reporting in sched/port.zig
+    // now announces, so a re-run should say directly whether that is
+    // what happens.
+    const BATCH: usize = embedded_tests.batch;
     // Aggregate counters across all repeats — used by the final
     // multi-run summary at end. Per-run summaries print after each.
     var agg_pass: usize = 0;
@@ -261,6 +280,86 @@ pub fn main(cap_table_base: u64) void {
                 serial.print(" / ");
                 serial.printU64(successful_spawns);
                 serial.print(" results — skipping rest of batch\n");
+                // Name the tests that are still outstanding at the
+                // timeout instant. `summarize` reports these later as
+                // MISS anyway, but by then the batch boundary is lost,
+                // and it is the batch shape that discriminates the two
+                // stygia-ojs severities: exactly one outstanding (a
+                // single EC's result lost) versus the whole batch
+                // outstanding (nothing delivered at all, which is not
+                // BATCH independent losses).
+                serial.print("[runner]   outstanding in batch ");
+                serial.printU64(batch_idx);
+                serial.print("..");
+                serial.printU64(batch_end);
+                serial.print(":");
+                var oi = batch_idx;
+                while (oi < batch_end) : (oi += 1) {
+                    if (results[oi].code == .not_run) {
+                        serial.print(" ");
+                        serial.print(embedded_tests.manifest[oi].name);
+                    }
+                }
+                serial.print("\n");
+                // Classify the timeout before abandoning the batch.
+                // Three outcomes are possible and they point at three
+                // different bugs, so guessing is not good enough:
+                //
+                //   fast=N (N > 0)  The result was already queued on the
+                //     port when the 30 s recv returned E_TIMEOUT. A 1 ms
+                //     recv cannot have waited for a test to finish, so
+                //     this is a KERNEL bug on the receive side — a lost
+                //     wake or a spurious timeout — not a stuck test.
+                //   slow=N          The sender ECs were merely late;
+                //     something starved them past 30 s.
+                //   both zero       The sender ECs never produced a
+                //     result at all (dead, parked, or faulted silently).
+                //
+                // Probed events are deliberately NOT recorded: they stay
+                // MISS in the summary. This is instrumentation, and it
+                // must not turn a real failure into a pass.
+                var probe_fast: usize = 0;
+                var probe_slow: usize = 0;
+                {
+                    const want = batch_started - batch_collected;
+                    while (probe_fast + probe_slow < want) {
+                        const p = syscall.recv(port_handle, PROBE_FAST_NS);
+                        if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
+                            probe_fast += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    var round: usize = 0;
+                    while (round < PROBE_SLOW_ROUNDS and
+                        probe_fast + probe_slow < want) : (round += 1)
+                    {
+                        const p = syscall.recv(port_handle, PROBE_SLOW_NS);
+                        if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
+                            probe_slow += 1;
+                        }
+                    }
+                }
+                serial.print("[runner]   probe: fast=");
+                serial.printU64(probe_fast);
+                serial.print(" slow=");
+                serial.printU64(probe_slow);
+                serial.print(" of ");
+                serial.printU64(batch_started - batch_collected);
+                serial.print(" outstanding\n");
+                if (embedded_tests.halt_on_miss) {
+                    // Freeze so the corpse stays inspectable — see the
+                    // -Dhalt_on_miss rationale in build.zig. Spin in
+                    // user mode rather than exiting: the kernel keeps
+                    // the lost EC, its port state and the per-core
+                    // scheduler state exactly as they are, and the
+                    // qemu gdb stub stays attachable. The harness sees
+                    // "no summary" and preserves the VM.
+                    serial.print("[runner] halt_on_miss — freezing for inspection (gdb stub)\n");
+                    while (true) {
+                        std.atomic.spinLoopHint();
+                    }
+                }
                 batch_recv_timed_out = true;
                 break;
             }

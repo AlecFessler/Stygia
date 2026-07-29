@@ -8,6 +8,7 @@
 // Compiles against `std` only and is exercised on the host via
 // `zig test kernel/utils/sync/debug_core.zig`.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 pub const SrcLoc = std.builtin.SourceLocation;
@@ -16,6 +17,34 @@ pub const HELD_STACK_DEPTH: u8 = 8;
 pub const MAX_CORES: usize = 8;
 pub const PAIR_REGISTRY_CAPACITY: usize = 512;
 pub const CLASS_TABLE_CAPACITY: usize = 256;
+
+/// Spin ceiling for the detector's OWN internal table locks
+/// (`PairRegistry.lock`, `ClassTable.lock`). On expiry the caller skips
+/// that piece of bookkeeping instead of spinning forever.
+///
+/// Rationale: these two locks are pure debug instrumentation with no
+/// correctness role in the running kernel, so degrading them is sound by
+/// construction — losing one lockdep observation is strictly better than
+/// losing the machine. Both were previously unbounded, and a core that
+/// died or stalled while holding one wedged every other core that
+/// subsequently took *any* SpinLock, because every acquire funnels
+/// through `checkIrqModeOn`. That amplification turned single-core faults
+/// into whole-machine wedges in the stygia-3ys corpses, and it also ate
+/// the panic report: a panicking core cannot describe itself while it is
+/// blocked on a lock the panic is contending over.
+///
+/// The ceiling is deliberately far above any healthy contention. The
+/// critical sections are a bounded hash probe over a fixed-capacity
+/// table with IRQs masked (see `debug.acquire`), so with `MAX_CORES`
+/// contenders the true worst case is a few thousand spins; 4M leaves
+/// ~1000x headroom and is only reachable when a holder is genuinely
+/// never going to release.
+///
+/// Host tests are exempt: the failure this bounds (a core dying mid-hold)
+/// cannot happen under `std.Thread`, whereas OS descheduling of a holder
+/// can legitimately exceed any spin count, and a spuriously skipped
+/// insertion would make the cycle-detection tests flaky.
+pub const TABLE_SPIN_LIMIT: usize = if (builtin.is_test) std.math.maxInt(usize) else 1 << 22;
 
 pub const Entry = struct {
     lock_ptr: *const anyopaque,
@@ -76,10 +105,17 @@ pub const PairRegistry = struct {
     /// saved-RIP slots, producing cascading downstream panics.
     pathexists_visited: [PAIR_REGISTRY_CAPACITY][*:0]const u8 = undefined,
 
-    fn acquireLock(self: *PairRegistry) void {
+    /// Bounded acquire. Returns false if `TABLE_SPIN_LIMIT` spins elapse
+    /// without the lock coming free — see that constant for why giving up
+    /// is the correct behaviour here.
+    fn tryAcquireLock(self: *PairRegistry) bool {
+        var spins: usize = 0;
         while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            if (spins >= TABLE_SPIN_LIMIT) return false;
+            spins += 1;
             std.atomic.spinLoopHint();
         }
+        return true;
     }
 
     fn releaseLock(self: *PairRegistry) void {
@@ -229,10 +265,19 @@ pub const ClassTable = struct {
     entries: [CLASS_TABLE_CAPACITY]ClassEntry = [_]ClassEntry{.{}} ** CLASS_TABLE_CAPACITY,
     lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    fn acquireLock(self: *ClassTable) void {
+    /// Bounded acquire — see `PairRegistry.tryAcquireLock` and
+    /// `TABLE_SPIN_LIMIT`. This one matters most: every `SpinLock`
+    /// acquire in the kernel funnels through `checkIrqModeOn`, so an
+    /// unbounded wait here is a system-wide serialization point that a
+    /// single dead core can turn into a system-wide wedge.
+    fn tryAcquireLock(self: *ClassTable) bool {
+        var spins: usize = 0;
         while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            if (spins >= TABLE_SPIN_LIMIT) return false;
+            spins += 1;
             std.atomic.spinLoopHint();
         }
+        return true;
     }
 
     fn releaseLock(self: *ClassTable) void {
@@ -390,51 +435,58 @@ pub fn acquireOn(
         i += 1;
     }
 
-    registry.acquireLock();
-    defer registry.releaseLock();
+    // Cycle detection needs the shared registry; the held-stack push
+    // below does not (it is per-core state). Keeping them separable is
+    // what lets a timed-out registry acquire degrade to "skip cycle
+    // detection this once" while still recording the held entry — the
+    // recursive and same-class checks above read that stack, so dropping
+    // the push would silently disable them too.
+    if (registry.tryAcquireLock()) {
+        defer registry.releaseLock();
 
-    var j: u8 = 0;
-    while (j < stack.depth) {
-        const held = stack.entries[j];
-        if (held.class != class) {
-            // ordered_group escape extends to cross-class cycle
-            // detection: when *either* side of the (held, acquiring)
-            // pair is opt-in-ordered (non-zero ordered_group), the
-            // caller has guaranteed safe ordering across every
-            // instance involved in that group. Skip both the cycle
-            // check and the edge registration for that pair so the
-            // ordered acquisition does not pollute the registry with
-            // an edge that contradicts another path's ordering. The
-            // futex bucket group, the ipc-reply Thread/Process
-            // overlap, and the fault-block Process/Thread overlap
-            // all rely on this; without it, every same-class
-            // ordered_group acquisition would still register a
-            // distinct (held.class, class) pair edge against any
-            // non-ordered lock on the held stack and seed AB-BA
-            // panics on the inverse class-level pair.
-            if (held.ordered_group == 0 and ordered_group == 0) {
-                if (registry.contains(class, held.class)) {
-                    const prior = registry.lookup(class, held.class) orelse PairEntry{};
-                    return .{
-                        .result = .panic_cycle,
-                        .cycle_outer = class,
-                        .cycle_inner = held.class,
-                        .cycle_prior_outer_src = prior.outer_src,
-                        .cycle_prior_inner_src = prior.inner_src,
-                    };
+        var j: u8 = 0;
+        while (j < stack.depth) {
+            const held = stack.entries[j];
+            if (held.class != class) {
+                // ordered_group escape extends to cross-class cycle
+                // detection: when *either* side of the (held, acquiring)
+                // pair is opt-in-ordered (non-zero ordered_group), the
+                // caller has guaranteed safe ordering across every
+                // instance involved in that group. Skip both the cycle
+                // check and the edge registration for that pair so the
+                // ordered acquisition does not pollute the registry with
+                // an edge that contradicts another path's ordering. The
+                // futex bucket group, the ipc-reply Thread/Process
+                // overlap, and the fault-block Process/Thread overlap
+                // all rely on this; without it, every same-class
+                // ordered_group acquisition would still register a
+                // distinct (held.class, class) pair edge against any
+                // non-ordered lock on the held stack and seed AB-BA
+                // panics on the inverse class-level pair.
+                if (held.ordered_group == 0 and ordered_group == 0) {
+                    if (registry.contains(class, held.class)) {
+                        const prior = registry.lookup(class, held.class) orelse PairEntry{};
+                        return .{
+                            .result = .panic_cycle,
+                            .cycle_outer = class,
+                            .cycle_inner = held.class,
+                            .cycle_prior_outer_src = prior.outer_src,
+                            .cycle_prior_inner_src = prior.inner_src,
+                        };
+                    }
+                    if (registry.pathExists(class, held.class)) {
+                        return .{
+                            .result = .panic_cycle,
+                            .cycle_outer = class,
+                            .cycle_inner = held.class,
+                            .cycle_transitive = true,
+                        };
+                    }
+                    registry.insert(held.class, class, held.src, src);
                 }
-                if (registry.pathExists(class, held.class)) {
-                    return .{
-                        .result = .panic_cycle,
-                        .cycle_outer = class,
-                        .cycle_inner = held.class,
-                        .cycle_transitive = true,
-                    };
-                }
-                registry.insert(held.class, class, held.src, src);
             }
+            j += 1;
         }
-        j += 1;
     }
 
     if (stack.depth < HELD_STACK_DEPTH) {
@@ -465,7 +517,11 @@ pub fn checkIrqModeOn(
     irqs_enabled: bool,
     src: SrcLoc,
 ) CheckOutcome {
-    table.acquireLock();
+    // Degrade rather than block — see `TABLE_SPIN_LIMIT`. Skipping one
+    // observation can only lose a detection, never manufacture a false
+    // one, because a mismatch requires two recorded sightings of the
+    // same class.
+    if (!table.tryAcquireLock()) return .{};
     defer table.releaseLock();
     const r = table.record(class, in_irq_handler, irqs_enabled, src);
     if (!r.mismatch) return .{};

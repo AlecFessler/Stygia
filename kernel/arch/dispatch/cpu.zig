@@ -298,6 +298,73 @@ pub fn syncInstructionCache() void {
     }
 }
 
+/// Make the bytes in `[start, start+len)` visible to instruction fetch.
+/// `start` is any kernel-accessible VA aliasing the physical range (the
+/// physmap alias is the natural choice) — `dc cvau` / `ic ivau` operate
+/// on the physical line behind the VA, so the target address space does
+/// not have to be active.
+///
+/// On x86-64 this is a no-op: the I-cache is coherent with stores.
+///
+/// On aarch64 it is required whenever a physical page becomes reachable
+/// by instruction fetch, because the I and D caches are NOT coherent.
+/// Two distinct hazards, both live before this existed (stygia-ojs):
+///
+///   1. The kernel zero-fills a recycled page frame through the physmap
+///      (a DATA-side write). That does not evict I-cache lines left over
+///      from the frame's PREVIOUS owner, so the new owner can
+///      instruction-fetch the previous domain's bytes — a correctness
+///      bug and an information-disclosure bug.
+///   2. Anything the kernel writes into a page that is about to be
+///      executable sits dirty in L1D and has not reached the PoU, so
+///      the first fetch can see stale (typically zero) bytes. Zeros
+///      decode as `udf #0` on aarch64, i.e. an undefined-instruction
+///      abort.
+///
+/// Sequence per ARM ARM B2.4.6 / D5.10.2: clean the data lines to the
+/// PoU, barrier, invalidate the instruction lines, barrier, then `isb`
+/// so this core refetches. `ic ivau` is broadcast to the inner
+/// shareable domain, so peer cores are covered without an IPI.
+///
+/// NOTE this does NOT make code that USERSPACE writes visible — those
+/// stores land after this runs. Userspace must do its own maintenance
+/// for self-modifying code, which is why SCTLR_EL1.UCI is enabled in
+/// `arch.aarch64.init` (see `enableEl0CacheMaintenance`).
+pub fn syncInstructionCacheRange(start: u64, len: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {
+            if (len == 0) return;
+            // Conservative fixed line size; matches the assumption
+            // already made by `cleanInvalidateDcacheRange` above. A
+            // too-small line size is always safe (extra ops), a
+            // too-large one would skip lines.
+            const line: u64 = 64;
+            const end = start + len;
+            var addr = start & ~(line - 1);
+            while (addr < end) : (addr += line) {
+                asm volatile ("dc cvau, %[a]"
+                    :
+                    : [a] "r" (addr),
+                    : .{ .memory = true });
+            }
+            asm volatile ("dsb ish" ::: .{ .memory = true });
+            addr = start & ~(line - 1);
+            while (addr < end) : (addr += line) {
+                asm volatile ("ic ivau, %[a]"
+                    :
+                    : [a] "r" (addr),
+                    : .{ .memory = true });
+            }
+            asm volatile (
+                \\dsb ish
+                \\isb
+                ::: .{ .memory = true });
+        },
+        else => unreachable,
+    }
+}
+
 /// Clean the data cache over the given byte range to the Point of
 /// Unification. On x86-64 this is a no-op (coherent caches). On aarch64
 /// this is required after writing freshly loaded ELF code through the
