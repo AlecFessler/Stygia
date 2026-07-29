@@ -121,6 +121,64 @@ the largest. (2) interacts with cache locality and with the `last_dispatched_cor
 / `on_cpu` invariants that `stygia-3ys` and item 3 depend on — treat it as the
 risky one.
 
+### Blast radius: the entire test suite runs on one core
+
+This is bigger than "an unlucky EC can starve". Following the affinity-0 path all
+the way through shows the whole 485-test suite executes its test ECs on a single
+core, for the entire run.
+
+The chain, all four links verified in source:
+
+1. **The runner spawns every test with `initial_ec_affinity = 0`** —
+   `tests/suite/runner/primary.zig:618-625`. Per-core ECs with pinned affinity
+   are explicitly *deferred future work* in that file's own header
+   (`primary.zig:19-26`).
+2. **`affinity = 0` enqueues the child on the calling core** —
+   `kernel/caps/capability_domain.zig:531-539`:
+   `if (initial_ec_affinity == 0) break :blk calling_core;`
+   The runner is a single EC, so "the calling core" is always the same core.
+3. **Re-enqueue on preemption picks the current core again** —
+   `scheduler.zig:617-620` computes `local_allowed = cur.affinity == 0 or ...`,
+   which is unconditionally true for `affinity == 0`, so the EC goes back on the
+   core it just ran on.
+4. **Nothing else ever moves it.** The scheduler says so directly at
+   `scheduler.zig:612`: *"there is no other migration trigger — `setAffinity`
+   writes the mask without repositioning, and `preempt` re-enters this same
+   path"*. There is no work stealing and no pull path; the only
+   `migrate`-shaped function in the file, `migrateFlush`, is an FPU-state
+   helper.
+
+Tests create their worker ECs from the test EC, also with affinity 0, so those
+land on the same core too. Net effect: on a 4-core target, test workloads use one
+core and three sit idle.
+
+Two consequences worth separating:
+
+- **Correctness/robustness.** This is the amplifier behind the whole starvation
+  family (`stygia-zzy`, `stygia-ojs`, `stygia-yj0`) and the leading mechanism for
+  `stygia-9tt`, where all 16 ECs of one batch went MISS together. Sixteen ECs
+  starving *simultaneously* is a single-core queueing phenomenon, not sixteen
+  independent accidents.
+- **Coverage.** The primary validation loop structurally cannot exercise
+  cross-core scheduling of test ECs. Any bug that needs two test ECs on two
+  different cores is invisible to it. That is a blind spot in the main gate, and
+  it is worth knowing before reading "485/485" as broad multi-core assurance.
+
+It also explains the latency numbers measured for `stygia-dk6`: 16-29 ms for an
+always-runnable EC and up to ~70 ms for a freshly-woken one are what
+single-core queueing with ~16 resident ECs looks like, not what a 4-core box
+should produce.
+
+One stale comment was corrected while establishing this:
+`capability_domain.zig` claimed "The scheduler's pull path can still migrate it
+later" next to the affinity-0 enqueue. There is no pull path; the comment
+described a mechanism that does not exist and made the pinning look temporary.
+
+Note this cuts both ways for remedy (3) above: adding work stealing would change
+the suite from single-core to genuinely concurrent, which is the point — but it
+would also expose the suite to cross-core races it has never run against, so
+expect new failures that are pre-existing bugs rather than regressions.
+
 ---
 
 ## 3. `stygia-5pw` (P2) — self-park clears `on_cpu` while still on the EC's kstack

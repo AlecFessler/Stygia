@@ -526,8 +526,24 @@ pub fn createCapabilityDomain(
     // Enqueue the initial EC on a core that satisfies its affinity
     // mask. With affinity = 0 (any core) or a mask containing the
     // calling core, prefer the calling core; otherwise use the lowest
-    // bit set in the mask. The scheduler's pull path can still migrate
-    // it later. Spec §[create_capability_domain] [5].
+    // bit set in the mask. Spec §[create_capability_domain] [5].
+    //
+    // NOTE: this placement is PERMANENT, not a first guess. There is no
+    // work stealing and no pull path — `scheduler.zig` says so at the
+    // affinity check in `yieldTo` ("there is no other migration trigger
+    // — `setAffinity` writes the mask without repositioning, and
+    // `preempt` re-enters this same path"), and for `affinity == 0` the
+    // preemption re-enqueue re-picks the current core every time. So an
+    // `affinity = 0` child is pinned for life to whichever core created
+    // it, even though the spec calls 0 "kernel picks any core".
+    //
+    // That matters most for a single spawner: the test runner creates
+    // every test domain from one EC with affinity 0, so the entire suite
+    // executes on one core while the rest idle. See stygia-yxj and
+    // docs/kernel/open-design-questions.md.
+    //
+    // (An earlier version of this comment claimed "the scheduler's pull
+    // path can still migrate it later". No such path exists.)
     const calling_core: u64 = arch.smp.coreID();
     const enqueue_core: u64 = blk: {
         if (initial_ec_affinity == 0) break :blk calling_core;
