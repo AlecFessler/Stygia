@@ -40,12 +40,14 @@
 //   fire. arm cap is not strictly required (we never call timer_rearm
 //   here) but adding it doesn't change the test surface.
 //
-//   Use a deadline_ns of 1 ms — long enough that the kernel timer
-//   path doesn't churn but short enough that two fires complete well
-//   inside the 1 s futex wait timeout the test uses as a fence.
+//   Use a deadline_ns of 400 ms — long enough that a woken observer
+//   always completes its sync + readCap before the next fire (see the
+//   sizing note at `deadline_ns` below), but short enough that a single
+//   fire still lands well inside the 1 s futex wait timeout the test
+//   uses as a fence.
 //
 // Action
-//   1. timerArm(caps={cancel}, deadline_ns=1_000_000, periodic=1) →
+//   1. timerArm(caps={cancel}, deadline_ns=400_000_000, periodic=1) →
 //      must return a handle.
 //   2. futex_wait_val(timeout=1s, addr=&field0, expected=0) →
 //      blocks until first fire, returns &field0.
@@ -92,17 +94,32 @@ pub fn main(cap_table_base: u64) void {
     };
     const caps_word: u64 = @as(u64, timer_caps.toU16());
 
-    // 50 ms period. Two fires complete well within the 1 s futex wait
-    // timeout, but the gap between fires is long enough that the
-    // intervening `sync` + `readCap` window on slow hosts (aarch64 Pi 5
-    // KVM with the in-kernel-parallel runner) cannot overlap a second
-    // fire. The earlier 1 ms period left no margin for futex
-    // wake → user-mode resume → sync → readCap on KVM aarch64; field0
-    // would tick to 2 before the post-wake read landed and the test
-    // tripped on assertion 4. Spec §[timer_arm] only pins the order of
-    // counter values, not their absolute timing, so any period that
-    // keeps the assertion observable is conformant.
-    const deadline_ns: u64 = 50_000_000;
+    // 400 ms period. The period must exceed the worst-case
+    // fire → futex wake → user-mode resume → sync → readCap latency,
+    // or field0 ticks to 2 before the post-wake read lands and the test
+    // trips on assertion 4 having never observed the value 1. Spec
+    // §[timer_arm] only pins the order of counter values, not their
+    // absolute timing, so any period that keeps the assertion
+    // observable is conformant.
+    //
+    // Sizing is measured, not guessed (stygia-39p / timer_arm_08 aid=4).
+    // On aarch64 Pi 5 KVM with the in-kernel-parallel runner at
+    // -Dbatch=16, instrumented runs showed:
+    //   - an always-runnable EC busy-polling field0 first sees the
+    //     fire-1 write 16-29 ms after the scheduled deadline;
+    //   - a freshly-woken EC, re-entering the priority run queue behind
+    //     15 peers, takes up to ~70 ms to resume and complete the read.
+    // 1 ms failed constantly, and 50 ms still failed 6/6 boots — the
+    // observer resumed only after fire 2, reading field0 == 2 with just
+    // 1 ms spent between wake and read. 400 ms is 5-6x the measured
+    // worst case and passed 6/6 boots of the timer group at batch 16.
+    //
+    // The delay is scheduling latency, not a lost wake: a genuinely
+    // dropped fire-1 wake would fail identically at 400 ms (waking at
+    // fire 2, 800 ms in, still inside the futex timeout), and it does
+    // not. Two fires at 400 ms leave ~530 ms of slack under the 1 s
+    // per-wait timeout, so a real missed fire still trips it.
+    const deadline_ns: u64 = 400_000_000;
 
     const arm_result = syscall.timerArm(caps_word, deadline_ns, PERIODIC_FLAG);
     if (testing.isHandleError(arm_result.v1)) {

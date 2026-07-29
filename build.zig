@@ -403,11 +403,46 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── Root service (copied into FAT image, loaded by bootloader) ─────
+    //
+    // The root service is a PREBUILT input: this build copies it verbatim
+    // and never re-derives it. `tests/suite/bin/root_service.elf` is
+    // arch-specific and is produced by a separate `cd tests/suite &&
+    // zig build [-Darch=arm]`, so building the kernel for one arch after
+    // building the suite for the other silently pairs an x86-64
+    // kernel.elf with an aarch64 root_service.elf (or vice versa).
+    //
+    // That mismatch used to exit 0 and boot. The bootloader maps the
+    // foreign ELF and jumps to its "entry", which lands in a zeroed page;
+    // on x86 the leading 00 00 decodes as `add %al,(%rax)` with rax = 0,
+    // producing a boot-time USR-PF write to address 0 followed by a
+    // single-live-EC [HANG] — a signature indistinguishable from a
+    // scheduler regression, and the leading explanation for stygia-gms.
+    // Verify it at configure time instead. See also
+    // `zig-out` staleness below.
+    //
+    // `-Dimage_check=false` waives both guards, for builds that consume only
+    // `kernel.elf` / `kernel.{arch}.ll` and never boot the image — the
+    // callgraph indexer's two back-to-back cross-arch builds in
+    // tests/precommit.sh are the only such caller. Anything that boots must
+    // leave the guards on.
+    const image_check = b.option(
+        bool,
+        "image_check",
+        "Reject an arch-mixed boot image at configure time (default: on; off only for builds that consume kernel.elf/.ll and never boot)",
+    ) orelse true;
+    if (image_check) verifyRootServiceArch(root_service_path, arch);
+
     const install_root_service = b.addInstallFile(
         .{ .cwd_relative = root_service_path },
         b.fmt("{s}/root_service.elf", .{out_dir}),
     );
     b.getInstallStep().dependOn(&install_root_service.step);
+
+    // `zig-out/` is not cleaned on an arch switch, so the previous arch's
+    // EFI loader survives beside the new one and the firmware may pick
+    // either. The install step writes only the matching loader, so a
+    // foreign one present here is always stale.
+    if (image_check) verifyNoStaleLoader(b, out_dir, arch);
 
     // ── QEMU ────────────────────────────────────────────────────────────
     // NVMe is on by default under -Dprofile=linux_guest (guest needs a
@@ -529,4 +564,108 @@ pub fn build(b: *std.Build) void {
     }
     const run_qemu_cmd = b.step("run", "Run QEMU");
     run_qemu_cmd.dependOn(&qemu_cmd.step);
+}
+
+/// ELF `e_machine` values for the two architectures this kernel targets.
+/// (`std.elf.EM` exists, but reading the two bytes directly keeps this
+/// guard independent of the host toolchain's ELF definitions.)
+const EM_X86_64: u16 = 0x3E;
+const EM_AARCH64: u16 = 0xB7;
+
+fn archMachineName(machine: u16) []const u8 {
+    return switch (machine) {
+        EM_X86_64 => "x86-64",
+        EM_AARCH64 => "aarch64",
+        else => "unknown",
+    };
+}
+
+/// Fail the build if the prebuilt root service ELF was compiled for a
+/// different architecture than the kernel we are about to pair it with.
+///
+/// Runs at configure time and deliberately stays silent when the file is
+/// absent or unreadable: a missing root service already fails later, at
+/// the install step, with a clearer message than anything we could emit.
+fn verifyRootServiceArch(path: []const u8, arch: std.Target.Cpu.Arch) void {
+    const want: u16 = switch (arch) {
+        .x86_64 => EM_X86_64,
+        .aarch64 => EM_AARCH64,
+        else => return,
+    };
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+
+    // e_ident[16] then e_type (u16) then e_machine (u16) — machine is at
+    // offset 18 in both ELF32 and ELF64.
+    var hdr: [20]u8 = undefined;
+    const n = file.readAll(&hdr) catch return;
+    if (n < hdr.len) return;
+    if (!std.mem.eql(u8, hdr[0..4], "\x7fELF")) return;
+
+    const got = std.mem.readInt(u16, hdr[18..20], .little);
+    if (got == want) return;
+
+    std.debug.print(
+        \\
+        \\error: root service arch mismatch — refusing to build a mixed image.
+        \\
+        \\  kernel target : {s}
+        \\  {s} : {s} (e_machine = 0x{X:0>2})
+        \\
+        \\This file is a prebuilt input; the kernel build copies it verbatim and
+        \\never re-derives it. Rebuild it for this arch, then rebuild the kernel:
+        \\
+        \\  cd tests/suite && rm -rf bin/ .zig-cache && zig build{s}
+        \\  cd - && rm -rf zig-out && zig build -Dprofile=test{s}
+        \\
+        \\Booting the mismatched pair would jump into a zeroed page and produce a
+        \\boot-time USR-PF write to address 0 plus a single-live-EC [HANG], which
+        \\looks exactly like a scheduler regression and is not one (stygia-gms).
+        \\
+    , .{
+        archMachineName(want),
+        path,
+        archMachineName(got),
+        got,
+        if (arch == .aarch64) " -Darch=arm" else "",
+        if (arch == .aarch64) " -Darch=arm" else "",
+    });
+    std.process.exit(1);
+}
+
+/// Fail the build if `zig-out` still holds the other architecture's EFI
+/// loader. The install step writes only the matching loader and nothing
+/// prunes the output tree on an arch switch, so a foreign loader here is
+/// always a leftover — and the firmware may boot it instead.
+fn verifyNoStaleLoader(b: *std.Build, out_dir: []const u8, arch: std.Target.Cpu.Arch) void {
+    const stale_name = switch (arch) {
+        .x86_64 => "BOOTAA64.EFI",
+        .aarch64 => "BOOTX64.EFI",
+        else => return,
+    };
+    const stale_path = b.fmt("{s}/{s}/efi/boot/{s}", .{ b.install_path, out_dir, stale_name });
+    std.fs.cwd().access(stale_path, .{}) catch return;
+
+    std.debug.print(
+        \\
+        \\error: stale EFI loader in the output tree — refusing to build a mixed image.
+        \\
+        \\  found : {s}
+        \\  but this is a {s} build, which installs {s}
+        \\
+        \\`zig-out` is not pruned on an arch switch, so both loaders would sit in
+        \\the FAT image and the firmware may pick either one. Clear it first:
+        \\
+        \\  rm -rf zig-out
+        \\
+    , .{
+        stale_path,
+        archMachineName(switch (arch) {
+            .x86_64 => EM_X86_64,
+            else => EM_AARCH64,
+        }),
+        if (arch == .x86_64) "BOOTX64.EFI" else "BOOTAA64.EFI",
+    });
+    std.process.exit(1);
 }

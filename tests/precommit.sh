@@ -64,6 +64,83 @@ STYGIA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # away the existing user cache.
 export ZIG_GLOBAL_CACHE_DIR="$STYGIA_ROOT/.zig-cache"
 
+# ── Zig toolchain pin ────────────────────────────────────────────────
+# This tree does not build with Zig 0.16: `process.args`,
+# heap.GeneralPurposeAllocator, `linkLibrary`, and
+# array_list.AlignedManaged.writer all changed incompatibly, and the
+# first things to break are the analyzer tools in tools/ — so a 0.16
+# gauntlet fails with a wall of API errors in code the commit never
+# touched, which reads exactly like a regression and is not one.
+#
+# This matters most when the gauntlet runs as a git hook: hooks inherit a
+# login PATH, which typically resolves `zig` to a distro package
+# (/usr/bin/zig) rather than whatever the interactive shell uses. So
+# resolve and verify the toolchain here instead of trusting PATH.
+#
+# Resolution order:
+#   1. $STYGIA_ZIG, if set — explicit override, must be the right version.
+#   2. `zig` as PATH already resolves it, if the version matches.
+#   3. A pinned toolchain directory in a conventional location.
+REQUIRED_ZIG="0.15.2"
+
+resolve_zig() {
+    local found=""
+
+    if [[ -n "${STYGIA_ZIG:-}" ]]; then
+        if [[ ! -x "$STYGIA_ZIG" ]]; then
+            echo "error: \$STYGIA_ZIG is set to '$STYGIA_ZIG', which is not executable." >&2
+            return 1
+        fi
+        if [[ "$("$STYGIA_ZIG" version 2>/dev/null)" != "$REQUIRED_ZIG" ]]; then
+            echo "error: \$STYGIA_ZIG is Zig $("$STYGIA_ZIG" version 2>/dev/null), but this tree requires $REQUIRED_ZIG." >&2
+            return 1
+        fi
+        found="$STYGIA_ZIG"
+    elif [[ "$(zig version 2>/dev/null)" == "$REQUIRED_ZIG" ]]; then
+        return 0  # PATH is already correct; leave it alone.
+    else
+        local cand
+        for cand in \
+            "$HOME/.local/opt/zig-x86_64-linux-$REQUIRED_ZIG/zig" \
+            "$HOME/.local/opt/zig-$REQUIRED_ZIG/zig" \
+            "/opt/zig-x86_64-linux-$REQUIRED_ZIG/zig" \
+            "/opt/zig-$REQUIRED_ZIG/zig"
+        do
+            if [[ -x "$cand" ]] && [[ "$("$cand" version 2>/dev/null)" == "$REQUIRED_ZIG" ]]; then
+                found="$cand"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$found" ]]; then
+        echo "" >&2
+        echo "error: no Zig $REQUIRED_ZIG toolchain found." >&2
+        echo "" >&2
+        echo "  PATH resolves \`zig\` to: $(command -v zig 2>/dev/null || echo '<none>')" >&2
+        echo "  which reports version : $(zig version 2>/dev/null || echo '<none>')" >&2
+        echo "" >&2
+        echo "This tree does not build with Zig 0.16 — the tools/ analyzers fail" >&2
+        echo "first, with API errors unrelated to whatever you are committing." >&2
+        echo "" >&2
+        echo "Point the gauntlet at the right toolchain, e.g.:" >&2
+        echo "  STYGIA_ZIG=\$HOME/.local/opt/zig-x86_64-linux-$REQUIRED_ZIG/zig ./tests/precommit.sh" >&2
+        echo "" >&2
+        return 1
+    fi
+
+    # Prepend the resolved toolchain's directory so every `zig` in every
+    # stage — including the ones that re-exec with a modified PATH for the
+    # qemu shim — picks it up.
+    PATH="$(cd "$(dirname "$found")" && pwd):$PATH"
+    export PATH
+    echo "[zig] using $found ($REQUIRED_ZIG)"
+}
+
+if ! resolve_zig; then
+    exit 1
+fi
+
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
 # Stays as a relative path so both ssh-shell-expansion contexts
 # (`cd $PI_REMOTE_DIR …`) and scp destinations (`host:$PI_REMOTE_DIR/x`,
@@ -288,7 +365,12 @@ ensure_callgraph_db() {
         fi
         if [[ $need_rebuild_x86 -eq 1 ]]; then
             echo "  building x86_64 kernel with -Darch=x64 -Demit_ir=true (needed by indexer)"
-            if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true 2>&1); then
+            # -Dimage_check=false: this build and the aarch64 one below run
+            # back-to-back for opposite arches and consume only kernel.elf /
+            # kernel.{arch}.ll. Neither boots the image, so build.zig's
+            # arch-mixed-image guards would reject a pairing that does not
+            # matter here. Every stage that DOES boot leaves them on.
+            if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test -Darch=x64 -Demit_ir=true -Dimage_check=false 2>&1); then
                 FAILURES+=("kernel build for IR/ELF (x86_64)")
                 return 1
             fi
@@ -319,7 +401,7 @@ ensure_callgraph_db() {
         # ZIG_GLOBAL_CACHE_DIR pin.
         if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.aarch64.ll" ]]; then
             echo "  building aarch64 kernel with -Darch=arm -Demit_ir=true (needed by indexer)"
-            if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test -Demit_ir=true 2>&1); then
+            if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test -Demit_ir=true -Dimage_check=false 2>&1); then
                 FAILURES+=("kernel build for IR (aarch64)")
                 return 1
             fi
@@ -488,6 +570,10 @@ stage_x86_kernel_tests() {
         return 1
     fi
 
+    # zig-out is not pruned on an arch switch, and the indexer stage above
+    # builds both arches back-to-back, so clear it before producing an image
+    # that will actually be booted (build.zig also refuses a mixed one).
+    rm -rf "$STYGIA_ROOT/zig-out"
     echo "Building x86 kernel..."
     if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test); then
         FAILURES+=("x86 kernel build")
@@ -643,6 +729,10 @@ stage_aarch64_vm_tests_tcg() {
         FAILURES+=("aarch64 vm-tests root_service build")
         return 1
     fi
+    # zig-out is not pruned on an arch switch, and the indexer stage above
+    # builds both arches back-to-back, so clear it before producing an image
+    # that will actually be booted (build.zig also refuses a mixed one).
+    rm -rf "$STYGIA_ROOT/zig-out"
     echo "Building aarch64 kernel..."
     if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 vm-tests kernel build")
@@ -662,29 +752,49 @@ stage_aarch64_kernel_tests_pi() {
         using_tcg_fallback=1
     fi
 
-    # Both the Pi-KVM happy path AND the TCG-fallback path drop the
-    # hv-prefix groups (per TEST_OWNERSHIP.toml [hv]) from the embedded
-    # manifest, for distinct but additive reasons:
-    #   - Pi 4/5 aarch64 hardware has no nested virt support, so these
-    #     tests cannot exercise their guest-of-guest behavior on the Pi
-    #     KVM backend (would surface as MISS/FAIL on the runner). The
-    #     canonical aarch64 hv coverage path is stage [2a/4] (TCG with
-    #     gic-version=3,virtualization=on); per-test transitive coverage
-    #     is on x86 KVM stage [1/4] (VMX). bd-Zag-Subsystems-Agents-0mvk.
-    #   - The full 477-test suite under -smp 4 TCG saturates emulation
-    #     throughput and overruns the 600s outer wallclock — the slow
-    #     edge is the VM-touching tests doing real stage-2 install work.
+    # The TCG-fallback path drops the hv-prefix groups (per
+    # TEST_OWNERSHIP.toml [hv]) from the embedded manifest; the Pi-KVM
+    # happy path does not.
+    #
+    # Historically both branches dropped them, for two stated reasons:
+    #   - "Pi 4/5 aarch64 hardware has no nested virt support, so these
+    #     tests would surface as MISS/FAIL on the Pi KVM backend."
+    #     bd-Zag-Subsystems-Agents-0mvk.
+    #   - The full suite under -smp 4 TCG saturates emulation throughput
+    #     and overruns the 600s outer wallclock — the slow edge is the
+    #     VM-touching tests doing real stage-2 install work.
     #     bd-Zag-Subsystems-Agents-1jds.
-    # Net effect on stage [2/4]: hv-prefix tests are stage [2a/4]'s
-    # responsibility, not this stage's, on either branch.
+    #
+    # The first reason was measured and is false (stygia-39p): across 57
+    # Pi 5 KVM boots of the full 485-test set, the only failure from any
+    # of the seven hv groups was a single MISS of
+    # port_io_virtualization_04 — a ~2% flake, the same order as the
+    # other residual aarch64 singletons, not a "this cannot run here"
+    # signal. Every other hv test passed every boot. So the Pi branch
+    # runs the whole suite: +58 tests of real aarch64 coverage, and the
+    # port_io_virtualization_04 flake is visible instead of hidden.
+    #
+    # The second reason is independent of hardware capability and still
+    # holds, so the TCG fallback keeps the exclusion. On that branch
+    # hv-prefix tests remain stage [2a/4]'s responsibility (TCG with
+    # gic-version=3,virtualization=on); per-test transitive coverage is
+    # on x86 KVM stage [1/4] (VMX).
+    local suite_excludes=()
+    if [[ $using_tcg_fallback -eq 1 ]]; then
+        suite_excludes=(-Dtests_exclude='create_vcpu_*,create_virtual_machine_*,map_guest_*,unmap_guest_*,port_io_virtualization_*,vm_inject_irq_*,vm_set_policy_*')
+    fi
+
     echo "Building aarch64 root_service (in-kernel runner with embedded test ELFs)..."
     if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
-          zig build -Darch=arm \
-          -Dtests_exclude='create_vcpu_*,create_virtual_machine_*,map_guest_*,unmap_guest_*,port_io_virtualization_*,vm_inject_irq_*,vm_set_policy_*'); then
+          zig build -Darch=arm "${suite_excludes[@]}"); then
         FAILURES+=("aarch64 root_service build")
         return 1
     fi
 
+    # zig-out is not pruned on an arch switch, and the indexer stage above
+    # builds both arches back-to-back, so clear it before producing an image
+    # that will actually be booted (build.zig also refuses a mixed one).
+    rm -rf "$STYGIA_ROOT/zig-out"
     echo "Building aarch64 kernel..."
     if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 kernel build")
@@ -700,7 +810,7 @@ stage_aarch64_kernel_tests_pi() {
     fi
 
     echo ""
-    echo "(Suite minus hv-prefix tests on Pi KVM; Pi 4/5 hardware lacks nested virt — canonical aarch64 hv coverage runs in stage [2a/4].)"
+    echo "(Full suite on Pi KVM, hv groups included — see stygia-39p.)"
     echo "Syncing artifacts to $PI_HOST..."
     if ! ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/img/efi/boot"; then
         FAILURES+=("ssh mkdir on Pi")
@@ -856,6 +966,10 @@ stage_linux_guest_aarch64_boot() {
         FAILURES+=("aarch64 linux_guest build")
         return 1
     fi
+    # zig-out is not pruned on an arch switch, and the indexer stage above
+    # builds both arches back-to-back, so clear it before producing an image
+    # that will actually be booted (build.zig also refuses a mixed one).
+    rm -rf "$STYGIA_ROOT/zig-out"
     if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=linux_guest -Dkvm=false -Doptimize=ReleaseSafe); then
         FAILURES+=("aarch64 linux_guest kernel build")
         return 1
@@ -937,6 +1051,10 @@ stage_perf_regression() {
         FAILURES+=("perf workload build")
         return 1
     fi
+    # zig-out is not pruned on an arch switch, and the indexer stage above
+    # builds both arches back-to-back, so clear it before producing an image
+    # that will actually be booted (build.zig also refuses a mixed one).
+    rm -rf "$STYGIA_ROOT/zig-out"
     if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test \
         -Dkernel_profile=trace -Doptimize=ReleaseFast \
         -Droot-service=tests/perf/bin/root_service.elf 2>&1); then

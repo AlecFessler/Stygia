@@ -39,11 +39,13 @@
 //        would have landed by now. Re-read field0 and assert still 0.
 //
 //   Sizing:
-//     - PRIOR_DEADLINE_NS = 5 ms — well above any plausible
-//       per-syscall latency, so the timer is genuinely armed when
-//       step 2 issues the rearm.
-//     - SETTLE_NS = 50 ms — 10× the prior deadline. If the kernel
-//       leaked the prior fire, field0 would be 1 by this point.
+//     - PRIOR_DEADLINE_NS = 400 ms — well above the worst-case
+//       preemption latency this EC can suffer between `timer_arm`
+//       returning and `timer_rearm` being issued, so the timer is
+//       genuinely armed when step 2 issues the rearm.
+//     - SETTLE_NS = 500 ms — clears the prior deadline (measured from
+//       after the rearm) with >= 100 ms of slack. If the kernel leaked
+//       the prior fire, field0 would be 1 by this point.
 //     - NEW_DEADLINE_NS = 60 s — vastly exceeds SETTLE_NS so the
 //       new config cannot fire during the observation window;
 //       field0 staying at 0 is unambiguously attributable to the
@@ -100,10 +102,21 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// 5 ms — non-trivial pending fire, deliberately larger than the
-// per-syscall latency window so the timer is genuinely armed at the
-// moment timer_rearm is issued.
-const PRIOR_DEADLINE_NS: u64 = 5_000_000;
+// 400 ms — non-trivial pending fire, deliberately larger than the
+// window between `timer_arm` returning and `timer_rearm` being issued,
+// so the timer is genuinely armed at the moment of the rearm.
+//
+// That window is bounded by *preemption* latency, not per-syscall
+// latency: between the two calls this EC does a readCap and can be
+// descheduled. Measured on aarch64 Pi 5 KVM with the
+// in-kernel-parallel runner at -Dbatch=16 (stygia-39p), an
+// always-runnable EC can be held off for 16-29 ms, and the window is
+// exposed to that twice. The original 5 ms was sized against
+// per-syscall latency and lost the race often enough to fail ~2 boots
+// in 42 of the full suite, tripping assertion 2 — the prior one-shot
+// had already fired before the setup readCap landed. 400 ms matches
+// the sizing basis validated for timer_arm_08's period.
+const PRIOR_DEADLINE_NS: u64 = 400_000_000;
 
 // 60 s — far enough out that NEW_DEADLINE_NS cannot expire during
 // the SETTLE_NS observation window. Means any non-zero field0 we
@@ -111,11 +124,13 @@ const PRIOR_DEADLINE_NS: u64 = 5_000_000;
 // config firing on schedule.
 const NEW_DEADLINE_NS: u64 = 60_000_000_000;
 
-// 50 ms — 10× the prior deadline. If the prior pending fire wasn't
-// cancelled, the kernel would deliver it well within this window.
-// Comfortably below NEW_DEADLINE_NS so the new config cannot fire
-// here by accident.
-const SETTLE_NS: u64 = 50_000_000;
+// 500 ms. This window is measured from *after* the rearm, so a leaked
+// prior fire lands at most PRIOR_DEADLINE_NS later (exactly that if the
+// rearm was issued immediately, sooner if this EC was preempted in
+// between). 500 ms therefore clears the prior deadline with >= 100 ms
+// of slack for the fire's propagation walk. Comfortably below
+// NEW_DEADLINE_NS so the new config cannot fire here by accident.
+const SETTLE_NS: u64 = 500_000_000;
 
 pub fn main(cap_table_base: u64) void {
     // §[timer] timer_arm caps word: bit 2 = arm, bit 3 = cancel. arm
