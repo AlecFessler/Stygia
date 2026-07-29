@@ -557,6 +557,42 @@ verify_image_arch() {
     return 0
 }
 
+# Scan a captured qemu/serial log for kernel-level faults that the runner's
+# own summary line cannot see.
+#
+# This closes a real hole in the gate. The suite verdict was taken purely
+# from `[runner] N total / … / 0 fail / 0 miss`, but that line is printed by
+# the runner EC, which keeps going when *another* core dies. A run was
+# observed reporting "485 total / 469 pass / 0 fail / 16 miss" with a
+# `KERNEL PANIC: kernel page fault on user VA with no current EC` sitting in
+# the middle of the log — and because 16 MISS was the only visible symptom,
+# the panic went unnoticed. A run that panics on one core and still reports a
+# clean summary used to PASS this gate outright.
+#
+# Marker choice is measured against a known-clean x86 run (485/485):
+#   KERNEL PANIC  0   Zig `panic:`  0   [NOROUTE]  0   [HANG]  0
+#   [USR-PF]    102  <-- NOT a marker; the map_pf tests fault on purpose.
+# `[NOROUTE]` means an event fired with no bound route and the EC parked
+# forever, so a result that should exist never will — abnormal by
+# construction, and zero in healthy runs.
+#
+# $1 = path to the captured log, $2 = label for the FAILURES entry
+verify_no_kernel_faults() {
+    local log="$1" label="$2"
+    [[ -f "$log" ]] || return 0
+    # The runner's per-test progress ticks interleave `~` into output, so
+    # strip them before matching (same reason the summary greps do).
+    local hits
+    hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[NOROUTE\]|\[HANG\]' | head -10)
+    if [[ -n "$hits" ]]; then
+        echo "[FAIL] $label: kernel-level fault in the log (runner summary cannot see this)"
+        echo "$hits" | sed 's/^/    /'
+        FAILURES+=("$label: kernel fault (panic/noroute/hang) in serial log")
+        return 1
+    fi
+    return 0
+}
+
 stage_x86_kernel_tests() {
     echo ""
     echo "=================================================="
@@ -622,6 +658,12 @@ stage_x86_kernel_tests() {
             return 1
         fi
 
+        # A clean summary is not proof the kernel survived — another core
+        # can die while the runner keeps reporting. See verify_no_kernel_faults.
+        if ! verify_no_kernel_faults "$qemu_log" "x86 kernel tests (rep ${rep}/3)"; then
+            rm -f "$qemu_log"
+            return 1
+        fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
         rm -f "$qemu_log"
     done
@@ -698,6 +740,12 @@ run_aarch64_tcg_3reps() {
             rm -f "$tcg_log"
             rm -rf "$fat"
             FAILURES+=("${fail_tag} rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+        # A clean summary is not proof the kernel survived — another core
+        # can die while the runner keeps reporting. See verify_no_kernel_faults.
+        if ! verify_no_kernel_faults "$tcg_log" "${label} (rep ${rep}/3)"; then
+            rm -f "$tcg_log"
             return 1
         fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
@@ -869,6 +917,12 @@ stage_aarch64_kernel_tests_pi() {
             return 1
         fi
 
+        # A clean summary is not proof the kernel survived — another core
+        # can die while the runner keeps reporting. See verify_no_kernel_faults.
+        if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests (rep ${rep}/3)"; then
+            rm -f "$pi_log"
+            return 1
+        fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
         rm -f "$pi_log"
     done
