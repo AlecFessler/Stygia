@@ -47,3 +47,25 @@ pub fn endOfInterrupt(irq_line: u32) void {
     }
 }
 
+/// EOI issued by the scheduler's noreturn `run()` escapes (yieldTo's
+/// cross-core-defer and disowned-current arms). Those escapes abandon
+/// the IRQ epilogue, so on x86 the in-service sched vector (0xFE) would
+/// otherwise never be EOI'd — and because 0xFE outranks both the wake
+/// IPI and tlb_shootdown (0xFD) vectors, a core that parks in that
+/// state goes deaf to all of them: stranded-RDY-EC hangs and shootdown
+/// initiators spinning forever on a missing ack. LAPIC EOI with an
+/// empty ISR is a no-op (every syscall-path `interrupts.switchTo`
+/// already issues one), so calling this from a non-IRQ yieldTo is safe.
+///
+/// aarch64 is a no-op: `handleIrqCurrentEl` writes ICC_EOIR1_EL1 /
+/// GICC_EOIR BEFORE invoking `dispatchIrq` (early-EOI discipline, see
+/// exceptions.zig), so the escape never abandons a pending EOI there —
+/// and a second EOIR write for a stale INTID would corrupt GIC state.
+pub fn schedulerEscapeEoi() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.endOfInterrupt(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+

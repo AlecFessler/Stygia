@@ -65,6 +65,13 @@ pub const GenLock = extern struct {
             if (cur & 1 == 0) {
                 if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) return;
             }
+            // Ack-while-spinning (stygia-rs6 mechanism 9): an
+            // IRQs-masked contender here is deaf to the shootdown
+            // IPI; if the current holder is inside
+            // `waitForShootdownAcks` the machine wedges. Service
+            // pending sync arms between attempts — near-free when
+            // none are pending.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
     }
@@ -180,6 +187,11 @@ pub const GenLock = extern struct {
                 debug.release(self);
                 return error.StaleHandle;
             }
+            // Ack-while-spinning — see `lockOrdered`. Captured live:
+            // fireMemoryFault (#PF context, IRQs off) spinning here on
+            // a CD gen-lock whose holder was waiting for this core's
+            // shootdown ack (stygia-rs6 mechanism 9).
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
     }

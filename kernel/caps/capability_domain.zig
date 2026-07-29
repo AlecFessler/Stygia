@@ -1228,7 +1228,22 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
             null,
     };
 
-    slab_instance.destroyLocked(cd, cd_gen);
+    // Dead-mark ONLY (gen → even, bytes intact, off the freelist).
+    // The actual zero + freelist push runs at the END of destroyPhase2
+    // (`destroyAlreadyMarked`), after every EC of this domain has been
+    // gen-bumped and evicted. Freeing (and zeroing) here opened the
+    // phase1→phase2 gap that killed CPU0 in the stygia-rs6 corpses:
+    // the domain's ECs are still gen-live and dispatchable in this
+    // window, and `switchTo` derefs `ec.domain.ptr.addr_space_root`
+    // raw — a dispatch racing this window read the zeroed root and
+    // loaded CR3 = 0 (KVM vCPU preemption stretches the gap to
+    // milliseconds). With bump-only, that read returns the REAL root
+    // (bytes intact), so an in-gap dispatch runs correctly and the
+    // phase-2 translation barrier sees its true `active_root`; the
+    // even gen simultaneously makes handle resolution fail fast and
+    // lets the dispatch filter drop dying-domain ECs by domain-gen
+    // mismatch before their own gens are bumped.
+    slab_instance.bumpDeadGenLocked(cd, cd_gen);
 
     return deferred;
 }
@@ -1250,12 +1265,61 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     const irq = arch.cpu.saveAndDisableInterrupts();
     defer arch.cpu.restoreInterrupts(irq);
 
+    // Self-destroy hazard (stygia-rs6 layer 2): when the caller EC is
+    // destroying its OWN domain, this core is still executing with the
+    // dying domain's translation root active (x86-64 CR3 covers both
+    // halves). Everything below — and `freeUserAddrSpace` especially —
+    // tears down the very tables that root points at; TLB retention
+    // hides it most runs, then one cold miss mid-teardown makes even
+    // kernel text/rodata unwalkable: recursive panic into triple
+    // fault. Detach to the kernel root first and publish the detach so
+    // the barrier below can't wait on ourselves. No-op when the active
+    // root is not the dying one (cross-domain destroy — the destroyer
+    // keeps publishing its own, unrelated root) and on aarch64 (kernel
+    // translation lives in TTBR1).
+    if (arch.paging.detachDyingUserRoot(
+        deferred.cd_addr_space_root,
+        stygia.memory.init.kernel_addr_space_root,
+    )) {
+        stygia.sched.scheduler.publishActiveRoot(
+            @truncate(arch.smp.coreID()),
+            0,
+        );
+    }
+
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
     stygia.sched.execution_context.destroyEcsInDomain(
         deferred.cd_ref,
         deferred.cd_addr_space_root,
         deferred.caller_ec,
+    );
+
+    // Translation barrier (stygia-rs6): the EC walk above only POSTS
+    // zombies + wake IPIs for victims still executing on remote cores.
+    // Everything after this point tears down state those victims'
+    // cores may still be translating through — `freeUserAddrSpace`
+    // most lethally (a core whose CR3/TTBR0 names the dying root dies
+    // on its first cold walk once the tables are recycled; reproduced
+    // as silent triple faults). Wait until no core has the dying root
+    // LOADED (published active_root) nor a dying-domain EC COMMITTED
+    // in its dispatch slot (current_ec — set before the root load, so
+    // it covers in-flight dispatches the publish can't see yet).
+    // Victim cores converge within one IRQ delivery: the wake IPI
+    // drives them through yieldTo's disowned-current escape into
+    // `run()`, which publishes either the next EC's root or 0 (park /
+    // kernel root) strictly AFTER the hardware load. Self cannot
+    // deadlock this: the detach above published 0 for the self-destroy
+    // case, the caller EC is not part of the current_ec clause's
+    // domain membership (its slot was cleared by parkSelfFaulted or
+    // names the caller which IS expected to keep running), and a
+    // cross-domain destroyer publishes its own (non-dying) root.
+    stygia.sched.scheduler.awaitDomainQuiesced(
+        deferred.cd_addr_space_root.addr,
+        // caller-pinned: raw pointer passed as an identity-only key —
+        // the barrier compares it against per-core `domain.ptr` values
+        // and never derefs the (dead-marked, bytes-intact) CD slot.
+        deferred.cd_ref.ptr,
     );
 
     // Reap the destroying-domain's caller EC's slab slot. `parkSelfFaulted`
@@ -1273,8 +1337,9 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         // caller-pinned: `deferred.cd_ref.ptr` is passed for identity-only
         // comparison against `ec.pending_reply_domain.ptr` inside
         // `destroyExecutionContextLocked`; the CD slab slot is already
-        // freed (Phase 1 ran `destroyLocked`) and we only use the raw
-        // pointer value as a key, never deref it.
+        // dead-marked (Phase 1 ran `bumpDeadGenLocked`; the zero +
+        // freelist push runs at the end of this function) and we only
+        // use the raw pointer value as a key, never deref it.
         const cd_for_identity = deferred.cd_ref.ptr;
         stygia.sched.execution_context.destroyExecutionContextLocked(
             caller_ref.ptr,
@@ -1386,6 +1451,18 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     pmm_mgr.freeBlock(deferred.kernel_buf[0..KERNEL_TABLE_BYTES]);
 
     if (deferred.addr_space_id != 0) arch.paging.freeAddrSpaceId(deferred.addr_space_id);
+
+    // Finish the CD slot destroy deferred from phase 1 (bumpDeadGenLocked):
+    // zero the bytes and return the slot to the freelist. Every EC of the
+    // domain is gen-dead and evicted (destroyEcsInDomain + the translation
+    // barrier above), so no dispatch or handle path can deref the slot's
+    // fields anymore — identity-compare users (`cd_for_identity`, the
+    // barrier's clause 2) only ever used the raw pointer value.
+    // caller-pinned: a lock bracket is impossible by design here — the
+    // gen has been even (dead) since phase 1; destroyAlreadyMarked
+    // asserts exactly that and this phase-2 tail is the slot's sole
+    // owner.
+    slab_instance.destroyAlreadyMarked(deferred.cd_ref.ptr);
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the

@@ -14,6 +14,7 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const ec_log = stygia.utils.ec_log;
+const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
 const port_mod = stygia.sched.port;
@@ -91,6 +92,43 @@ pub const PerCore = struct {
     /// here so we don't issue redundant CR-writes (each one costs a
     /// vmexit under KVM).
     fpu_trap_armed: bool = false,
+
+    /// Physical address of the user translation root this core has
+    /// LOADED (x86: CR3 root; aarch64: TTBR0), published with
+    /// `.release` immediately AFTER each hardware root load. 0 = no
+    /// user root (kernel root / parked / detached). This — not
+    /// `on_cpu`, not `current_ec` — is the authoritative "may this
+    /// core still walk translations of root R" signal that domain
+    /// teardown must wait on before freeing R's tables (stygia-rs6):
+    /// `on_cpu` stays stale-true across the migration boundary and
+    /// its gated clears race, and `current_ec` flips BEFORE the
+    /// dispatch path's root swap. Publishing after the load closes
+    /// both windows.
+    active_root: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Dispatch commitment, written UNDER `core_locks[core]` at the
+    /// moment a dequeue (or yieldTo target-arm pick) commits an EC to
+    /// this core, and cleared by the dispatch path once the EC's root
+    /// is loaded+published (or by the park path). Exists because the
+    /// window between the locked dequeue and `setCurrentEc` is
+    /// unbounded under host vCPU preemption (KVM can deschedule this
+    /// core mid-window for milliseconds), so domain teardown cannot
+    /// rely on either `current_ec` or `active_root` becoming visible
+    /// "soon" — instead the teardown barrier acquires each core lock
+    /// once after the gen flips, which by lock ordering makes every
+    /// pre-flip commitment visible here. Stale values are benign in
+    /// the conservative direction only (the barrier waits longer);
+    /// every path that abandons a commitment overwrites or clears it
+    /// within one scheduler-loop iteration.
+    /// caller-pinned: bare `*T` is deliberate — readers (the teardown
+    /// barrier) perform identity-only compares of `.domain.ptr`
+    /// against a raw CD key and never lock through this pointer. A
+    /// committed EC's slab bytes cannot be recycled under the reader:
+    /// the dequeue stamped `last_dispatched_core` under the same lock
+    /// as this field, routing any concurrent terminate through the
+    /// deferred-zombie path (bytes intact until this core's next
+    /// switchTo reap, which cannot run while the commitment stands).
+    committed_ec: ?*ExecutionContext = null,
 
     /// Per-core idle EC. Allocated at perCoreInit; runs `hlt`/`wfi`
     /// when the run queue is empty. Pinned to this core via affinity.
@@ -447,7 +485,11 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         }
     }
     const next = if (target) |t| blk: {
-        if (t.state == .ready and state.run_queue.remove(t)) {
+        // `domainRefAlive`: same dying-domain dispatch gate as the
+        // dequeue filter — a yieldTo target whose CD was dead-marked
+        // by destroyPhase1 must not be committed (its queue entry, if
+        // any, is drained and dropped by dequeueOrIdleLocked instead).
+        if (t.state == .ready and domainRefAlive(t) and state.run_queue.remove(t)) {
             // Same kstack-livesness rationale as dequeueOrIdleLocked's
             // stamp: we are committing `t` to dispatch on this core
             // under core_locks[core]. A cross-core terminate(t) that
@@ -462,6 +504,8 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
             // lock and remove(t) would no-op — harmless, but wastes a
             // lock acquire. Mirrors the dequeueOrIdleLocked clear.
             t.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+            // Locked dispatch commitment — see PerCore.committed_ec.
+            state.committed_ec = t;
             break :blk t;
         }
         break :blk dequeueOrIdleLocked(core);
@@ -480,6 +524,33 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
 
     if (next) |n| {
         switchTo(n);
+        // bd-qn0f: same two-cores-in-user-mode hazard as the empty-
+        // queue `next == null` arm below (closed by bd-20f7 / bd-btl8),
+        // on a different branch. `switchTo` is normally `noreturn`
+        // (loadEcContextAndReturn), but for a vCPU target the pre-loop
+        // (scheduler.zig:290-358) can RETURN at line 356 when the
+        // synthetic vm_exit fires + the subsequent `dequeueOrIdle`
+        // runs dry. In that case, with `deferred_cross_core` set, the
+        // bare `return;` below would let the caller (yield syscall
+        // epilogue, timer-IRQ epilogue, fault path, ...) iretq through
+        // `cur`'s saved iret frame on THIS excluded core — at the same
+        // time the satisfying core picks `cur` up via
+        // `loadEcContextAndReturn` from its run queue and iretqs
+        // through the same frame. Two cores executing `cur` in user
+        // mode simultaneously: catastrophic, identical to bd-20f7.
+        //
+        // Mirror bd-btl8's pattern: null this core's `current_ec` slot
+        // (`switchTo`'s vCPU-empty branch already cleared it inside
+        // its loop, but the clear is idempotent and pins the
+        // invariant against future refactors of `switchTo`'s exit
+        // path) and tail into `run()`. `run()` is `noreturn`, so the
+        // caller's frame is abandoned; `cur` resumes only on the
+        // satisfying core with `setSyscallReturn` already stamped
+        // into `cur.ctx`.
+        if (deferred_cross_core != null) {
+            clearCurrentEc(core);
+            escapeToRun();
+        }
         return;
     }
 
@@ -531,7 +602,7 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // before then.
     if (deferred_cross_core != null) {
         clearCurrentEc(core);
-        run();
+        escapeToRun();
     }
 
     // Empty queue and no idle EC. Clear `current_ec` and re-point the
@@ -554,6 +625,13 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     // Halting *here* would leave the IRQ never EOI'd — any subsequent
     // same-priority LAPIC tick would be blocked, wedging the scheduler
     // tick on this core.
+    // Record whether a disowned `cur` occupies the slot BEFORE the
+    // clear below — it decides between returning through the caller's
+    // iretq (safe only when this IRQ interrupted parked/idle context)
+    // and the noreturn escape further down (mandatory when it
+    // interrupted an EC a peer has since disowned).
+    const disowned_cur = (&core_states[core]).current_ec != null;
+
     const park_top = (&core_states[core]).park_stack.top.addr;
     if (park_top != 0) {
         arch.cpu.parkPerCoreCaches(core, park_top);
@@ -574,6 +652,33 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         }
     }
     clearCurrentEc(core);
+
+    // Disowned current: `cur` existed but was neither re-enqueued
+    // locally (a peer terminate/suspend/wait path flipped its state
+    // away from `.running` mid-quantum) nor migrated via
+    // `deferred_cross_core`. Returning here would iretq back into an
+    // EC this scheduler no longer tracks:
+    //
+    //   - a suspended `cur` that a peer then resumes gets dispatched
+    //     on another core while THIS core is still executing it in
+    //     user mode — bd-20f7's two-cores-one-frame catastrophe on
+    //     the empty-queue branch;
+    //   - an exited `cur` keeps running user code while destroyPhase2
+    //     frees its domain's page tables under it. Once the CR3 root
+    //     is recycled the CPU cannot even walk to the IDT: silent
+    //     triple fault (stygia-rs6 autopsy: exited EC still current
+    //     on core 0, on_cpu=1, teardown shootdown never acked).
+    //
+    // Escape into `run()` instead. `run()` parks (loading the kernel
+    // root and publishing active_root=0) or dispatches another EC
+    // (publishing that EC's root after the CR3/TTBR0 load) via the
+    // existing machinery — either way `destroyPhase2`'s
+    // `awaitNoActiveRoot` barrier observes this core off the dying
+    // domain's translation root before any table is freed. The park
+    // path also drains this core's pending zombies.
+    if (disowned_cur) {
+        escapeToRun();
+    }
 
     // Drain any pending_zombie before returning — same rationale as
     // parkAndAwaitIRQ. yieldTo's empty branch returns through
@@ -601,6 +706,20 @@ pub fn preempt() void {
 /// Picks the highest-priority ready EC (or falls back to per-core idle
 /// EC when set, otherwise `sti+hlt` until an IPI arrives), and
 /// dispatches; never returns.
+/// Shared exit for `yieldTo`'s noreturn escapes into `run()`. The
+/// escapes abandon the caller's IRQ epilogue, so on x86 the in-service
+/// sched vector (0xFE) must be EOI'd first: it outranks both the wake
+/// IPI and tlb_shootdown vectors, so a core that parks with it still
+/// in service goes deaf to cross-core wakes (stranded-RDY-EC hangs)
+/// and shootdown IPIs (initiator spins forever on the missing ack).
+/// Safe from syscall-context callers too — LAPIC EOI with an empty ISR
+/// is a no-op. aarch64 EOIs before dispatching the handler (early-EOI),
+/// so the dispatch helper is a no-op there.
+fn escapeToRun() noreturn {
+    arch.irq.schedulerEscapeEoi();
+    run();
+}
+
 pub fn run() noreturn {
     while (true) {
         if (dequeueOrIdle()) |next| {
@@ -755,6 +874,20 @@ fn parkAndAwaitIRQ() void {
     (&core_states[core]).current_ec = null;
     lock.unlockIrqRestore(irq);
 
+    // Detach from whatever user translation root the last dispatch
+    // left loaded and publish "no user root" BEFORE halting. A parked
+    // core otherwise keeps the previous domain's root live in CR3 —
+    // if that domain is then destroyed, `freeUserAddrSpace` recycles
+    // the tables this core's next IRQ entry walks through (stygia-rs6
+    // family). The kernel half is shared across all roots, so the
+    // swap is transparent to the park path itself; the publish order
+    // (hardware load first, then store-release) keeps the teardown
+    // barrier in `destroyPhase2` honest. Any stale dispatch
+    // commitment is retired too — this core is committing to hlt.
+    arch.paging.loadKernelRoot(memory_init.kernel_addr_space_root);
+    publishActiveRoot(core, 0);
+    (&core_states[core]).committed_ec = null;
+
     arch.cpu.parkAndAwaitIRQ(park_top);
 }
 
@@ -793,6 +926,19 @@ export fn scheduler_run_after_park() callconv(.c) noreturn {
 /// Internal helper — dequeues the highest-priority EC, or returns the
 /// per-core idle EC if the queue is empty. Returns null when both are
 /// empty (caller drops to `sti+hlt` and waits for a wake IPI).
+/// True while `ec`'s domain SlabRef still names the CD slot's live
+/// gen. Turns false the instant `destroyPhase1` dead-marks the CD —
+/// i.e. it covers the phase1→phase2 teardown gap in which the
+/// domain's ECs are themselves still gen-live and `.ready` but their
+/// domain (and imminently its translation root) is being destroyed.
+/// Every dispatch-commitment site must refuse such ECs BEFORE the
+/// `switchTo` domain deref; see the stygia-rs6 CR3=0 corpse notes at
+/// the dequeue filter.
+inline fn domainRefAlive(ec: *ExecutionContext) bool {
+    const dref = ec.domain;
+    return dref.ptr._gen_lock.currentGen() == @as(u64, dref.gen);
+}
+
 fn dequeueOrIdle() ?*ExecutionContext {
     const core: u8 = @truncate(arch.smp.coreID());
     const lock = &core_locks[core];
@@ -820,7 +966,20 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         // dispatching them would assert on the even gen in
         // `setCurrentEc`'s `SlabRef.init`, and the EC is reaped via the
         // pending_zombie path on its running core anyway.
-        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        //
+        // Also drop ECs whose DOMAIN ref is stale (`!domainRefAlive`):
+        // destroyPhase1 dead-marks the CD before phase 2 gen-bumps the
+        // domain's ECs, so in that gap a dying-domain EC is still
+        // gen-live and `.ready` — but dispatching it would deref the
+        // dying CD slot for its translation root in `switchTo`
+        // (stygia-rs6: a dispatch in this gap on the pre-fix code read
+        // the freed slot's zeroed `addr_space_root` and loaded CR3=0;
+        // the core wedged in an eternal page-fault loop until its TLB
+        // evicted the fault handler's text, then triple-faulted with
+        // no output).
+        if (ec.state == .exited or
+            ec._gen_lock.currentGen() % 2 == 0 or
+            !domainRefAlive(ec)) continue;
         // Stamp `last_dispatched_core` here, while still holding
         // `core_locks[core]`, so a cross-core `terminate(ec)` that lands
         // AFTER our dequeue but BEFORE our `setCurrentEc` finds the
@@ -880,12 +1039,18 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         // names this core; that's fine (false-positive zombie post → one
         // extra reap pass, no correctness impact).
         ec.last_dispatched_core = core;
+        // Record the commitment while still under core_locks[core] —
+        // the teardown barrier's lock-sweep keys on this (see
+        // PerCore.committed_ec). The dispatch path clears it after
+        // the root load+publish.
+        state.committed_ec = ec;
         return ec;
     }
     if (state.idle_ec) |idle_ref| {
         // caller-pinned: per-core idle EC is allocated at perCoreInit and
         // never freed — it's the dispatch-of-last-resort target.
         idle_ref.ptr.last_dispatched_core = core;
+        state.committed_ec = idle_ref.ptr;
         return idle_ref.ptr;
     }
     return null;
@@ -1051,6 +1216,111 @@ pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
 
 /// Clear this core's `current_ec` slot. Called by suspend / terminate /
 /// idle paths when the running EC stops being runnable.
+/// Publish the user translation root this core has just LOADED (0 =
+/// none / kernel root). Callers MUST issue the hardware root load
+/// BEFORE this store — see the `PerCore.active_root` field doc.
+pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
+    (&core_states[core]).active_root.store(root_addr, .release);
+}
+
+/// Spin until no core can execute through the dying domain's
+/// translation tables. Two per-core clauses, both required:
+///
+///   1. `active_root == root_addr` — the core has the dying root
+///      LOADED (published with release-after-load; see
+///      `PerCore.active_root`).
+///   2. `current_ec` names an EC whose `domain.ptr == cd_ptr` — the
+///      core has COMMITTED to dispatching a dying-domain EC but may
+///      not have loaded (or published) its root yet. `current_ec`
+///      flips at `setCurrentEc`, well before the dispatch path's
+///      root swap, so it is the conservative early signal for
+///      in-flight dispatches: a corpse showed a core dying INSIDE
+///      `interrupts.switchTo` (post-`setCurrentEc`, pre-publish,
+///      stalled in migrateFlush) when the teardown freed the root
+///      it was about to load.
+///
+/// Domain teardown calls this after the destroy walk (zombies + wake
+/// IPIs posted, gens bumped) and before freeing any table. Both
+/// clauses converge: dying-domain ECs are gen-dead so no NEW dequeue
+/// can dispatch them (dequeueOrIdleLocked filters even-gen), running
+/// victims get evicted within one IRQ delivery, and an in-flight
+/// dispatch either completes (publishing the root — clause 1 holds
+/// it) or aborts. Residual window: the dequeue→setCurrentEc sliver
+/// carries a committed EC in neither signal; it contains no spins
+/// and its close (`setCurrentEc`'s SlabRef.init) asserts on the
+/// bumped gen, so it cannot silently dispatch. Cross-core reads of
+/// `ec.domain.ptr` are identity-only; slab memory persists after
+/// reap (zeroed ⇒ ptr mismatch ⇒ clause exits).
+///
+/// The EXECUTING core is skipped: a self-destroying caller EC still
+/// occupies its own core's `current_ec` slot through phase 2 (and is
+/// standing on its kstack by design), so including self in clause 2
+/// would deadlock — the destroyer core detached its root separately
+/// and runs only kernel-mapped teardown code from here. All other 64
+/// slots are scanned; never-started cores sit at the 0 / null
+/// defaults.
+///
+/// Prologue: one acquire/release of every core's lock. Dispatch
+/// commitments are written under `core_locks[core]`
+/// (dequeueOrIdleLocked / yieldTo's target arm), and the gen flips
+/// the caller performed before this barrier are what stop NEW
+/// commitments (the dequeue filter drops even-gen ECs) — but a
+/// commitment made just BEFORE a flip may sit in a core's store
+/// buffer, or the committing core may be host-descheduled mid-window
+/// for milliseconds (KVM vCPU preemption breaks every "visible soon"
+/// argument). Taking each lock once forces the sweep to serialize
+/// after any in-progress locked commit, making `committed_ec` (and
+/// everything the committer wrote before its unlock) visible to the
+/// clause scan below.
+pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
+    const self_core: u8 = @truncate(arch.smp.coreID());
+    for (&core_locks) |*lock| {
+        const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        lock.unlockIrqRestore(irq);
+    }
+    for (&core_states, 0..) |*state, core_idx| {
+        if (core_idx == self_core) continue;
+        while (true) {
+            if (state.active_root.load(.acquire) == root_addr) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            if (state.current_ec) |ref| {
+                // caller-pinned: identity-only compare of the raw
+                // domain pointer against the dying CD's address — no
+                // field of the CD is read through it. Slab bytes of a
+                // current EC persist past its gen flip (deferred
+                // finalize), and a zeroed domain field simply
+                // mismatches and exits the clause.
+                if (@intFromPtr(ref.ptr.domain.ptr) == @intFromPtr(cd_ptr)) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+            }
+            if (state.committed_ec) |cec| {
+                // caller-pinned: same identity-only compare as the
+                // current_ec clause; see PerCore.committed_ec for why
+                // the committed EC's bytes cannot recycle under us.
+                if (@intFromPtr(cec.domain.ptr) == @intFromPtr(cd_ptr)) {
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Racy identity read of `core_states[core].current_ec.ptr` for
+/// cross-core "has this EC left its core's dispatch slot" waits
+/// (terminate's stops-executing barrier). Single-writer-per-core makes
+/// the 8-byte ptr read tear-free on both arches; the gen word is
+/// deliberately not read — pointer identity is all the caller compares.
+pub inline fn currentEcPtrOn(core: u8) ?*ExecutionContext {
+    if ((&core_states[core]).current_ec) |ref| return ref.ptr;
+    return null;
+}
+
 pub inline fn clearCurrentEc(core: u8) void {
     if (comptime ec_log.enabled) {
         const prev: ?*ExecutionContext =

@@ -2837,7 +2837,14 @@ pub fn switchTo(ec: *ExecutionContext) void {
         paging.swapAddrSpace(new_root, dom.addr_space_id);
         std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
-
+    // Publish AFTER the hardware load (store-release) — domain
+    // teardown's quiesce barrier keys on this to know no core can
+    // still walk a dying domain's tables. Unconditional: the no-swap
+    // branch above means the root was already loaded. The locked
+    // dispatch commitment (PerCore.committed_ec) stays armed until
+    // `setCurrentEc` below has run — see the retire site's comment
+    // for the barrier-sliver rationale.
+    scheduler.publishActiveRoot(cid, new_root.addr);
     // on_cpu transitions: clear the previous current_ec's flag (if any
     // and distinct from `ec`) and raise it on the freshly-dispatched
     // EC. Cross-core readers (`runningCoreOf`, terminate's defer-vs-
@@ -2852,6 +2859,17 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
     scheduler.setCurrentEc(cid, ec);
     ec.on_cpu.store(true, .release);
+    // Retire the locked dispatch commitment only AFTER `current_ec`
+    // names `ec` — never before. Clearing it between the root publish
+    // and `setCurrentEc` opened a sliver in which a teardown barrier
+    // sweep saw committed_ec == null, current_ec == <previous>, and
+    // active_root == <just-published value> — all three clauses clear
+    // while this core was irrevocably mid-dispatch of a dying-domain
+    // EC (stygia-rs6 CR3=0 corpses). With this ordering, at every
+    // instant of the dispatch at least one lock-ordered signal
+    // (committed_ec before/through setCurrentEc, current_ec from then
+    // on) names the EC being dispatched.
+    (&scheduler.core_states[cid]).committed_ec = null;
     // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
     // Each direct `per_cpu_scratch[i].field` write would otherwise
     // memcpy the full 256 KiB array onto the dispatch stack frame.

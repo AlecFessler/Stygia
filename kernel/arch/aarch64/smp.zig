@@ -587,6 +587,22 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
 /// Secondary core setup after MMU is enabled and stack is established.
 /// Called from secondaryEntry with core_idx in x0, running at kernel VA.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
+    // FIRST: restore the canonical WB-WA / Inner-Shareable table-walk
+    // attributes this core's trampoline deliberately booted without
+    // (see the `tcr_for_ap` strip above). The MMU and caches are on
+    // now, so cacheable walks are safe — and leaving the NC walk
+    // attributes permanent is fatal under any walker that honors
+    // NC and so reads page tables straight from DRAM while PTE
+    // writes sit dirty in the data cache (stygia-rs6 mechanism 10:
+    // deterministic eternal translation-fault loops on valid tables,
+    // caught live on a Pi 5 under a KVM-6.6 host kernel; the same
+    // silicon under KVM 6.12, TCG, and x86 walkers all tolerated it,
+    // but nothing obliges a walker to snoop). Everything after this point — GIC
+    // init allocations, scheduler per-core state, demand-mapped
+    // kstacks — depends on this core seeing PTE stores made by any
+    // core, including itself.
+    aarch64_paging.restoreWalkAttrs();
+
     // Initialize the GIC redistributor and CPU interface for this core.
     // This MUST complete before we increment `cores_online`: the BSP
     // moves on to the next CPU_ON (and ultimately to perCoreInit /

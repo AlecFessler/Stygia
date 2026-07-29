@@ -398,16 +398,35 @@ pub fn mapPage(
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
-            entry.* = parent_entry;
-            entry.setPAddr(new_phys);
+            // Compose the full descriptor BEFORE the single 8-byte
+            // store. The previous two-store sequence (install entry,
+            // then setPAddr) left a transient VALID table descriptor
+            // pointing at phys 0; the MMU walks asynchronously (and
+            // speculatively) and may cache the bogus intermediate in
+            // its walk caches, after which every sibling VA under
+            // this table persistently translation-faults against the
+            // stale cached walk even though memory holds the
+            // corrected entry. Observed on a Pi 5 (A76) under a
+            // KVM-6.6 host as an eternal level-3 translation-fault
+            // loop on kstack VAs whose in-memory walk was fully valid
+            // (stygia-rs6 mechanism 8). The per-VA TLBI at the tail
+            // of mapPage cannot repair it — the poisoned walk entry
+            // covers the table's whole VA range, not just the mapped
+            // leaf.
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_phys);
+            entry.* = filled_parent;
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
     const l0_entry = &table[l0Idx(virt)];
-    l0_entry.* = leaf_entry;
-    l0_entry.setPAddr(phys);
+    // Single-store leaf install — same transient-phys-0 hazard as the
+    // parent-entry sites above.
+    var filled_leaf = leaf_entry;
+    filled_leaf.setPAddr(phys);
+    l0_entry.* = filled_leaf;
 
     // ARM ARM D5.9: after installing a new leaf entry, broadcast TLB
     // maintenance so cached "not-present" (faulting) entries from prior
@@ -482,7 +501,6 @@ pub fn mapPageBoot(
                 page_entry_table_size,
             );
             @memset(new_entry, default_page_entry);
-            entry.* = parent_entry;
 
             const new_entry_virt = VAddr.fromInt(@intFromPtr(new_entry.ptr));
             var new_entry_phys: PAddr = undefined;
@@ -491,7 +509,20 @@ pub fn mapPageBoot(
             } else {
                 new_entry_phys = PAddr.fromVAddr(new_entry_virt, 0);
             }
-            entry.setPAddr(new_entry_phys);
+            // Single-store descriptor install (stygia-rs6 mechanism 8):
+            // the old `entry.* = parent_entry; ... entry.setPAddr(...)`
+            // sequence left a WIDE window (address computed in between)
+            // where the entry was a VALID table descriptor pointing at
+            // phys 0. AP bring-up runs this with the MMU LIVE, and the
+            // walker captured the bogus intermediate in its
+            // walk caches — every later fault in that entry's whole VA
+            // range then persistently translation-faulted against valid
+            // in-memory tables (deterministic per boot; per-VA TLBI
+            // cannot purge it). Same hazard class as the runtime
+            // mapPage sites.
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_entry_phys);
+            entry.* = filled_parent;
         }
 
         var entry_virt: VAddr = undefined;
@@ -513,10 +544,13 @@ pub fn mapPageBoot(
         entry = &table[idx];
 
         if (size == level_entry_size) {
-            entry.* = leaf_entry;
+            // Single-store leaf/block install — see the parent-entry
+            // comment above (stygia-rs6 mechanism 8).
+            var filled_leaf = leaf_entry;
             // Block descriptors at level 1/2: bits [1:0] = 0b01
-            if (level_entry_size != .page4k) entry.is_table = false;
-            entry.setPAddr(phys);
+            if (level_entry_size != .page4k) filled_leaf.is_table = false;
+            filled_leaf.setPAddr(phys);
+            entry.* = filled_leaf;
             return;
         }
 
@@ -755,6 +789,49 @@ pub fn forceT0Sz16() void {
         ::: .{ .memory = true });
 }
 
+/// Restore the canonical table-walk attributes — IRGN/ORGN = 0b01
+/// (Normal WB-WA) and SH = 0b11 (Inner Shareable) on BOTH TTBR halves
+/// — on THIS core's TCR_EL1. The AP trampoline deliberately boots
+/// with non-cacheable / non-shareable walk attributes (the strip in
+/// smp.zig, from the Pi-5 bring-up work in 387fee240: the secondary
+/// reads its boot params and early tables with caches off), but
+/// leaving them permanent is fatal under any walker that HONORS the
+/// NC attribute: such a walker reads page tables straight from
+/// DRAM, and any PTE whose dirty line stays resident in
+/// the data cache is invisible to it — observed live on a Pi 5
+/// (Cortex-A76) under a KVM-6.6 host kernel as
+/// deterministic, eternal level-3 translation faults on VAs whose
+/// in-memory walk was fully valid, the fault loop's own resolveVaddr
+/// reads keeping the PTE line hot forever (stygia-rs6 mechanism 10).
+/// The same silicon under a KVM-6.12 host, TCG, and x86 walkers all
+/// tolerated it — but NC walk attributes are a guest bug regardless:
+/// no architecture obliges a walker to snoop. Must be called with the MMU
+/// and caches ON; ends with the required local TLBI (TLB walk state
+/// derived under the old attributes must be dropped).
+pub fn restoreWalkAttrs() void {
+    var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
+        : [ret] "=r" (-> u64),
+    );
+    tcr &= ~@as(u64, (0x3F << 8) | (0x3F << 24));
+    tcr |= (@as(u64, 0b01) << 8) | // IRGN0 WB-WA
+        (@as(u64, 0b01) << 10) | // ORGN0 WB-WA
+        (@as(u64, 0b11) << 12) | // SH0 Inner Shareable
+        (@as(u64, 0b01) << 24) | // IRGN1 WB-WA
+        (@as(u64, 0b01) << 26) | // ORGN1 WB-WA
+        (@as(u64, 0b11) << 28); // SH1 Inner Shareable
+    asm volatile ("msr tcr_el1, %[val]"
+        :
+        : [val] "r" (tcr),
+        : .{ .memory = true });
+    asm volatile (
+        \\isb
+        \\dsb ishst
+        \\tlbi vmalle1
+        \\dsb nsh
+        \\isb
+        ::: .{ .memory = true });
+}
+
 /// ISB -- Instruction Synchronization Barrier.
 /// ARM ARM C6.2.4 -- flushes the pipeline so that subsequent instructions
 /// are fetched and decoded using the current state of the system.
@@ -785,9 +862,17 @@ fn dsbIsh() void {
 fn tlbiVae1is(vaddr: u64) void {
     kprof.point(.tlb_shootdown, vaddr);
 
-    const page_addr = vaddr >> 12;
+    // Operand: VA[55:12] in bits [43:0]; upper bits are ASID (VAE1)
+    // or RES0/TTL. The previous encoding passed the raw `vaddr >> 12`,
+    // which for kernel VAs (0xFFFF...) leaked high VA bits into the
+    // ASID field — VAE1IS then matched only that garbage ASID for
+    // non-global entries, silently missing user-page invalidations.
+    // Use VAAE1IS (VA, All ASIDs) with a masked operand: correct for
+    // kernel (global) and user (nG/ASID-tagged) entries alike, and no
+    // ASID plumbing needed at the call sites.
+    const page_addr = (vaddr >> 12) & ((@as(u64, 1) << 44) - 1);
     dsbIshst();
-    asm volatile ("tlbi vae1is, %[addr]"
+    asm volatile ("tlbi vaae1is, %[addr]"
         :
         : [addr] "r" (page_addr),
         : .{ .memory = true });
@@ -861,16 +946,35 @@ pub fn mapPageSized(
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
-            entry.* = parent_entry;
-            entry.setPAddr(new_phys);
+            // Compose the full descriptor BEFORE the single 8-byte
+            // store. The previous two-store sequence (install entry,
+            // then setPAddr) left a transient VALID table descriptor
+            // pointing at phys 0; the MMU walks asynchronously (and
+            // speculatively) and may cache the bogus intermediate in
+            // its walk caches, after which every sibling VA under
+            // this table persistently translation-faults against the
+            // stale cached walk even though memory holds the
+            // corrected entry. Observed on a Pi 5 (A76) under a
+            // KVM-6.6 host as an eternal level-3 translation-fault
+            // loop on kstack VAs whose in-memory walk was fully valid
+            // (stygia-rs6 mechanism 8). The per-VA TLBI at the tail
+            // of mapPage cannot repair it — the poisoned walk entry
+            // covers the table's whole VA range, not just the mapped
+            // leaf.
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_phys);
+            entry.* = filled_parent;
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
     const l0_entry = &table[l0Idx(virt)];
-    l0_entry.* = leaf_entry;
-    l0_entry.setPAddr(phys);
+    // Single-store leaf install — same transient-phys-0 hazard as the
+    // parent-entry sites above.
+    var filled_leaf = leaf_entry;
+    filled_leaf.setPAddr(phys);
+    l0_entry.* = filled_leaf;
 
     // ARM ARM D5.9: after installing a new leaf entry, broadcast TLB
     // maintenance so cached "not-present" (faulting) entries from prior

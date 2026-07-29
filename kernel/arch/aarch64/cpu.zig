@@ -481,6 +481,15 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     if (new_root.addr != stygia.arch.aarch64.paging.getAddrSpaceRoot().addr) {
         stygia.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
     }
+    // Publish AFTER the hardware TTBR0 load — domain teardown's
+    // quiesce barrier keys on this before freeing the dying domain's
+    // tables — and retire the locked dispatch commitment. Mirrors
+    // arch/x64/interrupts.zig switchTo.
+    {
+        const pub_cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
+        stygia.sched.scheduler.publishActiveRoot(pub_cid, new_root.addr);
+        (&stygia.sched.scheduler.core_states[pub_cid]).committed_ec = null;
+    }
 
     // Spec §[syscall_abi]: flush the recv-deferred syscall word into
     // user `[ec.ctx.sp_el0 + 0]` while we are guaranteed to be in the
@@ -609,21 +618,46 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     _ = park_top;
 }
 
-/// Swap SP to the per-core park kstack top, unmask IRQs, halt until any
-/// IRQ wakes us, then branch to `scheduler_run_after_park`. The original
+/// Swap SP to the per-core park kstack top, halt until an IRQ becomes
+/// pending, then branch to `scheduler_run_after_park`. The original
 /// caller's stack frame is abandoned by the SP swap — callers are
 /// noreturn, so this is intentional. Without the swap each park-wake
 /// cycle leaves a fresh frame on the caller's kstack (run() →
 /// parkAndAwaitIRQ → wake → scheduler_run_after_park → run() → …); after
 /// ~12 pages of cycles the kstack overflows into its guard page and the
-/// next push faults at the SP0 sync vector entry. Mirrors the x86_64
-/// `mov rsp, [top]; sti; hlt; cli; jmp scheduler_run_after_park`
-/// shape. ARM ARM DDI 0487 §C5.2.4 WFI.
+/// next push faults at the SP0 sync vector entry.
+///
+/// Sleep MASKED, then unmask exactly long enough to take the wake —
+/// both halves are load-bearing (stygia-rs6 mechanism 7).
+///
+/// Sleeping masked closes the lost-wake hole: WFI wakes on a pending
+/// interrupt regardless of PSTATE.I (ARM ARM DDI 0487 §D1.17.2), and
+/// aarch64 has no equivalent of x86's STI interrupt shadow, so the
+/// original `msr daifclr, #2; wfi` let a wake IPI land in the
+/// two-instruction window — delivered, EOI'd and CONSUMED — after
+/// which the WFI slept forever with ready ECs stranded in this core's
+/// run queue (caught live: four cores in WFI, two `.ready`
+/// futex-woken ECs queued on core 1). Callers reach here having
+/// re-checked the queue under the same mask, so the check-then-sleep
+/// pair is atomic.
+///
+/// Unmasking AFTER the WFI is equally required: a pending interrupt
+/// that merely wakes WFI is never *delivered* while PSTATE.I is set,
+/// so its handler never runs and the GIC never activates/EOIs it.
+/// The park loop would spin (WFI returning instantly on the still-
+/// pending IRQ), and — worse — further IPIs at that INTID coalesce
+/// into the un-acknowledged pending one, losing genuine later wakes.
+/// The brief unmask lets the handler run and EOI; the re-mask
+/// restores the IRQs-masked entry contract `scheduler_run_after_park`
+/// shares with the x86 park path. Net sequence mirrors x86's
+/// `sti; hlt; cli`, reordered so the sleep — not the unmask — is what
+/// races the wake.
 pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
     asm volatile (
         \\mov sp, %[top]
-        \\msr daifclr, #2
         \\wfi
+        \\msr daifclr, #2
+        \\isb
         \\msr daifset, #2
         \\b scheduler_run_after_park
         :

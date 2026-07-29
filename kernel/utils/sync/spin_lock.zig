@@ -29,8 +29,29 @@ pub const SpinLock = struct {
     pub fn lockOrdered(self: *SpinLock, src: SrcLoc, ordered_group: u32) void {
         debug.acquire(self, self.class, ordered_group, src);
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9): any
+            // IRQs-masked contender is deaf to the shootdown IPI; if
+            // the holder is inside `waitForShootdownAcks` the machine
+            // wedges. Near-free when no sync arm is pending.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
+    }
+
+    /// Single non-blocking acquisition attempt; registers with
+    /// lockdep only on success. For contenders that must stay
+    /// responsive while waiting — e.g. an IRQs-masked path spinning
+    /// on `shootdown_lock` must service pending TLB sync arms between
+    /// attempts, or the current holder's `waitForShootdownAcks` can
+    /// be waiting on THIS core's ack (deadlock observed live,
+    /// stygia-rs6; see arch/x64/paging.zig
+    /// `lockShootdownServicingArms`).
+    pub fn tryLock(self: *SpinLock, src: SrcLoc) bool {
+        if (self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            debug.acquire(self, self.class, 0, src);
+            return true;
+        }
+        return false;
     }
 
     pub fn unlock(self: *SpinLock) void {
@@ -56,6 +77,8 @@ pub const SpinLock = struct {
         const state = arch.cpu.saveAndDisableInterrupts();
         debug.acquire(self, self.class, ordered_group, src);
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            // Ack-while-spinning — see `lockOrdered`.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
         return state;

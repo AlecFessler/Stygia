@@ -848,6 +848,29 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         // has ever pointed at them. Safe to finalize inline.
         finalizeDestroyMarkedDead(ec);
     }
+
+    // Eviction barrier — spec §[terminate] test 04: "on success, the
+    // target EC stops executing." Without this spin, terminate returns
+    // OK while the target may still be executing user code on a remote
+    // core until the wake IPI lands, leaving a window where subsequent
+    // caller actions (unmap, teardown, page_frame release) race the
+    // target's final instructions (stygia-rs6 family). Spin on
+    // dispatch-slot identity, NOT `on_cpu`: a cross-core-migrated EC
+    // sits in the target core's run queue with on_cpu stale-true and
+    // nothing scheduled to clear it (btl8 migration protocol), so an
+    // on_cpu spin deadlocks on queued victims — while a queued victim
+    // was never executing, so the identity spin exits immediately.
+    // For a genuinely-running victim the wake IPI is in flight and the
+    // eviction path (disowned-current escape / switchTo replace /
+    // parkAndAwaitIRQ) rewrites `current_ec` within one IRQ delivery.
+    // The EC is gen-dead here, so no core can re-dispatch it after the
+    // slot stops naming it. Self-terminate is excluded: the caller
+    // cannot wait for its own eviction.
+    if (ec != caller and ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
+        while (scheduler.currentEcPtrOn(ec.last_dispatched_core) == ec) {
+            std.atomic.spinLoopHint();
+        }
+    }
     return errors.OK;
 }
 
@@ -1699,6 +1722,14 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
             }
         }.visit,
     );
+    // NOTE: victim ECs of this walk may still be EXECUTING on remote
+    // cores when this returns — the per-EC destroy only posts a zombie
+    // + wake IPI for on-cpu targets. Translation safety is the
+    // caller's job: destroyPhase2 runs `scheduler.awaitNoActiveRoot`
+    // on the dying root before freeing any table. (`on_cpu` is NOT a
+    // usable eviction signal here: it stays stale-true across the
+    // cross-core migration boundary for queued ECs and its gated
+    // clears race the dispatch path — see PerCore.active_root.)
 }
 
 /// Same as `destroyExecutionContext`, but tailored for the
@@ -1805,6 +1836,15 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     }
 
     ec.state = .exited;
+    // Re-sweep run_queues after the state flip — same race as in
+    // `terminate` (see the matching comment there): a yieldTo on the
+    // EC's running core can re-enqueue it during the cleanup window
+    // above (it still reads state == .running), leaving a dangling
+    // queue entry that a later dequeue traverses after the reap has
+    // zeroed the slab slot. The re-sweep undoes any such re-enqueue
+    // and publishes state=.exited via every core_locks[] pairing.
+    // This variant was missing the sweep terminate has had all along.
+    scheduler.removeFromQueue(ec);
     const gen = ec._gen_lock.currentGen();
     if (gen % 2 == 0) return;
 

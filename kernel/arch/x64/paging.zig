@@ -409,6 +409,74 @@ inline fn bumpSyncArmGen() u64 {
     return @atomicRmw(u64, &sync_arm_gen, .Add, 1, .release) + 1;
 }
 
+/// Service any pending sync arm from OUTSIDE the lock, using a
+/// conservative full non-global TLB flush. The descriptor
+/// (`shootdown_kind`/`addr`/`pcid`) is only stable under
+/// `shootdown_lock`, so a spinning contender cannot decode it — but
+/// over-flushing is always safe, and the ack contract only requires
+/// that this core's TLB holds no stale entry for ANY descriptor at or
+/// below the acked gen. Also drains the fire-and-forget per-PCID
+/// queue, mirroring `tlbShootdownHandler`.
+fn ackPendingSyncArmConservative(my_core: u64) void {
+    const armed = @atomicLoad(u64, &sync_arm_gen, .acquire);
+    if (@atomicLoad(u64, &core_acked_gen[my_core], .monotonic) >= armed) {
+        drainLocalPendingPcid(my_core);
+        return;
+    }
+    if (cpu.pcid_enabled) {
+        // INVPCID type 3: all-context excluding globals. Kernel
+        // global mappings survive; every user translation for every
+        // PCID is dropped — a superset of any sync-arm descriptor.
+        var desc: [2]u64 align(16) = undefined;
+        desc[0] = 0;
+        desc[1] = 0;
+        asm volatile ("invpcid (%[desc]), %[type]"
+            :
+            : [desc] "r" (&desc),
+              [type] "r" (@as(u64, 3)),
+            : .{ .memory = true });
+    } else {
+        // CR3 reload flushes all non-global entries when PCIDE=0.
+        cpu.writeCr3(cpu.readCr3());
+    }
+    drainLocalPendingPcid(my_core);
+    @atomicStore(u64, &core_acked_gen[my_core], armed, .release);
+}
+
+/// Public spin-loop service hook: acknowledge any pending sync TLB
+/// arm with a conservative full non-global flush. Called from the
+/// generic lock spin loops (SpinLock / GenLock) between acquisition
+/// attempts, because the shootdown-ack deadlock is NOT specific to
+/// `shootdown_lock` contention: ANY IRQs-masked spin on ANY lock
+/// whose holder is (transitively) inside `waitForShootdownAcks`
+/// wedges the machine — captured live (stygia-rs6 mechanism 9) as a
+/// #PF handler spinning IRQs-off on a CapabilityDomain gen-lock
+/// while the lock's holder ran `capability.delete` → `destroyVmar`
+/// → `unmapAll` → sync shootdown, waiting for the spinner's ack.
+/// Cheap when idle: one shared-cacheline load and compare.
+pub fn serviceTlbArmsWhileSpinning() void {
+    ackPendingSyncArmConservative(apic.coreID());
+}
+
+/// Acquire `shootdown_lock` while staying responsive to concurrent
+/// sync arms. The blind `shootdown_lock.lock()` deadlocks: a core
+/// spinning here with IRQs masked (destroyPhase2's `freeAddrSpaceId`
+/// → `flushRemotePcid`) cannot take the shootdown IPI, while the
+/// current holder sits in `waitForShootdownAcks` waiting for exactly
+/// this core's ack (stygia-rs6, captured live: core 0 IRQs-off in
+/// this spin, core 1 holding the lock waiting on core 0, both RDY
+/// test ECs stranded behind them). Servicing arms between attempts
+/// is the standard IPI-vs-spinlock discipline; it is correct for
+/// IRQs-on contenders too (the IPI handler acking concurrently is
+/// idempotent — both store the latest gen).
+fn lockShootdownServicingArms(src: std.builtin.SourceLocation) void {
+    const my_core = apic.coreID();
+    while (!shootdown_lock.tryLock(src)) {
+        ackPendingSyncArmConservative(my_core);
+        std.atomic.spinLoopHint();
+    }
+}
+
 /// Wait until every remote core has acked the sync arm at
 /// `expected_gen` by storing it into its `core_acked_gen` slot.
 /// Caller must hold `shootdown_lock`.
@@ -470,7 +538,7 @@ fn flushRemoteTlb(virt_addr: u64) void {
 
     const self_id = apic.coreID();
 
-    shootdown_lock.lock(@src());
+    lockShootdownServicingArms(@src());
     defer shootdown_lock.unlock();
 
     // Fire-and-forget: publish the descriptor and fan out, but do NOT
@@ -541,7 +609,7 @@ pub fn flushRemotePcid(pcid: u16) void {
         return;
     }
 
-    shootdown_lock.lock(@src());
+    lockShootdownServicingArms(@src());
     defer shootdown_lock.unlock();
 
     // Order matters under concurrent handler runs (a stale IPI from a
@@ -796,16 +864,31 @@ pub fn mapPage(
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
-            entry.* = parent_entry;
-            entry.setPAddr(new_phys);
+            // Compose the full descriptor BEFORE the single 8-byte
+            // store. The previous two-store sequence (install entry,
+            // then setPAddr) left a transient PRESENT table entry
+            // pointing at phys 0; hardware page walks are asynchronous
+            // and the paging-structure caches may capture the bogus
+            // intermediate, after which every sibling VA under this
+            // table persistently faults against a stale cached walk
+            // even though memory holds the corrected entry
+            // (stygia-rs6 mechanism 8 — the aarch64 twin of this
+            // pattern was implicated in eternal translation-fault
+            // loops on a Pi 5 / KVM-6.6 host).
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_phys);
+            entry.* = filled_parent;
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
     const l1_entry = &table[l1Idx(virt)];
-    l1_entry.* = leaf_entry;
-    l1_entry.setPAddr(phys);
+    // Single-store leaf install — same transient-phys-0 hazard as the
+    // parent-entry sites above.
+    var filled_leaf = leaf_entry;
+    filled_leaf.setPAddr(phys);
+    l1_entry.* = filled_leaf;
 }
 
 /// Boot-time page mapping supporting 4-KByte, 2-MByte, and 1-GByte pages.
@@ -865,7 +948,6 @@ pub fn mapPageBoot(
                 page_entry_table_size,
             );
             @memset(new_entry, default_page_entry);
-            entry.* = parent_entry;
 
             const new_entry_virt = VAddr.fromInt(@intFromPtr(new_entry.ptr));
             var new_entry_phys: PAddr = undefined;
@@ -874,7 +956,15 @@ pub fn mapPageBoot(
             } else {
                 new_entry_phys = PAddr.fromVAddr(new_entry_virt, 0);
             }
-            entry.setPAddr(new_entry_phys);
+            // Single-store descriptor install (stygia-rs6 mechanism 8):
+            // the old two-store sequence left a WIDE transient window
+            // (address computed between the stores) with a PRESENT
+            // table entry pointing at phys 0 — poisonable by the
+            // paging-structure caches when this runs with paging live
+            // (AP bring-up). See the aarch64 mapPageBoot twin.
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_entry_phys);
+            entry.* = filled_parent;
         }
 
         var entry_virt: VAddr = undefined;
@@ -896,9 +986,12 @@ pub fn mapPageBoot(
         entry = &table[idx];
 
         if (size == level_entry_size) {
-            entry.* = leaf_entry;
-            if (level_entry_size != .page4k) entry.huge_page = true;
-            entry.setPAddr(phys);
+            // Single-store leaf install — see the parent-entry comment
+            // above (stygia-rs6 mechanism 8).
+            var filled_leaf = leaf_entry;
+            if (level_entry_size != .page4k) filled_leaf.huge_page = true;
+            filled_leaf.setPAddr(phys);
+            entry.* = filled_leaf;
             return;
         }
 
@@ -1134,16 +1227,31 @@ pub fn mapPageSized(
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
-            entry.* = parent_entry;
-            entry.setPAddr(new_phys);
+            // Compose the full descriptor BEFORE the single 8-byte
+            // store. The previous two-store sequence (install entry,
+            // then setPAddr) left a transient PRESENT table entry
+            // pointing at phys 0; hardware page walks are asynchronous
+            // and the paging-structure caches may capture the bogus
+            // intermediate, after which every sibling VA under this
+            // table persistently faults against a stale cached walk
+            // even though memory holds the corrected entry
+            // (stygia-rs6 mechanism 8 — the aarch64 twin of this
+            // pattern was implicated in eternal translation-fault
+            // loops on a Pi 5 / KVM-6.6 host).
+            var filled_parent = parent_entry;
+            filled_parent.setPAddr(new_phys);
+            entry.* = filled_parent;
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
     const l1_entry = &table[l1Idx(virt)];
-    l1_entry.* = leaf_entry;
-    l1_entry.setPAddr(phys);
+    // Single-store leaf install — same transient-phys-0 hazard as the
+    // parent-entry sites above.
+    var filled_leaf = leaf_entry;
+    filled_leaf.setPAddr(phys);
+    l1_entry.* = filled_leaf;
 }
 
 pub fn unmapPageSized(
@@ -1355,7 +1463,7 @@ pub fn shootdownTlbRange(
     }
     if (remote_count == 0) return;
 
-    shootdown_lock.lock(@src());
+    lockShootdownServicingArms(@src());
     defer shootdown_lock.unlock();
 
     const kind: ShootdownKind = if (cpu.pcid_enabled) .invpcid_addr else .invlpg;

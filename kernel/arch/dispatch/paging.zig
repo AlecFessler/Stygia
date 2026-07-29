@@ -213,6 +213,72 @@ pub fn dropIdentityMapping() void {
     }
 }
 
+/// Detach this core from a dying user address space before its
+/// translation tables are freed. An EC destroying its OWN domain
+/// executes destroyPhase2 while the dying domain's root is still the
+/// active translation base on x86-64 (CR3 covers both halves), so
+/// `freeUserAddrSpace` would recycle the very tables the executing
+/// core walks through — the first cold TLB miss afterwards makes even
+/// kernel addresses unwalkable and the core dies in a recursive-panic
+/// / triple-fault cascade (stygia-rs6 layer 2). Swap to the kernel
+/// root iff the active root IS the dying root; the no-flush PCID swap
+/// is fine — stale entries for the dying PCID are handled by the
+/// existing flushRemotePcid machinery on addr-space-id release.
+///
+/// Returns true when a swap was performed, so the caller can publish
+/// `active_root = 0` truthfully (a cross-domain destroyer keeps its
+/// own root loaded and must keep publishing it).
+///
+/// aarch64: kernel translation lives in TTBR1_EL1 and the dying root
+/// only ever occupies TTBR0_EL1, which no kernel-mode walk depends on
+/// — nothing to detach; returns false.
+pub fn detachDyingUserRoot(dying_root: PAddr, kernel_root: PAddr) bool {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (x64.paging.getAddrSpaceRoot().addr == dying_root.addr) {
+                x64.paging.swapAddrSpace(kernel_root, 0);
+                return true;
+            }
+            return false;
+        },
+        .aarch64 => return false,
+        else => unreachable,
+    }
+}
+
+/// Service pending TLB-shootdown maintenance from inside a lock spin
+/// loop. x86-64: acknowledge any pending sync arm with a conservative
+/// full non-global flush — REQUIRED in every spin that can run with
+/// IRQs masked, or the spinner deadlocks against a lock holder inside
+/// `waitForShootdownAcks` (stygia-rs6 mechanism 9; see
+/// `x64.paging.serviceTlbArmsWhileSpinning`). aarch64: no-op — TLB
+/// maintenance is broadcast (TLBI *IS), there is no ack protocol.
+pub inline fn serviceTlbMaintenanceWhileSpinning() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.serviceTlbArmsWhileSpinning(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Load the kernel-only translation root on this core (idle/park
+/// hygiene — see scheduler.parkAndAwaitIRQ). x86-64: CR3 swap to the
+/// kernel root under PCID 0 unless already loaded. aarch64: no-op —
+/// kernel translation lives in TTBR1_EL1 and a parked core performs
+/// no TTBR0 walks (speculative-walk hygiene for real hardware is
+/// tracked separately).
+pub fn loadKernelRoot(kernel_root: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (x64.paging.getAddrSpaceRoot().addr != kernel_root.addr) {
+                x64.paging.swapAddrSpace(kernel_root, 0);
+            }
+        },
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 /// Classification of ELF relocation types for KASLR slide application.
 pub const RelocAction = enum { skip, abs64, abs32, unsupported };
 
