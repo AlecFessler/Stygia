@@ -12,13 +12,15 @@ const BootInfo = stygia.boot.protocol.BootInfo;
 const PAddr = stygia.memory.address.PAddr;
 const VAddr = stygia.memory.address.VAddr;
 
-pub fn panic(
-    msg: []const u8,
-    error_return_trace: ?*std.builtin.StackTrace,
-    ret_addr: ?usize,
-) noreturn {
-    stygia.panic.panic(msg, error_return_trace, ret_addr);
-}
+// Installs the kernel's panic interface for the whole program, including
+// every compiler-emitted safety check. Deliberately NOT a plain
+// `pub fn panic` — Zig wraps that in `std.debug.FullPanic`, whose
+// formatted safety hooks stack-allocate a 4 KiB buffer via
+// `std.debug.panicExtra`; on a busy kernel stack that buffer IS a stack
+// overflow, and the Debug-mode fill of it trampled the very frames the
+// panic was trying to report (measured on the Pi 5 rig). See
+// `stygia.panic.interface`.
+pub const panic = stygia.panic.interface;
 
 // Override compiler-rt's `memset` (which on aarch64 is implemented with
 // NEON `dup`/`stp q0,q0` instructions). The kernel's exception entry path

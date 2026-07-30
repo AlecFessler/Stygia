@@ -75,6 +75,15 @@ const MAX_PANIC_CORES: usize = 256;
 /// `core_id` should be the calling core's APIC id. The first call wins;
 /// any subsequent call from a DIFFERENT core returns false. Repeat calls
 /// from the SAME core (e.g. fault-handler print → `@panic`) return true.
+/// True when a DIFFERENT core owns the panic gate. Used by the locked
+/// printers to stop competing with an in-progress panic report for the
+/// UART — the loser halts rather than shredding the evidence.
+pub fn claimedByOtherCore() bool {
+    const o = panic_owner.load(.monotonic);
+    if (o == PANIC_OWNER_NONE) return false;
+    return o != @as(u32, @truncate(stygia.arch.dispatch.smp.coreID()));
+}
+
 pub fn claimPanic() bool {
     const self_core: u32 = @truncate(stygia.arch.dispatch.smp.coreID());
     const prev = panic_owner.cmpxchgStrong(
@@ -86,6 +95,109 @@ pub fn claimPanic() bool {
     if (prev == null) return true;
     return prev.? == self_core;
 }
+
+/// Root-module panic interface — installed via `pub const panic` in
+/// kernel/main.zig, REPLACING the implicit `std.debug.FullPanic` wrap.
+///
+/// FullPanic routes every formatted safety panic (index out of bounds,
+/// switch on corrupt value, sentinel mismatch, ...) through
+/// `std.debug.panicExtra`, which stack-allocates a 4 KiB format buffer —
+/// and in Debug the compiler pre-fills that `undefined` buffer. Caught in
+/// the act on the Pi 5 rig: a safety panic taken on a busy kernel stack
+/// had the fill march through the stack guard, so the PANIC ITSELF became
+/// a kernel-stack overflow that trampled the frames of the context it was
+/// reporting on, replacing saved fp/lr with fill bytes
+/// (`ret=0x0101010101010101`, `lr=1`) and burying the original fault.
+///
+/// This interface keeps the exact std messages, but the six formatted
+/// hooks render into a 128-byte buffer (values truncate rather than the
+/// stack dying), and the static ones pass their literal through directly.
+pub const interface = struct {
+    pub fn call(msg: []const u8, ret_addr: ?usize) noreturn {
+        panic(msg, null, ret_addr);
+    }
+    fn callFmt(ret_addr: ?usize, comptime fmt: []const u8, args: anytype) noreturn {
+        @branchHint(.cold);
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
+        panic(msg, null, ret_addr);
+    }
+    pub fn sentinelMismatch(expected: anytype, found: @TypeOf(expected)) noreturn {
+        callFmt(@returnAddress(), "sentinel mismatch: expected {any}, found {any}", .{ expected, found });
+    }
+    pub fn unwrapError(err: anyerror) noreturn {
+        callFmt(@returnAddress(), "attempt to unwrap error: {s}", .{@errorName(err)});
+    }
+    pub fn outOfBounds(index: usize, len: usize) noreturn {
+        callFmt(@returnAddress(), "index out of bounds: index {d}, len {d}", .{ index, len });
+    }
+    pub fn startGreaterThanEnd(start: usize, end: usize) noreturn {
+        callFmt(@returnAddress(), "start index {d} is larger than end index {d}", .{ start, end });
+    }
+    pub fn inactiveUnionField(active: anytype, accessed: @TypeOf(active)) noreturn {
+        callFmt(@returnAddress(), "access of union field '{s}' while field '{s}' is active", .{ @tagName(accessed), @tagName(active) });
+    }
+    pub fn sliceCastLenRemainder(src_len: usize) noreturn {
+        callFmt(@returnAddress(), "slice length '{d}' does not divide exactly into destination elements", .{src_len});
+    }
+    pub fn reachedUnreachable() noreturn {
+        call("reached unreachable code", @returnAddress());
+    }
+    pub fn unwrapNull() noreturn {
+        call("attempt to use null value", @returnAddress());
+    }
+    pub fn castToNull() noreturn {
+        call("cast causes pointer to be null", @returnAddress());
+    }
+    pub fn incorrectAlignment() noreturn {
+        call("incorrect alignment", @returnAddress());
+    }
+    pub fn invalidErrorCode() noreturn {
+        call("invalid error code", @returnAddress());
+    }
+    pub fn integerOutOfBounds() noreturn {
+        call("integer does not fit in destination type", @returnAddress());
+    }
+    pub fn integerOverflow() noreturn {
+        call("integer overflow", @returnAddress());
+    }
+    pub fn shlOverflow() noreturn {
+        call("left shift overflowed bits", @returnAddress());
+    }
+    pub fn shrOverflow() noreturn {
+        call("right shift overflowed bits", @returnAddress());
+    }
+    pub fn divideByZero() noreturn {
+        call("division by zero", @returnAddress());
+    }
+    pub fn exactDivisionRemainder() noreturn {
+        call("exact division produced remainder", @returnAddress());
+    }
+    pub fn integerPartOutOfBounds() noreturn {
+        call("integer part of floating point value out of bounds", @returnAddress());
+    }
+    pub fn corruptSwitch() noreturn {
+        call("switch on corrupt value", @returnAddress());
+    }
+    pub fn shiftRhsTooBig() noreturn {
+        call("shift amount is greater than the type size", @returnAddress());
+    }
+    pub fn invalidEnumValue() noreturn {
+        call("invalid enum value", @returnAddress());
+    }
+    pub fn forLenMismatch() noreturn {
+        call("for loop over objects with non-equal lengths", @returnAddress());
+    }
+    pub fn copyLenMismatch() noreturn {
+        call("source and destination arguments have non-equal lengths", @returnAddress());
+    }
+    pub fn memcpyAlias() noreturn {
+        call("@memcpy arguments alias", @returnAddress());
+    }
+    pub fn noreturnReturned() noreturn {
+        call("'noreturn' function returned", @returnAddress());
+    }
+};
 
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {
     @branchHint(.cold);
