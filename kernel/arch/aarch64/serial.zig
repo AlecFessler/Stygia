@@ -34,6 +34,11 @@ const offsets = struct {
 const fr_bits = struct {
     /// Bit 5: Transmit FIFO full. When set, the TX FIFO cannot accept more data.
     const txff: u32 = (1 << 5);
+
+    /// Bit 3: UART busy. Set while a character is still being shifted out, or
+    /// while the TX FIFO is non-empty. Clear means everything written has
+    /// physically left the pin.
+    const busy: u32 = (1 << 3);
 };
 
 /// MMIO base address of the PL011 UART, set at runtime from ACPI SPCR.
@@ -92,13 +97,75 @@ pub fn print(comptime format: []const u8, args: anytype) void {
     }
 }
 
+/// Wait until everything written has physically left the pin.
+///
+/// `writeByte` only waits for the FIFO to be non-FULL, so up to a FIFO's worth of
+/// characters (32 on a PL011) can still be queued when it returns. That is harmless
+/// right up until something resets the machine: PSCI `SYSTEM_RESET` does not drain
+/// the UART, so those bytes are simply lost.
+///
+/// Measured on the bare-metal Pi 5 rig, where the casualty was the single most
+/// important line of the entire run — the runner's cross-run aggregate, cut off
+/// mid-number as the reboot took effect:
+///
+///     [runner] === aggregate over 2 runs: 9
+///
+/// with `57 pass / 11 fail / 2 miss ===` never reaching the wire. Any verdict read
+/// off a serial console has to survive the reset that immediately follows it, so
+/// the power path drains before handing over to PSCI.
+///
+/// Bounded and `tx_dead`-aware for the same reasons as `writeByte`: a UART that
+/// never reports idle must not convert a clean reboot into a hang.
+pub fn flush() void {
+    if (tx_dead) return;
+    const base = base_addr orelse return;
+
+    const fr_ptr: *volatile u32 = @ptrFromInt(base + offsets.uartfr);
+    var spins: u32 = 0;
+    while ((fr_ptr.* & fr_bits.busy) != 0) {
+        spins += 1;
+        if (spins > tx_spin_budget) return;
+    }
+}
+
+/// Latched once the TX FIFO has failed to drain within `tx_spin_budget`.
+///
+/// Latched rather than checked per call so a UART that never drains costs one
+/// budget in total instead of one per byte. A per-byte bound on a 4 KB log would
+/// stall for minutes and still produce nothing.
+var tx_dead: bool = false;
+
+/// A 115200 8N1 character takes ~87 µs to shift out, and even a PCIe-attached
+/// register read (~1 µs each) needs only ~100 iterations to cover that. A million
+/// leaves four orders of magnitude of headroom for a slow emulated UART while still
+/// bounding a dead one, so this cannot drop output on a working console.
+const tx_spin_budget: u32 = 1_000_000;
+
 /// Poll UARTFR.TXFF until the transmit FIFO has space, then write one
 /// byte to UARTDR.
 /// DDI0183G Section 3.3.3 (UARTFR) and Section 3.3.1 (UARTDR).
+///
+/// The poll is bounded, which matters on exactly one configuration: bare metal,
+/// where `base_addr` comes from the loader rather than from firmware this kernel
+/// has already been talking through. A window that reads all-ones has TXFF
+/// permanently set, so an unbounded poll would never return from the *first*
+/// `print` — the kernel would die before emitting one byte on either console, and
+/// the symptom (total silence after the loader stops) is indistinguishable from a
+/// hang anywhere else in early boot. Dropping characters is the strictly better
+/// failure.
 fn writeByte(byte: u8, base: u64) void {
+    if (tx_dead) return;
+
     const fr_ptr: *volatile u32 = @ptrFromInt(base + offsets.uartfr);
     const dr_ptr: *volatile u32 = @ptrFromInt(base + offsets.uartdr);
 
-    while ((fr_ptr.* & fr_bits.txff) != 0) {}
+    var spins: u32 = 0;
+    while ((fr_ptr.* & fr_bits.txff) != 0) {
+        spins += 1;
+        if (spins > tx_spin_budget) {
+            tx_dead = true;
+            return;
+        }
+    }
     dr_ptr.* = byte;
 }

@@ -31,6 +31,8 @@
 const stygia = @import("stygia");
 
 const cpu = stygia.arch.aarch64.cpu;
+const watchdog = stygia.arch.aarch64.watchdog;
+const serial = stygia.arch.aarch64.serial;
 
 // --- PSCI return codes (DEN0022D, Table 6) ---
 
@@ -162,6 +164,35 @@ pub fn cpuOn(target_mpidr: u64, entry_point: u64, context_id: u64) i64 {
 /// DEN0022D, Section 5.1.7: SYSTEM_OFF powers down the entire system.
 /// Does not return on success.
 fn doShutdown() noreturn {
+    // Drain the UART before handing over to PSCI.
+    //
+    // `serial.writeByte` only waits for the TX FIFO to be non-full, so up to 32
+    // characters can still be queued here, and neither SYSTEM_OFF nor
+    // SYSTEM_RESET drains the UART on its way out. Measured on the bare-metal Pi
+    // 5 rig: the test runner's cross-run aggregate — the one line a whole
+    // unattended run is judged on — arrived as
+    // `[runner] === aggregate over 2 runs: 9`, truncated mid-number. A verdict
+    // read off a serial console has to survive the reset that follows it.
+    serial.flush();
+    // Stop petting the BCM2712 watchdog, if one was discovered. This adds no
+    // power logic of its own — `.shutdown` still means SYSTEM_OFF — it only
+    // stops the kernel from holding a board alive that has been asked to go
+    // away.
+    //
+    // It has to happen BEFORE the park below rather than after, for two
+    // reasons: `psciCall(SYSTEM_OFF)` does not return on a platform where
+    // SYSTEM_OFF works, and the `while (true) cpu.halt()` fallback taken when
+    // it doesn't parks in WFI without masking interrupts — so an interrupt
+    // arriving in the parked state would run `exceptions.dispatchIrq` and pet
+    // a watchdog on a board that is meant to be going away.
+    //
+    // Inert on every other target: there is no watchdog mapping without a
+    // `brcm,bcm2712-pm` devicetree node, and QEMU's SYSTEM_OFF genuinely powers
+    // off, so neither this call nor the park below is observable there. On a
+    // bare-metal Pi 5 the practical effect is that a genuine power-off request
+    // ends in the armed watchdog's ≤15 s reset instead of a dark board needing a
+    // human power cycle (whose cold boot would also erase the DRAM early log).
+    watchdog.stopPetting();
     _ = psciCall(SYSTEM_OFF, 0, 0, 0);
     // SYSTEM_OFF should not return. If it does, halt forever.
     while (true) cpu.halt();
@@ -171,6 +202,23 @@ fn doShutdown() noreturn {
 /// DEN0022D, Section 5.1.8: SYSTEM_RESET performs a cold reset of the system.
 /// Does not return on success.
 fn doReboot() noreturn {
+    // Drain the UART before handing over to PSCI.
+    //
+    // `serial.writeByte` only waits for the TX FIFO to be non-full, so up to 32
+    // characters can still be queued here, and neither SYSTEM_OFF nor
+    // SYSTEM_RESET drains the UART on its way out. Measured on the bare-metal Pi
+    // 5 rig: the test runner's cross-run aggregate — the one line a whole
+    // unattended run is judged on — arrived as
+    // `[runner] === aggregate over 2 runs: 9`, truncated mid-number. A verdict
+    // read off a serial console has to survive the reset that follows it.
+    serial.flush();
+    // Same reasoning as `doShutdown`, and equally not a policy change: only
+    // relevant if SYSTEM_RESET is unimplemented and this falls through to the
+    // interrupt-taking park below, where continuing to pet would keep a board
+    // alive that was asked to reset. On a bare-metal Pi 5 SYSTEM_RESET works
+    // (it is the suite's `-Dreboot_at_end` exit) so this line is never reached
+    // to any observable effect; no-op wherever no watchdog was discovered.
+    watchdog.stopPetting();
     _ = psciCall(SYSTEM_RESET, 0, 0, 0);
     // SYSTEM_RESET should not return. If it does, halt forever.
     while (true) cpu.halt();

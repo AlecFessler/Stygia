@@ -1,6 +1,7 @@
 pub const acpi = @import("acpi.zig");
 pub const asid = @import("asid.zig");
 pub const cpu = @import("cpu.zig");
+pub const dt_discovery = @import("dt_discovery.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const gic = @import("gic.zig");
 pub const hyp = @import("hyp.zig");
@@ -19,3 +20,4 @@ pub const sysinfo = @import("sysinfo.zig");
 pub const timers = @import("timers.zig");
 pub const vm = @import("vm.zig");
 pub const vm_runloop = @import("vm_runloop.zig");
+pub const watchdog = @import("watchdog.zig");

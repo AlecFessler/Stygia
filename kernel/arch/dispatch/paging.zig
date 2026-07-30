@@ -47,9 +47,23 @@ pub const addr_space = switch (builtin.cpu.arch) {
             .start = 0xFFFF_0000_4000_0000,
             .end = 0xFFFF_0400_0000_0000,
         };
+        // 128 GiB, not the 32 GiB x86-64 gets. `VAddr.fromPAddr` is a
+        // flat `physmap.start + PA` with no bounds check, so every
+        // physical address the kernel ever maps must fit inside this
+        // window or it lands in a neighbouring partition.
+        //
+        // 32 GiB is not enough on the Raspberry Pi 5: BCM2712 places its
+        // SoC peripherals at PA 0x10_0000_0000 and up (the GIC-400 at
+        // 0x10_7fff_9000, the debug PL011 at 0x10_7d00_1000 — ~66 GiB),
+        // and the RP1 southbridge window sits at 0x1F_0000_0000. Both fit
+        // under 128 GiB. Widening only moves the end: the three
+        // `physmap.contains()` consumers on aarch64
+        // (`arch/aarch64/paging.zig`) test page-table-page VAs whose PAs
+        // are RAM below 4 GiB, and no other aarch64 VA constant occupies
+        // 0xFFFF_FF88.. through 0xFFFF_FFA0.. .
         pub const physmap: Range = .{
             .start = 0xFFFF_FF80_0000_0000,
-            .end = 0xFFFF_FF88_0000_0000,
+            .end = 0xFFFF_FFA0_0000_0000,
         };
         // Kernel text/rodata (bottom of TTBR1 range).
         pub const kernel_code: Range = .{

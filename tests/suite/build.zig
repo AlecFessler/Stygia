@@ -753,6 +753,23 @@ pub fn build(b: *std.Build) void {
     // iteration counts without paying kernel-build / boot cost per rep.
     const repeat = b.option(u32, "repeat", "Number of times to replay the test manifest per boot (default 1)") orelse 1;
 
+    // How the runner stops the machine once every run has reported.
+    //
+    // Default `power_shutdown` is what every emulated target wants: under QEMU it
+    // exits the process, which is how `zig build run` terminates and how
+    // tests/precommit.sh distinguishes a finished run from its own timeout.
+    //
+    // Bare metal wants the opposite. On the Raspberry Pi 5 rig a genuine power-off
+    // leaves the board dark and unrecoverable over ssh, so an unattended
+    // N-runs-in-a-row loop would stall on its first *successful* pass. A reboot
+    // instead lands in PSCI SYSTEM_RESET, and because the Pi's firmware injects
+    // `reboot=w` the reset is warm — DRAM survives, so the loader's early log is
+    // still readable afterwards — and tryboot's one-shot fallback brings Pi OS
+    // back so the harness can start the next run.
+    //
+    // Off by default precisely so no existing gate changes behaviour.
+    const reboot_at_end = b.option(bool, "reboot_at_end", "End the run with power_reboot instead of power_shutdown (for bare-metal rigs that must return to the host OS; default false)") orelse false;
+
     // Debug aid for lost-result bugs (stygia-ojs): when a batch drain
     // hits its recv timeout, freeze instead of carrying on, so the
     // machine stays live and inspectable over the qemu gdb stub at the
@@ -1068,6 +1085,11 @@ pub fn build(b: *std.Build) void {
     manifest.writer().print(
         "pub const repeat: u32 = {d};\n",
         .{repeat},
+    ) catch unreachable;
+    // Comptime end-of-run action; see the -Dreboot_at_end option.
+    manifest.writer().print(
+        "pub const reboot_at_end: bool = {};\n",
+        .{reboot_at_end},
     ) catch unreachable;
     // Comptime corpse-preservation flag; see the -Dhalt_on_miss option.
     manifest.writer().print(

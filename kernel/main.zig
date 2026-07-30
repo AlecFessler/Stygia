@@ -88,7 +88,11 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.boot.init();
     try memory.init(boot_info.mmap);
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide);
-    try arch.boot.parseFirmwareTables(boot_info.xsdp_phys);
+    try arch.boot.parseFirmwareTables(
+        boot_info.xsdp_phys,
+        boot_info.dtb_phys,
+        boot_info.console_base,
+    );
     // Promote getMonotonicClock() from HPET MMIO to invariant TSC if the
     // CPU advertises it. Must run after parseFirmwareTables (HPET base
     // mapped) and before any code reads getMonotonicClock() — most

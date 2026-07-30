@@ -419,6 +419,19 @@ pub fn main() uefi.Status {
     boot_info.root_service.ptr = rs_bytes.ptr;
     boot_info.root_service.len = rs_bytes.len;
     boot_info.xsdp_phys = xsdp_phys;
+    // This loader always boots via UEFI+ACPI (findXSDP above aborts
+    // otherwise), so there is no DTB to hand over. Assigned explicitly
+    // rather than left to the field's default: `boot_info` points at raw
+    // stack memory, so `BootInfo`'s struct defaults never run and an
+    // unwritten field would be garbage the kernel maps and parses as a
+    // devicetree. The pi5 loader is where this gets a real value.
+    boot_info.dtb_phys = PAddr.fromInt(0);
+    // No loader-resolved console either: this path's UART comes from ACPI
+    // SPCR (or QEMU virt's hardcoded PL011 when there is no SPCR), which is
+    // correct for every target it boots. Zero means "discover one", and
+    // must be written for the same reason as `dtb_phys` — garbage here is
+    // an MMIO mapping of an arbitrary page that the kernel prints into.
+    boot_info.console_base = PAddr.fromInt(0);
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
     boot_info.kaslr_slide = kaslr_slide;

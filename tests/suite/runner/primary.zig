@@ -444,9 +444,24 @@ pub fn main(cap_table_base: u64) void {
     // partial log mid-run. Single-shot here captures the whole run.
     syscall.kprofDump();
 
-    // Stop the system. power_shutdown requires the `power` cap on
-    // the self-handle, which the primary holds by construction.
-    _ = syscall.powerShutdown();
+    // Stop the system. Both of these require the `power` cap on the
+    // self-handle, which the primary holds by construction.
+    //
+    // Reached once, after every run in the -Drepeat loop has reported and
+    // the aggregate is printed — not per run.
+    //
+    // -Dreboot_at_end picks a reboot instead, for bare-metal rigs where a
+    // real power-off cannot be undone remotely: on the Raspberry Pi 5 it
+    // becomes PSCI SYSTEM_RESET, which is warm on that board, so the host
+    // OS comes back by itself and an unattended N-runs-in-a-row harness can
+    // start the next boot. Under emulation the shutdown is what makes QEMU
+    // exit, which is how precommit tells a finished run from its own
+    // timeout, so the default must stay `powerShutdown`.
+    if (embedded_tests.reboot_at_end) {
+        _ = syscall.powerReboot();
+    } else {
+        _ = syscall.powerShutdown();
+    }
 }
 
 // Spawns a single test capability domain bound to the shared result

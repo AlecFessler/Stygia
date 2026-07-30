@@ -55,6 +55,54 @@ pub const BootInfo = extern struct {
     /// boot which uses its own hyp stub install path).
     arrived_at_el2: u8 = 0,
     _pad_ael2: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
+    /// Physical address of a flattened devicetree blob, or 0 when the
+    /// platform describes itself through ACPI instead.
+    ///
+    /// The aarch64 kernel needs SOME firmware description to find its GIC
+    /// and its UART, and on boards with no ACPI (Raspberry Pi 5) the DTB
+    /// is the only one there is. `arch.boot.parseFirmwareTables` prefers
+    /// `xsdp_phys` when both are set, so a UEFI/ACPI boot behaves exactly
+    /// as before.
+    ///
+    /// Every loader MUST assign this explicitly. `BootInfo` is built
+    /// field-by-field onto uninitialized stack memory (see
+    /// `bootloader/main.zig`), so struct-default values never run and an
+    /// unwritten field is whatever the stack happened to hold — which the
+    /// kernel would then map and parse as a devicetree.
+    ///
+    /// Appended after `_pad_ael2` deliberately: `arrived_at_el2` plus its
+    /// 7 bytes of padding ends 8-aligned, so a `PAddr` lands here without
+    /// shifting the offset of any existing field.
+    dtb_phys: PAddr = PAddr.fromInt(0),
+    /// Physical base of a console UART the LOADER already resolved and
+    /// verified, or 0 for "I have no opinion, discover one yourself".
+    ///
+    /// This exists because on some boards firmware discovery cannot reach
+    /// the UART that is physically observable. The Raspberry Pi 5 is the
+    /// motivating case: its devicetree describes seven PL011s, and the only
+    /// one wired to a connector that exists (RP1 `uart0` — the DT `serial0`
+    /// alias, Linux's `ttyAMA0`, the GPIO 14/15 header) sits behind the RP1
+    /// southbridge's PCIe bus at CPU PA 0x1F_0003_0000. Reaching it from
+    /// the DTB means translating a PCI address through two `ranges`
+    /// properties, which `boot.fdt` deliberately refuses to do — and it is
+    /// only alive at all because the pi5 loader trained the link. The
+    /// loader therefore already knows the answer, and has probed the
+    /// registers to confirm something answers there; re-deriving it in the
+    /// kernel would be strictly worse-informed.
+    ///
+    /// When nonzero, `arch.boot.parseFirmwareTables` maps this page as
+    /// device memory and points the serial driver at it BEFORE running
+    /// firmware discovery, and suppresses the devicetree UART search so
+    /// nothing displaces it. Zero reproduces the previous behaviour
+    /// exactly: no new code runs on any x86 or QEMU-aarch64 boot.
+    ///
+    /// Same explicit-assignment requirement as `dtb_phys` above, and for
+    /// the same reason — a garbage value here is an MMIO mapping of an
+    /// arbitrary physical page that the kernel then writes characters into.
+    ///
+    /// Appended after `dtb_phys`, which is 8-aligned and 8 bytes wide, so
+    /// this shifts no existing field's offset.
+    console_base: PAddr = PAddr.fromInt(0),
 };
 
 pub const MMap = extern struct {

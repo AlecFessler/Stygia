@@ -305,6 +305,7 @@ pub fn build(b: *std.Build) void {
     install_loader.step.dependOn(&loader.step);
     b.getInstallStep().dependOn(&install_loader.step);
 
+
     // ── Kernel ──────────────────────────────────────────────────────────
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
@@ -358,6 +359,200 @@ pub fn build(b: *std.Build) void {
     );
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
+
+    // ── Raspberry Pi 5 native loader (opt-in, aarch64 only) ─────────────
+    //
+    // A second bootloader for a board with no UEFI, so the kernel can be
+    // exercised on real silicon at EL2 — the only configuration in which
+    // aarch64 virtualization is actually testable (under Pi KVM the guest is
+    // pinned at EL1 and the hv tests short-circuit on E_NODEV).
+    //
+    // Deliberately NOT wired into b.getInstallStep(): it is built only by
+    // `zig build pi5 -Darch=arm`. That keeps default builds, the FAT image,
+    // and every precommit gate byte-identical to before this existed. It also
+    // means the mixed-arch image guards do not have to reason about a
+    // bare-metal artifact that never belongs in zig-out/img.
+    if (arch == .aarch64) {
+        const pi5_target = b.resolveTargetQuery(.{
+            .cpu_arch = .aarch64,
+            .os_tag = .freestanding,
+            .ofmt = .elf,
+            // Pi 5 is a BCM2712 (Cortex-A76). `el3` is required for the `smc`
+            // instruction used to call PSCI — without the feature LLVM rejects
+            // it outright with "instruction requires: el3". We never execute at
+            // EL3; the feature flag only gates the encoding.
+            .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.cortex_a76 },
+            .cpu_features_add = blk: {
+                var s = std.Target.Cpu.Feature.Set.empty;
+                s.addFeature(@intFromEnum(std.Target.aarch64.Feature.el3));
+                break :blk s;
+            },
+            // Drop FP and NEON. This is a correctness requirement, not an
+            // optimization choice, and it was measured rather than guessed.
+            //
+            // The loader runs with the MMU OFF (firmware hands us
+            // SCTLR_EL2 = 0x30c50830, so M=0). When stage 1 translation is
+            // disabled, data accesses are Device-nGnRnE, and an access to Device
+            // memory that is not naturally aligned raises an Alignment fault
+            // regardless of SCTLR_EL2.A.
+            //
+            // LLVM compiles 16-byte struct copies (`dtb.Range` is two u64s) into
+            // `ldr q0` / `str q0`. Those are 16-byte accesses, but Range has only
+            // 8-byte alignment, so against an 8-byte-aligned array element they
+            // are UNALIGNED Device accesses and fault as EC=0x25 / DFSC=0x21.
+            // Measured: 4 such instructions survived in the image, two of them in
+            // normalizeReservations' insertion sort.
+            //
+            // Subtracting `neon` alone is NOT sufficient — `ldr q`/`str q` are FP
+            // instructions gated on `fp_armv8`, so both features must go.
+            //
+            // Same family of hazard as the `memset` override in kernel/main.zig
+            // (compiler-rt's aarch64 memset uses `dup`/`stp q0,q0`) and the NEON
+            // TODO in the aarch64 `cpu_features_sub` above. Here it is free to
+            // fix properly: nothing in this loader wants FP or SIMD, so we remove
+            // the ability to emit either and let it use ldp/stp of x-registers,
+            // whose 8-byte constituent accesses are naturally aligned.
+            .cpu_features_sub = blk: {
+                var s = std.Target.Cpu.Feature.Set.empty;
+                s.addFeature(@intFromEnum(std.Target.aarch64.Feature.neon));
+                s.addFeature(@intFromEnum(std.Target.aarch64.Feature.fp_armv8));
+                break :blk s;
+            },
+        });
+        // ReleaseSmall, not ReleaseFast: this is a flat binary the firmware loads
+        // whole, and there is no hot path in it.
+        const pi5_optimize: std.builtin.OptimizeMode = .ReleaseSmall;
+
+        // The loader calls into the kernel's own paging code (mapPageBoot and
+        // friends) rather than reimplementing VMSAv8-64 table construction. That
+        // means kernel code executes MMU-OFF inside this image, so it must be
+        // built for the LOADER's target, not the kernel's — a separate instance
+        // of the same source, not the shared `stygia_mod`.
+        //
+        // This is not tidiness. `stygia_mod` resolves to `cortex_a72` with FP and
+        // NEON present, and the whole reason `pi5_target` subtracts them is that
+        // 16-byte FP accesses fault when translation is disabled (see the long
+        // comment above). Linking the shared module in would silently reintroduce
+        // exactly the hazard the target flags exist to prevent, in code that is
+        // harder to audit than the loader's own. Separately, FP at EL2 depends on
+        // CPTR_EL2.TFP, whose reset value is not architecturally guaranteed, so
+        // an FP instruction here could trap before it could fault.
+        //
+        // Consequence worth stating: at ReleaseSmall the `std.debug.assert` calls
+        // inside mapPageBoot compile away, so they check nothing here. The
+        // software table walk in bootloader/pi5/paging.zig is what actually
+        // verifies the tables, and it is strictly stronger — it checks the
+        // resulting translations rather than the arguments.
+        const pi5_stygia_mod = b.createModule(.{
+            .root_source_file = b.path("kernel/stygia.zig"),
+            .target = pi5_target,
+            .optimize = pi5_optimize,
+        });
+        pi5_stygia_mod.omit_frame_pointer = false;
+        pi5_stygia_mod.red_zone = false;
+        pi5_stygia_mod.addImport("stygia", pi5_stygia_mod);
+        pi5_stygia_mod.addImport("build_options", build_opts_mod);
+
+        const pi5_kprof_mod = b.createModule(.{
+            .root_source_file = b.path("kernel/kprof/kprof.zig"),
+            .target = pi5_target,
+            .optimize = pi5_optimize,
+        });
+        pi5_kprof_mod.omit_frame_pointer = false;
+        pi5_kprof_mod.red_zone = false;
+        pi5_kprof_mod.addImport("stygia", pi5_stygia_mod);
+        pi5_kprof_mod.addImport("build_options", build_opts_mod);
+        pi5_stygia_mod.addImport("kprof", pi5_kprof_mod);
+
+        // Same generated file as the kernel's, recompiled for this target. On
+        // aarch64 both members are empty slices today; when root_service starts
+        // being embedded, this is where the loader picks it up.
+        const pi5_embedded_bins_mod = b.createModule(.{
+            .root_source_file = embedded_bins_mod.root_source_file.?,
+            .target = pi5_target,
+            .optimize = pi5_optimize,
+        });
+        pi5_stygia_mod.addImport("embedded_bins", pi5_embedded_bins_mod);
+
+        // The kernel and root service, carried INSIDE the loader image.
+        //
+        // The UEFI loader opens `kernel.elf` and `root_service.elf` off the FAT
+        // volume. Pi firmware loads exactly one file and hands over with no
+        // storage stack at all, so both blobs have to be part of that one file.
+        //
+        // `align(4096)` is load-bearing, not cosmetic. `@embedFile` yields
+        // alignment 1, and the ELF parser reaches the header through
+        // `std.mem.bytesAsValue(Elf64_Ehdr, ...)`, which assumes natural
+        // alignment. With the MMU off every access is Device-nGnRnE and an
+        // unaligned one raises an Alignment fault — the same failure class that
+        // the FP/NEON subtraction above exists to prevent, arriving by a
+        // different route. Page alignment also makes `e_shoff`/`e_phoff`
+        // naturally aligned, since those are file-offset aligned already.
+        const pi5_blobs_wf = b.addWriteFiles();
+        _ = pi5_blobs_wf.addCopyFile(kernel.getEmittedBin(), "kernel.elf");
+        _ = pi5_blobs_wf.addCopyFile(
+            .{ .cwd_relative = root_service_path },
+            "root_service.elf",
+        );
+        const pi5_blobs_mod = b.createModule(.{
+            .root_source_file = pi5_blobs_wf.add("pi5_blobs.zig",
+                \\const kernel_raw = @embedFile("kernel.elf");
+                \\const rs_raw = @embedFile("root_service.elf");
+                \\
+                \\pub const kernel_elf: [kernel_raw.len]u8 align(4096) = kernel_raw.*;
+                \\pub const root_service_elf: [rs_raw.len]u8 align(4096) = rs_raw.*;
+                \\
+            ),
+            .target = pi5_target,
+            .optimize = pi5_optimize,
+        });
+
+        const pi5 = b.addExecutable(.{
+            .name = "pi5_loader.elf",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bootloader/pi5/entry.zig"),
+                .target = pi5_target,
+                .optimize = pi5_optimize,
+            }),
+        });
+        pi5.setLinkerScript(b.path("bootloader/pi5/link.ld"));
+        pi5.root_module.addImport("stygia", pi5_stygia_mod);
+        pi5.root_module.addImport("pi5_blobs", pi5_blobs_mod);
+
+        // The EL2->EL1 drop, shared with the UEFI loader.
+        //
+        // Given as a named module rather than imported by relative path: the pi5
+        // module root is `bootloader/pi5/`, so `@import("../aarch64_el2_drop.zig")`
+        // is rejected as an import outside the module path. A module declaration is
+        // the supported way to reach a sibling file, and it also gets the file
+        // compiled for `pi5_target` — which matters here for the same reason
+        // `pi5_stygia_mod` exists, since this code executes inside the loader.
+        //
+        // Sharing rather than copying is deliberate: `hyp_vectors_bytes` is
+        // comptime-assembled and position-independent, and a second copy of the
+        // drop's asm would be a second thing to keep correct.
+        const pi5_el2_drop_mod = b.createModule(.{
+            .root_source_file = b.path("bootloader/aarch64_el2_drop.zig"),
+            .target = pi5_target,
+            .optimize = pi5_optimize,
+        });
+        pi5_el2_drop_mod.omit_frame_pointer = false;
+        pi5_el2_drop_mod.red_zone = false;
+        pi5_el2_drop_mod.addImport("stygia", pi5_stygia_mod);
+        pi5.root_module.addImport("el2_drop", pi5_el2_drop_mod);
+
+        // The firmware loads a RAW binary, not an ELF.
+        const pi5_bin = b.addObjCopy(pi5.getEmittedBin(), .{ .format = .bin });
+        const install_pi5 = b.addInstallFile(
+            pi5_bin.getOutput(),
+            "pi5/kernel_stygia.img",
+        );
+        const pi5_step = b.step(
+            "pi5",
+            "Build the Raspberry Pi 5 bare-metal loader image (aarch64 only)",
+        );
+        pi5_step.dependOn(&install_pi5.step);
+    }
 
     var maybe_install_ir: ?*std.Build.Step.InstallFile = null;
     if (emit_ir or emit_index) {

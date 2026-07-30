@@ -65,9 +65,11 @@ pub fn init() void {
     // anyone who writes instructions. Without this, self-modifying code
     // and JITs are impossible on this kernel — see below.
     enableEl0CacheMaintenance();
-    // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
-    // and redistributor base addresses come from MADT, which has not
-    // been parsed yet at this point.
+    // NOTE: GIC init is deferred to arch.boot.parseFirmwareTables() —
+    // the distributor, CPU-interface and redistributor base addresses
+    // come from firmware (ACPI MADT, or the devicetree on boards with no
+    // ACPI), and neither has been parsed yet at this point. Both routes
+    // end in the same `gic.init(discovery)` call.
 }
 
 /// Set CPACR_EL1.FPEN bits [21:20] = 0b01 — trap any FP/SIMD access

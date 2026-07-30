@@ -127,7 +127,12 @@ const HYP_VECTORS_SIZE: usize = 0x800;
 /// page out of the PE `.text`). Clobbering x9/x10 is fine because
 /// `kernel/arch/aarch64/vm.zig :: installHypVectors` marks them
 /// clobbered in its inline asm around the HVC instruction.
-const hyp_vectors_bytes: [HYP_VECTORS_SIZE]u8 = blk: {
+/// `pub` so the Pi 5 bare-metal loader can copy these bytes into a page it
+/// allocated itself. That loader cannot use `allocateHypVectorStub` below —
+/// there is no UEFI `BootServices` on that platform — but the stub *content*
+/// is position-independent, so the bytes are exactly what it needs. See
+/// `bootloader/pi5/handoff.zig :: allocHypStub`.
+pub const hyp_vectors_bytes: [HYP_VECTORS_SIZE]u8 = blk: {
     @setEvalBranchQuota(100000);
     var out: [HYP_VECTORS_SIZE]u8 = [_]u8{0} ** HYP_VECTORS_SIZE;
 
@@ -222,7 +227,10 @@ pub fn currentEl() u8 {
 /// Drop from EL2 to EL1 in place, preserving the active MMU state.
 ///
 /// Must be called:
-///   - with the MMU enabled at EL2 (firmware configuration),
+///   - with the MMU enabled at EL2 — under UEFI that is firmware's
+///     configuration; on the Pi 5 bare-metal path `bootloader/pi5/mmu.zig`
+///     programs MAIR_EL2/MAIR_EL1/TCR_EL2/TTBR0_EL2 itself before calling
+///     here, which is what makes the mirroring below correct there too,
 ///   - AFTER `setKernelAddrSpace()` has loaded a kernel table into
 ///     TTBR1_EL1 (TTBR0_EL1 is populated here from TTBR0_EL2), and
 ///   - BEFORE `switchStackAndCall(kEntry, ...)`.

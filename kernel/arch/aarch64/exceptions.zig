@@ -61,6 +61,7 @@ const syscall_dispatch = stygia.syscall.dispatch;
 const timer_wheel = stygia.sched.timer;
 const timers = stygia.arch.aarch64.timers;
 const vmar = stygia.memory.vmar;
+const watchdog = stygia.arch.aarch64.watchdog;
 
 const VAddr = stygia.memory.address.VAddr;
 
@@ -968,6 +969,36 @@ const IrqOrigin = enum { user, kernel };
 /// IDT vector.
 fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
     _ = origin;
+
+    // Bare-metal Pi 5 watchdog pet. A no-op — not even a load of the
+    // reload constant — on every target whose devicetree has no
+    // `brcm,bcm2712-pm` node, which is all of them except a real BCM2712
+    // booted by `bootloader/pi5` (see `watchdog.zig`).
+    //
+    // Placed at the top of the shared dispatcher rather than inside the
+    // timer-PPI arm below, for two reasons:
+    //
+    //   1. Several arms of this switch are `noreturn` in practice —
+    //      `scheduler.preempt` can ERET into a different thread — so the
+    //      only position that is guaranteed to execute is before the
+    //      switch.
+    //   2. The timer PPI is not by itself a reliable heartbeat. Both the
+    //      SGI 0 (yield / cross-core wake) arm and the SGI_BCAST_TICK arm
+    //      re-arm the preemption timer for a fresh full TIMESLICE_NS, so a
+    //      workload that yields faster than the timeslice pushes the CNTV/
+    //      CNTP deadline out indefinitely and PPI 27/30 may never fire.
+    //      Petting from the dispatcher makes every interrupt a heartbeat,
+    //      which is both cheaper to reason about and strictly safer.
+    //
+    // Cost is one uncached 32-bit store per interrupt, against a 15 s
+    // window — orders of magnitude more often than strictly required, and
+    // still far below the noise floor of an IRQ entry.
+    //
+    // Not open-ended: `pet()` disables itself once its from-boot budget
+    // expires, so an unattended board still resets on its own after a run
+    // that never terminates. See `watchdog.zig`.
+    watchdog.pet();
+
     switch (intid) {
         // SGI 0 — scheduler IPI raised by `triggerSchedulerInterrupt` on
         // aarch64 (see `arch/dispatch.zig sched_ipi_vector`). Used by both
