@@ -296,7 +296,12 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         // EC is reaped while we spin, its slab bytes are zeroed, so
         // this load reads false and we fall through to phase 3, where
         // the gen check rejects it.
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        while (ec.on_cpu.load(.acquire)) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+            // matching note on `scheduler.markReady`'s kstack barrier.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+        }
 
         // Phase 3 — re-validate, then perform EVERY field write under
         // the gen lock. This is the actual fix: `setSyscallReturn`
@@ -694,7 +699,12 @@ pub fn expireTimedWaiters() void {
         }
 
         if (removed) {
-            while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            while (ec.on_cpu.load(.acquire)) {
+                // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+                // matching note on `scheduler.markReady`'s kstack barrier.
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+            }
             // Claim before writing. This is the timer half of the timed
             // futex wait; `wake()` is the event half and runs on whatever
             // core signalled. Both used to write `.ready` + enqueue

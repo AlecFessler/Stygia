@@ -512,6 +512,11 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .user_ctx = if (from_user) ctx else null,
         .fp = ctx.regs.rbp,
         .frame_ctx = ctx,
+        // AC in the SAVED flags is the state at fault time: the stub
+        // prologue CLACs before any Zig code runs, so only the frame
+        // remembers whether the faulting instruction was inside a
+        // STAC/CLAC user-access window. See `PageFaultContext`.
+        .in_user_access_window = (ctx.rflags & interrupts.RFLAGS_AC) != 0,
     };
     stygia.memory.fault.handlePageFault(&pf_ctx);
 

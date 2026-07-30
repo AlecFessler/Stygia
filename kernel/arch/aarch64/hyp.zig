@@ -68,6 +68,28 @@ const HVC_IMM_INSTALL_VBAR_EL2: u16 = 0xE112;
 /// is linked at a kernel high-half VA, so we walk the kernel page tables
 /// to resolve its PA first. The table is 2 KiB aligned (ARM ARM D1.10.2
 /// — VBAR_ELx bits [10:0] are RES0).
+/// Physical address of the kernel's EL2 vector table (`__hyp_vectors`),
+/// or 0 when EL2 / the bootloader hyp stub is unavailable or the VA
+/// cannot be resolved.
+///
+/// VBAR_EL2 holds a PHYSICAL address while the naked `__hyp_vectors`
+/// symbol is linked at a kernel high-half VA, so the kernel page tables
+/// have to be walked first. Exported so the SMP trampoline can hand each
+/// AP the same table the BSP installs — see `installHypVectors`.
+pub fn hypVectorsPa() u64 {
+    if (!vm.vmSupported()) return 0;
+    const vec_va: u64 = @intFromPtr(&__hyp_vectors);
+    const page_paddr = aarch64_paging.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(vec_va),
+    ) orelse return 0;
+    const vec_pa = page_paddr.addr | (vec_va & 0xFFF);
+    // ARM ARM D1.10.2 — VBAR_ELx bits [10:0] are RES0, so the table must
+    // be 2 KiB aligned.
+    std.debug.assert(vec_pa & 0x7FF == 0);
+    return vec_pa;
+}
+
 pub fn installHypVectors() void {
     // Requires both a CPU that implements EL2 and a live EL2 stub sitting
     // at VBAR_EL2 willing to honour our install HVC. The bootloader
@@ -82,25 +104,26 @@ pub fn installHypVectors() void {
     // which is exactly the conjunction we need: if EL2 is absent OR the
     // hyp stub was never installed, skip.
     if (!vm.vmSupported()) return;
-    // VBAR_EL2 is per-core and the bootloader's EL2 stub was only
-    // installed on the BSP before it ERETed to EL1. On secondaries
-    // (brought up via PSCI CPU_ON), VBAR_EL2 holds whatever firmware
-    // left there, so issuing the install HVC from an AP would trap into
-    // an unknown/unmapped handler and hang the core. Until a dedicated
-    // per-core EL2 bringup path lands, only the BSP runs the install
-    // HVC; VM runs are pinned to the BSP. ARM ARM D13.2.143 —
-    // VBAR_EL2 is per-PE state.
-    // TODO(smp): install vectors on every core once AP EL2 bringup lands.
+    // VBAR_EL2 is per-PE state (ARM ARM D13.2.143) and the bootloader's
+    // EL2 stub was only installed on the BSP before it ERETed to EL1. An
+    // AP must NOT issue this install HVC: its VBAR_EL2 still holds
+    // whatever firmware left there, so the HVC would trap into an
+    // unknown handler and hang the core.
+    //
+    // APs instead get the vector table programmed DIRECTLY via
+    // `msr vbar_el2` while they are still at EL2 inside the
+    // `secondaryEntry` trampoline (see `SecondaryBootParams.hyp_vbar` in
+    // arch/aarch64/smp.zig) — a plain sysreg write needs no working
+    // vector table to begin with, which is what made the HVC route
+    // unusable there. Until that landed, an AP that issued ANY hypcall
+    // wedged silently with IRQs masked: `map_guest` on a secondary core
+    // reached `stage2InvalidateIpa` -> `hvc`, never returned, and took
+    // the whole machine down behind the CD gen-lock it was holding.
     if (gic.coreID() != 0) return;
     if (@atomicLoad(bool, &vm.hyp_vectors_installed, .acquire)) return;
 
-    const vec_va: u64 = @intFromPtr(&__hyp_vectors);
-    const page_paddr = aarch64_paging.resolveVaddr(
-        memory_init.kernel_addr_space_root,
-        VAddr.fromInt(vec_va),
-    ) orelse return;
-    const vec_pa = page_paddr.addr | (vec_va & 0xFFF);
-    std.debug.assert(vec_pa & 0x7FF == 0);
+    const vec_pa = hypVectorsPa();
+    if (vec_pa == 0) return;
 
     const hvc_insn = comptime std.fmt.comptimePrint(
         "hvc #{d}",

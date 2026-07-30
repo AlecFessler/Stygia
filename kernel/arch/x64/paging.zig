@@ -179,9 +179,28 @@ const ShootdownKind = enum(u8) {
     invpcid_single = 1,
     invpcid_addr = 2,
     invlpg_no_ack = 3,
+    /// Whole-TLB invalidation INCLUDING global pages. The only kind
+    /// that reaches kernel mappings, which are installed global
+    /// (`kindAttrs(.kernel_data)`). Carries no address — one arm
+    /// covers an arbitrary kernel range, which is what the kernel-stack
+    /// teardown needs (see `publishKernelUnmapEpoch`).
+    flush_all_global = 4,
 };
 var shootdown_kind: u8 = @intFromEnum(ShootdownKind.invlpg);
 var shootdown_pcid: u16 = 0;
+
+/// False until every AP has signalled online. Gates the ONLY shootdown
+/// path that both waits for acks and is reachable during bring-up
+/// (`publishKernelUnmapEpoch`, via `stack.destroyKernel` on a failed AP
+/// stack mapping). `apic.coreCount()` counts discovered LAPICs, so an
+/// ack-wait armed before `smpInit` returns would block on cores that
+/// have not been started yet.
+var remote_shootdown_armed: bool = false;
+
+/// Called by `smpInit` once every AP has signalled online.
+pub fn armRemoteShootdown() void {
+    @atomicStore(bool, &remote_shootdown_armed, true, .release);
+}
 
 /// MAX_CORES on x86_64. Mirrors `gdt.MAX_CORES`, `acpi.MAX_CORES`, and
 /// `intel.vmx.MAX_CORES`; kept local so the shootdown ack-tracking
@@ -361,6 +380,9 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
                     : .{ .memory = true });
             }
         },
+        @intFromEnum(ShootdownKind.flush_all_global) => {
+            cpu.flushTlbIncludingGlobal();
+        },
         @intFromEnum(ShootdownKind.invpcid_addr) => {
             const pcid: u16 = @atomicLoad(u16, &shootdown_pcid, .acquire);
             const va: u64 = @atomicLoad(u64, &shootdown_addr, .acquire);
@@ -410,35 +432,30 @@ inline fn bumpSyncArmGen() u64 {
 }
 
 /// Service any pending sync arm from OUTSIDE the lock, using a
-/// conservative full non-global TLB flush. The descriptor
+/// conservative whole-TLB flush. The descriptor
 /// (`shootdown_kind`/`addr`/`pcid`) is only stable under
 /// `shootdown_lock`, so a spinning contender cannot decode it — but
-/// over-flushing is always safe, and the ack contract only requires
-/// that this core's TLB holds no stale entry for ANY descriptor at or
+/// over-flushing is always safe, and the ack contract requires that
+/// this core's TLB holds no stale entry for ANY descriptor at or
 /// below the acked gen. Also drains the fire-and-forget per-PCID
 /// queue, mirroring `tlbShootdownHandler`.
+///
+/// The flush MUST include global pages. This used INVPCID type 3
+/// ("all-context, EXCLUDING globals") / a CR3 reload (which also
+/// preserves globals under CR4.PGE), which is a superset of every
+/// *user* descriptor but reaches no kernel mapping at all — and kernel
+/// mappings are exactly what `kindAttrs(.kernel_data)` installs global.
+/// A `flush_all_global` arm (kernel-stack teardown) acked that way
+/// would be acknowledged without the stale kernel translation ever
+/// being dropped, which is precisely the lie the ack protocol exists to
+/// prevent.
 fn ackPendingSyncArmConservative(my_core: u64) void {
     const armed = @atomicLoad(u64, &sync_arm_gen, .acquire);
     if (@atomicLoad(u64, &core_acked_gen[my_core], .monotonic) >= armed) {
         drainLocalPendingPcid(my_core);
         return;
     }
-    if (cpu.pcid_enabled) {
-        // INVPCID type 3: all-context excluding globals. Kernel
-        // global mappings survive; every user translation for every
-        // PCID is dropped — a superset of any sync-arm descriptor.
-        var desc: [2]u64 align(16) = undefined;
-        desc[0] = 0;
-        desc[1] = 0;
-        asm volatile ("invpcid (%[desc]), %[type]"
-            :
-            : [desc] "r" (&desc),
-              [type] "r" (@as(u64, 3)),
-            : .{ .memory = true });
-    } else {
-        // CR3 reload flushes all non-global entries when PCIDE=0.
-        cpu.writeCr3(cpu.readCr3());
-    }
+    cpu.flushTlbIncludingGlobal();
     drainLocalPendingPcid(my_core);
     @atomicStore(u64, &core_acked_gen[my_core], armed, .release);
 }
@@ -1553,5 +1570,80 @@ pub fn shootdownTlbRange(
         fanoutShootdownIpis(self_id);
         waitForShootdownAcks(expected_gen, self_id, core_count);
     }
+}
+
+/// Publish a globals-inclusive whole-TLB invalidation to every remote
+/// core and return the sync-arm generation it was published at, WITHOUT
+/// waiting for anyone. Pair with `kernelUnmapEpochRetired`, which
+/// reports when every core has honoured it. Call after clearing leaf
+/// PTEs for a KERNEL virtual range; the backing physical frames may
+/// only be recycled once the returned epoch has retired.
+///
+/// `flushRemoteTlb` — what `unmapPage` uses — cannot serve that purpose:
+/// it is fire-and-forget AND per-VA. It publishes a single address into
+/// the shared descriptor, fans out IPIs and returns, so back-to-back
+/// arms overwrite each other's descriptor, and same-vector IPIs coalesce
+/// in the LAPIC IRR (one pending interrupt per vector). A caller
+/// unmapping N pages in a loop therefore leaves remote cores having
+/// invalidated, at best, the last VA of the run. The design note on
+/// `shootdownTlbRange` above documents exactly that hazard.
+///
+/// For kernel ranges the per-VA form is the wrong instrument twice over:
+/// kernel mappings are GLOBAL, and neither INVPCID type 0 (with PCIDs
+/// on) nor the conservative acker's flush used to touch a global
+/// translation. One whole-TLB, globals-inclusive arm carries no address,
+/// so descriptor overwrite and IPI coalescing are both harmless: any
+/// core that services ANY of these IPIs drops every stale kernel
+/// translation it holds.
+///
+/// Publish-and-poll rather than publish-and-wait, deliberately. This is
+/// reachable from `stack.destroyKernel` on paths that hold object
+/// gen-locks (`destroyExecutionContextLocked` runs under the dying
+/// domain's lock) and run with IRQs masked. Blocking for acks there
+/// closes a cycle against the IPC fast path, whose gen-lock CAS spins
+/// are hand-written assembly that runs IRQs-off and services no arms:
+/// the waiter cannot progress until a core acks, and that core cannot
+/// ack until the waiter releases the lock it is spinning on. Nothing in
+/// this function ever waits for another core.
+pub fn publishKernelUnmapEpoch() u64 {
+    // Local half: our own stale global entries have to go regardless of
+    // how many cores are online.
+    cpu.flushTlbIncludingGlobal();
+    const core_count = apic.coreCount();
+    if (core_count <= 1) return 0;
+    // `apic.coreCount()` counts DISCOVERED LAPICs, not running cores.
+    // Before `smpInit` finishes, an epoch could never retire: the cores
+    // it names have not been SIPI'd yet. The AP bring-up path itself
+    // calls `stack.destroyKernel` on a failed-mapping stack, and no
+    // remote core can hold a translation for a kernel VA the BSP mapped
+    // and tore down while that core was still parked in the trampoline —
+    // so the local flush above is the whole story until then.
+    if (!@atomicLoad(bool, &remote_shootdown_armed, .acquire)) return 0;
+
+    const self_id = apic.coreID();
+    lockShootdownServicingArms(@src());
+    defer shootdown_lock.unlock();
+
+    @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.flush_all_global), .release);
+    const gen = bumpSyncArmGen();
+    // We just performed the flush this arm asks for, so record our own
+    // ack directly. `kernelUnmapEpochRetired` can then require EVERY
+    // core to be caught up without knowing which core published.
+    @atomicStore(u64, &core_acked_gen[self_id], gen, .release);
+    fanoutShootdownIpis(self_id);
+    return gen;
+}
+
+/// Has every core honoured the invalidation published at `epoch`?
+/// `epoch == 0` means "nothing remote was published" (uniprocessor, or
+/// pre-SMP) and is always retired.
+pub fn kernelUnmapEpochRetired(epoch: u64) bool {
+    if (epoch == 0) return true;
+    const core_count = apic.coreCount();
+    var i: u64 = 0;
+    while (i < core_count) : (i += 1) {
+        if (@atomicLoad(u64, &core_acked_gen[i], .acquire) < epoch) return false;
+    }
+    return true;
 }
 

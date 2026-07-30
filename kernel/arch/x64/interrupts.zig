@@ -49,7 +49,25 @@ pub const PageFaultContext = struct {
     /// Full saved register frame, for the fatal-fault reporter's GPR
     /// dump. Unlike `user_ctx` this is set for kernel-mode faults too.
     frame_ctx: ?*const ArchCpuContext = null,
+    /// True when the faulting access happened inside a marked
+    /// copy-in/out window (`arch.dispatch.cpu.userAccessBegin` ..
+    /// `userAccessEnd`). On x86-64 that window is exactly RFLAGS.AC=1:
+    /// STAC sets it, CLAC clears it, `interruptStubPrologue` re-arms
+    /// SMAP with CLAC on every entry, and IRETQ restores the
+    /// interrupted context's AC from the frame — so the AC bit saved
+    /// in the fault frame is an exact record of whether the kernel was
+    /// deliberately touching user memory. `memory.fault` uses it to
+    /// tell a genuine accessor fault from a wild kernel pointer that
+    /// happens to land in the lower canonical half.
+    ///
+    /// Defaults to `true` so a context built by a path that cannot
+    /// determine the window degrades to the pre-existing (accessor)
+    /// behaviour rather than a spurious kernel panic.
+    in_user_access_window: bool = true,
 };
+
+/// RFLAGS.AC — Intel SDM Vol 1 §3.4.3. Set by STAC, cleared by CLAC.
+pub const RFLAGS_AC: u64 = 1 << 18;
 
 /// Dump every saved GPR of a fault frame. printRaw only — this runs on
 /// the fatal-fault path where `serial.print_lock` may already be held by

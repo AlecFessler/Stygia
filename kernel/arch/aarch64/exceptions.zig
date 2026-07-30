@@ -675,6 +675,9 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .fp = ctx.regs.x29,
                 .lr = ctx.regs.x30,
                 .frame_ctx = ctx,
+                // PAN in the SAVED PSTATE is the state at fault time —
+                // see `PageFaultContext.in_user_access_window`.
+                .in_user_access_window = (ctx.spsr_el1 & interrupts.SPSR_PAN) == 0,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -692,6 +695,9 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .fp = ctx.regs.x29,
                 .lr = ctx.regs.x30,
                 .frame_ctx = ctx,
+                // PAN in the SAVED PSTATE is the state at fault time —
+                // see `PageFaultContext.in_user_access_window`.
+                .in_user_access_window = (ctx.spsr_el1 & interrupts.SPSR_PAN) == 0,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -814,6 +820,27 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 asm volatile ("mrs %[v], mpidr_el1"
                     : [v] "=r" (mpidr),
                 );
+                // Report the LOGICAL core id in Aff0 rather than the raw
+                // hardware affinity. The whole point of emulating this
+                // read is to let an EC observe which core it is running
+                // on (see the affinity tests above), and the kernel's
+                // core numbering — affinity masks, run queues, per-core
+                // state — is `gic.coreID()`, an index into the
+                // firmware-described MPIDR table, NOT the raw Aff0.
+                //
+                // Those coincide only on a flat single-cluster topology.
+                // On the Pi 5 (BCM2712) firmware describes the cores as
+                // MPIDR 0x0 / 0x100 / 0x200 / 0x300 — the index lives in
+                // Aff1 and **Aff0 reads 0 on all four cores** — so the
+                // raw value made every core claim to be core 0 and no
+                // affinity restriction could ever be observed as honoured.
+                // Same MPIDR aliasing that `gic.coreID()` exists to
+                // resolve; QEMU/KVM hands us a flat topology, which is
+                // why this only ever failed on hardware.
+                //
+                // Aff1..Aff3 are left intact for anything that wants the
+                // real topology; only Aff0 is rewritten.
+                mpidr = (mpidr & ~@as(u64, 0xFF)) | (gic.coreID() & 0xFF);
                 if (rt < 31) {
                     const regs_ptr: [*]u64 = @ptrCast(&ctx.regs);
                     regs_ptr[rt] = mpidr;
@@ -945,6 +972,9 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .fp = ctx.regs.x29,
                 .lr = ctx.regs.x30,
                 .frame_ctx = ctx,
+                // PAN in the SAVED PSTATE is the state at fault time —
+                // see `PageFaultContext.in_user_access_window`.
+                .in_user_access_window = (ctx.spsr_el1 & interrupts.SPSR_PAN) == 0,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -962,6 +992,9 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .fp = ctx.regs.x29,
                 .lr = ctx.regs.x30,
                 .frame_ctx = ctx,
+                // PAN in the SAVED PSTATE is the state at fault time —
+                // see `PageFaultContext.in_user_access_window`.
+                .in_user_access_window = (ctx.spsr_el1 & interrupts.SPSR_PAN) == 0,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },

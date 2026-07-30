@@ -44,6 +44,7 @@ const stygia = @import("stygia");
 const aarch64_paging = stygia.arch.aarch64.paging;
 const cpu = stygia.arch.aarch64.cpu;
 const gic = stygia.arch.aarch64.gic;
+const hyp = stygia.arch.aarch64.hyp;
 const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
@@ -78,6 +79,8 @@ const SecondaryBootParams = extern struct {
     entry: u64, // offset 48: secondarySetup function pointer (kernel VA)
     core_idx: u64, // offset 56: Logical core index
     vbar: u64, // offset 64: VBAR_EL1 value (exception vector table)
+    hyp_vbar: u64, // offset 72: VBAR_EL2 value (PA), 0 = leave alone
+    hyp_sp: u64, // offset 80: SP_EL2 top (PA), 0 = leave alone
 };
 
 /// Boot params — static global, PA resolved via page table walk.
@@ -327,6 +330,21 @@ fn smpInitFull() !void {
     boot_params_storage.sctlr = readSctlr();
     boot_params_storage.entry = @intFromPtr(&secondarySetup);
     boot_params_storage.vbar = readVbar();
+    // VBAR_EL2 is per-PE state, and PSCI CPU_ON hands each AP whatever
+    // VBAR_EL2 firmware left behind. The BSP got its table via an HVC to
+    // the bootloader's EL2 stub, but an AP has no working EL2 vector to
+    // trap INTO, so the HVC route is unusable there — the AP has to
+    // program VBAR_EL2 directly during the window it is still at EL2 in
+    // `secondaryEntry`. Without this, any hypcall issued from an AP
+    // (`map_guest` -> `stage2InvalidateIpa` -> `hvc`) vectors into
+    // firmware's stale table and never returns, wedging that core with
+    // IRQs masked while it holds its capability-domain gen-lock.
+    //
+    // 0 when EL2 / the hyp stub is unavailable (e.g. running as a KVM
+    // guest at EL1), in which case the trampoline leaves VBAR_EL2 alone.
+    // Safe to read here: `bspBootHandoff` installs the BSP's vectors
+    // before secondaries are started.
+    boot_params_storage.hyp_vbar = hyp.hypVectorsPa();
 
     // Flush the params to main memory so the secondary can read them
     // with MMU off. DC CVAC cleans the cache line to the Point of Coherency.
@@ -383,6 +401,32 @@ fn smpInitFull() !void {
         // alignment (AAPCS64, Section 6.2.2).
         boot_params_storage.sp = cpu.alignStack(ap_stack.top).addr;
         boot_params_storage.core_idx = core_idx;
+
+        // Per-core EL2 stack. EL2 runs with the MMU off, so this must be
+        // a raw PA and must be physically contiguous — one 4 KiB page is
+        // both. Only needed when we are actually installing EL2 state on
+        // this AP; leave 0 otherwise so the trampoline skips the write.
+        // Deliberately per-core: a shared SP_EL2 would corrupt whenever
+        // two cores took an EL2 exception at once.
+        // Recomputed per core rather than read back out of
+        // `boot_params_storage`: the failure branch below zeroes the
+        // field for THIS core, and that must not leak into the next
+        // core's params (the struct is reused across loop iterations).
+        const hyp_vbar_pa = hyp.hypVectorsPa();
+        boot_params_storage.hyp_vbar = hyp_vbar_pa;
+        boot_params_storage.hyp_sp = 0;
+        if (hyp_vbar_pa != 0) {
+            if (pmm_mgr.create(paging.PageMem(.page4k))) |hyp_page| {
+                const hyp_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(hyp_page)), null);
+                boot_params_storage.hyp_sp = hyp_pa.addr + paging.PAGE4K;
+            } else |_| {
+                // Non-fatal: the core still boots and runs everything
+                // except hypcalls. Say so rather than failing silently,
+                // since a hypcall from this core would then wedge it.
+                serial.print("[smp] core {d}: no EL2 stack; hypcalls unavailable\n", .{core_idx});
+                boot_params_storage.hyp_vbar = 0;
+            }
+        }
 
         // Flush the updated params to main memory so the secondary can
         // read them with MMU off (non-cacheable access).
@@ -591,6 +635,52 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
         \\mov x12, #0x33ff
         \\msr cptr_el2, x12
         \\msr hstr_el2, xzr
+        \\
+        // Install the kernel's EL2 vector table on THIS core while we
+        // still have EL2 access. VBAR_EL2 is per-PE state (ARM ARM
+        // D13.2.143) and PSCI CPU_ON leaves it wherever firmware had it.
+        // The BSP installs its table by HVC'ing the bootloader's EL2
+        // stub, but that route is unavailable to an AP — an HVC needs a
+        // working EL2 vector to land in, which is precisely what is
+        // missing. A direct `msr` here needs none.
+        //
+        // Without this, any hypcall from an AP vectored into firmware's
+        // stale table and never came back: `map_guest` scheduled onto a
+        // secondary core reached `stage2InvalidateIpa` -> `hvc` and
+        // wedged that core with IRQs masked, still holding its
+        // capability-domain gen-lock, which then stalled every other
+        // core behind it. Silent (no vector = no panic output) and only
+        // reproducible on hardware with tests spread across cores.
+        //
+        // hyp_vbar == 0 means EL2 / the hyp stub is unavailable; leave
+        // VBAR_EL2 untouched in that case.
+        //
+        // All three of VBAR_EL2 / TPIDR_EL2 / SP_EL2 are required — this
+        // mirrors exactly what the bootloader does for the BSP in
+        // `aarch64_el2_drop.dropToEl1`. Installing only the vector table
+        // is NOT enough and still hangs:
+        //
+        //  - TPIDR_EL2 is the dispatcher's discriminator.
+        //    `hyp_sync_lower_a64` reads it as "tpidr_el2 != 0 => this is
+        //    a guest exit, else decode ESR_EL2 as an HVC". Firmware
+        //    leaves garbage there, so an AP's hypcall would be taken for
+        //    a guest exit and the handler would follow that garbage as a
+        //    WorldSwitchCtx PA — straight into a wild access, then into
+        //    a `b .` vector slot. Must be zeroed.
+        //
+        //  - SP_EL2 is a raw PA (EL2 runs with SCTLR_EL2.M=0, so the
+        //    kernel-VA stack this core uses at EL1 is meaningless here).
+        //    Each core gets its own page; sharing one would corrupt
+        //    across concurrent EL2 entries.
+        \\msr tpidr_el2, xzr
+        \\ldr x13, [x0, #72]
+        \\cbz x13, 2f
+        \\msr vbar_el2, x13
+        \\2:
+        \\ldr x13, [x0, #80]
+        \\cbz x13, 3f
+        \\mov sp, x13
+        \\3:
         \\
         // ELR_EL2 = label 1f (next instruction after the ERET).
         // SPSR_EL2 = EL1h with DAIF masked (0x3c5).

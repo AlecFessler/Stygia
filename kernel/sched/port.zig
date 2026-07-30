@@ -184,7 +184,12 @@ pub fn expireTimedRecvWaiters() void {
         if (!removed) continue;
 
         // EC has been removed from the wait queue; safe to wake.
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        while (ec.on_cpu.load(.acquire)) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+            // matching note on `scheduler.markReady`'s kstack barrier.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+        }
         ec.recv_deadline_ns = 0;
         ec.suspend_port = null;
         ec.event_type = .none;
@@ -2008,7 +2013,12 @@ pub fn rendezvousWithReceiver(
     // would race the saving core's GPR writes. Mirror the standard
     // wake-side pattern from futex.zig:239,588 and port.zig:187 — spin
     // until the prior core releases the EC.
-    while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+    while (receiver.on_cpu.load(.acquire)) {
+        // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+        // matching note on `scheduler.markReady`'s kstack barrier.
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
+        std.atomic.spinLoopHint();
+    }
     receiver.event_type = .none;
     receiver.suspend_port = null;
 

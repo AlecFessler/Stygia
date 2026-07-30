@@ -929,6 +929,9 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
                 arch.smp.sendWakeIpi(core);
             }
             post_spins +%= 1;
+            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+            // matching note on `scheduler.markReady`'s kstack barrier.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);
@@ -957,6 +960,9 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // cannot wait for its own eviction.
     if (ec != caller and ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
         while (scheduler.currentEcPtrOn(ec.last_dispatched_core) == ec) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+            // matching note on `scheduler.markReady`'s kstack barrier.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
     }
@@ -2047,6 +2053,9 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 arch.smp.sendWakeIpi(core);
             }
             post_spins +%= 1;
+            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+            // matching note on `scheduler.markReady`'s kstack barrier.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);

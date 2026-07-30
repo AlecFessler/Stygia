@@ -458,6 +458,35 @@ pub fn writeCr3(value: u64) void {
     );
 }
 
+/// Invalidate the ENTIRE TLB on this core, **including global pages**.
+///
+/// Intel SDM Vol 3A §5.10.4.1: a MOV to CR3 leaves global translations
+/// (PTE.G with CR4.PGE=1) in place, and INVPCID type 3 is documented as
+/// "all-context, excluding globals". Kernel mappings — kernel stacks
+/// among them — are installed global (`kindAttrs(.kernel_data)`), so
+/// neither of those reaches them. Toggling CR4.PGE off and back on does:
+/// SDM Vol 3A §5.10.4.1 lists "MOV to CR4 that changes CR4.PGE" as
+/// invalidating all TLB entries including global ones.
+///
+/// Needed by the TLB-shootdown ack path: a core that acknowledges a
+/// shootdown arm without dropping global translations is lying to the
+/// initiator, and the initiator then recycles physical frames that this
+/// core can still reach.
+pub fn flushTlbIncludingGlobal() void {
+    const cr4 = asm volatile ("mov %%cr4, %[out]"
+        : [out] "=r" (-> u64),
+    );
+    const pge: u64 = 1 << 7;
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (cr4 & ~pge),
+        : .{ .memory = true });
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (cr4),
+        : .{ .memory = true });
+}
+
 /// Intel SDM Vol 2A, "IN — Input from Port" / "OUT — Output to Port" —
 /// byte (8-bit), word (16-bit), and doubleword (32-bit) variants of the x86
 /// port I/O instructions. Port address is supplied in DX; data in AL/AX/EAX.

@@ -308,6 +308,51 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const is_exec = fault.is_exec;
 
     if (is_kernel_privilege and is_user_va) {
+        // ── Wild kernel pointer vs. genuine syscall accessor ──────────
+        //
+        // The user half is the whole lower canonical half, so a NULL-ish
+        // or otherwise wild KERNEL pointer lands here and is
+        // indistinguishable, by address alone, from a syscall accessor
+        // dereferencing a bad user pointer. The two need opposite
+        // handling:
+        //
+        //   * accessor fault  — userspace supplied a pointer the kernel
+        //     was asked to touch; deliver `memory_fault` to the EC.
+        //   * wild pointer    — a kernel bug (corrupted stack slot,
+        //     freed object, torn ref). Delivering `memory_fault` for it
+        //     is actively harmful: the arm below abandons the faulting
+        //     kernel frame via `yieldTo`/`hopParkRun` WITHOUT unwinding
+        //     it, so every lock that frame holds stays locked in memory
+        //     forever. `fireMemoryFault`'s no-route fallback then takes
+        //     `caps.derivation.tree_mutex` and blocking-acquires the
+        //     EC's capability-domain gen-lock — which, on the demand-
+        //     paging path, is exactly one of the locks just leaked
+        //     (fault.zig's own user arm took it, and vmar.handlePageFault
+        //     took the VMAR's). The result is an unkillable spin holding
+        //     a global mutex: captured live as
+        //     `[NOROUTE] memory_fault subcode=2 payload=0xfff` followed
+        //     by whole-suite starvation.
+        //
+        // Two structural discriminators, both cheap and exact:
+        //
+        //   1. `[0, 0x1000)` is the §[address_space] NULL guard. No
+        //      mapping path may ever install a leaf there, so no
+        //      accessor can legitimately fault in it — any fault in
+        //      that page is a wild pointer by construction.
+        //   2. The CPU records whether the access was inside a marked
+        //      copy-in/out window: x86-64 RFLAGS.AC (set by STAC in
+        //      `userAccessBegin`, cleared by CLAC and by the interrupt
+        //      stub prologue), aarch64 PSTATE.PAN. Outside that window
+        //      the kernel had no business touching a user VA at all.
+        //
+        // Either one firing means "kernel bug": report it with full
+        // registers, frame chain, core state and raw stack, and panic.
+        if (faulting_virt.addr < address.UserVA.null_guard.end or
+            !fault.in_user_access_window)
+        {
+            reportKernelFaultFatal(fault, "wild kernel pointer fault on a user VA");
+        }
+
         // Kernel touched a user VA via a syscall accessor — surface as a
         // memory_fault on the EC whose syscall triggered the access.
         const ec = scheduler.currentEc() orelse {

@@ -200,8 +200,8 @@ pub fn derive(
     const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const parent_le = lockEntrySkip(parent_link, null) orelse return false;
-    defer unlockEntrySkip(parent_le, null);
+    const parent_le = lockEntrySkip(parent_link, .{}) orelse return false;
+    defer unlockEntrySkip(parent_le, .{});
 
     // Every further entry acquire in this call (the ancestor hops, the
     // child) must skip the domain whose gen-lock the parent acquire
@@ -225,10 +225,10 @@ pub fn derive(
 
     // Cycle check: walk parent.parent.parent... — if any ancestor names
     // (child_dom, child_slot), refuse the link.
-    if (ancestorChainContains(parent_le.entry, child_link, self_held)) return false;
+    if (ancestorChainContains(parent_le.entry, child_link, HeldDomains.one(self_held))) return false;
 
-    const child_le = lockEntrySkip(child_link, self_held) orelse return false;
-    defer unlockEntrySkip(child_le, self_held);
+    const child_le = lockEntrySkip(child_link, HeldDomains.one(self_held)) orelse return false;
+    defer unlockEntrySkip(child_le, HeldDomains.one(self_held));
 
     // The child slot is normally the caller's fresh mint with all three
     // tree links zeroed. Under the deferred-derive discipline the mint
@@ -257,7 +257,7 @@ pub fn derive(
 fn ancestorChainContains(
     start: *KernelHandle,
     target: HandleLink,
-    held: ?*CapabilityDomain,
+    held: HeldDomains,
 ) bool {
     var cur: HandleLink = start.parent;
     var depth: u32 = 0;
@@ -408,29 +408,50 @@ fn detachForDelete(
     var depth: u32 = 0;
     while (cur.domain.ptr != null) {
         std.debug.assert(depth < MAX_DEPTH);
-        const c = lockEntrySkip(cur, entry_dom) orelse break;
+        const c = lockEntrySkip(cur, HeldDomains.one(entry_dom)) orelse break;
         c.entry.parent = parent_link;
         last_child_link = cur;
         const nxt = c.entry.next_sibling;
-        unlockEntrySkip(c, entry_dom);
+        unlockEntrySkip(c, HeldDomains.one(entry_dom));
         if (nxt.domain.ptr == null) break;
         cur = nxt;
         depth += 1;
     }
 
     if (last_child_link) |last_link| {
-        if (lockEntrySkip(last_link, entry_dom)) |lc| {
+        if (lockEntrySkip(last_link, HeldDomains.one(entry_dom))) |lc| {
             lc.entry.next_sibling = next_sibling;
-            unlockEntrySkip(lc, entry_dom);
+            unlockEntrySkip(lc, HeldDomains.one(entry_dom));
         }
     }
 
     const replacement: HandleLink = if (first_child.domain.ptr != null) first_child else next_sibling;
 
     if (parent_link.domain.ptr != null) {
-        if (lockEntrySkip(parent_link, entry_dom)) |p| {
-            replaceLinkInChildList(p.entry, entry_dom, entry_slot, replacement, entry_dom);
-            unlockEntrySkip(p, entry_dom);
+        if (lockEntrySkip(parent_link, HeldDomains.one(entry_dom))) |p| {
+            // From here until the `unlockEntrySkip` below, this core holds
+            // TWO CD gen-locks: `entry_dom` (taken by our caller) and the
+            // parent link's domain (just taken above). The child-list walk
+            // must skip BOTH. Passing only `entry_dom` — as this did — let
+            // a sibling living in the PARENT's domain fail the skip test
+            // and get blocking-acquired while this core already held it.
+            // See `HeldDomains` for the full failure mode.
+            //
+            // caller-pinned: identity-only token, never dereferenced —
+            // `HeldDomains.contains` compares by address, and the acquire
+            // above pins that gen-lock for this whole scope.
+            const parent_dom: ?*CapabilityDomain = if (parent_link.domain.ptr) |q|
+                @ptrCast(@alignCast(q))
+            else
+                null;
+            replaceLinkInChildList(
+                p.entry,
+                entry_dom,
+                entry_slot,
+                replacement,
+                .{ .a = entry_dom, .b = parent_dom },
+            );
+            unlockEntrySkip(p, HeldDomains.one(entry_dom));
         }
     }
     // entry was a root (or parent dead): the children become roots
@@ -461,6 +482,58 @@ const LockedEntry = struct {
     same_held: bool = false,
 };
 
+/// The set of CapabilityDomain gen-locks the current call already holds,
+/// which `lockEntrySkip` must NOT try to acquire a second time.
+///
+/// This is a SET, not a single domain, because the tree walk genuinely
+/// holds two at once: `detachForDelete` runs with the dying domain's
+/// gen-lock held by its caller and then takes the PARENT link's domain
+/// gen-lock before fixing up the parent's child list. Passing only the
+/// dying domain down into `replaceLinkInChildList` meant a sibling that
+/// lived in the parent's domain — the common case, since a child list is
+/// usually rooted in one domain — failed the skip test and was
+/// blocking-acquired while this very core already held it. That is a
+/// recursive acquire of the same gen-lock with IRQs masked and
+/// `tree_mutex` held: lockdep catches it as `panic_recursive` in Debug,
+/// but `debug.active` is Debug-only, so in ReleaseSafe it is a silent
+/// machine-wide wedge of exactly the shape stygia-9yp produced.
+///
+/// Two slots is sufficient and checked: no tree-walk path holds more
+/// than the caller's domain plus one link's domain at a time.
+const HeldDomains = struct {
+    /// caller-pinned: bare `*T` rather than `SlabRef(T)` on purpose. A
+    /// slot is only ever populated with a domain whose gen-lock the
+    /// caller ALREADY holds, and it is dropped when that lock is
+    /// released, so the slab slot cannot recycle while the field is
+    /// non-null — a gen re-check would have nothing to catch. Matching
+    /// against a stale generation is also the wrong test here: the set
+    /// answers "is this the very lock I am standing on", which is a
+    /// question about pointer identity, not liveness.
+    a: ?*CapabilityDomain = null,
+    /// caller-pinned: second slot, same contract as `a` above.
+    b: ?*CapabilityDomain = null,
+
+    inline fn one(d: ?*CapabilityDomain) HeldDomains {
+        return .{ .a = d };
+    }
+
+    /// Identity comparison only — the domains are never dereferenced
+    /// through this set, so a slot cannot go stale underneath it: the
+    /// caller holds every gen-lock named here for the whole scope.
+    inline fn contains(self: HeldDomains, raw: ?*anyopaque) bool {
+        return self.find(raw) != null;
+    }
+
+    /// The already-held `*CapabilityDomain` matching `raw`, if any, so a
+    /// skipped acquire can still reach the domain it did not re-lock.
+    inline fn find(self: HeldDomains, raw: ?*anyopaque) ?*CapabilityDomain {
+        const p = raw orelse return null;
+        if (self.a) |x| if (@as(*anyopaque, @ptrCast(x)) == p) return x;
+        if (self.b) |x| if (@as(*anyopaque, @ptrCast(x)) == p) return x;
+        return null;
+    }
+};
+
 /// Lock the holder domain of a tree link and return a pointer to the
 /// referenced kernel-table entry. Returns null on stale domain or bad
 /// link (out-of-range slot, free slot). Caller must call `unlockEntrySkip`.
@@ -468,12 +541,20 @@ const LockedEntry = struct {
 /// `held` names a domain whose gen-lock the caller already holds; if
 /// the link names `held`, the gen-lock acquisition is skipped (would
 /// deadlock against the held lock).
-fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
+fn lockEntrySkip(link: HandleLink, held: HeldDomains) ?LockedEntry {
     if (link.domain.ptr == null) return null;
 
-    const same_held = held != null and link.domain.ptr == @as(*anyopaque, @ptrCast(held.?));
+    // caller-pinned: `.ptr` read as an identity-only key, never
+    // dereferenced through. A lock bracket is impossible by
+    // construction here — the whole point of the test is to decide
+    // whether acquiring this gen-lock would be a RECURSIVE acquire of a
+    // lock this core already holds, so locking to find out would be the
+    // deadlock (stygia-wh7). A stale pointer is harmless: it can only
+    // fail to match, and a miss takes the normal locking path below.
+    const held_match = held.find(link.domain.ptr);
+    const same_held = held_match != null;
     var irq_state: u64 = 0;
-    const dom: *CapabilityDomain = if (same_held) held.? else blk: {
+    const dom: *CapabilityDomain = if (held_match) |m| m else blk: {
         const lr = link.domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch return null;
         irq_state = lr.irq_state;
         break :blk lr.ptr;
@@ -491,8 +572,11 @@ fn lockEntrySkip(link: HandleLink, held: ?*CapabilityDomain) ?LockedEntry {
     return .{ .dom_ref = link.domain, .entry = entry, .irq_state = irq_state, .same_held = same_held };
 }
 
-fn unlockEntrySkip(le: LockedEntry, held: ?*CapabilityDomain) void {
-    if (held != null and le.dom_ref.ptr == @as(*anyopaque, @ptrCast(held.?))) return;
+fn unlockEntrySkip(le: LockedEntry, held: HeldDomains) void {
+    // Must mirror `lockEntrySkip`'s predicate exactly, and callers must
+    // pass the SAME set to both — a mismatched set here would either
+    // leak the gen-lock or unlock one this call never took.
+    if (held.contains(le.dom_ref.ptr)) return;
     le.dom_ref.unlockTypedIrqRestore(CapabilityDomain, le.irq_state);
 }
 
@@ -594,7 +678,7 @@ fn replaceLinkInChildList(
     target_dom: *CapabilityDomain,
     target_slot: u12,
     replacement: HandleLink,
-    held: ?*CapabilityDomain,
+    held: HeldDomains,
 ) void {
     if (linkMatches(parent_entry.first_child, target_dom, target_slot)) {
         parent_entry.first_child = replacement;

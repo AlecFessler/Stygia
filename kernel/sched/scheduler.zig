@@ -1742,6 +1742,11 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
     for (&core_states, 0..) |*state, core_idx| {
         if (core_idx == self_core) continue;
         while (true) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9): this barrier
+            // is reachable with IRQs masked from the domain-destroy
+            // path, and a core deaf to the shootdown IPI while another
+            // core sits in `waitForShootdownAcks` wedges the machine.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
             if (state.active_root.load(.acquire) == root_addr) {
                 std.atomic.spinLoopHint();
                 continue;
@@ -1988,7 +1993,16 @@ pub fn markReady(ec: *ExecutionContext) void {
     // contract (`resumeFromReply` with the reply landing on the
     // executing core) — spinning there would wait on our own release.
     if (waiting_in != .running) {
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        while (ec.on_cpu.load(.acquire)) {
+            // Ack-while-spinning (stygia-rs6 mechanism 9). This spin is
+            // reachable with IRQs masked (timer/IPI wake paths), and a
+            // core that is deaf to the shootdown IPI while some other
+            // core sits in `waitForShootdownAcks` wedges the machine.
+            // The generic SpinLock / GenLock spins already do this; a
+            // bare atomic spin needs it just as much.
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+        }
     }
     enqueue(ec);
 }

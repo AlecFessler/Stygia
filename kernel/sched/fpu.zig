@@ -347,6 +347,11 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // service requests targeting our own core — the holder may itself
     // be inside a migrateFlush spin waiting on US.
     while (slot.request_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        // Ack-while-spinning (stygia-rs6 mechanism 9): this spin runs
+        // with IRQs masked (reached through `switchTo`), so without it
+        // a core parked here is deaf to the shootdown IPI another core
+        // is inside `waitForShootdownAcks` waiting for.
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
     }
@@ -396,6 +401,8 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
             arch.cpu.sendFpuFlushIpi(src_core);
         }
         flush_spins +%= 1;
+        // Ack-while-spinning — see the request_lock spin above.
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
     }

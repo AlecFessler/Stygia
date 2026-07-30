@@ -60,10 +60,19 @@ pub const GenLock = extern struct {
     /// escape hides real AB-BA deadlocks.
     pub fn lockOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) void {
         debug.acquire(self, self.class, ordered_group, src);
+        var iters: u64 = 0;
+        var published = false;
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
-                if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) return;
+                if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) {
+                    if (published) debug.clearWaiting();
+                    return;
+                }
+            }
+            if (!published) {
+                debug.publishWaiting(self, self.class, src);
+                published = true;
             }
             // Ack-while-spinning (stygia-rs6 mechanism 9): an
             // IRQs-masked contender here is deaf to the shootdown
@@ -73,6 +82,10 @@ pub const GenLock = extern struct {
             // none are pending.
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
+            iters +%= 1;
+            if (iters == debug.SPIN_PANIC_ITERS) {
+                debug.reportStuckLock(self, self.class, self.word.load(.monotonic), src);
+            }
         }
     }
 
@@ -180,12 +193,22 @@ pub const GenLock = extern struct {
         debug.acquire(self, self.class, ordered_group, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
+        var iters: u64 = 0;
+        var published = false;
         while (true) {
-            if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+            if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) {
+                if (published) debug.clearWaiting();
+                return;
+            }
             const cur = self.word.load(.monotonic);
             if ((cur >> 1) != expected_gen) {
+                if (published) debug.clearWaiting();
                 debug.release(self);
                 return error.StaleHandle;
+            }
+            if (!published) {
+                debug.publishWaiting(self, self.class, src);
+                published = true;
             }
             // Ack-while-spinning — see `lockOrdered`. Captured live:
             // fireMemoryFault (#PF context, IRQs off) spinning here on
@@ -193,6 +216,10 @@ pub const GenLock = extern struct {
             // shootdown ack (stygia-rs6 mechanism 9).
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
+            iters +%= 1;
+            if (iters == debug.SPIN_PANIC_ITERS) {
+                debug.reportStuckLock(self, self.class, self.word.load(.monotonic), src);
+            }
         }
     }
 

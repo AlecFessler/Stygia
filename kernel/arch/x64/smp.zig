@@ -179,6 +179,14 @@ pub fn smpInit() !void {
     // bumping `cores_online` (see coreInit below); the BSP did the same
     // at the top of this function. Safe to flip the global RDPID flag.
     apic.enableRdpidFastPath();
+
+    // Every AP that is going to come up has come up, so an ack-waiting
+    // remote shootdown can no longer block on a core that was never
+    // started. Arms `paging.publishKernelUnmapEpoch`'s remote half —
+    // before this point it degrades to a local flush, which is exactly
+    // what the bring-up path above needs when it tears down a kstack
+    // whose mapping failed.
+    arch_paging.armRemoteShootdown();
 }
 
 /// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"
