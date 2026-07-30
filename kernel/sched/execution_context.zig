@@ -46,6 +46,15 @@ pub const MAX_PAIR_ENTRIES_PER_EC: usize = 63;
 /// "no core to defer-finalize to" signal.
 pub const LAST_DISPATCHED_NEVER: u8 = 0xFF;
 
+/// Re-send the zombie-drain wake IPI every this many failed
+/// `postZombie` attempts. See the two `postZombie` spin loops: only the
+/// TARGET core can drain its own pending-zombie column, so a halted
+/// target must be woken or the poster spins forever. One wake is not
+/// enough on its own — the target can park in the window between our
+/// wake and our next attempt, and a wake consumed just before it halts
+/// is a wake lost — so the loop re-arms periodically.
+const ZOMBIE_WAKE_RETRY_SPINS: u32 = 1024;
+
 /// Decoded pair entry stashed on the suspending EC at `validatePairEntries`
 /// time and consumed at recv time in `port.deliverEvent`. Captures the
 /// kernel-side `ErasedSlabRef` to the source object (lock-validated at
@@ -833,15 +842,34 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        while (!scheduler.postZombie(core, ec, expected_gen)) {
-            std.atomic.spinLoopHint();
-        }
         // Wake the target core so it runs `switchTo` promptly and
         // drains the zombie. Without this, an idle target stays in
         // `arch.cpu.idle()` (sti+hlt) until the next preempt tick;
         // with the wake IPI it preempts now and the reap fires within
         // microseconds. Self-IPI is fine — a no-op when we are the
         // target core (we'll naturally run switchTo on syscall return).
+        //
+        // The wake MUST be inside the retry loop, not merely after it.
+        // `postZombie` returns false while the target's column for this
+        // poster is still occupied, and ONLY the target can drain that
+        // column — via `switchTo` or `parkAndAwaitIRQ`'s pre-park drain.
+        // A target that is ALREADY halted does neither until something
+        // wakes it, so a wake issued only after the post succeeds can
+        // never arrive: we spin forever on a core that is never going to
+        // move again, with IRQs masked on this side.
+        //
+        // That is the N=10 suite hang: target core parked with
+        // `current_ec = null` and RDY ECs sitting in its own run_queue,
+        // poster core live but emitting nothing. Same race family as
+        // stygia-810/qn0f.
+        var post_spins: u32 = 0;
+        while (!scheduler.postZombie(core, ec, expected_gen)) {
+            if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
+                arch.smp.sendWakeIpi(core);
+            }
+            post_spins +%= 1;
+            std.atomic.spinLoopHint();
+        }
         if (core != self_core) arch.smp.sendWakeIpi(core);
     } else {
         // Never dispatched — kstack pages are mapped but no core's rsp
@@ -1931,7 +1959,15 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
         // caller.
         const reap_irq = arch.cpu.saveAndDisableInterrupts();
         arch.cpu.enableInterrupts();
+        // Wake inside the retry loop, not only after it — a halted
+        // target can never drain the column we are waiting on. See the
+        // matching loop in `terminate` for the full rationale.
+        var post_spins: u32 = 0;
         while (!scheduler.postZombie(core, ec, @intCast(gen))) {
+            if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
+                arch.smp.sendWakeIpi(core);
+            }
+            post_spins +%= 1;
             std.atomic.spinLoopHint();
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);

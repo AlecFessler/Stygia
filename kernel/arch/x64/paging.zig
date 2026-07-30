@@ -860,7 +860,28 @@ pub fn mapPage(
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
         const entry = &table[idx];
-        if (!entry.present) {
+        // Intermediate-entry install must be atomic. Two cores mapping
+        // DIFFERENT VAs that happen to share a parent table both see the
+        // slot empty, both allocate, and — with a plain check-then-store
+        // — both publish. The loser then keeps walking into the table IT
+        // allocated, which is no longer referenced by the tree, installs
+        // its leaf there and returns success. The mapping silently does
+        // not exist; it resurfaces arbitrarily later as a wild address,
+        // and the orphaned table page leaks.
+        //
+        // Invisible until the suite actually ran on more than one core:
+        // `affinity = 0` put every test EC on the runner's core, so no
+        // two mappers ever overlapped. `-Dspread_cores` is what exposed
+        // it. `mapPageBoot` is deliberately left alone — single-core by
+        // construction.
+        //
+        // An absent entry is all-zero — every clear site writes
+        // `default_page_entry` (= `PageEntry{}`), and `PageEntry` is a
+        // `packed struct(u64)` whose fields all default to false/0 — so
+        // 0 is the correct compare value.
+        const slot: *u64 = @ptrCast(@alignCast(entry));
+        var cur = @atomicLoad(u64, slot, .acquire);
+        if (cur == 0) {
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
@@ -874,12 +895,27 @@ pub fn mapPage(
             // even though memory holds the corrected entry
             // (stygia-rs6 mechanism 8 — the aarch64 twin of this
             // pattern was implicated in eternal translation-fault
-            // loops on a Pi 5 / KVM-6.6 host).
+            // loops on a Pi 5 / KVM-6.6 host). The cmpxchg keeps that
+            // single-store publication intact.
             var filled_parent = parent_entry;
             filled_parent.setPAddr(new_phys);
-            entry.* = filled_parent;
+            const want: u64 = @bitCast(filled_parent);
+            if (@cmpxchgStrong(u64, slot, 0, want, .release, .acquire)) |winner| {
+                // Lost the race. Hand the orphan back and follow the
+                // winner's table — the walk is correct either way.
+                pmm_mgr.destroy(new_page);
+                cur = winner;
+            } else {
+                cur = want;
+            }
         }
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        // Whatever we ended up with — ours or the winner's — must be a
+        // live table pointer. Asserting keeps the "absent ⟺ zero"
+        // invariant honest instead of silently walking into garbage if
+        // some future clear site starts leaving stale bits behind.
+        const cur_entry: PageEntry = @bitCast(cur);
+        std.debug.assert(cur_entry.present);
+        const next_virt = VAddr.fromPAddr(cur_entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
@@ -1223,7 +1259,28 @@ pub fn mapPageSized(
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
         const entry = &table[idx];
-        if (!entry.present) {
+        // Intermediate-entry install must be atomic. Two cores mapping
+        // DIFFERENT VAs that happen to share a parent table both see the
+        // slot empty, both allocate, and — with a plain check-then-store
+        // — both publish. The loser then keeps walking into the table IT
+        // allocated, which is no longer referenced by the tree, installs
+        // its leaf there and returns success. The mapping silently does
+        // not exist; it resurfaces arbitrarily later as a wild address,
+        // and the orphaned table page leaks.
+        //
+        // Invisible until the suite actually ran on more than one core:
+        // `affinity = 0` put every test EC on the runner's core, so no
+        // two mappers ever overlapped. `-Dspread_cores` is what exposed
+        // it. `mapPageBoot` is deliberately left alone — single-core by
+        // construction.
+        //
+        // An absent entry is all-zero — every clear site writes
+        // `default_page_entry` (= `PageEntry{}`), and `PageEntry` is a
+        // `packed struct(u64)` whose fields all default to false/0 — so
+        // 0 is the correct compare value.
+        const slot: *u64 = @ptrCast(@alignCast(entry));
+        var cur = @atomicLoad(u64, slot, .acquire);
+        if (cur == 0) {
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
@@ -1237,12 +1294,27 @@ pub fn mapPageSized(
             // even though memory holds the corrected entry
             // (stygia-rs6 mechanism 8 — the aarch64 twin of this
             // pattern was implicated in eternal translation-fault
-            // loops on a Pi 5 / KVM-6.6 host).
+            // loops on a Pi 5 / KVM-6.6 host). The cmpxchg keeps that
+            // single-store publication intact.
             var filled_parent = parent_entry;
             filled_parent.setPAddr(new_phys);
-            entry.* = filled_parent;
+            const want: u64 = @bitCast(filled_parent);
+            if (@cmpxchgStrong(u64, slot, 0, want, .release, .acquire)) |winner| {
+                // Lost the race. Hand the orphan back and follow the
+                // winner's table — the walk is correct either way.
+                pmm_mgr.destroy(new_page);
+                cur = winner;
+            } else {
+                cur = want;
+            }
         }
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        // Whatever we ended up with — ours or the winner's — must be a
+        // live table pointer. Asserting keeps the "absent ⟺ zero"
+        // invariant honest instead of silently walking into garbage if
+        // some future clear site starts leaving stale bits behind.
+        const cur_entry: PageEntry = @bitCast(cur);
+        std.debug.assert(cur_entry.present);
+        const next_virt = VAddr.fromPAddr(cur_entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 

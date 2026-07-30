@@ -980,17 +980,24 @@ pub fn destroyVmar(v: *VMAR) void {
 
 /// VMAR teardown variant for the capability-domain destroy path:
 /// drops mapcnt for every installed page_frame, clears the leaf PTEs
-/// without issuing per-page TLB shootdowns (no core has the dying CD's
-/// CR3 active), removes from `domain.vars[]`, and frees the slab slot.
-/// Used by `destroyPhase1`'s `cd.vars[]` walk where paying for
-/// O(page_count) IPI broadcasts per VMAR is the dominant cost — a
-/// 4 MiB-stack-sized child with multiple VMARs would otherwise eat
-/// thousands of shootdown IPIs per spawn.
+/// without issuing per-page TLB shootdowns, removes from
+/// `domain.vars[]`, and frees the slab slot. Used by `destroyPhase2`'s
+/// `cd.vars[]` walk where paying for O(page_count) IPI broadcasts per
+/// VMAR is the dominant cost — a 4 MiB-stack-sized child with multiple
+/// VMARs would otherwise eat thousands of shootdown IPIs per spawn.
+///
+/// Skipping the shootdown is only legal AFTER `awaitDomainQuiesced`
+/// has confirmed that no core has the dying CD's translation root
+/// loaded and no core holds one of its ECs in its dispatch slot
+/// (stygia-1im). Do not call this from a context that cannot make that
+/// guarantee — use `destroyVmar` there instead.
 pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
-    // caller-pinned: the only caller is `capability_domain.destroyPhase1`
-    // walking `cd.vars[]` under `cd._gen_lock`; v's `domain` SlabRef
-    // points back at the locked CD, so the slab slot can't be reaped
-    // out from under us.
+    // caller-pinned: the only caller is `capability_domain.destroyPhase2`
+    // walking `cd.vars[]` after the quiesce barrier. The CD slot is
+    // dead-marked but bytes-intact until `destroyAlreadyMarked` runs at
+    // the end of that function, and its even gen blocks every handle
+    // path from reaching these VMARs, so `v.domain.ptr` stays readable
+    // and the slot can't be reaped out from under us.
     const domain = v.domain.ptr;
     const gen = v._gen_lock.currentGen();
     if (v.map == .page_frame or v.map == .demand) {
