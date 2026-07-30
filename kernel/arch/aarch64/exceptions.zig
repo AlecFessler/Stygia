@@ -973,7 +973,8 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
             // on the bare-metal rig) and the interrupted code may hold
             // `serial.print_lock`, so `serial.print` can wedge the report.
             const panic_mod = stygia.panic;
-            const boot = stygia.arch.dispatch.boot;
+            // Own-arch printer, not the dispatch facade.
+            const boot = serial;
             if (!panic_mod.claimPanic()) cpu.halt();
             boot.printRaw("KERNEL EXCEPTION: EC=0x");
             panic_mod.printHex(@intFromEnum(ec));
@@ -984,7 +985,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
             boot.printRaw(" FAR=0x");
             panic_mod.printHex(readFarEl1());
             boot.printRaw(" core=0x");
-            panic_mod.printHex(stygia.arch.dispatch.smp.coreID());
+            panic_mod.printHex(gic.coreID());
             boot.printRaw("\n");
             stygia.arch.aarch64.interrupts.dumpFaultRegs(ctx);
             stygia.memory.fault.dumpFrameChain(ctx.regs.x29);

@@ -100,6 +100,20 @@ const EV_CURRENT: u8 = 1;
 const ELFOSABI_NONE: u8 = 0;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+/// `e_machine` for the arch this test is built for. Hardcoding
+/// EM_X86_64 made the crafted child un-runnable on aarch64: the kernel
+/// mapped it, the initial EC executed the x86 stub bytes as A64
+/// (`adr x17, …` / `stxrh w0, w0, [x0]`), stored through its read-only
+/// cap_table_base, and died as a routeless `memory_fault` — one
+/// `[NOROUTE] subcode=0` per suite run, with the domain torn down by the
+/// no-route fallback instead of the intended `delete(SLOT_SELF)`.
+const EM_NATIVE: u16 = switch (@import("builtin").cpu.arch) {
+    .x86_64 => EM_X86_64,
+    .aarch64 => EM_AARCH64,
+    else => @compileError("unsupported target architecture"),
+};
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
@@ -143,7 +157,7 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     const entry_off: u64 = SIZEOF_EHDR64 + SIZEOF_PHDR64;
 
     writeU16(dst, 0x10, ET_DYN); // e_type — kernel requires PIE (ET_DYN)
-    writeU16(dst, 0x12, EM_X86_64); // e_machine
+    writeU16(dst, 0x12, EM_NATIVE); // e_machine
     writeU32(dst, 0x14, EV_CURRENT); // e_version
     writeU64(dst, 0x18, entry_off); // e_entry — vaddr of first insn
     writeU64(dst, 0x20, SIZEOF_EHDR64); // e_phoff
@@ -191,14 +205,36 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     // handle in its table is released with its type-specific delete
     // behavior applied." That is exactly what is required to keep the
     // CD slab balanced across runner reps.
-    const child_stub = [_]u8{
-        0x31, 0xC0, // xor %eax, %eax
-        0xB9, 0x10, 0x00, 0x00, 0x00, // mov $0x10, %ecx
-        0x48, 0x83, 0xEC, 0x10, // sub $0x10, %rsp
-        0x48, 0x89, 0x0C, 0x24, // mov %rcx, (%rsp)
-        0x0F, 0x05, // syscall
-        0xF4, // hlt (unreachable on success)
-        0xEB, 0xFD, // jmp -3 (back to hlt)
+    // aarch64 instruction stream (matches libz/syscall_aarch64.zig
+    // issueRegDiscard: v1..v13 in x0..x12, syscall_word at [sp] after a
+    // 784-byte frame reservation):
+    //   mov  x0, #0            ; v1 = SLOT_SELF (= 0)
+    //   mov  x1, #16           ; syscall_word = delete (num 16)
+    //   sub  sp, sp, #784      ; reserve the vreg frame
+    //   str  x1, [sp]          ; [sp] = syscall_word
+    //   svc  #0                ; → kernel deleteAndDetach
+    //   brk  #0                ; unreachable on success
+    //   b    .                 ; pin the EC if the syscall ever returns
+    const child_stub = switch (@import("builtin").cpu.arch) {
+        .x86_64 => [_]u8{
+            0x31, 0xC0, // xor %eax, %eax
+            0xB9, 0x10, 0x00, 0x00, 0x00, // mov $0x10, %ecx
+            0x48, 0x83, 0xEC, 0x10, // sub $0x10, %rsp
+            0x48, 0x89, 0x0C, 0x24, // mov %rcx, (%rsp)
+            0x0F, 0x05, // syscall
+            0xF4, // hlt (unreachable on success)
+            0xEB, 0xFD, // jmp -3 (back to hlt)
+        },
+        .aarch64 => [_]u8{
+            0x00, 0x00, 0x80, 0xD2, // mov  x0, #0
+            0x01, 0x02, 0x80, 0xD2, // mov  x1, #16
+            0xFF, 0x43, 0x0C, 0xD1, // sub  sp, sp, #784
+            0xE1, 0x03, 0x00, 0xF9, // str  x1, [sp]
+            0x01, 0x00, 0x00, 0xD4, // svc  #0
+            0x00, 0x00, 0x20, 0xD4, // brk  #0
+            0x00, 0x00, 0x00, 0x14, // b    .
+        },
+        else => @compileError("unsupported target architecture"),
     };
     var ci: usize = 0;
     while (ci < child_stub.len) : (ci += 1) {

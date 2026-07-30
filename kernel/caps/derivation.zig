@@ -212,6 +212,12 @@ pub fn derive(
     // the intra-call role the old `held_dom` parameter played; it now
     // derives from the parent lock itself rather than from a
     // caller-held lock.
+    // caller-pinned: identity-only token. `self_held` is never
+    // dereferenced — it is compared by address inside `lockEntrySkip` /
+    // `ancestorChainContains` to decide which domain's gen-lock this
+    // call already holds and must not re-acquire. The parent acquire
+    // above holds that very gen-lock for the whole scope, so the slot
+    // cannot be recycled underneath the comparison.
     const self_held: ?*CapabilityDomain = if (parent_link.domain.ptr) |p|
         @ptrCast(@alignCast(p))
     else

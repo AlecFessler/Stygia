@@ -120,7 +120,8 @@ pub const PageFaultContext = struct {
 /// the fatal-fault path where `serial.print_lock` may already be held by
 /// this core (see memory.fault.reportKernelFault).
 pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
-    const boot = stygia.arch.dispatch.boot;
+    // Own-arch printer, not the dispatch facade — see the x64 twin.
+    const boot = stygia.arch.aarch64.serial;
     const panic_mod = stygia.panic;
     inline for (@typeInfo(Registers).@"struct".fields, 0..) |f, i| {
         boot.printRaw(if (i % 4 == 0) "  " else " ");

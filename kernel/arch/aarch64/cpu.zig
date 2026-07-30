@@ -458,7 +458,7 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
                     const zp_chk = @intFromPtr(z);
                     const ka_chk = stygia.memory.address.KernelVA.KernelAllocators.range;
                     if (zp_chk < ka_chk.start or zp_chk >= ka_chk.end) {
-                        stygia.arch.dispatch.boot.print(
+                        stygia.arch.aarch64.serial.print(
                             "[zombie] BUG: pending slot [{d}] holds non-slab 0x{x}; dropped\n",
                             .{ i, zp_chk },
                         );

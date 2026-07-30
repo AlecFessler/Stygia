@@ -232,6 +232,13 @@ pub const PerCore = struct {
     /// and consumed only by this core (single producer/consumer); the
     /// EC slab slot cannot be freed while `on_cpu` is true, which is
     /// precisely what the stash keeps set.
+    ///
+    /// caller-pinned: bare `*T` rather than `SlabRef(T)` on purpose. The
+    /// stash EXISTS to keep `on_cpu` set, and
+    /// `finalizeDestroyMarkedDead` refuses to reap an EC with that flag
+    /// set, so the slot cannot be recycled while this field is non-null
+    /// — a gen re-check would have nothing to catch. The hop primitive
+    /// also needs the raw `&ec.on_cpu` byte address to store through.
     pending_kstack_release: ?*ExecutionContext = null,
 
     /// EC that must be enqueued on a DIFFERENT core (affinity
@@ -245,6 +252,12 @@ pub const PerCore = struct {
     /// enqueueing), so the target core can only ever see a fully
     /// released kstack. Single producer/consumer per core, same
     /// pinning argument as `pending_kstack_release`.
+    ///
+    /// caller-pinned: bare `*T` for the same reason as
+    /// `pending_kstack_release` — the migrating EC still has `on_cpu`
+    /// set (its release is the stash the hop consumes immediately
+    /// before this one), so its slab slot cannot be recycled while this
+    /// field is non-null.
     pending_cross_enqueue: ?*ExecutionContext = null,
 
     /// True when this core's most recent dispatch decision — taken
