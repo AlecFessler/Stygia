@@ -75,6 +75,38 @@ pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
     }
 }
 
+/// Abandon the current stack: switch SP to `stack_top` and branch to
+/// `target`, never returning. The frame pointer is zeroed first so no
+/// walker follows the chain back onto the abandoned stack.
+///
+/// Exists for the fatal-fault reporter: when the report concerns a
+/// corrupted kernel stack, the reporter is standing ON that stack and
+/// the writer that corrupted it is still active — measured on the Pi 5
+/// rig as a report dying 11 hex digits in, taking its evidence with it.
+pub fn jumpOnStack(stack_top: u64, target: *const fn () callconv(.c) noreturn) noreturn {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile (
+            \\mov sp, %[top]
+            \\mov x29, xzr
+            \\mov x30, xzr
+            \\br %[f]
+            :
+            : [top] "r" (stack_top & ~@as(u64, 15)),
+              [f] "r" (target),
+            : .{ .memory = true }),
+        .x86_64 => asm volatile (
+            \\movq %[top], %%rsp
+            \\xorl %%ebp, %%ebp
+            \\jmpq *%[f]
+            :
+            : [top] "r" (stack_top & ~@as(u64, 15)),
+              [f] "r" (target),
+            : .{ .memory = true }),
+        else => unreachable,
+    }
+    unreachable;
+}
+
 // --- Calling convention / entry ----------------------------------------
 
 pub fn cc() std.builtin.CallingConvention {

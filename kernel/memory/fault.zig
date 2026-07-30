@@ -84,25 +84,110 @@ fn demandPageKernel(faulting_virt: VAddr) void {
 /// interleaving into each other's output — the earlier bare-metal logs
 /// contain `KERKERNEL PAGE FAULT at 0xf` followed by a run of NULs,
 /// which is two cores writing the same reporter at once.
-fn reportKernelFault(fault: *const PageFaultContext) void {
+/// Static home for the fatal-fault report. The reporter may be standing
+/// on the very stack whose corruption it is reporting, with the
+/// corrupting writer still active — on the Pi 5 rig a stack-resident
+/// report died 11 hex digits in when the trampler caught up with it. So:
+/// claim the gate, copy the evidence into statics, abandon the doomed
+/// stack via `jumpOnStack`, and print from ground the trampler cannot
+/// reach. One buffer suffices: `claimPanic` serializes reporters (losers
+/// halt), and the winning core never leaves this path.
+const FatalCapture = struct {
+    addr: u64 = 0,
+    pc: u64 = 0,
+    lr: u64 = 0,
+    fp: u64 = 0,
+    is_write: bool = false,
+    is_exec: bool = false,
+    have_regs: bool = false,
+    regs: arch.cpu.ArchCpuContext = undefined,
+    msg: []const u8 = "",
+};
+var fatal_capture: FatalCapture = .{};
+var fatal_stack: [32 * 1024]u8 align(16) = undefined;
+
+/// Report an unexpected kernel-privilege fault and panic, printing from
+/// the static safe stack. Never returns.
+fn reportKernelFaultFatal(fault: *const PageFaultContext, msg: []const u8) noreturn {
     if (!panic_mod.claimPanic()) arch.cpu.halt();
+    fatal_capture.addr = fault.faulting_address;
+    fatal_capture.pc = fault.rip;
+    fatal_capture.lr = fault.lr;
+    fatal_capture.fp = fault.fp;
+    fatal_capture.is_write = fault.is_write;
+    fatal_capture.is_exec = fault.is_exec;
+    fatal_capture.msg = msg;
+    if (fault.frame_ctx) |ctx| {
+        fatal_capture.regs = ctx.*;
+        fatal_capture.have_regs = true;
+    } else {
+        fatal_capture.have_regs = false;
+    }
+    arch.cpu.jumpOnStack(
+        @intFromPtr(&fatal_stack) + fatal_stack.len,
+        &reportCapturedAndPanic,
+    );
+}
+
+fn reportCapturedAndPanic() callconv(.c) noreturn {
     arch.boot.printRaw("KERNEL PAGE FAULT at 0x");
-    panic_mod.printHex(fault.faulting_address);
-    arch.boot.printRaw(if (fault.is_write) " (write=true" else " (write=false");
-    arch.boot.printRaw(if (fault.is_exec) " exec=true" else " exec=false");
+    panic_mod.printHex(fatal_capture.addr);
+    arch.boot.printRaw(if (fatal_capture.is_write) " (write=true" else " (write=false");
+    arch.boot.printRaw(if (fatal_capture.is_exec) " exec=true" else " exec=false");
     // The faulting PC names the instruction; `lr` names its caller when
     // the PC is a leaf (the bare-metal corruption faulted inside memset,
     // which tells you nothing without the caller). `core` distinguishes
     // "the BSP running the whole suite" from "a supposedly idle AP".
     arch.boot.printRaw(" pc=0x");
-    panic_mod.printHex(fault.rip);
+    panic_mod.printHex(fatal_capture.pc);
     arch.boot.printRaw(" lr=0x");
-    panic_mod.printHex(fault.lr);
+    panic_mod.printHex(fatal_capture.lr);
     arch.boot.printRaw(" core=0x");
     panic_mod.printHex(arch.smp.coreID());
     arch.boot.printRaw(")\n");
-    if (fault.frame_ctx) |ctx| arch.cpu.dumpFaultRegs(ctx);
-    dumpFrameChain(fault.fp);
+    if (fatal_capture.have_regs) arch.cpu.dumpFaultRegs(&fatal_capture.regs);
+    dumpFrameChain(fatal_capture.fp);
+    dumpCoreStatesRaw();
+    @panic(fatal_capture.msg);
+}
+
+/// One line per online core: park-stack range, current EC and its
+/// kstack range, on_cpu, pending-zombie count. Racy cross-core reads,
+/// printRaw only — this exists so a corruption report shows which
+/// contexts could legally be writing near the victim address, instead
+/// of that question costing another hardware cycle.
+fn dumpCoreStatesRaw() void {
+    const n = @min(arch.smp.coreCount(), scheduler.MAX_CORES);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const cs = &scheduler.core_states[i];
+        arch.boot.printRaw("  core ");
+        panic_mod.printHex(i);
+        arch.boot.printRaw(" park=0x");
+        panic_mod.printHex(cs.park_stack.base.addr);
+        arch.boot.printRaw("..0x");
+        panic_mod.printHex(cs.park_stack.top.addr);
+        if (cs.current_ec) |ref| {
+            arch.boot.printRaw(" cur=0x");
+            panic_mod.printHex(@intFromPtr(ref.ptr));
+            arch.boot.printRaw(" kstk=0x");
+            panic_mod.printHex(ref.ptr.kernel_stack.base.addr);
+            arch.boot.printRaw("..0x");
+            panic_mod.printHex(ref.ptr.kernel_stack.top.addr);
+            arch.boot.printRaw(if (ref.ptr.on_cpu.load(.monotonic)) " on_cpu=1" else " on_cpu=0");
+        } else {
+            arch.boot.printRaw(" cur=null");
+        }
+        var zpend: usize = 0;
+        for (cs.pending_zombie) |mz| {
+            if (mz != null) zpend += 1;
+        }
+        if (zpend != 0) {
+            arch.boot.printRaw(" zpend=0x");
+            panic_mod.printHex(zpend);
+        }
+        arch.boot.printRaw("\n");
+    }
 }
 
 /// Walk the interrupted context's frame-record chain and print each
@@ -179,8 +264,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             // This panic is one of the downstream shapes of the bare-metal
             // 4-core corruption (stygia-723); report the full frame so it
             // stops being a one-line dead end.
-            reportKernelFault(fault);
-            @panic("kernel page fault on user VA with no current EC");
+            reportKernelFaultFatal(fault, "kernel page fault on user VA with no current EC");
         };
         if (comptime pf_log.enabled) {
             pf_log.mark(ec, .KERNEL_ON_USER_VA, faulting_virt.addr, 0);
@@ -234,8 +318,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                 // far into the guard page the push went, and the frame
                 // chain walked from the captured x29 names the call path
                 // that consumed the stack.
-                reportKernelFault(fault);
-                @panic("Kernel stack overflow");
+                reportKernelFaultFatal(fault, "Kernel stack overflow");
             },
             .not_stack => {},
         }
@@ -252,8 +335,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (comptime pf_log.enabled) {
             pf_log.mark(scheduler.currentEc(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
         }
-        reportKernelFault(fault);
-        @panic("unexpected kernel page fault");
+        reportKernelFaultFatal(fault, "unexpected kernel page fault");
     }
 
     const ec = scheduler.currentEc() orelse {
@@ -265,8 +347,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // core + register frame are what make it attributable. The fp
         // here is a user fp, so the chain walk stops at the first
         // unresolvable (user) address — the header is still worth it.
-        reportKernelFault(fault);
-        @panic("user page fault with no current EC");
+        reportKernelFaultFatal(fault, "user page fault with no current EC");
     };
 
     // Per-PF debug print intentionally elided. Every demand-page
