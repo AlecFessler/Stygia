@@ -188,11 +188,20 @@ pub fn expireTimedRecvWaiters() void {
         ec.recv_deadline_ns = 0;
         ec.suspend_port = null;
         ec.event_type = .none;
+        // Claim the wake BEFORE stamping anything into `ec.ctx`. This is
+        // the timer half of a timed recv; the event half is a sender
+        // delivering on another core at this very moment. Both used to
+        // write `.ready` and enqueue unconditionally, which is how one
+        // EC ended up with a run-queue node on two cores and got resumed
+        // twice off a single saved frame. Losing is normal: the event
+        // arrived first, it owns the wake, and our E_TIMEOUT would be
+        // both a lie and a second writer into a frame the winner is
+        // already resuming.
+        if (!execution_context.tryClaimWake(ec, .suspended_on_port)) continue;
         // Stash E_TIMEOUT in the syscall return slot. The scheduler's
         // resume path restores the syscall-return register on iretq.
         arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
-        ec.state = .ready;
-        scheduler.markReady(ec);
+        scheduler.enqueue(ec);
     }
 }
 
@@ -1961,7 +1970,10 @@ pub fn rendezvousWithReceiver(
         sender.pending_pair_count,
         receiver.recv_port_xfer,
     );
-    receiver.state = .ready;
+    // No manual `.ready` stamp: `markReady` claims the wait->ready
+    // transition itself, so a racing recv-timeout expiry on the timer
+    // core cannot also enqueue this receiver. Pre-stamping `.ready` here
+    // would defeat that claim (it would no longer see a wait state).
     scheduler.markReady(receiver);
     return true;
 }
@@ -2069,14 +2081,16 @@ pub fn resumeWithAbandoned(sender: *ExecutionContext) void {
 fn propagateClosedToReceivers(p: *Port) void {
     if (p.waiter_kind != .receivers) return;
     while (p.waiters.dequeue()) |waiter| {
+        // Claim before writing the return slot — a timeout expiry or a
+        // racing delivery is a competing waker for this same wait.
+        if (!execution_context.tryClaimWake(waiter, .suspended_on_port)) continue;
         if (waiter.iret_frame) |frame| {
             arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_CLOSED));
         } else {
             arch.syscall.setSyscallReturn(waiter.ctx, @bitCast(errors.E_CLOSED));
         }
         waiter.suspend_port = null;
-        waiter.state = .ready;
-        scheduler.markReady(waiter);
+        scheduler.enqueue(waiter);
     }
     p.waiter_kind = .none;
 }
@@ -2104,7 +2118,7 @@ fn propagateClosedToSenders(p: *Port) void {
         // `sender.pending_pair_count` on the next pairing and would
         // otherwise install ghost handles from the dead session).
         sender.pending_pair_count = 0;
-        sender.state = .ready;
+        // No manual stamp — `markReady` owns the wait->ready claim.
         scheduler.markReady(sender);
     }
     p.waiter_kind = .none;

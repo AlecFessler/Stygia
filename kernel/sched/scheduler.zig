@@ -1724,8 +1724,34 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
 
 /// Transition `ec` to ready and enqueue. Used by event delivery
 /// resumes (reply, futex wake, timer fire, recv→ready, etc.).
+///
+/// Routed through `tryClaimWake` so a resume that races a second waker
+/// for the same wait — classically a recv/futex timeout expiring on the
+/// timer core while the event it was waiting for arrives on another —
+/// enqueues the EC exactly once. The loser returns silently; the winner
+/// owns the wake. See `execution_context.tryClaimWake` for why a
+/// per-core queue lock cannot serialize this.
 pub fn markReady(ec: *ExecutionContext) void {
-    ec.state = .ready;
+    // Racy read, then a cmpxchg from exactly that value — if it shifts
+    // under us the claim fails and we correctly do nothing.
+    const waiting_in = ec.state;
+    switch (waiting_in) {
+        // Genuine wakes.
+        .suspended_on_port, .futex_wait, .idle_wait => {},
+        // Not a wake but a legitimate re-enqueue: `resumeFromReply` can
+        // reach here with the EC still `.running` (the reply landed on
+        // the core that was executing it). Claiming from `.running` is
+        // still single-writer, so it keeps the anti-double-enqueue
+        // property while not stranding the EC.
+        .running => {},
+        // `.ready` means someone already claimed this wake and queued
+        // the EC — enqueuing again is precisely the double-queue bug
+        // this function exists to prevent. `.exited` must never be
+        // resurrected: enqueueOnCore's dispatch filter keys on that
+        // state, so stamping `.ready` over it destroys the evidence.
+        else => return,
+    }
+    if (!execution_context.tryClaimWake(ec, waiting_in)) return;
     enqueue(ec);
 }
 

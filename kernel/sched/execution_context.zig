@@ -46,6 +46,53 @@ pub const MAX_PAIR_ENTRIES_PER_EC: usize = 63;
 /// "no core to defer-finalize to" signal.
 pub const LAST_DISPATCHED_NEVER: u8 = 0xFF;
 
+/// Atomically claim the right to wake `ec` out of `expected`.
+///
+/// Returns true exactly once per wait: the caller that flips
+/// `expected -> .ready` owns the wake and must be the one to enqueue.
+/// Every loser must do NOTHING — not enqueue, not write `ec.ctx`, not
+/// touch the wait-state fields. Someone else already owns this wake.
+///
+/// Why this exists. Every wake source used to write `state = .ready`
+/// and enqueue unconditionally: `markReady`, both futex paths (event
+/// wake and timeout expiry), timer-wheel expiry, and the port/reply
+/// resumes. An EC in a TIMED wait has two independent wakers — its
+/// timeout, firing on the timer core, and its event, firing on
+/// whichever core signalled. Both would see a waiting EC, both would
+/// set `.ready`, and both would enqueue it, producing two run-queue
+/// nodes on two different cores. Both cores then dispatch it and
+/// resume the SAME saved frame; whichever traps first re-saves over
+/// the other's context.
+///
+/// That is the two-cores-one-frame catastrophe, and it is the source
+/// of the whole corrupt-context family: wild kernel return addresses
+/// (`lr=1/fp=0`, `switch on corrupt value @ 0x2`), near-null user PCs
+/// and pointers (0x54, 0x80, 0xcaa, 0x8000), and the `[NOROUTE]`
+/// subcode=1/2/3 faults those degenerate into once the resumed EC
+/// touches them. Captured on bare metal as a user-privilege fault at
+/// PC=0 on core 1 with `current_ec=null`, while core 0 simultaneously
+/// held that very EC as its current.
+///
+/// Per-core run-queue locks cannot fix this: the two wakers target two
+/// different cores and take two different locks. The only common
+/// serialization point is the EC's own state word, so the claim has to
+/// live there.
+///
+/// `expected` must name a genuine WAIT state. A `.ready -> .ready`
+/// re-enqueue (preemption putting a runnable EC back on a queue) is
+/// not a wake and must not route through here — it would fail the
+/// claim and silently drop the EC off every queue.
+pub fn tryClaimWake(ec: *ExecutionContext, expected: State) bool {
+    return @cmpxchgStrong(
+        State,
+        &ec.state,
+        expected,
+        .ready,
+        .acq_rel,
+        .monotonic,
+    ) == null;
+}
+
 /// Re-send the zombie-drain wake IPI every this many failed
 /// `postZombie` attempts. See the two `postZombie` spin loops: only the
 /// TARGET core can drain its own pending-zombie column, so a halted
@@ -108,7 +155,13 @@ pub const NOT_IN_RUN_QUEUE: u8 = 0xFF;
 
 /// Lifecycle state. An EC is in at most one queue at a time; the state
 /// names which one (or none, when running or exited).
-pub const State = enum {
+/// Backing type is explicit and byte-wide so `tryClaimWake` can
+/// `cmpxchg` it. Zig would otherwise pick a u3, which has no atomic
+/// form. One byte is also what the x86 IPC fast-path asm already
+/// assumes — it writes this field with `movb` at
+/// `@offsetOf(ExecutionContext, "state")` — so pinning u8 changes no
+/// layout and no existing code.
+pub const State = enum(u8) {
     /// Currently executing on a CPU.
     running,
     /// Enqueued on a per-core run queue, waiting to be dispatched.
@@ -1560,7 +1613,12 @@ pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     ec.originating_write_cap = false;
     ec.pending_pair_count = 0;
     ec.originating_read_cap = false;
-    ec.state = .ready;
+    // No manual `.ready` stamp. `markReady` performs the wait->ready
+    // transition itself via `tryClaimWake`, so a reply landing here at
+    // the same moment the recv's timeout expires on the timer core
+    // enqueues this EC exactly once. Pre-stamping `.ready` would hide
+    // the wait state from that claim and let both wakers through — the
+    // double-enqueue that resumes one saved frame on two cores.
     scheduler.markReady(ec);
 }
 
