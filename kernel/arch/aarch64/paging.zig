@@ -415,7 +415,39 @@ pub fn mapPage(
             // leaf.
             var filled_parent = parent_entry;
             filled_parent.setPAddr(new_phys);
-            entry.* = filled_parent;
+            // Publish with a CAS, not a plain store.
+            //
+            // `if (!entry.valid)` above is a check-then-act across cores.
+            // Two cores mapping *different* VAs that happen to share this
+            // parent both observe it invalid, both allocate a table, and
+            // both store. The loser then keeps walking into the table IT
+            // allocated -- which the tree no longer references -- installs
+            // its leaf there, and returns success. The mapping simply does
+            // not exist, and the orphaned page is leaked.
+            //
+            // That is a silent corruption whose fault surfaces arbitrarily
+            // later and somewhere else, as a wild address. It cannot fire
+            // while every EC runs on one core, which is what `affinity = 0`
+            // was doing to the entire test suite until `-Dspread_cores`
+            // (stygia-yxj), and it is worst on hardware where four cores
+            // are genuinely simultaneous.
+            //
+            // On a lost race, free our now-unreachable table and fall
+            // through to the winner's: `entry` is re-read immediately
+            // below, so the walk continues down the table that is actually
+            // linked.
+            //
+            // Deliberately NOT done in `mapPageBoot`. That one runs in the
+            // pi5 loader with the MMU still off, where all memory is
+            // Device-nGnRnE and an atomic (`casal`) raises a synchronous
+            // external abort -- measured, DFSC=0x10 with ELR in the
+            // loader's own early text. It is also single-core by
+            // construction, so it has no race to fix.
+            const slot: *u64 = @ptrCast(@alignCast(entry));
+            const want: u64 = @bitCast(filled_parent);
+            if (@cmpxchgStrong(u64, slot, @as(u64, 0), want, .release, .acquire) != null) {
+                pmm_mgr.destroy(new_page);
+            }
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
@@ -963,7 +995,15 @@ pub fn mapPageSized(
             // leaf.
             var filled_parent = parent_entry;
             filled_parent.setPAddr(new_phys);
-            entry.* = filled_parent;
+            // Same CAS publish as `mapPage`, for the same reason: this is
+            // the runtime user-mapping path (vmar), so two cores faulting
+            // on different VAs under a shared parent race here too. See the
+            // full note in `mapPage`.
+            const slot: *u64 = @ptrCast(@alignCast(entry));
+            const want: u64 = @bitCast(filled_parent);
+            if (@cmpxchgStrong(u64, slot, @as(u64, 0), want, .release, .acquire) != null) {
+                pmm_mgr.destroy(new_page);
+            }
         }
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
