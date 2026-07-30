@@ -899,17 +899,29 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
         } else |_| {}
     }
 
-    const dom_root = blk: {
-        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk null;
-        const d = dlr.ptr;
-        defer ec.domain.unlockIrqRestore(dlr.irq_state);
-        break :blk d.addr_space_root;
-    };
-
     if (ec.user_stack) |us| {
         _ = us;
     }
-    if (dom_root) |root| stack.destroyKernel(ec.kernel_stack, root);
+    // Free the kstack only while the owning domain is still alive — the
+    // gate the old code applied implicitly by fetching the domain root
+    // under its lock. The root itself is no longer used (`destroyKernel`
+    // always unmaps from the kernel root now — on aarch64 the domain
+    // root is the TTBR0 user tree and walking it with kernel-VA indices
+    // unmapped LIVE USER PAGES, stygia-723), but the GATE is
+    // load-bearing on its own: an EC finalized during its domain's
+    // teardown can still be the SP_EL1 / TSS.RSP0 target of a core that
+    // has not converged through the quiesce barrier yet, and freeing
+    // that kstack turns the next exception on that core into a push
+    // onto unmapped memory. Lifting the gate (always-free) was measured
+    // as suite-wide fault storms on BOTH arches. The cost of keeping it
+    // is one leaked kstack per EC finalized after domain death — the
+    // pre-existing status quo.
+    const domain_alive = blk: {
+        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk false;
+        ec.domain.unlockIrqRestore(dlr.irq_state);
+        break :blk true;
+    };
+    if (domain_alive) stack.destroyKernel(ec.kernel_stack);
 
     slab_instance.destroyAlreadyMarked(ec);
 }
@@ -1580,7 +1592,7 @@ pub fn allocExecutionContext(
     const ec = pending.ptr;
 
     const kstack = try stack.createKernel();
-    errdefer stack.destroyKernel(kstack, domain.addr_space_root);
+    errdefer stack.destroyKernel(kstack);
 
     // Back the kernel stack VA range with physical pages mapped into
     // the *kernel* address space root (the kernel half is shared

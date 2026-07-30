@@ -3,6 +3,7 @@ const stygia = @import("stygia");
 
 const address = stygia.memory.address;
 const arch = stygia.arch.dispatch;
+const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 
@@ -73,10 +74,35 @@ pub fn createKernel() !Stack {
     };
 }
 
-pub fn destroyKernel(stack: Stack, addr_space_root: PAddr) void {
+/// Unmap and free a kernel stack's pages, then recycle its slot.
+///
+/// Deliberately takes NO address-space root: kernel stacks are mapped
+/// into `memory_init.kernel_addr_space_root` and nowhere else, so that
+/// is the only root it can ever be correct to unmap them from. The
+/// previous signature let callers pass a root, and the EC teardown path
+/// passed the owning domain's — correct on x86-64, where the kernel
+/// half is mirrored into every domain PML4, but wrong on aarch64, where
+/// the domain root is the TTBR0 (user-only) tree: `unmapPage` walked
+/// USER tables with indices derived from the kernel VA, so every EC
+/// destroy either silently leaked the kstack (walk found nothing) or
+/// unmapped and freed an unrelated LIVE USER PAGE at the aliased low VA
+/// — a page whose physical frame the domain's wholesale teardown then
+/// freed a second time, handing it to two owners at once. Measured on
+/// the bare-metal Pi 5 as cross-core trampling of an active kernel
+/// stack (stygia-723).
+pub fn destroyKernel(stack: Stack) void {
+    // Freeing a stack the calling core's own SP is inside is never
+    // correct — the reap protocol (takeOwnPendingZombie) exists to
+    // prevent exactly this. Scream rather than silently corrupt.
+    const sp = arch.cpu.currentSp();
+    if (sp >= stack.base.addr and sp < stack.top.addr) {
+        arch.boot.print("[kstk] BUG: freeing own live stack, slot {d} core {d} ra 0x{x}\n", .{
+            stack.slot, arch.smp.coreID(), @returnAddress(),
+        });
+    }
     var page_addr = stack.base.addr;
     while (page_addr < stack.top.addr) {
-        if (arch.paging.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
+        if (arch.paging.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             const pmm_mgr = &pmm.global_pmm.?;
             const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
             pmm_mgr.destroy(page);

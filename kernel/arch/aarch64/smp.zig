@@ -374,7 +374,7 @@ fn smpInitFull() !void {
 
         if (!map_ok) {
             serial.print("[smp] core {d}: kernel stack mapping failed\n", .{core_idx});
-            stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+            stack_mod.destroyKernel(ap_stack);
             core_idx += 1;
             continue;
         }
@@ -419,7 +419,7 @@ fn smpInitFull() !void {
                 "[smp] core {d} (mpidr {x}): PSCI CPU_ON failed, ret {d}\n",
                 .{ core_idx, target_mpidr, ret },
             );
-            stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+            stack_mod.destroyKernel(ap_stack);
             core_idx += 1;
             continue;
         }

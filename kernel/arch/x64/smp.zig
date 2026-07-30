@@ -118,7 +118,7 @@ pub fn smpInit() !void {
         }
 
         if (!map_ok) {
-            stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+            stack_mod.destroyKernel(ap_stack);
             continue;
         }
 
@@ -140,7 +140,7 @@ pub fn smpInit() !void {
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
-                stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+                stack_mod.destroyKernel(ap_stack);
                 break;
             }
             std.atomic.spinLoopHint();
