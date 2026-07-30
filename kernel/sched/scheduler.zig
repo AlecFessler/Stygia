@@ -1708,12 +1708,50 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
         // standing_on_zombie check below misses it, and finalize would
         // unmap the kstack mapped via TSS.RSP0 → next ring transition
         // pushes an iret frame at unmapped → #PF → #DF → triple-fault.
-        const ec_on_cpu = z.on_cpu.load(.acquire);
-        if (ec_on_cpu) continue;
         const z_top = z.kernel_stack.top.addr;
         const z_base = z.kernel_stack.base.addr;
         const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
         if (standing_on_zombie) continue;
+
+        // Bounded escape from a stranded `on_cpu` (stygia-7jm residual).
+        //
+        // `on_cpu` can be left set forever. `consumePostParkClear` nulls
+        // `post_park_clear_on_cpu` BEFORE its `last_dispatched_core ==
+        // core` guard can decline the clear, so a prev EC that migrated
+        // between the park and the wake loses its clear permanently —
+        // and nothing else writes the flag for an EC that will never be
+        // dispatched again. The zombie then pins this column forever:
+        // the gate below skips it, the column never frees, and the
+        // poster spins in `postZombie` against a core that can never
+        // drain. Observed as a wedged N=10 run with a parked core
+        // holding `pending_zombies=1` and READY ECs — including the
+        // root EC — stranded in its own run_queue.
+        //
+        // When WE are the EC's `last_dispatched_core`, a set `on_cpu` is
+        // provably stale and we may clear it. The flag means "this EC's
+        // kstack is live on its last-dispatched core". We are that core;
+        // we are executing this reaper, not the EC; and the rsp check
+        // above already proved we are not standing on its kstack. So the
+        // kstack is not live here.
+        //
+        // Race-free against a re-dispatch: `postZombie`'s callers run
+        // `bumpDeadGenLocked` first, so `z` is gen-dead by the time it
+        // reaches this column, and `dequeueOrIdleLocked` filters
+        // even-gen / `.exited` ECs. No core can commit to dispatching it
+        // again. The only writer that could re-set `on_cpu` is a
+        // dispatch of `z`, which can no longer happen. We also hold
+        // `core_locks[cid]`, under which this core's own dispatch
+        // commitments are made.
+        //
+        // Deliberately NOT extended to zombies owned by another core:
+        // proving that remotely needs that core's lock, and taking a
+        // second same-class core lock here is an AB-BA against a peer
+        // doing the reverse. Those remain gated on the owner clearing
+        // the flag, exactly as before.
+        if (z.on_cpu.load(.acquire)) {
+            if (z.last_dispatched_core != cid) continue;
+            z.on_cpu.store(false, .release);
+        }
         slots[i] = null;
         return z;
     }
