@@ -107,6 +107,12 @@ pub fn handleTrap(current: *ExecutionContext) void {
 /// there is no live FPU state left worth saving into a dying slab slot,
 /// and turning a teardown race into a kernel panic would be strictly
 /// worse than skipping work that no longer has an owner.
+/// Re-send the cross-core FPU flush IPI every this many failed
+/// completion checks. Only the target core can bump `done_seq`, and a
+/// halted target needs an interrupt to get there, so the request must be
+/// re-armed rather than sent once. See the spin in `migrateFlush`.
+const FLUSH_IPI_RETRY_SPINS: u32 = 1024;
+
 inline fn storedCore(raw: ?u8) ?u8 {
     const c = raw orelse return null;
     if (c >= scheduler.MAX_CORES) return null;
@@ -370,7 +376,26 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // because the lock prevents any later requester from advancing
     // the seq, this is unambiguous.
     //
+    // Re-arm the IPI periodically instead of relying on the single send
+    // above. Only `src_core` can bump `done_seq`, and it only does so
+    // from `drainLocalFlush` — reached via the flush-IPI handler or its
+    // own dispatch path. A core halted in `parkAndAwaitIRQ` does neither
+    // until an interrupt lands, so a single flush IPI that is lost,
+    // coalesced with another pending delivery, or raced against the
+    // target entering its park leaves us spinning here forever against a
+    // core that is never going to move again — while we hold
+    // `request_lock` and (via `switchTo`) run with IRQs masked.
+    //
+    // Structurally the same send-once-then-spin defect as the
+    // `postZombie` loops in execution_context.zig, and it presents
+    // identically: one core live but emitting nothing, another parked
+    // with ready ECs stranded in its own run_queue.
+    var flush_spins: u32 = 0;
     while (slot.done_seq.load(.acquire) != my_seq) {
+        if (flush_spins % FLUSH_IPI_RETRY_SPINS == 0) {
+            arch.cpu.sendFpuFlushIpi(src_core);
+        }
+        flush_spins +%= 1;
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
     }
