@@ -18,6 +18,7 @@ const arch_syscall = stygia.arch.dispatch.syscall;
 const errors = stygia.syscall.errors;
 const sched = stygia.sched.scheduler;
 
+const execution_context = stygia.sched.execution_context;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const PAddr = stygia.memory.address.PAddr;
 const Priority = stygia.sched.execution_context.Priority;
@@ -255,28 +256,77 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
             continue;
         }
 
-        // caller-pinned: the node lives in the waiting EC's
-        // `futex_wait_nodes_storage` array — the EC cannot have been
-        // freed while this node is still in our bucket. The gen-locked
-        // SlabRef is for tooling uniformity and the implicit liveness
-        // assertion.
-        const ec_lr = node.ec.lockIrqSave(@src()) catch continue;
-        const ec = ec_lr.ptr;
-        node.ec.unlockIrqRestore(ec_lr.irq_state);
-
+        // stygia-qbx: the EC behind this node can be destroyed by a
+        // DOMAIN teardown running on another core at any point in this
+        // iteration. The old comment here claimed the node's residence
+        // in our bucket pinned the EC ("cannot have been freed"); that
+        // is not true. `cancelWait` unlinks a victim's nodes under this
+        // same bucket lock, so while we hold it a concurrent teardown
+        // simply BLOCKS — the node stays visible to us — and the gen
+        // has typically already been bumped dead by then. The first
+        // acquire below catches an EC that is already dead; the danger
+        // was everything after the old unconditional unlock.
+        //
+        // Phase 1 — validated, bounded work under the EC's gen lock.
+        // Reads only, plus the bucket-structure unlink that must happen
+        // while we still hold the bucket lock.
+        const scan_lr = node.ec.lockIrqSave(@src()) catch continue;
+        const ec = scan_lr.ptr;
         // wake_index is the offset of this node in the EC's
         // wait_nodes array — the index of the address in the original
         // multi-address wait that matched.
-        const nodes = ec.futex_wait_nodes.?;
+        const nodes = ec.futex_wait_nodes orelse {
+            // Raced a cancel that already cleared the array; the node is
+            // stale. Drop it and move on rather than deref a null.
+            node.ec.unlockIrqRestore(scan_lr.irq_state);
+            continue;
+        };
         const node_idx: usize = (@intFromPtr(node) - @intFromPtr(nodes)) / @sizeOf(WaitNode);
-        ec.futex_wake_index = @intCast(node_idx);
 
         // Drop this EC's other nodes from every bucket they live in
         // (skipping the just-dequeued node and using the held lock
         // for any same-bucket sibling).
         removeNodesExcept(ec, node, wake_idx);
+        node.ec.unlockIrqRestore(scan_lr.irq_state);
 
+        // Phase 2 — the unbounded wait, deliberately OUTSIDE both the
+        // gen lock and any other lock. qbx rejected the obvious "just
+        // hold the gen lock across the whole tail" fix precisely
+        // because it parks an unbounded spin underneath a lock. If the
+        // EC is reaped while we spin, its slab bytes are zeroed, so
+        // this load reads false and we fall through to phase 3, where
+        // the gen check rejects it.
         while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+
+        // Phase 3 — re-validate, then perform EVERY field write under
+        // the gen lock. This is the actual fix: `setSyscallReturn`
+        // writes the EC's saved register frame, so landing it in a slot
+        // that has been freed and recycled corrupts whatever EC owns
+        // that slot now. Kernel-half corruption resumes an EC onto a
+        // wild return address; user-half corruption resumes it with
+        // near-null pointers, which fault as E_PERM/E_NOMEM and — with
+        // no route bound — become the `[NOROUTE]` subcode=1/2 family
+        // that starves the runner.
+        //
+        // On a failed acquire the EC died during phase 2. Its nodes are
+        // already unlinked, so simply skip it: nothing was woken, so it
+        // must not count toward `woken`.
+        const wake_lr = node.ec.lockIrqSave(@src()) catch continue;
+
+        // Claim the wake before touching ANYTHING. This EC's timeout can
+        // be expiring on the timer core at this exact moment, and that
+        // path is a wake source too. Without the claim both of us would
+        // write `.ready` and enqueue, landing two run-queue nodes for one
+        // EC on two different cores — both dispatch, both resume the same
+        // saved frame. The claim also makes the field writes below safe
+        // for a LIVE EC (the gen check above only covers dead ones):
+        // exactly one waker owns them, so nobody can be interleaving a
+        // second `setSyscallReturn` into the same `ec.ctx`.
+        if (!execution_context.tryClaimWake(ec, .futex_wait)) {
+            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            continue;
+        }
+        ec.futex_wake_index = @intCast(node_idx);
         if (ec.futex_deadline_ns != 0) {
             ec.futex_deadline_ns = 0;
             removeTimedWaiter(ec);
@@ -293,8 +343,16 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         ec.futex_bucket_count = 0;
         ec.futex_wait_nodes = null;
         ec.futex_wait_vaddrs = null;
-        ec.state = .ready;
-        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
+        // `state` is already `.ready` — the claim above set it.
+        const dest_core: u8 = @intCast(pickCoreForEc(ec));
+        node.ec.unlockIrqRestore(wake_lr.irq_state);
+
+        // Phase 4 — enqueue OUTSIDE the gen lock. `enqueueOnCore` takes
+        // `core_locks[]`, and nesting that under a gen lock is the
+        // gen-lock→core-lock AB-BA edge qbx flagged. Keeping it out
+        // here means this fix adds no new lock-order edge: the only
+        // nesting is bucket→gen, which the original code already had.
+        sched.enqueueOnCore(dest_core, ec);
         woken += 1;
     }
 
@@ -626,6 +684,15 @@ pub fn expireTimedWaiters() void {
 
         if (removed) {
             while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            // Claim before writing. This is the timer half of the timed
+            // futex wait; `wake()` is the event half and runs on whatever
+            // core signalled. Both used to write `.ready` + enqueue
+            // unconditionally, so a wait satisfied by BOTH its event and
+            // its timeout got queued on two cores and resumed twice off
+            // one saved frame. Losing here is normal and correct: the
+            // event beat us, it owns the wake and the E_TIMEOUT we were
+            // about to stamp would be a lie.
+            if (!execution_context.tryClaimWake(ec, .futex_wait)) continue;
             ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
             // [test 06]: timeout returns E_TIMEOUT in vreg 1. The
@@ -636,7 +703,7 @@ pub fn expireTimedWaiters() void {
             ec.futex_bucket_count = 0;
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
-            ec.state = .ready;
+            // `state` is already `.ready` — the claim above set it.
             sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
         }
     }
