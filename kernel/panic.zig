@@ -117,31 +117,45 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
             }
         }
     }
+    arch.boot.printRaw(" core=0x");
+    printHex(stygia.arch.dispatch.smp.coreID());
     arch.boot.printRaw("\n");
 
-    const first = @returnAddress();
-    var it = std.debug.StackIterator.init(first, null);
+    // Validated frame walk. `std.debug.StackIterator` loads each frame
+    // record with no checks, and panics are exactly where the chain may
+    // be garbage — measured on the Pi 5 rig as a `switch on corrupt
+    // value @ 0x2` panic (ret_addr slot held 2) whose walker then
+    // faulted on the corrupt chain and hit the `panicking` re-entry
+    // guard, eating the entire backtrace. Gate every load on the
+    // address actually resolving, exactly like memory.fault's
+    // dumpFrameChain, and symbolize what survives.
+    var fp: u64 = @frameAddress();
     var frames: u64 = 0;
-
     while (frames < 64) : (frames += 1) {
-        const pc = it.next() orelse break;
+        if (fp == 0 or fp % 16 != 0) break;
+        if (fp < stygia.memory.address.AddrSpacePartition.user.end) break;
+        const page = stygia.memory.address.VAddr.fromInt(
+            std.mem.alignBackward(u64, fp, stygia.memory.paging.PAGE4K),
+        );
+        if (arch.paging.resolveVaddr(stygia.memory.init.kernel_addr_space_root, page) == null) break;
+        const rec: *const [2]u64 = @ptrFromInt(fp);
+        const pc = rec[1];
+        if (pc == 0) break;
 
-        if (debug_info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(pc - debug_info.kaslr_slide);
-            if (sym_name) |sym| {
-                arch.boot.printRaw(sym);
-                arch.boot.printRaw("\n");
-            } else {
-                arch.boot.printRaw("PC: 0x");
-                printHex(pc);
-                arch.boot.printRaw(" (no symbol)\n");
-            }
+        const sym: ?[]const u8 = if (debug_info.global_ptr) |dbg_info|
+            dbg_info.getSymbolName(pc - debug_info.kaslr_slide)
+        else
+            null;
+        if (sym) |s| {
+            arch.boot.printRaw(s);
+            arch.boot.printRaw("\n");
         } else {
             arch.boot.printRaw("PC: 0x");
             printHex(pc);
             arch.boot.printRaw(" (no symbol)\n");
         }
-        if (pc == 0) break;
+        if (rec[0] <= fp) break;
+        fp = rec[0];
     }
 
     ctx_trace.dumpAllRingsToSerial();
