@@ -86,8 +86,35 @@ pub fn handleTrap(current: *ExecutionContext) void {
 /// on the named core (either `terminate` is from another core, or
 /// the EC is parked / .exited), and (b) FPU traps on the named core
 /// for a different EC would re-evict and clear the slot anyway.
+/// Validate a core id that was read back out of an EC field rather than
+/// derived from `coreID()` on the core we are currently running on.
+///
+/// `ec.last_fpu_core` is only ever written as `@truncate(coreID())` (see
+/// `fpuSwap`) or cleared to null, so by construction it is always either
+/// null or a live core index. A value outside `[0, MAX_CORES)` therefore
+/// means we observed the slab slot mid-recycle — the EC is being torn
+/// down under us and the byte we read is not a core id at all. 0xFF is
+/// the value that shows up in practice, matching both
+/// `LAST_DISPATCHED_NEVER` and a never-written byte.
+///
+/// Unchecked, that escapes straight into `flush_slot_state[]` /
+/// `core_states[]` as a wild subscript:
+///   `KERNEL PANIC: index out of bounds: index 255, len 64 @ drainLocalFlush`
+///
+/// Gate it where the stored value is read, not at each subscript. The
+/// deliberate tradeoff: we return null (skip the flush) rather than
+/// assert, because the EC this refers to is already being destroyed —
+/// there is no live FPU state left worth saving into a dying slab slot,
+/// and turning a teardown race into a kernel panic would be strictly
+/// worse than skipping work that no longer has an owner.
+inline fn storedCore(raw: ?u8) ?u8 {
+    const c = raw orelse return null;
+    if (c >= scheduler.MAX_CORES) return null;
+    return c;
+}
+
 pub fn clearFromLastFpuOwner(ec: *ExecutionContext) void {
-    const core = ec.last_fpu_core orelse return;
+    const core = storedCore(ec.last_fpu_core) orelse return;
     const per_core = &scheduler.core_states[core];
     if (per_core.last_fpu_owner) |ref| {
         if (ref.ptr == ec) per_core.last_fpu_owner = null;
@@ -300,7 +327,10 @@ pub fn flushIpiHandler(_: *ExecutionContext) void {
 ///   * deadlock freedom under arbitrary cycles of mutual flushes
 ///     (each spinning core cooperatively services its own mailbox).
 pub fn migrateFlush(ec: *ExecutionContext) void {
-    const src_core = ec.last_fpu_core orelse return;
+    // `storedCore` gate: `last_fpu_core` came out of a slab slot that a
+    // concurrent teardown may be recycling. See its doc for why an
+    // out-of-range value is skipped rather than asserted.
+    const src_core = storedCore(ec.last_fpu_core) orelse return;
     const cur_core: u8 = @truncate(arch.smp.coreID());
     if (src_core == cur_core) return;
 
@@ -339,6 +369,7 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // receiver path bumps done_seq to my_seq (see drainLocalFlush);
     // because the lock prevents any later requester from advancing
     // the seq, this is unambiguous.
+    //
     while (slot.done_seq.load(.acquire) != my_seq) {
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
