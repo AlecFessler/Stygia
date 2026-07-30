@@ -137,7 +137,11 @@ pub fn emulatePortIoFault(
         else
             memory_fault_invalid_read;
         port.fireMemoryFault(ec, subcode, fault_vaddr.addr);
-        cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // event may have suspended the EC with its kstack release
+        // stashed on this core; an IRQ handler here could spin on
+        // that very release (markReady's kstack barrier) — a
+        // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireMemoryFault`'s no-route fallback (`parkSelfFaulted`)
         // clears the local core's `current_ec`. If the run queue is
@@ -146,7 +150,7 @@ pub fn emulatePortIoFault(
         // (noreturn) — it idles until an IRQ delivers more work, at
         // which point dispatch via `loadEcContextAndReturn` resets
         // `rsp` and abandons this kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         return 0;
     }
 
@@ -182,9 +186,13 @@ pub fn emulatePortIoFault(
 /// Spec §[port_io_virtualization] tests 09-11.
 fn failProtection(ec: *ExecutionContext, rip: u64) i64 {
     port.fireThreadFault(ec, thread_fault_protection, rip);
-    cpu.enableInterrupts();
+    // IRQs stay MASKED through the dispatch attempt: the fired
+    // event may have suspended the EC with its kstack release
+    // stashed on this core; an IRQ handler here could spin on
+    // that very release (markReady's kstack barrier) — a
+    // self-deadlock on our own pending stash.
     scheduler.yieldTo(null);
-    if (scheduler.currentEc() == null) scheduler.run();
+    if (scheduler.currentEc() == null) scheduler.hopParkRun();
     return 0;
 }
 

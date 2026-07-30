@@ -701,3 +701,32 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         : .{ .memory = true });
     unreachable;
 }
+
+/// Abandon the current kernel stack: swap SP to `new_top`, publish the
+/// old stack's release by storing 0 to `release_byte` (store-release,
+/// pairing with the `.acquire` loads in the wake-side `on_cpu` spins),
+/// then tail-branch to `entry(arg)`. The store happens AFTER the SP
+/// swap — from that instruction on this core never touches the old
+/// stack again, which is the only point at which "may another core
+/// reuse that kstack" may be published. `release_byte` must always be
+/// valid; callers with nothing to release pass a dummy. noreturn: the
+/// caller's frames are abandoned and `entry` must never return.
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    asm volatile (
+        \\mov sp, %[top]
+        \\stlrb wzr, [%[rel]]
+        \\mov x0, %[arg]
+        \\br %[entry]
+        :
+        : [top] "r" (new_top),
+          [rel] "r" (release_byte),
+          [arg] "r" (arg),
+          [entry] "r" (entry),
+        : .{ .memory = true });
+    unreachable;
+}

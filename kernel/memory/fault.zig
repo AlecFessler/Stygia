@@ -280,7 +280,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // memory remain set — that is a separate (pre-existing) leak.
         sync_debug.dropAllHeldOnAbandonedStack();
         port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireMemoryFault`'s no-route fallback terminates `ec` and
         // clears `current_ec`; if the run queue is empty, returning
@@ -290,7 +294,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // more work, at which point dispatch via
         // `loadEcContextAndReturn` resets `rsp` and abandons this
         // kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         return;
     }
 
@@ -367,12 +371,16 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // See the kernel-on-user-VA branch above: the no-route fallback
         // drains `current_ec`; if no other EC is ready we MUST not iretq
         // back to the stale faulting frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         return;
     };
     const dom = dom_lr.ptr;
@@ -401,9 +409,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         else
             accessSubcode(is_write, is_exec);
         port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // Same rationale as the kernel-on-user-VA branch.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
     }
 }

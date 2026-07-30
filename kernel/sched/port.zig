@@ -595,7 +595,15 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     caller.pending_reply_holder = null;
     caller.pending_reply_domain = null;
     caller.pending_reply_slot = 0;
-    caller.on_cpu.store(false, .release);
+    // Deliberately NO `on_cpu` clear here. The caller keeps executing
+    // on this very kstack all the way through the syscall epilogue and
+    // into the scheduler (`hopParkRun`); clearing `on_cpu` now lets a
+    // sender's wake pass its release spin, enqueue the caller, and
+    // dispatch it on another core — which then builds fresh kernel
+    // frames down this kstack while we are still running on it (the
+    // "Kernel stack overflow" frame-stomp autopsy). The release is
+    // stashed below and published by the park-kstack hop, the first
+    // instruction after which this core no longer touches the kstack.
 
     // Timed recv — register before dropping the port lock so the wakeup
     // path can find us. Spec §[port].recv test 14.
@@ -610,6 +618,13 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (scheduler.coreCurrentIs(core_id, caller)) {
         scheduler.clearCurrentEc(core_id);
+        // Defer the `on_cpu` release to the park-kstack hop — see the
+        // comment at the `.suspended_on_port` transition above.
+        scheduler.stashKstackRelease(core_id, caller);
+    } else {
+        // Not this core's current EC (fast-path fallback shapes) — the
+        // kstack is not ours, release immediately as before.
+        caller.on_cpu.store(false, .release);
     }
     return 0;
 }

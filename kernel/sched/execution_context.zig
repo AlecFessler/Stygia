@@ -750,8 +750,16 @@ pub fn parkIdleWait(ec: *ExecutionContext) void {
         // the lifecycle and our park would corrupt their queueing.
         if (ec.state == .running) {
             ec.state = .idle_wait;
-            ec.on_cpu.store(false, .release);
         }
+        // Regardless of who won the state race, THIS core trapped out
+        // of `ec` and its hlt/wfi handler is still executing on `ec`'s
+        // kstack all the way into the scheduler — defer the on_cpu
+        // release to the park-kstack hop so a (racing or later)
+        // suspend-then-resume cannot dispatch `ec` onto the kstack we
+        // are standing on. See PerCore.pending_kstack_release. (The
+        // remote-suspend winner deliberately leaves on_cpu alone — the
+        // release is ours either way.)
+        scheduler.stashKstackRelease(core_id, ec);
     } else |_| {
         // Slab gen flipped — EC was destroyed mid-trap. Nothing to do;
         // the trampoline will ERET into a freed slot, but the next
@@ -1558,7 +1566,16 @@ pub fn suspendOnPort(
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = originating_write_cap;
     ec.originating_read_cap = originating_read_cap;
-    ec.on_cpu.store(false, .release);
+    // `on_cpu` handling is split by locality below (after the
+    // rendezvous decision): when `ec` is THIS core's current EC we are
+    // still executing on its kstack and must defer the release to the
+    // park-kstack hop (PerCore.pending_kstack_release) — clearing it
+    // here would let a resume enqueue+dispatch `ec` on another core
+    // that then reuses this very kstack under our feet. When `ec` is
+    // remote or queued, its previous core owns the release: touching
+    // the flag from here would fake "kstack free" for an EC that may
+    // still be running user code on its core (the remote-suspend
+    // two-cores-one-frame hole).
 
     // Rendezvous with a waiting receiver if one is parked. Spec
     // §[recv]/§[suspend]: a send-side rendezvous must wake the
@@ -1575,6 +1592,7 @@ pub fn suspendOnPort(
             const core_id: u8 = @truncate(arch.smp.coreID());
             if (scheduler.coreCurrentIs(core_id, ec)) {
                 scheduler.clearCurrentEc(core_id);
+                scheduler.stashKstackRelease(core_id, ec);
             }
             return 0;
         }
@@ -1587,10 +1605,13 @@ pub fn suspendOnPort(
     if (port.waiter_kind == .none) port.waiter_kind = .senders;
 
     // Drop currency on the local core if `ec` is the running EC; the
-    // caller's syscall return path will dispatch the next EC.
+    // caller's syscall return path will dispatch the next EC. The
+    // kstack release rides the same locality decision — see the
+    // comment above the rendezvous branch.
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (scheduler.coreCurrentIs(core_id, ec)) {
         scheduler.clearCurrentEc(core_id);
+        scheduler.stashKstackRelease(core_id, ec);
     }
     port._gen_lock.unlockIrqRestore(irq_state);
     return 0;

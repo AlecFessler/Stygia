@@ -222,6 +222,27 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
     }
 }
 
+/// Abandon the current kernel stack: swap rsp/sp to `new_top`, store 0
+/// to `release_byte` immediately AFTER the swap (the earliest instant
+/// at which this core provably no longer touches the old stack;
+/// store-release pairing with the wake-side `on_cpu` `.acquire` spins),
+/// then tail-call `entry(arg)`, which must never return. Used by the
+/// scheduler to leave a claimable EC's kstack before publishing that
+/// its kstack is reusable — see `sched.scheduler` kstack-release
+/// protocol (`PerCore.pending_kstack_release`).
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.hopToStackAndCall(new_top, release_byte, entry, arg),
+        .aarch64 => aarch64.cpu.hopToStackAndCall(new_top, release_byte, entry, arg),
+        else => unreachable,
+    }
+}
+
 /// Send a kprof-dump IPI to every core except the caller. Invoked by
 /// the dumping core inside `kprof.dump.end()` to quiesce every other
 /// CPU before serial-dumping. Per-arch backend resolves the IPI vector
