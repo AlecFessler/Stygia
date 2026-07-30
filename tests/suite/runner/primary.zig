@@ -16,14 +16,19 @@
 //     index, so a final pass over the manifest joins names with
 //     results without depending on completion order.
 //
+//   - Tests are pinned round-robin across cores via
+//     `create_capability_domain` `[5] initial_ec_affinity` (see
+//     `-Dspread_cores`). Passing 0 there — "kernel picks any core" —
+//     had the kernel resolve it to the runner's own core and never
+//     migrate, so the whole suite ran single-core (stygia-yxj).
+//
 // Future work (per task brief, deferred for the v3 lockdep cycle and
 // build-budget reasons):
-//   - Per-core EC + per-core port. Each per-core EC pinned via
-//     affinity, owning a port; tests spawned with affinity locked to
-//     a specific core's EC so result delivery hits the IPC fast path.
-//     The spec extension for `create_capability_domain` `[5]
-//     initial_ec_affinity` (added in this commit) is the substrate
-//     this design needs.
+//   - Per-core *port*, and a per-core runner EC that owns it, so
+//     result delivery hits the IPC fast path instead of every child
+//     on every core contending for the one shared result port. The
+//     affinity pinning above is half of that design; the port
+//     sharding is the half still outstanding.
 
 const std = @import("std");
 
@@ -219,6 +224,27 @@ pub fn main(cap_table_base: u64) void {
     // now announces, so a re-run should say directly whether that is
     // what happens.
     const BATCH: usize = embedded_tests.batch;
+
+    // Cores to spread test domains over; see `-Dspread_cores`.
+    //
+    // `info_system`'s `[1] cores` is "total online CPU core count"
+    // (spec §[system_info]) — the same number `create_capability_domain`
+    // [5] validates an affinity mask against, so a mask built from it
+    // can never trip that E_INVAL gate. Clamped to 64 because the mask
+    // is 64 bits wide, and floored at 1 so a platform reporting 0 (or
+    // `-Dspread_cores=false`) degrades to the historical single-core
+    // behaviour instead of producing an all-zero mask that would mean
+    // something else entirely.
+    const spread_cores: u64 = blk: {
+        if (!embedded_tests.spread_cores) break :blk 1;
+        const reported = syscall.infoSystem().v1;
+        if (reported == 0) break :blk 1;
+        break :blk @min(reported, 64);
+    };
+    serial.print("[runner] spreading tests over ");
+    serial.printU64(spread_cores);
+    serial.print(" core(s)\n");
+
     // Aggregate counters across all repeats — used by the final
     // multi-run summary at end. Per-run summaries print after each.
     var agg_pass: usize = 0;
@@ -252,7 +278,13 @@ pub fn main(cap_table_base: u64) void {
         var batch_started: usize = 0;
         var i = batch_idx;
         while (i < batch_end) : (i += 1) {
-            if (spawnOne(embedded_tests.manifest[i], port_handle)) {
+            // Round-robin on the *manifest* index, not the in-batch
+            // index, so the spread stays even across batch boundaries
+            // (BATCH is 16 and cores is typically 4, so both would work
+            // here — but only the manifest index survives a -Dbatch
+            // change that is not a multiple of the core count).
+            const affinity: u64 = @as(u64, 1) << @truncate(i % spread_cores);
+            if (spawnOne(embedded_tests.manifest[i], port_handle, affinity)) {
                 successful_spawns += 1;
                 batch_started += 1;
             }
@@ -468,7 +500,7 @@ pub fn main(cap_table_base: u64) void {
 // port. Returns true on success, false if create_capability_domain
 // reported an error in vreg 1 — the caller skips queueing a recv for
 // failed spawns so the recv loop's iteration count stays accurate.
-fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
+fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u64) bool {
     const pf_handle = stageElfIntoPageFrame(entry.bytes);
 
     // Grant the child:
@@ -626,16 +658,23 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId) bool {
     };
     const self_caps: u64 = @as(u64, child_self.toU16());
 
-    // Spec §[create_capability_domain] [5] initial_ec_affinity = 0
-    // (any core). The per-core-EC fast-path design (TODO above)
-    // would set this to a single-core mask matching the spawning
-    // EC's affinity.
+    // Spec §[create_capability_domain] [5] initial_ec_affinity — a
+    // single-core mask under `-Dspread_cores` (the default), else 1,
+    // which pins everything to core 0. Never 0: the kernel resolves
+    // "any core" to the caller's core and then never migrates the EC,
+    // so 0 silently meant "the runner's core, forever" (stygia-yxj).
+    //
+    // Worker ECs the tests create for themselves still pass affinity 0
+    // and so land on their parent test's core. That is deliberate —
+    // intra-test locality with inter-test spread — and it leaves the
+    // priority/starvation tests, which need contender and worker
+    // sharing a run queue, behaving exactly as before.
     const r = syscall.createCapabilityDomain(
         self_caps,
         ceilings_inner,
         ceilings_outer,
         pf_handle,
-        0,
+        affinity,
         passed[0..],
     );
 

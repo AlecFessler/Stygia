@@ -824,6 +824,36 @@ pub fn build(b: *std.Build) void {
     ) orelse 16;
     if (batch == 0) @panic("-Dbatch must be >= 1");
 
+    // Spread test domains across cores instead of letting them all pile
+    // onto the runner's core.
+    //
+    // The runner used to pass `initial_ec_affinity = 0` ("kernel picks
+    // any core") for every test domain. The kernel resolves 0 to *the
+    // calling core*, and nothing ever moves an affinity-0 EC afterwards
+    // — no work stealing, no pull path, and the preemption re-enqueue
+    // re-picks the current core. The runner is a single EC, so "the
+    // calling core" was always the same core and the entire 485-test
+    // suite executed on one core while the rest idled
+    // (docs/kernel/open-design-questions.md §2, stygia-yxj).
+    //
+    // With this on, test N is pinned to core `N % cores` via a
+    // single-bit mask, which the kernel honours on every enqueue *and*
+    // every wake (`pickCoreForAffinity` returns `@ctz(mask)` for a
+    // non-zero mask). Deterministic placement rather than
+    // load-dependent, which is what a stability rig wants: a failure
+    // reproduces on the same core on the next boot.
+    //
+    // This sidesteps rather than fixes stygia-yxj — the kernel's
+    // affinity-0 policy is unchanged, and picking among its three
+    // candidate shapes is still an open design decision. Set
+    // `-Dspread_cores=false` to A/B against the historical single-core
+    // behaviour without editing code.
+    const spread_cores = b.option(
+        bool,
+        "spread_cores",
+        "Pin test domain N to core N % cores instead of spawning every test with affinity 0, which the kernel resolves to the runner's core (default true)",
+    ) orelse true;
+
     // Build the filtered list of test entries up front. The same
     // selection drives both per-test ELF builds and the manifest the
     // primary runner iterates.
@@ -1100,6 +1130,11 @@ pub fn build(b: *std.Build) void {
     manifest.writer().print(
         "pub const batch: u32 = {d};\n",
         .{batch},
+    ) catch unreachable;
+    // Comptime per-core spread flag; see the -Dspread_cores option.
+    manifest.writer().print(
+        "pub const spread_cores: bool = {};\n",
+        .{spread_cores},
     ) catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 

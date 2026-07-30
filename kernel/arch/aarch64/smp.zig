@@ -49,6 +49,7 @@ const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 const power = stygia.arch.aarch64.power;
 const sched = stygia.sched.scheduler;
+const serial = stygia.arch.aarch64.serial;
 const stack_mod = stygia.memory.stack;
 
 // Type aliases — alphabetical
@@ -56,17 +57,6 @@ const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
 const PageEntry = aarch64_paging.PageEntry;
 const VAddr = stygia.memory.address.VAddr;
-
-/// Maximum number of cores supported.
-const MAX_CORES: usize = 256;
-
-/// MPIDR affinity values for each core, indexed by logical core ID.
-/// Populated by ACPI MADT parsing (GIC CPU Interface structures, ACPI 6.5 Table 5-45).
-/// Entry 0 is the BSP; entries 1..N-1 are secondary cores.
-var mpidr_table: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
-
-/// Whether each MPIDR entry has been set by ACPI parsing.
-var mpidr_valid: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
 
 /// Number of secondary cores successfully brought online.
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
@@ -95,27 +85,21 @@ const SecondaryBootParams = extern struct {
 var boot_params_storage: SecondaryBootParams align(64) = std.mem.zeroes(SecondaryBootParams);
 var boot_params_pa: u64 = 0;
 
-/// Store the MPIDR affinity value for a core. Called by ACPI MADT parsing
-/// when processing GIC CPU Interface structures (ACPI 6.5, Table 5-45).
+/// Get the MPIDR affinity value to hand PSCI CPU_ON for a core index.
 ///
-/// The MPIDR value contains the affinity fields (Aff3:Aff2:Aff1:Aff0) that
-/// uniquely identify the core for PSCI CPU_ON calls.
-pub fn setMpidr(core_idx: usize, mpidr: u64) void {
-    if (core_idx >= MAX_CORES) return;
-    mpidr_table[core_idx] = mpidr;
-    mpidr_valid[core_idx] = true;
-}
-
-/// Get the MPIDR for a core index. Returns null if not set by ACPI.
-/// Falls back to flat topology derivation (Aff0 = core_idx) if ACPI
-/// did not populate the table.
+/// The table is owned by `gic`, because the logical index it defines is
+/// simultaneously the GIC CPU interface number (see `gic.setMpidr`), and is
+/// populated by whichever firmware parser ran — MADT GIC CPU Interface
+/// structures (ACPI 6.5, Table 5-45) or the devicetree's `/cpus`.
+///
+/// Falls back to flat topology derivation (Aff0 = core_idx) when firmware
+/// described no such core. That is right for simple platforms where the
+/// two coincide (QEMU virt) and wrong for hardware that numbers cores
+/// outside Aff0 — but on such hardware `gic.coreCount()` is itself derived
+/// from the table, so the loop in `smpInitFull` never reaches an index the
+/// table does not cover.
 fn getMpidr(core_idx: usize) u64 {
-    if (core_idx >= MAX_CORES) return core_idx;
-    if (mpidr_valid[core_idx]) return mpidr_table[core_idx];
-    // Fallback: flat topology where MPIDR Aff0 = core index.
-    // This works for simple platforms (e.g., QEMU virt) but not
-    // for real hardware with multi-cluster topologies.
-    return core_idx;
+    return gic.mpidrFor(core_idx) orelse core_idx;
 }
 
 // ── System register readers ─────────────────────────────────────────────
@@ -278,12 +262,18 @@ fn smpInitFull() !void {
     const entry_page_paddr = aarch64_paging.resolveVaddr(
         memory_init.kernel_addr_space_root,
         VAddr.fromInt(entry_vaddr),
-    ) orelse return;
+    ) orelse {
+        serial.print("[smp] cannot resolve secondaryEntry VA {x} to a PA\n", .{entry_vaddr});
+        return;
+    };
     const entry_paddr = entry_page_paddr.addr | (entry_vaddr & 0xFFF);
 
     // Create a minimal identity mapping so the trampoline can still execute
     // after enabling the MMU (TTBR0 maps the trampoline PA as VA == PA).
-    const idmap_ttbr0 = createIdentityMapping(entry_paddr) catch return;
+    const idmap_ttbr0 = createIdentityMapping(entry_paddr) catch {
+        serial.print("[smp] identity mapping for trampoline PA {x} failed\n", .{entry_paddr});
+        return;
+    };
 
     // Resolve the PA of the static boot params struct by walking the
     // kernel page tables. This avoids relying on physmap VA→PA arithmetic
@@ -297,23 +287,42 @@ fn smpInitFull() !void {
 
     // Capture BSP system register state for secondaries.
     //
-    // The TTBR1 page-table hierarchy lives in kernel memory and has been
-    // touched by the BSP under its live MMU with TCR walker attrs
-    // IRGN1/ORGN1 = Normal WB cacheable. Those dirty lines sit in the
-    // BSP's caches and are *not* guaranteed to be visible to a freshly
-    // powered secondary whose HW table walker does a cached fetch —
-    // especially on TCG, which models inner-shareable snoop only
-    // loosely. Force the secondary's walker to bypass caches entirely
-    // by clearing IRGN1/ORGN1/IRGN0/ORGN0 and SH0/SH1 so the tables are
-    // read directly from the PoC. The TCR the BSP keeps running under
-    // is unchanged. ARM ARM D13.2.131 — TCR_EL1.{IRGN,ORGN,SH}.
+    // The AP gets the BSP's TCR **verbatim**, walker attributes included.
+    //
+    // This used to strip IRGN/ORGN/SH so the AP's table walker bypassed
+    // caches and read "directly from the PoC", on the reasoning that the
+    // BSP's page-table writes sit dirty in its caches and a cached walk
+    // might not see them. That reasoning is inverted: if the lines are
+    // dirty in the BSP's cache then the PoC holds the STALE copy, and a
+    // non-cacheable read is the one access that cannot snoop. A
+    // cacheable Inner-Shareable walk is precisely what does snoop, and
+    // matching the walker to the memory the tables actually live in
+    // (Normal WB, Inner Shareable) is also what avoids a mismatched-
+    // attribute alias. `secondarySetup` already said as much from the
+    // other side — it calls `restoreWalkAttrs` first thing because NC
+    // walk attrs are "fatal under any walker that honors NC".
+    //
+    // It survived because every rig it ran on hid the difference. Under
+    // AAVMF, `attr_indx=1` resolves to Normal *Non-Cacheable* (see
+    // dispatch/cpu.zig `switchStackAndCall`), so PoC and cache were the
+    // same place; under TCG there are no caches to be incoherent with.
+    // The bare-metal Pi 5 is the first configuration with genuinely
+    // cacheable kernel memory, and there it is fatal in a way that
+    // leaves no evidence: the loader cleans the kernel image to PoC when
+    // it loads it, so `secondaryEntry` and `secondarySetup` both resolve
+    // — but the AP's own kernel stack was mapped by `mapPage` at
+    // runtime, long after, and that PTE is still only in the BSP's
+    // cache. The NC walker reads a stale descriptor for it, so the AP
+    // faults on its first stack access, inside the prologue of the very
+    // function that would have repaired the attributes, with VBAR_EL1
+    // installed but no usable stack to take the exception on. Observed
+    // as three consecutive "CPU_ON accepted but core never signalled
+    // online" and nothing else.
+    //
+    // ARM ARM D13.2.131 — TCR_EL1.{IRGN,ORGN,SH}.
     boot_params_storage.ttbr0 = idmap_ttbr0;
     boot_params_storage.ttbr1 = aarch64_paging.readTtbr1();
-    var tcr_for_ap: u64 = readTcr();
-    // IRGN0/ORGN0/SH0 at bits [13:8], IRGN1/ORGN1/SH1 at bits [29:24].
-    tcr_for_ap &= ~@as(u64, (0x3F << 8) | (0x3F << 24));
-    // Leave SH=0 (non-shareable), IRGN/ORGN=0b00 (Normal NC).
-    boot_params_storage.tcr = tcr_for_ap;
+    boot_params_storage.tcr = readTcr();
     boot_params_storage.mair = readMair();
     boot_params_storage.sctlr = readSctlr();
     boot_params_storage.entry = @intFromPtr(&secondarySetup);
@@ -341,6 +350,7 @@ fn smpInitFull() !void {
 
         // Allocate a kernel stack for this secondary core.
         const ap_stack = stack_mod.createKernel() catch {
+            serial.print("[smp] core {d}: no kernel stack\n", .{core_idx});
             core_idx += 1;
             continue;
         };
@@ -363,6 +373,7 @@ fn smpInitFull() !void {
         }
 
         if (!map_ok) {
+            serial.print("[smp] core {d}: kernel stack mapping failed\n", .{core_idx});
             stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
             core_idx += 1;
             continue;
@@ -395,6 +406,19 @@ fn smpInitFull() !void {
 
         if (ret != 0) {
             // CPU_ON failed — clean up the stack.
+            //
+            // Worth a line rather than a silent skip: `gic.coreCount()` is
+            // NOT reduced when a core fails to start, so userspace can still
+            // set an affinity mask naming it (the syscall gate is
+            // `core_id < coreCount()`). An EC pinned to a core that never
+            // came up is simply never dispatched, which surfaces as a test
+            // MISS with no other evidence anywhere. DEN0022D Table 10:
+            // -1 NOT_SUPPORTED, -2 INVALID_PARAMETERS, -4 ALREADY_ON,
+            // -5 ON_PENDING, -9 INTERNAL_FAILURE.
+            serial.print(
+                "[smp] core {d} (mpidr {x}): PSCI CPU_ON failed, ret {d}\n",
+                .{ core_idx, target_mpidr, ret },
+            );
             stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
             core_idx += 1;
             continue;
@@ -424,17 +448,46 @@ fn smpInitFull() !void {
         // PSCI CPU_ON latency.
         var spin_count: u64 = 0;
         const max_spins: u64 = 50_000_000;
+        var came_up = true;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
-                stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+                // Same reasoning as the CPU_ON failure above, and a
+                // strictly worse state: firmware ACCEPTED the request, so
+                // the core is somewhere between the trampoline's first
+                // instruction and `gic.initSecondaryCoreGic`.
+                //
+                // Deliberately LEAK the stack instead of reclaiming it.
+                // A core that has not signalled yet may still arrive —
+                // measured on the bare-metal Pi 5, where all three APs
+                // timed out here and then faulted their way into the log
+                // hundreds of batches later, two of them concurrently.
+                // `destroyKernel` unmaps the kstack, so reclaiming it
+                // turns "AP is late" into a use-after-free on whatever
+                // next owns those pages, on a core the BSP has stopped
+                // accounting for. Three kstacks is a bounded, one-time
+                // cost paid only on a bring-up failure that has already
+                // gone wrong.
+                serial.print(
+                    "[smp] core {d} (mpidr {x}): CPU_ON accepted but core never signalled online" ++
+                        " (kstack leaked; it may still arrive)\n",
+                    .{ core_idx, target_mpidr },
+                );
+                came_up = false;
                 break;
             }
             std.atomic.spinLoopHint();
             spin_count += 1;
         }
+        if (came_up) {
+            serial.print("[smp] core {d} (mpidr {x}) online\n", .{ core_idx, target_mpidr });
+        }
 
         core_idx += 1;
     }
+    serial.print(
+        "[smp] {d} of {d} core(s) online\n",
+        .{ cores_online.load(.acquire), core_count },
+    );
 }
 
 /// Secondary core MMU-enable trampoline (naked).
@@ -587,20 +640,20 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
 /// Secondary core setup after MMU is enabled and stack is established.
 /// Called from secondaryEntry with core_idx in x0, running at kernel VA.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
-    // FIRST: restore the canonical WB-WA / Inner-Shareable table-walk
-    // attributes this core's trampoline deliberately booted without
-    // (see the `tcr_for_ap` strip above). The MMU and caches are on
-    // now, so cacheable walks are safe — and leaving the NC walk
-    // attributes permanent is fatal under any walker that honors
-    // NC and so reads page tables straight from DRAM while PTE
-    // writes sit dirty in the data cache (stygia-rs6 mechanism 10:
-    // deterministic eternal translation-fault loops on valid tables,
-    // caught live on a Pi 5 under a KVM-6.6 host kernel; the same
-    // silicon under KVM 6.12, TCG, and x86 walkers all tolerated it,
-    // but nothing obliges a walker to snoop). Everything after this point — GIC
-    // init allocations, scheduler per-core state, demand-mapped
-    // kstacks — depends on this core seeing PTE stores made by any
-    // core, including itself.
+    // Assert the canonical WB-WA / Inner-Shareable table-walk attributes.
+    //
+    // Idempotent now: the trampoline hands over the BSP's TCR verbatim,
+    // which already has them (see the walker-attribute note in
+    // `smpInitFull`). Kept because it is cheap and because the thing it
+    // guarantees is load-bearing for everything below — GIC init
+    // allocations, scheduler per-core state, demand-mapped kstacks all
+    // depend on this core seeing PTE stores made by any core, including
+    // itself. A walker that honors NC reads page tables straight from
+    // DRAM while PTE writes sit dirty in the data cache, which is
+    // stygia-rs6 mechanism 10: deterministic eternal translation-fault
+    // loops on valid tables, caught live on a Pi 5 under a KVM-6.6 host
+    // kernel. The same silicon under KVM 6.12, TCG, and x86 walkers all
+    // tolerated it, but nothing obliges a walker to snoop.
     aarch64_paging.restoreWalkAttrs();
 
     // Initialize the GIC redistributor and CPU interface for this core.

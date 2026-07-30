@@ -250,6 +250,33 @@ var redist_count: u64 = 0;
 /// fallback when the discovery struct left this zero.
 var core_count: u64 = 0;
 
+/// The affinity bits of MPIDR_EL1: Aff0 [7:0], Aff1 [15:8], Aff2 [23:16],
+/// Aff3 [39:32]. Every other populated bit — MT [24], U [30], RES1 [31] —
+/// describes properties of the PE rather than naming it, and differs
+/// between what firmware *describes* and what hardware *reports*. On
+/// BCM2712, `/cpus` gives `reg = <0x0>` for the boot core while its
+/// MPIDR_EL1 reads 0x81000000 (RES1 | MT). Comparing unmasked values
+/// would match nothing.
+///
+/// ARM ARM D13.2.83: MPIDR_EL1.
+const mpidr_affinity_mask: u64 = 0xFF_00FF_FFFF;
+
+/// MPIDR affinity value of each core, indexed by logical core ID, and the
+/// number of populated leading entries.
+///
+/// Filled in discovery order — ACPI MADT GIC CPU Interface structures
+/// (ACPI 6.5, Table 5-45) or the devicetree's `/cpus` `reg` properties —
+/// so entry 0 is the BSP and entry N is what PSCI CPU_ON must be handed to
+/// start logical core N.
+///
+/// This is the GIC's table rather than `smp`'s because the logical index it
+/// defines is a *GIC* numbering: on GICv2 it is the CPU interface number
+/// that `GICD_SGIR.CPUTargetList` and `GICD_ITARGETSR` address, and on
+/// GICv3 it is what `ICC_SGI1R_EL1`'s affinity fields must be derived from.
+/// `smp` consumes it for CPU_ON; nothing else may reorder it.
+var mpidr_table: [max_redist]u64 = [_]u64{0} ** max_redist;
+var mpidr_count: usize = 0;
+
 /// ACPI-discovered GIC topology passed from the MADT parser to `init()`.
 ///
 /// Replaces the earlier implicit contract where `parseMadt` mutated
@@ -780,15 +807,52 @@ pub fn coreCount() u64 {
     return if (core_count == 0) 1 else core_count;
 }
 
-/// Return the current core's logical ID derived from MPIDR_EL1.
+/// Record the MPIDR affinity value of logical core `core_idx`.
 ///
-/// Uses Aff0 [7:0] for flat topology (single cluster). For multi-cluster
-/// systems, this should be extended to incorporate Aff1/Aff2/Aff3.
+/// Called once per described core, in discovery order, by whichever
+/// firmware parser is in play: `acpi.parseMadt` for GIC CPU Interface
+/// structures, `dt_discovery.discoverCpus` for `/cpus`. Must complete
+/// before `init` so `coreID()` stops falling back to Aff0.
+pub fn setMpidr(core_idx: usize, mpidr: u64) void {
+    if (core_idx >= max_redist) return;
+    mpidr_table[core_idx] = mpidr & mpidr_affinity_mask;
+    if (core_idx + 1 > mpidr_count) mpidr_count = core_idx + 1;
+}
+
+/// MPIDR affinity value to hand PSCI CPU_ON for logical core `core_idx`,
+/// or null when firmware described no such core.
+pub fn mpidrFor(core_idx: usize) ?u64 {
+    if (core_idx >= mpidr_count) return null;
+    return mpidr_table[core_idx];
+}
+
+/// Return the current core's logical ID: its index in the MPIDR table
+/// firmware described, which is also its GIC CPU interface number.
+///
+/// Deriving this by masking Aff0 — as this did until the kernel met
+/// hardware that numbers cores anywhere else — is only correct when every
+/// core differs in Aff0. BCM2712 numbers its four Cortex-A76s in **Aff1**
+/// (`/cpus` `reg` = 0x0, 0x100, 0x200, 0x300), so all four report
+/// `Aff0 == 0` and an Aff0-derived ID collapses them onto logical core 0.
+/// Every per-core array the kernel keeps — `gicv2_last_iar`, scheduler
+/// core state, the PMU's per-core context — would then be shared by four
+/// cores that each believed they were the BSP, so `dt_discovery` had to
+/// pin `core_count = 1` to stay correct. A reverse lookup removes that
+/// restriction and costs a handful of compares against a table whose
+/// length is the core count.
+///
+/// The Aff0 fallback survives for the window before any firmware parser
+/// has run (`hyp.init` and the exception vectors both call this), where it
+/// is the only thing available and correctly reports 0 on the BSP.
 ///
 /// ARM ARM D13.2.83: MPIDR_EL1.
 pub fn coreID() u64 {
-    const mpidr = readMpidr();
-    return mpidr & 0xFF; // Aff0.
+    const aff = readMpidr() & mpidr_affinity_mask;
+    var i: usize = 0;
+    while (i < mpidr_count) : (i += 1) {
+        if (mpidr_table[i] == aff) return i;
+    }
+    return aff & 0xFF; // Aff0.
 }
 
 /// Last GICv2 IAR value read on this core, saved for EOI. On GICv2, EOI

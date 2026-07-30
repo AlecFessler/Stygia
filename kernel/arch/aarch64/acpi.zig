@@ -29,7 +29,6 @@ const paging = stygia.memory.paging;
 const power = stygia.arch.aarch64.power;
 const rtc = stygia.arch.aarch64.rtc;
 const serial = stygia.arch.aarch64.serial;
-const smp = stygia.arch.aarch64.smp;
 
 const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
@@ -547,7 +546,7 @@ fn parseMadt(madt_virt: VAddr) !gic.GicDiscovery {
         switch (entry) {
             .gicc => |gicc_entry| {
                 if (gicc_entry.flags & 0x1 == 0) continue;
-                smp.setMpidr(@intCast(core_count), gicc_entry.mpidr);
+                gic.setMpidr(@intCast(core_count), gicc_entry.mpidr);
                 core_count += 1;
                 if (gicc_mmio_phys == 0 and gicc_entry.physical_base_address != 0) {
                     gicc_mmio_phys = gicc_entry.physical_base_address;
