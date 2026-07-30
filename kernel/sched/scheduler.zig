@@ -427,6 +427,30 @@ fn pmuSwitch(core: u8, next: *ExecutionContext) void {
 /// `coreRunning`) take an inherent snapshot semantics and re-check on
 /// the target.
 pub fn switchTo(ec: *ExecutionContext) void {
+    // Dispatch-side half of the two-cores-one-frame fix. `on_cpu` means
+    // "this EC's kstack is live on some core" — set by every dispatch
+    // path before the SP/ring swap, cleared when that core switches
+    // away. An EC can become CLAIMABLE (suspend publishes it, a waker's
+    // tryClaimWake wins, it lands in a run queue) while the core that
+    // suspended it is still unwinding kernel frames on its kstack.
+    // Dispatching it here would resume the same stack on two cores —
+    // measured on the Pi 5 rig as core 0 running lockdep bookkeeping on
+    // slot 36 while core 1's current EC owned slot 36 with on_cpu=1.
+    // Re-enqueue and let the previous core's next switch-away release
+    // it; the wake is not lost, only deferred. `last == self` proceeds:
+    // our own stale flag covers frames WE abandoned, and blocking on it
+    // would deadlock the clear that only happens further down this very
+    // function.
+    {
+        const self: u8 = @truncate(arch.smp.coreID());
+        if (ec.last_dispatched_core != execution_context.LAST_DISPATCHED_NEVER and
+            ec.last_dispatched_core != self and
+            ec.on_cpu.load(.acquire))
+        {
+            enqueue(ec);
+            return;
+        }
+    }
     // vCPU dispatch: spec-v3 §[create_vcpu] requires that every time the
     // vCPU EC becomes runnable (initial creation, reply-induced resume),
     // the kernel re-enters guest mode and on the subsequent guest exit
