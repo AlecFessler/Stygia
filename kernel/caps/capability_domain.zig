@@ -439,7 +439,6 @@ pub fn createCapabilityDomain(
                 src_slot,
                 child_ref,
                 new_child_slot,
-                null,
             );
         }
 
@@ -642,7 +641,45 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
 ///     helpers. v0 spawns one EC per test domain, so N is bounded at 1
 ///     in the spec test surface; vregs 6+ remain TODO until a test
 ///     spawns a multi-EC domain through acquire_ecs.
+/// Derivation-tree link work recorded by the acquire_ecs/acquire_vmars
+/// mint loops for execution AFTER the caller's CD gen-lock drops.
+/// `derive` takes `tree_mutex` and must never run under a CD gen-lock
+/// (see the order contract on `caps.derivation.tree_mutex`) — the old
+/// inline derive (with the held CD passed as `held_dom`) established
+/// the `CD → tree_mutex` edge that deadlocks against the teardown /
+/// revoke tree walks. Both acquire paths are same-CD (self-IDC) only,
+/// so one domain ref covers parent and child sides.
+const DeferredAcquireDerives = struct {
+    dom: ErasedSlabRef = .{ .ptr = null, .gen = 0 },
+    n: u8 = 0,
+    src: [127]u12 = undefined,
+    dst: [127]u12 = undefined,
+
+    /// Caller must hold NO CD gen-lock. Safe to run after the mint's
+    /// critical section: the minted handles belong to the calling EC,
+    /// which is right here in this syscall; every `derive` re-validates
+    /// the domain gen and bails on slots a racer touched.
+    fn run(self: *const DeferredAcquireDerives) void {
+        var k: u8 = 0;
+        while (k < self.n) : (k += 1) {
+            _ = stygia.caps.derivation.derive(
+                self.dom,
+                self.src[k],
+                self.dom,
+                self.dst[k],
+            );
+        }
+    }
+};
+
 pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
+    var deferred: DeferredAcquireDerives = .{};
+    const ret = acquireEcsInner(caller, target_idc, &deferred);
+    deferred.run();
+    return ret;
+}
+
+fn acquireEcsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -742,26 +779,17 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
             cd.kernel_table[new_slot].first_child.domain.ptr == null and
             cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
         {
-            const target_cd_ref: ErasedSlabRef = .{
-                .ptr = target_cd,
-                .gen = @intCast(target_cd._gen_lock.currentGen()),
-            };
-            const cd_ref_local: ErasedSlabRef = .{
+            // Same-CD case (self-IDC): cd === target_cd (cross-CD is
+            // bailed E_BADCAP above). RECORDED, not derived inline —
+            // `derive` takes `tree_mutex` and this CD's gen-lock is
+            // held; see `DeferredAcquireDerives`.
+            deferred.dom = .{
                 .ptr = cd,
                 .gen = @intCast(cd._gen_lock.currentGen()),
             };
-            // Same-CD case (self-IDC): cd === target_cd, so pass `cd`
-            // as `held_dom` (the lock is held for the duration of the
-            // walk). Cross-CD case is bailed E_BADCAP above so this
-            // branch is currently unreachable, but encoded for the
-            // future when cross-CD acquire lands.
-            _ = stygia.caps.derivation.derive(
-                target_cd_ref,
-                @intCast(i),
-                cd_ref_local,
-                new_slot,
-                cd,
-            );
+            deferred.src[deferred.n] = @intCast(i);
+            deferred.dst[deferred.n] = new_slot;
+            deferred.n += 1;
         }
 
         minted_slots[n] = new_slot;
@@ -832,6 +860,13 @@ inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
 /// target IDC's referenced domain. MMIO and DMA-only VARs (`map=0` / `map=2`)
 /// are excluded — see §[acquire_vmars] [test 07].
 pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
+    var deferred: DeferredAcquireDerives = .{};
+    const ret = acquireVmarsInner(caller, target_idc, &deferred);
+    deferred.run();
+    return ret;
+}
+
+fn acquireVmarsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -954,21 +989,15 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
                 break;
             }
             if (src_found) {
-                const target_cd_ref: ErasedSlabRef = .{
-                    .ptr = target_cd,
-                    .gen = @intCast(target_cd._gen_lock.currentGen()),
-                };
-                const cd_ref_local: ErasedSlabRef = .{
+                // Same-CD (self-IDC) only — RECORDED, not derived
+                // inline; see `DeferredAcquireDerives`.
+                deferred.dom = .{
                     .ptr = cd,
                     .gen = @intCast(cd._gen_lock.currentGen()),
                 };
-                _ = stygia.caps.derivation.derive(
-                    target_cd_ref,
-                    src_slot,
-                    cd_ref_local,
-                    new_slot,
-                    cd,
-                );
+                deferred.src[deferred.n] = src_slot;
+                deferred.dst[deferred.n] = new_slot;
+                deferred.n += 1;
             }
         }
 

@@ -63,18 +63,26 @@ const MAX_DEPTH: u32 = 1 << 20;
 /// orders concurrent tree mutations against each other.
 ///
 /// Acquired with `lockIrqSaveOrdered(TREE_MUTEX_GROUP)` everywhere it is
-/// taken: the tree spans capability domains, and call sites that mint
-/// fresh aliases (suspend/recv/reply paths in `kernel/sched/port.zig`,
-/// `acquire_ecs`/`acquire_vmars` in `capability_domain.zig`,
-/// the xfer copy/move alias path) already hold one or both relevant CD
-/// gen-locks when they need to splice the new handle into the tree.
-/// Reversing the order at every such call site would require dropping
-/// + re-acquiring CD locks (and re-validating gens). Since `tree_mutex`
-/// is a single global mutex, AB-BA on `tree_mutex` itself is impossible;
-/// the ordered tag opts out of lockdep's pair-edge cycle detection so
-/// the legitimate `(CD → tree_mutex)` derive-side acquisitions don't
-/// register a phantom inverse cycle against the `(tree_mutex → CD)`
-/// revoke/delete path.
+/// taken.
+///
+/// KERNEL-WIDE ORDER: `tree_mutex` BEFORE any CapabilityDomain gen-lock,
+/// with NO exceptions. The tree walks (`revoke`, `deleteAndDetach`,
+/// `detachDyingDomainFromTree`) hold `tree_mutex` while blocking-
+/// acquiring arbitrary third-party CD gen-locks via `lockEntrySkip`, so
+/// ANY path that holds a CD gen-lock while acquiring `tree_mutex` forms
+/// a real AB-BA with them. The old code let mint sites (suspend/recv/
+/// reply pair transfers, `acquire_ecs`/`acquire_vmars`) call `derive`
+/// with a CD lock held and waved the inversion off in this very comment
+/// ("since tree_mutex is a single global mutex, AB-BA on tree_mutex
+/// itself is impossible") — but the cycle was never tree-vs-tree, it
+/// was tree-vs-CD, and it deadlocked live: `replyTransfer` on one core
+/// holding the sender's CD and spinning on `tree_mutex`,
+/// `detachDyingDomainFromTree` on another holding `tree_mutex` and
+/// spinning on that same CD, both IRQ-masked, READY ECs (including the
+/// test runner) stranded in a deaf core's run queue. Mint sites now
+/// defer their `derive` calls until after their CD locks drop; the
+/// ordered tag remains only to keep the tree-walk's structured
+/// multi-CD acquires out of lockdep's pair-edge detection.
 pub var tree_mutex: SpinLock = .{ .class = "caps.derivation.tree_mutex" };
 
 /// Lockdep group tag for `tree_mutex`. Non-zero opts every acquisition
@@ -156,29 +164,35 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 ///   - `child.next_sibling     = parent.first_child` (push as new head)
 ///   - `parent.first_child     = (child_dom, child_slot)`
 ///
-/// `held_dom` names a CD whose gen-lock the caller already holds; the
-/// helper skips the matching acquire so it doesn't deadlock against the
-/// already-held lock. Pass `null` if the caller holds neither domain's
-/// gen-lock.
-///
-/// Lock order: takes `tree_mutex` (with `TREE_MUTEX_GROUP` so the
-/// `(CD → tree_mutex)` direction registered here doesn't trip lockdep
-/// against the `(tree_mutex → CD)` direction in `revoke`/`delete`).
-/// Then acquires the parent and child CD gen-locks (skipping `held_dom`).
+/// LOCK CONTRACT — the caller must hold NO CapabilityDomain gen-lock.
+/// `derive` takes `tree_mutex` and then re-acquires both domains'
+/// gen-locks itself, keeping the kernel-wide `tree_mutex → CD` order
+/// intact. The old `held_dom` parameter let callers keep a CD lock
+/// across this call, which established the inverse `CD → tree_mutex`
+/// edge — autopsied live as a two-core AB-BA deadlock: one core in
+/// `replyTransfer` holding the sender's CD and spinning on
+/// `tree_mutex`, the other in `detachDyingDomainFromTree` holding
+/// `tree_mutex` and spinning on that exact CD gen-lock. Both spun with
+/// IRQs masked; the machine wedged with READY ECs (including the test
+/// runner) stranded in a deaf core's run queue. Mint-then-derive
+/// callers now run their derive loops AFTER dropping their CD locks.
 ///
 /// Cycle prevention: walks the parent's ancestor chain and refuses to
 /// install the link if `child` already appears as an ancestor of
 /// `parent`. Spec doesn't pin this but a corrupt or buggy mint path
 /// could otherwise create a cyclic chain that would loop revoke/delete
 /// forever. Returns `false` on cycle (link not installed; child remains
-/// a tree root) or stale source (treated as no-op — the source is gone
-/// so the alias has no live ancestor anyway).
+/// a tree root), stale source (treated as no-op — the source is gone
+/// so the alias has no live ancestor anyway), or a child slot whose
+/// links are already populated (the deferred-derive window lets a
+/// concurrent copy/delete touch the fresh slot first; linking over it
+/// would corrupt the tree, dropping the link only costs revoke
+/// reachability for a handle the racer already owns).
 pub fn derive(
     parent_dom_ref: ErasedSlabRef,
     parent_slot: u12,
     child_dom_ref: ErasedSlabRef,
     child_slot: u12,
-    held_dom: ?*CapabilityDomain,
 ) bool {
     const parent_link: HandleLink = .{ .domain = parent_dom_ref, .slot = parent_slot };
     const child_link: HandleLink = .{ .domain = child_dom_ref, .slot = child_slot };
@@ -186,23 +200,41 @@ pub fn derive(
     const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
     defer tree_mutex.unlockIrqRestore(tree_irq);
 
-    const parent_le = lockEntrySkip(parent_link, held_dom) orelse return false;
-    defer unlockEntrySkip(parent_le, held_dom);
+    const parent_le = lockEntrySkip(parent_link, null) orelse return false;
+    defer unlockEntrySkip(parent_le, null);
+
+    // Every further entry acquire in this call (the ancestor hops, the
+    // child) must skip the domain whose gen-lock the parent acquire
+    // just took — the same-CD shape (self-IDC acquire_ecs/vmars,
+    // single-domain pair transfers) has parent and child in ONE domain,
+    // and a second blocking acquire of the same gen-lock is a
+    // self-deadlock (caught by lockdep as a recursive acquire). This is
+    // the intra-call role the old `held_dom` parameter played; it now
+    // derives from the parent lock itself rather than from a
+    // caller-held lock.
+    const self_held: ?*CapabilityDomain = if (parent_link.domain.ptr) |p|
+        @ptrCast(@alignCast(p))
+    else
+        null;
 
     // Cycle check: walk parent.parent.parent... — if any ancestor names
-    // (child_dom, child_slot), refuse the link. The walk uses `held_dom`
-    // for skip-rule symmetry with the rest of the tree code.
-    if (ancestorChainContains(parent_le.entry, child_link, held_dom)) return false;
+    // (child_dom, child_slot), refuse the link.
+    if (ancestorChainContains(parent_le.entry, child_link, self_held)) return false;
 
-    const child_le = lockEntrySkip(child_link, held_dom) orelse return false;
-    defer unlockEntrySkip(child_le, held_dom);
+    const child_le = lockEntrySkip(child_link, self_held) orelse return false;
+    defer unlockEntrySkip(child_le, self_held);
 
-    // The child slot was just minted; its tree links must be zero (the
-    // mint paths zero them explicitly in `writeHandleSlot`). Catch a
-    // double-derive on the same slot loud and early.
-    std.debug.assert(child_le.entry.parent.domain.ptr == null);
-    std.debug.assert(child_le.entry.first_child.domain.ptr == null);
-    std.debug.assert(child_le.entry.next_sibling.domain.ptr == null);
+    // The child slot is normally the caller's fresh mint with all three
+    // tree links zeroed. Under the deferred-derive discipline the mint
+    // and this link run in separate critical sections, so a concurrent
+    // path may have already linked (or freed and re-minted) the slot —
+    // bail rather than stomp the existing links.
+    if (child_le.entry.parent.domain.ptr != null or
+        child_le.entry.first_child.domain.ptr != null or
+        child_le.entry.next_sibling.domain.ptr != null)
+    {
+        return false;
+    }
 
     child_le.entry.parent = parent_link;
     child_le.entry.next_sibling = parent_le.entry.first_child;
