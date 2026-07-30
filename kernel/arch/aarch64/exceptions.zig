@@ -890,6 +890,9 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .is_exec = false,
                 .rip = ctx.elr_el1,
                 .user_ctx = null,
+                .fp = ctx.regs.x29,
+                .lr = ctx.regs.x30,
+                .frame_ctx = ctx,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -904,14 +907,34 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .is_exec = true,
                 .rip = ctx.elr_el1,
                 .user_ctx = null,
+                .fp = ctx.regs.x29,
+                .lr = ctx.regs.x30,
+                .frame_ctx = ctx,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
         else => {
-            serial.print("KERNEL EXCEPTION: EC=0x{x} ESR=0x{x} ELR=0x{x} FAR=0x{x}\n", .{
-                @intFromEnum(ec), esr, ctx.elr_el1, readFarEl1(),
-            });
+            // Lock-free, same protocol as memory.fault.reportKernelFault:
+            // a corrupted PC lands here (PC-alignment fault, EC=0x22, seen
+            // on the bare-metal rig) and the interrupted code may hold
+            // `serial.print_lock`, so `serial.print` can wedge the report.
+            const panic_mod = stygia.panic;
+            const boot = stygia.arch.dispatch.boot;
+            if (!panic_mod.claimPanic()) cpu.halt();
+            boot.printRaw("KERNEL EXCEPTION: EC=0x");
+            panic_mod.printHex(@intFromEnum(ec));
+            boot.printRaw(" ESR=0x");
+            panic_mod.printHex(esr);
+            boot.printRaw(" ELR=0x");
+            panic_mod.printHex(ctx.elr_el1);
+            boot.printRaw(" FAR=0x");
+            panic_mod.printHex(readFarEl1());
+            boot.printRaw(" core=0x");
+            panic_mod.printHex(stygia.arch.dispatch.smp.coreID());
+            boot.printRaw("\n");
+            stygia.arch.aarch64.interrupts.dumpFaultRegs(ctx);
+            stygia.memory.fault.dumpFrameChain(ctx.regs.x29);
             @panic("Unhandled kernel synchronous exception");
         },
     }

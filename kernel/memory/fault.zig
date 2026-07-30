@@ -84,33 +84,64 @@ fn demandPageKernel(faulting_virt: VAddr) void {
 /// interleaving into each other's output — the earlier bare-metal logs
 /// contain `KERKERNEL PAGE FAULT at 0xf` followed by a run of NULs,
 /// which is two cores writing the same reporter at once.
-fn reportKernelFault(addr: u64, is_write: bool, is_exec: bool, pc: u64) void {
+fn reportKernelFault(fault: *const PageFaultContext) void {
     if (!panic_mod.claimPanic()) arch.cpu.halt();
     arch.boot.printRaw("KERNEL PAGE FAULT at 0x");
-    panic_mod.printHex(addr);
-    arch.boot.printRaw(if (is_write) " (write=true" else " (write=false");
-    arch.boot.printRaw(if (is_exec) " exec=true" else " exec=false");
-    // The faulting PC, which `PageFaultContext` has always carried and this
-    // reporter has never printed. Without it the panic says only WHICH
-    // address was touched, and the backtrace that follows starts inside the
-    // panic machinery — so a wild store gives you the victim and not the
-    // culprit. Chasing a write into `.rodata` on the bare-metal rig cost a
-    // full hardware cycle for want of this one field.
+    panic_mod.printHex(fault.faulting_address);
+    arch.boot.printRaw(if (fault.is_write) " (write=true" else " (write=false");
+    arch.boot.printRaw(if (fault.is_exec) " exec=true" else " exec=false");
+    // The faulting PC names the instruction; `lr` names its caller when
+    // the PC is a leaf (the bare-metal corruption faulted inside memset,
+    // which tells you nothing without the caller). `core` distinguishes
+    // "the BSP running the whole suite" from "a supposedly idle AP".
     arch.boot.printRaw(" pc=0x");
-    panic_mod.printHex(pc);
-    // Current SP. aarch64's vector entry pushes onto whatever SP already
-    // holds (no stack switch), so this is the faulting context's stack
-    // pointer less the handler's own frames — close enough to say WHICH
-    // region SP is in, which is the question that matters.
-    //
-    // Three different bare-metal panics (a write into .rodata, a branch
-    // into .rodata, and a PC-alignment fault on an odd .rodata address)
-    // are all one symptom if SP itself is pointing into .rodata: pushes
-    // land in read-only data, and `ret` loads a return address out of it.
-    // Printing SP distinguishes that from three unrelated wild pointers.
-    arch.boot.printRaw(" fp=0x");
-    panic_mod.printHex(@frameAddress());
+    panic_mod.printHex(fault.rip);
+    arch.boot.printRaw(" lr=0x");
+    panic_mod.printHex(fault.lr);
+    arch.boot.printRaw(" core=0x");
+    panic_mod.printHex(arch.smp.coreID());
     arch.boot.printRaw(")\n");
+    if (fault.frame_ctx) |ctx| arch.cpu.dumpFaultRegs(ctx);
+    dumpFrameChain(fault.fp);
+}
+
+/// Walk the interrupted context's frame-record chain and print each
+/// return address. `[fp]` = caller's fp, `[fp+8]` = return address —
+/// the layout is identical on aarch64 (AAPCS64 frame record) and x86-64
+/// (rbp chain), so this is arch-generic.
+///
+/// This is the backtrace the panic machinery cannot produce: its
+/// `StackIterator` starts from the panic call site and dies at the naked
+/// exception trampoline, three frames in. The fp captured in the
+/// exception frame predates the trampoline, so walking from it yields
+/// the call chain of the code that actually faulted.
+///
+/// Lock-free (printRaw only), and every load is gated on the address
+/// resolving in the kernel address space — the chain being walked
+/// belongs to a context that just faulted, so it may itself be the
+/// corrupted thing. A nested fault here would re-enter the reporter
+/// with the gate already claimed and wedge the output.
+pub fn dumpFrameChain(first_fp: u64) void {
+    var fp = first_fp;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        if (fp == 0 or fp % 16 != 0) break;
+        if (fp < address.AddrSpacePartition.user.end) break;
+        // fp and fp+8 sit in one 16-byte-aligned chunk — a single page
+        // resolve covers both loads.
+        const page = VAddr.fromInt(std.mem.alignBackward(u64, fp, paging.PAGE4K));
+        if (arch.paging.resolveVaddr(memory_init.kernel_addr_space_root, page) == null) break;
+        const rec: *const [2]u64 = @ptrFromInt(fp);
+        arch.boot.printRaw("  frame fp=0x");
+        panic_mod.printHex(fp);
+        arch.boot.printRaw(" ret=0x");
+        panic_mod.printHex(rec[1]);
+        arch.boot.printRaw("\n");
+        // Stacks grow down, so a well-formed chain strictly ascends;
+        // anything else is a cycle or corruption — stop.
+        if (rec[0] <= fp) break;
+        fp = rec[0];
+    }
 }
 
 /// Translate (is_write, is_exec) into the rwx triple consumed by
@@ -145,6 +176,10 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             if (comptime pf_log.enabled) {
                 pf_log.mark(null, .KERNEL_NO_EC, faulting_virt.addr, 0);
             }
+            // This panic is one of the downstream shapes of the bare-metal
+            // 4-core corruption (stygia-723); report the full frame so it
+            // stops being a one-line dead end.
+            reportKernelFault(fault);
             @panic("kernel page fault on user VA with no current EC");
         };
         if (comptime pf_log.enabled) {
@@ -195,12 +230,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                 // same three fault-handling frames and nothing about the
                 // call chain that actually consumed the stack.
                 //
-                // The two values here are what identify it instead. The
-                // address says how far into the guard page the push went,
-                // which combined with the slot geometry in `memory.stack`
-                // gives the overshoot; the PC names the instruction doing
-                // the pushing, which is the frame to look at.
-                reportKernelFault(faulting_virt.addr, is_write, is_exec, fault.rip);
+                // The report identifies it instead: the address says how
+                // far into the guard page the push went, and the frame
+                // chain walked from the captured x29 names the call path
+                // that consumed the stack.
+                reportKernelFault(fault);
                 @panic("Kernel stack overflow");
             },
             .not_stack => {},
@@ -218,7 +252,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (comptime pf_log.enabled) {
             pf_log.mark(scheduler.currentEc(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
         }
-        reportKernelFault(faulting_virt.addr, is_write, is_exec, fault.rip);
+        reportKernelFault(fault);
         @panic("unexpected kernel page fault");
     }
 
@@ -226,6 +260,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (comptime pf_log.enabled) {
             pf_log.mark(null, .USER_NO_EC, faulting_virt.addr, 0);
         }
+        // Same rationale as the kernel-on-user-VA no-EC arm: this panic
+        // is a recurring downstream shape of SMP corruption, and the
+        // core + register frame are what make it attributable. The fp
+        // here is a user fp, so the chain walk stops at the first
+        // unresolvable (user) address — the header is still worth it.
+        reportKernelFault(fault);
         @panic("user page fault with no current EC");
     };
 

@@ -65,6 +65,16 @@ pub const PageFaultContext = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
+/// Lock-free GPR dump of a fault frame (printRaw only) — safe on the
+/// fatal-fault path where `serial.print_lock` may already be held.
+pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.dumpFaultRegs(ctx),
+        .aarch64 => aarch64.interrupts.dumpFaultRegs(ctx),
+        else => unreachable,
+    }
+}
+
 // --- Calling convention / entry ----------------------------------------
 
 pub fn cc() std.builtin.CallingConvention {

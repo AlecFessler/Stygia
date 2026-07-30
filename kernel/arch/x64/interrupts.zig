@@ -40,7 +40,39 @@ pub const PageFaultContext = struct {
     /// real user frame instead of `thread.ctx` (which after yield points at
     /// a kernel-mode context). Null for kernel-mode faults.
     user_ctx: ?*ArchCpuContext = null,
+    /// Interrupted context's rbp — root of its frame-record chain for the
+    /// fatal-fault reporter's walk (the panic backtrace cannot walk past
+    /// the naked interrupt stub).
+    fp: u64 = 0,
+    /// Link register — aarch64 only, always 0 on x86-64.
+    lr: u64 = 0,
+    /// Full saved register frame, for the fatal-fault reporter's GPR
+    /// dump. Unlike `user_ctx` this is set for kernel-mode faults too.
+    frame_ctx: ?*const ArchCpuContext = null,
 };
+
+/// Dump every saved GPR of a fault frame. printRaw only — this runs on
+/// the fatal-fault path where `serial.print_lock` may already be held by
+/// this core (see memory.fault.reportKernelFault).
+pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
+    const boot = stygia.arch.dispatch.boot;
+    const panic_mod = stygia.panic;
+    inline for (@typeInfo(cpu.Registers).@"struct".fields, 0..) |f, i| {
+        boot.printRaw(if (i % 4 == 0) "  " else " ");
+        boot.printRaw(f.name ++ "=0x");
+        panic_mod.printHex(@field(ctx.regs, f.name));
+        if (i % 4 == 3) boot.printRaw("\n");
+    }
+    boot.printRaw("\n  rip=0x");
+    panic_mod.printHex(ctx.rip);
+    boot.printRaw(" rsp=0x");
+    panic_mod.printHex(ctx.rsp);
+    boot.printRaw(" rflags=0x");
+    panic_mod.printHex(ctx.rflags);
+    boot.printRaw(" err=0x");
+    panic_mod.printHex(ctx.err_code);
+    boot.printRaw("\n");
+}
 
 pub const IntVecs = enum(u8) {
     pmu = 0xFB,

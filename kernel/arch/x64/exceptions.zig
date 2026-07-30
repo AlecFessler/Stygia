@@ -498,6 +498,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .is_exec = pf_err.instr_fetch,
         .rip = ctx.rip,
         .user_ctx = if (from_user) ctx else null,
+        .fp = ctx.regs.rbp,
+        .frame_ctx = ctx,
     };
     stygia.memory.fault.handlePageFault(&pf_ctx);
 
