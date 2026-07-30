@@ -215,13 +215,17 @@ fn dumpCoreStatesRaw() void {
         } else {
             arch.boot.printRaw(" cur=null");
         }
-        var zpend: usize = 0;
-        for (cs.pending_zombie) |mz| {
-            if (mz != null) zpend += 1;
-        }
-        if (zpend != 0) {
-            arch.boot.printRaw(" zpend=0x");
-            panic_mod.printHex(zpend);
+        // Raw pending-zombie slots, column index included: the column IS
+        // the posting core, so a corrupt value here names its writer's
+        // core without another hardware cycle.
+        var zi: usize = 0;
+        while (zi < cs.pending_zombie.len) : (zi += 1) {
+            if (cs.pending_zombie[zi]) |zr| {
+                arch.boot.printRaw(" z[");
+                panic_mod.printHex(zi);
+                arch.boot.printRaw("]=0x");
+                panic_mod.printHex(@intFromPtr(zr.ptr));
+            }
         }
         arch.boot.printRaw("\n");
     }
@@ -248,7 +252,19 @@ pub fn dumpFrameChain(first_fp: u64) void {
     var depth: usize = 0;
     while (depth < 16) : (depth += 1) {
         if (fp == 0 or fp % 16 != 0) break;
-        if (fp < address.AddrSpacePartition.user.end) break;
+        // Canonicality, not just "above the user half": `resolveVaddr`
+        // is a software walk indexed by VA bits [47:12], so a
+        // NON-CANONICAL pointer whose low 48 bits alias a mapped kernel
+        // VA (autopsied: fp=0x2FF0_0000_4009_5A70 aliasing the kstack at
+        // 0xFFFF_0000_4009_5A70) resolves fine and then faults in
+        // hardware on the actual load. The canonical kernel-half base is
+        // the lowest kernel partition: kernel_code on aarch64
+        // (0xFFFF_0000_...), kernel on x86-64 (0xFFFF_8000_...).
+        const kernel_half_base = comptime @min(
+            address.AddrSpacePartition.kernel.start,
+            address.AddrSpacePartition.kernel_code.start,
+        );
+        if (fp < kernel_half_base) break;
         // fp and fp+8 sit in one 16-byte-aligned chunk — a single page
         // resolve covers both loads.
         const page = VAddr.fromInt(std.mem.alignBackward(u64, fp, paging.PAGE4K));
@@ -317,7 +333,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // memory remain set — that is a separate (pre-existing) leak.
         sync_debug.dropAllHeldOnAbandonedStack();
         port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireMemoryFault`'s no-route fallback terminates `ec` and
         // clears `current_ec`; if the run queue is empty, returning
@@ -333,7 +353,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // scheduler may be running elsewhere. Only `ec` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.run();
+        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
         return;
     }
 
@@ -410,7 +430,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // See the kernel-on-user-VA branch above: the no-route fallback
         // drains `current_ec`; if no other EC is ready we MUST not iretq
@@ -421,7 +445,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // scheduler may be running elsewhere. Only `ec` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.run();
+        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
         return;
     };
     const dom = dom_lr.ptr;
@@ -450,7 +474,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         else
             accessSubcode(is_write, is_exec);
         port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
-        arch.cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // fault event may have suspended the EC with its kstack
+        // release stashed on this core; an IRQ handler here could
+        // spin on that very release (markReady's kstack barrier) —
+        // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // Same rationale as the kernel-on-user-VA branch.
         // Identity, not just null: the wake/destroy machinery can leave
@@ -459,6 +487,6 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // scheduler may be running elsewhere. Only `ec` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.run();
+        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
     }
 }

@@ -245,7 +245,15 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     var frames: u64 = 0;
     while (frames < 64) : (frames += 1) {
         if (fp == 0 or fp % 16 != 0) break;
-        if (fp < stygia.memory.address.AddrSpacePartition.user.end) break;
+        // Canonical kernel-half base, not user.end: `resolveVaddr` walks
+        // VA index bits [47:12], so a non-canonical pointer aliasing a
+        // mapped kernel VA passes the resolve and faults on the load —
+        // see memory.fault.dumpFrameChain for the autopsy.
+        const kernel_half_base = comptime @min(
+            stygia.memory.address.AddrSpacePartition.kernel.start,
+            stygia.memory.address.AddrSpacePartition.kernel_code.start,
+        );
+        if (fp < kernel_half_base) break;
         const page = stygia.memory.address.VAddr.fromInt(
             std.mem.alignBackward(u64, fp, stygia.memory.paging.PAGE4K),
         );

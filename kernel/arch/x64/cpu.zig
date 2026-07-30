@@ -926,3 +926,35 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         : .{ .memory = true });
     unreachable;
 }
+
+/// Abandon the current kernel stack: swap rsp to `new_top`, publish the
+/// old stack's release by storing 0 to `release_byte`, then tail-call
+/// `entry(arg)`. The store happens AFTER the rsp swap — from that
+/// instruction on, this core provably never reads or writes the old
+/// stack again, so a byte that gates "may another core reuse that
+/// kstack" (an EC's `on_cpu` flag) can be cleared here and nowhere
+/// earlier. x86-TSO gives the plain `movb` store release semantics
+/// against the `.acquire` loads in the wake-side spins.
+///
+/// `release_byte` must always be a valid writable byte; callers with
+/// nothing to release pass a dummy. noreturn: the caller's frames are
+/// abandoned by the rsp swap and `entry` must never return.
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\movb $0, (%[rel])
+        \\movq %[arg], %%rdi
+        \\callq *%[entry]
+        :
+        : [top] "r" (new_top),
+          [rel] "r" (release_byte),
+          [arg] "r" (arg),
+          [entry] "r" (entry),
+        : .{ .memory = true });
+    unreachable;
+}

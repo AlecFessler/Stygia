@@ -275,8 +275,15 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 @panic("hlt trap with no current EC");
             ctx.rip += 1; // advance past the 1-byte HLT opcode
             execution_context.parkIdleWait(ec);
-            cpu.enableInterrupts();
-            scheduler.run();
+            // Hop to the park kstack, do NOT run the scheduler loop in
+            // place: this frame lives on the just-parked EC's kstack,
+            // the EC is already claimable (`suspend` accepts
+            // `.idle_wait`), and its deferred on_cpu release is stashed
+            // for the hop. Entering `run()` here — and formerly with
+            // IRQs re-enabled — raced the EC's re-dispatch for this
+            // very kstack. IRQs stay masked until the park/dispatch
+            // machinery's own unmask points.
+            scheduler.hopParkRun();
         }
 
         if (exceptionEvent(vector)) |event| {
@@ -303,26 +310,31 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 .thread_fault => |subcode| port.fireThreadFault(ec, subcode, ctx.rip),
                 .breakpoint => port.fireBreakpoint(ec, 0),
             }
-            cpu.enableInterrupts();
+            // IRQs deliberately stay MASKED through the dispatch
+            // attempt: the fired event may have suspended `ec` with its
+            // kstack release stashed on this core, and an IRQ handler
+            // here could spin on that very release (timer-wheel wakes
+            // routed through `markReady`'s kstack barrier) — a
+            // self-deadlock on our own pending stash.
             scheduler.yieldTo(null);
             // If `yieldTo` dispatched a fresh EC it would never return
-            // here (`loadEcContextAndReturn` is noreturn). Reaching this
-            // line means the run queue was empty — the no-route fallback
-            // (`parkSelfFaulted` for thread_fault, `markReady` of the
-            // resumed EC was the last work) drained `current_ec` to null.
-            // We CANNOT iretq back to the kernel-stack iret frame: that
-            // frame still holds the now-stale faulting user context, and
-            // returning there would re-fault on the same RIP and re-enter
-            // this handler with `currentEc() == null`, hitting the
+            // here (the park-kstack hop into the dispatch tail is
+            // noreturn). Reaching this line means the run queue was
+            // empty — the no-route fallback (`parkSelfFaulted` for
+            // thread_fault, `markReady` of the resumed EC was the last
+            // work) drained `current_ec` to null. We CANNOT iretq back
+            // to the kernel-stack iret frame: that frame still holds
+            // the now-stale faulting user context, and returning there
+            // would re-fault on the same RIP and re-enter this handler
+            // with `currentEc() == null`, hitting the
             // user-exception-with-no-current-EC panic.
             //
-            // Instead jump into the scheduler's main loop (noreturn). It
-            // will idle (`sti+hlt`) until any IRQ delivers more work, at
-            // which point it dispatches via `loadEcContextAndReturn`
-            // (which resets `rsp` to the new EC's saved context) — the
-            // current kernel-stack frame is abandoned, which is the same
-            // discipline the preempt-driven path uses.
-            if (scheduler.currentEc() == null) scheduler.run();
+            // Hop to the park kstack and enter the scheduler loop
+            // there (noreturn) — this frame lives on the suspended
+            // EC's kstack and the EC is claimable; `run()` in place
+            // raced its re-dispatch for this kstack. The hop publishes
+            // the stashed on_cpu release.
+            if (scheduler.currentEc() == null) scheduler.hopParkRun();
             return;
         }
     }
@@ -553,7 +565,11 @@ fn emulateVirtualBar(
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // event may have suspended the EC with its kstack release
+        // stashed on this core; an IRQ handler here could spin on
+        // that very release (markReady's kstack barrier) — a
+        // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`)
         // cleared `current_ec`; if `yieldTo` couldn't dispatch fresh
@@ -562,7 +578,7 @@ fn emulateVirtualBar(
         // until an IRQ delivers more work, at which point dispatch via
         // `loadEcContextAndReturn` resets `rsp` and abandons this
         // kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         unreachable;
     };
 
@@ -589,13 +605,17 @@ fn emulateVirtualBar(
     // Decode the instruction
     const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // event may have suspended the EC with its kstack release
+        // stashed on this core; an IRQ handler here could spin on
+        // that very release (markReady's kstack barrier) — a
+        // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // See the rip_page-resolve fallback above: if the run queue is
         // empty after firing the no-route park, return into
         // `scheduler.run()` rather than letting iretq return to a stale
         // user frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         unreachable;
     };
 
@@ -607,9 +627,13 @@ fn emulateVirtualBar(
         else
             MemoryFaultSubcode.invalid_read;
         port.fireMemoryFault(ec, subcode, faulting_addr);
-        cpu.enableInterrupts();
+        // IRQs stay MASKED through the dispatch attempt: the fired
+        // event may have suspended the EC with its kstack release
+        // stashed on this core; an IRQ handler here could spin on
+        // that very release (markReady's kstack barrier) — a
+        // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        if (scheduler.currentEc() == null) scheduler.run();
+        if (scheduler.currentEc() == null) scheduler.hopParkRun();
         return;
     }
 
@@ -630,9 +654,13 @@ fn emulateVirtualBar(
             4 => cpu.outd(value, io_port),
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                cpu.enableInterrupts();
+                // IRQs stay MASKED through the dispatch attempt: the fired
+                // event may have suspended the EC with its kstack release
+                // stashed on this core; an IRQ handler here could spin on
+                // that very release (markReady's kstack barrier) — a
+                // self-deadlock on our own pending stash.
                 scheduler.yieldTo(null);
-                if (scheduler.currentEc() == null) scheduler.run();
+                if (scheduler.currentEc() == null) scheduler.hopParkRun();
                 return;
             },
         }
@@ -643,9 +671,13 @@ fn emulateVirtualBar(
             4 => cpu.ind(io_port),
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                cpu.enableInterrupts();
+                // IRQs stay MASKED through the dispatch attempt: the fired
+                // event may have suspended the EC with its kstack release
+                // stashed on this core; an IRQ handler here could spin on
+                // that very release (markReady's kstack barrier) — a
+                // self-deadlock on our own pending stash.
                 scheduler.yieldTo(null);
-                if (scheduler.currentEc() == null) scheduler.run();
+                if (scheduler.currentEc() == null) scheduler.hopParkRun();
                 unreachable;
             },
         };

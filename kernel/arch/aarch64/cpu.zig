@@ -205,6 +205,8 @@ pub fn fpuStateInit(area: *[576]u8) void {
 /// at large still can't emit them.
 pub fn fpuSave(area: *[576]u8) void {
     asm volatile (
+        \\.arch_extension fp
+        \\.arch_extension simd
         \\stp  q0,  q1,  [%[a], #0]
         \\stp  q2,  q3,  [%[a], #32]
         \\stp  q4,  q5,  [%[a], #64]
@@ -233,6 +235,8 @@ pub fn fpuSave(area: *[576]u8) void {
 /// Restore V0-V31, FPCR, FPSR from `area`. Inverse of `fpuSave`.
 pub fn fpuRestore(area: *[576]u8) void {
     asm volatile (
+        \\.arch_extension fp
+        \\.arch_extension simd
         \\ldp  q0,  q1,  [%[a], #0]
         \\ldp  q2,  q3,  [%[a], #32]
         \\ldp  q4,  q5,  [%[a], #64]
@@ -451,6 +455,16 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
                 while (i < sched_mod.MAX_CORES) : (i += 1) {
                     const zr = slots[i] orelse continue;
                     const z = zr.ptr;
+                    const zp_chk = @intFromPtr(z);
+                    const ka_chk = stygia.memory.address.KernelVA.KernelAllocators.range;
+                    if (zp_chk < ka_chk.start or zp_chk >= ka_chk.end) {
+                        stygia.arch.dispatch.boot.print(
+                            "[zombie] BUG: pending slot [{d}] holds non-slab 0x{x}; dropped\n",
+                            .{ i, zp_chk },
+                        );
+                        slots[i] = null;
+                        continue;
+                    }
                     if (z.on_cpu.load(.acquire)) continue;
                     const z_top = z.kernel_stack.top.addr;
                     const z_base = z.kernel_stack.base.addr;
@@ -698,6 +712,35 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         \\b scheduler_run_after_park
         :
         : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
+}
+
+/// Abandon the current kernel stack: swap SP to `new_top`, publish the
+/// old stack's release by storing 0 to `release_byte` (store-release,
+/// pairing with the `.acquire` loads in the wake-side `on_cpu` spins),
+/// then tail-branch to `entry(arg)`. The store happens AFTER the SP
+/// swap — from that instruction on this core never touches the old
+/// stack again, which is the only point at which "may another core
+/// reuse that kstack" may be published. `release_byte` must always be
+/// valid; callers with nothing to release pass a dummy. noreturn: the
+/// caller's frames are abandoned and `entry` must never return.
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    asm volatile (
+        \\mov sp, %[top]
+        \\stlrb wzr, [%[rel]]
+        \\mov x0, %[arg]
+        \\br %[entry]
+        :
+        : [top] "r" (new_top),
+          [rel] "r" (release_byte),
+          [arg] "r" (arg),
+          [entry] "r" (entry),
         : .{ .memory = true });
     unreachable;
 }

@@ -207,6 +207,46 @@ pub const PerCore = struct {
     /// parity-correct placeholder for SlabRef constructor compatibility.
     post_park_clear_on_cpu: ?SlabRef(ExecutionContext) = null,
 
+    /// EC whose kstack this core is STILL EXECUTING ON even though the
+    /// EC itself has already been published as claimable (recv/futex/
+    /// suspend parked it, or a peer disowned it mid-quantum). The slot
+    /// is the deferred half of the kstack-release protocol:
+    ///
+    ///   `ec.on_cpu == false  ⟹  no core is executing on ec's kstack`
+    ///
+    /// The old code cleared `on_cpu` at the park/suspend site itself —
+    /// while the caller was still running on that very kstack, and kept
+    /// running on it through `run()` → `switchTo` → the arch dispatch
+    /// tail (reaper, CR3 swap, migrateFlush, EOI). A waker on another
+    /// core would pass its `on_cpu` spin, enqueue, and dispatch the EC;
+    /// the EC's next kernel entry then built frames down the same
+    /// kstack the parking core was still using. Mutual frame stomp;
+    /// observed as a runaway memcpy in `syscallDispatch` crossing the
+    /// kstack guard ("Kernel stack overflow" panics) and as corrupted
+    /// scheduler state wedges.
+    ///
+    /// Now the suspend sites STASH the EC here instead of clearing the
+    /// flag, and the flag is cleared by `arch.cpu.hopToStackAndCall` /
+    /// the park landing pad — i.e. at the exact instruction after which
+    /// this core provably never touches the old kstack again. Written
+    /// and consumed only by this core (single producer/consumer); the
+    /// EC slab slot cannot be freed while `on_cpu` is true, which is
+    /// precisely what the stash keeps set.
+    pending_kstack_release: ?*ExecutionContext = null,
+
+    /// EC that must be enqueued on a DIFFERENT core (affinity
+    /// migration) but whose kstack this core is still executing on.
+    /// `yieldTo`'s old code cross-enqueued immediately and then ran the
+    /// whole dispatch tail on the migrating EC's kstack — the target
+    /// core could dispatch it and reuse the kstack top while this
+    /// core's frames were live on it. The migration arm now stashes the
+    /// EC here and escapes to the park kstack; `scheduler_hop_run`
+    /// consumes the slot AFTER the hop (clearing `on_cpu`, then
+    /// enqueueing), so the target core can only ever see a fully
+    /// released kstack. Single producer/consumer per core, same
+    /// pinning argument as `pending_kstack_release`.
+    pending_cross_enqueue: ?*ExecutionContext = null,
+
     /// True when this core's most recent dispatch decision — taken
     /// under `core_locks[core]` inside `dequeueOrIdleLocked` — found
     /// nothing to run, i.e. the core is heading for (or already
@@ -560,8 +600,107 @@ pub fn switchTo(ec: *ExecutionContext) void {
     }
 
     const core: u8 = @truncate(arch.smp.coreID());
-    // Clear the OUTGOING ec's on_cpu BEFORE setCurrentEc rewrites
-    // current_ec to the new dispatch. The reaper inside
+    // ── kstack hop ───────────────────────────────────────────────────
+    //
+    // Everything from here to the iretq trampoline used to execute on
+    // whatever kstack the caller happened to be standing on — usually
+    // the OUTGOING EC's. That is fatal whenever the outgoing EC is
+    // already claimable by another core (recv/futex/suspend published
+    // its wait state; a preempt re-enqueued it): the other core
+    // dispatches it, the EC's next kernel entry builds frames from its
+    // kstack top downward, and both cores stomp each other's live
+    // frames on one kstack. Autopsied as core 2's `syscallDispatch`
+    // memcpy running away over the kstack guard (Kernel stack overflow
+    // panic) with core 1's switchTo/loadEcContextAndReturn frames
+    // interleaved on the same kstack.
+    //
+    // Hop to this core's park kstack FIRST, releasing the pending
+    // kstack-release stash (if any) at the exact swap instruction, and
+    // run the whole dispatch tail there. After the hop, no core ever
+    // executes scheduler machinery on a claimable EC's kstack —
+    // the collision is structurally impossible, independent of wake
+    // ordering.
+    //
+    // The hop deliberately happens ONLY on the non-vCPU final dispatch:
+    // the vCPU loop above must keep its "run dry and RETURN to the
+    // caller" contract (yieldTo's empty-return / qn0f handling).
+    //
+    // Boot fallback: before `perCoreInit` allocates the park stacks the
+    // first dispatches run single-core with nothing claimable — run the
+    // tail in place.
+    const park_top = (&core_states[core]).park_stack.top.addr;
+    if (park_top == 0) {
+        dispatchTailBody(core, current);
+    }
+    const release_ptr = takePendingReleaseByte(core, current);
+    arch.cpu.hopToStackAndCall(
+        park_top,
+        release_ptr,
+        &scheduler_dispatch_tail,
+        @intFromPtr(current),
+    );
+}
+
+/// Dummy byte handed to `hopToStackAndCall` when a hop has no pending
+/// kstack release — the primitive unconditionally stores 0 through the
+/// pointer it is given.
+var hop_release_dummy: u8 = 0;
+
+/// Consume this core's `pending_kstack_release` stash into a byte
+/// pointer for `hopToStackAndCall`'s post-swap release store.
+///
+/// `exclude` is the EC this core is about to dispatch (or null): if the
+/// stashed EC IS the incoming dispatch, its `on_cpu` must stay true —
+/// the flag is about to describe the new dispatch, and clearing it at
+/// the hop would let a reaper free the kstack we are dispatching onto.
+/// The slot is nulled either way (the pending release is resolved: by
+/// the hop store, or by the EC being re-dispatched right here).
+fn takePendingReleaseByte(core: u8, exclude: ?*ExecutionContext) *u8 {
+    const st = &core_states[core];
+    const pending = st.pending_kstack_release orelse return &hop_release_dummy;
+    st.pending_kstack_release = null;
+    if (exclude) |ex| {
+        if (pending == ex) return &hop_release_dummy;
+    }
+    return @ptrCast(&pending.on_cpu);
+}
+
+/// Record that this core is still executing on `ec`'s kstack even
+/// though `ec` has been published claimable (suspend/park sites) or
+/// disowned (peer flipped its state mid-quantum). The flag release is
+/// deferred to the next stack hop — the first point at which this core
+/// provably stops touching the kstack. See
+/// `PerCore.pending_kstack_release`.
+pub fn stashKstackRelease(core: u8, ec: *ExecutionContext) void {
+    const st = &core_states[core];
+    // Single-producer discipline: a second stash before the first is
+    // consumed would lose a release and strand `on_cpu` set forever
+    // (wake-side spins would hang). By construction every stash is
+    // followed by a hop before the next stash site can run.
+    std.debug.assert(st.pending_kstack_release == null or
+        st.pending_kstack_release == ec);
+    st.pending_kstack_release = ec;
+}
+
+/// C-callconv landing target for `switchTo`'s kstack hop. Runs on the
+/// per-core park kstack; must never return.
+export fn scheduler_dispatch_tail(arg: u64) callconv(.c) noreturn {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const current: *ExecutionContext = @ptrFromInt(arg);
+    dispatchTailBody(core, current);
+}
+
+/// The dispatch tail: everything between the dispatch decision and the
+/// context-load trampoline. Runs on the park kstack (or the boot stack
+/// before `perCoreInit`). noreturn via `loadEcContextAndReturn`.
+fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
+    // Defensive: a cross-core migration stash should always have been
+    // consumed by `scheduler_hop_run` before another dispatch commits,
+    // but consuming it here too keeps the invariant "slots drain at
+    // every hop" unconditional.
+    consumePendingCrossEnqueue(core);
+    // Clear the OUTGOING ec's on_cpu now that we are OFF its kstack
+    // (the hop above moved us to the park kstack). The reaper inside
     // `interrupts.switchTo` reads `on_cpu` to decide whether a queued
     // zombie's kstack is still in use; without this clear, prev's
     // on_cpu stays `true` indefinitely (no later writer flips it
@@ -597,6 +736,24 @@ pub fn switchTo(ec: *ExecutionContext) void {
     arch.cpu.loadEcContextAndReturn(current);
 }
 
+/// Consume this core's pending affinity-migration handoff: release the
+/// migrating EC's `on_cpu` (we are off its kstack — every caller runs
+/// on the park kstack, post-hop), then enqueue it on a core satisfying
+/// its affinity mask. Enqueue-after-release is the load-bearing order:
+/// the target core may dispatch the EC the instant it appears in its
+/// queue, and it must only ever see a released kstack.
+fn consumePendingCrossEnqueue(core: u8) void {
+    const st = &core_states[core];
+    const ec = st.pending_cross_enqueue orelse return;
+    st.pending_cross_enqueue = null;
+    ec.on_cpu.store(false, .release);
+    // A cross-core terminate may have hit the EC while it sat in the
+    // slot (it was in no run queue, so removeFromQueue missed it).
+    // `enqueueOnCore` rejects `.exited` / even-gen ECs, so the stale
+    // handoff drops harmlessly there.
+    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+}
+
 /// Voluntary yield — current EC drops back into ready, scheduler
 /// picks the next. If `target` is non-null and runnable, it runs next.
 pub fn yieldTo(target: ?*ExecutionContext) void {
@@ -606,10 +763,6 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     const core: u8 = @truncate(arch.smp.coreID());
     const state = &core_states[core];
     const lock = &core_locks[core];
-
-    // Track an EC that needs cross-core enqueue after we drop the
-    // local lock — see the affinity-aware branch below.
-    var deferred_cross_core: ?*ExecutionContext = null;
 
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     if (state.current_ec) |cur_ref| {
@@ -635,10 +788,8 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
             // excluded core, defeating the affinity mask (and there is
             // no other migration trigger — `setAffinity` writes the
             // mask without repositioning, and `preempt` re-enters this
-            // same path). The cross-core handoff also requires a fall-
-            // through to `run()` in the empty-no-`next` arm below; see
-            // that comment for the kstack-livesness rationale.
-            // `affinity == 0` is the spec "any core" sentinel.
+            // same path). `affinity == 0` is the spec "any core"
+            // sentinel.
             const local_allowed = cur.affinity == 0 or
                 (core < 64 and (cur.affinity & (@as(u64, 1) << @truncate(core))) != 0);
             if (local_allowed) {
@@ -651,7 +802,23 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
                 // that observes a non-sentinel value here.
                 cur.current_queue_core.store(core, .release);
             } else {
-                deferred_cross_core = cur;
+                // Affinity migration. The old code cross-enqueued `cur`
+                // right after dropping the local lock and then ran the
+                // dispatch machinery — ON `cur`'s KSTACK — while the
+                // target core was free to dispatch `cur` and reuse that
+                // same kstack (bd-qn0f / bd-20f7's whole two-cores-one-
+                // frame family, plus the frame-stomp autopsy under
+                // PerCore.pending_kstack_release). Instead: stash the
+                // handoff, abandon this kstack via the park-kstack hop,
+                // and let `scheduler_hop_run` release `cur.on_cpu` and
+                // enqueue it AFTER the hop. The local queue is left
+                // untouched — run() re-evaluates it from the park
+                // kstack. Costs one extra dequeue pass per migration;
+                // migrations are rare (explicit setAffinity exclusions).
+                lock.unlockIrqRestore(irq);
+                state.pending_cross_enqueue = cur;
+                clearCurrentEc(core);
+                escapeToRun();
             }
         }
     }
@@ -687,97 +854,16 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     } else dequeueOrIdleLocked(core);
     lock.unlockIrqRestore(irq);
 
-    // Cross-core enqueue runs unlocked: `enqueueOnCore` acquires the
-    // target core's lock, and we mustn't hold two `core_locks`
-    // simultaneously outside the registered ordered group. The EC's
-    // state was stamped `.ready` under the local lock, so any racing
-    // path that grabs it via `removeFromQueue` first sees no queue
-    // residence and just falls through to its normal handling.
-    if (deferred_cross_core) |cur| {
-        enqueueOnCore(pickCoreForAffinity(cur.affinity), cur);
-    }
-
     if (next) |n| {
+        // `switchTo` is normally `noreturn` (the park-kstack hop into
+        // `scheduler_dispatch_tail`), but for a vCPU target the vCPU
+        // pre-loop can RETURN when the synthetic vm_exit fires and the
+        // subsequent `dequeueOrIdle` runs dry. `current_ec` is null in
+        // that case and the caller's iretq path handles it (the
+        // affinity-migration arm above never reaches here — it escapes
+        // via the hop before selecting `next`).
         switchTo(n);
-        // bd-qn0f: same two-cores-in-user-mode hazard as the empty-
-        // queue `next == null` arm below (closed by bd-20f7 / bd-btl8),
-        // on a different branch. `switchTo` is normally `noreturn`
-        // (loadEcContextAndReturn), but for a vCPU target the pre-loop
-        // (scheduler.zig:290-358) can RETURN at line 356 when the
-        // synthetic vm_exit fires + the subsequent `dequeueOrIdle`
-        // runs dry. In that case, with `deferred_cross_core` set, the
-        // bare `return;` below would let the caller (yield syscall
-        // epilogue, timer-IRQ epilogue, fault path, ...) iretq through
-        // `cur`'s saved iret frame on THIS excluded core — at the same
-        // time the satisfying core picks `cur` up via
-        // `loadEcContextAndReturn` from its run queue and iretqs
-        // through the same frame. Two cores executing `cur` in user
-        // mode simultaneously: catastrophic, identical to bd-20f7.
-        //
-        // Mirror bd-btl8's pattern: null this core's `current_ec` slot
-        // (`switchTo`'s vCPU-empty branch already cleared it inside
-        // its loop, but the clear is idempotent and pins the
-        // invariant against future refactors of `switchTo`'s exit
-        // path) and tail into `run()`. `run()` is `noreturn`, so the
-        // caller's frame is abandoned; `cur` resumes only on the
-        // satisfying core with `setSyscallReturn` already stamped
-        // into `cur.ctx`.
-        if (deferred_cross_core != null) {
-            clearCurrentEc(core);
-            escapeToRun();
-        }
         return;
-    }
-
-    // No `next` after a cross-core handoff: `cur` was migrated to a
-    // satisfying core, and the local run queue had no replacement
-    // (and no `idle_ec`). Returning normally here would let the caller
-    // (yield syscall epilogue, timer-IRQ epilogue, fault path, ...)
-    // iretq through `cur`'s saved iret frame, resuming `cur` in user
-    // mode on THIS excluded core — at the same time the satisfying
-    // core picks `cur` up via `loadEcContextAndReturn` and iretqs
-    // through the same frame. Two cores executing `cur` in user mode
-    // simultaneously: catastrophic.
-    //
-    // Abandon the local kernel frame by entering `run()` — the
-    // scheduler loop will dispatch any racing-in EC or park this core
-    // on its dedicated park kstack. `cur` resumes only on the remote
-    // core, with the OK syscall return value already stamped into
-    // `cur.ctx` (see `setSyscallReturn` in `syscall/execution_context
-    // .zig::yield`). `run()` is `noreturn` so the caller's frame is
-    // never re-entered.
-    //
-    // Null out THIS core's `current_ec` first. `enqueueOnCore` already
-    // posted `cur` to the satisfying core's run queue; this core no
-    // longer dispatches `cur`. Leaving the stale ref in the slot is a
-    // torn-state hazard against both consumers `run()` will reach:
-    //
-    //   - `parkAndAwaitIRQ` reads `current_ec` to stash
-    //     `post_park_clear_on_cpu`. Gated on `last_dispatched_core ==
-    //     core`, which is still true here until the satisfying core's
-    //     `setCurrentEc` updates it. The wake-landing-pad then stores
-    //     `cur.on_cpu = false` AFTER the satisfying core's
-    //     `interrupts.switchTo` set `on_cpu = true` for its dispatch
-    //     of `cur` — leaving `cur` reapable while it is running in
-    //     user mode on the satisfying core. A subsequent terminate of
-    //     `cur` would pass the `on_cpu=false` reap gate and unmap a
-    //     live kstack.
-    //   - `scheduler.switchTo` for any race-in EC reads the same stale
-    //     prev_ref and the same `last_dispatched_core == core` branch
-    //     clears `cur.on_cpu`, with the identical race.
-    //
-    // Single-writer-per-core invariant for `current_ec` permits this
-    // unlocked write (see invariant 2 in subsystems/scheduler/SYSTEMS
-    // .md). `cur.on_cpu` is intentionally not touched — it stays true
-    // across the migration boundary; the satisfying core's switchTo
-    // is the next legitimate writer. Arch-side caches (gs:0 kernel_rsp,
-    // TSS.RSP0) are updated by `parkAndAwaitIRQ.parkPerCoreCaches` or
-    // by the destination EC's `interrupts.switchTo` along whichever
-    // `run()` branch fires; no caller-side ring transition happens
-    // before then.
-    if (deferred_cross_core != null) {
-        clearCurrentEc(core);
-        escapeToRun();
     }
 
     // Empty queue and no idle EC. Clear `current_ec` and re-point the
@@ -811,28 +897,31 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
     if (park_top != 0) {
         arch.cpu.parkPerCoreCaches(core, park_top);
     }
-    // Clear the previously-current EC's on_cpu flag now that TSS.RSP0
-    // has been retargeted at the park kstack. Future ring transitions
-    // on this core no longer push iret frames onto prev's kstack, so
-    // a reap that unmaps it is safe. Without this clear, the only
-    // writer of prev's on_cpu is `switchTo`'s "current_ec → new" edge,
-    // but `clearCurrentEc(core)` below sets the slot to null, leaving
-    // the next dispatch on this core with no `prev_ref` to drive the
-    // clear from. The EC stays `on_cpu=true` forever — every reap pass
-    // (`takeOwnPendingZombie`) skips it, the kstack stays mapped, and
-    // the slab slot leaks. Same window as parkAndAwaitIRQ; same fix.
+    // Stash the previously-current EC for a deferred on_cpu release.
+    // The old code CLEARED the flag right here — but this code is still
+    // executing on prev's kstack (only TSS.RSP0/gs:0 were re-pointed;
+    // rsp was not), and for a disowned `cur` the peer that suspended it
+    // is gated on exactly this flag before re-enqueueing it. Clearing
+    // here let the peer dispatch `cur` — and reuse this very kstack —
+    // while the escape below was still running on it. The stash is
+    // consumed (and the flag released) by the park-kstack hop inside
+    // `escapeToRun`, the first point where this core is provably off
+    // the kstack. Without any release the EC would stay `on_cpu=true`
+    // forever — every reap pass (`takeOwnPendingZombie`) skips it, the
+    // kstack stays mapped, and the slab slot leaks — hence the stash
+    // rather than simply dropping the clear.
     if ((&core_states[core]).current_ec) |prev_ref| {
         if (prev_ref.ptr.last_dispatched_core == core) {
-            prev_ref.ptr.on_cpu.store(false, .release);
+            stashKstackRelease(core, prev_ref.ptr);
         }
     }
     clearCurrentEc(core);
 
-    // Disowned current: `cur` existed but was neither re-enqueued
-    // locally (a peer terminate/suspend/wait path flipped its state
-    // away from `.running` mid-quantum) nor migrated via
-    // `deferred_cross_core`. Returning here would iretq back into an
-    // EC this scheduler no longer tracks:
+    // Disowned current: `cur` existed but was not re-enqueued locally
+    // (a peer terminate/suspend/wait path flipped its state away from
+    // `.running` mid-quantum; the affinity-migration arm escaped
+    // earlier and never reaches here). Returning here would iretq back
+    // into an EC this scheduler no longer tracks:
     //
     //   - a suspended `cur` that a peer then resumes gets dispatched
     //     on another core while THIS core is still executing it in
@@ -892,6 +981,38 @@ pub fn preempt() void {
 /// so the dispatch helper is a no-op there.
 fn escapeToRun() noreturn {
     arch.irq.schedulerEscapeEoi();
+    hopParkRun();
+}
+
+/// Abandon the current kernel stack for this core's park kstack and
+/// enter `run()` there. Releases the pending kstack-release stash at
+/// the hop instruction (see `PerCore.pending_kstack_release`) and
+/// consumes any pending affinity-migration handoff before re-entering
+/// the scheduler loop. This is the mandatory route into `run()` for
+/// every caller that may still be standing on a claimable EC's kstack
+/// (post-suspend syscall epilogues, fault-park paths, yieldTo escapes):
+/// entering `run()` in place would keep executing dequeue/park
+/// machinery on a kstack another core may concurrently dispatch onto.
+///
+/// Boot fallback: before `perCoreInit` allocates the park stacks
+/// nothing is claimable and there is no park kstack — enter `run()` in
+/// place.
+pub fn hopParkRun() noreturn {
+    const core: u8 = @truncate(arch.smp.coreID());
+    const park_top = (&core_states[core]).park_stack.top.addr;
+    if (park_top == 0) run();
+    const release_ptr = takePendingReleaseByte(core, null);
+    arch.cpu.hopToStackAndCall(park_top, release_ptr, &scheduler_hop_run, 0);
+}
+
+/// C-callconv landing target for `hopParkRun`. Runs on the park
+/// kstack with the pending kstack release already published by the hop
+/// primitive; drains the migration handoff, then enters the scheduler
+/// loop. Never returns.
+export fn scheduler_hop_run(arg: u64) callconv(.c) noreturn {
+    _ = arg;
+    const core: u8 = @truncate(arch.smp.coreID());
+    consumePendingCrossEnqueue(core);
     run();
 }
 
@@ -1084,6 +1205,21 @@ fn parkAndAwaitIRQ() void {
     arch.paging.loadKernelRoot(memory_init.kernel_addr_space_root);
     publishActiveRoot(core, 0);
     (&core_states[core]).committed_ec = null;
+
+    // Re-arm the preemption timer before sleeping — a parked core must
+    // keep a heartbeat. The idle path's final timer tick was silenced
+    // at the source (aarch64: silenceTimerLineIfFiring sets
+    // CNTV_CTL.IMASK so the level-sensitive PPI de-asserts; the
+    // matching unmask lives in armInterruptTimer, which only the
+    // DISPATCH path reaches), so a parked core otherwise has no
+    // periodic wake source at all and exactly one stale wake decision
+    // in enqueueOnCore strands its run queue forever. Measured on the
+    // .106 KVM reproducer as the persistent affinity_05/06 +
+    // create_execution_context_14 MISS: pass 1 parks cores 1..3 with
+    // silenced timers, and the first pinned enqueue that reads a stale
+    // busy/parked snapshot never gets a second chance. With the
+    // heartbeat, a missed wake costs one timeslice instead of the run.
+    arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
 
     arch.cpu.parkAndAwaitIRQ(park_top);
 }
@@ -1721,6 +1857,16 @@ pub fn takeOwnPendingZombie() ?*ExecutionContext {
     while (i < MAX_CORES) : (i += 1) {
         const zr = slots[i] orelse continue;
         const z = zr.ptr;
+        const zp_chk = @intFromPtr(z);
+        const ka_chk = stygia.memory.address.KernelVA.KernelAllocators.range;
+        if (zp_chk < ka_chk.start or zp_chk >= ka_chk.end) {
+            stygia.arch.dispatch.boot.print(
+                "[zombie] BUG: pending slot [{d}] holds non-slab 0x{x}; dropped\n",
+                .{ i, zp_chk },
+            );
+            slots[i] = null;
+            continue;
+        }
         // `on_cpu` is the EC's "kstack is live somewhere" flag — set by
         // every dispatch path (suspend FP step 14, reply FP R14, slow
         // `switchTo`) before the swap that hands ring 3 control to the
@@ -1814,6 +1960,23 @@ pub fn markReady(ec: *ExecutionContext) void {
         else => return,
     }
     if (!execution_context.tryClaimWake(ec, waiting_in)) return;
+    // Kstack-release barrier: the suspend/park sites no longer clear
+    // `on_cpu` in place — the parking core keeps it set until it has
+    // hopped off the EC's kstack (see PerCore.pending_kstack_release).
+    // Enqueueing before that release lets the dispatching core reuse a
+    // kstack whose previous core is still executing on it. Wait for the
+    // release, exactly like the futex wake's phase-2 spin and
+    // `deliverEvent`'s receiver spin. Bounded: the owner's path from
+    // publishing the wait state to its hop is lock-bounded local work
+    // (no IPI-ack waits), at worst one scheduler quantum when the EC
+    // was suspended remotely mid-quantum.
+    //
+    // Skipped for the `.running` claim: that arm is same-core by
+    // contract (`resumeFromReply` with the reply landing on the
+    // executing core) — spinning there would wait on our own release.
+    if (waiting_in != .running) {
+        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+    }
     enqueue(ec);
 }
 

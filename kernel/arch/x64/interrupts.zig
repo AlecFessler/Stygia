@@ -433,11 +433,16 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // wait), `current_ec` was cleared on this core and `caller.state`
     // was retargeted to `.suspended_on_port` / `.futex_wait`. The asm
     // epilogue would otherwise iretq back to the parked user mode and
-    // run the suspended EC. Switch to whatever's next (or idle); the
-    // saved register restore in the asm trampoline never executes
-    // because switchTo's `loadEcContextAndReturn` is `noreturn`.
+    // run the suspended EC. Switch to whatever's next (or idle) — via
+    // the park-kstack hop, NOT `run()` in place: this frame still
+    // lives on the suspended caller's kstack, and the caller is
+    // already claimable by wakers on other cores. Running the
+    // scheduler loop here raced the caller's re-dispatch for the same
+    // kstack (mutual frame stomp; "Kernel stack overflow" panics). The
+    // hop also publishes the caller's deferred `on_cpu` release — the
+    // signal the wake-side spins block on.
     if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
-        scheduler.run();
+        scheduler.hopParkRun();
     }
 
     // Last snapshot before the slow-path asm pops regs and iretq's.

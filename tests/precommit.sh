@@ -943,6 +943,11 @@ stage_linux_guest_x86_boot() {
         FAILURES+=("linux_guest build")
         return 1
     fi
+    # zig-out is not pruned on an arch switch, and stages [2/4]+[2a/4]
+    # leave an aarch64 image behind, so clear it before producing an
+    # image that will actually be booted (build.zig also refuses a mixed
+    # one). Every other booting stage does this; [3/4] was the one miss.
+    rm -rf "$STYGIA_ROOT/zig-out"
     if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=linux_guest -Diommu=amd -Doptimize=ReleaseSafe); then
         FAILURES+=("linux_guest kernel build")
         return 1

@@ -452,16 +452,23 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 
     // Park the EC: drop currency on the local core. The syscall
     // dispatcher (`arch.x64.interrupts.syscallDispatch`) sees
-    // `current_ec == null` and routes to `scheduler.run()` instead of
-    // iretq'ing back to the now-parked user EC. The wake/timeout path
-    // overwrites this EC's syscall-return slot with the real return
-    // value (vaddr or E_TIMEOUT) before re-marking it ready, so the
-    // placeholder returned here only needs to be a value the parked
-    // EC will never observe.
-    ec.on_cpu.store(false, .release);
+    // `current_ec == null` and routes to `scheduler.hopParkRun()`
+    // instead of iretq'ing back to the now-parked user EC. The
+    // wake/timeout path overwrites this EC's syscall-return slot with
+    // the real return value (vaddr or E_TIMEOUT) before re-marking it
+    // ready, so the placeholder returned here only needs to be a value
+    // the parked EC will never observe.
+    //
+    // `on_cpu` is NOT cleared here: this core keeps executing on the
+    // EC's kstack until the park-kstack hop, and the wake side's
+    // phase-2 spin gates its enqueue on exactly this flag. Stash the
+    // release for the hop instead (see PerCore.pending_kstack_release).
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (sched.coreCurrentIs(core_id, ec)) {
         sched.clearCurrentEc(core_id);
+        sched.stashKstackRelease(core_id, ec);
+    } else {
+        ec.on_cpu.store(false, .release);
     }
     return 0;
 }
@@ -545,11 +552,15 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
 
     releaseBucketLocks(&lock_state);
 
-    // Park the EC: see `waitVal` for the full rationale.
-    ec.on_cpu.store(false, .release);
+    // Park the EC: see `waitVal` for the full rationale, including why
+    // the `on_cpu` release is stashed for the park-kstack hop rather
+    // than performed here.
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (sched.coreCurrentIs(core_id, ec)) {
         sched.clearCurrentEc(core_id);
+        sched.stashKstackRelease(core_id, ec);
+    } else {
+        ec.on_cpu.store(false, .release);
     }
     return 0;
 }

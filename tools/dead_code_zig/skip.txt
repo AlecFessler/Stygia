@@ -745,3 +745,20 @@ entity:arch/aarch64/vm_runloop.zig::arch.aarch64.vm_runloop.WIDE_VREG_END_OFF   
 entity:arch/x64/vm_runloop.zig::arch.x64.vm_runloop.WIDE_VREG_END_OFF    sha256:8be6c4b3a55ec189dd8ccae10ce043f2ab19e8fa6e41af231c1ee2c1bd4ae2fc
 # bd-Zag-Subsystems-Agents-i86b — transient; remove when bd-Zag-Subsystems-Agents-ibaf lands and consumes fpuFlushMailbox via the dispatch facade
 entity:arch/dispatch/cpu.zig::arch.dispatch.cpu.fpuFlushMailbox    sha256:a96746f4a3c8463a880bf0c0a0aedb18e5cc8270d13ccac99dbe9a42c29bab85
+# panic.interface hooks: members of the std panic-interface contract
+# (`pub const panic = stygia.panic.interface` in main.zig). The compiler
+# calls each hook only from safety checks it actually EMITS in the
+# current build, so any hook whose check pattern doesn't occur in
+# today's kernel goes IR-dead — but removing it breaks compilation the
+# moment upstream code introduces such a check. Reachability here is a
+# property of the moment's codegen, not of the interface.
+entity:panic.zig::panic.interface.sentinelMismatch    sha256:7611c17019c09750e1ed758d126901049fef7436c9bca688f5bebcc30a82ce24
+entity:panic.zig::panic.interface.inactiveUnionField    sha256:a21b57c63f314238f55b089da42158b3996e8c28dfb2152a24e889c6eb056e5d
+entity:panic.zig::panic.interface.sliceCastLenRemainder    sha256:9f48f793407f6491c975e7ce3a47a3905b43df2d44c03c6b8c8c56b45ab9decc
+entity:panic.zig::panic.interface.invalidErrorCode    sha256:e6dc4413a29616d733226644e51abbff64eb99509f27b01e552477bb339f90ab
+entity:panic.zig::panic.interface.shlOverflow    sha256:2d5f372e094c213b20523002aca92f828918c9af610c7503073cb50e61760190
+entity:panic.zig::panic.interface.shrOverflow    sha256:2dbdfbbd067f179e7fdc03402e3164225684f968b0f1669acd5ceeffc953ef36
+entity:panic.zig::panic.interface.exactDivisionRemainder    sha256:bcade69a39473d4e6c34278a15a45fd293176996cba730e621c7d0b07c6ed1c6
+entity:panic.zig::panic.interface.integerPartOutOfBounds    sha256:b7e26ef6d6d923eb16da93f539a4900da1c9d9d4f7a41bf8646eb55867d75546
+entity:panic.zig::panic.interface.forLenMismatch    sha256:a824d236ed368e4060cfa60942a422a9b01067d03b119056eb42a75cf0dcbd32
+entity:panic.zig::panic.interface.noreturnReturned    sha256:375f14e0df7798859a6aff99d71f886b07c5aea8648038e9a44c47a381177ca4

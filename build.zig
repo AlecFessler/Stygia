@@ -182,15 +182,36 @@ pub fn build(b: *std.Build) void {
             s.addFeature(@intFromEnum(F.avx));
             s.addFeature(@intFromEnum(F.avx2));
         } else if (arch == .aarch64) {
-            // TODO: also drop neon for aarch64 — needs the bootloader
-            // path debugged first (initial attempt boot-faults in
-            // firmware between [STYGIA] stack and [STYGIA] exit BS). For now
-            // leave NEON enabled on aarch64 so the bootloader still
-            // works; lazy-FPU correctness still holds because the
-            // kernel save/restore asm runs unconditionally and the
-            // CPACR_EL1 trap arms regardless of whether the kernel
-            // *could* clobber V regs.
-            _ = std.Target.aarch64.Feature; // keep import shape stable
+            // Drop NEON *and* fp_armv8 (`ldr q`/`str q` are FP-gated, not
+            // NEON-gated — same rationale as the Pi 5 EL2 loader below).
+            //
+            // This is load-bearing for lazy-FPU correctness, not just
+            // codegen hygiene. With these features present, LLVM lowers
+            // 16-byte struct copies to `ldr q0`/`str q0` throughout the
+            // kernel (666 Debug-mode functions measured, including
+            // allocExecutionContext / destroyExecutionContextLocked /
+            // detachForDelete), and ReleaseSafe vectorizes whole loops
+            // (main.zig's exported memset became `dup v0.16b` +
+            // `stp q0,q0`). The lazy-FPU design gives kernel V-regs NO
+            // owner: an IRQ that preempts a kernel q-reg copy mid-flight
+            // context-switches without saving kernel V state, and the
+            // copy later resumes spraying another context's V0 into
+            // kernel structures. Autopsied live on the linux_guest
+            // ReleaseSafe boot: growOne's zeroing memset wrote
+            // v0={0xffffff80bd238280,0xffff000000008e9c} (a physmap ptr
+            // + its own return address) instead of zeros into the first
+            // CD slab slot, and the next create() read the garbage as a
+            // gen word.
+            //
+            // The old TODO here feared the EFI bootloader (it imports
+            // stygia_mod); the loader keeps its own full-featured target
+            // below, and NEON-free module code is valid everywhere.
+            // Hand-written V-reg asm (fpuSave/fpuRestore, hyp guest FP
+            // swap) re-enables the assembler locally via
+            // `.arch_extension fp` + `.arch_extension simd`.
+            const F = std.Target.aarch64.Feature;
+            s.addFeature(@intFromEnum(F.neon));
+            s.addFeature(@intFromEnum(F.fp_armv8));
         }
         break :blk s;
     };

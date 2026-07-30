@@ -492,6 +492,20 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
 /// so the canonical CD → Port order is never inverted — see the lock-
 /// order note on `deliverEvent`.
 pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
+    // Wrapper: run the recv body (which holds the caller's CD gen-lock
+    // throughout, including across `deliverEvent`), then execute the
+    // recorded derivation-tree links AFTER the CD lock has dropped —
+    // `derive` takes `tree_mutex` and must never run under a CD
+    // gen-lock (see `caps.derivation.tree_mutex`). Safe to defer: the
+    // freshly-minted slots belong to `caller`, who is right here in
+    // this syscall and cannot race its own handles.
+    var deferred: DeferredDerives = .{};
+    const ret = recvInner(caller, port, timeout_ns, &deferred);
+    deferred.run();
+    return ret;
+}
+
+fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *DeferredDerives) i64 {
     kprof.enter(.recv);
     defer kprof.exit(.recv);
     const cd_ref = caller.domain;
@@ -545,7 +559,7 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         const port_xfer = port_caps_typed.xfer;
         port_ref.unlockIrqRestore(port_irq_state);
-        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer);
+        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer, deferred);
     }
 
     // No sender ready. Spec §[recv] test 04: if the port has no
@@ -595,7 +609,15 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     caller.pending_reply_holder = null;
     caller.pending_reply_domain = null;
     caller.pending_reply_slot = 0;
-    caller.on_cpu.store(false, .release);
+    // Deliberately NO `on_cpu` clear here. The caller keeps executing
+    // on this very kstack all the way through the syscall epilogue and
+    // into the scheduler (`hopParkRun`); clearing `on_cpu` now lets a
+    // sender's wake pass its release spin, enqueue the caller, and
+    // dispatch it on another core — which then builds fresh kernel
+    // frames down this kstack while we are still running on it (the
+    // "Kernel stack overflow" frame-stomp autopsy). The release is
+    // stashed below and published by the park-kstack hop, the first
+    // instruction after which this core no longer touches the kstack.
 
     // Timed recv — register before dropping the port lock so the wakeup
     // path can find us. Spec §[port].recv test 14.
@@ -610,6 +632,13 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (scheduler.coreCurrentIs(core_id, caller)) {
         scheduler.clearCurrentEc(core_id);
+        // Defer the `on_cpu` release to the park-kstack hop — see the
+        // comment at the `.suspended_on_port` transition above.
+        scheduler.stashKstackRelease(core_id, caller);
+    } else {
+        // Not this core's current EC (fast-path fallback shapes) — the
+        // kstack is not ours, release immediately as before.
+        caller.on_cpu.store(false, .release);
     }
     return 0;
 }
@@ -867,25 +896,38 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
             0,
             0,
         );
+    }
+    // Snapshot the sender-CD ref while its gen is provably live (lock
+    // still held) for the post-unlock derive loop below.
+    const sender_dom_ref_for_derive: capability.ErasedSlabRef = .{
+        .ptr = sender_cd,
+        .gen = @intCast(sender_cd._gen_lock.currentGen()),
+    };
+    sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
-        // Spec §[capabilities].revoke: hang the new alias in the
-        // sender's domain under the source handle in the caller's
-        // (replier's) domain. The sender's CD lock is held; pass it
-        // as `held_dom` so `derive` doesn't re-acquire and deadlock.
+    // Spec §[capabilities].revoke: hang each new alias in the sender's
+    // domain under the source handle in the caller's (replier's)
+    // domain. Runs AFTER the sender-CD gen-lock dropped: `derive`
+    // takes `tree_mutex`, and the old in-loop call (with the CD held
+    // via `held_dom`) was one half of a live AB-BA against the
+    // domain-teardown tree walk — this core spinning on `tree_mutex`
+    // holding sender_cd, the teardown core holding `tree_mutex`
+    // spinning on sender_cd (see `caps.derivation.tree_mutex`).
+    // Ordering is safe: the suspended sender cannot use (or delete)
+    // the minted handles until `deliverReplyTransferResume` marks it
+    // ready in phase 5, and `derive` re-validates gens / bails on
+    // touched slots for every other racer.
+    k = 0;
+    while (k < n) : (k += 1) {
+        const stash = caller.pending_pair_entries[k];
         const caller_dom_ref: capability.ErasedSlabRef = @bitCast(caller.domain);
-        const sender_dom_ref_for_derive: capability.ErasedSlabRef = .{
-            .ptr = sender_cd,
-            .gen = @intCast(sender_cd._gen_lock.currentGen()),
-        };
         _ = stygia.caps.derivation.derive(
             caller_dom_ref,
             stash.src_slot,
             sender_dom_ref_for_derive,
-            target_slot,
-            sender_cd,
+            @intCast(@as(u16, tstart) + k),
         );
     }
-    sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
     // §[reply_transfer] test 14 vreg-14 (RIP) reload: harvest the
     // SMAP-bracketed user-stack read NOW, before any sender lock, so a
@@ -1245,6 +1287,18 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     // a cross-core synthetic-fault handler). For the common case
     // this is a no-op since `releaseSelf` will park it.
     const cd_ref = ec.domain;
+    // Acquire tree_mutex BEFORE the CD gen-lock, mirroring the
+    // `delete(SLOT_SELF)` path (caps.derivation.deleteAndDetach slot==0
+    // arm) EXACTLY — the previous version took the CD lock first and
+    // tree_mutex second, which is the `CD → tree_mutex` inversion that
+    // deadlocks against every tree walk holding `tree_mutex` while
+    // blocking-acquiring third-party CD locks (see the order contract
+    // on `caps.derivation.tree_mutex`). Tag with `TREE_MUTEX_GROUP`
+    // for symmetry with every other tree_mutex acquisition —
+    // mismatched ordered-group tags on the same lock would still
+    // register a phantom edge in cycle detection.
+    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), stygia.caps.derivation.TREE_MUTEX_GROUP);
+
     // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
     // `destroyPhase1`-driven `detachDyingDomainFromTree` walk (which
     // re-locks cross-domain CDs under the same group inside
@@ -1256,19 +1310,12 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
         // CD slab gen has moved — domain is already being torn down
         // by another path. Park the EC; the in-flight teardown will
         // reap it.
+        stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
         execution_context.parkSelfFaulted(ec);
         return;
     };
     const cd = cd_lr.ptr;
     const cd_irq_state = cd_lr.irq_state;
-
-    // Acquire tree_mutex to mirror the `delete(SLOT_SELF)` path
-    // (caps.derivation.deleteAndDetach slot==0 arm); tree_mutex
-    // serializes against concurrent revoke/derive. Tag with
-    // `TREE_MUTEX_GROUP` for symmetry with every other tree_mutex
-    // acquisition — mismatched ordered-group tags on the same lock
-    // would still register a phantom edge in cycle detection.
-    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), stygia.caps.derivation.TREE_MUTEX_GROUP);
 
     // `releaseSelf` releases `cd._gen_lock` via `destroyLocked`
     // before returning; we restore the captured IRQ state manually
@@ -1623,6 +1670,36 @@ fn popHighestPriorityReceiver(p: *Port) ?*ExecutionContext {
 /// reaching here. Holding Port across the CD acquisition done by the
 /// previous version of this function created an AB-BA cycle observed
 /// by lockdep at port.zig:613 vs port.zig:552.
+/// Derivation-tree link work recorded by `deliverEvent` for execution
+/// AFTER the receiver-CD gen-lock drops. `derive` takes `tree_mutex`
+/// and must never run with a CD gen-lock held (see the tree_mutex
+/// order contract in `caps.derivation`) — the old inline derive inside
+/// `deliverEvent`'s mint loop deadlocked against the domain-teardown
+/// tree walk. `src_slots` is bounded by the pair-transfer stash size.
+pub const DeferredDerives = struct {
+    parent_dom: capability.ErasedSlabRef = .{ .ptr = null, .gen = 0 },
+    child_dom: capability.ErasedSlabRef = .{ .ptr = null, .gen = 0 },
+    tstart: u12 = 0,
+    count: u8 = 0,
+    src_slots: [execution_context.MAX_PAIR_ENTRIES_PER_EC]u12 = undefined,
+
+    /// Run the recorded links. Caller must hold NO CD gen-lock. Every
+    /// `derive` re-validates both domains' gens and bails on slots a
+    /// racer touched in the deferral window, so a stale record is a
+    /// silent no-op.
+    pub fn run(self: *const DeferredDerives) void {
+        var k: u8 = 0;
+        while (k < self.count) : (k += 1) {
+            _ = stygia.caps.derivation.derive(
+                self.parent_dom,
+                self.src_slots[k],
+                self.child_dom,
+                @intCast(@as(u16, self.tstart) + k),
+            );
+        }
+    }
+};
+
 fn deliverEvent(
     sender: *ExecutionContext,
     receiver: *ExecutionContext,
@@ -1632,6 +1709,7 @@ fn deliverEvent(
     event_addr: u64,
     pair_count: u8,
     port_xfer: bool,
+    deferred: *DeferredDerives,
 ) i64 {
     kprof.enter(.deliver_event);
     defer kprof.exit(.deliver_event);
@@ -1727,21 +1805,23 @@ fn deliverEvent(
             // Spec §[capabilities].revoke: hang the new alias in the
             // receiver's domain under the source handle in the sender's
             // domain so a future revoke on any ancestor of
-            // `(sender.domain, entry.src_slot)` reaches the alias. The
-            // receiver's CD `dom` is held; we pass it as `held_dom` to
-            // skip the re-acquire inside `derive`.
-            const sender_dom_ref: capability.ErasedSlabRef = @bitCast(sender.domain);
-            const dom_ref: capability.ErasedSlabRef = .{
+            // `(sender.domain, entry.src_slot)` reaches the alias.
+            // RECORDED, not executed: `derive` takes `tree_mutex`, and
+            // the receiver's CD gen-lock is held here — running it
+            // inline is the `CD → tree_mutex` inversion that
+            // deadlocked against the teardown tree walk. The caller
+            // runs `deferred.run()` after this CD lock drops (and, on
+            // the rendezvous path, before the receiver is marked
+            // ready, so the fresh slots cannot be raced by their
+            // owner).
+            deferred.parent_dom = @bitCast(sender.domain);
+            deferred.child_dom = .{
                 .ptr = dom,
                 .gen = @intCast(dom._gen_lock.currentGen()),
             };
-            _ = stygia.caps.derivation.derive(
-                sender_dom_ref,
-                entry.src_slot,
-                dom_ref,
-                target_slot,
-                dom,
-            );
+            deferred.tstart = tstart;
+            deferred.src_slots[deferred.count] = entry.src_slot;
+            deferred.count += 1;
 
             k += 1;
         }
@@ -1958,8 +2038,8 @@ pub fn rendezvousWithReceiver(
         return true;
     };
     const dom = domlr.ptr;
-    defer receiver_dom_ref.unlockIrqRestore(domlr.irq_state);
 
+    var deferred: DeferredDerives = .{};
     _ = deliverEvent(
         sender,
         receiver,
@@ -1969,7 +2049,18 @@ pub fn rendezvousWithReceiver(
         event_addr,
         sender.pending_pair_count,
         receiver.recv_port_xfer,
+        &deferred,
     );
+    // Drop the receiver-CD lock BEFORE running the recorded derivation
+    // links: `derive` takes `tree_mutex`, and holding a CD gen-lock
+    // across that acquire is the AB-BA against the teardown tree walk
+    // (see `caps.derivation.tree_mutex`). Running the links BEFORE
+    // `markReady` keeps the fresh slots unracable: the receiver — the
+    // only legitimate user of the minted handles — cannot run until it
+    // is enqueued below.
+    receiver_dom_ref.unlockIrqRestore(domlr.irq_state);
+    deferred.run();
+
     // No manual `.ready` stamp: `markReady` claims the wait->ready
     // transition itself, so a racing recv-timeout expiry on the timer
     // core cannot also enqueue this receiver. Pre-stamping `.ready` here

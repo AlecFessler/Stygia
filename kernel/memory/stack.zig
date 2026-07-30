@@ -7,7 +7,6 @@ const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 
-const PAddr = stygia.memory.address.PAddr;
 const SpinLock = stygia.utils.sync.SpinLock;
 const VAddr = stygia.memory.address.VAddr;
 

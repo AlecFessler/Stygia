@@ -446,6 +446,8 @@ pub fn vmResume(
     const host_fp_ptr: [*]u8 = @ptrCast(&arch_scratch.host_fp);
     const guest_fp_ptr: [*]u8 = @ptrCast(guest_fxsave);
     asm volatile (
+        \\  .arch_extension fp
+        \\  .arch_extension simd
         \\  // Save host V0..V31 to [host_fp + 0x000..0x200]
         \\  stp     q0, q1,   [%[hfp], #0x000]
         \\  stp     q2, q3,   [%[hfp], #0x020]

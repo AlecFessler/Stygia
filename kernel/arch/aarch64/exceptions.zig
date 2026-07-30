@@ -625,9 +625,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // / futex_wait), `current_ec` was cleared on this core. The
             // exception trampoline would otherwise ERET back to the
             // now-parked user EC; drive the scheduler instead so the
-            // next ready EC takes over (or we idle).
+            // next ready EC takes over (or we idle). Via the
+            // park-kstack hop, not `run()` in place: this frame lives
+            // on the suspended caller's kstack, which is already
+            // claimable by wakers on other cores, and the hop also
+            // publishes the caller's deferred `on_cpu` release.
             if (scheduler.coreIsIdle(core)) {
-                scheduler.run();
+                scheduler.hopParkRun();
             }
             // Identity check, not just idle check. x64's syscall asm
             // re-validates the caller before its sysret; this tail only
@@ -640,9 +644,11 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // executing on another core (measured on the Pi 5 rig:
             // core 0 mid-fault-path on slot 36 with current_ec owning
             // slot 37). The trampoline eret is only ever correct for
-            // `caller`; anything else must go through the scheduler.
+            // `caller`; anything else must go through the scheduler —
+            // via the park-kstack hop: this frame IS the caller's
+            // kstack, and a caller no longer current is claimable.
             if (!scheduler.coreCurrentIs(core, caller)) {
-                scheduler.run();
+                scheduler.hopParkRun();
             }
         },
 
@@ -743,8 +749,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             const ec_ptr = scheduler.currentEc() orelse
                 @panic("wfi trap with no current EC");
             stygia.sched.execution_context.parkIdleWait(ec_ptr);
-            cpu.enableInterrupts();
-            scheduler.run();
+            // Park-kstack hop, IRQs kept masked: the EC is claimable
+            // (`suspend` accepts `.idle_wait`) with its on_cpu release
+            // stashed for the hop; running the scheduler loop in place
+            // on its kstack raced its re-dispatch, and an IRQ here
+            // could self-deadlock on our own pending release (see the
+            // x86 hlt-trap twin).
+            scheduler.hopParkRun();
         },
 
         .msr_mrs_sys_trapped => {
@@ -869,9 +880,11 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // `current_ec` still names the EC that owns it. If dispatchIrq's
     // scheduler work rewrote the slot and then RETURNED (switchTo's
     // non-dispatching exits), falling through would resume a frame the
-    // scheduler handed elsewhere.
+    // scheduler handed elsewhere. Hop, don't run in place: this frame
+    // sits on the interrupted EC's kstack, and an EC no longer current
+    // is claimable by other cores.
     if (scheduler.currentEc() != entry_cur) {
-        scheduler.run();
+        scheduler.hopParkRun();
     }
 }
 
@@ -1006,9 +1019,10 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     dispatchIrq(intid, ctx, .kernel);
     // Identity guard — see handleIrqLowerEl. Kernel-mode frames live on
     // the current EC's kstack; if the slot changed, that kstack may
-    // already be executing elsewhere.
+    // already be executing elsewhere — hop off it before entering the
+    // scheduler loop.
     if (scheduler.currentEc() != entry_cur) {
-        scheduler.run();
+        scheduler.hopParkRun();
     }
 }
 
@@ -1296,18 +1310,22 @@ fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     const ec = scheduler.currentEc() orelse
         @panic("user thread fault with no current EC");
     port.fireThreadFault(ec, @intFromEnum(subcode), payload);
-    cpu.enableInterrupts();
+    // IRQs stay masked: the routed fault may have suspended `ec` with
+    // its kstack release stashed on this core — an IRQ handler here
+    // could spin on that release (markReady's kstack barrier), a
+    // self-deadlock on our own pending stash.
     scheduler.yieldTo(null);
     // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`) cleared
     // this core's `current_ec`; if `yieldTo` couldn't dispatch fresh
     // work, ERET back through `exceptionTrampoline` would surface the
     // now-stale faulting user context, re-fault on the same PC, and
     // re-enter `handleSyncLowerEl` with `currentEc() == null` — hitting
-    // the panic above. Hand off to `scheduler.run()` (noreturn) — it
-    // idles via WFI until an IRQ delivers more work, at which point
-    // dispatch resets SP and abandons this kernel-stack frame.
+    // the panic above. Hand off via the park-kstack hop (noreturn) —
+    // this frame lives on the suspended EC's claimable kstack, and the
+    // hop publishes its deferred on_cpu release before the scheduler
+    // loop idles/dispatches.
     // Mirrors arch/x64/exceptions.zig user-exception handler tail.
-    if (scheduler.currentEc() == null) scheduler.run();
+    if (scheduler.currentEc() == null) scheduler.hopParkRun();
 }
 
 /// Look up the running EC, fire a `breakpoint` event with `subcode`,
@@ -1316,7 +1334,8 @@ fn deliverBreakpoint(subcode: BreakpointSubcode) void {
     const ec = scheduler.currentEc() orelse
         @panic("user breakpoint with no current EC");
     port.fireBreakpoint(ec, @intFromEnum(subcode));
-    cpu.enableInterrupts();
+    // Masked + hop for the same kstack-release reasons as
+    // `deliverThreadFault`.
     scheduler.yieldTo(null);
     // Same post-yieldTo guard as `deliverThreadFault`. `fireBreakpoint`'s
     // no-route fallback does NOT park (it just drops the event), so
@@ -1325,5 +1344,5 @@ fn deliverBreakpoint(subcode: BreakpointSubcode) void {
     // `current_ec` on this core. Without this guard a routed delivery
     // followed by an empty run queue would ERET back to a stale user
     // PC and re-fault.
-    if (scheduler.currentEc() == null) scheduler.run();
+    if (scheduler.currentEc() == null) scheduler.hopParkRun();
 }
