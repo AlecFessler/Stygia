@@ -1211,23 +1211,31 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
     // §[capabilities].revoke test 04 generalized to domain destroy).
     stygia.caps.derivation.detachDyingDomainFromTree(cd);
 
-    // Tear down every VMAR bound to the domain. The destroy-path
-    // variant clears leaf PTEs (so `freeUserAddrSpace` can distinguish
-    // PF-backed leaves from singleton PMM leaves) and decrements
-    // `pf.mapcnt` for every still-installed page_frame, but skips the
-    // per-page TLB shootdown — no core has the dying CD's CR3 active.
-    // removeVar tail-swaps so iterating from the tail each step lets
-    // the array shrink under us without reordering un-walked entries.
-    while (cd.var_count > 0) {
-        const last = cd.var_count - 1;
-        const v_ref = cd.vars[last] orelse {
-            cd.var_count = last;
-            continue;
-        };
-        // caller-pinned: VMAR's domain.ptr is cd; we hold cd._gen_lock.
-        stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
-    }
-
+    // NOTE (stygia-1im): the `cd.vars[]` teardown deliberately does NOT
+    // run here. It moved to `destroyPhase2`, immediately after
+    // `awaitDomainQuiesced`. Unmapping in phase 1 was unsound: phase 1
+    // only dead-marks the CD, and this function's callers hold locks
+    // that forbid the quiesce barrier, so at this point a still-live EC
+    // of this domain can be executing on ANOTHER core — typically
+    // sitting in the kernel mid-syscall, about to `sysretq` back to
+    // user. Clearing its leaf PTEs here pulls the user text out from
+    // under it, and the moment it returns to user mode it takes an
+    // instruction-fetch fault on an address with no VMAR. The resulting
+    // `memory_fault` is then unroutable (this CD's gen is already even,
+    // so the fault port cannot be resolved) and the EC is parked with
+    // `[NOROUTE] ... why=unbound`.
+    //
+    // Observed on x86-64 with the suite spread across 4 cores: the
+    // victim faults at the return address of libz's syscall stub
+    // (`syscall.issueRawNoStack` + 0x20) or at the `memcpy` it calls two
+    // instructions later, depending on which page was still TLB-hot.
+    // The old single-core test placement serialized the runner against
+    // its children and hid it entirely.
+    //
+    // The per-page-shootdown skip that the destroy-path VMAR teardown
+    // relies on ("no core has the dying CD's CR3 active") is likewise
+    // only TRUE after the barrier — so the unmap belongs there and
+    // nowhere else.
     const cd_gen = cd._gen_lock.currentGen();
     const deferred = DestroyDeferred{
         .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
@@ -1338,6 +1346,40 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         deferred.cd_ref.ptr,
     );
 
+    // Tear down every VMAR bound to the domain (stygia-1im: moved here
+    // from destroyPhase1 — see the note there). The destroy-path
+    // variant clears leaf PTEs (so `freeUserAddrSpace` below can
+    // distinguish PF-backed leaves from singleton PMM leaves) and
+    // decrements `pf.mapcnt` for every still-installed page_frame, but
+    // skips the per-page TLB shootdown. That skip is sound precisely
+    // BECAUSE the barrier above has already run: no core has the dying
+    // CD's root loaded and no core holds a dying-domain EC in its
+    // dispatch slot, so there is no live translation left to shoot
+    // down. Running it before the barrier is what produced the
+    // spurious user instruction-fetch faults this ordering fixes.
+    //
+    // removeVar tail-swaps, so iterating from the tail each step lets
+    // the array shrink under us without reordering un-walked entries.
+    //
+    // caller-pinned: `cd_ref.ptr` is dead-marked (phase 1's
+    // `bumpDeadGenLocked`) but bytes-intact until `destroyAlreadyMarked`
+    // at the end of this function, so `vars[]` / `var_count` /
+    // `addr_space_root` all still read true. The even gen makes handle
+    // resolution into this CD fail, so no concurrent `destroy_vmar` can
+    // reach these VMARs; phase 2 is their sole remaining owner. This
+    // walk must stay ahead of the per-handle release walk and
+    // `freeUserAddrSpace` below, exactly as it was when it ran in
+    // phase 1.
+    const dying_cd = deferred.cd_ref.ptr;
+    while (dying_cd.var_count > 0) {
+        const last = dying_cd.var_count - 1;
+        const v_ref = dying_cd.vars[last] orelse {
+            dying_cd.var_count = last;
+            continue;
+        };
+        stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
+    }
+
     // Reap the destroying-domain's caller EC's slab slot. `parkSelfFaulted`
     // left it at gen=odd / state=.exited / off-freelist — `destroyEcsInDomain`
     // skipped it via `keep_ref` because we are still standing on its kstack.
@@ -1373,7 +1415,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // device_region per spec proposal §3). With the alias-side
     // `incHandleRef`/`onHandleAcquire` in passed_handles processing,
     // every such handle is a real lifetime contributor and must be
-    // released here. VMARs are owned by destroyPhase1's `cd.vars[]`
+    // released here. VMARs are owned by destroyPhase2's `cd.vars[]`
     // walk; capability_domain / execution_context / reply / vm are
     // domain-or-system-lifetime and have nothing to release here.
     //
@@ -1446,7 +1488,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // page-table walker frees PT/PD/PDPT/PML4 pages and any leaf
     // physical page that came from a single-page PMM.create — i.e.
     // mapUserStack and loadElfSegments allocations. Page-frame leaves
-    // were already cleared by the destroyPhase1 vars[] walk; the leaves
+    // were already cleared by the destroyPhase2 vars[] walk above; the leaves
     // shared with `user_buf` (mapUserTableView aliases the user_buf
     // pages into user space at `table_base`) are skipped via the
     // [user_buf_phys, user_buf_phys + USER_TABLE_BYTES) range so the
