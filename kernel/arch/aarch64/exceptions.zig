@@ -629,6 +629,21 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             if (scheduler.coreIsIdle(core)) {
                 scheduler.run();
             }
+            // Identity check, not just idle check. x64's syscall asm
+            // re-validates the caller before its sysret; this tail only
+            // checked for idle, so a handler that left `current_ec`
+            // naming a DIFFERENT EC fell through to the trampoline
+            // epilogue, which ERETs the CALLER's frame — resuming an EC
+            // the scheduler had handed elsewhere, with SP_EL1 left on
+            // the caller's kstack. The next kernel entry from that user
+            // context then runs on a kstack whose EC is concurrently
+            // executing on another core (measured on the Pi 5 rig:
+            // core 0 mid-fault-path on slot 36 with current_ec owning
+            // slot 37). The trampoline eret is only ever correct for
+            // `caller`; anything else must go through the scheduler.
+            if (!scheduler.coreCurrentIs(core, caller)) {
+                scheduler.run();
+            }
         },
 
         .data_abort_lower_el => {
@@ -648,6 +663,12 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .is_exec = false,
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
+                // For the no-current-EC panic path: the doomed context's
+                // registers are the evidence (a disowned core running a
+                // double-dispatched EC shows the SECOND resume's frame).
+                .fp = ctx.regs.x29,
+                .lr = ctx.regs.x30,
+                .frame_ctx = ctx,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -662,6 +683,9 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .is_exec = true,
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
+                .fp = ctx.regs.x29,
+                .lr = ctx.regs.x30,
+                .frame_ctx = ctx,
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
@@ -682,8 +706,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             deliverBreakpoint(.software);
         },
 
-        .software_step_lower_el, .watchpoint_lower_el => {
-            // Single-step / watchpoint from userspace: resume silently.
+        .software_step_lower_el => {
+            // Single-step from userspace: resume silently.
+            return;
+        },
+
+        .watchpoint_lower_el => {
+            // Watchpoint from userspace: resume silently.
             return;
         },
 
@@ -832,8 +861,18 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // unreachable on a context switch, leaving the interrupt permanently
     // in the active state and masking every subsequent delivery of that
     // same priority (IHI 0069H §4.6: an active interrupt blocks pending).
+    const entry_cur = scheduler.currentEc();
     gic.endOfInterrupt(intid);
     dispatchIrq(intid, ctx, .user);
+    // Identity guard, same rationale as the svc tail: the trampoline
+    // epilogue ERETs the INTERRUPTED frame, which is only correct while
+    // `current_ec` still names the EC that owns it. If dispatchIrq's
+    // scheduler work rewrote the slot and then RETURNED (switchTo's
+    // non-dispatching exits), falling through would resume a frame the
+    // scheduler handed elsewhere.
+    if (scheduler.currentEc() != entry_cur) {
+        scheduler.run();
+    }
 }
 
 /// Mask CNTP/CNTV at the source if their ISTATUS is asserted. Called
@@ -914,6 +953,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
 
+
         else => {
             // Lock-free, same protocol as memory.fault.reportKernelFault:
             // a corrupted PC lands here (PC-alignment fault, EC=0x22, seen
@@ -961,8 +1001,15 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     silenceTimerLineIfFiring(intid);
 
     // EOI before dispatch — see handleIrqLowerEl for rationale.
+    const entry_cur = scheduler.currentEc();
     gic.endOfInterrupt(intid);
     dispatchIrq(intid, ctx, .kernel);
+    // Identity guard — see handleIrqLowerEl. Kernel-mode frames live on
+    // the current EC's kstack; if the slot changed, that kstack may
+    // already be executing elsewhere.
+    if (scheduler.currentEc() != entry_cur) {
+        scheduler.run();
+    }
 }
 
 /// Panic handler for unexpected/unimplemented vector entries.

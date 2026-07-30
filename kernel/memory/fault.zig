@@ -101,6 +101,10 @@ const FatalCapture = struct {
     is_exec: bool = false,
     have_regs: bool = false,
     regs: arch.cpu.ArchCpuContext = undefined,
+    /// Address the live exception frame was captured at, so the report
+    /// can locate and hex-dump the interrupted stack region itself —
+    /// the register copy alone cannot recover it.
+    frame_at: u64 = 0,
     msg: []const u8 = "",
 };
 var fatal_capture: FatalCapture = .{};
@@ -120,8 +124,10 @@ fn reportKernelFaultFatal(fault: *const PageFaultContext, msg: []const u8) noret
     if (fault.frame_ctx) |ctx| {
         fatal_capture.regs = ctx.*;
         fatal_capture.have_regs = true;
+        fatal_capture.frame_at = @intFromPtr(ctx);
     } else {
         fatal_capture.have_regs = false;
+        fatal_capture.frame_at = 0;
     }
     arch.cpu.jumpOnStack(
         @intFromPtr(&fatal_stack) + fatal_stack.len,
@@ -148,7 +154,38 @@ fn reportCapturedAndPanic() callconv(.c) noreturn {
     if (fatal_capture.have_regs) arch.cpu.dumpFaultRegs(&fatal_capture.regs);
     dumpFrameChain(fatal_capture.fp);
     dumpCoreStatesRaw();
+    // Raw bytes of the interrupted stack, from just below its SP upward
+    // through its live frames. The register scraps identify corruption;
+    // the raw bytes identify the WRITER — trample content is structured
+    // (slices, enums, frame records) and pattern-matches offline against
+    // the ELF far better than four sampled registers can.
+    if (fatal_capture.frame_at != 0) {
+        const interrupted_sp = fatal_capture.frame_at + @sizeOf(arch.cpu.ArchCpuContext) + 16;
+        dumpStackRaw(interrupted_sp - 64, 512);
+    }
     @panic(fatal_capture.msg);
+}
+
+fn dumpStackRaw(base: u64, len: u64) void {
+    arch.boot.printRaw("  stack raw:\n");
+    var addr = base & ~@as(u64, 7);
+    const end = base + len;
+    while (addr < end) : (addr += 64) {
+        const first = VAddr.fromInt(std.mem.alignBackward(u64, addr, paging.PAGE4K));
+        const last = VAddr.fromInt(std.mem.alignBackward(u64, addr + 63, paging.PAGE4K));
+        if (arch.paging.resolveVaddr(memory_init.kernel_addr_space_root, first) == null) break;
+        if (last.addr != first.addr and
+            arch.paging.resolveVaddr(memory_init.kernel_addr_space_root, last) == null) break;
+        arch.boot.printRaw("  ");
+        panic_mod.printHex(addr);
+        arch.boot.printRaw(":");
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            arch.boot.printRaw(" ");
+            panic_mod.printHex(@as(*const u64, @ptrFromInt(addr + i * 8)).*);
+        }
+        arch.boot.printRaw("\n");
+    }
 }
 
 /// One line per online core: park-stack range, current EC and its
@@ -290,7 +327,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // more work, at which point dispatch via
         // `loadEcContextAndReturn` resets `rsp` and abandons this
         // kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        // Identity, not just null: the wake/destroy machinery can leave
+        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an EC the
+        // scheduler may be running elsewhere. Only `ec` itself may be
+        // resumed through this frame.
+        const cur_after = scheduler.currentEc();
+        if (cur_after == null or cur_after.? != ec) scheduler.run();
         return;
     }
 
@@ -372,7 +415,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // See the kernel-on-user-VA branch above: the no-route fallback
         // drains `current_ec`; if no other EC is ready we MUST not iretq
         // back to the stale faulting frame.
-        if (scheduler.currentEc() == null) scheduler.run();
+        // Identity, not just null: the wake/destroy machinery can leave
+        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an EC the
+        // scheduler may be running elsewhere. Only `ec` itself may be
+        // resumed through this frame.
+        const cur_after = scheduler.currentEc();
+        if (cur_after == null or cur_after.? != ec) scheduler.run();
         return;
     };
     const dom = dom_lr.ptr;
@@ -404,6 +453,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         arch.cpu.enableInterrupts();
         scheduler.yieldTo(null);
         // Same rationale as the kernel-on-user-VA branch.
-        if (scheduler.currentEc() == null) scheduler.run();
+        // Identity, not just null: the wake/destroy machinery can leave
+        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an EC the
+        // scheduler may be running elsewhere. Only `ec` itself may be
+        // resumed through this frame.
+        const cur_after = scheduler.currentEc();
+        if (cur_after == null or cur_after.? != ec) scheduler.run();
     }
 }
