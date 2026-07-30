@@ -7,6 +7,7 @@ const kprof = stygia.kprof.trace_id;
 const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
+const panic_mod = stygia.panic;
 const pf_log = stygia.utils.pf_log;
 const port = stygia.sched.port;
 const scheduler = stygia.sched.scheduler;
@@ -49,6 +50,46 @@ fn demandPageKernel(faulting_virt: VAddr) void {
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
     arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS, .kernel_data) catch
         @panic("mapPage failed in kernel demand page fault");
+}
+
+/// Report an unexpected kernel-privilege fault, lock-free, immediately
+/// before panicking on it.
+///
+/// This used `arch.boot.print`, which takes `serial.print_lock`, and that
+/// turned a diagnosable panic into an undiagnosable wedge. Two ways:
+///
+///   1. **Recursive acquire.** A kernel fault can be taken *from inside*
+///      `serial.print` — that function keeps a 256-byte format buffer on
+///      the stack, so it is one of the larger frames in the kernel and a
+///      prime candidate for tipping a deep path over its stack guard.
+///      When that happens `print_lock` is already held by this core, and
+///      re-taking it trips the lockdep same-core recursive-acquire check,
+///      which calls `@panic` itself. The original fault address is lost
+///      and the kernel spins in the printer. Measured on the aarch64 rig
+///      under 4-core spread: the real event was a kernel stack overflow
+///      on core 3, and all that reached the wire was
+///      `lockdep: recursive acquire core=3` with a backtrace through
+///      `handlePageFault -> print -> lockIrqSave`.
+///   2. **Deadlock in disguise.** Even without lockdep, spinning for a
+///      lock whose holder is another core that is also panicking never
+///      terminates.
+///
+/// `kernel/panic.zig` documents both hazards and avoids them by using
+/// `printRaw` exclusively; this is the same reasoning applied to the
+/// pre-panic diagnostic, which `claimPanic`'s doc comment already
+/// anticipated ("fault-handler print -> @panic" from the same core
+/// returns true, so claiming here does not lock `panic()` out).
+///
+/// Claiming the gate also stops concurrent faulting cores from
+/// interleaving into each other's output — the earlier bare-metal logs
+/// contain `KERKERNEL PAGE FAULT at 0xf` followed by a run of NULs,
+/// which is two cores writing the same reporter at once.
+fn reportKernelFault(addr: u64, is_write: bool, is_exec: bool) void {
+    if (!panic_mod.claimPanic()) arch.cpu.halt();
+    arch.boot.printRaw("KERNEL PAGE FAULT at 0x");
+    panic_mod.printHex(addr);
+    arch.boot.printRaw(if (is_write) " (write=true" else " (write=false");
+    arch.boot.printRaw(if (is_exec) " exec=true)\n" else " exec=false)\n");
 }
 
 /// Translate (is_write, is_exec) into the rwx triple consumed by
@@ -143,7 +184,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (comptime pf_log.enabled) {
             pf_log.mark(scheduler.currentEc(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
         }
-        arch.boot.print("KERNEL PAGE FAULT at 0x{x} (write={} exec={})\n", .{ faulting_virt.addr, is_write, is_exec });
+        reportKernelFault(faulting_virt.addr, is_write, is_exec);
         @panic("unexpected kernel page fault");
     }
 

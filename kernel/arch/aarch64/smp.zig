@@ -550,6 +550,37 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
         \\mov x12, #(1 << 31)
         \\msr hcr_el2, x12
         \\
+        // Make EL1 reads of MIDR_EL1 / MPIDR_EL1 return this core's real
+        // identity. Whenever EL2 is implemented, those EL1 reads are
+        // serviced by VPIDR_EL2 / VMPIDR_EL2, whose reset values are
+        // architecturally UNKNOWN (ARM ARM D13.2.139, D13.2.140) — so
+        // without these two writes an AP that drops to EL1 reads GARBAGE
+        // for its own MPIDR while reading it correctly at EL2.
+        //
+        // `gic.coreID()` is MPIDR-derived, so that garbage becomes the
+        // core's logical index: `sched.perCoreInit` installs this core's
+        // park kstack at `core_states[garbage]`, and every later
+        // `currentEc()` / per-core lookup consults a slot no dispatch ever
+        // wrote. The observable failures are a "user page fault with no
+        // current EC" panic (a fault arrives from EL0 on a core whose
+        // current_ec slot is not the one dispatch used) and wild pointers
+        // out of neighbouring per-core state.
+        //
+        // The loader already does exactly this for the BSP, and its own
+        // comment calls leaving it "about the most confusing failure
+        // available" (bootloader/pi5/handoff.zig prepareEl2ForEl1). Linux
+        // does it in init_el2_state for the same reason. The AP trampoline
+        // configured HCR/CNTHCTL/CPTR/HSTR but never these, so only
+        // secondaries were affected — and only on hardware, since KVM and
+        // AAVMF hand the kernel a correctly-virtualized MPIDR at EL1.
+        //
+        // Reading MPIDR_EL1 here is safe: at EL2 it returns the real
+        // register, not VMPIDR_EL2.
+        \\mrs x12, midr_el1
+        \\msr vpidr_el2, x12
+        \\mrs x12, mpidr_el1
+        \\msr vmpidr_el2, x12
+        \\
         // Let EL1 access the physical counter/timer without trapping.
         \\mrs x12, cnthctl_el2
         \\orr x12, x12, #(3 << 0)
@@ -655,6 +686,30 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     // kernel. The same silicon under KVM 6.12, TCG, and x86 walkers all
     // tolerated it, but nothing obliges a walker to snoop.
     aarch64_paging.restoreWalkAttrs();
+
+    // This core's own idea of who it is must match the index the BSP
+    // started it as, BEFORE anything indexes per-core state by it.
+    //
+    // `core_idx` arrives from the BSP through SecondaryBootParams and is
+    // authoritative. `gic.coreID()` is derived from MPIDR_EL1, which at
+    // EL1 is serviced by VMPIDR_EL2 — see the VPIDR/VMPIDR note in the
+    // trampoline for how that read returns garbage if EL2 was not set up.
+    // A mismatch means `perCoreInit` would install this core's park kstack
+    // and timer under someone else's index, and every subsequent
+    // `currentEc()` on this core would consult a slot no dispatch wrote.
+    //
+    // Halting is the right response rather than continuing with a warning:
+    // the damage is to state SHARED with cores that are working, so a
+    // wrong-index core is strictly worse than an absent one. Not
+    // incrementing `cores_online` makes the BSP report this core as
+    // "CPU_ON accepted but never signalled online", which is accurate.
+    if (gic.coreID() != core_idx) {
+        serial.print(
+            "[smp] core {d}: FATAL, coreID() reports {d} — MPIDR_EL1 at EL1 is not this core's\n",
+            .{ core_idx, gic.coreID() },
+        );
+        cpu.halt();
+    }
 
     // Initialize the GIC redistributor and CPU interface for this core.
     // This MUST complete before we increment `cores_online`: the BSP

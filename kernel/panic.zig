@@ -34,6 +34,40 @@ pub const PANIC_OWNER_NONE: u32 = 0xff;
 
 pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OWNER_NONE);
 
+/// Set by `panic` on entry and never cleared. Distinct from `panic_owner`,
+/// which deliberately lets the SAME core back in so a fault-handler
+/// diagnostic can claim the gate and then `@panic` — see `claimPanic`.
+/// That allowance is also a recursion hole, because everything `panic`
+/// does after the first line needs stack: `printRaw` calls, a 64-frame
+/// `StackIterator` walk, symbolization, and three ring dumps.
+///
+/// When the panic IS a kernel stack overflow, that work faults on the
+/// guard page. The fault handler classifies it, calls
+/// `@panic("Kernel stack overflow")`, re-enters here, `claimPanic`
+/// returns true again for this core, and the next `printRaw` faults at
+/// the same depth. Each turn of the loop makes no forward progress and
+/// emits nothing, so the observable result is output that stops
+/// mid-sentence and a machine that never comes back.
+///
+/// Measured on the aarch64 KVM rig under 4-core spread: the entire panic
+/// output was the single line `KERNEL PANIC: user page fault with no
+/// current EC` — not even the `\n` that follows the message, let alone a
+/// frame. With this guard the second entry halts immediately, so the
+/// first panic's message is the last thing written and stays readable.
+///
+/// This cannot fully rescue an aarch64 stack overflow: the vector entry
+/// at `exceptions.exceptionVectorTable` does `stp x0, x30, [sp, #-16]!`
+/// with no stack switch, so once SP is below the guard the *hardware*
+/// takes a nested abort before any of this code runs. Reporting that
+/// properly needs a per-core exception stack (the moral equivalent of
+/// x86's IST), which is not attempted here.
+var panicking: [MAX_PANIC_CORES]bool = [_]bool{false} ** MAX_PANIC_CORES;
+
+/// Bound for the `panicking` flags. `smp.MAX_CORES` is 256 in the
+/// scheduler; a byte each is cheap and indexing is bounds-checked below so
+/// an out-of-range core id degrades to "no guard" rather than corruption.
+const MAX_PANIC_CORES: usize = 256;
+
 /// Try to claim the panic gate. Used both by pre-panic diagnostic prints
 /// (e.g. fault-handler dumps) and by `panic()` itself. The winning core
 /// is the only one allowed to print; loser cores halt silently.
@@ -58,6 +92,16 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     _ = trace;
 
     if (!claimPanic()) arch.cpu.halt();
+
+    // Re-entry on this core means the panic path itself faulted. Halt
+    // without touching the serial port or the stack: whatever we already
+    // emitted is the evidence, and any further work re-faults at the same
+    // depth. See `panicking`.
+    const self: usize = @truncate(stygia.arch.dispatch.smp.coreID());
+    if (self < MAX_PANIC_CORES) {
+        if (panicking[self]) arch.cpu.halt();
+        panicking[self] = true;
+    }
 
     arch.boot.printRaw("KERNEL PANIC: ");
     arch.boot.printRaw(msg);
@@ -107,7 +151,13 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     arch.cpu.halt();
 }
 
-fn printHex(n: u64) void {
+/// Print `n` as uppercase hex with no lock and no allocator.
+///
+/// Public because the panic path is not the only place that has to report
+/// something while `print_lock` may already be held by this very core —
+/// `memory.fault`'s kernel-fault diagnostic is in exactly that position.
+/// See the module doc above for why a locked printer cannot be used there.
+pub fn printHex(n: u64) void {
     var buf: [16]u8 = undefined;
     var i: usize = buf.len;
     var v = n;
