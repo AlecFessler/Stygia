@@ -776,7 +776,26 @@ pub fn onFire(t: *Timer, expected_pop_gen: u64) void {
 /// `value` into each `Capability.field0`, futex-waking the paddr, and
 /// kicking idle remote cores so they re-evaluate the wake. Spec §[timer]
 /// (eager but non-atomic propagation across copies).
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE) — see `propagateAndWake`.
+var prop_calls: u64 = 0;
+
 fn propagateAndWake(t: *Timer, gen: u63, value: u64) void {
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Spawns succeed and no
+    // resource reports empty, so the collapse is progressive SLOWDOWN,
+    // not exhaustion. Prime suspect: this walk. It runs on every timer
+    // fire, visits every live CD slab slot, and each visitor scans all
+    // MAX_HANDLES_PER_DOMAIN (4096) handles. `count_total` only grows
+    // (slots recycle, the slab never shrinks), so the per-fire cost
+    // climbs toward 256*4096 ~= 1M reads. Print it against the runner's
+    // pass summaries in the same log to see whether the cost curve and
+    // the collapse line up.
+    prop_calls +%= 1;
+    if (prop_calls % 2048 == 0) {
+        stygia.arch.dispatch.boot.print(
+            "[2u0] propagateAndWake calls={d} cd_count_total={d}\n",
+            .{ prop_calls, stygia.caps.capability_domain.slab_instance.count_total },
+        );
+    }
     var ctx = PropagateCtx{
         .timer_ref = SlabRef(Timer).init(t, gen),
         .value = value,
@@ -822,61 +841,178 @@ const PropagateCtx = struct {
     value: u64,
 };
 
-fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
-    _ = gen;
-    // caller-pinned: caller (`propagateAndWake`) holds a live SlabRef — the
-    // Timer is wheel-pinned + refcount-pinned for the duration of the
-    // visitor walk. We only consume the raw ptr/gen for identity match
-    // against `entry.ref` below; we never deref the timer through
-    // `timer_ptr`.
+/// TEMP DIAGNOSTIC (stygia-9zr, REMOVE). Instruments for "the CD died
+/// UNDER the propagate walk" — the race the verify-and-acquire below
+/// closes.
+///   w_visits — visitor invocations that acquired the CD
+///   w_stale  — invocations whose verify-and-acquire found the slot
+///              already dead (the race, caught and skipped)
+///   w_gen    — gen observed changing while we hold the lock at that
+///              gen. Impossible by construction; a tripwire, must be 0.
+///   w_null   — a table base observed null/changed inside the locked
+///              window. Also impossible now; must be 0.
+///
+/// BASELINE (no lock, x86 KVM, 20 clean passes, c3_probe_x86.log):
+/// `w_visits=7577 w_gen=13 w_null=0` — 13 walks read a CD that was
+/// dead-marked under them, 0.65 per suite pass.
+pub var w_visits: u64 = 0;
+pub var w_gen: u64 = 0;
+pub var w_null: u64 = 0;
+pub var w_stale: u64 = 0;
+
+fn wbump(counter: *u64) void { // TEMP DIAGNOSTIC (stygia-9zr, REMOVE)
+    _ = @atomicRmw(u64, counter, .Add, 1, .monotonic);
+}
+
+/// TEMP DIAGNOSTIC (stygia-9zr, REMOVE). Run at the end of a locked
+/// scan chunk, while the CD gen-lock is still held at `gen`.
+fn noteScanEnd(cd: *CapabilityDomain, gen: u63, kt0: usize, ut0: usize) void {
+    if (cd._gen_lock.currentGen() != gen) wbump(&w_gen);
+    const kt1 = @intFromPtr(cd.kernel_table);
+    const ut1 = @intFromPtr(cd.user_table);
+    if (kt1 != kt0 or ut1 != ut0 or kt1 == 0 or ut1 == 0) wbump(&w_null);
+}
+
+/// Slots scanned per CD gen-lock acquisition.
+///
+/// The lock CANNOT be held across the whole 4096-slot table. Every
+/// syscall takes its own domain's gen-lock (`callerDomain`), so a walk
+/// that holds it for a full table blocks that domain's syscalls for the
+/// whole scan — and with three idle cores each firing a periodic timer,
+/// the holder hands off to another walk before the syscall side ever
+/// wins. Measured as a 2118 ms `[HANG] no serial progress` with the
+/// runner EC RUN-but-starved on core 0 and every other core idle
+/// (c3_fix_x86_20.log:12789), on a build that was otherwise 20/20 clean.
+/// Chunking bounds a hold to `SCAN_CHUNK` slots and gives the syscall
+/// side an acquire window between chunks.
+///
+/// Correctness is per chunk, not per walk: within a chunk the gen-lock
+/// pins the CD and both table blocks, and each new chunk re-verifies
+/// the gen. A domain destroyed between chunks fails the re-acquire and
+/// the walk stops there — correct, since spec §[timer] makes
+/// propagation eager but non-atomic across copies and a dead domain has
+/// no observer left.
+const SCAN_CHUNK: u16 = 256;
+
+/// Matching handle slots staged per locked chunk before their
+/// `futex.wake`s are issued. The wake CANNOT run under the CD gen-lock:
+/// `futex.wake` phase 2 contains an unbounded `while (ec.on_cpu)` spin
+/// that stygia-qbx deliberately placed OUTSIDE every lock, and parking
+/// that spin under a gen-lock is the exact repair qbx rejected.
+const WAKE_BATCH: usize = 16;
+
+/// Walk one domain's handle table for copies of `ctx.timer_ref` and
+/// write `ctx.value` into each matching `Capability` field, waking the
+/// futex on each match when `which == .field0`. Spec §[timer] (eager
+/// but non-atomic propagation across copies).
+///
+/// VERIFY-AND-ACQUIRE, and why it is not optional. `forEachAlive` holds
+/// NO lock across the visitor and documents that liveness is
+/// best-effort: "callers must take the per-slot gen-lock themselves if
+/// they need exclusive access to T's fields". This walk needs exactly
+/// that — it dereferences `cd.kernel_table` and `cd.user_table` up to
+/// 4096 times each — and used to take nothing at all. A walk that
+/// admitted the CD before `destroyPhase1` dead-marked it stayed in the
+/// loop while `destroyPhase2` `freeBlock`'d both table blocks and then
+/// `destroyAlreadyMarked` zeroed every CD byte but the gen word. The
+/// entry-time null check that used to sit here could not see that: the
+/// base goes null mid-loop, long after the check passed.
+///
+/// Measured, not assumed. x86-64 KVM, 20 clean passes, `w_gen=13` of
+/// 7577 visits — 0.65 walks per suite pass read a CD that died under
+/// them. Reaching the zeroed base is rarer still, and that is the
+/// stygia-9zr panic: KERNEL PAGE FAULT at 0x5D9D8 = 104 * 3687 =
+/// `@sizeOf(KernelHandle) * slot` from a NULL base, in
+/// `propagateField1Visitor`, reached from `wheelExpireDue` -> `onFire`
+/// on core 1's park stack, which killed core 1 at pass 79 of an N=100
+/// run and stranded a READY EC in its run queue.
+///
+/// `destroyPhase1` bumps the gen dead UNDER this same lock, so holding
+/// it makes the CD and both tables stable for the chunk; an acquire
+/// that loses the race fails with `StaleHandle` and the domain is
+/// skipped.
+///
+/// Lock discipline: the fire path reaches here holding NOTHING
+/// (`wheelExpireDue` drops `wheel_locks[core]` before `onFire` and
+/// `onFire` drops `t._gen_lock` before propagating), and the syscall
+/// paths reach it via `callerDomain`, which unlocks before returning.
+/// So this is a top-of-chain acquisition, consistent with the
+/// documented `tree_mutex -> cd._gen_lock -> t._gen_lock ->
+/// wheel_locks[c]` order, and it can never nest on itself. Every CD
+/// gen-lock acquire site in the tree is IRQ-saving
+/// (`lockTypedIrqSaveOrdered` / `lockIrqSave`), so a timer IRQ cannot
+/// land on a core that already holds one.
+fn propagateVisit(
+    ctx: *PropagateCtx,
+    cd: *CapabilityDomain,
+    gen: u63,
+    comptime which: HandleField,
+) bool {
+    const cd_ref = SlabRef(CapabilityDomain).init(cd, gen);
+    // caller-pinned: caller (`propagateAndWake` / `propagateField1`) holds
+    // a live SlabRef — the Timer is wheel-pinned + refcount-pinned for the
+    // duration of the visitor walk. We only consume the raw ptr/gen for
+    // identity match against `entry.ref` below; we never deref the timer
+    // through `timer_ptr`.
     const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
     const timer_gen: u32 = ctx.timer_ref.gen;
+
     var slot: u16 = 0;
+    var acquired = false;
     while (slot < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) {
-        const entry = &cd.kernel_table[slot];
-        if (entry.ref.ptr) |obj_ptr| {
-            // Identity match requires both ptr and gen — without the
-            // gen check, a recycled slab slot at the same address would
-            // false-match and we'd write the new (different) timer's
-            // data to an unrelated CD's table slot.
-            if (obj_ptr == timer_ptr and entry.ref.gen == timer_gen) {
-                const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
-                if (tag == .timer) {
-                    const slot12: u12 = @truncate(slot);
-                    const paddr = computeFieldPaddr(cd, slot12, .field0);
-                    arch.userio.writeU64ViaPhysmap(paddr, ctx.value);
-                    _ = futex.wake(paddr, std.math.maxInt(u32));
+        var wakes: [WAKE_BATCH]PAddr = undefined;
+        var n: usize = 0;
+        {
+            const clr = cd_ref.lockIrqSave(@src()) catch {
+                // TEMP DIAGNOSTIC (stygia-9zr, REMOVE). Counts BOTH
+                // "already dead when the walk reached it" and "died
+                // between two chunks" — the same race either way, and
+                // the population that used to walk freed memory.
+                wbump(&w_stale);
+                return true;
+            };
+            defer cd_ref.unlockIrqRestore(clr.irq_state);
+            if (!acquired) {
+                acquired = true;
+                wbump(&w_visits); // TEMP DIAGNOSTIC (stygia-9zr, REMOVE)
+            }
+            const kernel_table = cd.kernel_table;
+            const user_table = cd.user_table;
+            const chunk_end = @min(
+                slot +| SCAN_CHUNK,
+                @as(u16, stygia.caps.capability.MAX_HANDLES_PER_DOMAIN),
+            );
+            while (slot < chunk_end and n < WAKE_BATCH) : (slot += 1) {
+                const entry = &kernel_table[slot];
+                const obj_ptr = entry.ref.ptr orelse continue;
+                // Identity match requires both ptr and gen — without the
+                // gen check, a recycled slab slot at the same address would
+                // false-match and we'd write the new (different) timer's
+                // data to an unrelated CD's table slot.
+                if (obj_ptr != timer_ptr or entry.ref.gen != timer_gen) continue;
+                if (capability.Word0.typeTag(user_table[slot].word0) != .timer) continue;
+                const paddr = computeFieldPaddr(user_table, @truncate(slot), which);
+                arch.userio.writeU64ViaPhysmap(paddr, ctx.value);
+                if (which == .field0) {
+                    wakes[n] = paddr;
+                    n += 1;
                 }
             }
+            // TEMP DIAGNOSTIC (stygia-9zr, REMOVE)
+            noteScanEnd(cd, gen, @intFromPtr(kernel_table), @intFromPtr(user_table));
         }
-        slot += 1;
+        var i: usize = 0;
+        while (i < n) : (i += 1) _ = futex.wake(wakes[i], std.math.maxInt(u32));
     }
     return true;
 }
 
+fn propagateField0Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
+    return propagateVisit(ctx, cd, gen, .field0);
+}
+
 fn propagateField1Visitor(ctx: *PropagateCtx, cd: *CapabilityDomain, gen: u63) bool {
-    _ = gen;
-    // caller-pinned: same rationale as `propagateField0Visitor` — caller
-    // pins the Timer via the wheel + refcount; raw ptr/gen are only
-    // consumed for identity match against `entry.ref`.
-    const timer_ptr: *anyopaque = @ptrCast(ctx.timer_ref.ptr);
-    const timer_gen: u32 = ctx.timer_ref.gen;
-    var slot: u16 = 0;
-    while (slot < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) {
-        const entry = &cd.kernel_table[slot];
-        if (entry.ref.ptr) |obj_ptr| {
-            if (obj_ptr == timer_ptr and entry.ref.gen == timer_gen) {
-                const tag = capability.Word0.typeTag(cd.user_table[slot].word0);
-                if (tag == .timer) {
-                    const slot12: u12 = @truncate(slot);
-                    const paddr = computeFieldPaddr(cd, slot12, .field1);
-                    arch.userio.writeU64ViaPhysmap(paddr, ctx.value);
-                }
-            }
-        }
-        slot += 1;
-    }
-    return true;
+    return propagateVisit(ctx, cd, gen, .field1);
 }
 
 fn callerDomain(caller: *anyopaque) ?*CapabilityDomain {
@@ -951,8 +1087,17 @@ fn encodeField1(armed: bool, periodic: bool) u64 {
 /// in slot `slot` of `cd`'s user table. Per-handle propagation needs
 /// the paddr (not vaddr) because the kernel writes into every copy of
 /// the read-only user-mapped table via the kernel physmap.
-fn computeFieldPaddr(cd: *CapabilityDomain, slot: u12, which: HandleField) PAddr {
-    const entry: *capability.Capability = &cd.user_table[slot];
+///
+/// Takes the table pointer rather than the CD so the caller's locked
+/// snapshot is what gets used — re-reading `cd.user_table` here would
+/// reintroduce the very mid-walk re-read that the propagate visitors'
+/// gen-lock exists to prevent.
+fn computeFieldPaddr(
+    user_table: *[stygia.caps.capability.MAX_HANDLES_PER_DOMAIN]capability.Capability,
+    slot: u12,
+    which: HandleField,
+) PAddr {
+    const entry: *capability.Capability = &user_table[slot];
     const field_addr: usize = switch (which) {
         .field0 => @intFromPtr(&entry.field0),
         .field1 => @intFromPtr(&entry.field1),

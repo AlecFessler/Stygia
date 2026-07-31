@@ -19,6 +19,59 @@ const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
 const PageFaultContext = stygia.arch.dispatch.cpu.PageFaultContext;
 const VAddr = stygia.memory.address.VAddr;
+const DbgArchCpuContext = stygia.arch.dispatch.cpu.ArchCpuContext;
+
+// TEMP DIAGNOSTIC (stygia-idc, REMOVE).
+//
+// The bare-metal cap is a recurring no-route `memory_fault subcode=0`.
+// Cycle 4's reporter dumped `ec.ctx` and produced a frame that is
+// INTERNALLY INCONSISTENT: `elr` named `bfxil x9, x0, #0, #12` (a
+// register-only instruction that cannot take a data abort) while every
+// GPR in the same frame held its value from four instructions EARLIER,
+// and the fault address (0x20) matches neither. All three readings
+// cannot describe one event, so at most one of them is the fault.
+//
+// `ec.ctx` is assigned exactly once, at EC creation, and both
+// `exceptionTrampoline` and `restoreContextAndEret` are built so the
+// frame always lands at `kstack.top - 288`. That is an ASSUMPTION about
+// where SP_EL1 was at entry, not a measurement. This stash records the
+// LIVE fault context — the frame pointer the arch handler was actually
+// handed, its `rip`, and the hardware fault address — so the reporter
+// can print the real frame next to `ec.ctx` and say which (if either)
+// is the fault. `live_ctx != ec.ctx` refutes the whole cycle-3/4 line
+// of inference in one comparison.
+const DbgFaultStash = struct {
+    valid: bool = false,
+    site: u8 = 0,
+    kpriv: bool = false,
+    is_write: bool = false,
+    is_exec: bool = false,
+    core: u8 = 0,
+    rip: u64 = 0,
+    far: u64 = 0,
+    live_ctx: ?*const DbgArchCpuContext = null,
+};
+
+/// Indexed by core id. Written on the fault path immediately before
+/// `port.fireMemoryFault`, read by `port.reportNoRouteFault` on the same
+/// core before anything can preempt it.
+pub var dbg_fault: [64]DbgFaultStash = @splat(.{});
+
+fn dbgStashFault(fault: *const PageFaultContext, site: u8) void {
+    const core: u8 = @truncate(arch.smp.coreID());
+    if (core >= dbg_fault.len) return;
+    dbg_fault[core] = .{
+        .valid = true,
+        .site = site,
+        .kpriv = fault.is_kernel_privilege,
+        .is_write = fault.is_write,
+        .is_exec = fault.is_exec,
+        .core = core,
+        .rip = fault.rip,
+        .far = fault.faulting_address,
+        .live_ctx = fault.frame_ctx,
+    };
+}
 
 /// Memory-fault sub-code carried in the event payload alongside
 /// `EventType.memory_fault` per spec §[event_type] table 1840 ("invalid
@@ -204,14 +257,14 @@ fn dumpCoreStatesRaw() void {
         panic_mod.printHex(cs.park_stack.base.addr);
         arch.boot.printRaw("..0x");
         panic_mod.printHex(cs.park_stack.top.addr);
-        if (cs.current_ec) |ref| {
+        if (cs.current_ec) |cur| {
             arch.boot.printRaw(" cur=0x");
-            panic_mod.printHex(@intFromPtr(ref.ptr));
+            panic_mod.printHex(@intFromPtr(cur));
             arch.boot.printRaw(" kstk=0x");
-            panic_mod.printHex(ref.ptr.kernel_stack.base.addr);
+            panic_mod.printHex(cur.kernel_stack.base.addr);
             arch.boot.printRaw("..0x");
-            panic_mod.printHex(ref.ptr.kernel_stack.top.addr);
-            arch.boot.printRaw(if (ref.ptr.on_cpu.load(.monotonic)) " on_cpu=1" else " on_cpu=0");
+            panic_mod.printHex(cur.kernel_stack.top.addr);
+            arch.boot.printRaw(if (cur.on_cpu.load(.monotonic)) " on_cpu=1" else " on_cpu=0");
         } else {
             arch.boot.printRaw(" cur=null");
         }
@@ -377,6 +430,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // next syscall on this core. The underlying lock bits in
         // memory remain set — that is a separate (pre-existing) leak.
         sync_debug.dropAllHeldOnAbandonedStack();
+        dbgStashFault(fault, 3); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack
@@ -474,6 +528,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         if (comptime pf_log.enabled) {
             pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
+        dbgStashFault(fault, 2); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack
@@ -518,6 +573,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             MemoryFaultSubcode.unmapped
         else
             accessSubcode(is_write, is_exec);
+        dbgStashFault(fault, 1); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack

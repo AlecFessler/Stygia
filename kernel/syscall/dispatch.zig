@@ -170,9 +170,265 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
     };
 }
 
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). State for `logSpawnError`.
+var spawn_err_prints: u32 = 0;
+var syscall_seq: u64 = 0;
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). The multi-pass collapse is
+/// entirely silent: ten clean passes, then decay to zero delivered
+/// results, with no panic, no fault, and — measured — no allocBlock
+/// failure and no handle-table exhaustion. Every candidate resource
+/// tested so far returns its "empty" signal without printing anything,
+/// so instead of guessing at the next one, report which SPAWN syscall
+/// starts refusing and with what code. Restricted to the two spawn
+/// syscalls so the budget is not eaten by tests that fail on purpose,
+/// and stamped with a sequence number so the failures can be located
+/// relative to the runner's own pass summaries in the same log.
+fn logSpawnError(num_raw: u64, res: i64) void {
+    if (res >= 0) return;
+    if (num_raw != @intFromEnum(SyscallNum.create_capability_domain) and
+        num_raw != @intFromEnum(SyscallNum.create_execution_context)) return;
+    if (spawn_err_prints >= 24) return;
+    spawn_err_prints += 1;
+    stygia.arch.dispatch.boot.print(
+        "[2u0] spawn syscall {d} -> {d} (seq {d})\n",
+        .{ num_raw, res, syscall_seq },
+    );
+}
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Census state.
+const EcCensus = struct {
+    total: u32 = 0,
+    on_cpu: u32 = 0,
+    susp: u32 = 0,
+    with_port: u32 = 0,
+    pending_reply: u32 = 0,
+    /// Per-`State` histogram: running/ready/suspended_on_port/
+    /// futex_wait/idle_wait/exited. The three hand-picked counters
+    /// above were not enough — `with_port` and `pending_reply` stayed
+    /// FLAT across a run where `total` more than quadrupled, so the
+    /// accumulating population is in some other state entirely. Let it
+    /// name itself rather than guessing which counter to add next.
+    by_state: [6]u32 = @splat(0),
+    /// Alive but never dispatched (`last_dispatched_core` == 0xFF).
+    never_disp: u32 = 0,
+    /// Leaked-`.exited` breakdown by originating writer (leak_tag):
+    /// [1]=parkSelfFaulted [2]=terminate [3]=destroyExecutionContextLocked,
+    /// [0]=never tagged (state set somewhere untagged).
+    exit_by_tag: [4]u32 = @splat(0),
+    /// `.exited` ECs with `on_cpu` still set. A stranded `on_cpu` makes
+    /// every reap path skip the EC forever (the stygia-7jm residual that
+    /// `takeOwnPendingZombie` has a bounded escape for) — if this tracks
+    /// `exit`, that escape is not covering these.
+    exit_on_cpu: u32 = 0,
+    /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Alive ECs whose owning CD
+    /// slot no longer carries the gen the EC captured — i.e. the domain
+    /// was destroyed (or its slot recycled) and this EC outlived it.
+    /// This is the direct measurement of "the domain-teardown EC walk is
+    /// missing them". If the climbing population is NOT orphaned, the
+    /// whole domain-teardown story is refuted and the ECs belong to a
+    /// still-live domain that simply never reaps them.
+    orphan: u32 = 0,
+    /// Orphan histogram over the same six states, so we can tell a
+    /// stranded-runnable leak from a stranded-parked one.
+    orphan_by_state: [6]u32 = @splat(0),
+};
+
+fn censusVisit(ctx: *EcCensus, ec: *stygia.sched.execution_context.ExecutionContext, gen: u63) bool {
+    ctx.total += 1;
+    if (ec.on_cpu.load(.acquire)) ctx.on_cpu += 1;
+    if (ec.suspend_port != null) ctx.with_port += 1;
+    const st = @intFromEnum(ec.state);
+    if (st < ctx.by_state.len) ctx.by_state[st] += 1;
+    if (ec.last_dispatched_core == 0xFF) ctx.never_disp += 1;
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). caller-pinned: the CD slab is
+    // statically backed, so reading the gen word of a dead (even zeroed)
+    // slot is safe; we never touch any other field.
+    if (ec.domain.ptr._gen_lock.currentGen() != ec.domain.gen) {
+        ctx.orphan += 1;
+        if (st < ctx.orphan_by_state.len) ctx.orphan_by_state[st] += 1;
+    }
+    if (ec.state == .exited and ec.on_cpu.load(.acquire)) ctx.exit_on_cpu += 1;
+    if (ec.state == .exited) {
+        const t = ec.leak_tag;
+        ctx.exit_by_tag[if (t < 4) t else 0] += 1;
+    }
+    if (ec.pending_reply_holder != null) {
+        ctx.pending_reply += 1;
+        // Identify the stuck ones. Only ~9 at collapse, so printing each
+        // is cheap and tells us what they are: state, which port they
+        // are parked on, and which core last ran them. An EC parked
+        // SUSP on a port holding an undelivered reply, whose partner is
+        // already dead, is the shape to confirm or rule out.
+        if (ctx.pending_reply <= 6) {
+            stygia.arch.dispatch.boot.print(
+                "[2u0]   stuck ec=0x{x} gen={d} state={d} on_cpu={d} last_disp={d} port=0x{x}\n",
+                .{
+                    @intFromPtr(ec),
+                    @as(u64, gen),
+                    @intFromEnum(ec.state),
+                    @as(u8, if (ec.on_cpu.load(.acquire)) 1 else 0),
+                    @as(u64, ec.last_dispatched_core),
+                    if (ec.suspend_port) |sp| @intFromPtr(sp.ptr) else 0,
+                },
+            );
+        }
+    }
+    return true;
+}
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Five mechanisms have now been
+/// tested and refuted (kstack A/B neutral, allocBlock never fails,
+/// handle table never full, spawn syscalls never error, timer
+/// propagation not hot). Spawns succeed and workers stop delivering, so
+/// stop proposing resources and just watch what DRIFTS across the ten
+/// good passes: how many ECs are alive, how many are parked on a port,
+/// how many hold an undelivered reply. A monotone climb in any of these
+/// across passes 1-10 is the accumulating state; flat lines refute the
+/// whole "accumulation" framing and point at the runner side instead.
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Count LIVE capability domains.
+/// Every previous census logged `cd_slots` = slab `count_total`, which is
+/// monotonic by construction and says nothing about liveness. ECs that
+/// are `.ready` but in no run queue are simply never-started ECs — which
+/// is normal — so the real question is whether their DOMAINS are being
+/// torn down. If live CDs climb with the same slope, domains leak and
+/// every per-domain object rides along.
+var cd_live_count: u32 = 0;
+fn cdCountVisit(ctx: *u32, cd: *stygia.caps.capability_domain.CapabilityDomain, gen: u63) bool {
+    _ = cd;
+    _ = gen;
+    ctx.* += 1;
+    return true;
+}
+
+fn ecCensus() void {
+    var c: EcCensus = .{};
+    stygia.sched.execution_context.slab_instance.forEachAlive(&c, censusVisit);
+    cd_live_count = 0;
+    stygia.caps.capability_domain.slab_instance.forEachAlive(&cd_live_count, cdCountVisit);
+    // How many pending_zombie columns are actually occupied right now,
+    // across every core. `.exited` ECs pile up ~8/pass; this says
+    // whether they are POSTED and never drained (pz high) or were never
+    // posted at all (pz ~0) — different bugs, different fixes.
+    var pz: u32 = 0;
+    var ci: usize = 0;
+    // Per-core "parked with work queued" detector. READY ECs that were
+    // never dispatched accumulate before the collapse (rdy 10 -> 44,
+    // nodisp -> 56), which means workers get enqueued but never
+    // scheduled. A core sitting `idle_parked` while its own run_queue is
+    // NON-EMPTY is a lost wake, and is decisive without walking the
+    // queues. Encoded one char per core: '.' idle+empty, 'R' running,
+    // 'q' awake with work, '!' PARKED WITH WORK QUEUED (the bug).
+    var qmap: [8]u8 = @splat('-');
+    while (ci < stygia.sched.scheduler.MAX_CORES) : (ci += 1) {
+        const st = &stygia.sched.scheduler.core_states[ci];
+        const slots = &st.pending_zombie;
+        var si: usize = 0;
+        while (si < slots.len) : (si += 1) {
+            if (slots[si] != null) pz += 1;
+        }
+        if (ci < qmap.len) {
+            const empty = st.run_queue.isEmpty();
+            const parked = st.idle_parked;
+            qmap[ci] = if (parked and !empty) '!' else if (parked) '.' else if (!empty) 'q' else 'R';
+        }
+    }
+    stygia.arch.dispatch.boot.print(
+        "[2u0] census seq={d} alive={d} run={d} rdy={d} susp={d} futex={d} idle={d} exit={d} exit_oncpu={d} pz_occupied={d} nodisp={d} port={d} preply={d} parks={d} cores=[{s}] tag0={d} tag1={d} tag2={d} tag3={d} ec_slots={d} cd_slots={d} cd_live={d}\n",
+        .{
+            syscall_seq,
+            c.total,
+            c.by_state[0],
+            c.by_state[1],
+            c.by_state[2],
+            c.by_state[3],
+            c.by_state[4],
+            c.by_state[5],
+            c.exit_on_cpu,
+            pz,
+            c.never_disp,
+            c.with_port,
+            c.pending_reply,
+            stygia.sched.execution_context.park_calls,
+            qmap[0..@min(stygia.sched.scheduler.MAX_CORES, qmap.len)],
+            c.exit_by_tag[0],
+            c.exit_by_tag[1],
+            c.exit_by_tag[2],
+            c.exit_by_tag[3],
+            stygia.sched.execution_context.slab_instance.count_total,
+            stygia.caps.capability_domain.slab_instance.count_total,
+            cd_live_count,
+        },
+    );
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). Second line: the two
+    // discriminators for "domain teardown strands ECs".
+    stygia.arch.dispatch.boot.print(
+        "[afo] census seq={d} orph={d} orph_st=[{d},{d},{d},{d},{d},{d}] p2_enter={d} p2_reap={d} p2_walk={d} p2_exit={d} p2_resid={d} slowpost={d}\n",
+        .{
+            syscall_seq,
+            c.orphan,
+            c.orphan_by_state[0],
+            c.orphan_by_state[1],
+            c.orphan_by_state[2],
+            c.orphan_by_state[3],
+            c.orphan_by_state[4],
+            c.orphan_by_state[5],
+            stygia.caps.capability_domain.p2_enter,
+            stygia.caps.capability_domain.p2_after_reap,
+            stygia.caps.capability_domain.p2_walk_done,
+            stygia.caps.capability_domain.p2_exit,
+            stygia.caps.capability_domain.p2_residue,
+            stygia.sched.execution_context.slow_post_spins,
+        },
+    );
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). Third line: WHERE the residual
+    // phase-2 abandonments happen. `sp_in`/`sp_out` bracket the contended
+    // IRQ-enabling postZombie spin; `wv_in`/`wv_out` bracket the walk's
+    // per-victim destroy; `ab_p2` counts abandonments observed directly at
+    // the `switchTo`-with-null-current_ec that loses the frame. Three
+    // independent instruments for one number.
+    stygia.arch.dispatch.boot.print(
+        "[afo2] census seq={d} sp_in={d} sp_out={d} sp_self={d} wv_in={d} wv_out={d} ab_p2={d} ab_other={d} inl_ok={d} inl_no={d}\n",
+        .{
+            syscall_seq,
+            stygia.sched.execution_context.slow_post_spins,
+            stygia.sched.execution_context.slow_post_done,
+            stygia.sched.execution_context.slow_post_self,
+            stygia.sched.execution_context.walk_visit_enter,
+            stygia.sched.execution_context.walk_visit_done,
+            stygia.caps.capability_domain.abandoned_in_p2,
+            stygia.caps.capability_domain.abandoned_other,
+            stygia.sched.execution_context.inline_finalize_ok,
+            stygia.sched.execution_context.inline_finalize_no,
+        },
+    );
+    // TEMP DIAGNOSTIC (stygia-9zr, REMOVE). Fourth line: does the timer
+    // propagate walk read a CapabilityDomain that died under it?
+    // `w_gen` counts visitor invocations whose CD gen changed between
+    // entry and exit; `w_null` counts those whose handle-table base
+    // pointer changed or went null in the same window — the exact
+    // condition behind the x86 pass-79 panic (104*3687 from a NULL
+    // base at timer.zig propagateField1Visitor). `w_stale` counts CDs
+    // the walk declined to touch because verify-and-acquire found the
+    // slot already dead.
+    stygia.arch.dispatch.boot.print(
+        "[9zr2] census seq={d} w_visits={d} w_gen={d} w_null={d} w_stale={d}\n",
+        .{
+            syscall_seq,
+            stygia.sched.timer.w_visits,
+            stygia.sched.timer.w_gen,
+            stygia.sched.timer.w_null,
+            stygia.sched.timer.w_stale,
+        },
+    );
+}
+
 pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     kprof.enter(.syscall);
     defer kprof.exit(.syscall);
+    syscall_seq +%= 1;
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
+    if (syscall_seq % 100_000 == 0) ecCensus();
 
     // Spec §[syscall]: syscall number lives in bits 0-11 of the syscall
     // word. Anything beyond that range is per-syscall metadata
@@ -192,7 +448,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 
     const num = std.meta.intToEnum(SyscallNum, num_raw) catch return errors.E_INVAL;
 
-    return switch (num) {
+    const dispatch_res = switch (num) {
         .restrict => capability.restrict(caller, arg(args, 0), arg(args, 1)),
         .delete => capability.delete(caller, arg(args, 0)),
         .revoke => capability.revoke(caller, arg(args, 0)),
@@ -480,4 +736,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             break :blk 0;
         },
     };
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
+    logSpawnError(num_raw, dispatch_res);
+    return dispatch_res;
 }

@@ -51,6 +51,41 @@ var quarantine: [QUARANTINE_CAP]QuarantinedFrame = undefined;
 var quarantine_len: usize = 0;
 var quarantine_lock: SpinLock = .{ .class = "stack.quarantine_lock" };
 
+/// Slots whose stack was torn down but whose VA range is not yet safe to
+/// hand to a new stack, for the same reason and on the same epoch as
+/// `quarantine` above — a core holding a stale translation for this
+/// slot's VAs would reach the OLD frames, which are sitting in that
+/// quarantine precisely so they cannot be reused yet.
+///
+/// Recycling the slot early is subtly worse than recycling a frame
+/// early, which is why this exists separately (stygia-za7). The frame
+/// quarantine guarantees the physical pages are not handed to anyone
+/// else; it says nothing about the VIRTUAL range. Recycle the slot
+/// immediately and the next `createKernel` maps FRESH frames at those
+/// same VAs, while a core with a stale TLB entry still translates them
+/// to the quarantined originals. That core then runs on a kernel stack
+/// whose stores land in a frame nobody will ever read: not a fault, not
+/// a crash, just a stack whose writes silently disappear.
+///
+/// Sized to `FREELIST_CAP`: a slot that cannot be parked here is a slot
+/// the freelist could not have absorbed either.
+///
+/// Guarded by `freelist_lock`, not a lock of its own. The quarantine is
+/// the staging half of the freelist — every entry is destined for it and
+/// nothing else reads either structure — so one lock keeps the drain
+/// (which moves entries from here to there) a single critical section.
+/// Two locks would have to nest, and `allocSlot` would want them in the
+/// opposite order from the drain.
+const SLOT_QUARANTINE_CAP: usize = FREELIST_CAP;
+
+const QuarantinedSlot = struct {
+    slot: u64,
+    epoch: u64,
+};
+
+var slot_quarantine: [SLOT_QUARANTINE_CAP]QuarantinedSlot = undefined;
+var slot_quarantine_len: usize = 0;
+
 /// Return every quarantined frame whose invalidation epoch has retired.
 /// Swap-removal, so the scan is O(live entries) and order does not
 /// matter.
@@ -96,8 +131,57 @@ pub fn isKernelStackPage(vaddr: VAddr) KernelStackPage {
     return .usable;
 }
 
+/// Move every slot whose invalidation epoch has retired from the
+/// quarantine onto the freelist. Swap-removal, so the scan is O(live
+/// entries). Caller must hold `freelist_lock`.
+fn drainSlotQuarantineLocked() void {
+    var i: usize = 0;
+    while (i < slot_quarantine_len) {
+        if (!arch.paging.kernelUnmapEpochRetired(slot_quarantine[i].epoch)) {
+            i += 1;
+            continue;
+        }
+        const slot = slot_quarantine[i].slot;
+        slot_quarantine_len -= 1;
+        slot_quarantine[i] = slot_quarantine[slot_quarantine_len];
+        // No capacity test: the quarantine is capped at FREELIST_CAP and
+        // every entry in it came out of the freelist's budget, so the
+        // freelist always has room for what drains back.
+        if (freelist_top < FREELIST_CAP) {
+            freelist_buf[freelist_top] = slot;
+            freelist_top += 1;
+        }
+    }
+}
+
+/// Park `slot` until `epoch` retires. On overflow the slot is
+/// deliberately LEAKED rather than recycled early — same reasoning as
+/// `quarantineFrame`, and a leaked slot is cheap: it costs one VA range
+/// out of `MAX_SLOTS` and no physical memory.
+fn quarantineSlot(slot: u64, epoch: u64) void {
+    freelist_lock.lock(@src());
+    defer freelist_lock.unlock();
+    // Drain BEFORE testing capacity. Teardown is bursty — a domain
+    // death destroys hundreds of stacks with nothing allocating in
+    // between — so a quarantine that only drained from `allocSlot`
+    // would fill during the burst and leak every slot past the cap,
+    // which is worse than the freelist it replaced (that one was being
+    // consumed continuously). Retired entries cost nothing to move.
+    if (slot_quarantine_len >= SLOT_QUARANTINE_CAP) drainSlotQuarantineLocked();
+    if (slot_quarantine_len >= SLOT_QUARANTINE_CAP) return;
+    slot_quarantine[slot_quarantine_len] = .{ .slot = slot, .epoch = epoch };
+    slot_quarantine_len += 1;
+}
+
 fn allocSlot() !u64 {
     freelist_lock.lock(@src());
+    // An empty freelist does NOT mean no slots are recoverable — it
+    // usually means they are all sitting in quarantine waiting on an
+    // epoch that has long since retired. Nothing else polls the
+    // quarantine, so without this drain a burst of teardowns followed by
+    // a burst of creates would march `next_slot` forward with a full
+    // quarantine behind it and exhaust the range for no reason.
+    if (freelist_top == 0) drainSlotQuarantineLocked();
     if (freelist_top > 0) {
         freelist_top -= 1;
         const slot = freelist_buf[freelist_top];
@@ -111,6 +195,10 @@ fn allocSlot() !u64 {
     return slot;
 }
 
+/// Return a slot to the freelist immediately. Only correct when no core
+/// can hold a stale translation for the slot's VA range — i.e. when
+/// nothing was ever mapped there. Everything else must go through
+/// `quarantineSlot`; see the `slot_quarantine` doc.
 fn recycleSlot(slot: u64) void {
     freelist_lock.lock(@src());
     defer freelist_lock.unlock();
@@ -235,8 +323,16 @@ pub fn destroyKernel(stack: Stack) void {
         // Phase 3 — release everything (this batch included, if the
         // epoch has already retired) that every core has caught up on.
         drainQuarantine();
-    }
 
-    recycleSlot(stack.slot);
+        // Phase 4 — the VA range rides the SAME epoch as its frames.
+        // Handing the slot back now would let the next `createKernel`
+        // map fresh frames at these VAs while a core still translates
+        // them to the ones just quarantined (stygia-za7).
+        quarantineSlot(stack.slot, epoch);
+    } else {
+        // Nothing was ever mapped here, so no core can hold a
+        // translation for it and the slot is immediately reusable.
+        recycleSlot(stack.slot);
+    }
 }
 

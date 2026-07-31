@@ -232,12 +232,11 @@ fn dumpCore(core_id: u8) void {
 
     const pc = &scheduler.core_states[core_id];
 
-    if (pc.current_ec) |ref| {
+    if (pc.current_ec) |ec| {
         rawWrite(" current_ec=");
-        printHex(@intFromPtr(ref.ptr));
+        printHex(@intFromPtr(ec));
         rawWrite(" ref_gen=");
-        printHex(@as(u64, ref.gen));
-        const ec = ref.ptr;
+        printHex(@as(u64, pc.current_ec_gen));
         rawWrite(" slot_gen=");
         printHex(@as(u64, ec._gen_lock.currentGen()));
         rawWrite(" state=");

@@ -135,7 +135,30 @@ pub const PhysicalMemoryManager = struct {
     pub fn allocBlock(self: *PhysicalMemoryManager, len: u64) ?[*]u8 {
         const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
-        return self.buddy.allocBlock(len);
+        const got = self.buddy.allocBlock(len);
+        // TEMP DIAGNOSTIC (stygia-2u0, REMOVE). A failed allocBlock is
+        // currently SILENT — it returns null and the caller surfaces at
+        // most a spawn failure — which is why 10 good passes followed by
+        // total collapse produces no marker at all. Distinguish the two
+        // candidate causes in one line: a true leak drains `free_pages`,
+        // whereas fragmentation leaves it high while every freelist at
+        // or above the requested order is empty. Capped so a wedged run
+        // doesn't drown the serial log it is being read from.
+        if (got == null) {
+            if (blk_fail_prints < 8) {
+                blk_fail_prints += 1;
+                var orders: [16]u8 = @splat('.');
+                var o: usize = 0;
+                while (o < self.buddy.freelists.len and o < orders.len) : (o += 1) {
+                    if (self.buddy.freelists[o].head != null) orders[o] = 'x';
+                }
+                arch.boot.print(
+                    "[2u0] allocBlock({d}) FAILED free_pages={d} orders=[{s}]\n",
+                    .{ len, self.buddy.free_pages, orders[0..] },
+                );
+            }
+        }
+        return got;
     }
 
     /// Free a contiguous physical block previously returned by
@@ -167,6 +190,10 @@ pub const PhysicalMemoryManager = struct {
         self.freePage(bytes);
     }
 };
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE) — print budget for failed
+/// `allocBlock` reports; see the call site in `allocBlock`.
+var blk_fail_prints: u32 = 0;
 
 pub var global_pmm: ?PhysicalMemoryManager = null;
 

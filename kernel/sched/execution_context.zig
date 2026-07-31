@@ -102,6 +102,49 @@ pub fn tryClaimWake(ec: *ExecutionContext, expected: State) bool {
 /// is a wake lost — so the loop re-arms periodically.
 const ZOMBIE_WAKE_RETRY_SPINS: u32 = 1024;
 
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). How many `destroyExecutionContextLocked`
+/// reaps had to fall back to the IRQ-enabling `postZombie` spin. The fix
+/// for the abandoned-phase-2 frame rests on the claim that this is rare
+/// and never happens for a same-core reap; if it climbs with the leak,
+/// the claim is wrong and the window is still open.
+///
+/// ATOMIC, like the p2_* counters: a plain `+=` raced by four cores loses
+/// increments, and cycle 1's residual claim ("every remaining abandoned
+/// phase-2 frame is a contended post") rested on comparing this lossy
+/// number against atomic ones. RMW so the comparison means something.
+pub var slow_post_spins: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Incremented AFTER the contended
+/// spin block returns. `slow_post_spins - slow_post_done` is the number of
+/// frames that entered the IRQ-enabling window and never came out — i.e.
+/// abandonments attributable to THIS site, measured rather than asserted.
+pub var slow_post_done: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Contended posts whose target is
+/// the posting core itself. The fast-path comment claims this is
+/// impossible (the self-drain immediately above empties that very slot).
+pub var slow_post_self: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Bracket around the per-victim
+/// `destroyExecutionContextLocked` inside `destroyEcsInDomain`'s visitor.
+/// `walk_visit_enter - walk_visit_done` is the number of abandonments that
+/// happened anywhere inside the walk's per-victim destroy. If that equals
+/// `p2_after_reap - p2_walk_done` the abandonment is in the victim destroy;
+/// if it also equals `slow_post_spins - slow_post_done` it is specifically
+/// the IRQ-enabling spin, which is the only `enableInterrupts()` call site
+/// outside `kernel/arch/`.
+pub var walk_visit_enter: u64 = 0;
+pub var walk_visit_done: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Same-core posts that failed and
+/// were resolved by finalizing inline instead, vs. the ones that still had
+/// to take the IRQ-enabling spin. The fix's claim is that the second is
+/// zero — the residual abandonments are ALL same-core and all inline-
+/// finalizable — so a non-zero `inline_finalize_no` is the falsifier.
+pub var inline_finalize_ok: u64 = 0;
+pub var inline_finalize_no: u64 = 0;
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Monotonic RMW bump helper.
+pub fn dbump(counter: *u64) void {
+    _ = @atomicRmw(u64, counter, .Add, 1, .monotonic);
+}
+
 /// Decoded pair entry stashed on the suspending EC at `validatePairEntries`
 /// time and consumed at recv time in `port.deliverEvent`. Captures the
 /// kernel-side `ErasedSlabRef` to the source object (lock-validated at
@@ -286,6 +329,16 @@ pub const ExecutionContext = struct {
     /// fully saved. Remote cores attempting to migrate or destroy this
     /// EC spin on this until the saving core releases it.
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Which code path last set
+    /// `state = .exited`: 1 = parkSelfFaulted, 2 = terminate,
+    /// 3 = destroyExecutionContextLocked. ~8 ECs per suite pass end up
+    /// `.exited` with an ODD gen (never dead-marked, never posted, never
+    /// reaped) and accumulate until the run collapses. Fixing the
+    /// parkSelfFaulted sites did not change the rate, so tag the writers
+    /// and let the leaked population say which one it came from instead
+    /// of eliminating candidates one build at a time.
+    leak_tag: u8 = 0,
 
     /// Core id of the most recent dispatch — set by `setCurrentEc` and by
     /// the FP step-14 / R-14 swap. Sentinel `LAST_DISPATCHED_NEVER` (0xFF)
@@ -701,7 +754,19 @@ pub fn self(caller: *ExecutionContext) i64 {
 /// (`exceptionHandler`) calls `scheduler.yieldTo(null)` — with
 /// `current_ec` cleared, `yieldTo` skips the re-enqueue path and
 /// dispatches the next runnable EC.
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Plain call counter only.
+///
+/// An earlier version of this probe also tried to classify each park by
+/// whether the EC's domain was still alive, via `ec.domain.lockIrqSave`.
+/// That DEADLOCKED the boot: `releaseSelf` calls `parkSelfFaulted` while
+/// already holding `cd._gen_lock` (the `destroyPhase1` invariant), so
+/// the probe was a recursive gen-lock acquire. Nothing in this function
+/// may take the domain lock.
+pub var park_calls: u64 = 0;
+
 pub fn parkSelfFaulted(ec: *ExecutionContext) void {
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
+    park_calls +%= 1;
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (scheduler.coreCurrentIs(core_id, ec)) {
         scheduler.clearCurrentEc(core_id);
@@ -711,6 +776,7 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // the slab so outstanding handles still resolve (just to a parked
     // EC) until the owning domain is destroyed.
     ec.state = .exited;
+    ec.leak_tag = 1; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Clear on_cpu — this EC is no longer running. Without this, a
     // peer-core terminate posts the EC to its last_dispatched_core's
     // pending_zombie, but the reaper sees on_cpu=true and refuses to
@@ -850,6 +916,7 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     }
 
     ec.state = .exited;
+    ec.leak_tag = 2; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Re-sweep run_queues after state=.exited so any yieldTo that
     // re-enqueued ec during the prepare phase (saw state=.running,
     // raced ahead of the first sweep) is undone here. The second
@@ -997,26 +1064,34 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
     if (ec.user_stack) |us| {
         _ = us;
     }
-    // Free the kstack only while the owning domain is still alive — the
-    // gate the old code applied implicitly by fetching the domain root
-    // under its lock. The root itself is no longer used (`destroyKernel`
-    // always unmaps from the kernel root now — on aarch64 the domain
-    // root is the TTBR0 user tree and walking it with kernel-VA indices
-    // unmapped LIVE USER PAGES, stygia-723), but the GATE is
-    // load-bearing on its own: an EC finalized during its domain's
-    // teardown can still be the SP_EL1 / TSS.RSP0 target of a core that
-    // has not converged through the quiesce barrier yet, and freeing
-    // that kstack turns the next exception on that core into a push
-    // onto unmapped memory. Lifting the gate (always-free) was measured
-    // as suite-wide fault storms on BOTH arches. The cost of keeping it
-    // is one leaked kstack per EC finalized after domain death — the
-    // pre-existing status quo.
-    const domain_alive = blk: {
-        const dlr = ec.domain.lockIrqSave(@src()) catch break :blk false;
-        ec.domain.unlockIrqRestore(dlr.irq_state);
-        break :blk true;
-    };
-    if (domain_alive) stack.destroyKernel(ec.kernel_stack);
+    // Free the kstack unconditionally. This used to be gated on "the
+    // owning domain is still alive" (inherited from when the old code
+    // fetched the domain root under its lock), which leaked a
+    // KERNEL_STACK_PAGES-page stack for every EC finalized after its
+    // domain had been dead-marked. Since domain teardown dead-marks in
+    // phase 1 and then destroys its ECs, that was very nearly every EC:
+    // ~30 MB per full suite pass, exhausting the PMM around pass 11-16
+    // of a repeat run on both bare metal and KVM (stygia-2u0).
+    //
+    // The gate was standing in for "no core is still live on this
+    // kstack" — a real hazard (freeing a stack that is some core's
+    // SP_EL1 / TSS.RSP0 target turns its next exception into a push onto
+    // unmapped memory) but one this function is already protected from
+    // by its callers, not by the domain's liveness. `on_cpu` is the
+    // precise signal, and every path here honours it: the three
+    // scheduler drains and both arch dispatch reap loops filter on
+    // `on_cpu` and `standing_on_zombie` (see `takeOwnPendingZombie`),
+    // and terminate's only ungated call is its `LAST_DISPATCHED_NEVER`
+    // branch, where no core's rsp has ever pointed at these pages.
+    //
+    // What the gate WAS masking is aliasing, and both halves are now
+    // closed in `destroyKernel`: frames are quarantined until their
+    // invalidation epoch retires (they used to re-enter the PMM ahead
+    // of it), and as of stygia-za7 the VA slot rides that same epoch
+    // instead of being recycled immediately. Lifting the gate before
+    // those two landed is what produced the suite-wide fault storms
+    // recorded in the previous version of this comment.
+    stack.destroyKernel(ec.kernel_stack);
 
     slab_instance.destroyAlreadyMarked(ec);
 }
@@ -1873,7 +1948,9 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
                 // caller-pinned: same outer-locked CD, passed through to
                 // the per-EC destroy helper which only uses the bare
                 // pointer for caller_cd identity comparison.
-                destroyExecutionContextLocked(ec, c.cd_addr_space_root, c.cd_ref.ptr);
+                dbump(&walk_visit_enter); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+                destroyExecutionContextLocked(ec, c.cd_ref.ptr); // caller-pinned: identity-only key, never dereferenced
+                dbump(&walk_visit_done); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
                 return true;
             }
         }.visit,
@@ -1886,6 +1963,24 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
     // usable eviction signal here: it stays stale-true across the
     // cross-core migration boundary for queued ECs and its gated
     // clears race the dispatch path — see PerCore.active_root.)
+}
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Count alive ECs still matching
+/// `cd_ref` — i.e. survivors of a `destroyEcsInDomain` walk that RAN TO
+/// COMPLETION. Non-zero here means the walk itself misses ECs; zero with
+/// a climbing orphan census means the walk never ran (abandoned frame)
+/// or the ECs were created after it.
+pub fn countEcsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
+    var ctx = struct { cd_ref: SlabRef(CapabilityDomain), n: u64 }{ .cd_ref = cd_ref, .n = 0 };
+    slab_instance.forEachAlive(&ctx, struct {
+        fn visit(c: *@TypeOf(ctx), ec: *ExecutionContext, _: u63) bool {
+            // caller-pinned: identity-only comparison, no deref of the
+            // dead-marked CD slot.
+            if (ec.domain.ptr == c.cd_ref.ptr and ec.domain.gen == c.cd_ref.gen) c.n += 1;
+            return true;
+        }
+    }.visit);
+    return ctx.n;
 }
 
 /// Same as `destroyExecutionContext`, but tailored for the
@@ -1903,12 +1998,22 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
 /// holder ref pointing at that CD is cleared without re-locking it.
 /// For pending replies pointing at OTHER domains (cross-domain reply
 /// pin), we run the normal `abandonPendingReply` path.
-pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, caller_cd: *CapabilityDomain) void {
-    _ = dom_root;
-
+/// `caller_cd` is the domain whose teardown is driving this destroy, or
+/// `null` when no domain is being torn down (the no-route fault paths in
+/// `sched/port.zig`, which destroy a single EC while its domain stays
+/// live). It exists solely for the same-CD pending-reply shortcut below,
+/// so `null` correctly forces the `abandonPendingReply` branch: nothing
+/// is freeing the holder's `user_table`, and silently dropping the
+/// back-pointer there would leak the holder slot.
+///
+/// The former `dom_root: PAddr` parameter was removed — it was never
+/// read (`_ = dom_root`), and computing it at the new call sites would
+/// mean dereferencing `ec.domain.ptr` for a domain that may already be
+/// dead, which is exactly the case those call sites exist to handle.
+pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*CapabilityDomain) void {
     if (ec.pending_reply_holder != null) {
         if (ec.pending_reply_domain) |dom_ref| {
-            if (dom_ref.ptr == caller_cd) {
+            if (caller_cd != null and dom_ref.ptr == caller_cd.?) {
                 // Same-CD reply pin — the user_table has already been
                 // disarmed by the time we get here (the holder slot
                 // referenced this caller_cd's table). Just drop the
@@ -1992,6 +2097,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
     }
 
     ec.state = .exited;
+    ec.leak_tag = 3; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Re-sweep run_queues after the state flip — same race as in
     // `terminate` (see the matching comment there): a yieldTo on the
     // EC's running core can re-enqueue it during the cleanup window
@@ -2033,33 +2139,108 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, dom_root: PAddr, cal
                 if (z != ec) finalizeDestroyMarkedDead(z);
             }
         }
-        // Cross-core postZombie can spin on a busy zombie column while
-        // the target core finishes a prior reap. If the outer caller
-        // (e.g. `destroyPhase2`) is running with IRQs masked, an
-        // unbounded spin here would block both timer interrupts and any
-        // inbound IPI from the target — the target may itself be
-        // blocked waiting on us. Snapshot+enable IRQs around the spin
-        // so wake IPIs and preempts can land; restore before returning
-        // so the gen-flip-finalize sequence stays IRQ-coherent for the
-        // caller.
-        const reap_irq = arch.cpu.saveAndDisableInterrupts();
-        arch.cpu.enableInterrupts();
-        // Wake inside the retry loop, not only after it — a halted
-        // target can never drain the column we are waiting on. See the
-        // matching loop in `terminate` for the full rationale.
-        var post_spins: u32 = 0;
-        while (!scheduler.postZombie(core, ec, @intCast(gen))) {
-            if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
-                arch.smp.sendWakeIpi(core);
+        // Try to post ONCE with the caller's interrupt state untouched
+        // (stygia-afo).
+        //
+        // `postZombie` writes `pending_zombie[self_core]` on the target
+        // — a slot only THIS core ever posts into — under
+        // `core_locks[core]`. It fails, and only fails, when our own
+        // previous zombie is still sitting there unreaped.
+        //
+        // CORRECTION (stygia-afo cycle 2). This comment used to claim the
+        // `core == self_core` case "cannot fail at all" because the
+        // self-drain immediately above has just emptied that very slot.
+        // That is false, and it is precisely backwards: the drain SKIPS
+        // the slot when we are standing on its occupant's kstack, which is
+        // the normal state of affairs throughout `destroyPhase2` (it reaps
+        // the caller EC first, and this frame runs on the caller's kstack).
+        // Measured over 25 aarch64 TCG passes: 1176 of 1176 failing posts
+        // were same-core, and 0 of 1176 ever succeeded. See the fallback
+        // below for what replaces the unsatisfiable spin.
+        //
+        // Why the single attempt matters so much. The unconditional
+        // `enableInterrupts()` that used to stand here was the ONLY
+        // unconditional IRQ re-enable in the whole kernel, and
+        // `destroyPhase2` reaches it while running on a frame that
+        // CANNOT be resumed: `parkSelfFaulted` has already cleared
+        // `current_ec`, so a preempt landing in this window makes
+        // `yieldTo` skip its re-enqueue block, dispatch some other EC
+        // and hop to the park kstack. The phase-2 frame is simply
+        // abandoned — its EC walk, address-space free, handle release
+        // and CD slab free never run, and since phase 1 already
+        // dead-marked the domain nothing will ever walk it again.
+        // Measured on aarch64 TCG smp=4: 1354 of 6228 phase-2 destroys
+        // (22%) never reached the end of the caller-EC reap, and the CD
+        // slab's `count_total` tracked that abandonment count to within
+        // ~16 slots for the whole run. The stranded ECs then pile up
+        // (194 alive, 192 of them orphaned from an already-destroyed
+        // domain) until the suite stops delivering results at pass ~14.
+        //
+        // So: keep the escape hatch, but only pay for it when it is
+        // actually needed. An uncontended post — which is what phase 2
+        // does — now completes with the caller's mask intact and the
+        // frame survives.
+        if (!scheduler.postZombie(core, ec, @intCast(gen))) {
+            dbump(&slow_post_spins); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+            if (core == self_core) dbump(&slow_post_self); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+            // A failed SAME-CORE post is not contention that will clear —
+            // it is unsatisfiable (stygia-afo cycle 2). `pending_zombie`
+            // has one slot per (poster, target) pair, and `destroyPhase2`
+            // pins this core's own slot for its whole body with the
+            // caller EC it reaps at the top: we stand on that EC's kstack
+            // until phase 2 returns, so the drain's `standing_on_zombie`
+            // guard can never evict it. Every same-core victim post from
+            // the `destroyEcsInDomain` walk then spins on a condition
+            // that cannot change, with IRQs enabled, until a preempt
+            // lands and abandons the phase-2 frame — taking the rest of
+            // the walk, the address-space free, the handle release and
+            // the CD slab free with it.
+            //
+            // MEASURED, aarch64 TCG smp=4, 25 passes, four independent
+            // instruments agreeing to the unit at seq 2.2M:
+            //   p2_enter-p2_walk 1176 | sp_in-sp_out 1176 (sp_out == 0,
+            //   i.e. not one contended post EVER completed) | sp_self
+            //   1176 (every one same-core; cross-core contention: zero) |
+            //   walk-visit gap 1176 | abandonments counted directly at
+            //   the losing `switchTo` 1176.
+            //
+            // The column is the wrong tool here. It exists to defer a
+            // kstack free until the last-dispatching core is off that
+            // stack — a condition we can simply CHECK, which is exactly
+            // what `takeOwnPendingZombie` does for its own drain. When it
+            // holds, finalize inline and skip the column entirely.
+            if (core == self_core and scheduler.claimOwnZombieInline(ec)) {
+                dbump(&inline_finalize_ok); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+                finalizeDestroyMarkedDead(ec);
+                return;
             }
-            post_spins +%= 1;
-            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-            // matching note on `scheduler.markReady`'s kstack barrier.
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            std.atomic.spinLoopHint();
+            dbump(&inline_finalize_no); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+            // Genuine cross-core contention (never once observed above).
+            // Only the target core drains its column and it may itself be
+            // blocked waiting on us, so the spin really is unbounded:
+            // snapshot+enable IRQs so wake IPIs and preempts can land;
+            // restore before returning so the gen-flip-finalize sequence
+            // stays IRQ-coherent for the caller.
+            const reap_irq = arch.cpu.saveAndDisableInterrupts();
+            arch.cpu.enableInterrupts();
+            // Wake inside the retry loop, not only after it — a halted
+            // target can never drain the column we are waiting on. See
+            // the matching loop in `terminate` for the full rationale.
+            var post_spins: u32 = 0;
+            while (!scheduler.postZombie(core, ec, @intCast(gen))) {
+                if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
+                    arch.smp.sendWakeIpi(core);
+                }
+                post_spins +%= 1;
+                // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
+                // matching note on `scheduler.markReady`'s kstack barrier.
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+            }
+            arch.cpu.restoreInterrupts(reap_irq);
+            dbump(&slow_post_done); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
         }
         if (core != self_core) arch.smp.sendWakeIpi(core);
-        arch.cpu.restoreInterrupts(reap_irq);
     } else {
         finalizeDestroyMarkedDead(ec);
     }

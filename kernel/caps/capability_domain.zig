@@ -189,6 +189,10 @@ pub const CapabilityDomain = struct {
 };
 
 pub const Allocator = SecureSlab(CapabilityDomain, 256);
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE) — print budget for handle-table
+/// exhaustion reports; see `allocFreeSlot`.
+var slot_full_prints: u32 = 0;
+
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
@@ -1307,7 +1311,66 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
 /// The visitor matches ECs by `ec.domain.ptr == cd && gen == cd_gen`;
 /// the gen check rejects any new CD that lands on the freed slab slot
 /// between phase 1 and phase 2.
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frame-abandonment discriminator.
+/// The standing hypothesis is that `destroyEcsInDomain` re-enables IRQs
+/// (via `destroyExecutionContextLocked`'s postZombie spin), a preempt
+/// lands, the phase-2 frame is abandoned mid-walk, and every not-yet-
+/// visited EC of the already-dead-marked domain is stranded forever.
+/// If that is true, `p2_enter` must exceed `p2_walk_done`. If the three
+/// counters stay equal the whole premise is dead regardless of how many
+/// ECs leak. `p2_residue` counts ECs that STILL match the dying CD after
+/// the walk returned — a completed-but-incomplete walk, a different bug.
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). ATOMIC, deliberately: the first
+/// version of these were plain `+= 1` and four cores raced them, which
+/// showed up as `p2_exit` (4876) EXCEEDING `p2_walk_done` (4874) — an
+/// ordering that is impossible in the code and proved increments were
+/// being lost. A lossy counter cannot discriminate "the walk was
+/// abandoned" from "the increment evaporated", so the whole 22%-gap
+/// reading rested on nothing. Monotonic RMW makes the gap real evidence.
+pub var p2_enter: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Reached only if the caller-EC
+/// reap returned. `p2_enter - p2_after_reap` isolates the abandonment to
+/// that reap; `p2_after_reap - p2_walk_done` isolates it to the walk.
+pub var p2_after_reap: u64 = 0;
+pub var p2_walk_done: u64 = 0;
+pub var p2_exit: u64 = 0;
+pub var p2_residue: u64 = 0;
+
+fn bump(counter: *u64, n: u64) void { // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+    _ = @atomicRmw(u64, counter, .Add, n, .monotonic);
+}
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Per-core "this core's C stack is
+/// currently inside `destroyPhase2`". Set on entry, cleared on the normal
+/// exit path. `scheduler.yieldTo` consults it at the ONE point where a
+/// frame is provably lost — `current_ec == null` and we `switchTo` some
+/// other EC, which never returns — so an abandonment is COUNTED at the
+/// moment it happens rather than inferred from a gap between two
+/// counters. Plain bools: each entry is written only by its own core.
+pub var in_phase2: [stygia.sched.scheduler.MAX_CORES]bool =
+    [_]bool{false} ** stygia.sched.scheduler.MAX_CORES;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frames abandoned while inside
+/// phase 2, and frames abandoned outside it (those are harmless: the
+/// disowned frames of a parking EC, which has nothing left to run).
+pub var abandoned_in_p2: u64 = 0;
+pub var abandoned_other: u64 = 0;
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Called by `scheduler.yieldTo`
+/// immediately before a `switchTo` that cannot return to this stack.
+pub fn noteFrameAbandoned() void {
+    const core: usize = @truncate(arch.smp.coreID());
+    if (core < in_phase2.len and in_phase2[core]) {
+        bump(&abandoned_in_p2, 1);
+        // The stack that owned this flag is gone; whatever runs on this
+        // core next is not in phase 2.
+        in_phase2[core] = false;
+    } else {
+        bump(&abandoned_other, 1);
+    }
+}
+
 pub fn destroyPhase2(deferred: DestroyDeferred) void {
+    bump(&p2_enter, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
     // Mask IRQs across the whole of phase 2. With the deferred caller_ec
     // reap, freeUserAddrSpace, and per-handle release walk, the
     // post-Phase1 work is no longer trivially short — a preempt landing
@@ -1317,6 +1380,65 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // cleanup never runs and resources accumulate across reps.
     const irq = arch.cpu.saveAndDisableInterrupts();
     defer arch.cpu.restoreInterrupts(irq);
+
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). Mark this core's stack as a
+    // phase-2 frame for `scheduler.yieldTo`'s abandonment detector.
+    {
+        const dcore: usize = @truncate(arch.smp.coreID());
+        if (dcore < in_phase2.len) in_phase2[dcore] = true;
+    }
+    defer {
+        const dcore: usize = @truncate(arch.smp.coreID());
+        if (dcore < in_phase2.len) in_phase2[dcore] = false;
+    }
+
+    // The mask above is NOT sufficient on its own, and the reason is
+    // worth stating precisely because the obvious repair does not work.
+    // `destroyPhase2` calls `destroyExecutionContextLocked` — once for
+    // the caller EC just below, then once per victim inside
+    // `destroyEcsInDomain` — and that helper used to re-enable
+    // interrupts UNCONDITIONALLY around its `postZombie` spin. Each such
+    // window is a chance for a preempt tick to land on a frame whose
+    // `current_ec` was already cleared by `parkSelfFaulted`, at which
+    // point `yieldTo` dispatches something else and hops to the park
+    // kstack — this frame's remaining teardown never runs, and because
+    // the CD is already dead-marked, nothing ever walks it again.
+    //
+    // REFUTED REPAIR (do not re-try): a `preempt_block` depth counter on
+    // `PerCore` that made `yieldTo` return instead of switching. It
+    // deadlocks the machine inside the FIRST suite pass. Blocking the
+    // switch also blocks the two protocols that are *implemented by*
+    // switching: `PerCore.pending_kstack_release` is consumed only by
+    // the park-kstack hop, so a stashed EC keeps `on_cpu == true`
+    // forever and every peer in `markReady`'s kstack barrier spins
+    // without bound; and a core only publishes `active_root = 0` on its
+    // way through `run()`, so a peer in `awaitNoActiveRoot` waits on a
+    // core that has been told never to leave. Measured: wedge at run
+    // 1, batch 16..32, no output thereafter.
+    //
+    // The window is closed at its source instead — see the two escapes in
+    // `destroyExecutionContextLocked`. Stage one (stygia-afo cycle 1): try
+    // `postZombie` ONCE under the caller's mask, and only pay for the
+    // IRQ-enabling spin when that fails. That closed the caller-EC reap
+    // completely (`p2_enter == p2_after_reap` over 10428 destroys, against
+    // 1354/6228 abandoned before) but left the walk leaking.
+    //
+    // Stage two (cycle 2) is what closed the walk, and the measurement is
+    // the interesting part: the failing posts were not contention at all.
+    // Phase 2 pins THIS core's own `pending_zombie` slot with the caller
+    // EC it reaps at the top, and this frame stands on that EC's kstack
+    // until it returns, so the drain can never evict it. Every same-core
+    // victim post from `destroyEcsInDomain` then spun on a condition that
+    // could not change: over 25 aarch64 TCG passes, 1176 of 1176 failing
+    // posts were same-core and 0 of 1176 ever completed. Each one hung
+    // until a preempt abandoned this frame. `claimOwnZombieInline` skips
+    // the column when this core is provably off the victim's kstack.
+    //
+    // Do NOT read the mask above as an invariant even so: the cross-core
+    // fallback still enables IRQs, by design, because only the target core
+    // drains its own column and it may itself be blocked on us. That path
+    // has never once been observed to execute; if it ever does, the frame
+    // it runs on is abandonable and the teardown below is skippable again.
 
     // Self-destroy hazard (stygia-rs6 layer 2): when the caller EC is
     // destroying its OWN domain, this core is still executing with the
@@ -1342,11 +1464,54 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
+    // Reap the caller EC FIRST, before anything that can drop the IRQ
+    // mask (stygia-2u0).
+    //
+    // The mask taken above is what keeps this frame alive — its own
+    // comment warns that an abandoned frame means "the rest of the
+    // cleanup never runs and resources accumulate across reps". But
+    // `destroyEcsInDomain` below reaches `destroyExecutionContextLocked`,
+    // which deliberately RE-ENABLES interrupts around its `postZombie`
+    // spin (otherwise a cross-core spin here would block the very IPIs
+    // it is waiting on). That reopens the preempt window mid-phase-2:
+    // `yieldTo` sees `current_ec == null` — cleared by the earlier
+    // `parkSelfFaulted` — dequeues something else and switches away, and
+    // this frame never resumes. Everything below the abandonment point
+    // is silently skipped.
+    //
+    // The caller EC used to be reaped at the END of phase 2, so it was
+    // the most likely casualty: left exactly as `parkSelfFaulted` made
+    // it (state `.exited`, gen still ODD, never posted as a zombie), it
+    // is then invisible to every reap path forever. Measured at ~8
+    // orphaned ECs per suite pass — a per-writer tag showed 100% of the
+    // leaked population came from `parkSelfFaulted` — accumulating until
+    // the run stops delivering results around pass 11.
+    //
+    // Doing it here costs nothing and cannot be skipped: the reap only
+    // dead-marks and posts a zombie (the finalize is deferred to a core
+    // that is provably off the kstack), and the `destroyEcsInDomain`
+    // walk below then skips this EC on its now-even gen rather than via
+    // `keep_ref`.
+    if (deferred.caller_ec) |caller_ref| {
+        // caller-pinned: `deferred.cd_ref.ptr` is an identity-only key
+        // for the pending-reply comparison inside the destroy helper;
+        // the CD slot is dead-marked but bytes-intact and is never
+        // dereferenced through here.
+        stygia.sched.execution_context.destroyExecutionContextLocked(
+            caller_ref.ptr,
+            deferred.cd_ref.ptr, // caller-pinned: identity-only key, never dereferenced
+        );
+    }
+    bump(&p2_after_reap, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+
     stygia.sched.execution_context.destroyEcsInDomain(
         deferred.cd_ref,
         deferred.cd_addr_space_root,
         deferred.caller_ec,
     );
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE).
+    bump(&p2_walk_done, 1);
+    bump(&p2_residue, stygia.sched.execution_context.countEcsInDomain(deferred.cd_ref));
 
     // Translation barrier (stygia-rs6): the EC walk above only POSTS
     // zombies + wake IPIs for victims still executing on remote cores.
@@ -1409,31 +1574,13 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
     }
 
-    // Reap the destroying-domain's caller EC's slab slot. `parkSelfFaulted`
-    // left it at gen=odd / state=.exited / off-freelist — `destroyEcsInDomain`
-    // skipped it via `keep_ref` because we are still standing on its kstack.
-    // Route through the standard deferred-destroy path: `bumpDeadGenLocked`
-    // flips gen → even immediately, `postZombie` hands the EC to this
-    // core's pending_zombie column, and the next dispatch
-    // (`yieldTo` / `parkAndAwaitIRQ` / `switchTo` `takeOwnPendingZombie`)
-    // finalizes it once `rsp` is no longer in the EC's kstack range.
-    // Without this, every domain-destroy leaks one EC slab slot — slabs
-    // are capped at 256 unique indices, so the test runner's
-    // ~481 destroys/rep starve `allocExecutionContext` at ~rep 5.
-    if (deferred.caller_ec) |caller_ref| {
-        // caller-pinned: `deferred.cd_ref.ptr` is passed for identity-only
-        // comparison against `ec.pending_reply_domain.ptr` inside
-        // `destroyExecutionContextLocked`; the CD slab slot is already
-        // dead-marked (Phase 1 ran `bumpDeadGenLocked`; the zero +
-        // freelist push runs at the end of this function) and we only
-        // use the raw pointer value as a key, never deref it.
-        const cd_for_identity = deferred.cd_ref.ptr;
-        stygia.sched.execution_context.destroyExecutionContextLocked(
-            caller_ref.ptr,
-            deferred.cd_addr_space_root,
-            cd_for_identity,
-        );
-    }
+    // NOTE (stygia-2u0): the caller-EC reap used to live HERE, at the end
+    // of phase 2. It moved to the top of this function — see the long
+    // comment there. Anything below the first point that drops the IRQ
+    // mask can be skipped entirely by a preempt abandoning this frame,
+    // and this reap was the casualty that leaked ~8 ECs per suite pass.
+    // `destroyExecutionContextLocked` early-returns on an already-even
+    // gen, so the move is safe even if some path reaches both.
 
     if (deferred.vm_ref) |vm_slab_ref| {
         stygia.hv.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
@@ -1550,11 +1697,28 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // asserts exactly that and this phase-2 tail is the slot's sole
     // owner.
     slab_instance.destroyAlreadyMarked(deferred.cd_ref.ptr);
+    bump(&p2_exit, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
 /// table is full.
 fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Handle-table exhaustion is
+    // silent: this returns null, the caller maps it to E_FULL, and the
+    // suite reports MISS with no marker. MAX_HANDLES_PER_DOMAIN is 4096
+    // and the runner spawns ~427 domains per pass, so its own table
+    // would be exhausted at ~pass 10 — exactly where the collapse
+    // starts, and without any allocBlock ever failing (the buddy probe
+    // stayed silent through a full collapse).
+    if (cd.free_count == 0 or cd.free_head == stygia.caps.capability.FREE_LIST_TAIL) {
+        if (slot_full_prints < 8) {
+            slot_full_prints += 1;
+            arch.boot.print(
+                "[2u0] handle table FULL cd=0x{x} free_count={d} free_head={d}\n",
+                .{ @intFromPtr(cd), cd.free_count, cd.free_head },
+            );
+        }
+    }
     if (cd.free_count == 0) return null;
     const head = cd.free_head;
     if (head == stygia.caps.capability.FREE_LIST_TAIL) return null;

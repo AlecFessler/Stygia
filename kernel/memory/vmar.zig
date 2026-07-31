@@ -31,6 +31,12 @@ const SlabRef = secure_slab.SlabRef;
 const VAddr = stygia.memory.address.VAddr;
 const Word0 = stygia.caps.capability.Word0;
 
+/// TEMP DIAGNOSTIC (stygia-idc, REMOVE). Count of `create_vmar`
+/// successes whose reported base sat below 4 GiB — impossible by
+/// construction (see the tripwire in `createVmar`). Surfaced on the
+/// census line so a run that never faults still reports a clean 0.
+pub var low_base_returns: u64 = 0;
+
 /// Cap bits in `Capability.word0[48..63]` for VMAR handles.
 /// Spec §[var] cap layout.
 pub const VmarCaps = packed struct(u16) {
@@ -303,6 +309,27 @@ pub fn createVmar(
     // these snapshots, but exposing them in registers lets a caller
     // capture base/size without a second VA load on the hot create_vmar
     // path.
+    // TEMP DIAGNOSTIC (stygia-idc, REMOVE). Discriminator for the
+    // recurring bare-metal `[NOROUTE] memory_fault subcode=0
+    // payload=0x10` on `idc_read_07`: that test stores through
+    // `cvar.v2`, so a fault at 0x10 means the base it received was
+    // near-null. NOTE (measured): `user_aslr.start` is 0x1000 on BOTH
+    // arches, so a low base is legal, merely rare — a first bare-metal
+    // run saw exactly one `base=0x87E8F000` in 14 suite passes. What is
+    // impossible is a base that is not 4 KiB-aligned, since every arm
+    // of `vaRangeAllocate` aligns to `sz_bytes`. So this tripwire does
+    // not by itself prove anything; it exists to tell "the kernel
+    // handed back a bad base" from "a good base was handed back and
+    // lost afterwards" for the specific 0x10 signature.
+    if (field0 < 0x1_0000_0000) {
+        _ = @atomicRmw(u64, &low_base_returns, .Add, 1, .monotonic);
+        stygia.arch.dispatch.boot.printRaw("[nrdbg] create_vmar LOW base=0x");
+        stygia.panic.printHex(field0);
+        stygia.arch.dispatch.boot.printRaw(" pref=0x");
+        stygia.panic.printHex(preferred_base);
+        stygia.arch.dispatch.boot.printRaw("\n");
+    }
+
     dispatch.syscall.setSyscallVreg2(caller.ctx, field0);
     dispatch.syscall.setSyscallVreg3(caller.ctx, field1);
 

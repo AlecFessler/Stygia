@@ -1449,11 +1449,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%gs:88, %%r11
             \\movq %%r11, %%gs:32
             \\movq %%gs:128, %%rax
-            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq {[gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
-            \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq %%rcx, %%gs:{[sc_cur_gen]d}
             \\movb $1, {[on_cpu_off]d}(%%r11)
             \\movzbl %%gs:{[sc_core_id]d}, %%ecx
@@ -1493,9 +1492,18 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                // `PerCore.current_ec` is a bare `?*ExecutionContext`:
+                // one pointer word whose null-ness IS the optional
+                // discriminant. This asm is a hand-rolled `setCurrentEc`
+                // and must publish exactly what it does — gen first,
+                // pointer last, no separate discriminant byte. The
+                // previous form wrote a `movb $1` at +16 for the old
+                // 24-byte `?SlabRef` tag; against the current layout
+                // that byte lands on an unrelated field. Offsets are
+                // taken with `@offsetOf` so a field reorder is a build
+                // error, not silent corruption.
                 .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec_gen"),
                 // Same EC._gen_lock-vs-offset-0 trap as the mint above:
                 // fpu_state pushes _gen_lock past offset 0; the comptime
                 // offset is the only safe way to read the gen-lock word.
@@ -2585,11 +2593,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%gs:72, %%r11
             \\movq %%r11, %%gs:32
             \\movq %%gs:128, %%rax
-            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq {[gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
-            \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq %%rcx, %%gs:{[sc_cur_gen]d}
             \\movb $1, {[on_cpu_off]d}(%%r11)
             \\movzbl %%gs:{[sc_core_id]d}, %%ecx
@@ -2629,9 +2636,18 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                // `PerCore.current_ec` is a bare `?*ExecutionContext`:
+                // one pointer word whose null-ness IS the optional
+                // discriminant. This asm is a hand-rolled `setCurrentEc`
+                // and must publish exactly what it does — gen first,
+                // pointer last, no separate discriminant byte. The
+                // previous form wrote a `movb $1` at +16 for the old
+                // 24-byte `?SlabRef` tag; against the current layout
+                // that byte lands on an unrelated field. Offsets are
+                // taken with `@offsetOf` so a field reorder is a build
+                // error, not silent corruption.
                 .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec_gen"),
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .sc_cur_gen = Offsets.sc_current_ec_gen,
                 .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
@@ -2925,9 +2941,9 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // setting it here, after the kstack/CR3 work and before the asm
     // jump, gives terminate from another core a stable window in which
     // current_ec→ptr already names this EC.
-    if ((&scheduler.core_states[cid]).current_ec) |prev_ref| {
-        if (prev_ref.ptr != ec) {
-            prev_ref.ptr.on_cpu.store(false, .release);
+    if ((&scheduler.core_states[cid]).current_ec) |prev| {
+        if (prev != ec) {
+            prev.on_cpu.store(false, .release);
         }
     }
     scheduler.setCurrentEc(cid, ec);

@@ -1259,6 +1259,78 @@ fn reportNoRouteFault(
         arch.boot.printRaw(")");
     }
     arch.boot.printRaw(" — EC parked, result (if any) will never be delivered\n");
+
+    // TEMP DIAGNOSTIC (stygia-idc, REMOVE). The bare-metal cap is a
+    // single recurring no-route memory_fault (`subcode=0 payload=0x10`,
+    // test `idc_read_07`, three occurrences across two independent
+    // N=100 runs on two different builds). Nothing in the line above
+    // says WHICH user instruction faulted, so the entire diagnosis so
+    // far has been inference from the address. Print the faulting EC's
+    // saved user frame: `pc-entry` is the byte offset into the test's
+    // own PIE image (entry_point is `e_entry + elf_slide`), which
+    // identifies the instruction exactly against
+    // `llvm-objdump -d tests/suite/bin/<case>.elf`, and the GPR dump
+    // names the register that carried the bad address.
+    arch.boot.printRaw("[nrdbg] entry=0x");
+    printHex64(ec.entry_point.addr);
+    arch.boot.printRaw(" pc=0x");
+    printHex64(arch_syscall.getEventRip(ec.ctx));
+    arch.boot.printRaw(" pc-entry=0x");
+    printHex64(arch_syscall.getEventRip(ec.ctx) -% ec.entry_point.addr);
+    arch.boot.printRaw("\n");
+    arch.cpu.dumpFaultRegs(ec.ctx);
+
+    // TEMP DIAGNOSTIC (stygia-idc, REMOVE). The frame above is `ec.ctx`,
+    // which is assigned ONCE at EC creation and thereafter merely
+    // ASSUMED to be where the next exception entry parks its frame
+    // (`kstack.top - 288`). Cycle 4's dump of it was internally
+    // inconsistent, so print the LIVE fault context the arch handler was
+    // actually handed. `live_ctx` differing from `ec.ctx` refutes every
+    // inference cycles 3 and 4 drew from that dump; `live_rip` is the
+    // real faulting instruction.
+    const dbg_core: u8 = @truncate(arch.smp.coreID());
+    const st = stygia.memory.fault.dbg_fault[
+        if (dbg_core < stygia.memory.fault.dbg_fault.len) dbg_core else 0
+    ];
+    arch.boot.printRaw("[nrdbg2] core=");
+    printHex64(dbg_core);
+    arch.boot.printRaw(" valid=");
+    printHex64(@intFromBool(st.valid));
+    arch.boot.printRaw(" site=");
+    printHex64(st.site);
+    arch.boot.printRaw(" kpriv=");
+    printHex64(@intFromBool(st.kpriv));
+    arch.boot.printRaw(" w=");
+    printHex64(@intFromBool(st.is_write));
+    arch.boot.printRaw(" x=");
+    printHex64(@intFromBool(st.is_exec));
+    arch.boot.printRaw(" far=0x");
+    printHex64(st.far);
+    arch.boot.printRaw(" live_rip=0x");
+    printHex64(st.rip);
+    arch.boot.printRaw(" live_rip-entry=0x");
+    printHex64(st.rip -% ec.entry_point.addr);
+    arch.boot.printRaw("\n[nrdbg2] live_ctx=0x");
+    printHex64(@intFromPtr(st.live_ctx));
+    arch.boot.printRaw(" ec_ctx=0x");
+    printHex64(@intFromPtr(ec.ctx));
+    arch.boot.printRaw(" kstack=0x");
+    printHex64(ec.kernel_stack.base.addr);
+    arch.boot.printRaw("..0x");
+    printHex64(ec.kernel_stack.top.addr);
+    arch.boot.printRaw(" state=");
+    printHex64(@intFromEnum(ec.state));
+    arch.boot.printRaw(" last_disp=");
+    printHex64(ec.last_dispatched_core);
+    arch.boot.printRaw(" oncpu=");
+    printHex64(@intFromBool(ec.on_cpu.load(.monotonic)));
+    arch.boot.printRaw("\n");
+    if (st.live_ctx) |lc| {
+        if (@intFromPtr(lc) != @intFromPtr(ec.ctx)) {
+            arch.boot.printRaw("[nrdbg2] LIVE FRAME (differs from ec.ctx):\n");
+            arch.cpu.dumpFaultRegs(lc);
+        }
+    }
 }
 
 fn printHex64(n: u64) void {
@@ -1312,11 +1384,19 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
     // `caps.derivation.deleteAndDetach` and
     // `caps.capability_domain.cleanupPartiallyCreatedCd`.
     const cd_lr = cd_ref.lockOrderedIrqSave(stygia.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
-        // CD slab gen has moved — domain is already being torn down
-        // by another path. Park the EC; the in-flight teardown will
-        // reap it.
+        // CD slab gen has moved — domain is already being torn down by
+        // another path. Parking alone used to rely on "the in-flight
+        // teardown will reap it", which only holds if that teardown's
+        // EC walk has not already passed this EC. When it has, the EC
+        // is orphaned forever (stygia-2u0; see the longer note on the
+        // thread-fault no-route fallback below). Destroy it explicitly
+        // instead — `destroyExecutionContextLocked` early-returns on an
+        // already-even gen, so racing the teardown is harmless, and a
+        // teardown walk that arrives later skips it for the same
+        // reason.
         stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
         execution_context.parkSelfFaulted(ec);
+        execution_context.destroyExecutionContextLocked(ec, null);
         return;
     };
     const cd = cd_lr.ptr;
@@ -1348,13 +1428,33 @@ pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
     // faulted again, and (when higher-priority than its peers) starved
     // every other EC in the domain.
     //
-    // Park instead of destroying: `parkSelfFaulted` clears the local
-    // core's `current_ec` and marks state `.exited` so the scheduler
-    // stops re-enqueueing it. We don't free the slab or kernel stack
-    // here — we're still running on that very stack inside the
-    // exception handler. The slab + stack are reclaimed when the
-    // owning domain is torn down.
+    // Park, THEN hand the EC to the standard deferred-destroy path.
+    //
+    // `parkSelfFaulted` clears the local core's `current_ec`, marks
+    // state `.exited` so the scheduler stops re-enqueueing it, and
+    // clears `on_cpu` so the reaper will accept it. What it does NOT do
+    // is bump the gen, post a zombie, or finalize — so on its own it
+    // leaves the EC alive-but-unreachable and delegates reclamation to
+    // "the owning domain is torn down". That delegation is an
+    // assumption, not a mechanism: if the domain's teardown has already
+    // run, or never runs, the EC is orphaned permanently — odd gen,
+    // `.exited`, off every queue, in no `pending_zombie` column, matched
+    // by no reap path. Measured at ~8 leaked ECs per suite pass, which
+    // is what degrades a repeat run to zero delivered results by pass
+    // ~11 (stygia-2u0); a per-state EC census showed `exited` climbing
+    // 7 → 73 while every other state stayed flat, with `pz_occupied`
+    // pinned at 0 proving they were never posted at all.
+    //
+    // `destroyExecutionContextLocked` is the same primitive
+    // `destroyPhase2` uses for the destroying domain's own caller EC,
+    // and it is safe to call while standing on the EC's kstack: it
+    // posts a zombie rather than freeing inline, and both
+    // `takeOwnPendingZombie` and the arch reap loops refuse to finalize
+    // an EC whose kstack contains the current `rsp`. `null` for
+    // `caller_cd` because no domain is being torn down here, so a
+    // pending reply must be ABANDONED rather than silently dropped.
     execution_context.parkSelfFaulted(ec);
+    execution_context.destroyExecutionContextLocked(ec, null);
 }
 
 /// Fire a breakpoint event. Fallback: drop, advance past trap, resume.
@@ -1462,12 +1562,7 @@ pub fn finalizePendingVcpus(head: ?*ExecutionContext) void {
         // pre-cascade `bind_refcount` contribution and is not yet on
         // any other reachability path, so its slab slot can't be
         // reaped before this destroy completes.
-        const ec_dom = ec.domain.ptr;
-        execution_context.destroyExecutionContextLocked(
-            ec,
-            ec_dom.addr_space_root,
-            ec_dom,
-        );
+        execution_context.destroyExecutionContextLocked(ec, ec.domain.ptr);
         cur = next;
     }
 }
