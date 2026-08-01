@@ -1,0 +1,3 @@
+callee <unresolved> via=exact
+callee mod.logf via=ir_mono_suffix
+phantom_edges=0

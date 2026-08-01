@@ -8,6 +8,7 @@ const ast_pass = @import("ast_pass.zig");
 const sync_mod = @import("sync.zig");
 const writer_mod = @import("writer.zig");
 const ir_pass = @import("ir_pass.zig");
+const entry_pass = @import("entry_pass.zig");
 const bin_pass = @import("bin_pass.zig");
 const refs_pass = @import("refs_pass.zig");
 const dwarf_types_pass = @import("dwarf_types_pass.zig");
@@ -327,7 +328,12 @@ pub fn main() !void {
         const ir_result = try ir_pass.pass(palloc, ir_path, &qmap);
         ir_fns_count = ir_result.ir_fns.len;
         ir_calls_count = ir_result.ir_calls.len;
+        const s = ir_result.stats;
         std.log.info("stage 3: parsed IR — {d} ir_fn, {d} ir_call rows", .{ ir_fns_count, ir_calls_count });
+        std.log.info(
+            "stage 3: demangling — {d} quoted defines ({d} matched a generic decl), {d} quoted callees; edges via mono-suffix={d}, via generic-erasure={d}",
+            .{ s.quoted_defines, s.demangled_fns, s.quoted_calls, s.calls_via_mono_suffix, s.calls_via_generic },
+        );
 
         if (ir_result.ir_fns.len > 0) {
             try channel.send(.{ .ir_fns = ir_result.ir_fns });
@@ -409,8 +415,13 @@ pub fn main() !void {
     //     "every pub fn in syscall/*.zig" overcount that pulled in
     //     ~16 private helpers.
     //   - boot: main.kEntry.
+    //
+    // Every insert is OR IGNORE and ordered legacy-first, because stage 5a
+    // (entry_pass) merges the mechanically discovered IDT / naked-vector-table
+    // handlers on top and an entity may be found by both. Legacy rows win so
+    // an entity's kind/label stays stable.
     const entry_sql: [:0]const u8 =
-        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\INSERT OR IGNORE INTO entry_point (entity_id, kind, label)
         \\SELECT e.id, 'exception', e.qualified_name
         \\FROM entity e JOIN file f ON f.id = e.def_file_id
         \\WHERE e.kind = 'fn'
@@ -424,16 +435,16 @@ pub fn main() !void {
         \\       OR e.qualified_name LIKE '%.handleUnexpected'
         \\       OR e.qualified_name LIKE '%.dispatchIrq'
         \\       OR e.qualified_name LIKE '%.schedTimerHandler');
-        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\INSERT OR IGNORE INTO entry_point (entity_id, kind, label)
         \\SELECT e.id, 'irq', e.qualified_name
         \\FROM entity e JOIN file f ON f.id = e.def_file_id
         \\WHERE e.kind = 'fn'
         \\  AND f.path LIKE 'arch/%/irq.zig'
         \\  AND e.qualified_name LIKE '%.schedTimerHandler';
-        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\INSERT OR IGNORE INTO entry_point (entity_id, kind, label)
         \\SELECT e.id, 'boot', e.qualified_name FROM entity e
         \\WHERE e.kind = 'fn' AND e.qualified_name = 'main.kEntry';
-        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\INSERT OR IGNORE INTO entry_point (entity_id, kind, label)
         \\SELECT DISTINCT callee.id, 'syscall', callee.qualified_name
         \\FROM ir_call ic
         \\JOIN entity caller ON caller.id = ic.caller_entity_id
@@ -445,7 +456,7 @@ pub fn main() !void {
         \\-- if the IR-driven insert produced zero syscall entries, fall back
         \\-- to the file-path convention. Production builds with IR will have
         \\-- already populated the precise set, so this is a no-op there.
-        \\INSERT INTO entry_point (entity_id, kind, label)
+        \\INSERT OR IGNORE INTO entry_point (entity_id, kind, label)
         \\SELECT e.id, 'syscall', e.qualified_name
         \\FROM entity e JOIN file f ON f.id = e.def_file_id
         \\WHERE e.kind = 'fn'
@@ -455,6 +466,41 @@ pub fn main() !void {
         \\  AND NOT EXISTS (SELECT 1 FROM entry_point ep WHERE ep.kind = 'syscall');
     ;
     try channel.send(.{ .raw_sql = entry_sql });
+
+    // ── Stage 5a: mechanical interrupt-entry discovery ────────────────────
+    //
+    // The name list above is complete only for as long as nobody adds a
+    // handler. entry_pass derives the set from the two places a vector is
+    // actually bound to a Zig function — `interrupts.registerVector(...)`
+    // (x86-64 IDT) and `&handler` inline-asm operands inside a
+    // `callconv(.naked)` fn (aarch64 vector table) — so a new handler is
+    // rooted the moment it is wired up. Merged with OR IGNORE after the
+    // legacy inserts, so existing rows keep their kind and label.
+    {
+        const ep = try entry_pass.pass(
+            palloc,
+            merged_files[0..kernel_file_count],
+            resolve_result.final_entities,
+        );
+        std.log.info("stage 5a: entry discovery — {d} handlers from registerVector / naked vector table, {d} unresolved", .{
+            ep.rows.len,
+            ep.unresolved.len,
+        });
+        for (ep.unresolved) |u| std.log.warn("stage 5a: {s}", .{u});
+        if (ep.rows.len > 0) {
+            var sql: std.ArrayList(u8) = .empty;
+            for (ep.rows) |r| {
+                try sql.print(
+                    palloc,
+                    "INSERT OR IGNORE INTO entry_point (entity_id, kind, label) VALUES ({d}, '{s}', '{s}');\n",
+                    .{ r.entity_id, r.kind, r.label },
+                );
+            }
+            try sql.append(palloc, 0);
+            const owned = sql.items[0 .. sql.items.len - 1 :0];
+            try channel.send(.{ .raw_sql = owned });
+        }
+    }
 
     // Cross-module slab-backed propagation: a `pub const X = SecureSlab(T, N)`
     // alias was marked is_slab_backed=1 in the AST pass; T may live in a

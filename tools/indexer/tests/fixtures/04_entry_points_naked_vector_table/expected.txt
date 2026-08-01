@@ -1,0 +1,8 @@
+exception  arch.aarch64.exceptions.exceptionTrampoline
+exception  arch.aarch64.exceptions.handleIrqCurrentEl
+exception  arch.aarch64.exceptions.handleIrqLowerEl
+exception  arch.aarch64.exceptions.handleSyncCurrentEl
+exception  arch.aarch64.exceptions.handleSyncLowerEl
+exception  arch.aarch64.exceptions.handleUnexpected
+irq  arch.aarch64.exceptions.handleIrqSpecial
+non_naked_rooted=0

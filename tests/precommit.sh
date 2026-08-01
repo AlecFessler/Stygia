@@ -476,10 +476,34 @@ stage_gen_lock_analyzer() {
     fi
     ensure_callgraph_db || return 1
     local analyzer="$STYGIA_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
+    # Both arches, like stage [0b] — but note the SHAPE DIFFERS. The
+    # dead-code detector accepts repeated `--db` flags and unions the
+    # alive-set across them; check_gen_lock's `--db` is single-valued
+    # (`args.db_path = v`), so a second `--db` would silently overwrite
+    # the first and analyze only one arch. Hence two invocations.
+    #
+    # Why both are needed: check 6's IRQ-discipline pass defers any
+    # acquire site under `kernel/arch/<other-arch>/` to the run for the
+    # arch that actually compiles it — that code is behind a resolved
+    # comptime arch branch and contributes zero ir_fn/ir_call rows here,
+    # so this DB has no evidence about it and every conclusion would rest
+    # on short-name text matching. The deferral is only sound because the
+    # other arch's run covers those sites; running one arch alone leaves
+    # them unanalyzed. The analyzer prints the deferred count on its
+    # summary line so a single-arch invocation can't hide them silently.
+    #
+    # Both runs execute even if the first fails, so one arch's findings
+    # don't mask the other's.
+    local genlock_rc=0
     if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
-        FAILURES+=("gen-lock analyzer findings")
-        return 1
+        FAILURES+=("gen-lock analyzer findings (x86_64)")
+        genlock_rc=1
     fi
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB_AARCH64" --target kernel --summary); then
+        FAILURES+=("gen-lock analyzer findings (aarch64)")
+        genlock_rc=1
+    fi
+    return $genlock_rc
 }
 
 stage_verify_coverage() {
