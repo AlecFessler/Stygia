@@ -16,7 +16,6 @@ const stygia = @import("stygia");
 const arch = stygia.arch.dispatch;
 const arch_syscall = stygia.arch.dispatch.syscall;
 const errors = stygia.syscall.errors;
-const lifecycle = stygia.sched.lifecycle;
 const sched = stygia.sched.scheduler;
 
 const execution_context = stygia.sched.execution_context;
@@ -297,9 +296,6 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         // EC is reaped while we spin, its slab bytes are zeroed, so
         // this load reads false and we fall through to phase 3, where
         // the gen check rejects it.
-        // Phase-2 measurement: entering this spin means the waker found
-        // its target mid-park — edge 5b's population.
-        if (ec.on_cpu.load(.acquire)) lifecycle.bumpCounter(.oncpu_spin_entered);
         while (ec.on_cpu.load(.acquire)) {
             // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
             // matching note on `scheduler.markReady`'s kstack barrier.
@@ -335,8 +331,6 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
             node.ec.unlockIrqRestore(wake_lr.irq_state);
             continue;
         }
-        // Phase-2 shadow: edge 5a / 5b (futex_wake syscall source).
-        execution_context.lcClaim(ec, .claim_futex_wake);
         ec.futex_wake_index = @intCast(node_idx);
         if (ec.futex_deadline_ns != 0) {
             ec.futex_deadline_ns = 0;
@@ -438,9 +432,6 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
     ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
-    // Phase-2 shadow: edge 3 (park, futex flavour). CAS-before-links,
-    // matching §3.2's M1 order — the bucket enqueues follow.
-    _ = execution_context.lcObserve(ec, .parking, .park_futex_val);
 
     for (0..count) |i| {
         const idx = bucketIdx(addrs[i]);
@@ -454,11 +445,6 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
             }
             releaseBucketLocks(&lock_state);
             ec.state = .running;
-            // Phase-2 shadow: NO §5 edge exists for `parking -> running`.
-            // §3.2 step 1 requires all fallible work BEFORE the publish;
-            // this site publishes, then fails a fallible registration,
-            // then un-publishes. Recorded, not repaired.
-            _ = execution_context.lcObserve(ec, .running, .futex_nomem_undo);
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
@@ -488,9 +474,6 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
         sched.stashKstackRelease(core_id, ec);
     } else {
         ec.on_cpu.store(false, .release);
-        // Phase-2 shadow: §4 hop step 2 — release happens here, not at a
-        // stack hop, so commit here too.
-        execution_context.lcHopCommit(ec, .waiting, .hop_faulted);
     }
     return 0;
 }
@@ -552,8 +535,6 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
     ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
     ec.state = .futex_wait;
-    // Phase-2 shadow: edge 3 (park, futex flavour). CAS-before-links.
-    _ = execution_context.lcObserve(ec, .parking, .park_futex_chg);
 
     for (0..count) |i| {
         (&buckets[bucketIdx(addrs[i])]).pq.enqueue(&nodes[i]);
@@ -566,11 +547,6 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
             }
             releaseBucketLocks(&lock_state);
             ec.state = .running;
-            // Phase-2 shadow: NO §5 edge exists for `parking -> running`.
-            // §3.2 step 1 requires all fallible work BEFORE the publish;
-            // this site publishes, then fails a fallible registration,
-            // then un-publishes. Recorded, not repaired.
-            _ = execution_context.lcObserve(ec, .running, .futex_nomem_undo);
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
@@ -590,9 +566,6 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
         sched.stashKstackRelease(core_id, ec);
     } else {
         ec.on_cpu.store(false, .release);
-        // Phase-2 shadow: §4 hop step 2 — release happens here, not at a
-        // stack hop, so commit here too.
-        execution_context.lcHopCommit(ec, .waiting, .hop_faulted);
     }
     return 0;
 }
@@ -741,9 +714,6 @@ pub fn expireTimedWaiters() void {
             // event beat us, it owns the wake and the E_TIMEOUT we were
             // about to stamp would be a lie.
             if (!execution_context.tryClaimWake(ec, .futex_wait)) continue;
-            // Phase-2 shadow: edge 5a / 5b, interrupt context (§5.1's
-            // "futex deadline expiry" row).
-            execution_context.lcClaim(ec, .claim_futex_expire);
             ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
             // [test 06]: timeout returns E_TIMEOUT in vreg 1. The

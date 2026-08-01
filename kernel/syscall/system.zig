@@ -3,7 +3,6 @@ const stygia = @import("stygia");
 const cpu = stygia.arch.dispatch.cpu;
 const errors = stygia.syscall.errors;
 const iommu = stygia.arch.dispatch.iommu;
-const lifecycle = stygia.sched.lifecycle;
 const pmu = stygia.arch.dispatch.pmu;
 const smp = stygia.arch.dispatch.smp;
 const sync = stygia.utils.sync;
@@ -460,18 +459,6 @@ pub fn powerSetIdle(caller: *anyopaque, core_id: u64, policy: u64) i64 {
 fn doPowerAction(caller: *anyopaque, action: PowerAction) i64 {
     const self_caps = readSelfCaps(caller) orelse return errors.E_BADCAP;
     if (!self_caps.power) return errors.E_PERM;
-    // Phase-2 EC-lifecycle shadow: dump the divergence profile before the
-    // machine goes away. `power_shutdown` / `power_reboot` is how the
-    // in-kernel test runner ends a boot, so this is the end-of-run hook
-    // for the whole suite. Debug builds only (`lifecycle.enabled`);
-    // `dump()` is a read-only print and returns immediately otherwise.
-    // Deliberately AFTER the cap check so an unprivileged caller cannot
-    // make the kernel print, and BEFORE `powerAction`, which never
-    // returns on success.
-    switch (action) {
-        .shutdown, .reboot => lifecycle.dump(),
-        else => {},
-    }
     return cpu.powerAction(action);
 }
 
