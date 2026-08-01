@@ -50,10 +50,27 @@
 //! indexer merges a generic's instantiations into ONE entity, so
 //! `secure_slab.forEachAlive` carries the union of every visitor's
 //! callees and a path may enter through one instantiation and leave
-//! through another. Class identity is likewise approximate — the class
-//! id is the literal receiver text, so `self.lock` conflates
-//! `PhysicalMemoryManager.lock` with `SecureSlab(T).lock`. Both are
-//! over-approximations: they cost false positives, not false negatives.
+//! through another.
+//!
+//! Class identity is taken from the kernel's OWN lockdep labels — the
+//! `.class = "…"` a `SpinLock` declares, and the one `SecureSlab.publish`
+//! assigns to a slot's `_gen_lock` at runtime — resolved from the
+//! receiver's terminal field name (same-file declaration first, then a
+//! tree-wide lookup that only fires when every declaration of that name
+//! agrees). See `loadLockClasses`. This replaced keying on the literal
+//! receiver text, which was wrong in both directions: `self.lock`
+//! conflated `PhysicalMemoryManager.lock` with `SecureSlab(T).lock`,
+//! while `ptr._gen_lock` and `self.ptr._gen_lock` were counted as two
+//! classes although the kernel proves them the same lock. Receivers whose
+//! terminal name determines no declared class — SlabRef locals such as
+//! `cd_ref`, whose type the DB does not record — still fall back to the
+//! literal text and so remain split per spelling.
+//!
+//! What remains approximate: `++`-joined class labels render the
+//! non-literal parts as `…`, so every instantiation of a generic collapses
+//! into one class (`SecureSlab(…).lock`). Like the reachability caveat
+//! above, that is an over-approximation — it costs false positives, not
+//! false negatives.
 //!
 //! Exit status nonzero iff any err-severity findings are emitted.
 
@@ -407,6 +424,11 @@ const State = struct {
     slab_types: StringHashMap(void), // short name → present
     slab_field_names: StringHashMap(void), // short field name → present
     entry_points: ArrayList(Entity),
+    /// Declared lockdep classes, keyed `"<file_id>\x00<decl name>"` and
+    /// `"\x00<decl name>"` (the file-agnostic entry, present only when every
+    /// declaration of that name agrees on its class). Populated by
+    /// `loadLockClasses`; consumed by `canonicalClassId`.
+    lock_classes: StringHashMap([]const u8),
 
     fn init(gpa: Allocator) State {
         return .{
@@ -417,6 +439,7 @@ const State = struct {
             .slab_types = StringHashMap(void).init(gpa),
             .slab_field_names = StringHashMap(void).init(gpa),
             .entry_points = .empty,
+            .lock_classes = StringHashMap([]const u8).init(gpa),
         };
     }
 
@@ -426,11 +449,167 @@ const State = struct {
         self.slab_types.deinit();
         self.slab_field_names.deinit();
         self.entry_points.deinit(self.gpa);
+        self.lock_classes.deinit();
         self.arena.deinit();
     }
 };
 
 // ── DB loaders ─────────────────────────────────────────────────────────
+
+/// Read the kernel's own lockdep class labels out of the token stream.
+///
+/// Class identity used to be the literal receiver text (`class_id =
+/// recv_chain`), which is wrong in both directions and known to be:
+/// `self.lock` conflated `PhysicalMemoryManager.lock` with
+/// `SecureSlab(T).lock`, while `ptr._gen_lock` and `self.ptr._gen_lock`
+/// were two classes even though they are provably the same lock. The
+/// kernel already publishes the ground truth — every `SpinLock` carries an
+/// explicit `.class = "…"` and `GenLock` gets one assigned at runtime by
+/// the slab that owns the slot — so use that instead of guessing from
+/// spelling. It is the same table `utils/sync/debug.zig` keys lockdep on.
+///
+/// Two syntactic forms, distinguished by what encloses the `.class` token:
+///
+///   declaration  `lock: SpinLock = .{ .class = "PhysicalMemoryManager.lock" }`
+///                the enclosing entity is the `field`/`var` being declared,
+///                so its short name is the decl name. Using the entity
+///                range rather than reading backwards through tokens is
+///                what makes the multi-line forms work — `wheel_locks` and
+///                `core_locks` put the literal on a continuation line.
+///
+///   runtime      `slot_ptr._gen_lock.class = "SecureSlab(" ++ … ++ "._gen_lock"`
+///                the enclosing entity is a `fn`, and the owning field is
+///                the identifier immediately before `.class`.
+///
+/// Assignments with no string literal on the right (`e.class = class;` —
+/// lockdep plumbing that copies a label rather than declaring one) are
+/// skipped: the query requires at least one `string_literal`.
+///
+/// `++`-joined literals are rendered with `…` between the parts, matching
+/// tools/check_ec_closure. That merges every instantiation of a generic
+/// into one class — an over-approximation that costs false positives, not
+/// false negatives.
+fn loadLockClasses(db: *sqlite.Db, st: *State) !void {
+    const a = st.arena.allocator();
+    var stmt = try db.prepare(
+        \\SELECT t.file_id, t.idx, t.byte_start,
+        \\  (SELECT e.kind FROM entity e
+        \\    WHERE e.def_file_id = t.file_id
+        \\      AND e.def_byte_start <= t.byte_start AND t.byte_start < e.def_byte_end
+        \\    ORDER BY e.def_byte_end - e.def_byte_start ASC LIMIT 1) AS owner_kind,
+        \\  (SELECT e.qualified_name FROM entity e
+        \\    WHERE e.def_file_id = t.file_id
+        \\      AND e.def_byte_start <= t.byte_start AND t.byte_start < e.def_byte_end
+        \\    ORDER BY e.def_byte_end - e.def_byte_start ASC LIMIT 1) AS owner_qname,
+        \\  (SELECT p.text FROM token p
+        \\    WHERE p.file_id = t.file_id AND p.idx = t.idx - 2 AND p.kind = 'identifier') AS prev_ident
+        \\FROM token t
+        \\WHERE t.kind = 'identifier' AND t.text = 'class'
+        \\  AND EXISTS (SELECT 1 FROM token q WHERE q.file_id = t.file_id AND q.idx = t.idx - 1 AND q.kind = 'period')
+        \\  AND EXISTS (SELECT 1 FROM token q WHERE q.file_id = t.file_id AND q.idx = t.idx + 1 AND q.kind = 'equal')
+        \\ORDER BY t.file_id, t.idx
+    , st.gpa);
+    defer stmt.finalize();
+
+    // name → class, plus a disagreement marker for the file-agnostic entry.
+    var agreed = StringHashMap([]const u8).init(st.gpa);
+    defer agreed.deinit();
+    var conflicting = StringHashMap(void).init(st.gpa);
+    defer conflicting.deinit();
+
+    while (try stmt.step()) {
+        const file_id: u32 = @intCast(stmt.columnInt(0));
+        const idx: u32 = @intCast(stmt.columnInt(1));
+        // Only kernel files were loaded into st.files.
+        if (fileById(st, file_id) == null) continue;
+        const owner_kind = stmt.columnText(3) orelse continue;
+        const owner_qname = stmt.columnText(4) orelse continue;
+        const prev_ident = stmt.columnText(5);
+
+        const name: []const u8 = if (mem.eql(u8, owner_kind, "fn")) blk: {
+            // Runtime form: the field being labelled sits before `.class`.
+            const pi = prev_ident orelse continue;
+            break :blk try a.dupe(u8, pi);
+        } else blk: {
+            const dot = mem.lastIndexOfScalar(u8, owner_qname, '.');
+            break :blk try a.dupe(u8, if (dot) |d| owner_qname[d + 1 ..] else owner_qname);
+        };
+
+        const class = (try collectClassLiteral(db, st, file_id, idx)) orelse continue;
+
+        const key = try std.fmt.allocPrint(a, "{d}\x00{s}", .{ file_id, name });
+        try st.lock_classes.put(key, class);
+
+        if (agreed.get(name)) |prev| {
+            if (!mem.eql(u8, prev, class)) try conflicting.put(name, {});
+        } else {
+            try agreed.put(name, class);
+        }
+    }
+
+    // File-agnostic entries, for receivers acquired outside the declaring
+    // file (`cd._gen_lock…` in syscall/ against a decl in caps/). Only when
+    // every declaration of that name agrees — otherwise the name genuinely
+    // does not determine the class and we must fall back.
+    var it = agreed.iterator();
+    while (it.next()) |e| {
+        if (conflicting.contains(e.key_ptr.*)) continue;
+        const key = try std.fmt.allocPrint(a, "\x00{s}", .{e.key_ptr.*});
+        try st.lock_classes.put(key, e.value_ptr.*);
+    }
+}
+
+/// String literal(s) forming the class label at `.class = …`, `++`-joined
+/// parts rendered as `…`. Null when the RHS holds no literal.
+fn collectClassLiteral(db: *sqlite.Db, st: *State, file_id: u32, class_idx: u32) !?[]const u8 {
+    const a = st.arena.allocator();
+    var stmt = try db.prepare(
+        \\SELECT kind, text FROM token
+        \\WHERE file_id = ? AND idx > ? ORDER BY idx LIMIT 24
+    , st.gpa);
+    defer stmt.finalize();
+    try stmt.bindInt(1, @intCast(file_id));
+    try stmt.bindInt(2, @intCast(class_idx + 1)); // skip the `=`
+    var buf: ArrayList(u8) = .empty;
+    var first = true;
+    while (try stmt.step()) {
+        const kind = stmt.columnText(0) orelse "";
+        if (mem.eql(u8, kind, "semicolon") or mem.eql(u8, kind, "comma") or
+            mem.eql(u8, kind, "r_brace")) break;
+        if (!mem.eql(u8, kind, "string_literal")) continue;
+        const txt = stmt.columnText(1) orelse continue;
+        if (!first) try buf.appendSlice(st.gpa, "\u{2026}");
+        try buf.appendSlice(st.gpa, stripStrQuotes(txt));
+        first = false;
+    }
+    if (buf.items.len == 0) return null;
+    const owned = try a.dupe(u8, buf.items);
+    buf.deinit(st.gpa);
+    return owned;
+}
+
+fn stripStrQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+    return s;
+}
+
+/// Canonical class id for an acquire/release receiver chain: the kernel's
+/// declared class where the terminal field name determines one, else the
+/// literal receiver text (the previous behaviour) so nothing is lost.
+fn canonicalClassId(st: *State, file_id: u32, recv_chain: []const u8) []const u8 {
+    const term = if (mem.lastIndexOfScalar(u8, recv_chain, '.')) |d|
+        recv_chain[d + 1 ..]
+    else
+        recv_chain;
+    if (term.len == 0) return recv_chain;
+    var kbuf: [512]u8 = undefined;
+    // Same-file declaration wins.
+    const fk = std.fmt.bufPrint(&kbuf, "{d}\x00{s}", .{ file_id, term }) catch return recv_chain;
+    if (st.lock_classes.get(fk)) |c| return c;
+    const gk = std.fmt.bufPrint(&kbuf, "\x00{s}", .{term}) catch return recv_chain;
+    if (st.lock_classes.get(gk)) |c| return c;
+    return recv_chain;
+}
 
 fn loadFiles(db: *sqlite.Db, st: *State, target: ?[]const u8) !void {
     const a = st.arena.allocator();
@@ -2338,8 +2517,10 @@ fn scanFnIrq(
         }
         if (recv_chain.len == 0) continue;
 
-        // Class id: literal chain text (best-effort grouping).
-        const class_id = try arena_alloc.dupe(u8, recv_chain);
+        // Class id: the kernel's declared lockdep class where the
+        // receiver's terminal field name determines one, else the literal
+        // chain text. See `loadLockClasses`.
+        const class_id = try arena_alloc.dupe(u8, canonicalClassId(st, fn_row.file_id, recv_chain));
         const method_dup = try arena_alloc.dupe(u8, method);
         const line = byteToLine(f.source, fn_row.byte_start + @as(u32, @intCast(p)));
 
@@ -2494,7 +2675,17 @@ pub fn main() !u8 {
     const gpa = gpa_impl.allocator();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    // writerStreaming, NOT writer: std.fs.File.writer() defaults to
+    // POSITIONAL writes (pwrite at the Writer's own `pos`, starting at 0).
+    // Against a terminal that is invisible, but the gauntlet is normally
+    // captured with `./tests/precommit.sh > log`, and there stdout is a
+    // seekable file — so every analyzer stage restarted at offset 0 and
+    // overwrote the stages before it. Captured logs silently lost their
+    // earlier stages; verified by feeding this binary a redirected stdout
+    // with known preceding lines and watching them disappear.
+    // Streaming mode uses ordinary write(2) and appends. See bd stygia-8qz
+    // (found while wiring stage [0d]).
+    var stdout_w = std.fs.File.stdout().writerStreaming(&stdout_buf);
     const w = &stdout_w.interface;
 
     const args = try parseArgs(gpa);
@@ -2524,6 +2715,9 @@ pub fn main() !u8 {
     try loadSlabTypes(&db, &st);
     try collectSlabFieldNames(&db, &st);
     try loadEntryPoints(&db, &st);
+    // Must follow loadFiles: only files that survived the kernel-scope
+    // filter are eligible to declare a class.
+    try loadLockClasses(&db, &st);
 
     if (args.list_slab_types) {
         try w.writeAll("Slab-backed types:\n");

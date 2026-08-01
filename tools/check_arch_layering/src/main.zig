@@ -451,7 +451,13 @@ fn lessFinding(_: void, a: Finding, b: Finding) bool {
 fn renderFindings(findings: []const Finding) !void {
     const stdout = std.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buf);
+    // writerStreaming, NOT writer: std.fs.File.writer() defaults to
+    // POSITIONAL writes (pwrite at the Writer's own `pos`, starting at 0),
+    // so when the gauntlet is captured with `./tests/precommit.sh > log`
+    // this stage rewound to offset 0 and overwrote whatever preceded it.
+    // Streaming mode uses ordinary write(2) and appends. Same fix as the
+    // other analyzer stages; see bd stygia-8qz.
+    var stdout_writer = stdout.writerStreaming(&stdout_buf);
     const w = &stdout_writer.interface;
 
     var up: u32 = 0;

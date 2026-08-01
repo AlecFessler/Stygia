@@ -337,6 +337,34 @@ fn resolveFn(
 
     const chain = joinChain(a, segs) catch return null;
 
+    // `full` = the chain IS the whole qualified name; `exact` = the chain is
+    // a dot-aligned SUFFIX of it. Full equality is strictly the stronger
+    // evidence and is tried first.
+    //
+    // Why this ordering is load-bearing: the indexer's source roots include
+    // `tools/`, which contains this pass's OWN fixtures. So the tree holds
+    // both
+    //     arch.x64.paging.tlbShootdownHandler                       (kernel)
+    //     tools.indexer.tests.fixtures.03_entry_points_register_vector
+    //         .kernel.arch.x64.paging.tlbShootdownHandler           (fixture)
+    // and the second one ends with `.arch.x64.paging.tlbShootdownHandler`.
+    // Ranking suffix hits equally therefore produced exact_n == 2 for the
+    // real IDT registration in kernel/arch/x64/irq.zig, which fell through
+    // to `if (exact_n > 1) return null` and dropped the W9 TLB-shootdown IPI
+    // handler from `entry_point` entirely — logged only as a one-line
+    // "did not resolve" warning. Both check_gen_lock and check_ec_closure
+    // seed from `entry_point`, so the shootdown path was a seed in NEITHER,
+    // and any lock class reachable only from it was invisible to both. A
+    // false NEGATIVE, unlike the rest of those tools' imprecision.
+    //
+    // A fixture can never win a full-equality match against a kernel entity
+    // (its qualified name is prefixed by its path), so preferring full
+    // equality resolves the collision in the kernel's favour without any
+    // path-based special-casing. See bd stygia-ywh.
+    var full: ?u32 = null;
+    var full_n: usize = 0;
+    var full_local: ?u32 = null;
+    var full_local_n: usize = 0;
     var exact: ?u32 = null;
     var exact_n: usize = 0;
     var exact_local: ?u32 = null;
@@ -351,6 +379,14 @@ fn resolveFn(
             local_n += 1;
         }
         const qn = e.qualified_name;
+        if (std.mem.eql(u8, qn, chain)) {
+            full = ci;
+            full_n += 1;
+            if (is_local) {
+                full_local = ci;
+                full_local_n += 1;
+            }
+        }
         if (std.mem.eql(u8, qn, chain) or
             (qn.len > chain.len and std.mem.endsWith(u8, qn, chain) and qn[qn.len - chain.len - 1] == '.'))
         {
@@ -362,6 +398,8 @@ fn resolveFn(
             }
         }
     }
+    if (full_n == 1) return full;
+    if (full_local_n == 1) return full_local;
     if (exact_n == 1) return exact;
     if (exact_local_n == 1) return exact_local;
     if (exact_n > 1) return null;

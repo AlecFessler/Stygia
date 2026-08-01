@@ -129,8 +129,16 @@ const WAKE_PRIMITIVES = [_]PrimSpec{
 /// indirect call through `vector_table[]`, which no callgraph resolves).
 const VECTOR_REGISTRARS = [_][]const u8{"registerVector"};
 
-/// Acquire methods on `SpinLock`. `masked` = the variant disables IRQs
-/// for the duration of the hold.
+/// Acquire methods on `SpinLock` and on `GenLock`/`SlabRef`. `masked` =
+/// the variant disables IRQs for the duration of the hold.
+///
+/// The `lockWithGen*` family is GenLock's verify-and-acquire path and
+/// `lockOrderedIrqSave` is SlabRef's; both were absent while GenLock was
+/// out of scope. They matter now that `_gen_lock` resolves to a class:
+/// omitting the two PLAIN ones (`lockWithGen`, `lockWithGenOrdered`)
+/// would let the class's verdict be computed from a strict subset of its
+/// acquires and report "IRQ-MASKED at every acquire" for a class that has
+/// plain acquires the scan never looked at.
 const AcquireMethod = struct { name: []const u8, masked: bool };
 const ACQUIRE_METHODS = [_]AcquireMethod{
     .{ .name = "lock", .masked = false },
@@ -138,7 +146,19 @@ const ACQUIRE_METHODS = [_]AcquireMethod{
     .{ .name = "tryLock", .masked = false },
     .{ .name = "lockIrqSave", .masked = true },
     .{ .name = "lockIrqSaveOrdered", .masked = true },
+    // GenLock verify-and-acquire / SlabRef.
+    .{ .name = "lockWithGen", .masked = false },
+    .{ .name = "lockWithGenOrdered", .masked = false },
+    .{ .name = "lockWithGenIrqSave", .masked = true },
+    .{ .name = "lockWithGenIrqSaveOrdered", .masked = true },
+    .{ .name = "lockOrderedIrqSave", .masked = true },
 };
+
+/// Types whose declarations carry a lockdep `.class` label. `GenLock` is
+/// the per-object gen+lock word every slab-backed type embeds as
+/// `_gen_lock`; it labels its class at RUNTIME from the slab constructor
+/// (see `runtimeClassAssignments`), not in the field default.
+const LOCK_TYPES = [_][]const u8{ "SpinLock", "GenLock" };
 
 /// The `SpinLock` implementation acquires through `self`, which is not a
 /// lock class. Skip the file rather than report bogus UNRESOLVED rows.
@@ -263,8 +283,17 @@ const LockDecl = struct {
     line: u32,
 };
 
+/// One lockdep class — the kernel's `.class` string — and every
+/// declaration that carries it.
+const ClassGroup = struct {
+    class: []const u8,
+    decls: []u32,
+};
+
 const AcquireSite = struct {
-    lock_idx: u32,
+    /// Index into `Ctx.classes`, NOT into `Ctx.locks`: identity is the
+    /// declared lockdep class, not the declaration site.
+    class_idx: u32,
     file_id: i64,
     line: u32,
     method: []const u8,
@@ -308,6 +337,10 @@ const Ctx = struct {
     in_adj: [][]u32,
 
     locks: []LockDecl,
+    /// Lock classes, keyed on the kernel's declared `.class` string.
+    classes: []ClassGroup,
+    /// `locks[i]` belongs to `classes[class_of_decl[i]]`.
+    class_of_decl: []u32,
     acquires: []AcquireSite,
     unresolved: []UnresolvedAcq,
 
@@ -587,6 +620,21 @@ fn resolveFn(ctx: *const Ctx, segs_in: []const []const u8, pref_file: ?i64) ?u32
     }
     const chain = buf.items;
 
+    // Full qualified-name equality outranks a dot-aligned suffix match.
+    //
+    // The DB indexes `tools/`, which holds this analyzer's own fixtures and
+    // the indexer's, so a kernel name can be shadowed by a fixture copy
+    // whose qualified name merely ENDS with it — e.g.
+    // `tools.indexer.tests.fixtures.03_….kernel.arch.x64.paging
+    //  .tlbShootdownHandler` vs the real `arch.x64.paging
+    //  .tlbShootdownHandler`. Counting both as "exact" made the IDT
+    // registration for the W9 TLB-shootdown IPI ambiguous, so it resolved
+    // to nothing and never became a Rule A/B seed. Mirrors the identical
+    // fix in tools/indexer/src/entry_pass.zig. See bd stygia-ywh.
+    var full: ?u32 = null;
+    var full_n: usize = 0;
+    var full_local: ?u32 = null;
+    var full_local_n: usize = 0;
     var exact: ?u32 = null;
     var exact_n: usize = 0;
     var exact_local: ?u32 = null;
@@ -601,6 +649,14 @@ fn resolveFn(ctx: *const Ctx, segs_in: []const []const u8, pref_file: ?i64) ?u32
             local_n += 1;
         }
         const qn = e.qname;
+        if (mem.eql(u8, qn, chain)) {
+            full = ci;
+            full_n += 1;
+            if (is_local) {
+                full_local = ci;
+                full_local_n += 1;
+            }
+        }
         if (mem.eql(u8, qn, chain) or
             (qn.len > chain.len and mem.endsWith(u8, qn, chain) and qn[qn.len - chain.len - 1] == '.'))
         {
@@ -612,6 +668,8 @@ fn resolveFn(ctx: *const Ctx, segs_in: []const []const u8, pref_file: ?i64) ?u32
             }
         }
     }
+    if (full_n == 1) return full;
+    if (full_local_n == 1) return full_local;
     if (exact_n == 1) return exact;
     if (exact_local_n == 1) return exact_local;
     if (exact_n > 1) return null;
@@ -831,7 +889,19 @@ fn collectIrqSeeds(ctx: *Ctx) ![]Seed {
     }
 
     // S2 / S3 — token-derived.
+    //
+    // Scope-filtered exactly like Rule B's lock discovery, and for the same
+    // reason. The indexer's extra source roots pull in `tools/`, which
+    // contains THIS analyzer's fixture kernels — every one of which calls
+    // `registerVector(…)` because that is how a fixture declares an ISR.
+    // Unfiltered, a real-tree run took 48 of its 70 "interrupt entry
+    // points" from tools/check_ec_closure/tests/fixtures/*, inflating the
+    // entry count, the closure, and the wake-source table with functions
+    // that are not in the kernel at all. The fixture harness itself is
+    // unaffected: it writes each fixture to `kernel/arch/x64/irq.zig` in a
+    // temp tree, so fixture DB paths are `arch/x64/…` and stay in scope.
     for (ctx.files, 0..) |f, fi| {
+        if (!inKernelScope(f.path)) continue;
         const toks = ctx.toks[fi];
         if (toks.len == 0) continue;
         var i: usize = 0;
@@ -1000,17 +1070,88 @@ fn argChain(ctx: *Ctx, toks: []const Tok, from: usize, to: usize) !?[][]const u8
 
 // ─── Rule B: lock-class discovery ─────────────────────────────────────
 
+/// Lockdep classes assigned at RUNTIME rather than in a field default:
+/// `<chain>.class = "lit"[ ++ … ];`. Keyed by the last field name of the
+/// assigned chain.
+///
+/// This exists for one construct, but it is the construct that covers most
+/// of the kernel's locks. A slab-backed type embeds `_gen_lock: GenLock =
+/// .{}` with no class, and `SecureSlab(T).publish` labels the slot as it
+/// hands it out:
+///
+///     slot_ptr._gen_lock.class = "SecureSlab(" ++ @typeName(T) ++ ")._gen_lock";
+///
+/// Every `_gen_lock` field in the tree therefore belongs to that class
+/// family, which is what lets an acquire written `cd._gen_lock…` in
+/// syscall/ resolve against a decl in caps/ — see `resolveLockClass`.
+///
+/// `++`-joined literals are rendered with `…` for the non-literal parts,
+/// the same convention `collectLockDecls` uses for `SecureSlab(" ++
+/// @typeName(T) ++ ").lock`. That collapses every instantiation of a
+/// generic into one class. It is an OVER-approximation — distinct `T`s get
+/// distinct strings at runtime — and so costs false positives, not false
+/// negatives, which is the correct bias here.
+///
+/// Assignments whose right-hand side is not a string literal (e.g.
+/// `e.class = class;` in utils/sync/debug_core.zig, which is plumbing that
+/// copies a class rather than declaring one) yield no literal and are
+/// skipped.
+fn runtimeClassAssignments(ctx: *Ctx) !std.StringHashMap([]const u8) {
+    const a = ctx.a;
+    var m = std.StringHashMap([]const u8).init(a);
+    for (ctx.files, 0..) |f, fi| {
+        if (!inKernelScope(f.path)) continue;
+        const toks = ctx.toks[fi];
+        var i: usize = 0;
+        while (i + 2 < toks.len) : (i += 1) {
+            // `… . class = <string literal chain> ;`
+            if (toks[i].kind != .identifier or !mem.eql(u8, toks[i].text, "class")) continue;
+            if (i == 0 or toks[i - 1].kind != .period) continue;
+            if (toks[i + 1].kind != .equal) continue;
+            // Field the class is being attached to: the chain segment
+            // immediately before `.class`.
+            if (i < 2 or toks[i - 2].kind != .identifier) continue;
+            const field = toks[i - 2].text;
+
+            var buf: ArrayList(u8) = .{};
+            var first = true;
+            var k = i + 2;
+            while (k < toks.len and toks[k].kind != .semicolon and
+                toks[k].kind != .comma and toks[k].kind != .r_brace) : (k += 1)
+            {
+                if (toks[k].kind != .string_literal) continue;
+                if (!first) try buf.appendSlice(a, "\u{2026}");
+                try buf.appendSlice(a, stripQuotes(toks[k].text));
+                first = false;
+            }
+            if (buf.items.len == 0) continue;
+            // First assignment wins; a second one for the same field name
+            // would be a genuine ambiguity we do not try to resolve.
+            if (m.contains(field)) continue;
+            try m.put(field, buf.items);
+        }
+    }
+    return m;
+}
+
 fn collectLockDecls(ctx: *Ctx) ![]LockDecl {
     const a = ctx.a;
     var out: ArrayList(LockDecl) = .{};
     var seen = std.StringHashMap(void).init(a);
+    var rt_classes = try runtimeClassAssignments(ctx);
+    defer rt_classes.deinit();
 
     for (ctx.files, 0..) |f, fi| {
         if (!inKernelScope(f.path)) continue;
         const toks = ctx.toks[fi];
         var i: usize = 0;
         while (i < toks.len) : (i += 1) {
-            if (toks[i].kind != .identifier or !mem.eql(u8, toks[i].text, "SpinLock")) continue;
+            if (toks[i].kind != .identifier) continue;
+            var is_lock_type = false;
+            for (LOCK_TYPES) |lt| {
+                if (mem.eql(u8, toks[i].text, lt)) is_lock_type = true;
+            }
+            if (!is_lock_type) continue;
 
             // Backward: find the declared name. Two accepted shapes:
             //     NAME : [ …len… ] [chain.] SpinLock …
@@ -1073,8 +1214,15 @@ fn collectLockDecls(ctx: *Ctx) ![]LockDecl {
                 }
             }
 
+            // A declaration with no inline `.class` may still have a class:
+            // `GenLock` is labelled at runtime by the slab that owns the
+            // slot (`slot_ptr._gen_lock.class = "SecureSlab(" ++
+            // @typeName(T) ++ ")._gen_lock"` in secure_slab.zig). Consult
+            // the runtime-assignment map by field name before giving up.
             const class: []const u8 = if (class_buf.items.len > 0)
                 class_buf.items
+            else if (rt_classes.get(nametok.text)) |c|
+                c
             else
                 try std.fmt.allocPrint(a, "@unclassified:{s}", .{nametok.text});
 
@@ -1172,7 +1320,56 @@ fn collectAliases(ctx: *Ctx, file_i: u32, host: u32) ![]Alias {
     return out.toOwnedSlice(a);
 }
 
-fn resolveLock(ctx: *Ctx, file_id: i64, aliases: []const Alias, segs_in: []const []const u8) ?u32 {
+/// Group the declarations into lock CLASSES, keyed on the kernel's own
+/// lockdep `.class` string.
+///
+/// Identity used to be one-row-per-declaration, which was wrong in both
+/// directions:
+///
+///   • UNDER-grouping. `serial.print_lock` is declared once in
+///     arch/x64/serial.zig and once in arch/aarch64/serial.zig. Two decls,
+///     one class — but Rule B printed two CLASS blocks and computed two
+///     independent verdicts, so a class could be reported "IRQ-MASKED at
+///     every acquire" on the strength of half its acquire sites.
+///
+///   • Unresolvable cross-file receivers. Every slab-backed type declares
+///     `_gen_lock`, so a decl-keyed lookup for `cd._gen_lock…` found ~12
+///     candidates, none in the acquiring file, and gave up — 33 acquires
+///     into UNRESOLVED. All 12 decls carry the SAME class, so the
+///     ambiguity was never real: the answer does not depend on which decl
+///     you pick.
+///
+/// Keying on the class string makes both cases fall out: candidates that
+/// disagree on class are still a genuine ambiguity and stay unresolved.
+fn buildClassGroups(ctx: *Ctx) !void {
+    const a = ctx.a;
+    var groups: ArrayList(ClassGroup) = .{};
+    var by_class = std.StringHashMap(u32).init(a);
+    const of_decl = try a.alloc(u32, ctx.locks.len);
+    for (ctx.locks, 0..) |l, li| {
+        const g = try by_class.getOrPut(l.class);
+        if (!g.found_existing) {
+            g.value_ptr.* = @intCast(groups.items.len);
+            try groups.append(a, .{ .class = l.class, .decls = &.{} });
+        }
+        of_decl[li] = g.value_ptr.*;
+    }
+    // Second pass: attach the decl list to each group, in decl order.
+    var lists = try a.alloc(ArrayList(u32), groups.items.len);
+    for (lists) |*x| x.* = .{};
+    for (ctx.locks, 0..) |_, li| try lists[of_decl[li]].append(a, @intCast(li));
+    for (lists, 0..) |*x, gi| groups.items[gi].decls = try x.toOwnedSlice(a);
+
+    ctx.classes = try groups.toOwnedSlice(a);
+    ctx.class_of_decl = of_decl;
+}
+
+/// Resolve an acquire receiver to a lock CLASS index.
+///
+/// Same-file decl wins outright. Otherwise every declaration sharing the
+/// receiver's terminal field name must agree on its class; if they do, the
+/// class is determined even though the declaration is not.
+fn resolveLockClass(ctx: *Ctx, file_id: i64, aliases: []const Alias, segs_in: []const []const u8) ?u32 {
     var segs = segs_in;
     if (segs.len == 1) {
         for (aliases) |al| {
@@ -1186,19 +1383,23 @@ fn resolveLock(ctx: *Ctx, file_id: i64, aliases: []const Alias, segs_in: []const
 
     var same_file: ?u32 = null;
     var same_n: usize = 0;
-    var global: ?u32 = null;
-    var global_n: usize = 0;
+    var any_class: ?u32 = null;
+    var n_named: usize = 0;
+    var all_agree = true;
     for (ctx.locks, 0..) |l, li| {
         if (!mem.eql(u8, l.decl_name, term)) continue;
-        global = @intCast(li);
-        global_n += 1;
+        n_named += 1;
+        const gi = ctx.class_of_decl[li];
+        if (any_class) |prev| {
+            if (prev != gi) all_agree = false;
+        } else any_class = gi;
         if (l.file_id == file_id) {
-            same_file = @intCast(li);
+            same_file = ctx.class_of_decl[li];
             same_n += 1;
         }
     }
     if (same_n == 1) return same_file;
-    if (global_n == 1) return global;
+    if (n_named > 0 and all_agree) return any_class;
     return null;
 }
 
@@ -1248,9 +1449,9 @@ fn collectAcquires(ctx: *Ctx) !void {
             const recv_text = try mem.join(a, ".", recv);
             const line = ctx.lineForByte(f.id, toks[anchor].byte_start);
 
-            if (resolveLock(ctx, f.id, cached_aliases, recv)) |li| {
+            if (resolveLockClass(ctx, f.id, cached_aliases, recv)) |li| {
                 try sites.append(a, .{
-                    .lock_idx = li,
+                    .class_idx = li,
                     .file_id = f.id,
                     .line = line,
                     .method = method,
@@ -1561,7 +1762,7 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
     const async_reach = try reach(a, ctx.out_adj, async_seeds.items, ctx.ents.len);
     const sync_reach = try reach(a, ctx.out_adj, sync_seeds.items, ctx.ents.len);
 
-    counts.classes = ctx.locks.len;
+    counts.classes = ctx.classes.len;
     counts.unresolved = ctx.unresolved.len;
 
     if (!o.summary) {
@@ -1569,10 +1770,10 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
     }
 
     // Order classes: plain-EC first (the interesting ones), then by name.
-    const order = try a.alloc(u32, ctx.locks.len);
+    const order = try a.alloc(u32, ctx.classes.len);
     for (order, 0..) |*x, i| x.* = @intCast(i);
 
-    const verdicts = try a.alloc(ClassVerdict, ctx.locks.len);
+    const verdicts = try a.alloc(ClassVerdict, ctx.classes.len);
     for (verdicts, 0..) |*v, li| {
         var n_sites: usize = 0;
         var n_plain_ec: usize = 0;
@@ -1580,7 +1781,7 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
         var n_plain_any: usize = 0;
         var n_masked: usize = 0;
         for (ctx.acquires) |s| {
-            if (s.lock_idx != li) continue;
+            if (s.class_idx != li) continue;
             n_sites += 1;
             const ec = if (s.host) |h| ec_reach[h] else false;
             const ir = if (s.host) |h| async_reach[h] else false;
@@ -1626,13 +1827,13 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
             const rx = rank(self.v[x]);
             const ry = rank(self.v[y]);
             if (rx != ry) return rx < ry;
-            return mem.order(u8, self.ctx.locks[x].class, self.ctx.locks[y].class) == .lt;
+            return mem.order(u8, self.ctx.classes[x].class, self.ctx.classes[y].class) == .lt;
         }
     };
     std.mem.sort(u32, order, Sorter{ .ctx = ctx, .v = verdicts }, Sorter.less);
 
     for (order) |li| {
-        const l = ctx.locks[li];
+        const g = ctx.classes[li];
         const verdict: []const u8 = switch (verdicts[li]) {
             .masked_all => "IRQ-MASKED at every acquire",
             .plain_ec => "PLAIN acquires on EC-context paths  ← preemptible while held",
@@ -1640,11 +1841,16 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
             .plain_unreachable => "PLAIN acquires whose callers the static graph cannot reach - context UNPROVEN",
             .no_sites => "no acquire sites found",
         };
-        try w.print("\nCLASS {s}\n      decl {s}  (`{s}`)\n      {s}\n", .{
-            l.class, ctx.dloc(l.file_id, l.line), l.decl_name, verdict,
-        });
+        try w.print("\nCLASS {s}\n      {s}\n", .{ g.class, verdict });
+        // Every declaration carrying this class. More than one is normal:
+        // per-arch twins (`serial.print_lock`) and the `_gen_lock` field of
+        // every slab-backed type all share a single class.
+        for (g.decls) |di| {
+            const l = ctx.locks[di];
+            try w.print("      decl {s}  (`{s}`)\n", .{ ctx.dloc(l.file_id, l.line), l.decl_name });
+        }
         for (ctx.acquires) |s| {
-            if (s.lock_idx != li) continue;
+            if (s.class_idx != li) continue;
             const ec = if (s.host) |h| ec_reach[h] else false;
             const ai = if (s.host) |h| async_reach[h] else false;
             const sx = if (s.host) |h| sync_reach[h] else false;
@@ -1673,10 +1879,19 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
     }
 
     if (ctx.unresolved.len > 0) {
-        try w.print("\nUNRESOLVED acquire receivers ({d}) — receivers that do not name a\n", .{ctx.unresolved.len});
-        try w.print("declared SpinLock class. Expected to be entirely GenLock/SlabRef\n", .{});
-        try w.print("acquires (`<slabref>.lockIrqSave(@src())`), which are out of scope\n", .{});
-        try w.print("for this rule; anything else here is a Rule-B blind spot.\n", .{});
+        try w.print("\nUNRESOLVED acquire receivers ({d}) — receivers whose terminal field\n", .{ctx.unresolved.len});
+        try w.print("name does not determine a declared lockdep class.\n", .{});
+        try w.print("\n", .{});
+        try w.print("Direct `SpinLock` and `<x>._gen_lock` acquires ARE resolved (the\n", .{});
+        try w.print("latter via the runtime class assignment in secure_slab.zig). What\n", .{});
+        try w.print("remains is dominated by SlabRef receivers — `cd_ref.lockIrqSave(…)`\n", .{});
+        try w.print("— where the receiver is a local whose type decides the class. The\n", .{});
+        try w.print("kernel proves every SlabRef acquire bottoms out in the target's\n", .{});
+        try w.print("`self.ptr._gen_lock`, so these ARE that class; the analyzer cannot\n", .{});
+        try w.print("say so, because the DB carries no local-variable types (`dwarf_local`\n", .{});
+        try w.print("is empty) and attributing them by elimination would silently\n", .{});
+        try w.print("misfile any genuinely unresolved SpinLock landing here.\n", .{});
+        try w.print("tools/check_gen_lock check 6 covers this population directly.\n", .{});
         // Group by receiver terminal for a readable summary.
         var grouped = std.StringHashMap(u32).init(a);
         for (ctx.unresolved) |u| {
@@ -1737,7 +1952,7 @@ fn writeFindings(a: Allocator, db_path: []const u8, ctx: *Ctx, sites: []const Cl
     for (ctx.acquires) |s| {
         if (s.masked) continue;
         const msg = try std.fmt.allocPrint(a, "plain (non-IRQ-masked) acquire of lock class {s} via {s}.{s}()", .{
-            ctx.locks[s.lock_idx].class, s.receiver, s.method,
+            ctx.classes[s.class_idx].class, s.receiver, s.method,
         });
         ins.reset();
         try ins.bindText(1, "warn");
@@ -1832,7 +2047,17 @@ pub fn main() !void {
 
     const stdout = std.fs.File.stdout();
     var buf: [1 << 16]u8 = undefined;
-    var fw = stdout.writer(&buf);
+    // writerStreaming, NOT writer: std.fs.File.writer() defaults to
+    // POSITIONAL writes (pwrite at the Writer's own `pos`, starting at 0).
+    // Against a terminal that is invisible, but the gauntlet is normally
+    // captured with `./tests/precommit.sh > log`, and there stdout is a
+    // seekable file — so every analyzer stage restarted at offset 0 and
+    // overwrote the stages before it. Captured logs silently lost their
+    // earlier stages; verified by feeding this binary a redirected stdout
+    // with known preceding lines and watching them disappear.
+    // Streaming mode uses ordinary write(2) and appends. See bd stygia-8qz
+    // (found while wiring stage [0d]).
+    var fw = stdout.writerStreaming(&buf);
     const w = &fw.interface;
 
     var exit_code: u8 = 0;
@@ -1861,6 +2086,8 @@ pub fn main() !void {
             .out_adj = undefined,
             .in_adj = undefined,
             .locks = undefined,
+            .classes = undefined,
+            .class_of_decl = undefined,
             .acquires = undefined,
             .unresolved = undefined,
         };
@@ -1889,6 +2116,7 @@ pub fn main() !void {
         try buildAdjacency(&ctx);
 
         ctx.locks = try collectLockDecls(&ctx);
+        try buildClassGroups(&ctx);
         try collectAcquires(&ctx);
 
         var counts: Counts = .{};

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Mega precommit: run the full cross-arch gauntlet before a commit.
 #
-# Stages (all gated):
+# Stages (all gated except [0d], which is report-only):
 #   0. arch layering lint           (arch-specific / generic boundaries)
 #   0b. dead-code report             (skip-list checked into the tree)
 #   0c. gen-lock analyzer            (fat-pointer + bracketing invariants)
+#   0d. EC-closure analyzer          (REPORT-ONLY — never affects exit status)
 #   0e. spec ↔ test coverage         (verify_coverage.py)
 #   1. x86_64 kernel test suite      (KVM on this dev PC, 3 reps)
 #   2. aarch64 kernel test suite     (KVM on the Pi 5 @ 192.168.86.106 via SSH; TCG fallback)
@@ -351,6 +352,37 @@ ensure_callgraph_db() {
     CALLGRAPH_DB="$STYGIA_ROOT/tools/callgraph_http/test/dbs/x86_64-${sha}${suffix}.db"
     CALLGRAPH_DB_AARCH64="$STYGIA_ROOT/tools/callgraph_http/test/dbs/aarch64-${sha}${suffix}.db"
 
+    # ── IR freshness stamps ──────────────────────────────────────────
+    #
+    # The DB filename keys on (HEAD, working_tree_hash), so a dirty tree
+    # correctly forces a cache MISS and the indexer reruns. But the
+    # rebuild predicates below used to test only EXISTENCE (and ELF arch)
+    # of zig-out/kernel.<arch>.ll — never freshness. So the indexer got
+    # rerun against a STALE .ll and produced a DB *named for the current
+    # tree* whose ir_fn/ir_call rows describe older source, while its
+    # entity/ast_node/token rows (read straight from the working tree by
+    # the indexer) are current. Internally inconsistent, and completely
+    # silent: every analyzer that joins entity→ir_call — check_gen_lock's
+    # bracketing, dead_code_zig's alive-set, check_ec_closure's Rule B —
+    # reasons over a mixture of two source states and reports findings
+    # that are neither tree's truth.
+    #
+    # The concrete trigger is the ordinary edit loop: run the gauntlet,
+    # edit a kernel file, run it again. Second run's tree_hash changes →
+    # new DB name → miss → but kernel.x86_64.ll still exists from run 1,
+    # so `[[ ! -f ... ]]` was false and the build was skipped entirely.
+    # The staler the .ll, the more confident and wrong the analyzers get.
+    #
+    # Fix: stamp the emitted artifacts with the SAME identity string the
+    # DB name is keyed on, and treat a missing/mismatched stamp as a
+    # rebuild trigger. The stamp lives in zig-out/ so it is destroyed by
+    # the `rm -rf zig-out` in stage [1] together with the artifacts it
+    # describes — a stamp can never outlive its .ll. See bd stygia-8qz.
+    local ir_want ir_stamp_x86 ir_stamp_arm
+    ir_want="${sha}${suffix}"
+    ir_stamp_x86="$STYGIA_ROOT/zig-out/.ir-stamp.x86_64"
+    ir_stamp_arm="$STYGIA_ROOT/zig-out/.ir-stamp.aarch64"
+
     # ── x86_64 DB ────────────────────────────────────────────────────
     if [[ ! -f "$CALLGRAPH_DB" ]]; then
         # Need .ll AND an x86_64-flavored kernel.elf. If a previous aarch64
@@ -359,7 +391,16 @@ ensure_callgraph_db() {
         local need_rebuild_x86=0
         if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.x86_64.ll" || ! -f "$STYGIA_ROOT/zig-out/bin/kernel.elf" ]]; then
             need_rebuild_x86=1
+        elif [[ ! -f "$ir_stamp_x86" || "$(cat "$ir_stamp_x86" 2>/dev/null)" != "$ir_want" ]]; then
+            # Artifacts exist but were emitted from a different tree state.
+            echo "  zig-out/kernel.x86_64.ll is stale (want $ir_want, have $(cat "$ir_stamp_x86" 2>/dev/null || echo '<none>')) — rebuilding"
+            need_rebuild_x86=1
         elif ! file "$STYGIA_ROOT/zig-out/bin/kernel.elf" 2>/dev/null | grep -q "x86-64"; then
+            # Belt-and-braces: the aarch64 leg below overwrites
+            # zig-out/bin/kernel.elf with an ARM ELF *after* the x86 stamp
+            # is written, so a same-identity rerun can hit a matching stamp
+            # beside a wrong-arch ELF. Keep this guard independent of the
+            # stamp check for exactly that case.
             echo "  zig-out/bin/kernel.elf is not x86_64 — rebuilding"
             need_rebuild_x86=1
         fi
@@ -374,6 +415,9 @@ ensure_callgraph_db() {
                 FAILURES+=("kernel build for IR/ELF (x86_64)")
                 return 1
             fi
+            # Only after a SUCCESSFUL build — a failed build leaves the old
+            # .ll in place, and stamping it would launder stale IR as fresh.
+            printf '%s' "$ir_want" > "$ir_stamp_x86"
         fi
         if ! (cd "$STYGIA_ROOT" && tools/indexer/zig-out/bin/indexer \
             --kernel-root kernel \
@@ -399,12 +443,20 @@ ensure_callgraph_db() {
         # extra ~30-60s build on cold worktree cache; warm-cache subsequent
         # gauntlets in the same worktree reuse it via the per-worktree
         # ZIG_GLOBAL_CACHE_DIR pin.
+        local need_rebuild_arm=0
         if [[ ! -f "$STYGIA_ROOT/zig-out/kernel.aarch64.ll" ]]; then
+            need_rebuild_arm=1
+        elif [[ ! -f "$ir_stamp_arm" || "$(cat "$ir_stamp_arm" 2>/dev/null)" != "$ir_want" ]]; then
+            echo "  zig-out/kernel.aarch64.ll is stale (want $ir_want, have $(cat "$ir_stamp_arm" 2>/dev/null || echo '<none>')) — rebuilding"
+            need_rebuild_arm=1
+        fi
+        if [[ $need_rebuild_arm -eq 1 ]]; then
             echo "  building aarch64 kernel with -Darch=arm -Demit_ir=true (needed by indexer)"
             if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test -Demit_ir=true -Dimage_check=false 2>&1); then
                 FAILURES+=("kernel build for IR (aarch64)")
                 return 1
             fi
+            printf '%s' "$ir_want" > "$ir_stamp_arm"
         fi
         # No --elf for aarch64: bin_pass is x86-only (see function header
         # comment). Indexer's stage 4 logs "skipped (no --elf argument)";
@@ -504,6 +556,73 @@ stage_gen_lock_analyzer() {
         genlock_rc=1
     fi
     return $genlock_rc
+}
+
+# ── [0d] EC-lifecycle closure analyzer — REPORT-ONLY, NOT GATING ──────
+#
+# GATING IS A PENDING MAINTAINER DECISION. Do not "promote" this stage to
+# gating without them saying so.
+#
+# Rationale for report-only: `check_ec_closure` mechanizes two enumerations
+# that docs/kernel/systems.md otherwise maintains by hand, and its Rule B
+# is what the design doc's enforcement story leans on — but neither rule
+# has been through a full triage pass against the real tree yet. Rule A's
+# call graph deliberately over-approximates (a syntactic overlay on top of
+# `ir_call`, so calls through monomorphized generics and address-taken
+# callbacks are not silently missing), and Rule B's `ec` / `async-irq`
+# context labels inherit that over-approximation. Both biases cost false
+# positives, which is the right bias for a "did we miss one" tool and the
+# wrong bias for a gate. Turning it red would block every commit on
+# findings nobody has classified yet.
+#
+# So: print everything, contribute nothing to $FAILURES, and leave the
+# gating call to a human who has read a full report.
+#
+# Deliberately NOT in REQUIRED_STAGES — that list is documented as
+# blockers, and `--git-hook` runs only those. This stage therefore runs in
+# the full manual gauntlet and is skipped by the commit hook, which is
+# what "informational" should mean here.
+#
+# One `check_ec_closure` invocation covers both arches. Note the SHAPE
+# DIFFERS from stage [0c]: check_gen_lock's `--db` is single-valued
+# (`args.db_path = v`), so a repeated flag silently overwrites and it must
+# be invoked twice. check_ec_closure's `--db` is genuinely repeatable — it
+# appends to a list (`try dbs.append(a, …)`) and loops over every DB,
+# printing a banner and a `Summary[<arch>]:` line per DB. Verified by
+# reading the arg parser, not assumed from [0c]'s shape.
+stage_ec_closure_report() {
+    echo ""
+    echo "=================================================="
+    echo "[0d] EC-lifecycle closure analyzer (REPORT-ONLY — does not gate)"
+    echo "=================================================="
+    if ! (cd "$STYGIA_ROOT/tools/check_ec_closure" && zig build 2>&1); then
+        echo "[0d] analyzer build failed — skipping report (stage does not gate)"
+        return 0
+    fi
+    # Self-tests first: a regression in the analyzer silently weakens every
+    # finding below. Report-only, so a failure is loud but not fatal.
+    if ! bash "$STYGIA_ROOT/tools/check_ec_closure/tests/run_tests.sh"; then
+        echo "[0d] WARNING: check_ec_closure fixture suite FAILED — findings below are untrustworthy"
+    fi
+    # Deliberately does NOT call ensure_callgraph_db. That helper appends
+    # to $FAILURES on error, which would let a report-only stage turn the
+    # gauntlet red — the one thing this stage must never do. Stages [0],
+    # [0b] and [0c] all run before this one and all call it, so the two
+    # globals are already set and the DBs already built; if they are not,
+    # the gauntlet is red for that reason already and this stage has
+    # nothing to add.
+    if [[ ! -f "${CALLGRAPH_DB:-}" || ! -f "${CALLGRAPH_DB_AARCH64:-}" ]]; then
+        echo "[0d] callgraph DBs not present — skipping report (stage does not gate)"
+        return 0
+    fi
+    # No --target flag: check_ec_closure's arg parser rejects unknown flags
+    # with exit 2. Its kernel-scope filter is built in (`inKernelScope`).
+    local analyzer="$STYGIA_ROOT/tools/check_ec_closure/zig-out/bin/check_ec_closure"
+    (cd "$STYGIA_ROOT" && "$analyzer" \
+        --db "$CALLGRAPH_DB" \
+        --db "$CALLGRAPH_DB_AARCH64") || true
+    echo "[0d] report-only: findings above do NOT affect precommit's exit status."
+    return 0
 }
 
 stage_verify_coverage() {
@@ -1197,6 +1316,7 @@ ensure_suite_root_service_elf || true
 run_stage arch_layering_lint
 run_stage dead_code_report
 run_stage gen_lock_analyzer
+run_stage ec_closure_report
 run_stage verify_coverage
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi

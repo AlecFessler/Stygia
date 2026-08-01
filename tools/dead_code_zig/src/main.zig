@@ -1500,7 +1500,17 @@ pub fn main() !void {
     // Render: group by file, drop skip-covered, match old format.
     const stdout = std.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = stdout.writer(&stdout_buf);
+    // writerStreaming, NOT writer: std.fs.File.writer() defaults to
+    // POSITIONAL writes (pwrite at the Writer's own `pos`, starting at 0).
+    // Against a terminal that is invisible, but the gauntlet is normally
+    // captured with `./tests/precommit.sh > log`, and there stdout is a
+    // seekable file — so every analyzer stage restarted at offset 0 and
+    // overwrote the stages before it. Captured logs silently lost their
+    // earlier stages; verified by feeding this binary a redirected stdout
+    // with known preceding lines and watching them disappear.
+    // Streaming mode uses ordinary write(2) and appends. See bd stygia-8qz
+    // (found while wiring stage [0d]).
+    var stdout_writer = stdout.writerStreaming(&stdout_buf);
     const w = &stdout_writer.interface;
 
     var unused_total: u32 = 0;
