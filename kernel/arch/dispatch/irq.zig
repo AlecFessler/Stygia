@@ -48,7 +48,8 @@ pub fn endOfInterrupt(irq_line: u32) void {
 }
 
 /// EOI issued by the scheduler's noreturn `run()` escapes (yieldTo's
-/// cross-core-defer and disowned-current arms). Those escapes abandon
+/// disowned-current arm, and every post-suspend `hopParkRun` reached
+/// from an IRQ-context caller). Those escapes abandon
 /// the IRQ epilogue, so on x86 the in-service sched vector (0xFE) would
 /// otherwise never be EOI'd — and because 0xFE outranks both the wake
 /// IPI and tlb_shootdown (0xFD) vectors, a core that parks in that

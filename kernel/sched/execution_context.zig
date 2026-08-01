@@ -951,6 +951,93 @@ pub fn self(caller: *ExecutionContext) i64 {
 /// may take the domain lock.
 pub var park_calls: u64 = 0;
 
+// ── Edge 9: retire ───────────────────────────────────────────────────
+
+/// What `retire` did. Two independent facts, because the tree has one
+/// retire flavour that deliberately does not reclaim the slot.
+pub const Retire = struct {
+    /// This call performed the state transition — it is THE retirer of
+    /// record for `ec`. False means the EC was already retired, or the
+    /// slot's generation had already moved on; either way the caller is
+    /// a second retirer and must not repeat the retire's one-shot
+    /// side effects.
+    transitioned: bool = false,
+    /// This call rotated the slab generation to the freed parity.
+    flipped: bool = false,
+    /// The live (odd) generation the flip consumed — the value
+    /// `postZombie` / `finalizeDestroyMarkedDead` are keyed on. Only
+    /// meaningful when `flipped`.
+    gen: u63 = 1,
+};
+
+/// Edge 9 of `docs/kernel/systems.md` rev 7 §5: retire, as ONE
+/// self-excluding transition taken under `ec._gen_lock` and fused with
+/// the generation flip.
+///
+/// Each of the tree's three retire sites used to perform a plain
+/// `ec.state = .exited` store. A plain store is not self-excluding, so
+/// every EC that `terminate` or `parkSelfFaulted` had already retired
+/// was retired a SECOND time by `destroyExecutionContextLocked` — 493
+/// per x86-64 boot and 492 per aarch64 boot as measured by the Phase-2
+/// shadow observer, roughly one per EC created, every record at
+/// `retire_destroy`. Holding `_gen_lock` across read-check-write makes
+/// the second retire unrepresentable rather than merely unlikely: the
+/// losing retirer observes `.exited` and reports `transitioned = false`.
+///
+/// Fusing the flip into the same held section (`reclaim = true`) closes
+/// the other half. Before this, `terminate` published `.exited`, dropped
+/// every lock, swept the run queues, and only then re-acquired
+/// `_gen_lock` to flip the generation — a window in which the two
+/// filters every dispatch path tests (`state == .exited` and even gen)
+/// disagreed about the same EC. Fused, they arm together, and the
+/// re-sweep that follows runs with BOTH already armed, so
+/// `enqueueOnCore` can no longer re-admit the EC behind the sweep.
+///
+/// `reclaim = false` is `parkSelfFaulted`'s flavour: retire the EC out
+/// of the machine but leave the slot generation live, so outstanding
+/// handles keep resolving until the owning domain's teardown reclaims
+/// it. That asymmetry is bead stygia-y7g and is deliberately NOT closed
+/// here — flipping the generation at that site would leave the EC with
+/// no finalizer at all (`destroyExecutionContextLocked` early-returns on
+/// an even gen), which is a reclamation change, not a lifecycle one, and
+/// belongs with the phase that owns reclamation.
+///
+/// Lock order: `ec._gen_lock` and nothing else. Callers may hold a CD
+/// gen-lock (CD → EC is the canonical order — see the prepare-phase note
+/// in `terminate`); no caller may already hold `ec._gen_lock`.
+fn retire(ec: *ExecutionContext, site: lifecycle.Site, reclaim: bool) Retire {
+    const gen = ec._gen_lock.currentGen();
+    // Even generation: the slot is already freed-marked, so whoever
+    // flipped it is the retirer of record and there is nothing left to
+    // publish. `SlabRef.init` would assert on the even gen anyway.
+    if (gen % 2 == 0) return .{};
+    const ec_ref = SlabRef(ExecutionContext).init(ec, gen);
+    // StaleHandle: someone flipped the gen between the read above and
+    // the acquire. Same conclusion as the even-gen case.
+    const lr = ec_ref.lockIrqSave(@src()) catch return .{};
+    var out = Retire{ .gen = gen };
+    if (ec.state != .exited) {
+        ec.state = .exited;
+        // Phase-2 shadow: edge 9. Observed INSIDE the held section, so
+        // the observation and the transition cannot be separated by a
+        // racing retirer.
+        _ = lcObserve(ec, .retired, site);
+        out.transitioned = true;
+    }
+    if (reclaim) {
+        // `bumpDeadGenLocked` clears the lock bit as part of the flip
+        // (that is what makes it a fusion and not two sections), so the
+        // release below is an IRQ restore only — `unlockIrqRestore`
+        // would assert on the already-cleared bit.
+        slab_instance.bumpDeadGenLocked(ec, gen);
+        arch.cpu.restoreInterrupts(lr.irq_state);
+        out.flipped = true;
+    } else {
+        ec_ref.unlockIrqRestore(lr.irq_state);
+    }
+    return out;
+}
+
 pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     park_calls +%= 1;
@@ -958,15 +1045,15 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     if (scheduler.coreCurrentIs(core_id, ec)) {
         scheduler.clearCurrentEc(core_id);
     }
-    // `.exited` is the closest existing state for "will never run again";
-    // no `markReady`/`enqueue*` path observes it, and the EC stays in
-    // the slab so outstanding handles still resolve (just to a parked
-    // EC) until the owning domain is destroyed.
-    ec.state = .exited;
-    // Phase-2 shadow: edge 9 (retire). Observer only; runs after the
-    // legacy store so the legacy-agreement cross-check compares against
-    // the value this site just committed.
-    _ = lcObserve(ec, .retired, .retire_faulted);
+    // Edge 9, non-reclaiming flavour. `.exited` is the closest existing
+    // state for "will never run again"; no `markReady`/`enqueue*` path
+    // observes it, and the EC stays in the slab so outstanding handles
+    // still resolve (just to a parked EC) until the owning domain is
+    // destroyed. Routed through `retire` rather than a bare store so
+    // this site is self-excluding against the `destroyExecutionContextLocked`
+    // that every caller of ours runs next, and against a cross-core
+    // `terminate` landing on the same EC.
+    _ = retire(ec, .retire_faulted, false);
     ec.leak_tag = 1; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Clear on_cpu — this EC is no longer running. Without this, a
     // peer-core terminate posts the EC to its last_dispatched_core's
@@ -1057,7 +1144,6 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     cd_ref.unlockIrqRestore(cd_irq_state);
 
     const ec = worker_ref.ptr;
-    const expected_gen: u63 = @intCast(worker_ref.gen);
 
     // Prepare phase — runs WITHOUT the EC's gen lock held to avoid
     // EC→CD lock-order inversion (abandonPendingReply takes the
@@ -1109,14 +1195,20 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         arch.vm.freeVcpuArchState(ec);
     }
 
-    ec.state = .exited;
-    // Phase-2 shadow: edge 9 (retire). Observer only.
-    _ = lcObserve(ec, .retired, .retire_terminate);
+    // Edge 9: retire. One self-excluding transition under `_gen_lock`,
+    // fused with the rotation of the generation to the freed parity —
+    // after it, any concurrent handle resolution (`lockWithGen`) on this
+    // slot fails with stale-handle while the data bytes remain intact
+    // for the running core to keep dereferencing until the reap path
+    // zeros + freelists. The flip used to live ~25 lines further down
+    // in its own lock section; fusing removes the window in which
+    // `state == .exited` and the gen parity disagreed. See `retire`.
+    const retired = retire(ec, .retire_terminate, true);
     ec.leak_tag = 2; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
-    // Re-sweep run_queues after state=.exited so any yieldTo that
+    // Re-sweep run_queues after the retire so any yieldTo that
     // re-enqueued ec during the prepare phase (saw state=.running,
     // raced ahead of the first sweep) is undone here. The second
-    // sweep also publishes state=.exited via every core_locks[]
+    // sweep also publishes the retire via every core_locks[]
     // acquire/release pairing, so any yieldTo that still owes a
     // state read sees the new state on its next lock acquire and
     // refuses to re-enqueue. Without this re-sweep the dangling
@@ -1125,20 +1217,10 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // has zeroed/unmapped the slab slot.
     scheduler.removeFromQueue(ec);
 
-    // Re-acquire the EC's gen-lock briefly to atomically rotate gen to
-    // the freed parity. After this point any concurrent handle
-    // resolution (`lockWithGen`) on this slot fails with stale-handle.
-    // The data bytes remain intact for the running core to keep
-    // dereferencing until the reap path zeros + freelists. If the
-    // re-acquire fails, another path already raced us through the
-    // bump — the destroy is in progress, return OK and let the
-    // winner finish.
-    const wlr2 = worker_ref.lockIrqSave(@src()) catch return errors.OK;
-    slab_instance.bumpDeadGenLocked(ec, expected_gen);
-    // bumpDeadGenLocked clears the lock bit as part of the gen flip,
-    // so we cannot use unlockIrqRestore (it would assert held). Just
-    // restore IRQs.
-    arch.cpu.restoreInterrupts(wlr2.irq_state);
+    // We did not perform the flip: another path already raced us through
+    // the destroy. Return OK and let the winner finish.
+    if (!retired.flipped) return errors.OK;
+    const expected_gen: u63 = retired.gen;
 
     // Defer the finalize to whichever core most recently dispatched the
     // EC. The kstack-in-use window outlives `current_ec.ptr == ec` (slow-
@@ -2336,21 +2418,28 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
         arch.vm.freeVcpuArchState(ec);
     }
 
-    ec.state = .exited;
-    // Phase-2 shadow: edge 9 (retire). Observer only.
-    _ = lcObserve(ec, .retired, .retire_destroy);
+    // Edge 9: retire — the same self-excluding, gen-flip-fused
+    // transition `terminate` performs. This is the site the Phase-2
+    // observer caught re-retiring: every EC that reached here had
+    // already been retired by `parkSelfFaulted` (the no-route fault
+    // fallbacks call the two back to back) or by `terminate`, and the
+    // bare `ec.state = .exited` store this replaces re-published the
+    // retire unconditionally. `retire` reports whether we were the
+    // retirer of record; either way the reclamation below is ours iff
+    // we performed the generation flip.
+    const retired = retire(ec, .retire_destroy, true);
     ec.leak_tag = 3; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
-    // Re-sweep run_queues after the state flip — same race as in
+    // Re-sweep run_queues after the retire — same race as in
     // `terminate` (see the matching comment there): a yieldTo on the
     // EC's running core can re-enqueue it during the cleanup window
     // above (it still reads state == .running), leaving a dangling
     // queue entry that a later dequeue traverses after the reap has
     // zeroed the slab slot. The re-sweep undoes any such re-enqueue
-    // and publishes state=.exited via every core_locks[] pairing.
+    // and publishes the retire via every core_locks[] pairing.
     // This variant was missing the sweep terminate has had all along.
     scheduler.removeFromQueue(ec);
-    const gen = ec._gen_lock.currentGen();
-    if (gen % 2 == 0) return;
+    if (!retired.flipped) return;
+    const gen: u63 = retired.gen;
 
     // Route the slab destroy through the deferred-finalize path
     // (`bumpDeadGenLocked` + `postZombie` / `finalizeDestroyMarkedDead`)
@@ -2364,11 +2453,9 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
     // until the next allocator pop re-inits them), and the kstack
     // unmap that `finalizeDestroyMarkedDead` does only fires once the
     // EC's `last_dispatched_core` has done a `switchTo` — i.e. the
-    // running core is provably off the kstack.
-    const ec_ref = SlabRef(ExecutionContext).init(ec, @intCast(gen));
-    const wlr = ec_ref.lockIrqSave(@src()) catch return;
-    slab_instance.bumpDeadGenLocked(ec, @intCast(gen));
-    arch.cpu.restoreInterrupts(wlr.irq_state);
+    // running core is provably off the kstack. The `bumpDeadGenLocked`
+    // half is performed by `retire` above, fused with the state
+    // transition; what remains here is the deferred-finalize routing.
 
     if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
         const core = ec.last_dispatched_core;
