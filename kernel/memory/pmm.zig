@@ -68,15 +68,27 @@ pub const PhysicalMemoryManager = struct {
                 return page;
             }
 
-            self.lock.lock(@src());
+            // `lockIrqSave`, not plain `lock`: this class is reachable
+            // from the async timer entry (`schedTimerHandler → preempt →
+            // yieldTo → finalizeDestroyMarkedDead → stack.destroyKernel
+            // → drainQuarantine → freePage`), so a core holding it with
+            // IRQs enabled would spin on a lock it holds itself.
+            //
+            // The `saveAndDisableInterrupts` above already covers this
+            // window, but it exists for the per-core `page_caches` slot
+            // and must span more than the lock — so it is not where the
+            // buddy lock's IRQ discipline belongs. This nests inside it
+            // and restores the interrupts-off state it saw, leaving the
+            // outer bracket's intent intact.
+            const lock_irq = self.lock.lockIrqSave(@src());
             const bulk = self.buddy.allocBlock(paging.PAGE4K * CACHE_REFILL_PAGES) orelse {
                 const single = self.buddy.allocBlock(paging.PAGE4K);
-                self.lock.unlock();
+                self.lock.unlockIrqRestore(lock_irq);
                 arch.cpu.restoreInterrupts(irq);
                 return single;
             };
             var batch = self.buddy.splitAllocation(@intFromPtr(bulk), 0);
-            self.lock.unlock();
+            self.lock.unlockIrqRestore(lock_irq);
 
             while (batch.pop()) |page| {
                 cache.push(@ptrCast(page));
@@ -109,14 +121,22 @@ pub const PhysicalMemoryManager = struct {
                 return;
             }
 
-            self.lock.lock(@src());
+            // `lockIrqSave`, not plain `lock` — same reasoning as
+            // `allocPage`: the async timer entry reaches this class via
+            // `schedTimerHandler → preempt → yieldTo →
+            // finalizeDestroyMarkedDead → stack.destroyKernel →
+            // drainQuarantine → freePage`, which is THIS function.
+            // Nests inside the per-core cache's
+            // `saveAndDisableInterrupts` bracket above and restores the
+            // interrupts-off state it saw.
+            const lock_irq = self.lock.lockIrqSave(@src());
             var i: u32 = 0;
             while (i < CACHE_MAX_PAGES / 2) {
                 const cached = cache.pop().?;
                 self.buddy.freeBlock(cached[0..paging.PAGE4K]);
                 i += 1;
             }
-            self.lock.unlock();
+            self.lock.unlockIrqRestore(lock_irq);
 
             cache.push(page);
             arch.cpu.restoreInterrupts(irq);

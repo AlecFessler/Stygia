@@ -21,6 +21,26 @@ const FREELIST_CAP: usize = 512;
 var next_slot = std.atomic.Value(u64).init(0);
 var freelist_buf: [FREELIST_CAP]u64 = undefined;
 var freelist_top: usize = 0;
+
+/// Always taken with `lockIrqSave`, never plain `lock`.
+///
+/// This lock is reachable from an ASYNCHRONOUS interrupt: the timer
+/// entry `arch.x64.irq.schedTimerHandler` → `scheduler.preempt` →
+/// `scheduler.yieldTo` → `execution_context.finalizeDestroyMarkedDead`
+/// → `destroyKernel`, which calls `quarantineSlot`/`recycleSlot` below.
+/// It is also taken from EC-context teardown and from `allocSlot` on the
+/// creation path. If a tick lands on a core that is already inside one
+/// of those critical sections with IRQs enabled, the handler spins on a
+/// lock its own core holds — an unbreakable single-core self-deadlock
+/// (and `debug.checkIrqModeOn`'s `panic_irq_mode_mix`).
+///
+/// Every EC-context caller is *believed* to already run IRQs-masked, but
+/// nothing enforces it — notably `destroyExecutionContextLocked`'s
+/// `else { finalizeDestroyMarkedDead(ec); }` arm sits outside that
+/// function's `saveAndDisableInterrupts`/`restoreInterrupts` bracket.
+/// Masking here makes the requirement local and self-enforcing instead
+/// of caller-dependent and unchecked. The critical sections are a few
+/// array writes, so the masked window stays tiny.
 var freelist_lock: SpinLock = .{ .class = "stack.freelist_lock" };
 
 pub const Stack = struct {
@@ -159,8 +179,11 @@ fn drainSlotQuarantineLocked() void {
 /// `quarantineFrame`, and a leaked slot is cheap: it costs one VA range
 /// out of `MAX_SLOTS` and no physical memory.
 fn quarantineSlot(slot: u64, epoch: u64) void {
-    freelist_lock.lock(@src());
-    defer freelist_lock.unlock();
+    // IRQ-masked: reached from the async timer entry via
+    // `schedTimerHandler → preempt → yieldTo →
+    // finalizeDestroyMarkedDead → destroyKernel`. See `freelist_lock`.
+    const irq = freelist_lock.lockIrqSave(@src());
+    defer freelist_lock.unlockIrqRestore(irq);
     // Drain BEFORE testing capacity. Teardown is bursty — a domain
     // death destroys hundreds of stacks with nothing allocating in
     // between — so a quarantine that only drained from `allocSlot`
@@ -174,7 +197,11 @@ fn quarantineSlot(slot: u64, epoch: u64) void {
 }
 
 fn allocSlot() !u64 {
-    freelist_lock.lock(@src());
+    // IRQ-masked for the same reason as `quarantineSlot`: the tick
+    // handler reaches this lock class through `destroyKernel`, so a core
+    // holding it with IRQs enabled would deadlock against itself. See
+    // `freelist_lock`.
+    const irq = freelist_lock.lockIrqSave(@src());
     // An empty freelist does NOT mean no slots are recoverable — it
     // usually means they are all sitting in quarantine waiting on an
     // epoch that has long since retired. Nothing else polls the
@@ -185,10 +212,10 @@ fn allocSlot() !u64 {
     if (freelist_top > 0) {
         freelist_top -= 1;
         const slot = freelist_buf[freelist_top];
-        freelist_lock.unlock();
+        freelist_lock.unlockIrqRestore(irq);
         return slot;
     }
-    freelist_lock.unlock();
+    freelist_lock.unlockIrqRestore(irq);
 
     const slot = next_slot.fetchAdd(1, .monotonic);
     if (slot >= MAX_SLOTS) return error.OutOfKernelStacks;
@@ -200,8 +227,12 @@ fn allocSlot() !u64 {
 /// nothing was ever mapped there. Everything else must go through
 /// `quarantineSlot`; see the `slot_quarantine` doc.
 fn recycleSlot(slot: u64) void {
-    freelist_lock.lock(@src());
-    defer freelist_lock.unlock();
+    // IRQ-masked: `destroyKernel`'s never-mapped arm calls this, and
+    // `destroyKernel` is reachable from the async timer entry via
+    // `schedTimerHandler → preempt → yieldTo →
+    // finalizeDestroyMarkedDead`. See `freelist_lock`.
+    const irq = freelist_lock.lockIrqSave(@src());
+    defer freelist_lock.unlockIrqRestore(irq);
     if (freelist_top < FREELIST_CAP) {
         freelist_buf[freelist_top] = slot;
         freelist_top += 1;
