@@ -17,6 +17,7 @@ const ec_log = stygia.utils.ec_log;
 const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
@@ -710,6 +711,38 @@ pub fn switchTo(ec: *ExecutionContext) void {
 /// pointer it is given.
 var hop_release_dummy: u8 = 0;
 
+/// PHASE-2 SHADOW state (`docs/kernel/systems.md` §4). The outgoing EC of
+/// the hop this core is about to perform, captured by
+/// `takePendingReleaseByte` on the near side and consumed by the landing
+/// pads on the far side.
+///
+/// The doc's hop contract is release-then-commit: step 1 overwrites
+/// `PerCore.current` and re-points the SP caches, step 2 CASes
+/// `parking -> waiting`. Today's structural equivalent of step 1 is the
+/// `on_cpu` release, and that release is performed by the hop primitive's
+/// ASM at the stack-swap instruction — not reachable from Zig. So the
+/// outgoing EC's identity is stashed here on the near side and the commit
+/// (step 2) runs on the far side, which puts the observer's commit strictly
+/// after the real release exactly as the contract requires.
+///
+/// Written and read only by the owning core, and only between a
+/// `takePendingReleaseByte` and its landing pad — single-producer,
+/// single-consumer, same core, no atomics needed. Debug builds only.
+var lc_hop_outgoing: [MAX_CORES]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_CORES;
+
+/// Consume this core's stashed hop-outgoing EC and run §4's commit step
+/// against the shadow. No-op when the hop had no outgoing parking EC.
+fn lcConsumeHop(core: u8, site: lifecycle.Site) void {
+    if (!lifecycle.enabled) return;
+    const outgoing = lc_hop_outgoing[core] orelse return;
+    lc_hop_outgoing[core] = null;
+    // `waiting` is the wait-park arm (edge 4). The requeue arm (edge 8)
+    // never reaches here: today's requeue places the EC into `ready`
+    // inline at `yieldTo`, before the hop, which is itself the
+    // divergence the requeue_place site records.
+    execution_context.lcHopCommit(outgoing, .waiting, site);
+}
+
 /// Consume this core's `pending_kstack_release` stash into a byte
 /// pointer for `hopToStackAndCall`'s post-swap release store.
 ///
@@ -726,6 +759,8 @@ fn takePendingReleaseByte(core: u8, exclude: ?*ExecutionContext) *u8 {
     if (exclude) |ex| {
         if (pending == ex) return &hop_release_dummy;
     }
+    // Phase-2 shadow: this is the hop's outgoing EC. See `lc_hop_outgoing`.
+    if (lifecycle.enabled) lc_hop_outgoing[core] = pending;
     return @ptrCast(&pending.on_cpu);
 }
 
@@ -758,6 +793,8 @@ export fn scheduler_dispatch_tail(arg: u64) callconv(.c) noreturn {
 /// context-load trampoline. Runs on the park kstack (or the boot stack
 /// before `perCoreInit`). noreturn via `loadEcContextAndReturn`.
 fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
+    // Phase-2 shadow: §4 hop step 2 for the EC we just hopped off.
+    lcConsumeHop(core, .hop_dispatch);
     // Defensive: a cross-core migration stash should always have been
     // consumed by `scheduler_hop_run` before another dispatch commits,
     // but consuming it here too keeps the invariant "slots drain at
@@ -784,6 +821,10 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
     if ((&core_states[core]).current_ec) |prev| {
         if (prev != current and prev.last_dispatched_core == core) {
             prev.on_cpu.store(false, .release);
+            // Phase-2 shadow: this release is the hop's step 1 for a
+            // park that did NOT stash (a `parking` EC whose owner core
+            // reached here without going through `takePendingReleaseByte`).
+            execution_context.lcHopCommit(prev, .waiting, .hop_dispatch);
         }
     }
     // Same clear, for the case where `current_ec` was already nulled by a
@@ -796,6 +837,23 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
     pmuSwitch(core, current);
     setCurrentEc(core, current);
     current.state = .running;
+    // Phase-2 shadow: edge 2 (dispatch commit). NOTE the doc requires
+    // this CAS inside `core_locks[core]`; today it runs post-hop with the
+    // lock already dropped, which the transition map records as a
+    // divergence in its own right.
+    if (lifecycle.enabled) {
+        if (lifecycle.peek(&current.lc) == .retired) {
+            lifecycle.flag(
+                .dispatch_of_retired,
+                .dispatch_commit,
+                lifecycle.ecId(current),
+                .retired,
+                .running,
+                @intFromEnum(current.state),
+            );
+        }
+        _ = execution_context.lcObserve(current, .running, .dispatch_commit);
+    }
     kprof.point(.dispatch, @intFromPtr(current));
     arch.cpu.loadEcContextAndReturn(current);
 }
@@ -849,6 +907,14 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
         // ownership of the EC's lifecycle and yieldTo musn't trample.
         if (cur.state == .running) {
             cur.state = .ready;
+            // Phase-2 shadow: edge 3 with `kind == .requeue`. Today's
+            // code FUSES edge 3(requeue) with edge 8's placement into
+            // this one store, executed on the outgoing EC's own kstack
+            // BEFORE the hop; the target machine performs the placement
+            // CAS at the hop instead. Modelling it as two observed edges
+            // keeps the edge table honest and makes the fusion visible
+            // as a `quiescent_on_cpu` population at `requeue_place`.
+            _ = execution_context.lcObserve(cur, .parking, .requeue_park);
             // Honor affinity. If `cur` is no longer allowed on this
             // core (e.g. `setAffinity` excluded it mid-quantum) hand it
             // off to a satisfying core unconditionally — even when the
@@ -864,6 +930,8 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
                 (core < 64 and (cur.affinity & (@as(u64, 1) << @truncate(core))) != 0);
             if (local_allowed) {
                 state.run_queue.enqueue(cur);
+                // Phase-2 shadow: edge 8 (requeue placement).
+                execution_context.lcPlace(cur, .requeue_place, false);
                 // Publish queue residency under `core_locks[core]` so
                 // `removeFromQueue` can target this lock directly
                 // instead of sweeping all 64 cores. `.release` pairs
@@ -885,6 +953,12 @@ pub fn yieldTo(target: ?*ExecutionContext) void {
                 // untouched — run() re-evaluates it from the park
                 // kstack. Costs one extra dequeue pass per migration;
                 // migrations are rare (explicit setAffinity exclusions).
+                // Phase-2 shadow: the affinity-migration arm defers
+                // placement to `consumePendingCrossEnqueue` on the far
+                // side of the hop — the ONE requeue shape in the tree
+                // that already has edge 8's post-hop placement. Leave
+                // the shadow in `parking` so that placement is observed
+                // as `parking -> ready` there.
                 lock.unlockIrqRestore(irq);
                 state.pending_cross_enqueue = cur;
                 clearCurrentEc(core);
@@ -1086,6 +1160,8 @@ pub fn hopParkRun() noreturn {
 export fn scheduler_hop_run(arg: u64) callconv(.c) noreturn {
     _ = arg;
     const core: u8 = @truncate(arch.smp.coreID());
+    // Phase-2 shadow: §4 hop step 2, park-stack escape flavour.
+    lcConsumeHop(core, .hop_park_run);
     consumePendingCrossEnqueue(core);
     run();
 }
@@ -1370,6 +1446,9 @@ fn consumePostParkClear(core: u8, incoming: ?*const ExecutionContext) void {
     // window because `finalizeDestroyMarkedDead` skips ECs with
     // on_cpu=true, and that flag is exactly what this clear releases.
     prev_ref.ptr.on_cpu.store(false, .release);
+    // Phase-2 shadow: §4 hop step 2 for a park whose owner core halted
+    // before reaching a dispatch. Same release-then-commit order.
+    execution_context.lcHopCommit(prev_ref.ptr, .waiting, .hop_post_park);
 }
 
 /// Asm landing pad after `parkAndAwaitIRQ`'s wake: rsp is on the park
@@ -1592,6 +1671,13 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     // right lock instead of sweeping all 64. `.release` pairs with
     // the `.acquire` load in `removeFromQueue`.
     ec.current_queue_core.store(core, .release);
+    // Phase-2 shadow: the placement CAS-then-link of edges 1 (creation
+    // publish), 6 (holder placement), 6p (owner-hop placement) and 8
+    // (requeue placement). Which edge it is, is decided by the shadow's
+    // from-state and shows up in the census. Runs inside the destination
+    // queue-lock section, as S8 requires, and after the link so §9.2's
+    // "into `ready` ⇒ linked in the same section" is checkable.
+    execution_context.lcPlace(ec, .enqueue_place, true);
     // Snapshot the target's current EC before deciding whether to
     // wake / preempt. Reading the remote core's `current_ec` is a racy
     // hint — the worst case if it changes after we decide is a spurious
@@ -2111,6 +2197,11 @@ pub fn markReady(ec: *ExecutionContext) void {
         else => return,
     }
     if (!execution_context.tryClaimWake(ec, waiting_in)) return;
+    // Phase-2 shadow: edge 5a / 5b / 5c. The destination is chosen by the
+    // shadow's from-state — a `parking` origin is 5b (`pended`), which
+    // today has no representation and is instead handled by the `on_cpu`
+    // spin below.
+    execution_context.lcClaim(ec, .claim_mark_ready);
     // Kstack-release barrier: the suspend/park sites no longer clear
     // `on_cpu` in place — the parking core keeps it set until it has
     // hopped off the EC's kstack (see PerCore.pending_kstack_release).
@@ -2126,6 +2217,11 @@ pub fn markReady(ec: *ExecutionContext) void {
     // contract (`resumeFromReply` with the reply landing on the
     // executing core) — spinning there would wait on our own release.
     if (waiting_in != .running) {
+        // Phase-2 measurement: entering this spin means the claimant
+        // found its target mid-park — the population edge 5b/`pended`
+        // exists to serve, and (for interrupt-context wakers) the X2
+        // cycle §3.6 deletes.
+        if (ec.on_cpu.load(.acquire)) lifecycle.bumpCounter(.oncpu_spin_entered);
         while (ec.on_cpu.load(.acquire)) {
             // Ack-while-spinning (stygia-rs6 mechanism 9). This spin is
             // reachable with IRQs masked (timer/IPI wake paths), and a

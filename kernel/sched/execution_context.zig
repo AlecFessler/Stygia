@@ -7,6 +7,7 @@ const stygia = @import("stygia");
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
+const lifecycle = stygia.sched.lifecycle;
 const memory_init = stygia.memory.init;
 const paging_consts = stygia.memory.paging;
 const perfmon_mod = stygia.sched.perfmon;
@@ -91,6 +92,172 @@ pub fn tryClaimWake(ec: *ExecutionContext, expected: State) bool {
         .acq_rel,
         .monotonic,
     ) == null;
+}
+
+// ── Phase-2 lifecycle shadow: EC-side entry points ───────────────────
+//
+// These wrap `sched/lifecycle.zig`'s context-free observer with the
+// cross-checks that need an `*ExecutionContext` — the ones that compare
+// the shadow against today's signals. Every one of them is a no-op when
+// `lifecycle.enabled` is false, and none of them writes anything the
+// kernel reads.
+
+/// Today's `State` re-expressed in the target machine's vocabulary, per
+/// `systems.md` §2.6's disposition table. Returns `null` for the target
+/// states today's enum simply cannot express — `parking`, `claimed`, and
+/// `pended` are unrepresented by construction (see `lifecycle.zig`'s
+/// header), so a mismatch against them is not information and is not
+/// reported.
+fn legacyEquivalent(s: State) ?lifecycle.State {
+    return switch (s) {
+        .ready => .ready,
+        .running => .running,
+        .suspended_on_port, .futex_wait, .idle_wait => .waiting,
+        .exited => .retired,
+    };
+}
+
+/// Observe a shadow transition to `to` at `site`, then run the
+/// cross-checks that apply to that destination state.
+///
+/// Returns the shadow's from-state so a claim site can distinguish 5a
+/// (`waiting` origin) from 5b (`parking` origin) without a second read.
+pub fn lcObserve(
+    ec: *ExecutionContext,
+    to: lifecycle.State,
+    site: lifecycle.Site,
+) lifecycle.State {
+    if (!lifecycle.enabled) return .absent;
+    const id = lifecycle.ecId(ec);
+    const from = lifecycle.observe(&ec.lc, id, to, site);
+
+    // S3, the kstack-quiescence half: "Claimable ⇒ kstack-quiescent"
+    // (§4). Checked only for the two claimable destinations — `running`
+    // is deliberately NOT checked, because today's `on_cpu` is set by
+    // arch code (`loadEcContextAndReturn`) strictly AFTER the dispatch
+    // commit, so a check there would report a by-construction ordering
+    // rather than a divergence, and Phase 2 may not move that store.
+    switch (to) {
+        .ready, .waiting => {
+            if (ec.on_cpu.load(.acquire)) {
+                lifecycle.flag(.quiescent_on_cpu, site, id, to, to, 1);
+            }
+        },
+        else => {},
+    }
+
+    // Legacy agreement, checked only for the four target states today's
+    // enum can express at all. `parking`, `claimed` and `pended` have no
+    // representation in the tree by construction (that IS the finding,
+    // recorded once in the transition map), so comparing against them
+    // would produce a per-transition flood carrying no information.
+    switch (to) {
+        .ready, .running, .waiting, .retired => {
+            const have = legacyEquivalent(ec.state);
+            if (have == null or have.? != to) {
+                lifecycle.flag(
+                    .legacy_mismatch,
+                    site,
+                    id,
+                    to,
+                    have orelse .absent,
+                    @intFromEnum(ec.state),
+                );
+            }
+        },
+        else => {},
+    }
+
+    // Edge 9 against an EC that never entered the machine, or a second
+    // retire of the same EC. `illegal_edge` also fires on the first of
+    // those; this is the specific diagnosis.
+    if (to == .retired and (from == .absent or from == .retired)) {
+        lifecycle.flag(.retire_of_absent, site, id, from, .retired, 0);
+    }
+    return from;
+}
+
+/// The claim sites' entry point (edges 5a / 5b / 5c). The destination is
+/// chosen by the shadow's own from-state, exactly as §3.2's wake body
+/// specifies: a quiescent origin becomes `claimed` and the claimant
+/// discharges; a `parking` origin becomes `pended` and placement is owed
+/// to the owner core's hop.
+///
+/// Today's code has neither state — `tryClaimWake` stamps `.ready` — so
+/// this is where the shadow diverges from the tree by construction, and
+/// where the `claim_found_parking` counter measures how often edge 5b
+/// would actually fire on real hardware.
+pub fn lcClaim(ec: *ExecutionContext, site: lifecycle.Site) void {
+    if (!lifecycle.enabled) return;
+    const id = lifecycle.ecId(ec);
+    const now = lifecycle.peek(&ec.lc);
+    switch (now) {
+        .parking => {
+            lifecycle.bumpCounter(.claim_found_parking);
+            _ = lifecycle.observe(&ec.lc, id, .pended, site);
+        },
+        .running => {
+            // No §5 edge: `running` is unclaimable except by retire
+            // (§2.1), and §5's notes state that no `running -> ready`
+            // edge exists. `markReady`'s `.running` arm reaches here.
+            lifecycle.flag(.claim_of_running, site, id, .running, .claimed, 0);
+            _ = lifecycle.observe(&ec.lc, id, .claimed, site);
+        },
+        else => {
+            _ = lifecycle.observe(&ec.lc, id, .claimed, site);
+        },
+    }
+}
+
+/// Placement into `ready` (edges 6 / 6p / 8). Runs `lcObserve`'s checks
+/// plus §9.2's "Into `ready` ⇒ linked in the same section", read off
+/// `current_queue_core` — the one containment fact today's code makes
+/// discoverable for run queues.
+///
+/// `linked` is the caller's own knowledge of whether it performed the
+/// link; the field is only authoritative for Zig enqueue sites (the x64
+/// IPC fast-path asm enqueues without maintaining it, which is why
+/// `removeFromQueue` keeps its 64-way fallback).
+pub fn lcPlace(ec: *ExecutionContext, site: lifecycle.Site, linked: bool) void {
+    if (!lifecycle.enabled) return;
+    const id = lifecycle.ecId(ec);
+    const from = lcObserve(ec, .ready, site);
+    if (from == .ready) {
+        lifecycle.flag(.place_from_ready, site, id, .ready, .ready, 0);
+    }
+    if (linked) {
+        const q = ec.current_queue_core.load(.acquire);
+        if (q == NOT_IN_RUN_QUEUE) {
+            lifecycle.flag(.place_unlinked, site, id, .ready, .ready, q);
+        }
+    }
+}
+
+/// The hop's commit step (§4, edges 4 / 8). `to` is `waiting` for a wait
+/// park and `ready` for a requeue park; the caller knows which because
+/// today's park sites are flavour-specific.
+///
+/// Asserts §9.2's "outgoing state ∈ {parking, pended, retired}". An
+/// outgoing `claimed` is specifically unreachable per §4 and is reported
+/// as such.
+pub fn lcHopCommit(ec: *ExecutionContext, to: lifecycle.State, site: lifecycle.Site) void {
+    if (!lifecycle.enabled) return;
+    const id = lifecycle.ecId(ec);
+    const outgoing = lifecycle.peek(&ec.lc);
+    lifecycle.bumpCounter(.hop_commits);
+    switch (outgoing) {
+        .parking => {
+            _ = lcObserve(ec, to, site);
+        },
+        // A wake claimed this parking EC before the hop. The doc's hop
+        // discharges it (placement CAS `pended -> ready`); today the
+        // claimant did the placement itself, so the shadow is already
+        // past this point — record the shape and leave the word alone.
+        .pended, .ready, .retired => {},
+        else => {
+            lifecycle.flag(.hop_bad_outgoing, site, id, outgoing, to, 0);
+        },
+    }
 }
 
 /// Re-send the zombie-drain wake IPI every this many failed
@@ -323,6 +490,26 @@ pub const ExecutionContext = struct {
 
     /// Lifecycle state. See `State` for the queue invariant.
     state: State = .ready,
+
+    /// PHASE-2 SHADOW lifecycle word (`docs/kernel/systems.md` §2.1,
+    /// `sched/lifecycle.zig`). Holds a `lifecycle.State` — the target
+    /// machine's seven states plus the `absent` sentinel — written
+    /// alongside every transition site and READ ONLY BY ASSERTIONS.
+    /// Nothing in the kernel branches on it. `state` above remains the
+    /// sole authority.
+    ///
+    /// Ordering: written exclusively through `lifecycle.observe`, a
+    /// single `.acq_rel` exchange; see that function's doc comment for
+    /// why an exchange rather than a CAS and what the two halves of the
+    /// ordering buy. The `absent = 0` encoding means the slab's
+    /// zero-on-free leaves a recycled slot correctly outside the machine
+    /// with no explicit reset (`allocExecutionContext` relies on the same
+    /// contract for `on_cpu`, `next`, `prev`, …).
+    ///
+    /// Compiled-in unconditionally (one byte) so EC layout does not vary
+    /// with optimize mode; every write is gated on `lifecycle.enabled`,
+    /// so a release build never touches it.
+    lc: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     /// Cross-core context-switch barrier. Set true while actively
     /// executing on a CPU; cleared after the outgoing context has been
@@ -776,6 +963,10 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // the slab so outstanding handles still resolve (just to a parked
     // EC) until the owning domain is destroyed.
     ec.state = .exited;
+    // Phase-2 shadow: edge 9 (retire). Observer only; runs after the
+    // legacy store so the legacy-agreement cross-check compares against
+    // the value this site just committed.
+    _ = lcObserve(ec, .retired, .retire_faulted);
     ec.leak_tag = 1; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Clear on_cpu — this EC is no longer running. Without this, a
     // peer-core terminate posts the EC to its last_dispatched_core's
@@ -816,6 +1007,9 @@ pub fn parkIdleWait(ec: *ExecutionContext) void {
         // the lifecycle and our park would corrupt their queueing.
         if (ec.state == .running) {
             ec.state = .idle_wait;
+            // Phase-2 shadow: edge 3 (park, wfi/hlt flavour). The hop
+            // commit (edge 4) rides `stashKstackRelease` below.
+            _ = lcObserve(ec, .parking, .park_idle);
         }
         // Regardless of who won the state race, THIS core trapped out
         // of `ec` and its hlt/wfi handler is still executing on `ec`'s
@@ -916,6 +1110,8 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     }
 
     ec.state = .exited;
+    // Phase-2 shadow: edge 9 (retire). Observer only.
+    _ = lcObserve(ec, .retired, .retire_terminate);
     ec.leak_tag = 2; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Re-sweep run_queues after state=.exited so any yieldTo that
     // re-enqueued ec during the prepare phase (saw state=.running,
@@ -1052,6 +1248,24 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
 /// pointer via the even-gen test, but removing it explicitly here
 /// keeps the wait queue's count/size accurate.
 pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
+    // Phase-2 shadow: edge 10 (finalize), plus §9.2's 64-way `current`
+    // scan. Runs FIRST, before the port unwind below, because §8.2's N4
+    // mechanism makes "finalize's first act is the idempotent container
+    // unwind" normative and the assertion has to observe the state the
+    // unwind starts from. `stack.destroyKernel` and
+    // `destroyAlreadyMarked` follow the unwind, so this function already
+    // has the N4 ordering.
+    if (lifecycle.enabled) {
+        const id = lifecycle.ecId(ec);
+        var c: u8 = 0;
+        while (c < scheduler.MAX_CORES) : (c += 1) {
+            if (scheduler.currentEcPtrOn(c) == ec) {
+                lifecycle.flag(.finalize_referenced, .finalize, id, .retired, .running, c);
+                break;
+            }
+        }
+        _ = lcObserve(ec, .absent, .finalize);
+    }
     if (ec.suspend_port) |port_ref| {
         if (port_ref.lockIrqSave(@src())) |plr| {
             const p = plr.ptr;
@@ -1641,7 +1855,33 @@ pub fn suspendOnPort(
     ec.event_state_gprs = arch.syscall.getEventStateGprs(sender_ctx);
     ec.event_rip = arch.syscall.getEventRip(sender_ctx);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
+    // Phase-2 shadow. Three §5 shapes converge on this one store:
+    //   * self-suspend of a running EC       -> edge 3 (park_port);
+    //   * cross-EC suspend of a `.ready`     -> edges 5c + 7;
+    //   * cross-EC suspend of an idle-waiter -> edges 5a + 7.
+    // The remote-suspend-of-a-running-target case is separated out
+    // because §2.5 forbids it outright (running is unclaimable except by
+    // retire; the target machine delegates via the suspend directive) —
+    // so a non-zero `park_port_remote` population is the measurement of
+    // how much traffic the directive protocol has to absorb.
+    const lc_prev = ec.state;
     ec.state = .suspended_on_port;
+    if (lifecycle.enabled) {
+        switch (lc_prev) {
+            .ready, .idle_wait => {
+                lcClaim(ec, .claim_suspend_ready);
+                _ = lcObserve(ec, .waiting, .repin_suspend);
+            },
+            else => {
+                const self_core: u8 = @truncate(arch.smp.coreID());
+                const site: lifecycle.Site = if (scheduler.coreCurrentIs(self_core, ec))
+                    .park_port
+                else
+                    .park_port_remote;
+                _ = lcObserve(ec, .parking, site);
+            },
+        }
+    }
     ec.pending_reply_holder = null;
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
@@ -2097,6 +2337,8 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
     }
 
     ec.state = .exited;
+    // Phase-2 shadow: edge 9 (retire). Observer only.
+    _ = lcObserve(ec, .retired, .retire_destroy);
     ec.leak_tag = 3; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
     // Re-sweep run_queues after the state flip — same race as in
     // `terminate` (see the matching comment there): a yieldTo on the

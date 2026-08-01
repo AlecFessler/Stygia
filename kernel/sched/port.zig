@@ -34,6 +34,7 @@ const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -184,6 +185,10 @@ pub fn expireTimedRecvWaiters() void {
         if (!removed) continue;
 
         // EC has been removed from the wait queue; safe to wake.
+        // Phase-2 measurement: this spin runs in INTERRUPT context (the
+        // tick), so entering it is the X2 shape §3.6 rule (a) deletes —
+        // interrupt context waiting on scheduler progress.
+        if (ec.on_cpu.load(.acquire)) lifecycle.bumpCounter(.oncpu_spin_entered);
         while (ec.on_cpu.load(.acquire)) {
             // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
             // matching note on `scheduler.markReady`'s kstack barrier.
@@ -203,6 +208,9 @@ pub fn expireTimedRecvWaiters() void {
         // both a lie and a second writer into a frame the winner is
         // already resuming.
         if (!execution_context.tryClaimWake(ec, .suspended_on_port)) continue;
+        // Phase-2 shadow: edge 5a / 5b, interrupt context (§5.1's
+        // "recv deadline expiry" row).
+        execution_context.lcClaim(ec, .claim_recv_expire);
         // Stash E_TIMEOUT in the syscall return slot. The scheduler's
         // resume path restores the syscall-return register on iretq.
         arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
@@ -611,6 +619,10 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
         caller.recv_port_xfer = port_caps_typed.xfer;
     }
     caller.state = .suspended_on_port;
+    // Phase-2 shadow: edge 3 (park, recv flavour). NOTE `enqueueReceiver`
+    // above ran BEFORE this store — links-before-CAS, the reverse of
+    // §3.2's M1 order. Recorded in the transition map; not repaired here.
+    _ = execution_context.lcObserve(caller, .parking, .park_recv);
     caller.pending_reply_holder = null;
     caller.pending_reply_domain = null;
     caller.pending_reply_slot = 0;
@@ -644,6 +656,9 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
         // Not this core's current EC (fast-path fallback shapes) — the
         // kstack is not ours, release immediately as before.
         caller.on_cpu.store(false, .release);
+        // Phase-2 shadow: §4 hop step 2 — this park's release happens
+        // here rather than at a stack hop, so commit here too.
+        execution_context.lcHopCommit(caller, .waiting, .hop_faulted);
     }
     return 0;
 }
@@ -2108,6 +2123,7 @@ pub fn rendezvousWithReceiver(
     // would race the saving core's GPR writes. Mirror the standard
     // wake-side pattern from futex.zig:239,588 and port.zig:187 — spin
     // until the prior core releases the EC.
+    if (receiver.on_cpu.load(.acquire)) lifecycle.bumpCounter(.oncpu_spin_entered);
     while (receiver.on_cpu.load(.acquire)) {
         // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
         // matching note on `scheduler.markReady`'s kstack barrier.
@@ -2280,6 +2296,9 @@ fn propagateClosedToReceivers(p: *Port) void {
         // Claim before writing the return slot — a timeout expiry or a
         // racing delivery is a competing waker for this same wait.
         if (!execution_context.tryClaimWake(waiter, .suspended_on_port)) continue;
+        // Phase-2 shadow: edge 5a (close propagation, §5 edge-5a source
+        // list).
+        execution_context.lcClaim(waiter, .claim_port_closed);
         if (waiter.iret_frame) |frame| {
             arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_CLOSED));
         } else {
