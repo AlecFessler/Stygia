@@ -1,17 +1,32 @@
-# TLA+ model of the EC-lifecycle machine (`systems.md` revision 15)
+# TLA+ model of the EC-lifecycle machine (model rev 15 / `systems.md` rev 16)
 
-TLC-checked model of the execution-context lifecycle state machine specified
-in `docs/kernel/systems.md`, **revision 10 (2026-08-01)**. Revisions 6
-through 10 were CO-EVOLVED with this model: model findings (N1–N6) were fed
-back into the doc, doc findings back into the model, and neither artifact
-is cited without the other. Built from the doc (plus `systems-review.md`
-for round-1 history); kernel sources are consulted only to CHECK a doc
-claim, never to supply one — rounds 7, 8 and 9 did exactly that
-repeatedly, and three times the tree contradicted the design: round 8's
-C-1 (the tree's self-terminate carve-out that the doc lacked), round 8's
-C-3 (`port.zig` declaring the opposite lock order to the one the doc had
-just derived), and round 9's C-4 (`IA32_FMASK` masking IRQs on SYSCALL,
-against a premise the doc never stated but twelve arguments needed).
+TLC-checked model of the execution-context lifecycle state machine
+specified in `docs/kernel/systems.md`. **The two artifacts are at
+different revisions right now and that is deliberate, not drift:** the
+module is **model revision 15**, which is what the `run.sh` exit-0
+battery below ran against, and the doc is **revision 16 (2026-08-02)**,
+which is DOC-ONLY — it states a premise, fixes which leg of the user
+boundary one arm is checked on, and records a tree obligation, all three
+invisible to a model that has no domains and no user memory. No verdict
+in this file went stale on that edit. Its parity gap is ledger entry
+**G12**, and G12 is the largest open one in the artifact.
+
+Revisions 6 through 10 were CO-EVOLVED with this model: model findings
+(N1–N6) were fed back into the doc, doc findings back into the model, and
+neither artifact is cited without the other. Built from the doc (plus
+`systems-review.md` for round-1 history); kernel sources are consulted
+only to CHECK a doc claim, never to supply one — rounds 7, 8, 9 and the
+round-13 follow-up did exactly that, and **four times the tree
+contradicted the design**: round 8's C-1 (the tree's self-terminate
+carve-out that the doc lacked), round 8's C-3 (`port.zig` declaring the
+opposite lock order to the one the doc had just derived), round 9's C-4
+(`IA32_FMASK` masking IRQs on SYSCALL, against a premise the doc never
+stated but twelve arguments needed), and revision 16's §11.13 (the
+dispatch trampoline writing a resumed EC's user stack after the
+address-space swap, against the premise §0.3's domain-pause argument
+rests on). **All four were found by reading the tree, none by running
+TLC**, which is the standing argument for why a green battery is a floor
+and not a ceiling.
 
 **Round 8 in one paragraph, and it is the important one.** Three
 criticals, and **all three were completeness failures of enumerations
@@ -158,11 +173,23 @@ spec GAP goes to §11 as a maintainer call, never to a silent narrowing.
 
 ```sh
 cd docs/kernel/tla
-./run.sh                 # everything except xlarge and the c1full rung
-RUN_XLARGE=1 ./run.sh    # plus the 3-core/4-EC safety run
+./run.sh                            # the DEFAULT battery: 29 configs + sany
+RUN_XLARGE=1 ./run.sh               # + xlarge (3c × 4e safety)
+RUN_SLOW=1   ./run.sh               # + t1full, cr1fullself, liveness_a/b
+RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # all 34; hours, launch it detached
 ```
 
-`run.sh` exits non-zero unless every revision-10 run is clean AND every
+**Always launch a long run DETACHED** — `setsid nohup ... & disown` —
+because an agent tool timeout will otherwise kill the JVM mid-battery and
+the transcript will look like a failure it is not. Knobs: `TLC_HEAP`
+(default `5g`), `TLC_WORKERS` (default 4 — raising it does nothing for
+the liveness phase, which is single-threaded), `TLC_TIMEOUT` (default
+7200 s **per config**; a config that hits it is reported
+`UNCONVERGED (timeout)` and fails the battery, which is the honest
+outcome and must not be rounded to a pass). `run.sh` refuses to start if
+another TLC JVM is live, and gates each launch on ≥ 3.5 GiB available.
+
+`run.sh` exits non-zero unless every clean-expected run is clean AND every
 gate reproduces its expected violation. **Round-9 C-2 is why this
 sentence is now trustworthy**: the previous script was a revision-8
 artifact invoking eight deleted configs, so it could not exit 0 under any
@@ -273,14 +300,16 @@ gitignored; keep all generated output under them.
 
 | File | Purpose |
 |---|---|
-| `ECLifecycle.tla` | the model: rev 10, plus every older/defective machine as a switch |
-| `ECProbes.tla` | the three reachability probes |
-| `run.sh` | **runs every config below except the `q*` set; exits non-zero on any deviation** |
+| `ECLifecycle.tla` | the model: rev 15, plus every older/defective machine as a switch |
+| `ECProbes.tla` | the **five** reachability probes (`pr1`–`pr5`) |
+| `run.sh` | **runs every config below except the `q*` set and `dirabafix`; exits non-zero on any deviation** |
 | `ECLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
-| `ECLifecycle_medium.cfg` | 2c × 3e, ALL features, symmetry |
+| `ECLifecycle_medium.cfg` | 2c × 3e, ALL features, symmetry. **Two documented scope cuts in-file**: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
 | `ECLifecycle_large.cfg` | 3c × 3e, core + rendezvous, symmetry |
 | `ECLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
-| `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs |
+| `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
+| `ECLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: expects `InvNoFalseSuspendSuccess`, and the repair |
+| `ECLifecycle_pr{4,5}.cfg` | the round-10/11 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`) |
 | `ECLifecycle_t1{min,s,r,full}.cfg` | **`LiveTerm` ladder under `SpecTrm`**, its minimal fairness set |
 | `ECLifecycle_cr1{min,full}self.cfg` | `LiveSuspender` under `SpecFairN3` (neither N6 assumption) |
 | `ECLifecycle_liveness_{a,b}.cfg` | L1/L2/L6 and L3/L4/L5 at 2×2 under `SpecFairCore` |
@@ -301,16 +330,22 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_diraba.cfg` / `dirabafix.cfg` | **round-10 C-D**: the directive-word ABA, and the identity-gated repair |
 
 
-**Config taxonomy after round 7** (which machine each family describes):
+**Config taxonomy** (which machine each family describes). DERIVED from
+`ls ECLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
+an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
+ladder, **none of which are on disk**; they were deleted in revisions
+9–11 and the taxonomy kept describing them. There are **43 `.cfg` files**
+and `run.sh` invokes **34**; the 9 it does not are `q1`–`q7`, `q7d` and
+`dirabafix`, each with its reason recorded in `run.sh` itself.
+
 `small`/`medium`/`large`/`xlarge`, every gate, every probe,
-`liveness_a`/`liveness_b`/`c2`/`mp*`, and the `*self` files all run the
-BLESSED machine, `CYCLE_REJECT = "self"`. The `cr*` files without
-`self` run mechanism **(A)** `"pair"` and exist to show what it does and
-does not close. The `c1*` ladder (`SpecFairAligned`) now runs
-`CYCLE_REJECT = "none"` — it describes the REV-7 machine, the one that
-needed the N6 assumptions, and is kept as the historical comparison the
-13s-vs-2min03s measurement is against. `crcyc`/`crfals` are `"none"`
-falsifiers.
+`liveness_a`/`liveness_b`, the `t1*` ladder and the `*self` files all run
+the BLESSED machine, `CYCLE_REJECT = "self"`. The `cr*` files without
+`self` (`cr3`, `crcyc`, `crfals`) run mechanism **(A)** `"pair"` or
+`"none"` and exist to show what each does and does not close.
+`SpecFairAligned` survives in the module as the rev-7 machine's spec and
+is used by no live config — the 13s-vs-2min03s measurement it backs is
+history, not a runnable comparison.
 
 Machine switches: `PENDED`/`PIN_GATE` (FALSE+FALSE = the rev-3 machine),
 `F1_MODE` (`"rev5"` = W7 pre-CAS wait; `"nowait"`/`"alwayswait"` = the two
@@ -376,6 +411,9 @@ window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
 | §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | |
 | S1/S3/S4/S8 | `InvS1`, `InvS3`, `InvS4Holder`+`InvS4Pended`; S8 by construction | S2/S5/S6 and S7's lock half outside boundary |
 | L1-L6, W3/W4/W5 | `LiveParking/Retired/Ready/Wake/Mark/Claim/Term/Suspender` | L3 states DISPATCH, not merely "leaves ready" |
+| §0.3 / §3.4 domain pause (`cd.paused`), §2.2 `wait.kind = .domain_pause`, §3.1 rule 3's third arm, §5 edge 1's gated publish, §3.6 W5-N | **NOTHING. No variable, no action, no invariant.** | **G12** — the largest open gap. The model has no domains beyond a per-EC `dd` flag. Round-13 C-1's whole fix, plus revision 16's quiesced-resume rule and boundary-leg fix, are doc-only. G12 carries the four lost properties and the design for closing it |
+| §3.4 `current_queue_core` | **no model field** | **G13** — MP. Run-queue membership IS `cores[c].q`; the field is a cache of a fact the model computes, so a field would add no reachability. What is lost is CACHE INCOHERENCE, which needs two words and the model has one — and the x64 asm fast path is a real writer that does not maintain it |
+| §3.3 quiesced-resume rule (rev 16) | **not modelled, and not modellable here** | user memory is entirely below this model's granularity — there is no user address space in the state. Enforcement is §9.2's assert pair and §9.3(2)'s analyzer clause; §11.13 records the HEAD violation. Folded into G12 |
 
 ## Divergence & ambiguity ledger
 
@@ -462,10 +500,148 @@ incomparable/reconstruction.
   `FUTEX_BUCKET_GROUP` opt-out rather than by any chain. A fourth class
   (CD gen locks) was missing from the chain entirely. **Lock order is
   outside this model's boundary — TLC contributed nothing to finding
-  this and would not have caught it.** Recorded as a blocker in
-  `systems.md` §11.10: §8.1's re-bucketing must not be implemented
-  against a guessed order, and what is actually needed is a lockdep
-  group design that does not exist.
+  this and would not have caught it.**
+  **XREF CORRECTED (revision 15/16): this entry used to say "recorded as
+  a blocker in `systems.md` §11.10: §8.1's re-bucketing must not be
+  implemented against a guessed order, and what is actually needed is a
+  lockdep group design that does not exist". That is no longer what
+  §11.10 says.** §11.10 was **RETRACTED in revision 13** (§0.2, §3.5):
+  revisions 10–12 escalated the refuted chain into a blocker gating
+  §8.1, §8.2, §8.5 and six migration steps, and revision 13 withdrew
+  both the chain and the blocker — the kernel uses address-ordered
+  same-class nesting under a named group plus lockdep's dynamic cycle
+  detection, and §8.1's repair uses drop-and-retry so it never holds two
+  classes at once. **Nothing is blocked.** What survives from §11.10 is
+  a one-line tree defect about `EC_NESTED_GROUP`, not a design gate.
+  Cross-class lock ordering is OUT of scope by §0.2, and the correct
+  reading of this ledger entry is now the sentence above it: the model
+  is silent here, and it was a reviewer reading `port.zig` — not a
+  battery — that produced the finding.
+- **G12 (NEW, rev 15/16, LP — the largest open parity gap in the
+  artifact; LEDGERED, not modelled, and the reason is stated rather than
+  implied).** **The domain pause is UNMODELLED IN ITS ENTIRETY.** Round
+  13's C-1 fix — `cd.paused` (§3.4), §3.1 rule 3's third boundary arm,
+  edge 1's gated publish (§5), `wait.kind = .domain_pause` (§2.2), W5-N
+  (§3.6), §0.3's two refusals — has **no TLA+ variable, no action and no
+  invariant**. The model has no domains at all beyond a per-EC `dd`
+  (dead-domain) flag, which is a different fact. Revision 16's additions
+  (the quiesced-resume rule, the boundary-leg fix, §11.13) sit inside the
+  same gap.
+
+  **This is the shape the parity discipline was rewritten for**, and it
+  is worth being blunt: round 11's C-1 was a doc mechanism the model did
+  not have, the battery was green throughout, and every gate still fired.
+  This is that again, one mechanism later — except that this time it is
+  **recorded before** anyone cites the green run rather than after.
+
+  **What is LOST, concretely** — four properties nothing checks:
+  1. **The pauser terminates.** W5-N is a T3 row with a
+     PREDICATE-shaped wait, the only one in §3.6. Its termination
+     argument is that the runnable set only ever decreases, which rests
+     on edge 1's publish reading `cd.paused` under the CD `_gen_lock`.
+     Nothing executes that argument.
+  2. **No EC of a paused domain reaches user code while paused.** This
+     is the pause's entire point and it is a safety invariant — the
+     cheap direction — and it is unstated in the model.
+  3. **Mutual pause is unrepresentable.** §0.3's second refusal is the
+     domain-level analogue of §2.5.1's self-mark. The self-mark version
+     IS modelled and IS gated (`crcyc`, `cr3`); the domain version is
+     not, so the one mechanism of this shape that has never been
+     falsification-tested is the newest one.
+  4. **The boundary LEG.** Revision 16 found by reading that an
+     entry-only reading of §3.1 rule 3 falsifies W5-N's own soundness
+     argument. A model with a return-leg boundary action would have made
+     that a reachability question instead of a reading question.
+
+  **Why it is ledgered and not modelled, honestly.** Three reasons, and
+  none of them is "it is hard".
+
+  First and decisively: **the mechanism has been DEFERRED out of the
+  `systems.md` §12 refactor entirely**, by maintainer decision, to bead
+  `stygia-qap` (§0.3, revision 16). It is unimplemented at HEAD —
+  `memory/vmar.zig:1606`/`:1610` are empty `_ = cd;` stubs and
+  `acquire_vmars` has no pause call at all — so nothing is being built
+  against it and no step of §12 depends on it. **The model work belongs
+  with that bead, and doing it now would put a validated model in front
+  of a design decision the bead has not made yet** (the §11.13 call
+  between gate-before-flush and re-deferral is open). G12 is the record
+  that keeps the two in step.
+
+  Second: the module is the artifact the kernel refactor is building
+  against, and the extended battery that must re-validate any change to
+  it takes hours under the one-JVM rule — so a module edit lands as its
+  own revision with its own full battery, not as a side effect of a doc
+  round.
+
+  Third: modelling it properly is not a small delta. It needs a domain
+  map, a `paused` word, a pauser role, a return-leg boundary action the
+  model does not currently have (dispatch puts an EC `running` and user
+  mode is implicit), and it multiplies the state space at exactly the
+  scopes that already needed cuts.
+
+  **The design, so the next revision is mechanical rather than
+  open-ended.** Variables: `dom \in [ECs -> Domains]` (fixed at `Init`,
+  no migration), `paused \in [Domains -> BOOLEAN]`, and `pauser \in
+  [Domains -> ECs \cup {NULL}]`. Actions: `PauseStart(u, d)` — guarded
+  on `dom[u] # d` (refusal 1), `~paused[dom[u]]` (refusal 2) and
+  `~paused[d]`, sets `paused[d]` and `pauser[d] := u`; `PauseProceed(u)`
+  — guarded on no `e` with `dom[e] = d` in `{running, ready, parking}`,
+  the W5-N predicate; `PauseResume(u, d)` — clears the word, then 5a +
+  edge 6 per gated EC; `BoundaryPause(e)` — the return-leg arm, an
+  edge-3 park into `waiting("dpause")` guarded on `paused[dom[e]]`, at
+  precedence below `BoundaryRetired` and the directive arm. Edge 1's
+  `CreateEC` gains the gated-publish arm. Invariants:
+  `InvNoPausedUserCode` (no `e` with `paused[dom[e]]` is `running` and
+  past its gate), `InvNoPauseCycle`. Property: `LivePause` —
+  `pauser[d] # NULL ~> ~paused[d]` — under a minimal fairness set, which
+  per the standing methodology is the thing to get right first.
+  Falsifiers, one per must-land, because a mechanism with no falsifier is
+  decoration: **`dpub`** (edge 1 publishes `ready` into a paused domain —
+  expect `LivePause` to fail, the pauser starves on a growing set);
+  **`dcyc`** (drop refusal 2 — expect `InvNoPauseCycle` or a deadlock);
+  **`dleg`** (gate on the entry leg only — expect `InvNoPausedUserCode`,
+  which is revision 16's finding turned into a machine check).
+  Expected cost: this is a 2c × 2e / 2-domain job. Do not attempt it at
+  the `medium` scope. **Sequencing: this work is `stygia-qap`'s first
+  step, not its last** — the bead exists because the mechanism is
+  unimplemented, and the whole point of the deferral is that it gets a
+  validated model BEFORE an implementation, which is the one discipline
+  the reverted rev-7 refactor violated.
+- **G13 (NEW, rev 14/16, MP — LEDGERED, not modelled).**
+  **`current_queue_core` has no model field.** §3.4 gave it a row in
+  revision 14 (1 byte, `NOT_IN_RUN_QUEUE` sentinel, written by the party
+  holding the DESTINATION queue lock at the CAS-then-link of edges
+  1/6/6p/8, cleared under the same lock on every exit from `ready`,
+  valid iff `state = ready`), and the model has nothing corresponding.
+
+  **Unlike G12 this one is close to harmless, and the reason is worth
+  stating precisely rather than waving at.** The field is a **cache of a
+  fact the model already represents exactly**: run-queue membership is
+  `cores[c].q`, so "which core's queue is `e` in" is
+  `CHOOSE c \in Cores : e \in cores[c].q`, computed rather than stored.
+  Every model action that would write the field already updates the set
+  in the same atomic step, so a model field would be a redundant
+  projection with no independent behaviour — adding it could only add
+  states, never reachability. Marked MP rather than LP for that reason.
+
+  **What is nonetheless LOST is the one thing that can actually go
+  wrong**: the field is a *separate word* in the tree and the set is not,
+  so **CACHE INCOHERENCE — the field disagreeing with real membership —
+  is not expressible here.** §3.4 argues that away structurally (written
+  and cleared only under the queue lock that owns the membership it
+  names, in the same section as the state CAS, and a stale read is
+  re-validated by §3.5's drop-and-retry). That argument is sound for
+  every writer that takes the lock — **and the tree has a writer that
+  does not.** DERIVED (`grep -rn current_queue_core kernel --include=*.zig`
+  → 14 sites, all Zig, none in asm): the x86-64 IPC fast path places ECs
+  from assembly and maintains no such field, which is the measured
+  `stygia-qde` population — 485 illegal transitions per boot on x86-64,
+  zero on aarch64, arithmetic closing exactly. So on x86-64 the field can
+  lie, the model cannot see it lying, and **a §9.2 S1-containment
+  assertion built on it would be checking a field that is wrong on one
+  arch**. That is the note to carry into the refactor; it is not a reason
+  to model the field, because modelling a coherent copy would not
+  reproduce an incoherence the model has no second word to hold.
 
 ## Validation gates — results
 
@@ -655,7 +831,12 @@ what its tooling actually RAN.
   `persist` keeps an EC running while its domain's VMARs are freed. **The
   instructive part is the method**: this README's sufficiency table was
   derived by walking the spec's SYSCALL list, and `§[restart_semantics]`
-  is not a syscall section. A blind spot in the derivation, of which the
+  is not a syscall section. **STATUS as of rev 16: `restart_at_entry` is
+  no longer an obligation** — downgraded by maintainer decision once the
+  tree showed only policy plumbing exists (see the sufficiency table).
+  The FINDING is unaffected and is the reason this entry stays: what C-5
+  caught was a derivation method, not a missing edge. A blind spot in the
+  derivation, of which the
   missing rows are only a symptom. The table below is re-derived from the
   spec's SECTION list.
 
@@ -1048,18 +1229,74 @@ deleted outright and this subsection kept only as history — including the
 impossibility proof above, which stays true and is the reason nobody
 should try the ghost-fairness route again.
 
-## Revision 11 — results
+## Results
 
-**`./run.sh` exits 0 against this revision — verified, not asserted.**
-Transcript: `out/rev11_runsh_verified.txt` — `RESULT: OK`,
-`RUNSH_EXIT=0`, covering sany, all **13** falsification gates, all **4**
-probes, 6 safety configs and 4 liveness configs in one invocation. This
-is the first revision since 8 for which the header's claim discipline —
-"the battery is green" is claimable only for text a full `run.sh` exit-0
-has run against — is **satisfiable at all** (round-9 C-2).
+### Revision 15 — the current battery
 
-**Revision 10 makes NO model change at all, so no verdict below went
-stale.** Round 9's five criticals were text and apparatus: the one that
+**`./run.sh` exits 0 against model revision 15 — verified, not
+asserted.** Transcript: `out/rev15_runsh_EXIT0.txt` (`RESULT: OK`,
+`RUNSH_EXIT=0`). `out/` is gitignored, so the durable copy of these
+verdicts is the commit message of the revision-15 commit.
+
+**Scope of that exit-0, stated exactly, because it is not the whole
+battery.** The DEFAULT battery is **29 configs + sany**: 14 falsification
+gates, 5 reachability probes, 6 safety configs, 4 liveness configs. Five
+further configs live in `run.sh` behind `RUN_XLARGE=1` / `RUN_SLOW=1` —
+`xlarge`, `t1full`, `cr1fullself`, `liveness_a`, `liveness_b` — and their
+figures in the revision-11 table below are **STALE**: they have not been
+re-run since the model gained six per-EC fields in revisions 11–13
+(`gen`, `dgen`, `dlv`, `pok`, `dfs`, `dbad`). Treat every one of them as
+having NO verdict on the current machine until the extended battery lands
+here. `crfals` is the calibration point for how large that gap is: it
+went 1,768 → 18,216 distinct on the same config, a **10×** growth.
+
+| | Config | Rev 15 verdict |
+|---|---|---|
+| syntax | `sany` | PASS |
+| gates | `x1` `x2` `x3` `f1a` `f1b` `n4` `e4` `pinord` `crcyc` `cr3` `crfals` `mterm` `diraba` `dirf6` | **all 14 FIRED** |
+| probes | `pr1`–`pr5` | **all 5 FIRED** (the violation IS the pass) |
+| safety | `mtermfix` | PASS 9,585 |
+| | `dirf6fix` | PASS 483,636 |
+| | `small` | PASS 2,957,560 |
+| | `large` | PASS 68,733 |
+| | `cr3self` | PASS 6,179,060 |
+| | `medium` | PASS 37,637,315 (~9.5 min) |
+| liveness | `t1min` / `t1s` / `t1r` | PASS 9,585 / 10,237 / 11,969 |
+| | `cr1minself` | PASS 58,600 (~25 min; the temporal phase dominates) |
+| **not run** | `xlarge` `t1full` `cr1fullself` `liveness_a` `liveness_b` | **NO REV-15 VERDICT** |
+
+**Two configs carry documented scope cuts, and the cut is written into
+the `.cfg` file, not only here.** `cr3self` and `medium` set
+`DIR_DROP = FALSE`; `medium` and `xlarge` set `CR_BUDGET = 0`. What is
+LOST, stated as the discipline requires: with `DIR_DROP = FALSE` the
+stale-port drop path is not exercised **at 3 ECs** — it is covered at 2
+by `dirf6`/`dirf6fix`, so a defect in the drop path that needs a third EC
+to construct would not be found; with `CR_BUDGET = 0` there is **no slab
+reuse at all** in those runs, so every ABA shape that depends on a
+recycled slot is unreachable there — which is precisely the family
+`gen`/`dgen` exist to guard, and it is covered only at the smaller
+scopes. Both cuts were forced: `medium` ran past 143M distinct with a
+still-growing queue before them.
+
+**`dirabafix` is on disk and NOT in `run.sh`** (`run.sh:156-166`), and
+the reason is round-12 M-3's own finding: under `DIR_OWNED = TRUE` the
+disarm guard forces `dsrc = u`, so `InvNoForeignDisarm`'s update term is
+identically FALSE and the invariant holds **a priori**. A clean run would
+establish `TypeOK` and deadlock-freedom at that scope and say nothing
+about the ownership mechanism. The falsifier `diraba` is the whole of
+that gate's content.
+
+### Revision 11 — superseded figures, kept for the growth record
+
+**Everything in this subsection is a REVISION-11 verdict.** It is kept
+because the state-space growth across revisions is itself evidence — a
+green run on a smaller space was green about less — and because the
+`t1full`, `liveness_a`, `liveness_b` and `cr1fullself` analysis below is
+the only analysis those configs have. **Do not cite any number here as a
+statement about the current machine.**
+
+**Revision 10 made NO model change at all, so no revision-11 verdict went
+stale at the time.** Round 9's five criticals were text and apparatus: the one that
 looked like a machine change — deleting the directive word's `dropped`
 value (C-1) — turned out to be doc-only, because `dropped` was never
 modelled in the first place (see the parity-gap row above). `ECLifecycle.tla`
@@ -1272,10 +1509,12 @@ distinction a closure table exists to make.
 | `timer_arm` / `timer_rearm` / `timer_cancel` | T1 one-shot registration lifecycle (§5.1, §8.4) | `shot \in {none,armed,consumed}`; `FireAny` | the arming EC; the tick |
 | IPC fast paths | §9.4 fused compositions | `FastPath`, `ReplyFP` as ideal atomic compositions | pinned asm sites |
 | **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireEC` / `Terminate` | the exiting domain's teardown |
-| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NO EDGE EXISTS (round-9 C-5)** — an EC in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an EC in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
 | **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an EC *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live EC, and it collides directly with `active_root` / translation quiescence (W6): a running EC on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
-| `power_shutdown` / `power_reboot` / `power_sleep` | **not an EC state change** — terminal/diagnostic core-stopping paths, §3.6 carve-out (added in rev 8) | not modelled, by carve-out | — |
-| `sync`, `restrict`, `ack`, `idc_read`/`idc_write`, `perfmon_*`, all VMAR/page-frame/VM-policy calls, `create_port`, `bind_event_route`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability, memory or perfmon state only | not modelled, correctly | — |
+| `power_shutdown` / `power_reboot` | **not an EC state change** — terminal core-stopping paths, §3.6 carve-out (added in rev 8) | not modelled, by carve-out | — |
+| `power_sleep` | **not an EC state change, but NOT by the terminal carve-out** — the spec says it RETURNS on wake, so it is not terminal. OUT by §0.2 reason B: the core idles and resumes the same EC. Revisions 14–15 filed it under §3.6's terminal carve-out while §0.2 said the opposite; **corrected in revision 16** | not modelled, by §0.2 exclusion | — |
+| **`acquire_vmars` / `idc_read` / `idc_write`** | **THEY DO CHANGE EC STATE, and an earlier version of this table said they could not.** `specv3.md` `:722`/`:1894`/`:1952` say each **pauses every EC in the target domain**: §3.1 rule 3's third boundary arm, an edge-3 park into `waiting(domain_pause)`, plus edge 7's re-containment into the paused-domain EC list, plus edge 1's gated publish, plus the W5-N wait the caller performs | **NOT MODELLED — see G12** | the pauser (entry/resume); each gated EC itself (the park) |
+| `sync`, `restrict`, `ack`, `perfmon_*`, all VMAR/page-frame/VM-policy calls, `create_port`, `bind_event_route`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability, memory or perfmon state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
 Two rows in that table are the round-7 additions that closed acceptance
 condition 3's gaps: `yieldTo`'s target side had no rule at all, and the
@@ -1295,8 +1534,11 @@ here, and round 8 is the demonstration that a wrong claim in this area
 survives a fully green battery; slab gen / S5 fusion
 and every stale-handle race; S2/S6 writer- and width-discipline; domains
 beyond a per-EC dead flag; W6/W8/W9; the §9.4 fast path's asm conformance;
-§3.3's sync-exception rule; **descriptor-write windows and instruction
-orders below action granularity — including C1's claim-side bump**; queue
+§3.3's sync-exception rule; **the entire domain-pause mechanism (G12) —
+`cd.paused`, `.domain_pause`, W5-N, both no-cycle refusals, the boundary
+leg, and §3.3's quiesced-resume rule**; **descriptor-write windows and
+instruction orders below action granularity — including C1's claim-side
+bump**; queue
 ordering, priorities and bucket position (which is why C2 is
 model-invisible); affinity masks; capacity/E_NOMEM. Those belong to the
 §9.3 analyzers, the §9.2 asserts, lockdep, and the N=100 bare-metal
@@ -1306,7 +1548,8 @@ campaign.
 
 *(Verdict tables follow this section; read them together.)*
 
-What the green battery establishes: at 2–4 ECs and 2–3 cores, the rev-11
+What the green battery establishes: at 2–3 ECs and 2–3 cores (the 4-EC
+rung is `xlarge`, which has no rev-15 verdict yet), the rev-15
 protocol — the seven-state CAS word, both hand-off shapes, the pended
 split with W7's pre-CAS wait, the wait-free retired arm, the
 finalizer-owned container unwind, the pin gate with F3's widened class and
@@ -1325,9 +1568,22 @@ dialed to `lock(); pin_depth += 1;` it violates T2's ready×K justification
 in four. Its own narrowing (N2) was caught and corrected against the
 literal text.
 
-**Three things a green rev-8 run does NOT establish, stated because each
-was a live question in round 7:**
+**Things a green rev-15 run does NOT establish. Read (0) first — it is
+the largest one and it is newer than the rest:**
 
+0. **THE DOMAIN PAUSE IS NOT IN THIS MODEL AT ALL (G12).** Not the
+   `cd.paused` gate, not `.domain_pause`, not W5-N's predicate wait, not
+   either of §0.3's two no-cycle refusals, not edge 1's gated publish,
+   not the boundary leg, not §3.3's quiesced-resume rule. It is the
+   NEWEST mechanism in `systems.md` and the one with the **least**
+   evidence behind it — every other mechanism in the list above has at
+   least one falsifier proving its fix load-bearing, and this one has
+   none. Two of its defects have already been found by READING rather
+   than running (revision 16: the asserted user-memory premise, and the
+   boundary leg that falsified W5-N's own soundness argument), which is
+   the empirical case for modelling it rather than an argument that
+   reading suffices. G12 carries the four lost properties, the design,
+   and three named falsifiers to build with it.
 1. **C1's claim-side half is unchecked** and cannot be checked at this
    granularity. Only the pin-class-lock half has a falsifier. If the
    kernel bumps `pin_depth` after dropping the reaching container lock,
