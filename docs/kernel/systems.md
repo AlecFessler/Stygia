@@ -169,10 +169,21 @@ EC-lifecycle or lost-wake bug, include it.
 - **The claim protocol** — who owns an EC in transit (§3.5, §5.2's T2).
 - **The domain-wide pause AND its resume** (§0.3) — it moves N ECs off
   cores and then back onto them, which is the test's own definition.
+  **IN SCOPE, but DEFERRED out of the §12 refactor to bead `stygia-qap`**
+  (maintainer decision, revision 16): it is unimplemented at HEAD,
+  unmodelled in the battery, and no migration step depends on it. In
+  scope means the design is here and normative; it does not mean this
+  refactor builds it.
 - **The wakes caused by `revoke`/`restrict`** — a port-refcount cascade
   waking suspended senders with `E_CLOSED` is a wake, so it is in, via
   edge 5a's existing close-propagation trigger. No new edge.
-- **`restart_at_entry`** — it makes an EC runnable.
+- ~~**`restart_at_entry`** — it makes an EC runnable.~~ **NO LONGER AN
+  OBLIGATION as of revision 16** (maintainer decision, §0.3). It WOULD
+  make an EC runnable, and the machine will route it when restart
+  semantics are built — but the tree implements only the policy plumbing,
+  so this listed a scope commitment against a feature that does not
+  exist. The test is unchanged; what changed is that there is nothing yet
+  for the test to apply to.
 - **The invariants that give every EC-lifecycle fact ONE WRITER and ONE
   VALIDITY PREDICATE** (§6, §2.6). **This is the deliverable**, and it
   is worth stating precisely rather than as "provably redundant"
@@ -2875,7 +2886,11 @@ ideal composition is exactly this section's decision list plus
    > call passes rather than fails.)
 
    **Second, smaller spec addition in the same section (round-13 C-1):
-   `acquire_vmars`, `idc_read` and `idc_write` need an E_BUSY cause.**
+   `acquire_vmars`, `idc_read` and `idc_write` need an E_BUSY cause.
+   NOT URGENT — this rides with bead `stygia-qap`, not with §12**
+   (revision 16): the pause is deferred out of the refactor, and at HEAD
+   the three syscalls cannot emit this error because they do not pause at
+   all. Proposed now so the bead does not have to re-derive it.
    §0.3's domain-pause gate refuses a pause in two cases — the target
    domain contains the calling EC, or the caller's own domain is already
    paused — and those refusals are what make mutual pause
@@ -2928,8 +2943,9 @@ ideal composition is exactly this section's decision list plus
    suspend state-gate error code) — both touch §[suspend] and it should
    be opened once.**
 
-9. **Domain restart is absent from this machine entirely (round-9 C-5;
-   NEW). My read: it is IN scope and needs a new edge.**
+9. **Domain restart is absent from this machine entirely (round-9 C-5).
+   DECIDED IN REVISION 16 — see the resolution at the end of this item;
+   the analysis below is kept because it is what the follow-on will use.**
    `grep -ni restart systems.md` returned **zero** before revision 10.
    `specv3.md` §[restart_semantics] is normative and per-EC — when a
    domain holding `restart` on its self-handle exits (voluntary, fault
@@ -2958,11 +2974,23 @@ ideal composition is exactly this section's decision list plus
      prevent, so `persist` either needs the barrier or needs to state
      why it is exempt.
 
-   **Recommendation: do NOT scope it out.** It is per-EC lifecycle by
-   construction and the machine claims to be sufficient for the syscall
-   API's EC state changes. But it is a revision's worth of work, not a
-   paragraph, and it should be opened deliberately rather than bolted
-   onto a revision closing other findings. **The meta-finding is the
+   ~~**Recommendation: do NOT scope it out.**~~ **RESOLVED IN REVISION 16
+   — the maintainer scoped `restart_at_entry` OUT, and the recommendation
+   above is superseded.** The argument for keeping it in was that the
+   machine "claims to be sufficient for the syscall API's EC state
+   changes", and that claim is about state changes the API can actually
+   cause. It cannot cause this one: the kernel implements only the policy
+   PLUMBING (`caps/capability.zig:346`/`:581`/`:591`/`:604` —
+   `restartPolicyMonotone`, `restartPolicyMask`, create/copy ceiling
+   bounding), all eight `tests/suite/cases/restart_semantics_*.zig` cases
+   test `E_PERM` bounding rather than restart behaviour, and there is no
+   domain-restart implementation anywhere. So committing the machine to an
+   edge here would have been routing one value of one policy in a feature
+   whose semantics will move when it is designed. **The machine routes it
+   when restart semantics are built; the sketch above is what that
+   follow-on starts from.** (`persist` is unaffected — it remains OUT by
+   §0.2 reason B with its W6 obligation retained, per §0.3.) **The
+   meta-finding is the
    more valuable half and is fixed now** (§13, and the model README's
    sufficiency table): that table was derived by walking the spec's
    SYSCALL list, and §[restart_semantics] is not a syscall section — so
@@ -3145,7 +3173,10 @@ ideal composition is exactly this section's decision list plus
 
 ## 12. Migration
 
-Each step lands green and deletes a mechanism:
+Each step lands green and deletes a mechanism. **Read the precondition
+below and the closure note at the end of this section before starting
+step 1** — the first is a gate the implementer may not open, and the
+second names what is deliberately NOT here.
 
 **PRECONDITION OF STEPS 1 AND 9 — not the implementer's call.** Both
 steps promote an analyzer into gating CI. `tests/precommit.sh:563-564`
@@ -3448,8 +3479,9 @@ pass before the next lands. Step 10 rides `specv3.md` §[priority]'s
 tests instead.
 
 **What is deliberately NOT in this plan, so its absence is not read as an
-omission** (the failure mode §12's first review found five times over —
-a mechanism written normatively into §§0–9 and scheduled nowhere):
+omission** (§12's first review found five blockers, and the one that
+recurs across revisions is this shape — a mechanism written normatively
+into §§0–9 and scheduled nowhere):
 
 - **The domain-wide pause** — `cd.paused`, `.domain_pause`, §3.1 rule 3's
   third boundary arm, edge 1's gated publish, edge 7's paused-list arm,
@@ -3462,10 +3494,12 @@ a mechanism written normatively into §§0–9 and scheduled nowhere):
 - **Cross-class lock ordering** — out of scope entirely by §0.2; §11.10
   is retracted and nothing here is gated on it.
 
-**FOUND BY THAT CHECK AND NOT YET ROUTED — one item, and it is the
-maintainer's call, not the implementer's.** Running the grep below over
-revision 16's §12 turned up two unnamed mechanisms. `teardown_pending`
-had an unambiguous home and is now named at step 6. The other does not:
+**FOUND BY THE CLOSURE CHECK AND NOT YET ROUTED — one item, and it is
+the maintainer's call, not the implementer's.** Running that check (the
+last paragraph of this section: grep §12 for each mechanism's name)
+against revision 16's own §12 turned up two unnamed mechanisms.
+`PerCore.teardown_pending` had an unambiguous home and is now named at
+step 6. The other does not:
 
 - **§2.1.1's per-core idle EC.** The section is normative — *"the idle
   EC's permanent containment is its core's `idle_ec` slot, which counts
