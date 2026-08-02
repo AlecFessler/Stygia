@@ -370,7 +370,7 @@ window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
 | Spec | Model | Notes |
 |---|---|---|
 | §2.1 lifecycle word, 7 states | `ecs[e].st`, CAS = guarded atomic actions | + `"freed"` as the post-edge-10 pseudo-state |
-| §2.1.1 idle EC | **not modelled** | G7 |
+| ~~§2.1.1 idle EC~~ | **nothing to model — §2.1.1 WITHDRAWN in doc rev 16** | **G7 CLOSED by the doc retracting.** There is no per-core idle EC (`idle_ec` never assigned; `parkAndAwaitIRQ` is the real mechanism and replaced it to fix a cross-core kstack-sharing bug). A core with an empty run queue holds no EC, so the model having none is faithful, not a gap. Unaffected: the `.idle_wait` EC state / `wait.kind == .idle`, which are a USER EC choosing to idle |
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
 | §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-EC words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
@@ -450,8 +450,22 @@ incomparable/reconstruction.
 - **G6** — doc soft spot (stands, now stated doc-side): a device-woken,
   not-yet-acked EC can be suspended (5c) or retired while `ready`; the
   line stays masked. §8.4 states it; userspace owns the consequence.
-- **G7** — LP. The per-core idle EC (§2.1.1) is unmodelled; an
-  idle-slot-specific containment race would be invisible here.
+- **~~G7~~ (CLOSED in rev 16 — by DELETING THE DOC SIDE, not by
+  modelling).** Was: "LP. The per-core idle EC (§2.1.1) is unmodelled; an
+  idle-slot-specific containment race would be invisible here."
+  **§2.1.1 is withdrawn**: there is no per-core idle EC. `idle_ec` is
+  declared at `sched/scheduler.zig:184`, read once unreachably at
+  `:1521`, and **never assigned**; the tree parks an idle core on its own
+  park kstack via `parkAndAwaitIRQ`, and `:1098` records that this
+  replaced the idle EC specifically to kill a cross-core kstack-sharing
+  bug. So there is no idle slot, no idle-slot containment race, and
+  nothing for the model to be missing. **The model was right and the doc
+  was wrong** — which is the opposite of this ledger's usual direction
+  and worth recording as such: a gap entry can close because the design
+  retracts, not only because the model catches up. (Same shape as the
+  round-9 `dropped` row in the parity table.) A core with an empty run
+  queue holds no EC at all, so the model's absence of an idle EC is now
+  FAITHFUL rather than an over-simplification.
 - **G8 (closed in rev 6)** — `payload_done` is cleared by the discharger.
 - **G-D1/G-D2/G-D3 (closed in rev 6)** — the arm CAS, the reset atomic
   with the publish, and the `claiming` break case.

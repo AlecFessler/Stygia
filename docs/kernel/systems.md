@@ -569,11 +569,58 @@ comparison is `pended` versus a wait or a decline, not `pended` versus
 nothing; cutting it re-opens X2/X3 by construction. Removal was
 considered and rejected in the rev-6 removal sweep (§13).
 
-#### 2.1.1 The per-core idle EC
+#### 2.1.1 ~~The per-core idle EC~~ — WITHDRAWN in revision 16
 
-The idle EC's permanent containment is its core's `idle_ec` slot, which
-counts as its run queue for S1; a preempt requeues it to the slot. Never
-retired while the core lives.
+**There is no per-core idle EC, this machine does not introduce one, and
+the tree's arrangement is better than the one this section described.**
+Revisions up to 15 said: *"the idle EC's permanent containment is its
+core's `idle_ec` slot, which counts as its run queue for S1; a preempt
+requeues it to the slot. Never retired while the core lives."* That was a
+normative containment rule for a construct nothing builds — found by §12's
+closure check, not by reading, after sixteen revisions.
+
+**What the tree actually does, and why it is not a gap to be filled.**
+DERIVED — `grep -rn idle_ec kernel --include=*.zig` returns exactly three
+sites and **none of them is an assignment**: the declaration at
+`sched/scheduler.zig:184` (`idle_ec: ?SlabRef(ExecutionContext) = null`),
+one read at `:1521`, and a comment at `:1098`. `perCoreInit`
+(`scheduler.zig:392`) does not allocate one, so the read at `:1521` is
+unreachable and the declaration's own comment — *"Allocated at
+perCoreInit; runs `hlt`/`wfi` when the run queue is empty"* — describes a
+mechanism that does not exist.
+
+The real mechanism is **`parkAndAwaitIRQ`**, and `:1098` states why it
+replaced the idle EC: it *"eliminates the cross-core kstack-sharing bug
+where multiple idle cores held stale `gs:0` pointing at the same suspended
+EC's kstack and concurrently pushed IRQ frames onto it from kernel mode,
+silently stomping each other's saved state"*. A core with an empty run
+queue swaps `rsp`/`gs:0`/`TSS.RSP0` to its own **dedicated park kstack**
+and `sti`+`hlt`s there. **Building an idle EC to satisfy this section
+would regress a fixed bug.** So the section is withdrawn rather than
+scheduled, and §12 gains no step.
+
+**S1 is untouched, and this is the part to state explicitly rather than
+leave to inference.** S1 says every EC in a valid state is in exactly one
+container. The withdrawn text made the idle slot a container so that the
+idle EC would have one. With no idle EC there is no such EC to contain:
+
+> **A core with an empty run queue holds NO execution context.** It is
+> parked on its own park kstack, which is core-owned storage and not an
+> EC container. Idleness is therefore a fact about a CORE, recorded in
+> `PerCore.idle_parked` (`scheduler.zig:347`), **not a state of any EC** —
+> so it raises no containment obligation at all.
+
+The `idle_ec` field, its unreachable read, and its stale declaration
+comment are dead code in the tree; retiring them belongs to a cleanup, not
+to this machine, and §12 deliberately does not claim it.
+
+**Not to be confused with the `.idle_wait` EC state or `wait.kind ==
+.idle`, which are REAL and unaffected** (§2.2; §11.6 "unchanged"). Those
+are what a *user* EC parks in when it executes `wfi`/`hlt` and traps — the
+aarch64 EL0 `wfi` trap at `arch/aarch64/exceptions.zig:737` and the x86-64
+`#GP`-on-`hlt` path at `arch/x64/exceptions.zig:260` — and `suspend`
+accepts such a target (`exceptions.zig:741`, `:759`). That is an EC
+choosing to idle, which is nothing like a core having no EC to run.
 
 ### 2.2 The wait descriptor
 
@@ -699,9 +746,17 @@ pub const PerCore = struct {
     run_queue: EcQueue,            // under core_locks[core] as today
     current: ?*ExecutionContext,   // ONE naturally aligned pointer word
     active_root: atomic u64,       // publish-after-load, as today
-    idle_parked: bool,             // park decision, under core_locks[core]
-    park_stack: Stack,
-    idle_ec: ?SlabRef(EC),
+    idle_parked: bool,             // park decision, under core_locks[core].
+                                   // THIS is where idleness lives — it is a
+                                   // fact about the CORE, not a state of any
+                                   // EC (§2.1.1, revision 16)
+    park_stack: Stack,             // the idle core parks HERE, via
+                                   // parkAndAwaitIRQ — core-owned storage,
+                                   // NOT an EC container (§2.1.1)
+    // idle_ec: REMOVED in revision 16 with §2.1.1. There is no per-core idle
+    // EC: the field is never assigned at HEAD and its one read is
+    // unreachable, and re-introducing one would regress the cross-core
+    // kstack-sharing bug `parkAndAwaitIRQ` fixed (scheduler.zig:1098).
     teardown_pending: ?TeardownRequest, // §8.2; self-produced, self-consumed
 };
 ```
@@ -2025,7 +2080,7 @@ definition.
 | Container | Pop/scan/iterate sites | Deref discipline | Retired-EC handling | Derivation |
 |---|---|---|---|---|
 | run queue (per core) | edge-2 dequeue; retire's ready-row unlink; S7 claim route; the `affinity` claim-move (5c) and the **`priority` in-lock re-bucket** (§8.1) | under `core_locks[core]` | edge-2 CAS fails on `retired`; pop-side `stale` skip (§9.2); the re-bucket re-validates state + residency under the lock and does nothing to a non-`ready` EC | recall |
-| per-core idle slot (§2.1.1) | idle-slot pick at dispatch; preempt requeue-to-slot | under `core_locks[core]` (the slot counts as the queue for S1) | idle EC is never retired while the core lives, so no retired-EC case arises; asserted | recall |
+| ~~per-core idle slot (§2.1.1)~~ | **ROW DELETED IN REVISION 16 — it is not a container, because there is no idle EC to contain.** §2.1.1 is withdrawn: `idle_ec` is declared, read once unreachably, and never assigned, and the tree parks an idle core on its own park kstack via `parkAndAwaitIRQ` precisely to avoid the cross-core kstack sharing an idle EC caused. A core with an empty run queue holds NO EC, so this row's S1 claim ("the slot counts as the queue") had nothing to quantify over. The row was marked `recall` and was wrong — **which is the T4 table's own standing warning working as intended** | — | — | **was `recall`; now retracted** |
 | port queue | recv pop (5a); close propagation; cascade destroys; **`priority` re-bucket** (§8.1 — `Port.waiters` is an `EcQueue` whose `enqueue` keys on `ec.priority` at LINK time and whose `dequeue` never re-reads it, so a bare field store leaves the old selection order standing) | under the port `_gen_lock` | claim CAS fails on `retired`; skip | recall (`port.zig:613`, `sched/priority_queue.zig`) |
 | futex buckets (**plural** — one waiter links into every bucket of its multi-word wait) | `futex.wake`'s bucket pop, **plus the same function's re-enqueue of the non-matching nodes it dequeued** (`futex.zig:249,255,364` — multiple paddrs hash to one bucket, so a dequeued node may not match the wake's address; VERIFIED present, round 7); **`priority` re-bucket** of every node of the wait (§8.1 — the `WaitNode` SNAPSHOTS `ec.priority` at park, `futex.zig:427,530`) | under the bucket lock(s), sorted all-buckets discipline for multi-bucket ops | gen-checked `node.ec.lockIrqSave` generalized to claim-CAS-or-skip (§3.5) | recall (`futex.zig:434`) + the cited line numbers, re-checked against the tree in round 7 |
 | deadline table | tick scan (`expireTimedWaiters`/`expireTimedRecvWaiters`) | under the table lock | claim CAS fails on `retired`; loser/stale nodes left for the unwind | recall (§8.4) |
@@ -3494,29 +3549,34 @@ into §§0–9 and scheduled nowhere):
 - **Cross-class lock ordering** — out of scope entirely by §0.2; §11.10
   is retracted and nothing here is gated on it.
 
-**FOUND BY THE CLOSURE CHECK AND NOT YET ROUTED — one item, and it is
-the maintainer's call, not the implementer's.** Running that check (the
-last paragraph of this section: grep §12 for each mechanism's name)
-against revision 16's own §12 turned up two unnamed mechanisms.
-`PerCore.teardown_pending` had an unambiguous home and is now named at
-step 6. The other does not:
+**FOUND BY THE CLOSURE CHECK, BOTH NOW RESOLVED.** Running that check
+(the last paragraph of this section: grep §12 for each mechanism's name)
+against revision 16's own §12 turned up two mechanisms named nowhere.
+`PerCore.teardown_pending` had an unambiguous home and is now at step 6.
+The other was resolved by the maintainer in the other direction:
 
-- **§2.1.1's per-core idle EC.** The section is normative — *"the idle
-  EC's permanent containment is its core's `idle_ec` slot, which counts
-  as its run queue for S1; a preempt requeues it to the slot. Never
-  retired while the core lives."* — so S1's containment answer for that
-  EC is defined in terms of it. **At HEAD the slot is declared and read
-  and never assigned**: `sched/scheduler.zig:184`
-  (`idle_ec: ?SlabRef(ExecutionContext) = null`), read at `:1521`, with
-  `:1098` explicitly handling the "no `idle_ec` set up" case — so the
-  idle arm is unreachable and no idle EC exists. It is also **unmodelled**
-  (README ledger G7). No step creates one. Two readings, and this
-  document does not pick: either step 7 (creation) builds the per-core
-  idle EC and §2.1.1 becomes real, or §2.1.1 is demoted the way
-  `restart_at_entry` just was, on the ground that the tree parks the core
-  instead and nothing depends on the slot. **What is not acceptable is
-  the current state** — a normative containment rule for a construct
-  nothing builds.
+- **§2.1.1's per-core idle EC — WITHDRAWN, and deliberately given NO
+  step.** The section was normative and defined S1's containment answer
+  for an EC that does not exist: `idle_ec` is declared at
+  `sched/scheduler.zig:184`, read once unreachably at `:1521`, and
+  **never assigned**. Building one to satisfy the paragraph would
+  **regress a fixed bug** — `:1098` records that `parkAndAwaitIRQ`
+  replaced the idle EC precisely to kill the cross-core kstack sharing it
+  caused, where several idle cores held stale `gs:0` into one suspended
+  EC's kstack. So §2.1.1 is withdrawn, its §5.3 T4 container row is
+  deleted, and **S1 is restated where it mattered: a core with an empty
+  run queue holds NO EC — idleness is a fact about a CORE
+  (`PerCore.idle_parked`), not a state of any EC, and raises no
+  containment obligation.** The dead field and its stale declaration
+  comment are a cleanup, not this machine's business.
+
+**Three deferrals, three shapes, and the pattern is worth naming.** The
+pause is deferred because it is unimplemented and unmodelled;
+`restart_at_entry` because the feature it belongs to does not exist; the
+idle EC because **the tree deliberately does something better**. Only the
+first is likely to come back as written. The common cause is that all
+three were carried as design obligations on the strength of a paragraph
+rather than a check against the tree.
 
 Everything else that §§0–9 states normatively has a step above. That
 closure is the property to re-check after any edit to §§0–9, and **the
@@ -3680,14 +3740,44 @@ time at the largest scale yet. Two maintainer decisions and the repairs:
   reading §12 and judging. Running it against revision 16's own §12
   turned up **`PerCore.teardown_pending`** — a word §2.6 lists among
   those the machine ADDS, unnamed in any step, now at step 6 — and
-  **§2.1.1's per-core idle EC**, which is normative, defines S1's
-  containment answer for that EC, is UNMODELLED (ledger G7), and whose
+  **§2.1.1's per-core idle EC**, which was normative, defined S1's
+  containment answer for that EC, was UNMODELLED (ledger G7 — since
+  CLOSED by the withdrawal below, the model having been right), and whose
   slot at `sched/scheduler.zig:184` is declared and read and **never
   assigned** at HEAD (`:1098` handles the "no `idle_ec` set up" case
-  outright). That one is left as an explicit maintainer call — build it
-  at step 7 or demote §2.1.1 — because either is a design decision and
-  neither is the implementer's. Reading had missed both across sixteen
-  revisions; the grep found them in one pass.
+  outright). Reading had missed both across sixteen revisions; the grep
+  found them in one pass.
+- **§2.1.1 is WITHDRAWN (maintainer decision), and it is the most
+  instructive of revision 16's three deferrals because here the tree is
+  not merely different — it is deliberately BETTER.** `parkAndAwaitIRQ`
+  replaced the idle EC to kill a real bug, recorded at
+  `sched/scheduler.zig:1098`: several idle cores held stale `gs:0` into
+  one suspended EC's kstack and concurrently pushed IRQ frames onto it
+  from kernel mode, stomping each other's saved state and surfacing as
+  `iretq` #GP or NO-EC page faults. **Building an idle EC to satisfy a
+  doc paragraph would have regressed that fix**, which is why the answer
+  is withdrawal and NOT a §12 step. Landing with it: §5.3's T4 row for
+  the "per-core idle slot" is deleted (it is not a container — there is
+  no EC to contain), §2.3's `PerCore` drops the field with the reason
+  in-line, and **S1's answer is restated where the withdrawal touched
+  it**: a core with an empty run queue holds NO execution context; it
+  parks on its own park kstack, which is core-owned storage rather than
+  an EC container; idleness is a fact about a CORE, recorded in
+  `PerCore.idle_parked`, not a state of any EC — so it raises no
+  containment obligation and S1 is untouched. Explicitly NOT affected:
+  the `.idle_wait` EC state and `wait.kind == .idle`, which are real and
+  live (the aarch64 EL0 `wfi` trap at
+  `arch/aarch64/exceptions.zig:737`, x86-64 `#GP`-on-`hlt` at
+  `arch/x64/exceptions.zig:260`, and `suspend` accepts such a target) —
+  those are a USER EC choosing to idle, which is a different thing from a
+  core having no EC to run.
+- **Three deferrals in one revision, three different shapes, one common
+  cause.** The pause: unimplemented and unmodelled. `restart_at_entry`:
+  the feature it belongs to does not exist. The idle EC: the tree
+  deliberately does something better. All three had been carried as
+  design obligations on the strength of a paragraph rather than a check
+  against the tree, and all three were surfaced by mechanical checks —
+  the §12 grep and `grep -rn` over the kernel — not by rereading.
 
 **Revision 15 (2026-08-02)** — closes round 13's single blocker.
 
