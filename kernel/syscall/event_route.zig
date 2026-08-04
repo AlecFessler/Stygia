@@ -1,8 +1,11 @@
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
+const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
+const lifecycle = stygia.sched.lifecycle;
 const port_mod = stygia.sched.port;
 
 const EcCaps = execution_context.EcCaps;
@@ -13,6 +16,49 @@ const PortCaps = port_mod.PortCaps;
 const Word0 = capability.Word0;
 
 const HANDLE_MASK: u64 = 0xFFF;
+const BIND_ROUTE_DIAG_BUDGET: u32 = 96;
+
+var bind_route_diag_prints: u32 = 0;
+
+fn diagTag(ec: *ExecutionContext) u64 {
+    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
+    return 0;
+}
+
+fn logBindRouteBadcap(
+    caller_ec: *ExecutionContext,
+    site: []const u8,
+    target: u64,
+    port: u64,
+    event_type: u64,
+    slot: u12,
+    expected_type: u64,
+    got_type: u64,
+    ref_gen: u64,
+    current_word: u64,
+    target_state: u64,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &bind_route_diag_prints, .Add, 1, .monotonic);
+    if (n >= BIND_ROUTE_DIAG_BUDGET) return;
+    arch.boot.print(
+        "[berdiag] site={s} tag=0x{x} target={x} port={x} event={d} slot={x} expected_type={x} got_type={x} ref_gen={x} obj_word=0x{x} live_gen={x} target_state={x}\n",
+        .{
+            site,
+            diagTag(caller_ec),
+            target,
+            port,
+            event_type,
+            slot,
+            expected_type,
+            got_type,
+            ref_gen,
+            current_word,
+            current_word >> 1,
+            target_state,
+        },
+    );
+}
 
 /// Installs the kernel-held binding `(target, event_type) → port`. If a
 /// binding already exists for `(target, event_type)`, it is replaced
@@ -62,18 +108,32 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
     const target_was_valid_handle, const rc = blk: {
         const ec_ptr: *ExecutionContext = @ptrCast(@alignCast(caller));
         const cd_ref = ec_ptr.domain;
-        const lr = cd_ref.lockIrqSave(@src()) catch break :blk .{ false, errors.E_BADCAP };
+        const lr = cd_ref.lockIrqSave(@src()) catch {
+            logBindRouteBadcap(ec_ptr, "caller_domain_lock", target, port, event_type, 0, 0, 0, cd_ref.gen, 0, 0);
+            break :blk .{ false, errors.E_BADCAP };
+        };
         const cd = lr.ptr;
         defer cd_ref.unlockIrqRestore(lr.irq_state);
 
         const target_slot: u12 = @truncate(target);
-        const ec_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse
+        const ec_entry = capability.resolveHandleOnDomain(cd, target_slot, .execution_context) orelse {
+            const raw_entry = &cd.kernel_table[target_slot];
+            const got_type: u64 = if (raw_entry.ref.ptr == null or capability.isReservedHandleSlot(raw_entry))
+                0xffff
+            else
+                @intFromEnum(Word0.typeTag(cd.user_table[target_slot].word0));
+            logBindRouteBadcap(ec_ptr, "target_lookup", target, port, event_type, target_slot, @intFromEnum(capability.CapabilityType.execution_context), got_type, raw_entry.ref.gen, 0, 0);
             break :blk .{ false, errors.E_BADCAP };
+        };
 
-        const target_ec_ref = capability.typedRef(ExecutionContext, ec_entry.*) orelse
+        const target_ec_ref = capability.typedRef(ExecutionContext, ec_entry.*) orelse {
+            logBindRouteBadcap(ec_ptr, "target_typed_ref", target, port, event_type, target_slot, @intFromEnum(capability.CapabilityType.execution_context), @intFromEnum(Word0.typeTag(cd.user_table[target_slot].word0)), ec_entry.ref.gen, 0, 0);
             break :blk .{ false, errors.E_BADCAP };
-        const target_ec_lr = target_ec_ref.lockIrqSave(@src()) catch
+        };
+        const target_ec_lr = target_ec_ref.lockIrqSave(@src()) catch {
+            logBindRouteBadcap(ec_ptr, "target_lock", target, port, event_type, target_slot, @intFromEnum(capability.CapabilityType.execution_context), @intFromEnum(Word0.typeTag(cd.user_table[target_slot].word0)), target_ec_ref.gen, 0, 0);
             break :blk .{ false, errors.E_BADCAP };
+        };
         const target_ec = target_ec_lr.ptr;
         defer target_ec_ref.unlockIrqRestore(target_ec_lr.irq_state);
 
@@ -81,8 +141,15 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
         // step errors, spec test 10 still requires the field0/field1
         // refresh as a side effect.
         const port_slot: u12 = @truncate(port);
-        const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse
+        const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
+            const raw_entry = &cd.kernel_table[port_slot];
+            const got_type: u64 = if (raw_entry.ref.ptr == null or capability.isReservedHandleSlot(raw_entry))
+                0xffff
+            else
+                @intFromEnum(Word0.typeTag(cd.user_table[port_slot].word0));
+            logBindRouteBadcap(ec_ptr, "port_lookup", target, port, event_type, port_slot, @intFromEnum(capability.CapabilityType.port), got_type, raw_entry.ref.gen, 0, @intFromEnum(lifecycle.load(target_ec)));
             break :blk .{ true, errors.E_BADCAP };
+        };
 
         const port_caps_word: u16 = Word0.caps(cd.user_table[port_slot].word0);
         const port_caps: PortCaps = @bitCast(port_caps_word);
@@ -97,14 +164,16 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
             if (!ec_caps.bind) break :blk .{ true, errors.E_PERM };
         }
 
-        const target_port_ref = capability.typedRef(Port, port_entry.*) orelse
+        const target_port_ref = capability.typedRef(Port, port_entry.*) orelse {
+            logBindRouteBadcap(ec_ptr, "port_typed_ref", target, port, event_type, port_slot, @intFromEnum(capability.CapabilityType.port), @intFromEnum(Word0.typeTag(cd.user_table[port_slot].word0)), port_entry.ref.gen, 0, @intFromEnum(lifecycle.load(target_ec)));
             break :blk .{ true, errors.E_BADCAP };
-        const target_port_lr = target_port_ref.lockIrqSave(@src()) catch
-            break :blk .{ true, errors.E_BADCAP };
-        const target_port = target_port_lr.ptr;
-        defer target_port_ref.unlockIrqRestore(target_port_lr.irq_state);
+        };
 
-        break :blk .{ true, port_mod.installEventRoute(target_ec, target_port, slot_idx) };
+        const install_rc = port_mod.installEventRoute(target_ec, target_port_ref, slot_idx);
+        if (install_rc == errors.E_BADCAP) {
+            logBindRouteBadcap(ec_ptr, "port_inc_bind_ref", target, port, event_type, port_slot, @intFromEnum(capability.CapabilityType.port), @intFromEnum(Word0.typeTag(cd.user_table[port_slot].word0)), target_port_ref.gen, 0, @intFromEnum(lifecycle.load(target_ec)));
+        }
+        break :blk .{ true, install_rc };
     };
 
     if (target_was_valid_handle) _ = capability.sync(caller, target);

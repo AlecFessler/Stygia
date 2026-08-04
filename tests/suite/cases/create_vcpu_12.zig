@@ -1,17 +1,19 @@
 // Spec §[create_vcpu] — test 12.
 //
-// "[test 12] immediately after creation, an initial vm_exit event is
-//  delivered on `[4] exit_port` with zeroed guest state in the vregs
-//  and the initial-state sub-code."
+// "[test 12] after creation, the initial vCPU dispatch delivers a
+//  vm_exit event on `[4] exit_port` with zeroed guest state in the
+//  vregs and the initial-state sub-code; a waiting `recv` observes
+//  that delivery before guest entry."
 //
 // Spec semantics
-//   §[create_vcpu] (around the test list): "Immediately upon creation,
-//   the kernel enqueues a vm_exit-style delivery on `exit_port`
-//   representing the initial 'not yet started' condition: the reply
-//   cap is valid, all guest-state vregs are zero, and the exit
-//   sub-code is the initial-state sub-code." The creator recvs this
-//   event, writes the real initial guest state into the vregs, and
-//   replies with a resume action to enter guest mode.
+//   §[create_vcpu] (around the test list): create_vcpu publishes the
+//   vCPU as runnable, and the first vCPU dispatch delivers a vm_exit-
+//   style event on `exit_port` representing the initial 'not yet
+//   started' condition: the reply cap is valid, all guest-state vregs
+//   are zero, and the exit sub-code is the initial-state sub-code.
+//   The creator recvs this event, writes the real initial guest state
+//   into the vregs, and replies with a resume action to enter guest
+//   mode.
 //
 //   §[vm_exit_state] enumerates per-arch vm_exit sub-codes (cpuid, io,
 //   mmio, ept, hlt, ...). The `initial_state` sub-code is the explicit
@@ -25,9 +27,10 @@
 //   exit_port with `bind | recv`, and call create_vcpu with caps = 0
 //   so every other §[create_vcpu] gate (caps subset, priority,
 //   affinity, reserved bits, badcap on [2]/[4]) is defused. On
-//   success the kernel must have already enqueued the initial vm_exit
-//   on the exit_port, so the very next `recv(exit_port)` returns
-//   immediately with the synthetic event.
+//   success the kernel must have made the vCPU runnable. If the
+//   caller's `recv(exit_port)` parks before an event is queued, the
+//   scheduler dispatches the vCPU, synthesizes the initial vm_exit
+//   through the normal running-to-port lifecycle, and wakes the recv.
 //
 //   Event readout
 //     Per §[vm_exit_state] the vm_exit-style delivery's vreg 2 carries
@@ -67,7 +70,7 @@
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
 //   5. createPort(caps={bind, recv}) — exit_port for the vCPU; recv
-//      lets us observe the kernel-injected initial vm_exit.
+//      lets us observe the scheduler-delivered initial vm_exit.
 //   6. createVcpu(caps_word=0, vm_handle, affinity=0, exit_port).
 //   7. recv(exit_port) — must return OK with the initial vm_exit.
 //   8. regs.v2 == syscall.INITIAL_STATE_SUBCODE (13 on x86-64, 10 on
@@ -83,7 +86,8 @@
 //   5: setup — createPort returned an error word.
 //   6: setup — createVcpu returned an error word.
 //   7: recv on the exit_port did not return OK in vreg 1 (the spec
-//      assertion: an initial vm_exit must already be queued).
+//      assertion: initial vCPU dispatch must deliver the initial
+//      vm_exit to a waiting receiver).
 //   8: the recv'd event's sub-code (vreg 2) is not the §[vm_exit_state]
 //      `initial_state` sub-code (x86-64: 13, aarch64: 10).
 //   9: any guest-state vreg observed via the register-passed slots is
@@ -174,7 +178,7 @@ pub fn main(cap_table_base: u64) void {
     // 5. Mint the exit port. `bind` is required for the port to be
     //    usable as the destination of create_vcpu's vm_exit deliveries
     //    (the §[create_vcpu] [4] handle-cap check). `recv` lets the
-    //    test EC pull the kernel-injected initial vm_exit back off
+    //    test EC observe the scheduler-delivered initial vm_exit on
     //    the port.
     const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp = syscall.createPort(@as(u64, exit_port_caps.toU16()));
@@ -199,9 +203,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 7. The kernel must have enqueued the initial vm_exit on
-    //    exit_port at create_vcpu time, so this recv returns
-    //    immediately with the synthetic event rather than blocking.
+    // 7. The kernel made the vCPU runnable at create_vcpu time; if the
+    //    event is not already queued, this recv parks until the first
+    //    vCPU dispatch synthesizes the initial vm_exit.
     const got = syscall.recv(exit_port, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(7);

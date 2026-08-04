@@ -31,31 +31,27 @@
 //           - test 14 move = 0 dodges this  → move bit cleared
 //           - test 15 source lacks `copy`   → fires here
 //
-//   Bringing the pair entry into vreg 127 needs the high-vreg layout
-//   that the libz `reply` wrapper does not yet plumb. We hand-roll the
-//   syscall in inline asm, materialising the syscall word at [rsp + 0],
-//   leaving vregs 14..126 zeroed (kernel only reads [128-N..127] =
-//   vreg 127 here), and writing the pair entry at [rsp + 912] = vreg
-//   127 per the ABI in libz/syscall.zig.
+//   The libz `replyTransfer` wrapper places the pair entry in the
+//   architecture-specific high-vreg slot (vreg 127 for N=1), so the
+//   test source does not carry its own syscall ABI asm.
 //
 // Pipeline
 //   1. create_port(p_recv, caps={bind, recv, xfer}) — host-side port:
-//      bind so we can suspend W on it, recv so we dequeue the event,
+//      bind so W can self-suspend on it, recv so we dequeue the event,
 //      xfer so the minted reply handle carries xfer.
 //   2. create_port(p_src,  caps={recv})              — pair-entry source:
 //      no `copy`, no `move`. recv keeps the caps word non-zero so the
 //      entry's caps subset check (test 13) has a real cap to subset.
-//   3. create_execution_context(W, caps={term, susp, restart_policy=0})
-//   4. suspend(W, p_recv)                            — queues W
+//   3. pin self to the current core, then create same-core W
+//   4. release W; W self-suspends on p_recv          — queues W
 //   5. recv(p_recv)                                  — yields reply id
-//   6. reply with one pair entry (p_src, caps={recv}, move=0)
-//      via inline asm. Spec demands E_PERM in vreg 1 from test 15.
+//   6. reply with one pair entry (p_src, caps={recv}, move=0).
+//      Spec demands E_PERM in vreg 1 from test 15.
 //
 // Assertions
 //   1: setup — create_port(p_recv) returned an error word
 //   2: setup — create_port(p_src)  returned an error word
-//   3: setup — create_execution_context returned an error word
-//   4: setup — suspend(W, p_recv) did not return OK
+//   3: setup — same-core pin or create_execution_context failed
 //   5: setup — recv(p_recv) did not return OK
 //   6: reply returned something other than E_PERM (i.e. the kernel
 //      did not surface the missing-`copy`/move=0 contract this test
@@ -69,17 +65,40 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
-// which only assembles on x86. Arch-dispatched twin keeps the test
-// compiling on aarch64.
-fn localDummyEntry() noreturn {
+const HandleId = caps.HandleId;
+
+var g_port_handle: u64 = 0;
+var g_self_handle: u64 = 0;
+var g_ready: u32 = 0;
+
+fn spinHint() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+        else => @compileError("unsupported target architecture"),
+    }
+}
+
+fn parkForever() noreturn {
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfi"),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
             else => @compileError("unsupported target architecture"),
         }
     }
+}
+
+fn siblingEntry() callconv(.c) noreturn {
+    while (@atomicLoad(u32, &g_ready, .acquire) == 0) {
+        spinHint();
+    }
+
+    const self_ec_id = @atomicLoad(u64, &g_self_handle, .acquire);
+    const port_id = @atomicLoad(u64, &g_port_handle, .acquire);
+    _ = syscall.suspendEc(@truncate(self_ec_id), @truncate(port_id), &.{});
+
+    parkForever();
 }
 
 // §[handle_attachments] entry layout, packed into one u64:
@@ -94,68 +113,6 @@ fn pairEntry(id: u12, caps_word: u16, move: bool) u64 {
         .caps = caps_word,
         .move = move,
     }).toU64();
-}
-
-// Hand-rolled reply with pair_count = 1 and one pair entry at vreg 127.
-//
-// Stack frame at the moment the kernel reads vregs (per libz/syscall.zig
-// "Spec v3 vreg-ABI syscall wrappers"):
-//   rsp + 0     = vreg 0  (syscall word)
-//   rsp + 8     = vreg 14 (unused, zero)
-//   ...
-//   rsp + 912   = vreg 127 (the pair entry)
-//
-// We reserve 912 bytes for vregs 14..127 (114 slots), then `pushq`
-// the syscall word (rcx) so the word lands at the new rsp + 0 and
-// vreg 127 ends up at rsp + 912 (was rsp + 904 prior to the push).
-// rcx and r11 are clobbered by sysret; rax carries the return code
-// (vreg 1) the spec specifies for E_PERM.
-fn replyOnePair(reply_handle: u12, entry: u64) u64 {
-    // Syscall word: bits 0-11 = syscall_num (52 = reply),
-    // bits 12-19 = pair_count (1 entry), bits 20-31 = reply_handle_id
-    // (per §[reply] ABI). Other bits zero per §[syscall_abi].
-    const word: u64 =
-        (@as(u64, @intFromEnum(syscall.SyscallNum.reply)) & 0xFFF) |
-        ((@as(u64, 1) & 0xFF) << 12) |
-        ((@as(u64, reply_handle) & 0xFFF) << 20);
-
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            var ret: u64 = undefined;
-            asm volatile (
-                \\ subq $912, %%rsp
-                \\ movq %[entry], 904(%%rsp)
-                \\ pushq %%rcx
-                \\ syscall
-                \\ addq $920, %%rsp
-                : [ret] "={rax}" (ret),
-                : [word] "{rcx}" (word),
-                  [entry] "r" (entry),
-                : .{ .rcx = true, .r11 = true, .memory = true });
-            return ret;
-        },
-        .aarch64 => {
-            // aarch64: vreg 127 = [sp + 768]; reserve 784 bytes.
-            var ret: u64 = undefined;
-            asm volatile (
-                \\ sub sp, sp, #784
-                \\ str %[word], [sp]
-                \\ str %[entry], [sp, #768]
-                \\ svc #0
-                \\ add sp, sp, #784
-                : [ret] "={x0}" (ret),
-                : [word] "r" (word),
-                  [entry] "r" (entry),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
-            return ret;
-        },
-        else => @compileError("unsupported target architecture"),
-    }
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -176,7 +133,7 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const p_recv: u12 = @truncate(cp_recv.v1 & 0xFFF);
+    const p_recv: HandleId = @truncate(cp_recv.v1 & 0xFFF);
 
     // Step 2: source port for the pair entry. Caps lack `copy`, `move`
     // — this is the "lacks the `copy` cap" condition test 15 demands.
@@ -193,47 +150,67 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const p_src: u12 = @truncate(cp_src.v1 & 0xFFF);
+    const p_src: HandleId = @truncate(cp_src.v1 & 0xFFF);
 
-    // Step 3: sibling EC W. susp lets us queue it on p_recv; term lets
+    // Step 3: pin this test EC to the core where W will be created.
+    // This removes cross-core progress from the setup: once we block in
+    // recv, the same scheduler queue can run W until it self-suspends.
+    const pinned_core = testing.currentCoreId();
+    const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((sibling_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(3);
+        return;
+    }
+
+    // Step 4: sibling EC W. susp authorizes W's self-suspend; term lets
     // the spec test_07 cleanup happen if needed (not required here, but
     // mirrors terminate_07's recipe). restart_policy = 0 keeps the EC
     // inside the runner's ceiling and prevents any restart fallback.
+    // Priority 1 lets W make progress after this EC parks in recv.
     const w_caps = caps.EcCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&localDummyEntry);
+    const ec_caps_word: u64 = @as(u64, w_caps.toU16()) | (@as(u64, 1) << 32);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
-        entry,
+        @intFromPtr(&siblingEntry),
         1, // stack_pages
         0, // target = self
-        0, // affinity = any core
+        sibling_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
         testing.fail(3);
         return;
     }
-    const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const w_handle: HandleId = @truncate(cec.v1 & 0xFFF);
 
-    // Step 4: queue W as a suspended sender on p_recv. Per §[suspend],
-    // when [1] != self the syscall does not block the caller — it just
-    // suspends the target.
-    const sus = syscall.issueReg(.@"suspend", 0, .{
-        .v1 = w_handle,
-        .v2 = p_recv,
-    });
-    if (sus.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(4);
-        return;
-    }
+    @atomicStore(u64, &g_port_handle, @as(u64, p_recv), .release);
+    @atomicStore(u64, &g_self_handle, @as(u64, w_handle), .release);
+    @atomicStore(u32, &g_ready, 1, .release);
 
-    // Step 5: recv. With W queued and our port carrying bind+recv+xfer,
-    // recv returns immediately with reply_handle_id in the syscall word
-    // bits 32-43 (per §[recv]).
+    // Step 5: recv. If W has not reached suspend yet this blocks until
+    // W self-suspends on p_recv. The resulting event carries the reply
+    // handle id in syscall-word bits 32-43 (per §[recv]).
     const got = syscall.recv(p_recv, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(5);
@@ -247,8 +224,8 @@ pub fn main(cap_table_base: u64) void {
     const entry_caps = caps.PortCap{ .recv = true };
     const pe = pairEntry(p_src, entry_caps.toU16(), false);
 
-    const code = replyOnePair(reply_handle, pe);
-    if (code != @intFromEnum(errors.Error.E_PERM)) {
+    const result = syscall.replyTransfer(reply_handle, &.{pe});
+    if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(6);
         return;
     }

@@ -398,8 +398,8 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                         );
                         stygia.arch.x64.irq.setIoapicBase(ioapic_virt.addr);
                     },
-                    .int_src_override => |_| {},
-                    .lapic_nmi => |_| {},
+                    .int_src_override => {},
+                    .lapic_nmi => {},
                     .lapic_addr_override => |x| {
                         lapic_base = x.addr;
                     },

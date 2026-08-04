@@ -86,8 +86,41 @@ pub fn handleTrap(current: *ExecutionContext) void {
 /// on the named core (either `terminate` is from another core, or
 /// the EC is parked / .exited), and (b) FPU traps on the named core
 /// for a different EC would re-evict and clear the slot anyway.
+/// Validate a core id that was read back out of an EC field rather than
+/// derived from `coreID()` on the core we are currently running on.
+///
+/// `ec.last_fpu_core` is only ever written as `@truncate(coreID())` (see
+/// `fpuSwap`) or cleared to null, so by construction it is always either
+/// null or a live core index. A value outside `[0, MAX_CORES)` therefore
+/// means we observed the slab slot mid-recycle — the EC is being torn
+/// down under us and the byte we read is not a core id at all. 0xFF is
+/// the value that shows up in practice, matching both
+/// `LAST_DISPATCHED_NEVER` and a never-written byte.
+///
+/// Unchecked, that escapes straight into `flush_slot_state[]` /
+/// `core_states[]` as a wild subscript:
+///   `KERNEL PANIC: index out of bounds: index 255, len 64 @ drainLocalFlush`
+///
+/// Gate it where the stored value is read, not at each subscript. The
+/// deliberate tradeoff: we return null (skip the flush) rather than
+/// assert, because the EC this refers to is already being destroyed —
+/// there is no live FPU state left worth saving into a dying slab slot,
+/// and turning a teardown race into a kernel panic would be strictly
+/// worse than skipping work that no longer has an owner.
+/// Re-send the cross-core FPU flush IPI every this many failed
+/// completion checks. Only the target core can bump `done_seq`, and a
+/// halted target needs an interrupt to get there, so the request must be
+/// re-armed rather than sent once. See the spin in `migrateFlush`.
+const FLUSH_IPI_RETRY_SPINS: u32 = 1024;
+
+inline fn storedCore(raw: ?u8) ?u8 {
+    const c = raw orelse return null;
+    if (c >= scheduler.MAX_CORES) return null;
+    return c;
+}
+
 pub fn clearFromLastFpuOwner(ec: *ExecutionContext) void {
-    const core = ec.last_fpu_core orelse return;
+    const core = storedCore(ec.last_fpu_core) orelse return;
     const per_core = &scheduler.core_states[core];
     if (per_core.last_fpu_owner) |ref| {
         if (ref.ptr == ec) per_core.last_fpu_owner = null;
@@ -300,7 +333,10 @@ pub fn flushIpiHandler(_: *ExecutionContext) void {
 ///   * deadlock freedom under arbitrary cycles of mutual flushes
 ///     (each spinning core cooperatively services its own mailbox).
 pub fn migrateFlush(ec: *ExecutionContext) void {
-    const src_core = ec.last_fpu_core orelse return;
+    // `storedCore` gate: `last_fpu_core` came out of a slab slot that a
+    // concurrent teardown may be recycling. See its doc for why an
+    // out-of-range value is skipped rather than asserted.
+    const src_core = storedCore(ec.last_fpu_core) orelse return;
     const cur_core: u8 = @truncate(arch.smp.coreID());
     if (src_core == cur_core) return;
 
@@ -311,6 +347,11 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // service requests targeting our own core — the holder may itself
     // be inside a migrateFlush spin waiting on US.
     while (slot.request_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        // Ack-while-spinning (stygia-rs6 mechanism 9): this spin runs
+        // with IRQs masked (reached through `switchTo`), so without it
+        // a core parked here is deaf to the shootdown IPI another core
+        // is inside `waitForShootdownAcks` waiting for.
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
     }
@@ -339,7 +380,29 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // receiver path bumps done_seq to my_seq (see drainLocalFlush);
     // because the lock prevents any later requester from advancing
     // the seq, this is unambiguous.
+    //
+    // Re-arm the IPI periodically instead of relying on the single send
+    // above. Only `src_core` can bump `done_seq`, and it only does so
+    // from `drainLocalFlush` — reached via the flush-IPI handler or its
+    // own dispatch path. A core halted in `parkAndAwaitIRQ` does neither
+    // until an interrupt lands, so a single flush IPI that is lost,
+    // coalesced with another pending delivery, or raced against the
+    // target entering its park leaves us spinning here forever against a
+    // core that is never going to move again — while we hold
+    // `request_lock` and (via `switchTo`) run with IRQs masked.
+    //
+    // Structurally the same send-once-then-spin defect as the
+    // `postZombie` loops in execution_context.zig, and it presents
+    // identically: one core live but emitting nothing, another parked
+    // with ready ECs stranded in its own run_queue.
+    var flush_spins: u32 = 0;
     while (slot.done_seq.load(.acquire) != my_seq) {
+        if (flush_spins % FLUSH_IPI_RETRY_SPINS == 0) {
+            arch.cpu.sendFpuFlushIpi(src_core);
+        }
+        flush_spins +%= 1;
+        // Ack-while-spinning — see the request_lock spin above.
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
     }

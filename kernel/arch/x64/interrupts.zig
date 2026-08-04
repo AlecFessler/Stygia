@@ -8,8 +8,10 @@ const ctx_trace = stygia.utils.ctx_trace;
 const gdt = stygia.arch.x64.gdt;
 const idt = stygia.arch.x64.idt;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const paging = stygia.arch.x64.paging;
 const scheduler = stygia.sched.scheduler;
+const execution_context = stygia.sched.execution_context;
 const sync_debug = stygia.utils.sync.debug;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
@@ -40,7 +42,61 @@ pub const PageFaultContext = struct {
     /// real user frame instead of `thread.ctx` (which after yield points at
     /// a kernel-mode context). Null for kernel-mode faults.
     user_ctx: ?*ArchCpuContext = null,
+    /// Interrupted context's rbp — root of its frame-record chain for the
+    /// fatal-fault reporter's walk (the panic backtrace cannot walk past
+    /// the naked interrupt stub).
+    fp: u64 = 0,
+    /// Link register — aarch64 only, always 0 on x86-64.
+    lr: u64 = 0,
+    /// Full saved register frame, for the fatal-fault reporter's GPR
+    /// dump. Unlike `user_ctx` this is set for kernel-mode faults too.
+    frame_ctx: ?*const ArchCpuContext = null,
+    /// True when the faulting access happened inside a marked
+    /// copy-in/out window (`arch.dispatch.cpu.userAccessBegin` ..
+    /// `userAccessEnd`). On x86-64 that window is exactly RFLAGS.AC=1:
+    /// STAC sets it, CLAC clears it, `interruptStubPrologue` re-arms
+    /// SMAP with CLAC on every entry, and IRETQ restores the
+    /// interrupted context's AC from the frame — so the AC bit saved
+    /// in the fault frame is an exact record of whether the kernel was
+    /// deliberately touching user memory. `memory.fault` uses it to
+    /// tell a genuine accessor fault from a wild kernel pointer that
+    /// happens to land in the lower canonical half.
+    ///
+    /// Defaults to `true` so a context built by a path that cannot
+    /// determine the window degrades to the pre-existing (accessor)
+    /// behaviour rather than a spurious kernel panic.
+    in_user_access_window: bool = true,
 };
+
+/// RFLAGS.AC — Intel SDM Vol 1 §3.4.3. Set by STAC, cleared by CLAC.
+pub const RFLAGS_AC: u64 = 1 << 18;
+
+/// Dump every saved GPR of a fault frame. printRaw only — this runs on
+/// the fatal-fault path where `serial.print_lock` may already be held by
+/// this core (see memory.fault.reportKernelFault).
+pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
+    // Own-arch printer, not the dispatch facade: `dispatch.boot`
+    // just switches back to `x64.serial` for this target, and an
+    // arch file reaching up through dispatch is an arch-layering
+    // up-leak.
+    const boot = stygia.arch.x64.serial;
+    const panic_mod = stygia.panic;
+    inline for (@typeInfo(cpu.Registers).@"struct".fields, 0..) |f, i| {
+        boot.printRaw(if (i % 4 == 0) "  " else " ");
+        boot.printRaw(f.name ++ "=0x");
+        panic_mod.printHex(@field(ctx.regs, f.name));
+        if (i % 4 == 3) boot.printRaw("\n");
+    }
+    boot.printRaw("\n  rip=0x");
+    panic_mod.printHex(ctx.rip);
+    boot.printRaw(" rsp=0x");
+    panic_mod.printHex(ctx.rsp);
+    boot.printRaw(" rflags=0x");
+    panic_mod.printHex(ctx.rflags);
+    boot.printRaw(" err=0x");
+    panic_mod.printHex(ctx.err_code);
+    boot.printRaw("\n");
+}
 
 pub const IntVecs = enum(u8) {
     pmu = 0xFB,
@@ -351,6 +407,9 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     args[11] = r.r14;
     args[12] = r.r15;
     const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
+    if (execution_context.consumeSuspendDirective(caller, ctx)) {
+        scheduler.hopParkRun();
+    }
     ctx_trace.mark(caller, .slowpath_save);
 
     const dispatch_len: usize = @max(@as(usize, max_vreg), 13);
@@ -366,7 +425,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // `ret` (always 0 on the suspend path) would race with that remote
     // write and clobber the real wake value back to 0.
     const core_id_for_ret: u8 = @truncate(apic.coreID());
-    if (scheduler.coreCurrentIs(core_id_for_ret, caller)) {
+    if (scheduler.coreCurrentIsRunning(core_id_for_ret, caller)) {
         r.rax = @bitCast(ret);
     }
 
@@ -377,7 +436,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // core when dispatch returned without suspending us, and we are
     // still in the caller's CR3, so the user-page write is safe here.
     if (caller.pending_event_word_valid and
-        scheduler.coreCurrentIs(@truncate(apic.coreID()), caller))
+        scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), caller))
     {
         writeUserSyscallWord(ctx, caller.pending_event_word);
         caller.pending_event_word = 0;
@@ -401,11 +460,16 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // wait), `current_ec` was cleared on this core and `caller.state`
     // was retargeted to `.suspended_on_port` / `.futex_wait`. The asm
     // epilogue would otherwise iretq back to the parked user mode and
-    // run the suspended EC. Switch to whatever's next (or idle); the
-    // saved register restore in the asm trampoline never executes
-    // because switchTo's `loadEcContextAndReturn` is `noreturn`.
-    if (scheduler.coreIsIdle(@truncate(apic.coreID()))) {
-        scheduler.run();
+    // run the suspended EC. Switch to whatever's next (or idle) — via
+    // the park-kstack hop, NOT `run()` in place: this frame still
+    // lives on the suspended caller's kstack, and the caller is
+    // already claimable by wakers on other cores. Running the
+    // scheduler loop here raced the caller's re-dispatch for the same
+    // kstack (mutual frame stomp; "Kernel stack overflow" panics). The
+    // hop also publishes the caller's deferred `on_cpu` release — the
+    // signal the wake-side spins block on.
+    if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), caller)) {
+        scheduler.hopParkRun();
     }
 
     // Last snapshot before the slow-path asm pops regs and iretq's.
@@ -413,7 +477,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
     // would have rerouted via `scheduler.run()` above and not returned
     // here). Captures the iret frame slots that are about to be
     // restored — most useful pre-iretq mark for the corruption hunt.
-    if (scheduler.coreCurrentIs(@truncate(apic.coreID()), caller)) {
+    if (scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), caller)) {
         ctx_trace.mark(caller, .slowpath_epilogue);
     }
 }
@@ -580,61 +644,56 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%rsp, %%gs:8                  // user_rsp
         \\movq %%gs:0, %%rsp                  // switch to kernel stack
 
-    // ═══════════════════════════════════════════════════════════════
-    // CLASSIFIER — two-arm fast path dispatch:
-    //   1) suspend fast path: rcx ≤ 13 (the fast-suspend variants where
-    //      the syscall_word IS the payload_count and upper bits must be
-    //      zero — a single unsigned compare verifies both).
-    //   2) reply fast path: syscall_num (rcx low 12 bits) == 52 AND
-    //      pair_count (bits 12-19) == 0 AND recv_port_handle_id
-    //      (bits 32-43) == 0 AND reserved bits 44-63 == 0. Spec §[reply]
-    //      bare-reply: handle id at bits 20-31; no attachments, no recv.
-    // On suspend fast-path entry: rcx = payload_count.
-    // On reply fast-path entry:   rcx = syscall_word (full).
-    //
-    // Build-time gated independently per arm via
-    // `-Dkernel_fastpath_suspend` / `-Dkernel_fastpath_reply` (both
-    // default to `-Dkernel_fastpath`). When an arm is disabled its
-    // classifier emit is comptime-substituted away so the corresponding
-    // syscalls funnel into the slow Zig dispatch path — used for
-    // attributing the per-leg perf delta in A/B sweeps.
-    // ═══════════════════════════════════════════════════════════════
-        ++ "\n"
-        ++ (if (build_options.kernel_fastpath_suspend)
-            \\cmpq $13, %%rcx
-            \\jbe  .Lsyscall_suspend_fast
-        else
-            "")
-        ++ "\n"
-        ++ (if (build_options.kernel_fastpath_reply)
-            // Fast path engages on:
-            //   syscall_num (bits 0-11)  == 52 (.reply)
-            //   pair_count  (bits 12-19) == 0  (no attachments)
-            //   reserved    (bits 44-63) == 0
-            // recv_port_handle_id (bits 32-43) is NOT gated — non-zero
-            // selects the atomic-recv-park branch in the fast-path
-            // body (caller parks on that port after the reply commits).
-            \\movq %%rcx, %%r11
-            \\andq $0xFFF, %%r11
-            \\cmpq $52, %%r11
-            \\jne  .Lsyscall_slow_path
-            \\movq %%rcx, %%r11
-            \\shrq $44, %%r11
-            \\jnz  .Lsyscall_slow_path
-            \\movq %%rcx, %%r11
-            \\shrq $12, %%r11
-            \\andq $0xFF, %%r11
-            \\jz   .Lsyscall_reply_fast
-        else
-            "")
-        ++ "\n"
-        ++
-    // ═══════════════════════════════════════════════════════════════
-    // SLOW PATH — 176-byte Context save + dispatch + iretq. Vregs
-    // 1-13 are saved/restored across the call so handlers that leave
-    // them alone return them to userspace unchanged. `.Lsyscall_slow_path`
-    // is the bail-out target for fast-path validation failures.
-    // ═══════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
+        // CLASSIFIER — two-arm fast path dispatch:
+        //   1) suspend fast path: rcx ≤ 13 (the fast-suspend variants where
+        //      the syscall_word IS the payload_count and upper bits must be
+        //      zero — a single unsigned compare verifies both).
+        //   2) reply fast path: syscall_num (rcx low 12 bits) == 52 AND
+        //      pair_count (bits 12-19) == 0 AND recv_port_handle_id
+        //      (bits 32-43) == 0 AND reserved bits 44-63 == 0. Spec §[reply]
+        //      bare-reply: handle id at bits 20-31; no attachments, no recv.
+        // On suspend fast-path entry: rcx = payload_count.
+        // On reply fast-path entry:   rcx = syscall_word (full).
+        //
+        // Build-time gated independently per arm via
+        // `-Dkernel_fastpath_suspend` / `-Dkernel_fastpath_reply` (both
+        // default to `-Dkernel_fastpath`). When an arm is disabled its
+        // classifier emit is comptime-substituted away so the corresponding
+        // syscalls funnel into the slow Zig dispatch path — used for
+        // attributing the per-leg perf delta in A/B sweeps.
+        // ═══════════════════════════════════════════════════════════════
+    ++ "\n" ++ (if (build_options.kernel_fastpath_suspend)
+        \\cmpq $13, %%rcx
+        \\jbe  .Lsyscall_suspend_fast
+    else
+        "") ++ "\n" ++ (if (build_options.kernel_fastpath_reply)
+        // Fast path engages on:
+        //   syscall_num (bits 0-11)  == 52 (.reply)
+        //   pair_count  (bits 12-19) == 0  (no attachments)
+        //   recv_port_handle_id (bits 32-43) is NOT gated — non-zero
+        //   selects the atomic-recv-park branch in the fast-path
+        //   body (caller parks on that port after the reply commits).
+        //   reserved    (bits 44-63) == 0
+        \\movq %%rcx, %%r11
+        \\andq $0xFFF, %%r11
+        \\cmpq $52, %%r11
+        \\jne  .Lsyscall_slow_path
+        \\movq %%rcx, %%r11
+        \\shrq $44, %%r11
+        \\jnz  .Lsyscall_slow_path
+        \\movq %%rcx, %%r11
+        \\shrq $12, %%r11
+        \\andq $0xFF, %%r11
+        \\jz   .Lsyscall_reply_fast
+    else
+        "") ++ "\n" ++
+        // ═══════════════════════════════════════════════════════════════
+        // SLOW PATH — 176-byte Context save + dispatch + iretq. Vregs
+        // 1-13 are saved/restored across the call so handlers that leave
+        // them alone return them to userspace unchanged. `.Lsyscall_slow_path`
+        // is the bail-out target for fast-path validation failures.
+        // ═══════════════════════════════════════════════════════════════
         \\.Lsyscall_slow_path:
         \\movq %%gs:16, %%rcx                 // restore user_rip
         \\movq %%gs:24, %%r11                 // restore user_rflags
@@ -698,77 +757,77 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\addq $16, %%rsp
         \\iretq
 
-    // ═══════════════════════════════════════════════════════════════
-    // FAST PATH — L4-style zero-copy IPC rendezvous.
-    //
-    // Entry: rcx = payload_count (0..13). All other GPRs are sender
-    // vregs and MUST survive end-to-end (they ARE the §[event_state]
-    // payload the receiver gets). Free scratch: rcx, r11, rax (after
-    // we spill its target_id contents to gs:72).
-    //
-    // gs scratch slot map:
-    //   gs:64  fast_temp[0]  payload_count spill
-    //   gs:72  fast_temp[1]  target_id (rax) spill, restored on bail
-    //   gs:80  fast_temp[2]  Port* spill during dequeue pop +
-    //                        recv_cd_ptr spill during mint
-    //   gs:88  fast_temp[3]  receiver EC* spill (persists through CD
-    //                        acquire + mint + state mutations)
-    //   gs:96  fast_temp[4]  reply slot id (u16 in low bits)
-    //   gs:104 fast_temp[5]  recv_cd_gen
-    //   gs:112 fast_temp[6]  &kernel_table[reply_slot]
-    //   gs:120 fast_temp[7]  port_ptr (after port lock release)
-    //
-    // Bail handlers all funnel into .Lsyscall_lock_fail which restores
-    // rax = target_id from gs:72 then jmps .Lsyscall_slow_path. The
-    // slow path expects sender's vreg 1 in rax for syscallDispatch's
-    // arg-reading contract.
-    // ═══════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
+        // FAST PATH — L4-style zero-copy IPC rendezvous.
+        //
+        // Entry: rcx = payload_count (0..13). All other GPRs are sender
+        // vregs and MUST survive end-to-end (they ARE the §[event_state]
+        // payload the receiver gets). Free scratch: rcx, r11, rax (after
+        // we spill its target_id contents to gs:72).
+        //
+        // gs scratch slot map:
+        //   gs:64  fast_temp[0]  payload_count spill
+        //   gs:72  fast_temp[1]  target_id (rax) spill, restored on bail
+        //   gs:80  fast_temp[2]  Port* spill during dequeue pop +
+        //                        recv_cd_ptr spill during mint
+        //   gs:88  fast_temp[3]  receiver EC* spill (persists through CD
+        //                        acquire + mint + state mutations)
+        //   gs:96  fast_temp[4]  reply slot id (u16 in low bits)
+        //   gs:104 fast_temp[5]  recv_cd_gen
+        //   gs:112 fast_temp[6]  &kernel_table[reply_slot]
+        //   gs:120 fast_temp[7]  port_ptr (after port lock release)
+        //
+        // Bail handlers all funnel into .Lsyscall_lock_fail which restores
+        // rax = target_id from gs:72 then jmps .Lsyscall_slow_path. The
+        // slow path expects sender's vreg 1 in rax for syscallDispatch's
+        // arg-reading contract.
+        // ═══════════════════════════════════════════════════════════════
         \\.Lsyscall_suspend_fast:
 
-    // ─── Step 0: drop rsp below ec.ctx so any non-IST kernel-mode
-    // exception's hardware iret-frame push lands clear of the saved
-    // context. PHASE 1 left rsp = ec.kstack.top; ec.ctx lives at
-    // kstack.top - 176 with its iret-frame fields ending at
-    // kstack.top - 8. A 5-qword push at rsp - 40 would otherwise
-    // overlap ec.ctx.{rip,cs,rflags,rsp,ss} byte-for-byte and
-    // silently poison the EC's saved frame. Slow path's `subq $176`
-    // accomplishes the same — this mirrors that invariant for the
-    // fast path. 192 = 176 ec.ctx + 16-byte alignment slack, matching
-    // the buffer R12.5 (reply FP) reserves below sender.kstack.top.
-    //
-    // Bail-to-slow-path edges (.Lsyscall_lock_fail / .Lsyscall_no_receiver
-    // / .Lreply_handle_invalid / .Lreply_lock_fail) inherit this rsp
-    // delta; the slow-path entry resets rsp from gs:0 before doing its
-    // own subq $176 so the Context buffer it builds always lands at
-    // kstack.top - 176 = ec.ctx_addr regardless of which arm we came
-    // from.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 0: drop rsp below ec.ctx so any non-IST kernel-mode
+        // exception's hardware iret-frame push lands clear of the saved
+        // context. PHASE 1 left rsp = ec.kstack.top; ec.ctx lives at
+        // kstack.top - 176 with its iret-frame fields ending at
+        // kstack.top - 8. A 5-qword push at rsp - 40 would otherwise
+        // overlap ec.ctx.{rip,cs,rflags,rsp,ss} byte-for-byte and
+        // silently poison the EC's saved frame. Slow path's `subq $176`
+        // accomplishes the same — this mirrors that invariant for the
+        // fast path. 192 = 176 ec.ctx + 16-byte alignment slack, matching
+        // the buffer R12.5 (reply FP) reserves below sender.kstack.top.
+        //
+        // Bail-to-slow-path edges (.Lsyscall_lock_fail / .Lsyscall_no_receiver
+        // / .Lreply_handle_invalid / .Lreply_lock_fail) inherit this rsp
+        // delta; the slow-path entry resets rsp from gs:0 before doing its
+        // own subq $176 so the Context buffer it builds always lands at
+        // kstack.top - 176 = ec.ctx_addr regardless of which arm we came
+        // from.
+        // ────────────────────────────────────────────────────────────────
         \\subq $192, %%rsp
 
-    // ─── Step 1: port handle bounds check (rbx = port_id). ─────────
+        // ─── Step 1: port handle bounds check (rbx = port_id). ─────────
         \\cmpq $0xFFF, %%rbx
         \\ja .Lsyscall_slow_path
 
-    // ─── Step 2: port type-tag check at user_table[port_id].word0
-    // bits 12-15 == .port. Spill payload_count (rcx) to gs:64 first.
-    // user_table base cached at gs:48.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 2: port type-tag check at user_table[port_id].word0
+        // bits 12-15 == .port. Spill payload_count (rcx) to gs:64 first.
+        // user_table base cached at gs:48.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%gs:64
         \\movq %%gs:48, %%rcx
         \\lea (%%rbx, %%rbx, 2), %%r11
         \\movq (%%rcx, %%r11, 8), %%r11
         \\shrq $12, %%r11
         \\andq $0xF, %%r11
-        ++ std.fmt.comptimePrint(
-            "\ncmpq ${d}, %%r11\njne .Lsyscall_slow_path\n",
-            .{@intFromEnum(CapabilityType.port)},
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\ncmpq ${d}, %%r11\njne .Lsyscall_slow_path\n",
+        .{@intFromEnum(CapabilityType.port)},
+    ) ++
 
-    // ─── Step 3: target validation (rax = target_id). Bounds check,
-    // caps check (susp+read+write all set; bits 53-55 of word0), then
-    // self-suspend predicate (kernel_table[target].ref.ptr ==
-    // current_ec @ gs:32). rcx still holds user_table base.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 3: target validation (rax = target_id). Bounds check,
+        // caps check (susp+read+write all set; bits 53-55 of word0), then
+        // self-suspend predicate (kernel_table[target].ref.ptr ==
+        // current_ec @ gs:32). rcx still holds user_table base.
+        // ────────────────────────────────────────────────────────────────
         \\cmpq $0xFFF, %%rax
         \\ja .Lsyscall_slow_path
         \\lea (%%rax, %%rax, 2), %%r11
@@ -778,66 +837,66 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\cmpq $7, %%r11
         \\jne .Lsyscall_slow_path
         \\movq %%gs:56, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nimulq ${d}, %%rax, %%r11\n",
-            .{@sizeOf(KernelHandle)},
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nimulq ${d}, %%rax, %%r11\n",
+        .{@sizeOf(KernelHandle)},
+    ) ++
         \\movq (%%rcx, %%r11), %%rcx
         \\cmpq %%gs:32, %%rcx
         \\jne .Lsyscall_slow_path
 
-    // ─── Step 4: resolve Port* + acquire gen-validating spinlock.
-    // Spill rax (target_id) to gs:72 — cmpxchg uses rax implicitly,
-    // and bail paths from here onward must restore for slow path.
-    // disp+index addressing folds the addq for the kernel_table walk.
-    // CAS loop: success → past retry block; gen drift → bail; just
-    // contention → spin and retry.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 4: resolve Port* + acquire gen-validating spinlock.
+        // Spill rax (target_id) to gs:72 — cmpxchg uses rax implicitly,
+        // and bail paths from here onward must restore for slow path.
+        // disp+index addressing folds the addq for the kernel_table walk.
+        // CAS loop: success → past retry block; gen drift → bail; just
+        // contention → spin and retry.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rax, %%gs:72
         \\movq %%gs:56, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\imulq ${[kh_size]d}, %%rbx, %%r11
-            \\movq {[ref_gen_off]d}(%%rcx, %%r11), %%rax
-            \\movq {[ref_ptr_off]d}(%%rcx, %%r11), %%rcx
-            \\testq %%rcx, %%rcx
-            \\jz .Lsyscall_lock_fail
-            \\shlq $1, %%rax
-            \\lea 1(%%rax), %%r11
-            \\.Lacquire_port:
-            \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
-            \\je .Lport_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lsyscall_lock_fail
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lacquire_port
-            \\.Lport_acquired:
-            \\
-        ,
-            .{
-                .kh_size = @sizeOf(KernelHandle),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
-                .port_lock_off = @offsetOf(Port, "_gen_lock"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\imulq ${[kh_size]d}, %%rbx, %%r11
+        \\movq {[ref_gen_off]d}(%%rcx, %%r11), %%rax
+        \\movq {[ref_ptr_off]d}(%%rcx, %%r11), %%rcx
+        \\testq %%rcx, %%rcx
+        \\jz .Lsyscall_lock_fail
+        \\shlq $1, %%rax
+        \\lea 1(%%rax), %%r11
+        \\.Lacquire_port:
+        \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
+        \\je .Lport_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lsyscall_lock_fail
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lacquire_port
+        \\.Lport_acquired:
+        \\
+    ,
+        .{
+            .kh_size = @sizeOf(KernelHandle),
+            .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+            .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
+            .port_lock_off = @offsetOf(Port, "_gen_lock"),
+        },
+    ) ++
 
-    // ─── Step 5: peek port.waiter_kind. Lock held; if not .receivers,
-    // bail via .Lsyscall_no_receiver (releases lock).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 5: peek port.waiter_kind. Lock held; if not .receivers,
+        // bail via .Lsyscall_no_receiver (releases lock).
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             "\ncmpb ${d}, {d}(%%rcx)\njne .Lsyscall_no_receiver\n",
             .{ @intFromEnum(WaiterKind.receivers), @offsetOf(Port, "waiter_kind") },
         ) ++
 
-    // ─── Step 6: dequeue highest-priority receiver. Walk levels[3..0],
-    // first non-null head wins. Pop block clobbers rcx briefly (spilled
-    // to gs:80) for the new_head temp; on exit rcx = Port*, r11 =
-    // receiver EC*, rax = &level (disposable).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 6: dequeue highest-priority receiver. Walk levels[3..0],
+        // first non-null head wins. Pop block clobbers rcx briefly (spilled
+        // to gs:80) for the new_head temp; on exit rcx = Port*, r11 =
+        // receiver EC*, rax = &level (disposable).
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq {[w3_head]d}(%%rcx), %%r11
@@ -891,22 +950,22 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step 6.5: snapshot receiver state under port lock for the
-    // recv_cd + receiver_ec acquire chain that follows port release.
-    // Port lock pins the receiver while held, so reads here are
-    // gen-coherent. Stash:
-    //   gs:104 = receiver_ec_gen   (snapshot for Step 9.5 lockWithGen)
-    //   gs:80  = recv_cd_ptr        (overwritten by recv_cd value at
-    //                                Step 10; we re-stash there)
-    //   gs:96  = recv_cd_gen        (overwritten at Step 10 line ~800
-    //                                with reply_slot id; we use it
-    //                                in Step 9 acquire then it's free)
-    //
-    // Capturing receiver.domain.ptr/.gen here moves the analyzer-
-    // flagged "receiver.domain via %r11: lock not held" read at
-    // (former) Step 9 line 752 into the port-locked window where the
-    // receiver is provably alive. Step 9 then uses cached values.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 6.5: snapshot receiver state under port lock for the
+        // recv_cd + receiver_ec acquire chain that follows port release.
+        // Port lock pins the receiver while held, so reads here are
+        // gen-coherent. Stash:
+        //   gs:104 = receiver_ec_gen   (snapshot for Step 9.5 lockWithGen)
+        //   gs:80  = recv_cd_ptr        (overwritten by recv_cd value at
+        //                                Step 10; we re-stash there)
+        //   gs:96  = recv_cd_gen        (overwritten at Step 10 line ~800
+        //                                with reply_slot id; we use it
+        //                                in Step 9 acquire then it's free)
+        //
+        // Capturing receiver.domain.ptr/.gen here moves the analyzer-
+        // flagged "receiver.domain via %r11: lock not held" read at
+        // (former) Step 9 line 752 into the port-locked window where the
+        // receiver is provably alive. Step 9 then uses cached values.
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq {[ec_lock_off]d}(%%r11), %%rax
@@ -925,9 +984,9 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step 7: maintain port.waiter_kind. Scan all 4 levels — if
-    // all heads null, set .none. Otherwise leave .receivers intact.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 7: maintain port.waiter_kind. Scan all 4 levels — if
+        // all heads null, set .none. Otherwise leave .receivers intact.
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq {[w3_head]d}(%%rcx), %%rax
@@ -956,174 +1015,174 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step 8: spill port_ptr (sender.suspend_port mutation needs
-    // it later) and release the port lock. Plain andq — we own the
-    // word, no concurrent writer.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 8: spill port_ptr (sender.suspend_port mutation needs
+        // it later) and release the port lock. Plain andq — we own the
+        // word, no concurrent writer.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%gs:120
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
-            .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
+        .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
+    ) ++
 
-    // ─── Step 9: acquire receiver's CD gen-lock from cached snapshot
-    // (Step 6.5: gs:80 = recv_cd_ptr, gs:96 = recv_cd_gen). Spill
-    // receiver EC* to gs:88 (persists through everything that follows).
-    // Lock order: recv_cd here is the ONLY lock held; we acquire
-    // receiver_ec at Step 9.5 — canonical CD → EC.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 9: acquire receiver's CD gen-lock from cached snapshot
+        // (Step 6.5: gs:80 = recv_cd_ptr, gs:96 = recv_cd_gen). Spill
+        // receiver EC* to gs:88 (persists through everything that follows).
+        // Lock order: recv_cd here is the ONLY lock held; we acquire
+        // receiver_ec at Step 9.5 — canonical CD → EC.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%r11, %%gs:88
         \\movq %%gs:80, %%rcx
         \\movq %%gs:96, %%r11
-        ++ std.fmt.comptimePrint(
-            \\
-            \\shlq $1, %%r11
-            \\movq %%r11, %%rax
-            \\incq %%r11
-            \\.Lacquire_recv_cd:
-            \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
-            \\je .Lrecv_cd_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lrecv_cd_fail
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lacquire_recv_cd
-            \\.Lrecv_cd_acquired:
-            \\
-        ,
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\shlq $1, %%r11
+        \\movq %%r11, %%rax
+        \\incq %%r11
+        \\.Lacquire_recv_cd:
+        \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
+        \\je .Lrecv_cd_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lrecv_cd_fail
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lacquire_recv_cd
+        \\.Lrecv_cd_acquired:
+        \\
+    ,
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
 
-    // ─── Step 9.5: acquire receiver_ec gen-lock with snapshotted gen
-    // from Step 6.5. Holds recv_cd lock — canonical CD → EC order.
-    // Bail to .Lrecv_ec_destroyed (release recv_cd, jmp slow path) if
-    // gen rotated under us between Step 6.5 and now (concurrent
-    // destroy walked the receiver while we were between port release
-    // and recv_cd acquire). Receiver_ec held through Step 15 — covers
-    // every receiver field write (state, event_*, ctx) plus the
-    // kernel_stack.top read in Step 14.
-    //
-    // Register map mirrors Step 9 acquire: rcx = base reg for the
-    // cmpxchg memory operand, rax = expected (unlocked target),
-    // r11 = desired (locked target). After success rcx holds
-    // receiver_ec_ptr (was recv_cd_ptr coming in from Step 9) — Step
-    // 10's first instructions reload rcx = recv_cd_ptr from gs:80
-    // and r11 = recv_cd_gen from gs:96.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 9.5: acquire receiver_ec gen-lock with snapshotted gen
+        // from Step 6.5. Holds recv_cd lock — canonical CD → EC order.
+        // Bail to .Lrecv_ec_destroyed (release recv_cd, jmp slow path) if
+        // gen rotated under us between Step 6.5 and now (concurrent
+        // destroy walked the receiver while we were between port release
+        // and recv_cd acquire). Receiver_ec held through Step 15 — covers
+        // every receiver field write (state, event_*, ctx) plus the
+        // kernel_stack.top read in Step 14.
+        //
+        // Register map mirrors Step 9 acquire: rcx = base reg for the
+        // cmpxchg memory operand, rax = expected (unlocked target),
+        // r11 = desired (locked target). After success rcx holds
+        // receiver_ec_ptr (was recv_cd_ptr coming in from Step 9) — Step
+        // 10's first instructions reload rcx = recv_cd_ptr from gs:80
+        // and r11 = recv_cd_gen from gs:96.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:88, %%rcx
         \\movq %%gs:104, %%rax
-        ++ std.fmt.comptimePrint(
-            \\
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lacquire_recv_ec:
-            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
-            \\je .Lrecv_ec_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lrecv_ec_destroyed
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lacquire_recv_ec
-            \\.Lrecv_ec_acquired:
-            \\
-        ,
-            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lacquire_recv_ec:
+        \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+        \\je .Lrecv_ec_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lrecv_ec_destroyed
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lacquire_recv_ec
+        \\.Lrecv_ec_acquired:
+        \\
+    ,
+        .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+    ) ++
 
-    // ─── Step 9.7: acquire sender_ec gen-lock. Sender = current_ec
-    // (gs:32). Snap gen comes from `scratch.current_ec_gen` (gs:176),
-    // captured by `switchTo` and refreshed by every fast-path
-    // current-EC swap (Step 14 / R14). Per the lock discipline, every
-    // slab-field access uses lockWithGen against a snap — even when
-    // "we are this EC" — because terminate-from-another-core (some
-    // other EC holds a handle to us in its own CD) can fire between
-    // syscall entry and here, rotating the gen and possibly
-    // reallocating the slot to a different EC. Held through Step 12
-    // (last sender field write); released at Step 12.5.
-    //
-    // Same-class nesting with receiver_ec (held since Step 9.5).
-    // Discipline: in suspend fast path, receiver_ec is acquired
-    // BEFORE sender_ec. The reply fast path never holds both
-    // simultaneously, so no cross-path AB-BA. tools/check_gen_lock
-    // will flag the nesting; the documented invariant is that this
-    // is the only path that holds both ECs at once.
-    //
-    // Bail to .Lsender_ec_destroyed: hard panic. By this point recv_cd
-    // and recv_ec are both held — there's no clean unwind that doesn't
-    // race the destroyer, and "I shouldn't exist" is a hard invariant
-    // break. Mirrors `.Lreply_caller_destroyed` / `.Lreply_sender_destroyed`.
-    //
-    // Register map: rcx = sender_ec_ptr, rax/r11 = lock-word values.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 9.7: acquire sender_ec gen-lock. Sender = current_ec
+        // (gs:32). Snap gen comes from `scratch.current_ec_gen` (gs:176),
+        // captured by `switchTo` and refreshed by every fast-path
+        // current-EC swap (Step 14 / R14). Per the lock discipline, every
+        // slab-field access uses lockWithGen against a snap — even when
+        // "we are this EC" — because terminate-from-another-core (some
+        // other EC holds a handle to us in its own CD) can fire between
+        // syscall entry and here, rotating the gen and possibly
+        // reallocating the slot to a different EC. Held through Step 12
+        // (last sender field write); released at Step 12.5.
+        //
+        // Same-class nesting with receiver_ec (held since Step 9.5).
+        // Discipline: in suspend fast path, receiver_ec is acquired
+        // BEFORE sender_ec. The reply fast path never holds both
+        // simultaneously, so no cross-path AB-BA. tools/check_gen_lock
+        // will flag the nesting; the documented invariant is that this
+        // is the only path that holds both ECs at once.
+        //
+        // Bail to .Lsender_ec_destroyed: hard panic. By this point recv_cd
+        // and recv_ec are both held — there's no clean unwind that doesn't
+        // race the destroyer, and "I shouldn't exist" is a hard invariant
+        // break. Mirrors `.Lreply_caller_destroyed` / `.Lreply_sender_destroyed`.
+        //
+        // Register map: rcx = sender_ec_ptr, rax/r11 = lock-word values.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:32, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:{[sc_cur_gen]d}, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lacquire_sender_ec:
-            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
-            \\je .Lsender_ec_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lsender_ec_destroyed
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lacquire_sender_ec
-            \\.Lsender_ec_acquired:
-            \\
-        ,
-            .{
-                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .sc_cur_gen = Offsets.sc_current_ec_gen,
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:{[sc_cur_gen]d}, %%rax
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lacquire_sender_ec:
+        \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+        \\je .Lsender_ec_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lsender_ec_destroyed
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lacquire_sender_ec
+        \\.Lsender_ec_acquired:
+        \\
+    ,
+        .{
+            .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .sc_cur_gen = Offsets.sc_current_ec_gen,
+        },
+    ) ++
 
-    // ─── Step 10: mint reply handle. recv_cd held by lock; receiver_ec
-    // also held (Step 9.5). Reload rcx = recv_cd_ptr and r11 =
-    // recv_cd_gen from the Step 6.5 stash since Step 9.5 left rcx =
-    // receiver_ec_ptr. gs:104 still holds receiver_ec_gen from Step
-    // 6.5; we overwrite it here with recv_cd_gen — receiver_ec_gen
-    // is no longer needed (the lockWithGen acquire at Step 9.5
-    // committed the gen check).
-    // Pop free slot via cd.free_head + free-list link (kernel_table[slot]
-    // .parent.slot at offset 32 within KernelHandle). Write
-    // user_table[slot] (word0=caps|type|slot, field0/field1=0) and
-    // kernel_table[slot] (ref={sender,sender_gen}, parent/first_child/
-    // next_sibling=0). Set sender backpointers pending_reply_holder/
-    // domain/slot. word0 caps for fast path:
-    // ReplyCaps{move=1,xfer=1}=0b101=5; tag=.reply=7.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 10: mint reply handle. recv_cd held by lock; receiver_ec
+        // also held (Step 9.5). Reload rcx = recv_cd_ptr and r11 =
+        // recv_cd_gen from the Step 6.5 stash since Step 9.5 left rcx =
+        // receiver_ec_ptr. gs:104 still holds receiver_ec_gen from Step
+        // 6.5; we overwrite it here with recv_cd_gen — receiver_ec_gen
+        // is no longer needed (the lockWithGen acquire at Step 9.5
+        // committed the gen check).
+        // Pop free slot via cd.free_head + free-list link (kernel_table[slot]
+        // .parent.slot at offset 32 within KernelHandle). Write
+        // user_table[slot] (word0=caps|type|slot, field0/field1=0) and
+        // kernel_table[slot] (ref={sender,sender_gen}, parent/first_child/
+        // next_sibling=0). Set sender backpointers pending_reply_holder/
+        // domain/slot. word0 caps for fast path:
+        // ReplyCaps{move=1,xfer=1}=0b101=5; tag=.reply=7.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:80, %%rcx
         \\movq %%gs:96, %%r11
         \\movq %%r11, %%gs:104
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movzwq {[fh_off]d}(%%rcx), %%rax
-            \\cmpq $0xFFFF, %%rax
-            \\je .Lcd_full
-            \\movq %%rax, %%gs:96
-            \\movq {[kt_off]d}(%%rcx), %%r11
-            \\imulq ${[kh_size]d}, %%rax, %%rax
-            \\movzwq 32(%%r11, %%rax), %%r11
-            \\movw %%r11w, {[fh_off]d}(%%rcx)
-            \\decw {[fc_off]d}(%%rcx)
-            \\
-        ,
-            .{
-                .fh_off = @offsetOf(CapabilityDomain, "free_head"),
-                .fc_off = @offsetOf(CapabilityDomain, "free_count"),
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .kh_size = @sizeOf(KernelHandle),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movzwq {[fh_off]d}(%%rcx), %%rax
+        \\cmpq $0xFFFF, %%rax
+        \\je .Lcd_full
+        \\movq %%rax, %%gs:96
+        \\movq {[kt_off]d}(%%rcx), %%r11
+        \\imulq ${[kh_size]d}, %%rax, %%rax
+        \\movzwq 32(%%r11, %%rax), %%r11
+        \\movw %%r11w, {[fh_off]d}(%%rcx)
+        \\decw {[fc_off]d}(%%rcx)
+        \\
+    ,
+        .{
+            .fh_off = @offsetOf(CapabilityDomain, "free_head"),
+            .fc_off = @offsetOf(CapabilityDomain, "free_count"),
+            .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+            .kh_size = @sizeOf(KernelHandle),
+        },
+    ) ++
         std.fmt.comptimePrint(
             \\
             \\movq {[kt_off]d}(%%rcx), %%r11
@@ -1213,164 +1272,164 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step 11: release recv_cd lock. ────────────────────────────
+        // ─── Step 11: release recv_cd lock. ────────────────────────────
         \\movq %%gs:80, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
 
-    // ─── Step 12: park sender state (sender = current_ec = gs:32).
-    // state=.suspended_on_port, event_type=.suspension, suspend_port
-    // = SlabRef(port_ptr, port_gen) (payload + disc), originating
-    // write/read caps = true (we verified susp+read+write earlier),
-    // on_cpu = false. Save user RIP/RFLAGS/RSP into sender.ctx so the
-    // eventual reply can resume via the existing iretq epilogue.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 12: park sender state (sender = current_ec = gs:32).
+        // state=.suspended_on_port, event_type=.suspension, suspend_port
+        // = SlabRef(port_ptr, port_gen) (payload + disc), originating
+        // write/read caps = true (we verified susp+read+write earlier),
+        // on_cpu = false. Save user RIP/RFLAGS/RSP into sender.ctx so the
+        // eventual reply can resume via the existing iretq epilogue.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:32, %%r11
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movb ${[state_susp]d}, {[state_off]d}(%%r11)
-            \\movb ${[event_susp]d}, {[event_off]d}(%%r11)
-            \\movb $0, {[event_subcode_off]d}(%%r11)
-            \\movq $0, {[event_addr_off]d}(%%r11)
-            \\movb $1, {[orig_write_off]d}(%%r11)
-            \\movb $1, {[orig_read_off]d}(%%r11)
-            \\movb $0, {[on_cpu_off]d}(%%r11)
-            \\movq %%gs:120, %%rax
-            \\movq %%rax, {[susp_port_off]d}(%%r11)
-            \\movq {[port_lock_off]d}(%%rax), %%rcx
-            \\shrq $1, %%rcx
-            \\movq %%rcx, {[susp_port_gen_off]d}(%%r11)
-            \\movb $1, {[susp_port_disc_off]d}(%%r11)
-            \\movq {[ctx_off]d}(%%r11), %%rax
-            \\movq %%gs:16, %%rcx
-            \\movq %%rcx, {[ctx_rip_off]d}(%%rax)
-            \\movq %%gs:24, %%rcx
-            \\movq %%rcx, {[ctx_rflags_off]d}(%%rax)
-            \\movq %%gs:8, %%rcx
-            \\movq %%rcx, {[ctx_rsp_off]d}(%%rax)
-            \\
-            \\# Step 12.5: release sender_ec gen-lock (acquired Step 9.7).
-            \\# r11 still holds sender_ec_ptr from Step 12 entry. After
-            \\# this point only receiver_ec is held; the rest of the fast
-            \\# path (Steps 13-15) writes receiver fields under that lock.
-            \\andq $-2, {[ec_unlock_off]d}(%%r11)
-            \\
-        ,
-            .{
-                .state_susp = @intFromEnum(stygia.sched.execution_context.State.suspended_on_port),
-                .event_susp = @intFromEnum(stygia.sched.execution_context.EventType.suspension),
-                .state_off = @offsetOf(ExecutionContext, "state"),
-                .event_off = @offsetOf(ExecutionContext, "event_type"),
-                .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
-                .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
-                .orig_write_off = @offsetOf(ExecutionContext, "originating_write_cap"),
-                .orig_read_off = @offsetOf(ExecutionContext, "originating_read_cap"),
-                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .susp_port_off = @offsetOf(ExecutionContext, "suspend_port"),
-                .susp_port_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
-                .susp_port_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
-                .ctx_off = @offsetOf(ExecutionContext, "ctx"),
-                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .port_lock_off = @offsetOf(Port, "_gen_lock"),
-                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
-                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
-                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
-            },
-        ) ++ (if (build_options.kernel_ctx_trace)
-            // Move rsp below ec.ctx [kstack.top-176, kstack.top) before the
-            // `call` so the saved RIP and the trampoline's GPR pushes do
-            // not stomp the very iret-frame slots ctx_trace is here to
-            // observe. FP rsp = scratch.kernel_rsp = kstack.top throughout
-            // the path, so `call`'s RIP push lands at top-8 = ctx.ss
-            // and the first 5 pushes overwrite ctx.{ss,rsp,rflags,cs,rip}
-            // without this guard. 192 B leaves the full 176 B Context
-            // intact plus 16 B alignment slack; restored after ret.
-            \\subq $192, %%rsp
-            \\call ctxTraceMarkFromAsm_fp_suspend_step12
-            \\addq $192, %%rsp
-            \\
-        else
-            "") ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movb ${[state_susp]d}, {[state_off]d}(%%r11)
+        \\movb ${[event_susp]d}, {[event_off]d}(%%r11)
+        \\movb $0, {[event_subcode_off]d}(%%r11)
+        \\movq $0, {[event_addr_off]d}(%%r11)
+        \\movb $1, {[orig_write_off]d}(%%r11)
+        \\movb $1, {[orig_read_off]d}(%%r11)
+        \\movb $0, {[on_cpu_off]d}(%%r11)
+        \\movq %%gs:120, %%rax
+        \\movq %%rax, {[susp_port_off]d}(%%r11)
+        \\movq {[port_lock_off]d}(%%rax), %%rcx
+        \\shrq $1, %%rcx
+        \\movq %%rcx, {[susp_port_gen_off]d}(%%r11)
+        \\movb $1, {[susp_port_disc_off]d}(%%r11)
+        \\movq {[ctx_off]d}(%%r11), %%rax
+        \\movq %%gs:16, %%rcx
+        \\movq %%rcx, {[ctx_rip_off]d}(%%rax)
+        \\movq %%gs:24, %%rcx
+        \\movq %%rcx, {[ctx_rflags_off]d}(%%rax)
+        \\movq %%gs:8, %%rcx
+        \\movq %%rcx, {[ctx_rsp_off]d}(%%rax)
+        \\
+        \\# Step 12.5: release sender_ec gen-lock (acquired Step 9.7).
+        \\# r11 still holds sender_ec_ptr from Step 12 entry. After
+        \\# this point only receiver_ec is held; the rest of the fast
+        \\# path (Steps 13-15) writes receiver fields under that lock.
+        \\andq $-2, {[ec_unlock_off]d}(%%r11)
+        \\
+    ,
+        .{
+            .state_susp = @intFromEnum(stygia.sched.execution_context.State.parking),
+            .event_susp = @intFromEnum(stygia.sched.execution_context.EventType.suspension),
+            .state_off = @offsetOf(ExecutionContext, "state"),
+            .event_off = @offsetOf(ExecutionContext, "event_type"),
+            .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
+            .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
+            .orig_write_off = @offsetOf(ExecutionContext, "originating_write_cap"),
+            .orig_read_off = @offsetOf(ExecutionContext, "originating_read_cap"),
+            .on_cpu_off = @offsetOf(ExecutionContext, "owner_core"),
+            .susp_port_off = @offsetOf(ExecutionContext, "suspend_port"),
+            .susp_port_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
+            .susp_port_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
+            .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+            .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .port_lock_off = @offsetOf(Port, "_gen_lock"),
+            .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+            .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+            .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+        },
+    ) ++ (if (build_options.kernel_ctx_trace)
+        // Move rsp below ec.ctx [kstack.top-176, kstack.top) before the
+        // `call` so the saved RIP and the trampoline's GPR pushes do
+        // not stomp the very iret-frame slots ctx_trace is here to
+        // observe. FP rsp = scratch.kernel_rsp = kstack.top throughout
+        // the path, so `call`'s RIP push lands at top-8 = ctx.ss
+        // and the first 5 pushes overwrite ctx.{ss,rsp,rflags,cs,rip}
+        // without this guard. 192 B leaves the full 176 B Context
+        // intact plus 16 B alignment slack; restored after ret.
+        \\subq $192, %%rsp
+        \\call ctxTraceMarkFromAsm_fp_suspend_step12
+        \\addq $192, %%rsp
+        \\
+    else
+        "") ++
 
-    // ─── Step 13: wake receiver state (gs:88). state=.running,
-    // event_type=.none, suspend_port disc=null, recv_deadline_ns=0.
-    // Stale slot in timed_recv_waiters[] self-clears via the
-    // expireTimedRecvWaiters re-check logic.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 13: wake receiver state (gs:88). state=.running,
+        // event_type=.none, suspend_port disc=null, recv_deadline_ns=0.
+        // Stale slot in timed_recv_waiters[] self-clears via the
+        // expireTimedRecvWaiters re-check logic.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:88, %%r11
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movb ${[state_run]d}, {[state_off]d}(%%r11)
-            \\movb ${[event_none]d}, {[event_off]d}(%%r11)
-            \\movb $0, {[susp_disc_off]d}(%%r11)
-            \\movq $0, {[deadline_off]d}(%%r11)
-            \\movb $0, {[pew_valid_off]d}(%%r11)
-            \\movb $0, {[per_valid_off]d}(%%r11)
-            \\
-            \\# Inline removeTimedRecvWaiter for receiver (in r11). Mirrors
-            \\# the slow-path rendezvousWithReceiver call. SpinLock state
-            \\# at offset {[lock_state_off]d} (Zig auto-reorders fields by
-            \\# alignment: 8-byte class pointer first, u32 atomic state
-            \\# second). xchgl-based blocking acquire (cmpxchgl would need
-            \\# a third register for the desired value; only rax/rcx are
-            \\# scratch since r11 holds receiver_ec for the compare).
-            \\movq %%gs:{[sc_lock_ptr]d}, %%rcx
-            \\.Ltrl_acquire:
-            \\movl $1, %%eax
-            \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
-            \\testl %%eax, %%eax
-            \\jz .Ltrl_have
-            \\pause
-            \\jmp .Ltrl_acquire
-            \\.Ltrl_have:
-            \\movq %%gs:{[sc_waiters_ptr]d}, %%rcx
-            \\xorl %%eax, %%eax
-            \\.Ltrw_scan:
-            \\cmpl ${[trw_max]d}, %%eax
-            \\jge .Ltrw_done
-            \\cmpq (%%rcx, %%rax, 8), %%r11
-            \\je .Ltrw_clear
-            \\incl %%eax
-            \\jmp .Ltrw_scan
-            \\.Ltrw_clear:
-            \\movq $0, (%%rcx, %%rax, 8)
-            \\.Ltrw_done:
-            \\movq %%gs:{[sc_lock_ptr]d}, %%rcx
-            \\movl $0, {[lock_state_off]d}(%%rcx)
-            \\
-        ,
-            .{
-                .state_run = @intFromEnum(stygia.sched.execution_context.State.running),
-                .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
-                .state_off = @offsetOf(ExecutionContext, "state"),
-                .event_off = @offsetOf(ExecutionContext, "event_type"),
-                .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
-                .deadline_off = @offsetOf(ExecutionContext, "recv_deadline_ns"),
-                .pew_valid_off = @offsetOf(ExecutionContext, "pending_event_word_valid"),
-                .per_valid_off = @offsetOf(ExecutionContext, "pending_event_rip_valid"),
-                .trw_max = stygia.sched.port.MAX_TIMED_RECV_WAITERS,
-                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
-                .sc_lock_ptr = Offsets.sc_timed_recv_lock_ptr,
-                .sc_waiters_ptr = Offsets.sc_timed_recv_waiters_ptr,
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movb ${[state_run]d}, {[state_off]d}(%%r11)
+        \\movb ${[event_none]d}, {[event_off]d}(%%r11)
+        \\movb $0, {[susp_disc_off]d}(%%r11)
+        \\movq $0, {[deadline_off]d}(%%r11)
+        \\movb $0, {[pew_valid_off]d}(%%r11)
+        \\movb $0, {[per_valid_off]d}(%%r11)
+        \\
+        \\# Inline removeTimedRecvWaiter for receiver (in r11). Mirrors
+        \\# the slow-path rendezvousWithReceiver call. SpinLock state
+        \\# at offset {[lock_state_off]d} (Zig auto-reorders fields by
+        \\# alignment: 8-byte class pointer first, u32 atomic state
+        \\# second). xchgl-based blocking acquire (cmpxchgl would need
+        \\# a third register for the desired value; only rax/rcx are
+        \\# scratch since r11 holds receiver_ec for the compare).
+        \\movq %%gs:{[sc_lock_ptr]d}, %%rcx
+        \\.Ltrl_acquire:
+        \\movl $1, %%eax
+        \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
+        \\testl %%eax, %%eax
+        \\jz .Ltrl_have
+        \\pause
+        \\jmp .Ltrl_acquire
+        \\.Ltrl_have:
+        \\movq %%gs:{[sc_waiters_ptr]d}, %%rcx
+        \\xorl %%eax, %%eax
+        \\.Ltrw_scan:
+        \\cmpl ${[trw_max]d}, %%eax
+        \\jge .Ltrw_done
+        \\cmpq (%%rcx, %%rax, 8), %%r11
+        \\je .Ltrw_clear
+        \\incl %%eax
+        \\jmp .Ltrw_scan
+        \\.Ltrw_clear:
+        \\movq $0, (%%rcx, %%rax, 8)
+        \\.Ltrw_done:
+        \\movq %%gs:{[sc_lock_ptr]d}, %%rcx
+        \\movl $0, {[lock_state_off]d}(%%rcx)
+        \\
+    ,
+        .{
+            .state_run = @intFromEnum(stygia.sched.execution_context.State.running),
+            .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
+            .state_off = @offsetOf(ExecutionContext, "state"),
+            .event_off = @offsetOf(ExecutionContext, "event_type"),
+            .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
+            .deadline_off = @offsetOf(ExecutionContext, "recv_deadline_ns"),
+            .pew_valid_off = @offsetOf(ExecutionContext, "pending_event_word_valid"),
+            .per_valid_off = @offsetOf(ExecutionContext, "pending_event_rip_valid"),
+            .trw_max = stygia.sched.port.MAX_TIMED_RECV_WAITERS,
+            .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
+            .sc_lock_ptr = Offsets.sc_timed_recv_lock_ptr,
+            .sc_waiters_ptr = Offsets.sc_timed_recv_waiters_ptr,
+        },
+    ) ++
 
-    // ─── Step 14: per-core scheduler accounting + lazy-FPU policy.
-    // Update gs:32/40/48/56/0 + *(gs:136). Also keep the scheduler-side
-    // `PerCore.current_ec` (= `core_states[core].current_ec`) in sync —
-    // pageFaultHandler / syscall dispatch / etc. all read EC identity
-    // through `scheduler.currentEc()` which loads from `PerCore`, not
-    // from `gs:32`. If the fast path leaves them divergent, the next
-    // user fault on this core resolves the wrong domain (e.g. primary
-    // serial.print MMIO traps look up COM1 in the previously-scheduled
-    // child's CD → null → spurious memory_fault that retires the wrong
-    // EC). Mirrors `switchTo` (this file, end of module). FPU: arm
-    // CR0.TS iff receiver != per_core->last_fpu_owner.ptr; skip CR-write
-    // if already in desired state (each MOV-CR0 is a vmexit under KVM).
-    // migrateFlush is currently a no-op stub (scheduler.zig:466).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 14: per-core scheduler accounting + lazy-FPU policy.
+        // Update gs:32/40/48/56/0 + *(gs:136). Also keep the scheduler-side
+        // `PerCore.current_ec` (= `core_states[core].current_ec`) in sync —
+        // pageFaultHandler / syscall dispatch / etc. all read EC identity
+        // through `scheduler.currentEc()` which loads from `PerCore`, not
+        // from `gs:32`. If the fast path leaves them divergent, the next
+        // user fault on this core resolves the wrong domain (e.g. primary
+        // serial.print MMIO traps look up COM1 in the previously-scheduled
+        // child's CD → null → spurious memory_fault that retires the wrong
+        // EC). Mirrors `switchTo` (this file, end of module). FPU: arm
+        // CR0.TS iff receiver != per_core->last_fpu_owner.ptr; skip CR-write
+        // if already in desired state (each MOV-CR0 is a vmexit under KVM).
+        // migrateFlush is currently a no-op stub (scheduler.zig:466).
+        // ────────────────────────────────────────────────────────────────
         (if (build_options.kernel_ec_log)
             // ec_log mark fires BEFORE the gs:32 write so the trampoline
             // observes prev=gs:32 (still the outgoing sender) alongside
@@ -1390,11 +1449,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%gs:88, %%r11
             \\movq %%r11, %%gs:32
             \\movq %%gs:128, %%rax
-            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq {[gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
-            \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq %%rcx, %%gs:{[sc_cur_gen]d}
             \\movb $1, {[on_cpu_off]d}(%%r11)
             \\movzbl %%gs:{[sc_core_id]d}, %%ecx
@@ -1434,114 +1492,123 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                // `PerCore.current_ec` is a bare `?*ExecutionContext`:
+                // one pointer word whose null-ness IS the optional
+                // discriminant. This asm is a hand-rolled `setCurrentEc`
+                // and must publish exactly what it does — gen first,
+                // pointer last, no separate discriminant byte. The
+                // previous form wrote a `movb $1` at +16 for the old
+                // 24-byte `?SlabRef` tag; against the current layout
+                // that byte lands on an unrelated field. Offsets are
+                // taken with `@offsetOf` so a field reorder is a build
+                // error, not silent corruption.
                 .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec_gen"),
                 // Same EC._gen_lock-vs-offset-0 trap as the mint above:
                 // fpu_state pushes _gen_lock past offset 0; the comptime
                 // offset is the only safe way to read the gen-lock word.
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .sc_cur_gen = Offsets.sc_current_ec_gen,
-                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .on_cpu_off = @offsetOf(ExecutionContext, "owner_core"),
+                .last_disp_off = @offsetOf(ExecutionContext, "owner_core"),
                 .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
-    // ─── Step 15: stash recv_ctx, compose vreg 0 return word.
-    //
-    // recv_ctx (= receiver.ctx, a *cpu.Context) is needed for the
-    // user RIP/RFLAGS/RSP reads after the CR3 swap. Park it in gs:88
-    // (reusing the receiver_ec slot — no longer needed).
-    //
-    // vreg 0 layout per §[event_state]:
-    //   bits 32-43: reply_handle_id
-    //   bits 44-48: event_type (.suspension = 4)
-    //   bits 49-55: payload_count
-    // Compose in rcx using the gs spill values.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 15: stash recv_ctx, compose vreg 0 return word.
+        //
+        // recv_ctx (= receiver.ctx, a *cpu.Context) is needed for the
+        // user RIP/RFLAGS/RSP reads after the CR3 swap. Park it in gs:88
+        // (reusing the receiver_ec slot — no longer needed).
+        //
+        // vreg 0 layout per §[event_state]:
+        //   bits 32-43: reply_handle_id
+        //   bits 44-48: event_type (.suspension = 4)
+        //   bits 49-55: payload_count
+        // Compose in rcx using the gs spill values.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:88, %%r11
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[ctx_off]d}(%%r11), %%rcx
-            \\
-            \\# Step 15.5: release receiver_ec gen-lock acquired at
-            \\# Step 9.5. This is the last receiver-EC field access in
-            \\# the suspend fast path; subsequent code only uses the
-            \\# *cpu.Context (`rcx` here) which is not a slab type.
-            \\andq $-2, {[ec_unlock_off]d}(%%r11)
-            \\
-            \\movq %%rcx, %%gs:88
-            \\movq {[ctx_rsp_off]d}(%%rcx), %%rax
-            \\
-        ,
-            .{
-                .ctx_off = @offsetOf(ExecutionContext, "ctx"),
-                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[ctx_off]d}(%%r11), %%rcx
+        \\
+        \\# Step 15.5: release receiver_ec gen-lock acquired at
+        \\# Step 9.5. This is the last receiver-EC field access in
+        \\# the suspend fast path; subsequent code only uses the
+        \\# *cpu.Context (`rcx` here) which is not a slab type.
+        \\andq $-2, {[ec_unlock_off]d}(%%r11)
+        \\
+        \\movq %%rcx, %%gs:88
+        \\movq {[ctx_rsp_off]d}(%%rcx), %%rax
+        \\
+    ,
+        .{
+            .ctx_off = @offsetOf(ExecutionContext, "ctx"),
+            .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+        },
+    ) ++
         \\movq %%gs:96, %%rcx
         \\shlq $32, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nmovabsq ${d}, %%r11\norq %%r11, %%rcx\n",
-            .{@as(u64, @intFromEnum(stygia.sched.execution_context.EventType.suspension)) << 44},
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nmovabsq ${d}, %%r11\norq %%r11, %%rcx\n",
+        .{@as(u64, @intFromEnum(stygia.sched.execution_context.EventType.suspension)) << 44},
+    ) ++
         \\movq %%gs:64, %%r11
         \\shlq $49, %%r11
         \\orq %%r11, %%rcx
 
-    // ─── Step 16: CR3 swap to receiver's address space (PCID-aware).
-    // Plain CR3 write — no NO-FLUSH bit, so new PCID's TLB entries
-    // get flushed conservatively. After the swap kernel mappings are
-    // unchanged (copyKernelMappings invariant), so gs/scratch reads
-    // continue to work.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 16: CR3 swap to receiver's address space (PCID-aware).
+        // Plain CR3 write — no NO-FLUSH bit, so new PCID's TLB entries
+        // get flushed conservatively. After the swap kernel mappings are
+        // unchanged (copyKernelMappings invariant), so gs/scratch reads
+        // continue to work.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%gs:104
         \\movq %%gs:80, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[asr_off]d}(%%rcx), %%r11
-            \\testb $1, %%gs:144
-            \\jz .Lcr3_no_pcid
-            \\movzwq {[asid_off]d}(%%rcx), %%rcx
-            \\orq %%rcx, %%r11
-            \\.Lcr3_no_pcid:
-            \\
-        ,
-            .{
-                .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
-                .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[asr_off]d}(%%rcx), %%r11
+        \\testb $1, %%gs:144
+        \\jz .Lcr3_no_pcid
+        \\movzwq {[asid_off]d}(%%rcx), %%rcx
+        \\orq %%rcx, %%r11
+        \\.Lcr3_no_pcid:
+        \\
+    ,
+        .{
+            .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
+            .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
+        },
+    ) ++
         \\movq %%r11, %%cr3
 
-    // ─── Step 17: write vregs 0/14 to receiver's user stack, set up
-    // sysretq state, return to user mode.
-    //
-    // Stack writes use rax = recv_user_rsp (loaded pre-CR3-swap).
-    // After CR3 = recv_cd's PML4, recv's user pages are mapped.
-    //
-    // vreg 0 staged in gs:104 (we spilled it pre-CR3 to free rcx).
-    // vreg 14 (sender RIP) comes from gs:16.
-    //
-    // Sysretq state:
-    //   rcx = recv_user_rip   (recv_ctx.rip @ 136)
-    //   r11 = recv_user_rflags (recv_ctx.rflags @ 152)
-    //   rsp = recv_user_rsp   (already in rax; copy after stack writes)
-    //   rax = OK (0) — Spec §[error_codes]: vreg 1 is the syscall
-    //         return register. On recv success the slow path's
-    //         deliverEvent overwrites rax to OK; this fast path mirrors
-    //         that contract so both rendezvous shapes deliver vreg 1 = 0.
-    //
-    // Vregs 2..13 (rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14,
-    // r15) flow zero-copy from sender's hw regs through the kernel into
-    // receiver's hw regs per §[event_state]'s GPR projection.
-    //
-    // TODO §[event_state] vregs 15/16/17/18 (sender's RFLAGS, RSP,
-    // FS.base, GS.base) — write to recv_user_rsp + 16/24/32/40. The
-    // first two come from gs:24 / gs:8; FS.base/GS.base require rdmsr.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step 17: write vregs 0/14 to receiver's user stack, set up
+        // sysretq state, return to user mode.
+        //
+        // Stack writes use rax = recv_user_rsp (loaded pre-CR3-swap).
+        // After CR3 = recv_cd's PML4, recv's user pages are mapped.
+        //
+        // vreg 0 staged in gs:104 (we spilled it pre-CR3 to free rcx).
+        // vreg 14 (sender RIP) comes from gs:16.
+        //
+        // Sysretq state:
+        //   rcx = recv_user_rip   (recv_ctx.rip @ 136)
+        //   r11 = recv_user_rflags (recv_ctx.rflags @ 152)
+        //   rsp = recv_user_rsp   (already in rax; copy after stack writes)
+        //   rax = OK (0) — Spec §[error_codes]: vreg 1 is the syscall
+        //         return register. On recv success the slow path's
+        //         deliverEvent overwrites rax to OK; this fast path mirrors
+        //         that contract so both rendezvous shapes deliver vreg 1 = 0.
+        //
+        // Vregs 2..13 (rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14,
+        // r15) flow zero-copy from sender's hw regs through the kernel into
+        // receiver's hw regs per §[event_state]'s GPR projection.
+        //
+        // TODO §[event_state] vregs 15/16/17/18 (sender's RFLAGS, RSP,
+        // FS.base, GS.base) — write to recv_user_rsp + 16/24/32/40. The
+        // first two come from gs:24 / gs:8; FS.base/GS.base require rdmsr.
+        // ────────────────────────────────────────────────────────────────
         \\stac
         \\movq %%gs:104, %%rcx
         \\movq %%rcx, (%%rax)
@@ -1549,29 +1616,29 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%rcx, 8(%%rax)
         \\clac
         \\movq %%gs:88, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[ctx_rflags_off]d}(%%rcx), %%r11
-            \\movq {[ctx_rip_off]d}(%%rcx), %%rcx
-            \\
-        ,
-            .{
-                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
-                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[ctx_rflags_off]d}(%%rcx), %%r11
+        \\movq {[ctx_rip_off]d}(%%rcx), %%rcx
+        \\
+    ,
+        .{
+            .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+            .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+        },
+    ) ++
         \\movq %%rax, %%rsp
         \\xorl %%eax, %%eax
         \\swapgs
         \\sysretq
 
-    // ─── Bail handlers ─────────────────────────────────────────────
+        // ─── Bail handlers ─────────────────────────────────────────────
         \\.Lcd_full:
         \\movq %%gs:80, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
         \\ud2
         \\.Lrecv_cd_fail:
         \\ud2
@@ -1581,10 +1648,10 @@ pub export fn syscallEntry() callconv(.naked) void {
         // recv_cd and bail to slow path.
         \\.Lrecv_ec_destroyed:
         \\movq %%gs:80, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
         \\jmp .Lsyscall_lock_fail
 
         // .Lsender_ec_destroyed: Step 9.7 lockWithGen detected sender
@@ -1597,95 +1664,95 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\.Lsender_ec_destroyed:
         \\ud2
         \\.Lsyscall_no_receiver:
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
-            .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[port_lock_off]d}(%%rcx)\n",
+        .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
+    ) ++
         \\.Lsyscall_lock_fail:
         \\movq %%gs:72, %%rax                 // restore target_id for slow path
         \\jmp .Lsyscall_slow_path
 
-    // ═══════════════════════════════════════════════════════════════
-    // REPLY FAST PATH — L4-style direct rendezvous. Mirror of the
-    // suspend fast path: the reply cap names a parked sender (no port
-    // queue to walk — the cap IS the only path to that EC). We switch
-    // this core to that sender via sysretq and the receiver's live
-    // vregs flow zero-copy through the GPRs into sender's user-mode
-    // resumption regs. Receiver gets pushed onto this core's run
-    // queue with .ctx patched so its later re-dispatch returns to the
-    // post-syscall RIP with rax=0.
-    //
-    // Entry: rcx = full syscall_word (low 12 = 52 = .reply,
-    //              bits 12-23 = reply_handle_id, bits 24-63 = 0).
-    //        All other GPRs are receiver vregs and MUST stay
-    //        untouched — they ARE sender's resumption vregs. Free
-    //        scratch: rcx, r11; rax is freed after the gs:64 spill
-    //        and reloaded just before sysretq.
-    //
-    // Predicates (all under receiver CD lock so we can bail to slow
-    // path BEFORE touching the slot):
-    //   1. kernel_table[slot].ref.ptr != null
-    //   2. user_table[slot].word0 type tag == .reply (= 7)
-    //   3. ReplyCaps.abandoned bit (word0 bit 51) clear
-    //   4. sender.iret_frame == null  (slow path uses iret_frame ?? ctx)
-    //   5. sender.vcpu_arch_state == null  (vCPU writeback skipped)
-    //   6. sender.originating_write_cap == true  (else slow path
-    //      preserves sender's own regs; we'd clobber them)
-    // After lock release + slot free, the only remaining failure is
-    // the sender gen-lock acquire racing terminate → inline E_TERM
-    // sysretq to the *receiver* (slot already freed, so re-entering
-    // the slow path would mis-report E_BADCAP).
-    //
-    // Receiver semantics: libz `issueRegDiscard` (the reply asm)
-    // declares all 13 vreg registers as clobbered, so the receiver
-    // does NOT depend on them surviving the syscall. We are free to
-    // hand them off to the sender wholesale — only `receiver.ctx.rax`
-    // gets the explicit 0-write so the syscall return is 0 (success).
-    // The other 12 ctx.regs.* slots stay whatever was there from a
-    // prior preemption; per the libz contract that is in-spec garbage.
-    //
-    // gs scratch slot map (separate slot bands from suspend; only
-    // one fast path runs per syscall trap):
-    //   gs:64  fast_temp[0]  receiver's rax (vreg 1) spill;
-    //                        becomes sender resumption rax
-    //   gs:72  fast_temp[1]  sender_ec_ptr
-    //   gs:80  fast_temp[2]  reply_slot id
-    //   gs:88  fast_temp[3]  &kernel_table[reply_slot]
-    //   gs:96  fast_temp[4]  sender_ec_gen (cap snapshot)
-    //   gs:104 fast_temp[5]  sender_cd_ptr (after sender lock)
-    //   gs:112 fast_temp[6]  (unused)
-    //   gs:120 fast_temp[7]  (unused)
-    // ═══════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
+        // REPLY FAST PATH — L4-style direct rendezvous. Mirror of the
+        // suspend fast path: the reply cap names a parked sender (no port
+        // queue to walk — the cap IS the only path to that EC). We switch
+        // this core to that sender via sysretq and the receiver's live
+        // vregs flow zero-copy through the GPRs into sender's user-mode
+        // resumption regs. Receiver gets pushed onto this core's run
+        // queue with .ctx patched so its later re-dispatch returns to the
+        // post-syscall RIP with rax=0.
+        //
+        // Entry: rcx = full syscall_word (low 12 = 52 = .reply,
+        //              bits 12-23 = reply_handle_id, bits 24-63 = 0).
+        //        All other GPRs are receiver vregs and MUST stay
+        //        untouched — they ARE sender's resumption vregs. Free
+        //        scratch: rcx, r11; rax is freed after the gs:64 spill
+        //        and reloaded just before sysretq.
+        //
+        // Predicates (all under receiver CD lock so we can bail to slow
+        // path BEFORE touching the slot):
+        //   1. kernel_table[slot].ref.ptr != null
+        //   2. user_table[slot].word0 type tag == .reply (= 7)
+        //   3. ReplyCaps.abandoned bit (word0 bit 51) clear
+        //   4. sender.iret_frame == null  (slow path uses iret_frame ?? ctx)
+        //   5. sender.vcpu_arch_state == null  (vCPU writeback skipped)
+        //   6. sender.originating_write_cap == true  (else slow path
+        //      preserves sender's own regs; we'd clobber them)
+        // After lock release + slot free, the only remaining failure is
+        // the sender gen-lock acquire racing terminate → inline E_TERM
+        // sysretq to the *receiver* (slot already freed, so re-entering
+        // the slow path would mis-report E_BADCAP).
+        //
+        // Receiver semantics: libz `issueRegDiscard` (the reply asm)
+        // declares all 13 vreg registers as clobbered, so the receiver
+        // does NOT depend on them surviving the syscall. We are free to
+        // hand them off to the sender wholesale — only `receiver.ctx.rax`
+        // gets the explicit 0-write so the syscall return is 0 (success).
+        // The other 12 ctx.regs.* slots stay whatever was there from a
+        // prior preemption; per the libz contract that is in-spec garbage.
+        //
+        // gs scratch slot map (separate slot bands from suspend; only
+        // one fast path runs per syscall trap):
+        //   gs:64  fast_temp[0]  receiver's rax (vreg 1) spill;
+        //                        becomes sender resumption rax
+        //   gs:72  fast_temp[1]  sender_ec_ptr
+        //   gs:80  fast_temp[2]  reply_slot id
+        //   gs:88  fast_temp[3]  &kernel_table[reply_slot]
+        //   gs:96  fast_temp[4]  sender_ec_gen (cap snapshot)
+        //   gs:104 fast_temp[5]  sender_cd_ptr (after sender lock)
+        //   gs:112 fast_temp[6]  (unused)
+        //   gs:120 fast_temp[7]  (unused)
+        // ═══════════════════════════════════════════════════════════════
         \\.Lsyscall_reply_fast:
 
-    // ─── Step R0: drop rsp below ec.ctx. Same rationale as the
-    // matching Step 0 above `.Lsyscall_suspend_fast` — non-IST
-    // kernel-mode exceptions push their hardware iret frame onto the
-    // current rsp, and ec.ctx.{rip,cs,rflags,rsp,ss} live at
-    // kstack.top - 40 .. kstack.top - 8. 192 = 176 ec.ctx + 16-byte
-    // alignment slack. Bail edges (.Lreply_handle_invalid /
-    // .Lreply_lock_fail / .Lreply_sender_field_fail) inherit this
-    // rsp delta; the slow-path entry resets rsp from gs:0 before its
-    // own subq $176, so the Context buffer always lands at
-    // kstack.top - 176 = ec.ctx_addr.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R0: drop rsp below ec.ctx. Same rationale as the
+        // matching Step 0 above `.Lsyscall_suspend_fast` — non-IST
+        // kernel-mode exceptions push their hardware iret frame onto the
+        // current rsp, and ec.ctx.{rip,cs,rflags,rsp,ss} live at
+        // kstack.top - 40 .. kstack.top - 8. 192 = 176 ec.ctx + 16-byte
+        // alignment slack. Bail edges (.Lreply_handle_invalid /
+        // .Lreply_lock_fail / .Lreply_sender_field_fail) inherit this
+        // rsp delta; the slow-path entry resets rsp from gs:0 before its
+        // own subq $176, so the Context buffer always lands at
+        // kstack.top - 176 = ec.ctx_addr.
+        // ────────────────────────────────────────────────────────────────
         \\subq $192, %%rsp
 
-    // ─── Step R1: spill receiver's rax (vreg 1) to gs:64. cmpxchg
-    // loops below clobber rax; we restore the original value by
-    // copying it into sender.ctx.regs.rax (matches slow-path
-    // copyEventStateGprs gated on sender.originating_write_cap).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R1: spill receiver's rax (vreg 1) to gs:64. cmpxchg
+        // loops below clobber rax; we restore the original value by
+        // copying it into sender.ctx.regs.rax (matches slow-path
+        // copyEventStateGprs gated on sender.originating_write_cap).
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rax, %%gs:64
 
-    // ─── Step R2: extract reply_slot from rcx bits 20-31 (gs:80) and
-    // recv_port_handle_id from rcx bits 32-43 (gs:112). recv_port == 0
-    // ⇒ bare reply (caller resumes after replyee). recv_port != 0 ⇒
-    // atomic-recv-mode reply (caller parks on the named port after
-    // the replyee resumes). gs:112 doubles as the branch flag at R13.
-    // R4b will overlay gs:112 with the packed (recv_port | xfer<<12 |
-    // port_gen<<32) once the recv_port handle has been validated.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R2: extract reply_slot from rcx bits 20-31 (gs:80) and
+        // recv_port_handle_id from rcx bits 32-43 (gs:112). recv_port == 0
+        // ⇒ bare reply (caller resumes after replyee). recv_port != 0 ⇒
+        // atomic-recv-mode reply (caller parks on the named port after
+        // the replyee resumes). gs:112 doubles as the branch flag at R13.
+        // R4b will overlay gs:112 with the packed (recv_port | xfer<<12 |
+        // port_gen<<32) once the recv_port handle has been validated.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%rcx, %%rax
         \\shrq $20, %%rax
         \\andq $0xFFF, %%rax
@@ -1695,35 +1762,35 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\andq $0xFFF, %%rax
         \\movq %%rax, %%gs:112
 
-    // ─── Step R3: acquire receiver's CD gen-lock. CD ptr at gs:40.
-    // CAS pattern matches suspend fast path Step 9.
-    // ────────────────────────────────────────────────────────────────
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:40, %%rcx
-            \\movq {[cd_lock_off]d}(%%rcx), %%rax
-            \\andq $-2, %%rax
-            \\lea 1(%%rax), %%r11
-            \\.Lreply_acquire_cd:
-            \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
-            \\je .Lreply_cd_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_lock_fail
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acquire_cd
-            \\.Lreply_cd_acquired:
-            \\
-        ,
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+        // ─── Step R3: acquire receiver's CD gen-lock. CD ptr at gs:40.
+        // CAS pattern matches suspend fast path Step 9.
+        // ────────────────────────────────────────────────────────────────
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:40, %%rcx
+        \\movq {[cd_lock_off]d}(%%rcx), %%rax
+        \\andq $-2, %%rax
+        \\lea 1(%%rax), %%r11
+        \\.Lreply_acquire_cd:
+        \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
+        \\je .Lreply_cd_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lreply_lock_fail
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lreply_acquire_cd
+        \\.Lreply_cd_acquired:
+        \\
+    ,
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
 
-    // ─── Step R4: validate handle. Compute &kernel_table[slot] and
-    // check ref.ptr != null; check user_table[slot].word0 has type
-    // tag == .reply and the abandoned bit (word0 bit 51) is clear.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R4: validate handle. Compute &kernel_table[slot] and
+        // check ref.ptr != null; check user_table[slot].word0 has type
+        // tag == .reply and the abandoned bit (word0 bit 51) is clear.
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq {[kt_off]d}(%%rcx), %%r11
@@ -1765,21 +1832,21 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step R4b: atomic-recv-mode validation. Only fires when
-    // gs:112 (recv_port_handle_id) is non-zero. Validates the named
-    // port handle while the CD lock is still held (user_table /
-    // kernel_table mutations are CD-protected). On any failure
-    // (E_BADCAP for bad slot/type, E_PERM for missing recv cap),
-    // bail to .Lreply_handle_invalid → slow path re-resolves and
-    // returns the right error code with the reply handle intact
-    // (spec §[reply] tests 22/23).
-    //
-    // Stashes after success:
-    //   gs:120 = port_ec_ptr
-    //   gs:112 = recv_port (bits 0-11) | xfer (bit 12) | port_gen (bits 32-63)
-    //
-    // After this block, rcx == receiver_cd (preserved for R6).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R4b: atomic-recv-mode validation. Only fires when
+        // gs:112 (recv_port_handle_id) is non-zero. Validates the named
+        // port handle while the CD lock is still held (user_table /
+        // kernel_table mutations are CD-protected). On any failure
+        // (E_BADCAP for bad slot/type, E_PERM for missing recv cap),
+        // bail to .Lreply_handle_invalid → slow path re-resolves and
+        // returns the right error code with the reply handle intact
+        // (spec §[reply] tests 22/23).
+        //
+        // Stashes after success:
+        //   gs:120 = port_ec_ptr
+        //   gs:112 = recv_port (bits 0-11) | xfer (bit 12) | port_gen (bits 32-63)
+        //
+        // After this block, rcx == receiver_cd (preserved for R6).
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq %%gs:112, %%rax
@@ -1851,60 +1918,60 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step R5a: acquire sender's gen-lock BEFORE reading sender
-    // fields. Mirrors slow-path's `sender_ref.lockIrqSave(@src())` in
-    // `port.reply` — every read of sender state happens under the
-    // sender's gen-lock so a concurrent destroy/realloc of the slab
-    // slot can't tear our predicate snapshot.
-    //
-    // Stash sender_cd_ptr (sender.domain.ptr) to gs:104 along the
-    // way — needed for the per-core switch + CR3 swap below.
-    //
-    // Lock order: CD (R3) → sender_ec (here). Released sender_ec
-    // (R10) → CD (R7). Acquire CD-then-EC matches port.recv ordering.
-    //
-    // Bails:
-    //   .Lreply_eterm_under_cd : sender gen mismatch (slot recycled
-    //                            since R4 snapshot). CD lock held,
-    //                            handle NOT yet cleared. Release CD,
-    //                            sysretq E_TERM to receiver.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R5a: acquire sender's gen-lock BEFORE reading sender
+        // fields. Mirrors slow-path's `sender_ref.lockIrqSave(@src())` in
+        // `port.reply` — every read of sender state happens under the
+        // sender's gen-lock so a concurrent destroy/realloc of the slab
+        // slot can't tear our predicate snapshot.
+        //
+        // Stash sender_cd_ptr (sender.domain.ptr) to gs:104 along the
+        // way — needed for the per-core switch + CR3 swap below.
+        //
+        // Lock order: CD (R3) → sender_ec (here). Released sender_ec
+        // (R10) → CD (R7). Acquire CD-then-EC matches port.recv ordering.
+        //
+        // Bails:
+        //   .Lreply_eterm_under_cd : sender gen mismatch (slot recycled
+        //                            since R4 snapshot). CD lock held,
+        //                            handle NOT yet cleared. Release CD,
+        //                            sysretq E_TERM to receiver.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:72, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:96, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lreply_acquire_sender:
-            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
-            \\je .Lreply_sender_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_eterm_under_cd
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acquire_sender
-            \\.Lreply_sender_acquired:
-            \\movq {[dom_off]d}(%%rcx), %%r11
-            \\movq %%r11, %%gs:104
-            \\
-        ,
-            .{
-                .dom_off = @offsetOf(ExecutionContext, "domain"),
-                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:96, %%rax
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lreply_acquire_sender:
+        \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+        \\je .Lreply_sender_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lreply_eterm_under_cd
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lreply_acquire_sender
+        \\.Lreply_sender_acquired:
+        \\movq {[dom_off]d}(%%rcx), %%r11
+        \\movq %%r11, %%gs:104
+        \\
+    ,
+        .{
+            .dom_off = @offsetOf(ExecutionContext, "domain"),
+            .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+        },
+    ) ++
 
-    // ─── Step R5b: read sender predicate fields under sender lock.
-    // rcx still holds sender_ec_ptr from R5a's cmpxchg target — keep
-    // using it so the genlock analyzer can prove the lock-acquired
-    // pointer and the field-access pointer are the same register.
-    // Bail to .Lreply_sender_field_fail: releases sender lock first
-    // (LIFO with R5a acquire), then falls into .Lreply_handle_invalid
-    // which releases CD lock and jumps slow path.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R5b: read sender predicate fields under sender lock.
+        // rcx still holds sender_ec_ptr from R5a's cmpxchg target — keep
+        // using it so the genlock analyzer can prove the lock-acquired
+        // pointer and the field-access pointer are the same register.
+        // Bail to .Lreply_sender_field_fail: releases sender lock first
+        // (LIFO with R5a acquire), then falls into .Lreply_handle_invalid
+        // which releases CD lock and jumps slow path.
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movq {[ir_off]d}(%%rcx), %%rax
@@ -1924,108 +1991,111 @@ pub export fn syscallEntry() callconv(.naked) void {
             },
         ) ++
 
-    // ─── Step R6: clearAndFreeSlot inline. R5a left rcx = sender_ec_ptr,
-    // so reload rcx = receiver_cd from gs:40 first.
-    //   user_table[slot] = {0, 0, 0}
-    //   kernel_table[slot].ref = .{}                    (16 bytes)
-    //   kernel_table[slot].parent = encodeFreeNext(cd.free_head)
-    //     (16 bytes domain ErasedSlabRef = 0, then u16 slot =
-    //      cd.free_head, then 6 bytes _reserved = 0)
-    //   kernel_table[slot].first_child = .{}            (24 bytes 0)
-    //   kernel_table[slot].next_sibling = .{}           (24 bytes 0)
-    //   cd.free_head = slot
-    //   cd.free_count += 1
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R6: clearAndFreeSlot inline. R5a left rcx = sender_ec_ptr,
+        // so reload rcx = receiver_cd from gs:40 first.
+        //   kernel_table[slot].instance += 1
+        //   user_table[slot] = {0, 0, 0}
+        //   kernel_table[slot].ref = .{}                    (16 bytes)
+        //   kernel_table[slot].parent = encodeFreeNext(cd.free_head)
+        //     (16 bytes domain ErasedSlabRef = 0, then u16 slot =
+        //      cd.free_head, then 6 bytes _reserved = 0)
+        //   kernel_table[slot].first_child = .{}            (24 bytes 0)
+        //   kernel_table[slot].next_sibling = .{}           (24 bytes 0)
+        //   cd.free_head = slot
+        //   cd.free_count += 1
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:40, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[ut_off]d}(%%rcx), %%r11
-            \\movq %%gs:80, %%rax
-            \\leaq (%%rax, %%rax, 2), %%rax
-            \\leaq (%%r11, %%rax, 8), %%r11
-            \\movq $0, {[w0_off]d}(%%r11)
-            \\movq $0, {[f0_off]d}(%%r11)
-            \\movq $0, {[f1_off]d}(%%r11)
-            \\movq %%gs:88, %%r11
-            \\movq $0, {[ref_ptr_off]d}(%%r11)
-            \\movq $0, {[ref_gen_off]d}(%%r11)
-            \\movq $0, {[par0]d}(%%r11)
-            \\movq $0, {[par1]d}(%%r11)
-            \\movzwq {[fh_off]d}(%%rcx), %%rax
-            \\movq %%rax, {[par2]d}(%%r11)
-            \\movq $0, {[fc0]d}(%%r11)
-            \\movq $0, {[fc1]d}(%%r11)
-            \\movq $0, {[fc2]d}(%%r11)
-            \\movq $0, {[ns0]d}(%%r11)
-            \\movq $0, {[ns1]d}(%%r11)
-            \\movq $0, {[ns2]d}(%%r11)
-            \\movq %%gs:80, %%rax
-            \\movw %%ax, {[fh_off]d}(%%rcx)
-            \\incw {[fc_off]d}(%%rcx)
-            \\
-        ,
-            .{
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
-                .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
-                .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
-                .f1_off = @offsetOf(stygia.caps.capability.Capability, "field1"),
-                .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
-                .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
-                .par0 = @offsetOf(KernelHandle, "parent") + 0,
-                .par1 = @offsetOf(KernelHandle, "parent") + 8,
-                .par2 = @offsetOf(KernelHandle, "parent") + 16,
-                .fc0 = @offsetOf(KernelHandle, "first_child") + 0,
-                .fc1 = @offsetOf(KernelHandle, "first_child") + 8,
-                .fc2 = @offsetOf(KernelHandle, "first_child") + 16,
-                .ns0 = @offsetOf(KernelHandle, "next_sibling") + 0,
-                .ns1 = @offsetOf(KernelHandle, "next_sibling") + 8,
-                .ns2 = @offsetOf(KernelHandle, "next_sibling") + 16,
-                .fh_off = @offsetOf(CapabilityDomain, "free_head"),
-                .fc_off = @offsetOf(CapabilityDomain, "free_count"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[ut_off]d}(%%rcx), %%r11
+        \\movq %%gs:80, %%rax
+        \\leaq (%%rax, %%rax, 2), %%rax
+        \\leaq (%%r11, %%rax, 8), %%r11
+        \\movq $0, {[w0_off]d}(%%r11)
+        \\movq $0, {[f0_off]d}(%%r11)
+        \\movq $0, {[f1_off]d}(%%r11)
+        \\movq %%gs:88, %%r11
+        \\incq {[inst_off]d}(%%r11)
+        \\movq $0, {[ref_ptr_off]d}(%%r11)
+        \\movq $0, {[ref_gen_off]d}(%%r11)
+        \\movq $0, {[par0]d}(%%r11)
+        \\movq $0, {[par1]d}(%%r11)
+        \\movzwq {[fh_off]d}(%%rcx), %%rax
+        \\movq %%rax, {[par2]d}(%%r11)
+        \\movq $0, {[fc0]d}(%%r11)
+        \\movq $0, {[fc1]d}(%%r11)
+        \\movq $0, {[fc2]d}(%%r11)
+        \\movq $0, {[ns0]d}(%%r11)
+        \\movq $0, {[ns1]d}(%%r11)
+        \\movq $0, {[ns2]d}(%%r11)
+        \\movq %%gs:80, %%rax
+        \\movw %%ax, {[fh_off]d}(%%rcx)
+        \\incw {[fc_off]d}(%%rcx)
+        \\
+    ,
+        .{
+            .ut_off = @offsetOf(CapabilityDomain, "user_table"),
+            .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
+            .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
+            .f1_off = @offsetOf(stygia.caps.capability.Capability, "field1"),
+            .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
+            .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
+            .inst_off = @offsetOf(KernelHandle, "instance"),
+            .par0 = @offsetOf(KernelHandle, "parent") + 0,
+            .par1 = @offsetOf(KernelHandle, "parent") + 8,
+            .par2 = @offsetOf(KernelHandle, "parent") + 16,
+            .fc0 = @offsetOf(KernelHandle, "first_child") + 0,
+            .fc1 = @offsetOf(KernelHandle, "first_child") + 8,
+            .fc2 = @offsetOf(KernelHandle, "first_child") + 16,
+            .ns0 = @offsetOf(KernelHandle, "next_sibling") + 0,
+            .ns1 = @offsetOf(KernelHandle, "next_sibling") + 8,
+            .ns2 = @offsetOf(KernelHandle, "next_sibling") + 16,
+            .fh_off = @offsetOf(CapabilityDomain, "free_head"),
+            .fc_off = @offsetOf(CapabilityDomain, "free_count"),
+        },
+    ) ++
 
-    // ─── Step R7: release CD lock. ─────────────────────────────────
+        // ─── Step R7: release CD lock. ─────────────────────────────────
         std.fmt.comptimePrint(
             "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
             .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
         ) ++
 
-    // ─── Step R8: (folded into R5a — sender's gen-lock is already
-    // held by the time we reach here. sender_cd_ptr was stashed to
-    // gs:104 in R5a. Just reload rcx = sender_ec_ptr for R9 below.)
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R8: (folded into R5a — sender's gen-lock is already
+        // held by the time we reach here. sender_cd_ptr was stashed to
+        // gs:104 in R5a. Just reload rcx = sender_ec_ptr for R9 below.)
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:72, %%rcx
-        ++
+    ++
 
-    // ─── Step R9: resumeFromReply state writes on sender. Sender goes
-    // straight to .running because we are about to switch this core
-    // to it (no runqueue insertion for sender — direct dispatch).
-    // Mirrors execution_context.resumeFromReply field-for-field.
-    //
-    // ALSO: stamp `sender.last_dispatched_core = core_id` here, while
-    // sender's gen-lock is still held (acquired R5a, released R10).
-    // The R14 stamp site fires AFTER R10, leaving a window where a
-    // concurrent terminate(sender) acquires sender's gen-lock
-    // (briefly), reads a STALE `last_dispatched_core` (the core that
-    // ran sender pre-suspend, possibly idle now), and posts sender's
-    // zombie to that wrong core. That core's next switchTo sees
-    // `standing_on_zombie = false` (it's not on sender's kstack —
-    // sender's kstack is unused in user-mode park), reaps sender,
-    // and `finalizeDestroyMarkedDead` unmaps sender's kstack pages +
-    // zeroes the slab. Then THIS core's R14 reads
-    // `ec.kernel_stack.top` from the just-zeroed slab → writes 0 to
-    // gs:0 / TSS.RSP0. The next ring-3 → ring-0 entry pushes its
-    // iret-frame at virt 0 → #PF (no IST) → #DF → triple-fault, with
-    // no panic text emitted. Stamping under sender's gen-lock here
-    // forces terminate to wait until R10 releases, by which point
-    // `last_dispatched_core` correctly names this core; the resulting
-    // postZombie + wake IPI then routes to us, and our next switchTo
-    // (already off sender's kstack via sysretq's user-mode return)
-    // reaps cleanly. Same race exists architecturally on the suspend
-    // FP step 14, but there the stamp is already inside the receiver
-    // gen-lock window (Step 9.5 → Step 15.5).
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R9: resumeFromReply state writes on sender. Sender goes
+        // straight to .running because we are about to switch this core
+        // to it (no runqueue insertion for sender — direct dispatch).
+        // Mirrors execution_context.resumeFromReply field-for-field.
+        //
+        // ALSO: stamp `sender.last_dispatched_core = core_id` here, while
+        // sender's gen-lock is still held (acquired R5a, released R10).
+        // The R14 stamp site fires AFTER R10, leaving a window where a
+        // concurrent terminate(sender) acquires sender's gen-lock
+        // (briefly), reads a STALE `last_dispatched_core` (the core that
+        // ran sender pre-suspend, possibly idle now), and posts sender's
+        // zombie to that wrong core. That core's next switchTo sees
+        // `standing_on_zombie = false` (it's not on sender's kstack —
+        // sender's kstack is unused in user-mode park), reaps sender,
+        // and `finalizeDestroyMarkedDead` unmaps sender's kstack pages +
+        // zeroes the slab. Then THIS core's R14 reads
+        // `ec.kernel_stack.top` from the just-zeroed slab → writes 0 to
+        // gs:0 / TSS.RSP0. The next ring-3 → ring-0 entry pushes its
+        // iret-frame at virt 0 → #PF (no IST) → #DF → triple-fault, with
+        // no panic text emitted. Stamping under sender's gen-lock here
+        // forces terminate to wait until R10 releases, by which point
+        // `last_dispatched_core` correctly names this core; the resulting
+        // postZombie + wake IPI then routes to us, and our next switchTo
+        // (already off sender's kstack via sysretq's user-mode return)
+        // reaps cleanly. Same race exists architecturally on the suspend
+        // FP step 14, but there the stamp is already inside the receiver
+        // gen-lock window (Step 9.5 → Step 15.5).
+        // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
             \\movb ${[state_run]d}, {[state_off]d}(%%rcx)
@@ -2057,459 +2127,460 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .orig_write_off = @offsetOf(ExecutionContext, "originating_write_cap"),
                 .orig_read_off = @offsetOf(ExecutionContext, "originating_read_cap"),
                 .ppc_off = @offsetOf(ExecutionContext, "pending_pair_count"),
-                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .last_disp_off = @offsetOf(ExecutionContext, "owner_core"),
                 .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
-    // ─── Step R10: release sender gen lock. ────────────────────────
+        // ─── Step R10: release sender gen lock. ────────────────────────
         std.fmt.comptimePrint(
             "\nandq $-2, {[ec_lock_off]d}(%%rcx)\n",
             .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
         ) ++
 
-    // ─── Step R10.5: acquire caller (= receiver = current_ec) gen-lock
-    // before any receiver-EC field writes. R11..R13 mutate receiver.ctx
-    // (rip/rsp/rflags/rax/cs/ss), receiver.state, receiver.event_*,
-    // receiver.suspend_port, receiver.recv_port_xfer, receiver.next /
-    // priority — every one of those is also a write target for unrelated
-    // syscalls that other cores can issue against a handle to this same
-    // EC (priority, setRegisters, kill, etc.). Per the lock discipline:
-    // touching a slab-backed object's fields requires holding its
-    // _gen_lock against a snapshotted gen.
-    //
-    // Snap is `scratch.current_ec_gen` (gs:176), captured by `switchTo`
-    // alongside `current_ec`. Between R7 (CD release) and here the
-    // caller_ec carries no held lock, so a concurrent terminate from
-    // another core that holds a handle to *us* could fire (locks
-    // caller_ec briefly, releases, then `destroyExecutionContext`
-    // rotates gen to even; a fresh allocation could rotate it again
-    // back to a different odd). A plain spin-acquire would lock the
-    // wrong slab generation; lockWithGen catches the mismatch and
-    // bails to `.Lreply_caller_destroyed`.
-    //
-    // Lock order: nothing else held at this point (R7 dropped CD, R10
-    // dropped sender_ec). For the atomic-recv-park R13 branch the port
-    // lock will nest under this lock (receiver_ec → port). Tag the
-    // acquisition with ordered_group=2 (EC_NESTED_GROUP) so future asm
-    // additions that need same-class nesting (sender_ec + receiver_ec
-    // simultaneously, address-ordered) don't trip lockdep — though this
-    // particular path holds only one EC at a time.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R10.5: acquire caller (= receiver = current_ec) gen-lock
+        // before any receiver-EC field writes. R11..R13 mutate receiver.ctx
+        // (rip/rsp/rflags/rax/cs/ss), receiver.state, receiver.event_*,
+        // receiver.suspend_port, receiver.recv_port_xfer, receiver.next /
+        // priority — every one of those is also a write target for unrelated
+        // syscalls that other cores can issue against a handle to this same
+        // EC (priority, setRegisters, kill, etc.). Per the lock discipline:
+        // touching a slab-backed object's fields requires holding its
+        // _gen_lock against a snapshotted gen.
+        //
+        // Snap is `scratch.current_ec_gen` (gs:176), captured by `switchTo`
+        // alongside `current_ec`. Between R7 (CD release) and here the
+        // caller_ec carries no held lock, so a concurrent terminate from
+        // another core that holds a handle to *us* could fire (locks
+        // caller_ec briefly, releases, then `destroyExecutionContext`
+        // rotates gen to even; a fresh allocation could rotate it again
+        // back to a different odd). A plain spin-acquire would lock the
+        // wrong slab generation; lockWithGen catches the mismatch and
+        // bails to `.Lreply_caller_destroyed`.
+        //
+        // Lock order: nothing else held at this point (R7 dropped CD, R10
+        // dropped sender_ec). For the atomic-recv-park R13 branch the port
+        // lock will nest under this lock (receiver_ec → port). Tag the
+        // acquisition with ordered_group=2 (EC_NESTED_GROUP) so future asm
+        // additions that need same-class nesting (sender_ec + receiver_ec
+        // simultaneously, address-ordered) don't trip lockdep — though this
+        // particular path holds only one EC at a time.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:32, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:{[sc_cur_gen]d}, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lreply_acq_caller:
-            \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
-            \\je .Lreply_caller_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_caller_destroyed
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acq_caller
-            \\.Lreply_caller_acquired:
-            \\
-        ,
-            .{
-                .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .sc_cur_gen = Offsets.sc_current_ec_gen,
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:{[sc_cur_gen]d}, %%rax
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lreply_acq_caller:
+        \\lock cmpxchgq %%r11, {[ec_lock_off]d}(%%rcx)
+        \\je .Lreply_caller_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lreply_caller_destroyed
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lreply_acq_caller
+        \\.Lreply_caller_acquired:
+        \\
+    ,
+        .{
+            .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .sc_cur_gen = Offsets.sc_current_ec_gen,
+        },
+    ) ++
 
-    // ─── Step R11: patch receiver.ctx so its eventual re-dispatch
-    // through `switchTo` iretq's into post-syscall user mode with
-    // rax=0 (success). Only 4 fields touched: regs.rax, rip, rflags,
-    // rsp. The other 12 ctx.regs.* slots stay whatever was there
-    // from a prior preemption — receiver's libz reply asm declares
-    // them clobbered, so stale values are in-spec garbage.
-    //
-    // No Context push, no per-vreg copy — the live receiver vregs
-    // remain in registers and ride sysretq into sender's user mode
-    // zero-copy.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R11: patch receiver.ctx so its eventual re-dispatch
+        // through `switchTo` iretq's into post-syscall user mode with
+        // rax=0 (success). Only 4 fields touched: regs.rax, rip, rflags,
+        // rsp. The other 12 ctx.regs.* slots stay whatever was there
+        // from a prior preemption — receiver's libz reply asm declares
+        // them clobbered, so stale values are in-spec garbage.
+        //
+        // No Context push, no per-vreg copy — the live receiver vregs
+        // remain in registers and ride sysretq into sender's user mode
+        // zero-copy.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:32, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[ec_ctx_off]d}(%%rcx), %%rcx
-            \\movq $0, {[reg_rax_off]d}(%%rcx)
-            \\movq %%gs:16, %%r11
-            \\movq %%r11, {[ctx_rip_off]d}(%%rcx)
-            \\movq %%gs:24, %%r11
-            \\movq %%r11, {[ctx_rflags_off]d}(%%rcx)
-            \\movq %%gs:8, %%r11
-            \\movq %%r11, {[ctx_rsp_off]d}(%%rcx)
-            \\movq $0x23, {[ctx_cs_off]d}(%%rcx)
-            \\movq $0x1b, {[ctx_ss_off]d}(%%rcx)
-            \\
-        ,
-            .{
-                .ec_ctx_off = @offsetOf(ExecutionContext, "ctx"),
-                .reg_rax_off = @offsetOf(cpu.Context, "regs") + @offsetOf(cpu.Registers, "rax"),
-                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
-                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
-                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
-                .ctx_cs_off = @offsetOf(cpu.Context, "cs"),
-                .ctx_ss_off = @offsetOf(cpu.Context, "ss"),
-            },
-        ) ++ (if (build_options.kernel_ctx_trace)
-            // See suspend Step 12 mark above for the kstack-vs-ec.ctx
-            // overlap rationale.
-            \\subq $192, %%rsp
-            \\call ctxTraceMarkFromAsm_fp_reply_r11
-            \\addq $192, %%rsp
-            \\
-        else
-            "") ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[ec_ctx_off]d}(%%rcx), %%rcx
+        \\movq $0, {[reg_rax_off]d}(%%rcx)
+        \\movq %%gs:16, %%r11
+        \\movq %%r11, {[ctx_rip_off]d}(%%rcx)
+        \\movq %%gs:24, %%r11
+        \\movq %%r11, {[ctx_rflags_off]d}(%%rcx)
+        \\movq %%gs:8, %%r11
+        \\movq %%r11, {[ctx_rsp_off]d}(%%rcx)
+        \\movq $0x23, {[ctx_cs_off]d}(%%rcx)
+        \\movq $0x1b, {[ctx_ss_off]d}(%%rcx)
+        \\
+    ,
+        .{
+            .ec_ctx_off = @offsetOf(ExecutionContext, "ctx"),
+            .reg_rax_off = @offsetOf(cpu.Context, "regs") + @offsetOf(cpu.Registers, "rax"),
+            .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+            .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+            .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+            .ctx_cs_off = @offsetOf(cpu.Context, "cs"),
+            .ctx_ss_off = @offsetOf(cpu.Context, "ss"),
+        },
+    ) ++ (if (build_options.kernel_ctx_trace)
+        // See suspend Step 12 mark above for the kstack-vs-ec.ctx
+        // overlap rationale.
+        \\subq $192, %%rsp
+        \\call ctxTraceMarkFromAsm_fp_reply_r11
+        \\addq $192, %%rsp
+        \\
+    else
+        "") ++
 
-    // ─── Step R12: enter the IRQ-disabled critical section. cli
-    // covers the receiver-enqueue (`core_locks[i]` is taken from
-    // IRQ context by `enqueueOnCore`), the per-core swap of identity
-    // away from the receiver, and the CR3 switch — any IRQ landing
-    // mid-transition would see PerCore.current_ec=sender alongside
-    // a TSS.RSP0 still pointing at receiver's kstack and could
-    // dispatch `switchTo(other)` over our half-completed swap.
-    // sysretq's RFLAGS load (from the suspended sender's saved IF=1
-    // RFLAGS in r11) re-enables IRQs in user mode, so no explicit sti.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R12: enter the IRQ-disabled critical section. cli
+        // covers the receiver-enqueue (`core_locks[i]` is taken from
+        // IRQ context by `enqueueOnCore`), the per-core swap of identity
+        // away from the receiver, and the CR3 switch — any IRQ landing
+        // mid-transition would see PerCore.current_ec=sender alongside
+        // a TSS.RSP0 still pointing at receiver's kstack and could
+        // dispatch `switchTo(other)` over our half-completed swap.
+        // sysretq's RFLAGS load (from the suspended sender's saved IF=1
+        // RFLAGS in r11) re-enables IRQs in user mode, so no explicit sti.
+        // ────────────────────────────────────────────────────────────────
         \\cli
 
-    // ─── Step R13: park or enqueue the caller (= receiver of the
-    // original event). Branches on gs:112 != 0:
-    //
-    //   recv_port == 0 (bare reply): caller goes on this core's run
-    //   queue with state .ready. Existing path. Caller resumes via
-    //   switchTo when scheduler picks it up.
-    //
-    //   recv_port != 0 (atomic-recv-mode): caller parks on the named
-    //   port's wait queue with state .suspended_on_port, mirroring
-    //   what slow-path port.recv would do. Lock order: port lock only
-    //   (CD released at R7, sender released at R10). Acquires port's
-    //   gen-lock with snapshot port_gen (gs:112 bits 32-63); if gen
-    //   mismatch (port destroyed between R4b validation and now),
-    //   fall back to run-queue enqueue — caller's syscall returns OK
-    //   without parking. (Spec leaves this exact race undefined; the
-    //   port-recv-cap holder is the caller itself, so port destruction
-    //   from outside our domain is impossible here in practice.)
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R13: park or enqueue the caller (= receiver of the
+        // original event). Branches on gs:112 != 0:
+        //
+        //   recv_port == 0 (bare reply): caller goes on this core's run
+        //   queue with state .ready. Existing path. Caller resumes via
+        //   switchTo when scheduler picks it up.
+        //
+        //   recv_port != 0 (atomic-recv-mode): caller parks on the named
+        //   port's wait queue with state .suspended_on_port, mirroring
+        //   what slow-path port.recv would do. Lock order: port lock only
+        //   (CD released at R7, sender released at R10). Acquires port's
+        //   gen-lock with snapshot port_gen (gs:112 bits 32-63); if gen
+        //   mismatch (port destroyed between R4b validation and now),
+        //   fall back to run-queue enqueue — caller's syscall returns OK
+        //   without parking. (Spec leaves this exact race undefined; the
+        //   port-recv-cap holder is the caller itself, so port destruction
+        //   from outside our domain is impossible here in practice.)
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:112, %%rax
         \\testq %%rax, %%rax
         \\jnz .Lreply_atomic_recv_park
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:{[sc_core_lock]d}, %%rcx
-            \\.Lreply_acq_core:
-            \\movl $1, %%eax
-            \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
-            \\testl %%eax, %%eax
-            \\jz .Lreply_have_core
-            \\pause
-            \\jmp .Lreply_acq_core
-            \\.Lreply_have_core:
-            \\
-            \\movq %%gs:32, %%rcx
-            \\movb $0, {[on_cpu_off]d}(%%rcx)
-            \\# stygia-qbx: do NOT stamp .ready over .exited. A peer core
-            \\# can terminate this caller while it is mid-reply; stamping
-            \\# unconditionally resurrects it AND erases the `.exited`
-            \\# marker that dequeueOrIdleLocked filters on, so a dead EC
-            \\# gets dispatched in the window before bumpDeadGenLocked
-            \\# flips the gen. Checked under the core lock we just took,
-            \\# so this agrees with scheduler.enqueueOnCore's gate rather
-            \\# than racing it. on_cpu is cleared either way — the EC is
-            \\# leaving this core regardless, and leaving it set strands
-            \\# the zombie reap.
-            \\cmpb ${[state_exited]d}, {[state_off]d}(%%rcx)
-            \\je .Lreply_R13_unlock
-            \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
-            \\
-            \\movzbq {[priority_off]d}(%%rcx), %%r11
-            \\shlq $4, %%r11
-            \\movq %%gs:{[sc_per_core]d}, %%rax
-            \\addq ${[run_queue_off]d}, %%rax
-            \\addq %%r11, %%rax
-            \\
-            \\movq {[lvl_tail_off]d}(%%rax), %%r11
-            \\testq %%r11, %%r11
-            \\jz .Lreply_q_empty
-            \\movq %%rcx, {[ec_next_off]d}(%%r11)
-            \\jmp .Lreply_q_set_tail
-            \\.Lreply_q_empty:
-            \\movq %%rcx, {[lvl_head_off]d}(%%rax)
-            \\.Lreply_q_set_tail:
-            \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
-            \\movq $0, {[ec_next_off]d}(%%rcx)
-            \\
-            \\.Lreply_R13_unlock:
-            \\movq %%gs:{[sc_core_lock]d}, %%rcx
-            \\movl $0, {[lock_state_off]d}(%%rcx)
-            \\jmp .Lreply_R13_done
-            \\
-        ,
-            .{
-                .sc_core_lock = Offsets.sc_core_lock_ptr,
-                .sc_per_core = Offsets.sc_per_core_ptr,
-                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
-                .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
-                .state_exited = @intFromEnum(stygia.sched.execution_context.State.exited),
-                .state_off = @offsetOf(ExecutionContext, "state"),
-                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .priority_off = @offsetOf(ExecutionContext, "priority"),
-                .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
-                .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
-                .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
-                .ec_next_off = @offsetOf(ExecutionContext, "next"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:{[sc_core_lock]d}, %%rcx
+        \\.Lreply_acq_core:
+        \\movl $1, %%eax
+        \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
+        \\testl %%eax, %%eax
+        \\jz .Lreply_have_core
+        \\pause
+        \\jmp .Lreply_acq_core
+        \\.Lreply_have_core:
+        \\
+        \\movq %%gs:32, %%rcx
+        \\movb $0, {[on_cpu_off]d}(%%rcx)
+        \\# stygia-qbx: do NOT stamp .ready over .exited. A peer core
+        \\# can terminate this caller while it is mid-reply; stamping
+        \\# unconditionally resurrects it AND erases the `.exited`
+        \\# marker that dequeueOrIdleLocked filters on, so a dead EC
+        \\# gets dispatched in the window before bumpDeadGenLocked
+        \\# flips the gen. Checked under the core lock we just took,
+        \\# so this agrees with scheduler.enqueueOnCore's gate rather
+        \\# than racing it. on_cpu is cleared either way — the EC is
+        \\# leaving this core regardless, and leaving it set strands
+        \\# the zombie reap.
+        \\cmpb ${[state_exited]d}, {[state_off]d}(%%rcx)
+        \\je .Lreply_R13_unlock
+        \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
+        \\
+        \\movzbq {[priority_off]d}(%%rcx), %%r11
+        \\shlq $4, %%r11
+        \\movq %%gs:{[sc_per_core]d}, %%rax
+        \\addq ${[run_queue_off]d}, %%rax
+        \\addq %%r11, %%rax
+        \\
+        \\movq {[lvl_tail_off]d}(%%rax), %%r11
+        \\testq %%r11, %%r11
+        \\jz .Lreply_q_empty
+        \\movq %%rcx, {[ec_next_off]d}(%%r11)
+        \\jmp .Lreply_q_set_tail
+        \\.Lreply_q_empty:
+        \\movq %%rcx, {[lvl_head_off]d}(%%rax)
+        \\.Lreply_q_set_tail:
+        \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
+        \\movq $0, {[ec_next_off]d}(%%rcx)
+        \\
+        \\.Lreply_R13_unlock:
+        \\movq %%gs:{[sc_core_lock]d}, %%rcx
+        \\movl $0, {[lock_state_off]d}(%%rcx)
+        \\jmp .Lreply_R13_done
+        \\
+    ,
+        .{
+            .sc_core_lock = Offsets.sc_core_lock_ptr,
+            .sc_per_core = Offsets.sc_per_core_ptr,
+            .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
+            .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
+            .state_exited = @intFromEnum(stygia.sched.execution_context.State.retired),
+            .state_off = @offsetOf(ExecutionContext, "state"),
+            .on_cpu_off = @offsetOf(ExecutionContext, "owner_core"),
+            .priority_off = @offsetOf(ExecutionContext, "priority"),
+            .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
+            .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
+            .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
+            .ec_next_off = @offsetOf(ExecutionContext, "next"),
+        },
+    ) ++
 
-    // ─── Step R13 atomic-recv-park branch: caller parks on the
-    // recv_port wait queue. Acquires port's gen-lock with snapshot
-    // port_gen (gs:112 bits 32-63). port_ec_ptr in gs:120. Lock
-    // order: port lock only — no other locks held at this point
-    // (CD released R7, sender released R10). Mirrors slow-path
-    // port.recv's enqueueReceiver path.
-    //
-    // Receiver fields written (matches slow-path port.recv):
-    //   state            = .suspended_on_port
-    //   suspend_port     = SlabRef{port_ec_ptr, port_gen} + Some
-    //   event_type       = .none
-    //   event_subcode    = 0
-    //   event_addr       = 0
-    //   pending_reply_*  = null/0
-    //   recv_port_xfer   = bit 12 of packed gs:112
-    //   on_cpu           = false
-    //
-    // Port fields written:
-    //   waiters[priority]        — append receiver
-    //   waiter_kind              = .receivers
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R13 atomic-recv-park branch: caller parks on the
+        // recv_port wait queue. Acquires port's gen-lock with snapshot
+        // port_gen (gs:112 bits 32-63). port_ec_ptr in gs:120. Lock
+        // order: port lock only — no other locks held at this point
+        // (CD released R7, sender released R10). Mirrors slow-path
+        // port.recv's enqueueReceiver path.
+        //
+        // Receiver fields written (matches slow-path port.recv):
+        //   state            = .suspended_on_port
+        //   suspend_port     = SlabRef{port_ec_ptr, port_gen} + Some
+        //   event_type       = .none
+        //   event_subcode    = 0
+        //   event_addr       = 0
+        //   pending_reply_*  = null/0
+        //   recv_port_xfer   = bit 12 of packed gs:112
+        //   on_cpu           = false
+        //
+        // Port fields written:
+        //   waiters[priority]        — append receiver
+        //   waiter_kind              = .receivers
+        // ────────────────────────────────────────────────────────────────
         \\.Lreply_atomic_recv_park:
-        ++ (if (build_options.kernel_ctx_trace)
-            // See suspend Step 12 mark above for the kstack-vs-ec.ctx
-            // overlap rationale.
-            \\subq $192, %%rsp
-            \\call ctxTraceMarkFromAsm_recv_park
-            \\addq $192, %%rsp
-            \\
-        else
-            "") ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:120, %%rcx
-            \\movq %%gs:112, %%rax
-            \\shrq $32, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lreply_acq_port:
-            \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
-            \\je .Lreply_port_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_atomic_recv_fallback
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acq_port
-            \\.Lreply_port_acquired:
-            \\
-            \\# Senders-bail under port lock: if the recv_port has
-            \\# pending senders, the park branch below would clobber
-            \\# waiter_kind to .receivers and strand them. Release
-            \\# port_lock + caller gen-lock and route to the Zig
-            \\# slow-path-recv helper which performs the rendezvous
-            \\# (deliverEvent stages event_state into caller's
-            \\# pending_event_word, helper marks caller .ready and
-            \\# enqueues on this core's run queue). Asm continues
-            \\# with R14 swap to the original replyee.
-            \\movq %%gs:120, %%rcx
-            \\cmpb ${[wk_senders]d}, {[waiter_kind_off]d}(%%rcx)
-            \\jne .Lreply_port_no_senders
-            \\andq $-2, {[port_lock_off]d}(%%rcx)
-            \\movq %%gs:32, %%rcx
-            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
-            \\movq %%gs:32, %%rdi
-            \\movq %%gs:112, %%rsi
-            \\andq $0xFFF, %%rsi
-            \\subq $192, %%rsp
-            \\call replyAtomicRecvSendersFallback
-            \\addq $192, %%rsp
-            \\jmp .Lreply_R13_done
-            \\.Lreply_port_no_senders:
-            \\
-            \\movq %%gs:32, %%r11
-            \\movzbq {[priority_off]d}(%%r11), %%rax
-            \\shlq $4, %%rax
-            \\movq %%gs:120, %%rcx
-            \\addq ${[waiters_off]d}, %%rcx
-            \\addq %%rax, %%rcx
-            \\
-            \\movq {[lvl_tail_off]d}(%%rcx), %%rax
-            \\testq %%rax, %%rax
-            \\jz .Lreply_port_q_empty
-            \\movq %%r11, {[ec_next_off]d}(%%rax)
-            \\jmp .Lreply_port_q_set_tail
-            \\.Lreply_port_q_empty:
-            \\movq %%r11, {[lvl_head_off]d}(%%rcx)
-            \\.Lreply_port_q_set_tail:
-            \\movq %%r11, {[lvl_tail_off]d}(%%rcx)
-            \\movq $0, {[ec_next_off]d}(%%r11)
-            \\
-            \\movq %%gs:120, %%rcx
-            \\movb ${[wk_recv]d}, {[waiter_kind_off]d}(%%rcx)
-            \\
-            \\movq %%gs:32, %%rcx
-            \\movb ${[event_none]d}, {[event_off]d}(%%rcx)
-            \\movb $0, {[event_subcode_off]d}(%%rcx)
-            \\movq $0, {[event_addr_off]d}(%%rcx)
-            \\movq $0, {[prh_off]d}(%%rcx)
-            \\movb $0, {[prd_disc_off]d}(%%rcx)
-            \\movw $0, {[prs_off]d}(%%rcx)
-            \\
-            \\movq %%gs:120, %%r11
-            \\movq %%r11, {[susp_value_ptr_off]d}(%%rcx)
-            \\movq %%gs:112, %%r11
-            \\shrq $32, %%r11
-            \\movl %%r11d, {[susp_value_gen_off]d}(%%rcx)
-            \\movb $1, {[susp_disc_off]d}(%%rcx)
-            \\
-            \\movq %%gs:112, %%r11
-            \\shrq $12, %%r11
-            \\andq $1, %%r11
-            \\movb %%r11b, {[recv_xfer_off]d}(%%rcx)
-            \\
-            \\movb ${[state_susp]d}, {[state_off]d}(%%rcx)
-            \\movb $0, {[on_cpu_off]d}(%%rcx)
-            \\
-            \\movq %%gs:120, %%rcx
-            \\andq $-2, {[port_lock_off]d}(%%rcx)
-            \\jmp .Lreply_R13_done
-            \\
-            \\.Lreply_atomic_recv_fallback:
-            \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
-            \\.Lreply_acq_core_fb:
-            \\movl $1, %%eax
-            \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
-            \\testl %%eax, %%eax
-            \\jz .Lreply_have_core_fb
-            \\pause
-            \\jmp .Lreply_acq_core_fb
-            \\.Lreply_have_core_fb:
-            \\movq %%gs:32, %%rcx
-            \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
-            \\movb $0, {[on_cpu_off]d}(%%rcx)
-            \\movzbq {[priority_off]d}(%%rcx), %%r11
-            \\shlq $4, %%r11
-            \\movq %%gs:{[sc_per_core_late]d}, %%rax
-            \\addq ${[run_queue_off]d}, %%rax
-            \\addq %%r11, %%rax
-            \\movq {[lvl_tail_off]d}(%%rax), %%r11
-            \\testq %%r11, %%r11
-            \\jz .Lreply_q_empty_fb
-            \\movq %%rcx, {[ec_next_off]d}(%%r11)
-            \\jmp .Lreply_q_set_tail_fb
-            \\.Lreply_q_empty_fb:
-            \\movq %%rcx, {[lvl_head_off]d}(%%rax)
-            \\.Lreply_q_set_tail_fb:
-            \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
-            \\movq $0, {[ec_next_off]d}(%%rcx)
-            \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
-            \\movl $0, {[lock_state_off]d}(%%rcx)
-            \\
-            \\.Lreply_R13_done:
-            \\
-            \\# Step R13.5: release caller (= receiver) gen-lock paired
-            \\# with R10.5 acquire. After this point R14's per-core swap
-            \\# moves gs:32 from receiver to sender, so the receiver's
-            \\# lock window covers exactly the receiver-EC field writes
-            \\# in R11..R13. Plain `andq $-2` mirrors R7/R10.
-            \\movq %%gs:32, %%rcx
-            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
-            \\
-            \\# Step R13.6: re-acquire sender (= replyee) gen-lock
-            \\# before R14's sender-EC field reads (kernel_stack.top at
-            \\# R14, ctx pointer at R16). Sender was unlocked at R10
-            \\# while we wrote the receiver, but R14 reads sender.
-            \\# kernel_stack.top and R16 reads sender.ctx — both EC
-            \\# fields whose race window opens whenever another core
-            \\# holds a sender-EC handle and mounts a syscall against
-            \\# it (priority/setRegisters/etc.). Spec §[reply] mandates
-            \\# the sender resumes coherent register state; without
-            \\# this lock-window, a concurrent setRegisters on another
-            \\# core could overwrite ctx mid-sysretq-prep.
-            \\#
-            \\# Uses the lockWithGen pattern (R5a-style) against the
-            \\# snapshotted sender_gen at gs:96: if a concurrent destroy
-            \\# fired between R10 release and here, the gen has rotated
-            \\# to even and our cmpxchg fails with bit-1+ set. We
-            \\# detect that via xorq+testq and bail to a UAF-panic — the
-            \\# fast path has already cleared the reply slot and parked
-            \\# the receiver, so there's no clean unwind; landing on a
-            \\# destroyed sender's ctx during sysretq is the worse
-            \\# alternative.
-            \\#
-            \\# Lock order: only sender_ec held at this point. caller_ec
-            \\# was just released (R13.5); CD released at R7. No nesting.
-            \\movq %%gs:72, %%rcx
-            \\movq %%gs:96, %%rax
-            \\shlq $1, %%rax
-            \\movq %%rax, %%r11
-            \\incq %%r11
-            \\.Lreply_acq_sender_r14:
-            \\lock cmpxchgq %%r11, {[ec_unlock_off]d}(%%rcx)
-            \\je .Lreply_sender_r14_acquired
-            \\xorq %%r11, %%rax
-            \\testq $-2, %%rax
-            \\jnz .Lreply_sender_destroyed
-            \\pause
-            \\movq %%r11, %%rax
-            \\andq $-2, %%rax
-            \\jmp .Lreply_acq_sender_r14
-            \\.Lreply_sender_r14_acquired:
-            \\
-        ,
-            .{
-                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .port_lock_off = @offsetOf(stygia.sched.port.Port, "_gen_lock"),
-                .waiters_off = @offsetOf(stygia.sched.port.Port, "waiters"),
-                .waiter_kind_off = @offsetOf(stygia.sched.port.Port, "waiter_kind"),
-                .wk_recv = @intFromEnum(stygia.sched.port.WaiterKind.receivers),
-                .wk_senders = @intFromEnum(stygia.sched.port.WaiterKind.senders),
-                .priority_off = @offsetOf(ExecutionContext, "priority"),
-                .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
-                .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
-                .ec_next_off = @offsetOf(ExecutionContext, "next"),
-                .state_off = @offsetOf(ExecutionContext, "state"),
-                .state_susp = @intFromEnum(stygia.sched.execution_context.State.suspended_on_port),
-                .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
-                .event_off = @offsetOf(ExecutionContext, "event_type"),
-                .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
-                .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
-                .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
-                .prh_off = @offsetOf(ExecutionContext, "pending_reply_holder"),
-                .prd_disc_off = @offsetOf(ExecutionContext, "pending_reply_domain") + 16,
-                .prs_off = @offsetOf(ExecutionContext, "pending_reply_slot"),
-                .susp_value_ptr_off = @offsetOf(ExecutionContext, "suspend_port") + 0,
-                .susp_value_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
-                .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
-                .recv_xfer_off = @offsetOf(ExecutionContext, "recv_port_xfer"),
-                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
-                .sc_core_lock_late = Offsets.sc_core_lock_ptr,
-                .sc_per_core_late = Offsets.sc_per_core_ptr,
-                .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
-            },
-        ) ++
+    ++ (if (build_options.kernel_ctx_trace)
+        // See suspend Step 12 mark above for the kstack-vs-ec.ctx
+        // overlap rationale.
+        \\subq $192, %%rsp
+        \\call ctxTraceMarkFromAsm_recv_park
+        \\addq $192, %%rsp
+        \\
+    else
+        "") ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:120, %%rcx
+        \\movq %%gs:112, %%rax
+        \\shrq $32, %%rax
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lreply_acq_port:
+        \\lock cmpxchgq %%r11, {[port_lock_off]d}(%%rcx)
+        \\je .Lreply_port_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lreply_atomic_recv_fallback
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lreply_acq_port
+        \\.Lreply_port_acquired:
+        \\
+        \\# Senders-bail under port lock: if the recv_port has
+        \\# pending senders, the park branch below would clobber
+        \\# waiter_kind to .receivers and strand them. Release
+        \\# port_lock + caller gen-lock and route to the Zig
+        \\# slow-path-recv helper which performs the rendezvous
+        \\# (deliverEvent stages event_state into caller's
+        \\# pending_event_word, helper marks caller .ready and
+        \\# enqueues on this core's run queue). Asm continues
+        \\# with R14 swap to the original replyee.
+        \\movq %%gs:120, %%rcx
+        \\cmpb ${[wk_senders]d}, {[waiter_kind_off]d}(%%rcx)
+        \\jne .Lreply_port_no_senders
+        \\andq $-2, {[port_lock_off]d}(%%rcx)
+        \\movq %%gs:32, %%rcx
+        \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+        \\movq %%gs:32, %%rdi
+        \\movq %%gs:112, %%rsi
+        \\andq $0xFFF, %%rsi
+        \\subq $192, %%rsp
+        \\call replyAtomicRecvSendersFallback
+        \\addq $192, %%rsp
+        \\jmp .Lreply_R13_after_caller_unlock
+        \\.Lreply_port_no_senders:
+        \\
+        \\movq %%gs:32, %%r11
+        \\movzbq {[priority_off]d}(%%r11), %%rax
+        \\shlq $4, %%rax
+        \\movq %%gs:120, %%rcx
+        \\addq ${[waiters_off]d}, %%rcx
+        \\addq %%rax, %%rcx
+        \\
+        \\movq {[lvl_tail_off]d}(%%rcx), %%rax
+        \\testq %%rax, %%rax
+        \\jz .Lreply_port_q_empty
+        \\movq %%r11, {[ec_next_off]d}(%%rax)
+        \\jmp .Lreply_port_q_set_tail
+        \\.Lreply_port_q_empty:
+        \\movq %%r11, {[lvl_head_off]d}(%%rcx)
+        \\.Lreply_port_q_set_tail:
+        \\movq %%r11, {[lvl_tail_off]d}(%%rcx)
+        \\movq $0, {[ec_next_off]d}(%%r11)
+        \\
+        \\movq %%gs:120, %%rcx
+        \\movb ${[wk_recv]d}, {[waiter_kind_off]d}(%%rcx)
+        \\
+        \\movq %%gs:32, %%rcx
+        \\movb ${[event_none]d}, {[event_off]d}(%%rcx)
+        \\movb $0, {[event_subcode_off]d}(%%rcx)
+        \\movq $0, {[event_addr_off]d}(%%rcx)
+        \\movq $0, {[prh_off]d}(%%rcx)
+        \\movb $0, {[prd_disc_off]d}(%%rcx)
+        \\movw $0, {[prs_off]d}(%%rcx)
+        \\
+        \\movq %%gs:120, %%r11
+        \\movq %%r11, {[susp_value_ptr_off]d}(%%rcx)
+        \\movq %%gs:112, %%r11
+        \\shrq $32, %%r11
+        \\movl %%r11d, {[susp_value_gen_off]d}(%%rcx)
+        \\movb $1, {[susp_disc_off]d}(%%rcx)
+        \\
+        \\movq %%gs:112, %%r11
+        \\shrq $12, %%r11
+        \\andq $1, %%r11
+        \\movb %%r11b, {[recv_xfer_off]d}(%%rcx)
+        \\
+        \\movb ${[state_susp]d}, {[state_off]d}(%%rcx)
+        \\movb $0, {[on_cpu_off]d}(%%rcx)
+        \\
+        \\movq %%gs:120, %%rcx
+        \\andq $-2, {[port_lock_off]d}(%%rcx)
+        \\jmp .Lreply_R13_done
+        \\
+        \\.Lreply_atomic_recv_fallback:
+        \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
+        \\.Lreply_acq_core_fb:
+        \\movl $1, %%eax
+        \\xchgl %%eax, {[lock_state_off]d}(%%rcx)
+        \\testl %%eax, %%eax
+        \\jz .Lreply_have_core_fb
+        \\pause
+        \\jmp .Lreply_acq_core_fb
+        \\.Lreply_have_core_fb:
+        \\movq %%gs:32, %%rcx
+        \\movb ${[state_ready]d}, {[state_off]d}(%%rcx)
+        \\movb $0, {[on_cpu_off]d}(%%rcx)
+        \\movzbq {[priority_off]d}(%%rcx), %%r11
+        \\shlq $4, %%r11
+        \\movq %%gs:{[sc_per_core_late]d}, %%rax
+        \\addq ${[run_queue_off]d}, %%rax
+        \\addq %%r11, %%rax
+        \\movq {[lvl_tail_off]d}(%%rax), %%r11
+        \\testq %%r11, %%r11
+        \\jz .Lreply_q_empty_fb
+        \\movq %%rcx, {[ec_next_off]d}(%%r11)
+        \\jmp .Lreply_q_set_tail_fb
+        \\.Lreply_q_empty_fb:
+        \\movq %%rcx, {[lvl_head_off]d}(%%rax)
+        \\.Lreply_q_set_tail_fb:
+        \\movq %%rcx, {[lvl_tail_off]d}(%%rax)
+        \\movq $0, {[ec_next_off]d}(%%rcx)
+        \\movq %%gs:{[sc_core_lock_late]d}, %%rcx
+        \\movl $0, {[lock_state_off]d}(%%rcx)
+        \\
+        \\.Lreply_R13_done:
+        \\
+        \\# Step R13.5: release caller (= receiver) gen-lock paired
+        \\# with R10.5 acquire. After this point R14's per-core swap
+        \\# moves gs:32 from receiver to sender, so the receiver's
+        \\# lock window covers exactly the receiver-EC field writes
+        \\# in R11..R13. Plain `andq $-2` mirrors R7/R10.
+        \\movq %%gs:32, %%rcx
+        \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+        \\.Lreply_R13_after_caller_unlock:
+        \\
+        \\# Step R13.6: re-acquire sender (= replyee) gen-lock
+        \\# before R14's sender-EC field reads (kernel_stack.top at
+        \\# R14, ctx pointer at R16). Sender was unlocked at R10
+        \\# while we wrote the receiver, but R14 reads sender.
+        \\# kernel_stack.top and R16 reads sender.ctx — both EC
+        \\# fields whose race window opens whenever another core
+        \\# holds a sender-EC handle and mounts a syscall against
+        \\# it (priority/setRegisters/etc.). Spec §[reply] mandates
+        \\# the sender resumes coherent register state; without
+        \\# this lock-window, a concurrent setRegisters on another
+        \\# core could overwrite ctx mid-sysretq-prep.
+        \\#
+        \\# Uses the lockWithGen pattern (R5a-style) against the
+        \\# snapshotted sender_gen at gs:96: if a concurrent destroy
+        \\# fired between R10 release and here, the gen has rotated
+        \\# to even and our cmpxchg fails with bit-1+ set. We
+        \\# detect that via xorq+testq and bail to a UAF-panic — the
+        \\# fast path has already cleared the reply slot and parked
+        \\# the receiver, so there's no clean unwind; landing on a
+        \\# destroyed sender's ctx during sysretq is the worse
+        \\# alternative.
+        \\#
+        \\# Lock order: only sender_ec held at this point. caller_ec
+        \\# was just released (R13.5); CD released at R7. No nesting.
+        \\movq %%gs:72, %%rcx
+        \\movq %%gs:96, %%rax
+        \\shlq $1, %%rax
+        \\movq %%rax, %%r11
+        \\incq %%r11
+        \\.Lreply_acq_sender_r14:
+        \\lock cmpxchgq %%r11, {[ec_unlock_off]d}(%%rcx)
+        \\je .Lreply_sender_r14_acquired
+        \\xorq %%r11, %%rax
+        \\testq $-2, %%rax
+        \\jnz .Lreply_sender_destroyed
+        \\pause
+        \\movq %%r11, %%rax
+        \\andq $-2, %%rax
+        \\jmp .Lreply_acq_sender_r14
+        \\.Lreply_sender_r14_acquired:
+        \\
+    ,
+        .{
+            .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .port_lock_off = @offsetOf(stygia.sched.port.Port, "_gen_lock"),
+            .waiters_off = @offsetOf(stygia.sched.port.Port, "waiters"),
+            .waiter_kind_off = @offsetOf(stygia.sched.port.Port, "waiter_kind"),
+            .wk_recv = @intFromEnum(stygia.sched.port.WaiterKind.receivers),
+            .wk_senders = @intFromEnum(stygia.sched.port.WaiterKind.senders),
+            .priority_off = @offsetOf(ExecutionContext, "priority"),
+            .lvl_head_off = @offsetOf(EcQueueLevel, "head"),
+            .lvl_tail_off = @offsetOf(EcQueueLevel, "tail"),
+            .ec_next_off = @offsetOf(ExecutionContext, "next"),
+            .state_off = @offsetOf(ExecutionContext, "state"),
+            .state_susp = @intFromEnum(stygia.sched.execution_context.State.parking),
+            .state_ready = @intFromEnum(stygia.sched.execution_context.State.ready),
+            .event_off = @offsetOf(ExecutionContext, "event_type"),
+            .event_none = @intFromEnum(stygia.sched.execution_context.EventType.none),
+            .event_subcode_off = @offsetOf(ExecutionContext, "event_subcode"),
+            .event_addr_off = @offsetOf(ExecutionContext, "event_addr"),
+            .prh_off = @offsetOf(ExecutionContext, "pending_reply_holder"),
+            .prd_disc_off = @offsetOf(ExecutionContext, "pending_reply_domain") + 16,
+            .prs_off = @offsetOf(ExecutionContext, "pending_reply_slot"),
+            .susp_value_ptr_off = @offsetOf(ExecutionContext, "suspend_port") + 0,
+            .susp_value_gen_off = @offsetOf(ExecutionContext, "suspend_port") + 8,
+            .susp_disc_off = @offsetOf(ExecutionContext, "suspend_port") + 16,
+            .recv_xfer_off = @offsetOf(ExecutionContext, "recv_port_xfer"),
+            .on_cpu_off = @offsetOf(ExecutionContext, "owner_core"),
+            .lock_state_off = @offsetOf(stygia.utils.sync.spin_lock.SpinLock, "state"),
+            .sc_core_lock_late = Offsets.sc_core_lock_ptr,
+            .sc_per_core_late = Offsets.sc_per_core_ptr,
+            .run_queue_off = @offsetOf(stygia.sched.scheduler.PerCore, "run_queue"),
+        },
+    ) ++
 
-    // ─── Step R14: per-core scheduler accounting + lazy-FPU policy.
-    // Mirror image of suspend Step 14: switch this core's identity
-    // from receiver → sender. Updates gs:32/40/48/56/0 + *(gs:136)
-    // (TSS.RSP0) + PerCore.current_ec via gs:128.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R14: per-core scheduler accounting + lazy-FPU policy.
+        // Mirror image of suspend Step 14: switch this core's identity
+        // from receiver → sender. Updates gs:32/40/48/56/0 + *(gs:136)
+        // (TSS.RSP0) + PerCore.current_ec via gs:128.
+        // ────────────────────────────────────────────────────────────────
         (if (build_options.kernel_ec_log)
             // ec_log mark fires BEFORE the gs:32 write so the trampoline
             // observes prev=gs:32 (still the outgoing receiver) alongside
@@ -2526,11 +2597,10 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\movq %%gs:72, %%r11
             \\movq %%r11, %%gs:32
             \\movq %%gs:128, %%rax
-            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq {[gen_off]d}(%%r11), %%rcx
             \\shrq $1, %%rcx
             \\movl %%ecx, {[cur_ec_gen_off]d}(%%rax)
-            \\movb $1, {[cur_ec_disc_off]d}(%%rax)
+            \\movq %%r11, {[cur_ec_off]d}(%%rax)
             \\movq %%rcx, %%gs:{[sc_cur_gen]d}
             \\movb $1, {[on_cpu_off]d}(%%r11)
             \\movzbl %%gs:{[sc_core_id]d}, %%ecx
@@ -2570,93 +2640,102 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .kstack_top_off = @offsetOf(ExecutionContext, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
+                // `PerCore.current_ec` is a bare `?*ExecutionContext`:
+                // one pointer word whose null-ness IS the optional
+                // discriminant. This asm is a hand-rolled `setCurrentEc`
+                // and must publish exactly what it does — gen first,
+                // pointer last, no separate discriminant byte. The
+                // previous form wrote a `movb $1` at +16 for the old
+                // 24-byte `?SlabRef` tag; against the current layout
+                // that byte lands on an unrelated field. Offsets are
+                // taken with `@offsetOf` so a field reorder is a build
+                // error, not silent corruption.
                 .cur_ec_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec"),
-                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 8,
-                .cur_ec_disc_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec") + 16,
+                .cur_ec_gen_off = @offsetOf(stygia.sched.scheduler.PerCore, "current_ec_gen"),
                 .gen_off = @offsetOf(ExecutionContext, "_gen_lock"),
                 .sc_cur_gen = Offsets.sc_current_ec_gen,
-                .on_cpu_off = @offsetOf(ExecutionContext, "on_cpu"),
-                .last_disp_off = @offsetOf(ExecutionContext, "last_dispatched_core"),
+                .on_cpu_off = @offsetOf(ExecutionContext, "owner_core"),
+                .last_disp_off = @offsetOf(ExecutionContext, "owner_core"),
                 .sc_core_id = Offsets.sc_core_id,
             },
         ) ++
 
-    // ─── Step R15: CR3 swap to sender's address space (PCID-aware,
-    // mirror of suspend Step 16). sender_cd_ptr still in gs:104.
-    // ────────────────────────────────────────────────────────────────
+        // ─── Step R15: CR3 swap to sender's address space (PCID-aware,
+        // mirror of suspend Step 16). sender_cd_ptr still in gs:104.
+        // ────────────────────────────────────────────────────────────────
         \\movq %%gs:104, %%rcx
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq {[asr_off]d}(%%rcx), %%r11
-            \\testb $1, %%gs:144
-            \\jz .Lreply_cr3_no_pcid
-            \\movzwq {[asid_off]d}(%%rcx), %%rcx
-            \\orq %%rcx, %%r11
-            \\.Lreply_cr3_no_pcid:
-            \\
-        ,
-            .{
-                .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
-                .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
-            },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq {[asr_off]d}(%%rcx), %%r11
+        \\testb $1, %%gs:144
+        \\jz .Lreply_cr3_no_pcid
+        \\movzwq {[asid_off]d}(%%rcx), %%rcx
+        \\orq %%rcx, %%r11
+        \\.Lreply_cr3_no_pcid:
+        \\
+    ,
+        .{
+            .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
+            .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
+        },
+    ) ++
         \\movq %%r11, %%cr3
 
-    // ─── Step R16: load sysretq state from sender.ctx, restore live
-    // rax (= receiver's reply-time vreg 1, becomes sender's vreg 1),
-    // and return to user mode at sender's pre-suspend RIP. The 12
-    // other live vregs (rbx, rdx, rbp, rsi, rdi, r8-r10, r12-r15)
-    // were never touched and ride sysretq into sender's user mode
-    // zero-copy.
-    //
-    // Lock discipline: sender_ec gen-lock (R13.6 acquire) is held
-    // across ALL three ctx reads (rflags/rsp/rip), released after the
-    // last ctx read but before sysretq. We stash user_rsp in gs:80
-    // (no longer needed by R16 — it held reply_slot, consumed at R6)
-    // so that we can read all three ctx fields under the lock without
-    // running out of scratch registers — sysretq needs rcx=rip,
-    // r11=rflags, rsp=user_rsp, rax=vreg1 simultaneously.
-    // ────────────────────────────────────────────────────────────────
-        ++ std.fmt.comptimePrint(
-            \\
-            \\movq %%gs:72, %%rcx
-            \\movq {[ec_ctx_off]d}(%%rcx), %%rax
-            \\movq {[ctx_rflags_off]d}(%%rax), %%r11
-            \\movq {[ctx_rsp_off]d}(%%rax), %%rax
-            \\movq %%rax, %%gs:80
-            \\movq {[ec_ctx_off]d}(%%rcx), %%rax
-            \\movq {[ctx_rip_off]d}(%%rax), %%rax
-            \\andq $-2, {[ec_unlock_off]d}(%%rcx)
-            \\movq %%rax, %%rcx
-            \\movq %%gs:80, %%rsp
-            \\movq %%gs:64, %%rax
-            \\swapgs
-            \\sysretq
-            \\
-        ,
-            .{
-                .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
-                .ec_ctx_off = @offsetOf(ExecutionContext, "ctx"),
-                .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
-                .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
-                .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
-            },
-        ) ++
+        // ─── Step R16: load sysretq state from sender.ctx, restore live
+        // rax (= receiver's reply-time vreg 1, becomes sender's vreg 1),
+        // and return to user mode at sender's pre-suspend RIP. The 12
+        // other live vregs (rbx, rdx, rbp, rsi, rdi, r8-r10, r12-r15)
+        // were never touched and ride sysretq into sender's user mode
+        // zero-copy.
+        //
+        // Lock discipline: sender_ec gen-lock (R13.6 acquire) is held
+        // across ALL three ctx reads (rflags/rsp/rip), released after the
+        // last ctx read but before sysretq. We stash user_rsp in gs:80
+        // (no longer needed by R16 — it held reply_slot, consumed at R6)
+        // so that we can read all three ctx fields under the lock without
+        // running out of scratch registers — sysretq needs rcx=rip,
+        // r11=rflags, rsp=user_rsp, rax=vreg1 simultaneously.
+        // ────────────────────────────────────────────────────────────────
+    ++ std.fmt.comptimePrint(
+        \\
+        \\movq %%gs:72, %%rcx
+        \\movq {[ec_ctx_off]d}(%%rcx), %%rax
+        \\movq {[ctx_rflags_off]d}(%%rax), %%r11
+        \\movq {[ctx_rsp_off]d}(%%rax), %%rax
+        \\movq %%rax, %%gs:80
+        \\movq {[ec_ctx_off]d}(%%rcx), %%rax
+        \\movq {[ctx_rip_off]d}(%%rax), %%rax
+        \\andq $-2, {[ec_unlock_off]d}(%%rcx)
+        \\movq %%rax, %%rcx
+        \\movq %%gs:80, %%rsp
+        \\movq %%gs:64, %%rax
+        \\swapgs
+        \\sysretq
+        \\
+    ,
+        .{
+            .ec_unlock_off = @offsetOf(ExecutionContext, "_gen_lock"),
+            .ec_ctx_off = @offsetOf(ExecutionContext, "ctx"),
+            .ctx_rip_off = @offsetOf(cpu.Context, "rip"),
+            .ctx_rflags_off = @offsetOf(cpu.Context, "rflags"),
+            .ctx_rsp_off = @offsetOf(cpu.Context, "rsp"),
+        },
+    ) ++
 
-    // ─── Reply-fast bail handlers ──────────────────────────────────
-    //
-    // .Lreply_eterm_under_cd: sender gen-lock acquire (R5a) saw a
-    // stale gen — sender slot recycled between our R4 snapshot and
-    // our CAS. Handle is NOT yet cleared (R6 not run); CD lock IS
-    // still held. Slow path's CD-locked re-resolve would also see
-    // the stale gen via SlabRef and return E_TERM — short-circuit
-    // it here: release CD, sysretq E_TERM.
+        // ─── Reply-fast bail handlers ──────────────────────────────────
+        //
+        // .Lreply_eterm_under_cd: sender gen-lock acquire (R5a) saw a
+        // stale gen — sender slot recycled between our R4 snapshot and
+        // our CAS. Handle is NOT yet cleared (R6 not run); CD lock IS
+        // still held. Slow path's CD-locked re-resolve would also see
+        // the stale gen via SlabRef and return E_TERM — short-circuit
+        // it here: release CD, sysretq E_TERM.
         \\.Lreply_eterm_under_cd:
         \\movq %%gs:40, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
         std.fmt.comptimePrint(
             "\nmovq ${d}, %%rax\n",
             .{@as(u64, @bitCast(stygia.syscall.errors.E_TERM))},
@@ -2667,54 +2746,54 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\swapgs
         \\sysretq
 
-    // .Lreply_sender_field_fail: sender field predicate (R5b) failed
-    // while we hold both sender's gen-lock and CD lock. Release sender
-    // lock first (LIFO with R5a acquire), then fall through to
-    // .Lreply_handle_invalid which releases CD and jumps slow path.
+        // .Lreply_sender_field_fail: sender field predicate (R5b) failed
+        // while we hold both sender's gen-lock and CD lock. Release sender
+        // lock first (LIFO with R5a acquire), then fall through to
+        // .Lreply_handle_invalid which releases CD and jumps slow path.
         \\.Lreply_sender_field_fail:
         \\movq %%gs:72, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[ec_lock_off]d}(%%rcx)\n",
-            .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[ec_lock_off]d}(%%rcx)\n",
+        .{ .ec_lock_off = @offsetOf(ExecutionContext, "_gen_lock") },
+    ) ++
 
-    // .Lreply_handle_invalid: bail with CD lock held. Release lock,
-    // restore receiver's rax from gs:64, jmp slow path.
+        // .Lreply_handle_invalid: bail with CD lock held. Release lock,
+        // restore receiver's rax from gs:64, jmp slow path.
         \\.Lreply_handle_invalid:
         \\movq %%gs:40, %%rcx
-        ++ std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
-        ) ++
+    ++ std.fmt.comptimePrint(
+        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
+        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+    ) ++
         \\movq %%gs:64, %%rax
         \\jmp .Lsyscall_slow_path
 
-    // .Lreply_lock_fail: CD acquire saw stale gen (no locks held).
-    // Restore rax, jmp slow path.
+        // .Lreply_lock_fail: CD acquire saw stale gen (no locks held).
+        // Restore rax, jmp slow path.
         \\.Lreply_lock_fail:
         \\movq %%gs:64, %%rax
         \\jmp .Lsyscall_slow_path
 
-    // .Lreply_sender_destroyed: R13.6 lockWithGen detected sender's
-    // gen rotated under us — sender was destroyed between R10 release
-    // and the R13.6 re-acquire. By this point the reply slot has
-    // already been cleared (R6) and the receiver is parked or queued
-    // (R13). There's no clean unwind: we cannot context-switch into a
-    // destroyed sender, and we cannot un-park the receiver without
-    // re-entering the slow paths. Hard panic — this is a rare race
-    // (requires concurrent terminate on a .running EC) and an
-    // explicit stop is preferable to silent UAF on the next sysretq.
+        // .Lreply_sender_destroyed: R13.6 lockWithGen detected sender's
+        // gen rotated under us — sender was destroyed between R10 release
+        // and the R13.6 re-acquire. By this point the reply slot has
+        // already been cleared (R6) and the receiver is parked or queued
+        // (R13). There's no clean unwind: we cannot context-switch into a
+        // destroyed sender, and we cannot un-park the receiver without
+        // re-entering the slow paths. Hard panic — this is a rare race
+        // (requires concurrent terminate on a .running EC) and an
+        // explicit stop is preferable to silent UAF on the next sysretq.
         \\.Lreply_sender_destroyed:
         \\ud2
 
-    // .Lreply_caller_destroyed: R10.5 lockWithGen detected caller (= our
-    // current_ec) was destroyed between syscall entry (gs:176 snap) and
-    // the caller-acquire here. Means another core called terminate(self)
-    // against a handle to us, freed the slab, and possibly the slot has
-    // been reallocated as a different EC. We cannot continue: any field
-    // write into the (foreign or freed) slab corrupts unrelated state.
-    // The reply slot has already been cleared (R6), so the receiver
-    // sees the reply commit even though we panic.
+        // .Lreply_caller_destroyed: R10.5 lockWithGen detected caller (= our
+        // current_ec) was destroyed between syscall entry (gs:176 snap) and
+        // the caller-acquire here. Means another core called terminate(self)
+        // against a handle to us, freed the slab, and possibly the slot has
+        // been reallocated as a different EC. We cannot continue: any field
+        // write into the (foreign or freed) slab corrupts unrelated state.
+        // The reply slot has already been cleared (R6), so the receiver
+        // sees the reply commit even though we panic.
         \\.Lreply_caller_destroyed:
         \\ud2
     );
@@ -2778,63 +2857,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
     const cid: u8 = @truncate(core_id);
     ctx_trace.mark(ec, .switchto_entry);
 
-    // Cross-core terminate may have stashed a zombie EC on this core.
-    // Decide whether it's safe to finalize: read live rsp via inline asm
-    // and check whether it falls within the zombie's kstack range.
-    //
-    // We use the rsp range, not `current_ec.ptr == zombie`, because the
-    // proxy is unreliable in two cases:
-    //   1. Slow-path `switchTo` updates `current_ec` via `setCurrentEc`
-    //      BEFORE arriving here. By the time we read `current_ec`, the
-    //      OUTGOING EC's identity is already gone from that slot — the
-    //      proxy would mis-classify "OUTGOING == zombie" as safe.
-    //   2. `parkSelfFaulted` clears `current_ec` to null while leaving
-    //      the EC's kstack as the active rsp on this core. Subsequent
-    //      `switchTo` from `scheduler.run()` would see `current_ec=null`,
-    //      `cur_is_zombie=false`, and finalize while still standing on
-    //      the parked EC's kstack.
-    {
-        // core_locks[cid] serializes the read-modify-write against the
-        // remote postZombie writer. Drop the lock before
-        // finalizeDestroyMarkedDead so the unmap path doesn't run with
-        // a per-core spinlock held — finalize takes its own locks.
-        // Walk all per-poster columns; under cross-core load multiple
-        // peers can have queued zombies on this core's slab, and
-        // single-take here would let the backlog grow unbounded.
-        while (true) {
-            const zombie_to_reap: ?*ExecutionContext = blk: {
-                const lock = &scheduler.core_locks[cid];
-                const irq = lock.lockIrqSaveOrdered(@src(), scheduler.SCHED_CORE_GROUP);
-                defer lock.unlockIrqRestore(irq);
-                const slots = &(&scheduler.core_states[cid]).pending_zombie;
-                const rsp_addr = asm volatile ("movq %%rsp, %[out]"
-                    : [out] "=r" (-> u64),
-                );
-                var i: u8 = 0;
-                while (i < scheduler.MAX_CORES) : (i += 1) {
-                    const zr = slots[i] orelse continue;
-                    const z = zr.ptr;
-                    // See `takeOwnPendingZombie`'s on_cpu doc — reaping
-                    // an on_cpu EC unmaps the kstack mapped via TSS.RSP0
-                    // and triple-faults the next ring transition. The
-                    // outgoing ec's on_cpu is still true here (cleared
-                    // post-reaper at line ~2770), so this also covers
-                    // the prev-ec case the standing_on_zombie check was
-                    // approximating.
-                    if (z.on_cpu.load(.acquire)) continue;
-                    const z_top = z.kernel_stack.top.addr;
-                    const z_base = z.kernel_stack.base.addr;
-                    const standing_on_zombie = rsp_addr >= z_base and rsp_addr < z_top;
-                    if (standing_on_zombie or ec == z) continue;
-                    slots[i] = null;
-                    break :blk z;
-                }
-                break :blk null;
-            };
-            const z = zombie_to_reap orelse break;
-            stygia.sched.execution_context.finalizeDestroyMarkedDead(z);
-        }
-    }
+    scheduler.drainTeardown(cid, ec);
 
     const kstack = ec.kernel_stack.top.addr;
     gdt.coreTss(core_id).rsp0 = kstack;
@@ -2851,39 +2874,8 @@ pub fn switchTo(ec: *ExecutionContext) void {
         paging.swapAddrSpace(new_root, dom.addr_space_id);
         std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
-    // Publish AFTER the hardware load (store-release) — domain
-    // teardown's quiesce barrier keys on this to know no core can
-    // still walk a dying domain's tables. Unconditional: the no-swap
-    // branch above means the root was already loaded. The locked
-    // dispatch commitment (PerCore.committed_ec) stays armed until
-    // `setCurrentEc` below has run — see the retire site's comment
-    // for the barrier-sliver rationale.
     scheduler.publishActiveRoot(cid, new_root.addr);
-    // on_cpu transitions: clear the previous current_ec's flag (if any
-    // and distinct from `ec`) and raise it on the freshly-dispatched
-    // EC. Cross-core readers (`runningCoreOf`, terminate's defer-vs-
-    // -finalize decision) snapshot this together with `current_ec` —
-    // setting it here, after the kstack/CR3 work and before the asm
-    // jump, gives terminate from another core a stable window in which
-    // current_ec→ptr already names this EC.
-    if ((&scheduler.core_states[cid]).current_ec) |prev_ref| {
-        if (prev_ref.ptr != ec) {
-            prev_ref.ptr.on_cpu.store(false, .release);
-        }
-    }
-    scheduler.setCurrentEc(cid, ec);
-    ec.on_cpu.store(true, .release);
-    // Retire the locked dispatch commitment only AFTER `current_ec`
-    // names `ec` — never before. Clearing it between the root publish
-    // and `setCurrentEc` opened a sliver in which a teardown barrier
-    // sweep saw committed_ec == null, current_ec == <previous>, and
-    // active_root == <just-published value> — all three clauses clear
-    // while this core was irrevocably mid-dispatch of a dying-domain
-    // EC (stygia-rs6 CR3=0 corpses). With this ordering, at every
-    // instant of the dispatch at least one lock-ordered signal
-    // (committed_ec before/through setCurrentEc, current_ec from then
-    // on) names the EC being dispatched.
-    (&scheduler.core_states[cid]).committed_ec = null;
+    std.debug.assert((&scheduler.core_states[cid]).current_ec == ec);
     // Pointer-index `per_cpu_scratch[]`: see `updateScratchKernelRsp`.
     // Each direct `per_cpu_scratch[i].field` write would otherwise
     // memcpy the full 256 KiB array onto the dispatch stack frame.
@@ -2956,9 +2948,10 @@ pub fn switchTo(ec: *ExecutionContext) void {
 
     asm volatile (
         \\movq %[new_stack], %%rsp
-        \\jmp interruptStubEpilogue
+        \\jmp %[epilogue:P]
         :
         : [new_stack] "r" (@intFromPtr(ec.ctx)),
+          [epilogue] "X" (&interruptStubEpilogue),
     );
 }
 
@@ -2968,17 +2961,19 @@ pub fn getInterruptStub(comptime int_num: u8, comptime does_push_err: bool) Inte
             if (does_push_err) {
                 asm volatile (
                     \\pushq %[num]
-                    \\jmp interruptStubPrologue
+                    \\jmp %[prologue:P]
                     :
                     : [num] "i" (@as(u64, int_num)),
+                      [prologue] "X" (&interruptStubPrologue),
                 );
             } else {
                 asm volatile (
                     \\pushq $0
                     \\pushq %[num]
-                    \\jmp interruptStubPrologue
+                    \\jmp %[prologue:P]
                     :
                     : [num] "i" (@as(u64, int_num)),
+                      [prologue] "X" (&interruptStubPrologue),
                 );
             }
         }
@@ -2997,6 +2992,11 @@ pub fn registerVector(
     };
 }
 
+fn canConsumeSuspendDirectiveBeforeHandler(ctx: *const cpu.Context, is_async_irq: bool, from_user: bool) bool {
+    if (!is_async_irq or !from_user) return false;
+    return ctx.int_num == @intFromEnum(IntVecs.sched);
+}
+
 export fn interruptStubPrologue() callconv(.naked) void {
     // Re-arm SMAP before any kernel work runs. CLAC is a no-op on CPUs
     // that lack SMAP (RFLAGS.AC is already 0 for CPL-0 code that never
@@ -3009,51 +3009,54 @@ export fn interruptStubPrologue() callconv(.naked) void {
     // with AC=1 as expected. Single-byte-equivalent, no register clobber.
     asm volatile (
         \\clac
-        \\pushq %rax
-        \\pushq %rcx
-        \\pushq %rdx
-        \\pushq %rbx
-        \\pushq %rbp
-        \\pushq %rsi
-        \\pushq %rdi
-        \\pushq %r8
-        \\pushq %r9
-        \\pushq %r10
-        \\pushq %r11
-        \\pushq %r12
-        \\pushq %r13
-        \\pushq %r14
-        \\pushq %r15
+        \\pushq %%rax
+        \\pushq %%rcx
+        \\pushq %%rdx
+        \\pushq %%rbx
+        \\pushq %%rbp
+        \\pushq %%rsi
+        \\pushq %%rdi
+        \\pushq %%r8
+        \\pushq %%r9
+        \\pushq %%r10
+        \\pushq %%r11
+        \\pushq %%r12
+        \\pushq %%r13
+        \\pushq %%r14
+        \\pushq %%r15
         \\
         // Lazy FPU: no FXSAVE here. Kernel is built without SSE so it
         // cannot dirty the FP/SIMD register file across the handler.
         // The previous owner of the FPU on this core (which may be the
         // userspace thread we just interrupted, or some other thread
         // whose state has been parked here) keeps its regs in place.
-        \\movq %rsp, %rdi
-        \\call dispatchInterrupt
+        \\movq %%rsp, %%rdi
+        \\call %[dispatch:P]
         \\
-        \\jmp interruptStubEpilogue
+        \\jmp %[epilogue:P]
+        :
+        : [dispatch] "X" (&dispatchInterrupt),
+          [epilogue] "X" (&interruptStubEpilogue),
     );
 }
 
 export fn interruptStubEpilogue() callconv(.naked) void {
     asm volatile (
-        \\popq %r15
-        \\popq %r14
-        \\popq %r13
-        \\popq %r12
-        \\popq %r11
-        \\popq %r10
-        \\popq %r9
-        \\popq %r8
-        \\popq %rdi
-        \\popq %rsi
-        \\popq %rbp
-        \\popq %rbx
-        \\popq %rdx
-        \\popq %rcx
-        \\popq %rax
+        \\popq %%r15
+        \\popq %%r14
+        \\popq %%r13
+        \\popq %%r12
+        \\popq %%r11
+        \\popq %%r10
+        \\popq %%r9
+        \\popq %%r8
+        \\popq %%rdi
+        \\popq %%rsi
+        \\popq %%rbp
+        \\popq %%rbx
+        \\popq %%rdx
+        \\popq %%rcx
+        \\popq %%rax
         \\
         \\addq $16, %%rsp
         \\iretq
@@ -3268,9 +3271,41 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         if (is_async_irq) sync_debug.enterIrqContext();
         defer if (is_async_irq) sync_debug.exitIrqContext();
 
+        const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
+        const from_user = (ctx.cs & ring_3) == ring_3;
+        const entry_cur = if (is_async_irq and from_user) scheduler.currentEc() else null;
+        var eoi_sent = false;
+        if (canConsumeSuspendDirectiveBeforeHandler(ctx, is_async_irq, from_user)) {
+            if (entry_cur) |ec| {
+                const core: u8 = @truncate(apic.coreID());
+                if (scheduler.coreCurrentIsRunning(core, ec) and
+                    lifecycle.directiveTag(ec.directive_state.load(.acquire)) == .armed)
+                {
+                    // Model/spec assumption: an armed user-mode scheduler
+                    // tick consumes the suspend directive before the scheduler
+                    // requeue/preempt decision. Limit this pre-handler EOI to
+                    // the scheduler vector: level-triggered IOAPIC device IRQs
+                    // must run deviceIrqHandler's mask step before LAPIC EOI.
+                    // Do not hop here: the IRQ body still has to run; the tail
+                    // identity guard handles any current-EC change after
+                    // returning handlers.
+                    apic.endOfInterrupt();
+                    eoi_sent = true;
+                    _ = execution_context.consumeSuspendDirective(ec, ctx);
+                }
+            }
+        }
+
         h(ctx);
-        if (is_async_irq) {
+        if (is_async_irq and !eoi_sent) {
             apic.endOfInterrupt();
+        }
+        if (entry_cur) |ec| {
+            if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), ec)) {
+                scheduler.hopParkRun();
+            }
+        } else if (is_async_irq and from_user and scheduler.currentEc() != null) {
+            scheduler.hopParkRun();
         }
         return;
     }

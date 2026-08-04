@@ -161,11 +161,16 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // rather than a §[suspend] cap miss.
     if (pair_count > 0 and !port_caps.xfer) return errors.E_PERM;
 
+    port_obj.releasePendingPairEntries(ec);
     if (pair_count > 0) {
         if (validatePairEntries(ec, pair_count)) |err| return err;
     }
 
-    return port_obj.suspendEc(ec, target, port);
+    const ret = port_obj.suspendEc(ec, target, port);
+    if (ret != errors.OK) {
+        port_obj.releasePendingPairEntries(ec);
+    }
+    return ret;
 }
 
 /// Reads `pair_count` pair entries from the suspending EC's user
@@ -229,6 +234,10 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     defer cd_ref.unlockIrqRestore(lr.irq_state);
+    const source_domain: capability.ErasedSlabRef = .{
+        .ptr = cd,
+        .gen = @intCast(cd._gen_lock.currentGen()),
+    };
 
     i = 0;
     while (i < n) {
@@ -236,7 +245,11 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         const entry_caps: u16 = @truncate((entries[i] >> 16) & 0xFFFF);
         const move_flag: bool = (entries[i] & PAIR_MOVE_BIT) != 0;
 
-        const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+        const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse {
+            ec.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(ec);
+            return errors.E_BADCAP;
+        };
 
         const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
 
@@ -246,7 +259,11 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         // execution_context, page_frame, var, device_region, timer,
         // capability_domain IDC) — none of them carry the 2-bit
         // restart_policy enum that `restrict` special-cases.
-        if (entry_caps & ~src_caps != 0) return errors.E_PERM;
+        if (entry_caps & ~src_caps != 0) {
+            ec.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(ec);
+            return errors.E_PERM;
+        }
 
         // Tests 04/05: move/copy authority. Bit 0 = `move`, bit 1 =
         // `copy` in the cap layout shared by transferable handle
@@ -256,9 +273,17 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         const has_move = (src_caps & 0x1) != 0;
         const has_copy = (src_caps & 0x2) != 0;
         if (move_flag) {
-            if (!has_move) return errors.E_PERM;
+            if (!has_move) {
+                ec.pending_pair_count = @intCast(i);
+                port_obj.releasePendingPairEntries(ec);
+                return errors.E_PERM;
+            }
         } else {
-            if (!has_copy) return errors.E_PERM;
+            if (!has_copy) {
+                ec.pending_pair_count = @intCast(i);
+                port_obj.releasePendingPairEntries(ec);
+                return errors.E_PERM;
+            }
         }
 
         // Stash the decoded entry on the suspending EC. The kernel
@@ -272,10 +297,20 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         const obj_type = Word0.typeTag(cd.user_table[slot].word0);
         ec.pending_pair_entries[i] = .{
             .obj_ref = handle.ref,
+            .source_domain = source_domain,
+            .source_instance = handle.instance,
             .obj_type = obj_type,
+            .source_caps = src_caps,
+            .pending_ref_caps = 0,
             .caps = entry_caps,
             .move = move_flag,
             .src_slot = slot,
+        };
+        ec.pending_pair_entries[i].pending_ref_caps = port_obj.pendingRefCapsForEntry(ec.pending_pair_entries[i]);
+        port_obj.acquirePendingPairEntryRef(ec.pending_pair_entries[i]) catch {
+            ec.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(ec);
+            return errors.E_BADCAP;
         };
 
         i += 1;

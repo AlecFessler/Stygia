@@ -7,17 +7,22 @@
 //!
 //!   2. Fat-pointer invariant on struct fields — `*T` / `?*T` / `[N]*T` /
 //!      `[]*T` for slab-backed T are violations. SlabRef(T) is required.
+//!      Exempt: the two slab-allocator files, and any field carrying a
+//!      `// caller-pinned` annotation (same line, or in the bounded
+//!      comment window above — see ANNOTATION_LOOKBACK_LINES).
 //!
 //!   3. `.ptr` bypass — chains `<x>.<slabref_field>.ptr` outside an
-//!      explicit lock/unlock bracket, with `// caller-pinned` exemption.
+//!      explicit lock/unlock bracket, with the same `// caller-pinned`
+//!      exemption and walker as check 2. NOTE: the annotation the code
+//!      honors is `caller-pinned`; `self-alive` is NOT recognized
+//!      anywhere in this analyzer despite older prose to the contrary.
 //!
-//!   4. Per-entry bracketing — every access to a slab-typed local in a
-//!      syscall / exception handler must be tight-preceded by a lock and
-//!      tight-followed by an unlock on the same ident. Simplified
-//!      version that flags entry-point fns containing acquires that
-//!      aren't paired before the next return on every path. The detailed
-//!      "bracket" semantics from the legacy analyzer collapse into the
-//!      release-coverage check below.
+//!   4. Per-entry bracketing — FOLDED INTO CHECK 5; there is no separate
+//!      pass. The legacy analyzer's tight-precede/tight-follow bracket
+//!      semantics, and its per-param callee-summary fold across call
+//!      boundaries, are NOT implemented here. What remains is check 5's
+//!      release-coverage walk over each entry body. Kept as a numbered
+//!      slot only so finding names and docs elsewhere keep lining up.
 //!
 //!   5. Per-path release coverage — for every lock acquired in an entry
 //!      body, every reachable control-flow exit (return / try error
@@ -27,11 +32,45 @@
 //!      ref.unlock(...)`. `@panic`/`unreachable` impose no obligation.
 //!
 //!   6. IRQ-acquired lock-class discipline — a lock class L is "IRQ-
-//!      acquired" iff some IRQ / NMI / async-trap entry can transitively
-//!      reach an acquire of L. Process-context acquires of an IRQ-
-//!      acquired class must use an IRQ-saving variant or be wrapped in
-//!      saveAndDisableInterrupts/restoreInterrupts. Pairing variants
-//!      must match (plain↔plain, IrqSave↔IrqRestore).
+//!      acquired" iff some ASYNCHRONOUS, masked-on-entry interrupt
+//!      (irq_async / nmi / irq_unexpected) can transitively reach an
+//!      acquire of L. Acquires of such a class must use an IRQ-saving
+//!      variant, sit inside a saveAndDisableInterrupts/restoreInterrupts
+//!      bracket, or be reachable ONLY from a masked-on-entry interrupt.
+//!      Pairing variants must match (plain↔plain, IrqSave↔IrqRestore).
+//!
+//!      Entry seeds come from the DB's `entry_point` table (the indexer
+//!      derives them from `registerVector` sites and naked vector
+//!      tables), NOT from a hardcoded name list. Reachability is the
+//!      union of `ir_call` edges and source-text call edges; every
+//!      resolved edge is traversed regardless of `resolved_via`, and the
+//!      weakest provenance along the way is surfaced in the finding.
+//!
+//! Reachability caveat that bounds every claim check 6 makes: the
+//! indexer merges a generic's instantiations into ONE entity, so
+//! `secure_slab.forEachAlive` carries the union of every visitor's
+//! callees and a path may enter through one instantiation and leave
+//! through another.
+//!
+//! Class identity is taken from the kernel's OWN lockdep labels — the
+//! `.class = "…"` a `SpinLock` declares, and the one `SecureSlab.publish`
+//! assigns to a slot's `_gen_lock` at runtime — resolved from the
+//! receiver's terminal field name (same-file declaration first, then a
+//! tree-wide lookup that only fires when every declaration of that name
+//! agrees). See `loadLockClasses`. This replaced keying on the literal
+//! receiver text, which was wrong in both directions: `self.lock`
+//! conflated `PhysicalMemoryManager.lock` with `SecureSlab(T).lock`,
+//! while `ptr._gen_lock` and `self.ptr._gen_lock` were counted as two
+//! classes although the kernel proves them the same lock. Receivers whose
+//! terminal name determines no declared class — SlabRef locals such as
+//! `cd_ref`, whose type the DB does not record — still fall back to the
+//! literal text and so remain split per spelling.
+//!
+//! What remains approximate: `++`-joined class labels render the
+//! non-literal parts as `…`, so every instantiation of a generic collapses
+//! into one class (`SecureSlab(…).lock`). Like the reachability caveat
+//! above, that is an over-approximation — it costs false positives, not
+//! false negatives.
 //!
 //! Exit status nonzero iff any err-severity findings are emitted.
 
@@ -48,18 +87,6 @@ const sqlite = @import("sqlite.zig");
 const asm_analyzer = @import("asm_analyzer.zig");
 
 // ── Domain-knowledge tables (carried over from the legacy analyzer) ────
-
-const EXCEPTION_ENTRY_NAMES = [_][]const u8{
-    "exceptionHandler",
-    "pageFaultHandler",
-    "handleSyncLowerEl",
-    "handleIrqLowerEl",
-    "handleSyncCurrentEl",
-    "handleIrqCurrentEl",
-    "handleUnexpected",
-    "dispatchIrq",
-    "schedTimerHandler",
-};
 
 const PLAIN_ACQUIRE_METHODS = [_][]const u8{
     "lock",
@@ -79,8 +106,6 @@ const IRQ_SAVE_ACQUIRE_METHODS = [_][]const u8{
 
 const PLAIN_RELEASE_METHODS = [_][]const u8{ "unlock" };
 const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{ "unlockIrqRestore" };
-
-const LOCK_TYPE_NAMES = [_][]const u8{ "SpinLock", "GenLock" };
 
 const BARE_PTR_FIELD_EXEMPT_FILES = [_][]const u8{
     "kernel/memory/allocators/secure_slab.zig",
@@ -110,19 +135,185 @@ const IrqEntryKind = enum {
     }
 };
 
-const IrqEntryDecl = struct { name: []const u8, kind: IrqEntryKind };
+// Provenance of a call edge, weakest-wins along a path. Ordered:
+// lower ordinal == stronger evidence that the edge is real.
+//
+//   .exact          `ir_call.resolved_via IS NULL` — the LLVM IR named
+//                   the callee outright.
+//   .mono_suffix    `ir_mono_suffix` — matched after stripping a
+//                   `__anon_NNNN` monomorphization suffix.
+//   .generic_erased `ir_generic_erased` — matched after erasing the
+//                   generic instantiation. Also the bucket for any
+//                   other non-null `resolved_via` the indexer grows
+//                   later, so a new provenance string degrades to
+//                   "weakest IR tier" instead of silently reading as
+//                   `.exact`.
+//   .text           No IR edge at all: recovered by scanning the
+//                   caller's source for `<name>(`. Short-name matching,
+//                   so it over-approximates.
+const Prov = enum(u8) {
+    exact = 0,
+    mono_suffix = 1,
+    generic_erased = 2,
+    text = 3,
 
-const IRQ_ENTRY_DECLS = [_]IrqEntryDecl{
-    .{ .name = "schedTimerHandler", .kind = .irq_async },
-    .{ .name = "dispatchIrq", .kind = .irq_async },
-    .{ .name = "handleIrqLowerEl", .kind = .irq_async },
-    .{ .name = "handleIrqCurrentEl", .kind = .irq_async },
-    .{ .name = "handleUnexpected", .kind = .irq_unexpected },
-    .{ .name = "exceptionHandler", .kind = .trap_sync },
-    .{ .name = "pageFaultHandler", .kind = .trap_sync },
-    .{ .name = "handleSyncLowerEl", .kind = .trap_sync },
-    .{ .name = "handleSyncCurrentEl", .kind = .trap_sync },
+    pub fn label(self: Prov) []const u8 {
+        return switch (self) {
+            .exact => "exact",
+            .mono_suffix => "ir_mono_suffix",
+            .generic_erased => "ir_generic_erased",
+            .text => "source-text",
+        };
+    }
 };
+
+const PROV_TIERS: u8 = 4;
+
+fn provFromResolvedVia(rv: ?[]const u8) Prov {
+    const s = rv orelse return .exact;
+    if (s.len == 0) return .exact;
+    if (mem.eql(u8, s, "ir_mono_suffix")) return .mono_suffix;
+    return .generic_erased;
+}
+
+fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
+    if (needle.len > hay.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |c, j| {
+            if (ascii.toLower(hay[i + j]) != ascii.toLower(c)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+// Map an `entry_point.kind` row onto the analyzer's IRQ taxonomy.
+//
+// The indexer's stage 5a derives handlers mechanically but only labels
+// them `irq` (bound via `registerVector`, or a naked-vector-table
+// operand whose name says "irq") or `exception` (everything else in a
+// vector table). That is coarser than what the discipline rule needs,
+// because `exception` covers BOTH genuinely synchronous traps
+// (`pageFaultHandler`, `handleSyncLowerEl`) and the aarch64 asynchronous
+// IRQ arms (`handleIrqLowerEl`, `dispatchIrq`) that arrive with IRQs
+// masked. The distinction matters: only a masked-on-entry kind can
+// justify a plain acquire on an IRQ-reachable class.
+//
+// So the SET of entries comes from the DB (new handlers are picked up
+// the moment they are wired to a vector), and only the async/sync
+// CLASSIFICATION uses the handler's name. Defaults are chosen so a
+// misclassification errs toward reporting: an unrecognized `exception`
+// name becomes `.trap_sync`, which is NOT in `masked_kind_bits` and so
+// grants no exemption.
+//
+// Returns null for kinds that are not interrupt entries at all
+// (`syscall`, `boot`) — those are the process-context seeds.
+fn classifyIrqEntry(db_kind: []const u8, qname: []const u8) ?IrqEntryKind {
+    const sn = shortName(qname);
+    if (mem.eql(u8, db_kind, "irq")) {
+        if (containsIgnoreCase(sn, "nmi")) return .nmi;
+        if (containsIgnoreCase(sn, "spurious") or containsIgnoreCase(sn, "unexpected")) {
+            return .irq_unexpected;
+        }
+        return .irq_async;
+    }
+    if (mem.eql(u8, db_kind, "exception")) {
+        if (containsIgnoreCase(sn, "nmi")) return .nmi;
+        if (containsIgnoreCase(sn, "unexpected")) return .irq_unexpected;
+        if (containsIgnoreCase(sn, "irq")) return .irq_async;
+        return .trap_sync;
+    }
+    return null;
+}
+
+// Entry kinds that run in process context — the seeds whose reach
+// REVOKES the "only ever entered with IRQs already masked" exemption.
+fn isProcessContextEntryKind(db_kind: []const u8) bool {
+    return mem.eql(u8, db_kind, "syscall") or mem.eql(u8, db_kind, "boot");
+}
+
+const EntrySeed = struct {
+    entity_id: u32,
+    kind: IrqEntryKind,
+    qname: []const u8,
+    db_kind: []const u8,
+};
+
+// One call-graph edge, fn-row index to fn-row index.
+const Edge = struct { to: u32, prov: Prov };
+
+// What makes a lock class "IRQ-acquired": which interrupt kinds can
+// reach an acquire of it, and the strongest provenance among the paths
+// that establish that.
+const ClassInfo = struct { kinds: u8, prov: u8 };
+
+// The line range over which a fn holds interrupts masked with an
+// explicit `saveAndDisableInterrupts()` / `restoreInterrupts()` pair.
+// Absolute file lines. `valid` is false when the fn has no such pair.
+const BracketRange = struct { start: u32 = 0, end: u32 = 0, valid: bool = false };
+
+// Locate a fn's IRQ-mask bracket.
+//
+// `start` is the first `saveAndDisableInterrupts(`. `end` is the last
+// `restoreInterrupts(` — UNLESS a restore is deferred, in which case
+// the bracket runs to the end of the fn, because
+//
+//     const irq = saveAndDisableInterrupts();
+//     defer restoreInterrupts(irq);
+//     ... everything here is masked ...
+//
+// is the dominant idiom and a naive "last restore line" would put the
+// bracket end two lines below its start and cover nothing.
+fn computeBracket(st: *State, fn_row: *const FnRow, arena_alloc: Allocator) !BracketRange {
+    const f = fileById(st, fn_row.file_id) orelse return .{};
+    const stripped = try stripComments(arena_alloc, fn_row.body);
+    const save_off = mem.indexOf(u8, stripped, "saveAndDisableInterrupts(") orelse return .{};
+    var end_line = byteToLine(f.source, fn_row.byte_end);
+    var last_restore: ?usize = null;
+    var deferred = false;
+    var p: usize = 0;
+    while (mem.indexOfPos(u8, stripped, p, "restoreInterrupts(")) |off| {
+        last_restore = off;
+        // Is this occurrence deferred? Scan back to the line start.
+        var ls: usize = off;
+        while (ls > 0 and stripped[ls - 1] != '\n') ls -= 1;
+        if (mem.indexOf(u8, stripped[ls..off], "defer") != null) deferred = true;
+        p = off + 1;
+    }
+    const lr = last_restore orelse return .{};
+    if (!deferred) end_line = byteToLine(f.source, fn_row.byte_start + @as(u32, @intCast(lr)));
+    return .{
+        .start = byteToLine(f.source, fn_row.byte_start + @as(u32, @intCast(save_off))),
+        .end = end_line,
+        .valid = true,
+    };
+}
+
+// Expand `reached` in place over every edge whose provenance is at
+// least as strong as `max_prov`. Seeds are whatever is already true on
+// entry, so calling this repeatedly with a widening `max_prov` performs
+// a tiered ("widest path") search: each fn ends up stamped with the
+// strongest provenance tier that can reach it.
+fn bfsExpand(gpa: Allocator, adj: []const ArrayList(Edge), reached: []bool, max_prov: Prov) !void {
+    var queue: ArrayList(u32) = .empty;
+    defer queue.deinit(gpa);
+    for (reached, 0..) |v, i| if (v) try queue.append(gpa, @intCast(i));
+    const limit = @intFromEnum(max_prov);
+    var qi: usize = 0;
+    while (qi < queue.items.len) : (qi += 1) {
+        for (adj[queue.items[qi]].items) |e| {
+            if (@intFromEnum(e.prov) > limit) continue;
+            if (reached[e.to]) continue;
+            reached[e.to] = true;
+            try queue.append(gpa, e.to);
+        }
+    }
+}
 
 // ── Small helpers ──────────────────────────────────────────────────────
 
@@ -158,13 +349,6 @@ fn isAnyAcquire(name: []const u8) bool { return isPlainAcquire(name) or isIrqSav
 fn isPlainRelease(name: []const u8) bool { return inList(name, &PLAIN_RELEASE_METHODS); }
 fn isIrqRestoreRelease(name: []const u8) bool { return inList(name, &IRQ_RESTORE_RELEASE_METHODS); }
 fn isAnyRelease(name: []const u8) bool { return isPlainRelease(name) or isIrqRestoreRelease(name); }
-
-fn lookupIrqEntryKind(name: []const u8) ?IrqEntryKind {
-    for (IRQ_ENTRY_DECLS) |d| {
-        if (mem.eql(u8, d.name, name)) return d.kind;
-    }
-    return null;
-}
 
 // Type-string ref parser. Recognizes `*T`, `?*T`, `*const T`,
 // `SlabRef(T)`, `?SlabRef(T)`. Returns the inner T name.
@@ -240,6 +424,11 @@ const State = struct {
     slab_types: StringHashMap(void), // short name → present
     slab_field_names: StringHashMap(void), // short field name → present
     entry_points: ArrayList(Entity),
+    /// Declared lockdep classes, keyed `"<file_id>\x00<decl name>"` and
+    /// `"\x00<decl name>"` (the file-agnostic entry, present only when every
+    /// declaration of that name agrees on its class). Populated by
+    /// `loadLockClasses`; consumed by `canonicalClassId`.
+    lock_classes: StringHashMap([]const u8),
 
     fn init(gpa: Allocator) State {
         return .{
@@ -250,6 +439,7 @@ const State = struct {
             .slab_types = StringHashMap(void).init(gpa),
             .slab_field_names = StringHashMap(void).init(gpa),
             .entry_points = .empty,
+            .lock_classes = StringHashMap([]const u8).init(gpa),
         };
     }
 
@@ -259,11 +449,167 @@ const State = struct {
         self.slab_types.deinit();
         self.slab_field_names.deinit();
         self.entry_points.deinit(self.gpa);
+        self.lock_classes.deinit();
         self.arena.deinit();
     }
 };
 
 // ── DB loaders ─────────────────────────────────────────────────────────
+
+/// Read the kernel's own lockdep class labels out of the token stream.
+///
+/// Class identity used to be the literal receiver text (`class_id =
+/// recv_chain`), which is wrong in both directions and known to be:
+/// `self.lock` conflated `PhysicalMemoryManager.lock` with
+/// `SecureSlab(T).lock`, while `ptr._gen_lock` and `self.ptr._gen_lock`
+/// were two classes even though they are provably the same lock. The
+/// kernel already publishes the ground truth — every `SpinLock` carries an
+/// explicit `.class = "…"` and `GenLock` gets one assigned at runtime by
+/// the slab that owns the slot — so use that instead of guessing from
+/// spelling. It is the same table `utils/sync/debug.zig` keys lockdep on.
+///
+/// Two syntactic forms, distinguished by what encloses the `.class` token:
+///
+///   declaration  `lock: SpinLock = .{ .class = "PhysicalMemoryManager.lock" }`
+///                the enclosing entity is the `field`/`var` being declared,
+///                so its short name is the decl name. Using the entity
+///                range rather than reading backwards through tokens is
+///                what makes the multi-line forms work — `wheel_locks` and
+///                `core_locks` put the literal on a continuation line.
+///
+///   runtime      `slot_ptr._gen_lock.class = "SecureSlab(" ++ … ++ "._gen_lock"`
+///                the enclosing entity is a `fn`, and the owning field is
+///                the identifier immediately before `.class`.
+///
+/// Assignments with no string literal on the right (`e.class = class;` —
+/// lockdep plumbing that copies a label rather than declaring one) are
+/// skipped: the query requires at least one `string_literal`.
+///
+/// `++`-joined literals are rendered with `…` between the parts, matching
+/// tools/check_ec_closure. That merges every instantiation of a generic
+/// into one class — an over-approximation that costs false positives, not
+/// false negatives.
+fn loadLockClasses(db: *sqlite.Db, st: *State) !void {
+    const a = st.arena.allocator();
+    var stmt = try db.prepare(
+        \\SELECT t.file_id, t.idx, t.byte_start,
+        \\  (SELECT e.kind FROM entity e
+        \\    WHERE e.def_file_id = t.file_id
+        \\      AND e.def_byte_start <= t.byte_start AND t.byte_start < e.def_byte_end
+        \\    ORDER BY e.def_byte_end - e.def_byte_start ASC LIMIT 1) AS owner_kind,
+        \\  (SELECT e.qualified_name FROM entity e
+        \\    WHERE e.def_file_id = t.file_id
+        \\      AND e.def_byte_start <= t.byte_start AND t.byte_start < e.def_byte_end
+        \\    ORDER BY e.def_byte_end - e.def_byte_start ASC LIMIT 1) AS owner_qname,
+        \\  (SELECT p.text FROM token p
+        \\    WHERE p.file_id = t.file_id AND p.idx = t.idx - 2 AND p.kind = 'identifier') AS prev_ident
+        \\FROM token t
+        \\WHERE t.kind = 'identifier' AND t.text = 'class'
+        \\  AND EXISTS (SELECT 1 FROM token q WHERE q.file_id = t.file_id AND q.idx = t.idx - 1 AND q.kind = 'period')
+        \\  AND EXISTS (SELECT 1 FROM token q WHERE q.file_id = t.file_id AND q.idx = t.idx + 1 AND q.kind = 'equal')
+        \\ORDER BY t.file_id, t.idx
+    , st.gpa);
+    defer stmt.finalize();
+
+    // name → class, plus a disagreement marker for the file-agnostic entry.
+    var agreed = StringHashMap([]const u8).init(st.gpa);
+    defer agreed.deinit();
+    var conflicting = StringHashMap(void).init(st.gpa);
+    defer conflicting.deinit();
+
+    while (try stmt.step()) {
+        const file_id: u32 = @intCast(stmt.columnInt(0));
+        const idx: u32 = @intCast(stmt.columnInt(1));
+        // Only kernel files were loaded into st.files.
+        if (fileById(st, file_id) == null) continue;
+        const owner_kind = stmt.columnText(3) orelse continue;
+        const owner_qname = stmt.columnText(4) orelse continue;
+        const prev_ident = stmt.columnText(5);
+
+        const name: []const u8 = if (mem.eql(u8, owner_kind, "fn")) blk: {
+            // Runtime form: the field being labelled sits before `.class`.
+            const pi = prev_ident orelse continue;
+            break :blk try a.dupe(u8, pi);
+        } else blk: {
+            const dot = mem.lastIndexOfScalar(u8, owner_qname, '.');
+            break :blk try a.dupe(u8, if (dot) |d| owner_qname[d + 1 ..] else owner_qname);
+        };
+
+        const class = (try collectClassLiteral(db, st, file_id, idx)) orelse continue;
+
+        const key = try std.fmt.allocPrint(a, "{d}\x00{s}", .{ file_id, name });
+        try st.lock_classes.put(key, class);
+
+        if (agreed.get(name)) |prev| {
+            if (!mem.eql(u8, prev, class)) try conflicting.put(name, {});
+        } else {
+            try agreed.put(name, class);
+        }
+    }
+
+    // File-agnostic entries, for receivers acquired outside the declaring
+    // file (`cd._gen_lock…` in syscall/ against a decl in caps/). Only when
+    // every declaration of that name agrees — otherwise the name genuinely
+    // does not determine the class and we must fall back.
+    var it = agreed.iterator();
+    while (it.next()) |e| {
+        if (conflicting.contains(e.key_ptr.*)) continue;
+        const key = try std.fmt.allocPrint(a, "\x00{s}", .{e.key_ptr.*});
+        try st.lock_classes.put(key, e.value_ptr.*);
+    }
+}
+
+/// String literal(s) forming the class label at `.class = …`, `++`-joined
+/// parts rendered as `…`. Null when the RHS holds no literal.
+fn collectClassLiteral(db: *sqlite.Db, st: *State, file_id: u32, class_idx: u32) !?[]const u8 {
+    const a = st.arena.allocator();
+    var stmt = try db.prepare(
+        \\SELECT kind, text FROM token
+        \\WHERE file_id = ? AND idx > ? ORDER BY idx LIMIT 24
+    , st.gpa);
+    defer stmt.finalize();
+    try stmt.bindInt(1, @intCast(file_id));
+    try stmt.bindInt(2, @intCast(class_idx + 1)); // skip the `=`
+    var buf: ArrayList(u8) = .empty;
+    var first = true;
+    while (try stmt.step()) {
+        const kind = stmt.columnText(0) orelse "";
+        if (mem.eql(u8, kind, "semicolon") or mem.eql(u8, kind, "comma") or
+            mem.eql(u8, kind, "r_brace")) break;
+        if (!mem.eql(u8, kind, "string_literal")) continue;
+        const txt = stmt.columnText(1) orelse continue;
+        if (!first) try buf.appendSlice(st.gpa, "\u{2026}");
+        try buf.appendSlice(st.gpa, stripStrQuotes(txt));
+        first = false;
+    }
+    if (buf.items.len == 0) return null;
+    const owned = try a.dupe(u8, buf.items);
+    buf.deinit(st.gpa);
+    return owned;
+}
+
+fn stripStrQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+    return s;
+}
+
+/// Canonical class id for an acquire/release receiver chain: the kernel's
+/// declared class where the terminal field name determines one, else the
+/// literal receiver text (the previous behaviour) so nothing is lost.
+fn canonicalClassId(st: *State, file_id: u32, recv_chain: []const u8) []const u8 {
+    const term = if (mem.lastIndexOfScalar(u8, recv_chain, '.')) |d|
+        recv_chain[d + 1 ..]
+    else
+        recv_chain;
+    if (term.len == 0) return recv_chain;
+    var kbuf: [512]u8 = undefined;
+    // Same-file declaration wins.
+    const fk = std.fmt.bufPrint(&kbuf, "{d}\x00{s}", .{ file_id, term }) catch return recv_chain;
+    if (st.lock_classes.get(fk)) |c| return c;
+    const gk = std.fmt.bufPrint(&kbuf, "\x00{s}", .{term}) catch return recv_chain;
+    if (st.lock_classes.get(gk)) |c| return c;
+    return recv_chain;
+}
 
 fn loadFiles(db: *sqlite.Db, st: *State, target: ?[]const u8) !void {
     const a = st.arena.allocator();
@@ -384,6 +730,111 @@ fn loadEntryPoints(db: *sqlite.Db, st: *State) !void {
             .is_slab_backed = sb,
         });
     }
+}
+
+// Interrupt/exception entry seeds for the IRQ-discipline reachability
+// roots. Replaces the analyzer's former hardcoded nine-name
+// `IRQ_ENTRY_DECLS` table: the indexer's stage 5a now derives handlers
+// from `registerVector` call sites and naked-vector-table operands, so
+// a handler is rooted here the moment it is wired to a vector rather
+// than whenever somebody remembers to edit this file.
+fn loadIrqEntrySeeds(db: *sqlite.Db, st: *State) !ArrayList(EntrySeed) {
+    var out: ArrayList(EntrySeed) = .empty;
+    const a = st.arena.allocator();
+    var stmt = try db.prepare(
+        \\SELECT ep.entity_id, ep.kind, e.qualified_name
+        \\  FROM entry_point ep JOIN entity e ON e.id = ep.entity_id
+        \\ WHERE ep.kind IN ('irq', 'exception')
+        \\ ORDER BY e.qualified_name
+    , st.gpa);
+    defer stmt.finalize();
+    while (try stmt.step()) {
+        const id: u32 = @intCast(stmt.columnInt(0));
+        const dbk = stmt.columnText(1) orelse continue;
+        const q = stmt.columnText(2) orelse continue;
+        const kind = classifyIrqEntry(dbk, q) orelse continue;
+        try out.append(st.gpa, .{
+            .entity_id = id,
+            .kind = kind,
+            .qname = try a.dupe(u8, q),
+            .db_kind = try a.dupe(u8, dbk),
+        });
+    }
+    return out;
+}
+
+// Process-context entry seeds (`syscall`, `boot`).
+fn loadProcEntrySeeds(db: *sqlite.Db, st: *State) !ArrayList(u32) {
+    var out: ArrayList(u32) = .empty;
+    var stmt = try db.prepare(
+        \\SELECT ep.entity_id, ep.kind FROM entry_point ep
+    , st.gpa);
+    defer stmt.finalize();
+    while (try stmt.step()) {
+        const id: u32 = @intCast(stmt.columnInt(0));
+        const dbk = stmt.columnText(1) orelse continue;
+        if (!isProcessContextEntryKind(dbk)) continue;
+        try out.append(st.gpa, id);
+    }
+    return out;
+}
+
+const IrEdge = struct { caller: u32, callee: u32, prov: Prov };
+
+// Every resolved edge in `ir_call`, tagged with its provenance.
+//
+// Policy: unresolved edges (`callee_entity_id IS NULL`, i.e. indirect
+// calls the IR pass could not pin) are the one thing we cannot traverse
+// — there is no target to traverse to. Every RESOLVED edge is
+// traversed regardless of how it was resolved. Dropping
+// `ir_generic_erased` edges would be the analyzer quietly deciding that
+// a call it can see does not exist, and in a safety analyzer a missed
+// edge is a false negative — silence where a deadlock lives. The weaker
+// tiers are instead recorded and surfaced in the finding text so a
+// human can weigh the evidence.
+fn loadIrEdges(db: *sqlite.Db, st: *State) !ArrayList(IrEdge) {
+    var out: ArrayList(IrEdge) = .empty;
+    var stmt = try db.prepare(
+        \\SELECT caller_entity_id, callee_entity_id, resolved_via
+        \\  FROM ir_call
+        \\ WHERE callee_entity_id IS NOT NULL
+    , st.gpa);
+    defer stmt.finalize();
+    while (try stmt.step()) {
+        const caller: u32 = @intCast(stmt.columnInt(0));
+        const callee: u32 = @intCast(stmt.columnInt(1));
+        try out.append(st.gpa, .{
+            .caller = caller,
+            .callee = callee,
+            .prov = provFromResolvedVia(stmt.columnText(2)),
+        });
+    }
+    return out;
+}
+
+// The arch this DB was built for (`meta.arch`): "x86_64" | "aarch64".
+fn loadDbArch(db: *sqlite.Db, st: *State) !?[]const u8 {
+    var stmt = try db.prepare("SELECT value FROM meta WHERE key = 'arch'", st.gpa);
+    defer stmt.finalize();
+    if (try stmt.step()) {
+        if (stmt.columnText(0)) |v| return try st.arena.allocator().dupe(u8, v);
+    }
+    return null;
+}
+
+// Path prefix of the arch directory that is provably NOT compiled into
+// this DB's kernel.
+//
+// `kernel/arch/<arch>/` is a resolved comptime arch branch in this tree:
+// `arch/dispatch/*.zig` switches on `builtin.cpu.arch` and only one
+// side is ever instantiated, which is exactly why the other side has
+// zero `ir_fn` / `ir_call` rows in this DB. Shared code
+// (`kernel/arch/dispatch/`, `kernel/arch/arch.zig`) is deliberately NOT
+// covered by this prefix.
+fn foreignArchPrefix(db_arch: []const u8) ?[]const u8 {
+    if (mem.eql(u8, db_arch, "x86_64")) return "kernel/arch/aarch64/";
+    if (mem.eql(u8, db_arch, "aarch64")) return "kernel/arch/x64/";
+    return null;
 }
 
 // Source bytes for a span. Returns "" if file not loaded.
@@ -602,37 +1053,85 @@ fn containsCallerPinned(line_text: []const u8) bool {
     return false;
 }
 
-// Walk back through the contiguous `//`-comment block immediately above
-// a container field at field_line, looking for `caller-pinned`. Mirrors
-// the .ptr-bypass exemption walker so a field comment can justify a
-// bare `*T` reference where SlabRef(T) would normally be required.
-fn hasCallerPinnedAnnotation(source: []const u8, field_line: u32) bool {
-    // Find start byte of field_line.
-    var line_no: u32 = 1;
-    var i: usize = 0;
-    while (i < source.len and line_no < field_line) : (i += 1) {
-        if (source[i] == '\n') line_no += 1;
-    }
-    if (line_no != field_line) return false;
-    const field_line_start = i;
-    const field_line_end = mem.indexOfScalarPos(u8, source, field_line_start, '\n') orelse source.len;
-    // Same-line annotation.
-    if (mem.indexOf(u8, source[field_line_start..field_line_end], "caller-pinned") != null) return true;
-    // Walk backwards through contiguous `//`-comment block above.
-    if (field_line_start == 0) return false;
-    var pos: usize = field_line_start - 1;
-    while (pos > 0) {
+// How far above an annotated site the walker will look.
+//
+// The real safety property is NOT this number — it is the
+// stop-at-first-line-of-code rule in `annotationAboveByte`, which
+// already makes it impossible for an annotation to cover anything but
+// the statement directly beneath its comment block. This bound is a
+// secondary guard against a pathological case that rule alone does not
+// cover: a very long file-header banner that happens to contain the
+// word, sitting above the file's first statement.
+//
+// 32 is calibrated against the tree rather than guessed. The 93
+// `caller-pinned` comment annotations in kernel/ sit at most 14 lines
+// above the code they justify (`sched/scheduler.zig:1819`, a 14-line
+// explanation of a lock-free cross-core identity compare), so 32 leaves
+// better than 2x headroom for the codebase's actual commenting style.
+// An earlier value of 8 was too tight and turned three legitimately
+// annotated sites into errors.
+const ANNOTATION_LOOKBACK_LINES: u32 = 32;
+
+// Walk upwards from the start byte of a site's line looking for
+// `needle` in a `//` comment.
+//
+// Tolerance model (deliberate, see README "Annotation adjacency"):
+//
+//   - `//` comment lines are searched for the needle.
+//   - BLANK lines are stepped over rather than terminating the search.
+//     The pre-hardening walker stopped dead at the first blank line,
+//     so inserting one blank line — or a temporary probe line that was
+//     later blanked — between a `// caller-pinned` block and the code
+//     it justified silently revoked the exemption and turned the site
+//     into an error. That is a footgun during live debugging.
+//   - Any other non-blank line is CODE, and terminates the search
+//     immediately. This is what stops an annotation from drifting onto
+//     an unrelated site: a comment block can only ever cover the next
+//     statement below it, never one past an intervening statement.
+//   - At most ANNOTATION_LOOKBACK_LINES lines are examined, so a long
+//     doc-comment banner far above cannot reach down to a site.
+fn annotationAboveByte(source: []const u8, line_start: usize, needle: []const u8) bool {
+    if (line_start == 0) return false;
+    var pos: usize = line_start - 1;
+    var scanned: u32 = 0;
+    while (scanned < ANNOTATION_LOOKBACK_LINES) : (scanned += 1) {
         var prev_start: usize = pos;
         while (prev_start > 0 and source[prev_start - 1] != '\n') prev_start -= 1;
-        const prev_line = source[prev_start..pos];
-        const trimmed = trimAscii(prev_line);
-        if (trimmed.len == 0) return false;
-        if (!mem.startsWith(u8, trimmed, "//")) return false;
-        if (mem.indexOf(u8, trimmed, "caller-pinned") != null) return true;
+        const trimmed = trimAscii(source[prev_start..pos]);
+        if (trimmed.len == 0) {
+            // Blank line — tolerated, keep walking.
+        } else if (mem.startsWith(u8, trimmed, "//")) {
+            if (mem.indexOf(u8, trimmed, needle) != null) return true;
+        } else {
+            return false; // real code: the annotation belongs to it, not us
+        }
         if (prev_start == 0) return false;
         pos = prev_start - 1;
     }
     return false;
+}
+
+// Byte offset of the first character of 1-based `line`, or null.
+fn lineStartByte(source: []const u8, line: u32) ?usize {
+    if (line == 0) return null;
+    var line_no: u32 = 1;
+    var i: usize = 0;
+    while (i < source.len and line_no < line) : (i += 1) {
+        if (source[i] == '\n') line_no += 1;
+    }
+    if (line_no != line) return null;
+    return i;
+}
+
+// `caller-pinned` on the site's own line, or in the bounded comment
+// window above it. Used both for the bare-`*T` container-field
+// exemption and for the `.ptr`-bypass exemption so the two checks
+// cannot drift apart.
+fn hasCallerPinnedAnnotation(source: []const u8, field_line: u32) bool {
+    const field_line_start = lineStartByte(source, field_line) orelse return false;
+    const field_line_end = mem.indexOfScalarPos(u8, source, field_line_start, '\n') orelse source.len;
+    if (mem.indexOf(u8, source[field_line_start..field_line_end], "caller-pinned") != null) return true;
+    return annotationAboveByte(source, field_line_start, "caller-pinned");
 }
 
 // ── Per-entry slab-typed local tracker ─────────────────────────────────
@@ -958,53 +1457,32 @@ fn checkPtrBypasses(
     for (st.files.items) |f| {
         if (inList(f.path, &PTR_BYPASS_EXEMPT_FILES)) continue;
         const src = f.source;
-        // Walk lines. Maintain a small state machine over contiguous `//`
-        // comment blocks so a `// caller-pinned` annotation in the lines
-        // immediately above a `.ptr` access exempts that access — not
-        // just an annotation on the same line. The legacy analyzer
-        // checks the comment block above; matching that here drops ~18
-        // false positives in sched/timer.zig and similar sites.
+        // Walk lines. A `// caller-pinned` annotation on the access's own
+        // line, or in the bounded comment window above it, exempts the
+        // access. The window walker (`annotationAboveByte`) is shared
+        // with the bare-`*T` field check so the two exemptions cannot
+        // drift apart, and it steps over blank lines — see the note on
+        // ANNOTATION_LOOKBACK_LINES.
         var line_no: u32 = 1;
         var line_start: usize = 0;
         var i: usize = 0;
-        var in_comment_block = false;
-        var block_has_caller_pinned = false;
         while (i <= src.len) : (i += 1) {
             const at_eol = (i == src.len) or (src[i] == '\n');
             if (!at_eol) continue;
             const raw_line = src[line_start..i];
             const trimmed = trimAscii(raw_line);
-            const is_comment = mem.startsWith(u8, trimmed, "//");
-            const is_blank = trimmed.len == 0;
-            // Track contiguous `//`-comment block above the next code
-            // line. A blank line breaks the block (legacy behavior).
-            if (is_comment) {
-                in_comment_block = true;
-                if (mem.indexOf(u8, trimmed, "caller-pinned") != null) {
-                    block_has_caller_pinned = true;
-                }
+            if (mem.startsWith(u8, trimmed, "//") or trimmed.len == 0) {
                 line_no += 1;
                 line_start = i + 1;
                 continue;
             }
-            if (is_blank) {
-                in_comment_block = false;
-                block_has_caller_pinned = false;
-                line_no += 1;
-                line_start = i + 1;
-                continue;
-            }
-            const just_left_block = in_comment_block;
-            const block_caller_pinned = block_has_caller_pinned;
-            in_comment_block = false;
-            block_has_caller_pinned = false;
             // Skip comment (cheap stripped: anything past `//`).
             const stripped_line = blk: {
                 if (mem.indexOf(u8, raw_line, "//")) |idx| break :blk raw_line[0..idx];
                 break :blk raw_line;
             };
             if (containsCallerPinned(raw_line) or
-                (just_left_block and block_caller_pinned))
+                annotationAboveByte(src, line_start, "caller-pinned"))
             {
                 line_no += 1;
                 line_start = i + 1;
@@ -1427,6 +1905,20 @@ const Walker = struct {
         }
     }
 
+    /// Drop the active entry that a *specific* acquire site created.
+    /// Matching on `lock_line` as well as `ident` matters: `appendActive`
+    /// de-dupes by ident, so if the same receiver was already held from
+    /// an earlier line, that earlier (still genuine) acquire keeps its
+    /// original `lock_line` and must NOT be dropped here.
+    fn dropActiveAcquiredAt(list: *ArrayList(ActiveLock), ident: []const u8, line: u32) void {
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (list.items[i].lock_line == line and mem.eql(u8, list.items[i].ident, ident)) {
+                _ = list.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
     fn cloneActives(self: *Walker, src: []const ActiveLock) !ArrayList(ActiveLock) {
         var dst: ArrayList(ActiveLock) = .empty;
         try dst.appendSlice(self.gpa, src);
@@ -1582,9 +2074,105 @@ fn walkNode(
 
 fn walkChildren(w: *Walker, node_id: u64, actives: *ArrayList(ActiveLock)) anyerror!void {
     const list = w.children.get(node_id) orelse return;
-    for (list.items) |cid| {
+    var i: usize = 0;
+    while (i < list.items.len) : (i += 1) {
+        const cid = list.items[i];
         try walkNode(w, cid, actives);
+
+        // ── Acquire-failure branch (`catch` / `orelse` on the acquire) ──
+        //
+        // The indexer's AST pass flattens `a catch b` and `a orelse b`
+        // into two siblings under the shared parent, so the failure
+        // branch of `ref.lockIrqSave(@src()) catch { … }` arrives here
+        // as the node immediately after the acquire `call`.
+        //
+        // On that branch the acquire FAILED, so the lock was never
+        // taken: `GenLock.lockWithGenIrqSaveOrdered` restores interrupts
+        // and returns `error.StaleHandle` *without* holding it. Walking
+        // the branch with the lock still marked active makes every
+        // `catch { return; }` read as a leak, and "fixing" the report by
+        // releasing there would itself be a bug (unlock of a lock we
+        // never took). Walk it with just that one acquire dropped.
+        //
+        // The drop is scoped to the cloned branch state: after the
+        // catch/orelse falls through, `actives` still holds the lock, so
+        // a `catch {}`-style swallow followed by an unreleased exit is
+        // still reported, as is any *other* lock live across the branch.
+        if (i + 1 >= list.items.len) continue;
+        const guard = failureBranchOf(w, cid, list.items[i + 1]) orelse continue;
+        var clone = try w.cloneActives(actives.items);
+        defer clone.deinit(w.gpa);
+        Walker.dropActiveAcquiredAt(&clone, guard.ident, guard.line);
+        try walkNode(w, list.items[i + 1], &clone);
+        i += 1; // the failure branch is walked; don't walk it again
     }
+}
+
+const FailureBranch = struct {
+    ident: []const u8,
+    line: u32,
+};
+
+/// If `acquire_id` is an acquire call and `body_id` is the `catch`/
+/// `orelse` branch attached directly to it, return the acquire's tracked
+/// ident + line. Anything else returns null, leaving the default
+/// (leak-reporting) walk in place.
+fn failureBranchOf(w: *Walker, acquire_id: u64, body_id: u64) ?FailureBranch {
+    const acq = w.nodes.get(acquire_id) orelse return null;
+    if (!mem.eql(u8, acq.kind, "call")) return null;
+    const sh = parseCallShape(w.nodeBytes(acq)) orelse return null;
+    if (!isAnyAcquire(sh.method)) return null;
+
+    const body = w.nodes.get(body_id) orelse return null;
+    const src = w.file.source;
+    if (body.byte_start < acq.byte_end) return null;
+    if (acq.byte_end > src.len or body.byte_start > src.len) return null;
+    if (!isFailureBranchGap(src[acq.byte_end..body.byte_start])) return null;
+
+    return .{ .ident = sh.head, .line = w.nodeLine(acq) };
+}
+
+/// True when the source between an acquire call and the following
+/// sibling node is exactly `catch`/`orelse` (plus an optional `|err|`
+/// payload capture, whitespace and comments) — i.e. the sibling really
+/// is that acquire's failure branch and not an unrelated statement.
+fn isFailureBranchGap(gap: []const u8) bool {
+    var i = skipGapFiller(gap, 0);
+    const kw: []const u8 = if (mem.startsWith(u8, gap[i..], "catch"))
+        "catch"
+    else if (mem.startsWith(u8, gap[i..], "orelse"))
+        "orelse"
+    else
+        return false;
+    i += kw.len;
+    // Guard against an identifier that merely starts with the keyword.
+    if (i < gap.len and isIdentChar(gap[i])) return false;
+    i = skipGapFiller(gap, i);
+    if (i < gap.len and gap[i] == '|') {
+        i += 1;
+        while (i < gap.len and gap[i] != '|') i += 1;
+        if (i >= gap.len) return false;
+        i += 1;
+        i = skipGapFiller(gap, i);
+    }
+    return i == gap.len;
+}
+
+/// Advance past whitespace and `//` comments.
+fn skipGapFiller(s: []const u8, start: usize) usize {
+    var i = start;
+    while (i < s.len) {
+        if (ascii.isWhitespace(s[i])) {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < s.len and s[i] == '/' and s[i + 1] == '/') {
+            while (i < s.len and s[i] != '\n') i += 1;
+            continue;
+        }
+        break;
+    }
+    return i;
 }
 
 fn walkIfLike(w: *Walker, node_id: u64, actives: *ArrayList(ActiveLock)) anyerror!void {
@@ -1773,14 +2361,23 @@ fn analyzeEntryRelease(
 
 // ── Check 6: IRQ-discipline ────────────────────────────────────────────
 //
-// Scope simplification vs. legacy: we operate on pre-built reachability
-// from entry_point + ir_call. For each fn entity the kernel has, we
-// determine:
-//   (a) whether it is reached from any IRQ entry (per IRQ_ENTRY_DECLS by
-//       short-name match against entry_point.label).
-//   (b) the set of acquire sites in its body.
-// Then for each acquire site whose lock class is also acquired from an
-// IRQ-async/NMI entry, we apply rules a/b/c (see legacy doc above).
+// For each fn entity the kernel has, we determine:
+//   (a) whether an interrupt entry reaches it, per kind, and whether a
+//       process-context entry (syscall / boot) also reaches it;
+//   (b) the set of acquire/release sites in its body.
+// Then for each acquire site whose lock class is acquired from an
+// ASYNCHRONOUS interrupt, we apply rules a/b/c.
+//
+// Seeds are `entry_point` rows joined to `entity`, matched by entity id.
+// (Two historical traps: `entry_point.label` holds the QUALIFIED name —
+// `arch.x64.irq.schedTimerHandler`, not `schedTimerHandler` — so the
+// short-name match the old comment described could never have matched
+// it; and `loadEntryPoints` selects `e.kind`, the entity kind, which is
+// always 'fn'. Neither is used for seeding any more.)
+//
+// Reachability is the union of `ir_call` and source-text edges, since
+// each loses calls the other keeps: IR is emitted post-inlining, and
+// text matching is short-name only. See the union note at the call site.
 
 const IrqAcquireSite = struct {
     file_path: []const u8,
@@ -1920,8 +2517,10 @@ fn scanFnIrq(
         }
         if (recv_chain.len == 0) continue;
 
-        // Class id: literal chain text (best-effort grouping).
-        const class_id = try arena_alloc.dupe(u8, recv_chain);
+        // Class id: the kernel's declared lockdep class where the
+        // receiver's terminal field name determines one, else the literal
+        // chain text. See `loadLockClasses`.
+        const class_id = try arena_alloc.dupe(u8, canonicalClassId(st, fn_row.file_id, recv_chain));
         const method_dup = try arena_alloc.dupe(u8, method);
         const line = byteToLine(f.source, fn_row.byte_start + @as(u32, @intCast(p)));
 
@@ -2076,7 +2675,17 @@ pub fn main() !u8 {
     const gpa = gpa_impl.allocator();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    // writerStreaming, NOT writer: std.fs.File.writer() defaults to
+    // POSITIONAL writes (pwrite at the Writer's own `pos`, starting at 0).
+    // Against a terminal that is invisible, but the gauntlet is normally
+    // captured with `./tests/precommit.sh > log`, and there stdout is a
+    // seekable file — so every analyzer stage restarted at offset 0 and
+    // overwrote the stages before it. Captured logs silently lost their
+    // earlier stages; verified by feeding this binary a redirected stdout
+    // with known preceding lines and watching them disappear.
+    // Streaming mode uses ordinary write(2) and appends. See bd stygia-8qz
+    // (found while wiring stage [0d]).
+    var stdout_w = std.fs.File.stdout().writerStreaming(&stdout_buf);
     const w = &stdout_w.interface;
 
     const args = try parseArgs(gpa);
@@ -2106,6 +2715,9 @@ pub fn main() !u8 {
     try loadSlabTypes(&db, &st);
     try collectSlabFieldNames(&db, &st);
     try loadEntryPoints(&db, &st);
+    // Must follow loadFiles: only files that survived the kernel-scope
+    // filter are eligible to declare a class.
+    try loadLockClasses(&db, &st);
 
     if (args.list_slab_types) {
         try w.writeAll("Slab-backed types:\n");
@@ -2209,56 +2821,211 @@ pub fn main() !u8 {
         try gop.value_ptr.append(gpa, @intCast(i));
     }
 
-    // BFS reachability from IRQ-entry fns.
+    // Entity-id → fn-row index. `ir_call` rows are entity-keyed.
+    var fn_by_entity = std.AutoHashMap(u32, u32).init(gpa);
+    defer fn_by_entity.deinit();
+    for (fn_rows.items, 0..) |fr, i| try fn_by_entity.put(fr.id, @intCast(i));
+
+    // ── Call graph: `ir_call` edges ∪ source-text edges ───────────────
+    //
+    // The IR is the precise source — real, post-semantic-analysis call
+    // edges with a provenance tag — but it is emitted after inlining,
+    // so a call that was inlined away leaves no `ir_call` row at all.
+    // The source-text scan is the opposite trade: it never loses an
+    // inlined call, but it matches on short names and over-approximates.
+    //
+    // Unioning them is the only combination that is conservative for
+    // BOTH questions this check asks:
+    //   - "can an IRQ entry reach this acquire?" — a missed edge hides
+    //     a real self-deadlock (false negative);
+    //   - "can process context ALSO reach it?" — a missed edge grants a
+    //     bogus IRQ-only exemption, which is also a false negative.
+    // Over-approximating both directions costs false positives, which
+    // are visible and arguable; false negatives in a commit gate are
+    // neither.
+    var adj = try gpa.alloc(ArrayList(Edge), fn_rows.items.len);
+    defer {
+        for (adj) |*l| l.deinit(gpa);
+        gpa.free(adj);
+    }
+    for (adj) |*l| l.* = .empty;
+
+    var ir_edges = try loadIrEdges(&db, &st);
+    defer ir_edges.deinit(gpa);
+    var n_ir_edges: u32 = 0;
+    for (ir_edges.items) |e| {
+        const ci = fn_by_entity.get(e.caller) orelse continue;
+        const ti = fn_by_entity.get(e.callee) orelse continue;
+        try adj[ci].append(gpa, .{ .to = ti, .prov = e.prov });
+        n_ir_edges += 1;
+    }
+    var n_text_edges: u32 = 0;
+    for (fn_callees, 0..) |cl, i| {
+        for (cl.items) |cn| {
+            const targets = fn_by_short.get(cn) orelse continue;
+            for (targets.items) |t| {
+                try adj[i].append(gpa, .{ .to = t, .prov = .text });
+                n_text_edges += 1;
+            }
+        }
+    }
+
+    // ── Entry seeds, straight from the DB ─────────────────────────────
+    var irq_seeds = try loadIrqEntrySeeds(&db, &st);
+    defer irq_seeds.deinit(gpa);
+    var proc_seed_ids = try loadProcEntrySeeds(&db, &st);
+    defer proc_seed_ids.deinit(gpa);
+
+    // Per-kind reachability bitmask (all edge tiers — see union note).
     const reached_from_irq = try gpa.alloc(u8, fn_rows.items.len);
     defer gpa.free(reached_from_irq);
     @memset(reached_from_irq, 0);
 
-    for (IRQ_ENTRY_DECLS) |decl| {
-        const kind_bit: u8 = @as(u8, 1) << @intFromEnum(decl.kind);
-        const list_opt = fn_by_short.get(decl.name) orelse continue;
-        var queue: ArrayList(u32) = .empty;
-        defer queue.deinit(gpa);
-        var visited = std.AutoHashMap(u32, void).init(gpa);
-        defer visited.deinit();
-        for (list_opt.items) |idx| {
-            try queue.append(gpa, idx);
-            try visited.put(idx, {});
+    const scratch = try gpa.alloc(bool, fn_rows.items.len);
+    defer gpa.free(scratch);
+
+    var seed_buf: ArrayList(u32) = .empty;
+    defer seed_buf.deinit(gpa);
+
+    for ([_]IrqEntryKind{ .irq_async, .nmi, .trap_sync, .irq_unexpected }) |kind| {
+        seed_buf.clearRetainingCapacity();
+        for (irq_seeds.items) |s| {
+            if (s.kind != kind) continue;
+            const idx = fn_by_entity.get(s.entity_id) orelse continue;
+            try seed_buf.append(gpa, idx);
         }
-        var qi: usize = 0;
-        while (qi < queue.items.len) : (qi += 1) {
-            const idx = queue.items[qi];
-            reached_from_irq[idx] |= kind_bit;
-            for (fn_callees[idx].items) |cn| {
-                const cl = fn_by_short.get(cn) orelse continue;
-                for (cl.items) |cidx| {
-                    const v = try visited.getOrPut(cidx);
-                    if (v.found_existing) continue;
-                    try queue.append(gpa, cidx);
+        if (seed_buf.items.len == 0) continue;
+        @memset(scratch, false);
+        for (seed_buf.items) |s| scratch[s] = true;
+        try bfsExpand(gpa, adj, scratch, .text);
+        const bit: u8 = @as(u8, 1) << @intFromEnum(kind);
+        for (scratch, 0..) |v, i| if (v) {
+            reached_from_irq[i] |= bit;
+        };
+    }
+
+    // Best (strongest) provenance at which each fn is reachable from
+    // ANY interrupt entry. Tiered BFS: widen the admissible edge set one
+    // provenance tier at a time and stamp each fn with the first tier
+    // that reaches it, so a fn reachable purely through exact IR edges
+    // is never reported as if it depended on an erased generic.
+    const irq_prov = try gpa.alloc(u8, fn_rows.items.len);
+    defer gpa.free(irq_prov);
+    @memset(irq_prov, 0xFF);
+    {
+        @memset(scratch, false);
+        for (irq_seeds.items) |s| {
+            const idx = fn_by_entity.get(s.entity_id) orelse continue;
+            scratch[idx] = true;
+        }
+        var tier: u8 = 0;
+        while (tier < PROV_TIERS) : (tier += 1) {
+            try bfsExpand(gpa, adj, scratch, @enumFromInt(tier));
+            for (scratch, 0..) |v, i| if (v and irq_prov[i] == 0xFF) {
+                irq_prov[i] = tier;
+            };
+        }
+    }
+
+    // ── Rule (c2): masked by every caller ────────────────────────────
+    //
+    // Rule (c) as it stood only saw a save/restore bracket in the
+    // acquire's OWN function body, which misses the commonest way the
+    // kernel actually masks: the bracket lives one or more frames up.
+    // `arch.x64.vm_runloop.enterGuest` has exactly one call site in the
+    // tree, `scheduler.zig:599`, sitting inside the
+    // `saveAndDisableInterrupts()` / `restoreInterrupts()` pair at
+    // 598/618 whose comment states outright that "IRQs are disabled
+    // across the entry+exit window". Every plain acquire in `enterGuest`
+    // therefore runs masked, and reporting them is simply wrong.
+    //
+    // A fn is in masked context iff it has at least one IR caller and
+    // EVERY call site either sits inside its caller's bracket or comes
+    // from a caller that is itself in masked context. Computed as a
+    // greatest fixpoint (start optimistic, falsify) so a call cycle
+    // whose every entry is masked stays masked. Fns with no IR caller
+    // are false: unknown context, so no exemption.
+    //
+    // Only IR edges are used. Text edges carry no call-site line, so
+    // they cannot be tested against a bracket, and admitting them
+    // unchecked would hand out exemptions on short-name collisions.
+    const brackets = try gpa.alloc(BracketRange, fn_rows.items.len);
+    defer gpa.free(brackets);
+    for (fn_rows.items, 0..) |*fr, i| {
+        brackets[i] = try computeBracket(&st, fr, irq_arena_alloc);
+    }
+
+    const InEdge = struct { from: u32, line: u32 };
+    var in_edges = try gpa.alloc(ArrayList(InEdge), fn_rows.items.len);
+    defer {
+        for (in_edges) |*l| l.deinit(gpa);
+        gpa.free(in_edges);
+    }
+    for (in_edges) |*l| l.* = .empty;
+    {
+        var stmt = try db.prepare(
+            \\SELECT caller_entity_id, callee_entity_id, site_line
+            \\  FROM ir_call WHERE callee_entity_id IS NOT NULL
+        , gpa);
+        defer stmt.finalize();
+        while (try stmt.step()) {
+            const ci = fn_by_entity.get(@intCast(stmt.columnInt(0))) orelse continue;
+            const ti = fn_by_entity.get(@intCast(stmt.columnInt(1))) orelse continue;
+            try in_edges[ti].append(gpa, .{ .from = ci, .line = @intCast(stmt.columnInt(2)) });
+        }
+    }
+
+    const masked_ctx = try gpa.alloc(bool, fn_rows.items.len);
+    defer gpa.free(masked_ctx);
+    for (in_edges, 0..) |l, i| masked_ctx[i] = l.items.len > 0;
+    {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (masked_ctx, 0..) |m, i| {
+                if (!m) continue;
+                for (in_edges[i].items) |ie| {
+                    const b = brackets[ie.from];
+                    const inside = b.valid and ie.line > b.start and ie.line < b.end;
+                    if (inside) continue;
+                    if (masked_ctx[ie.from]) continue;
+                    masked_ctx[i] = false;
+                    changed = true;
+                    break;
                 }
             }
         }
     }
 
+    // Process-context reachability. This is what makes the "already
+    // masked on entry" exemption honest: an acquire is only genuinely
+    // IRQ-only if NO syscall or boot path can also reach it.
+    const reached_from_proc = try gpa.alloc(bool, fn_rows.items.len);
+    defer gpa.free(reached_from_proc);
+    @memset(reached_from_proc, false);
+    {
+        for (proc_seed_ids.items) |eid| {
+            const idx = fn_by_entity.get(eid) orelse continue;
+            reached_from_proc[idx] = true;
+        }
+        try bfsExpand(gpa, adj, reached_from_proc, .text);
+    }
+
     // IRQ-acquired classes: any class id whose acquire is reached from
-    // an IRQ entry, with kind bitmask.
-    var irq_classes = StringHashMap(u8).init(gpa);
+    // an interrupt entry, with kind bitmask + weakest-link provenance.
+    var irq_classes = StringHashMap(ClassInfo).init(gpa);
     defer irq_classes.deinit();
     for (acquires.items) |acq| {
-        // Find owning fn idx.
-        var fn_idx: ?usize = null;
-        for (fn_rows.items, 0..) |fr, i| {
-            if (fr.id == acq.fn_entity_id) {
-                fn_idx = i;
-                break;
-            }
-        }
-        const fi = fn_idx orelse continue;
+        const fi = fn_by_entity.get(acq.fn_entity_id) orelse continue;
         const bits = reached_from_irq[fi];
         if (bits == 0) continue;
         const gop = try irq_classes.getOrPut(acq.class_id);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* |= bits;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .kinds = 0, .prov = 0xFF };
+        gop.value_ptr.*.kinds |= bits;
+        // Strongest provenance over the class's IRQ-reachable acquires:
+        // if ANY of them is reached by exact edges, the class really is
+        // IRQ-acquired and the finding should not be hedged.
+        if (irq_prov[fi] < gop.value_ptr.*.prov) gop.value_ptr.*.prov = irq_prov[fi];
     }
 
     // Discipline + pairing findings.
@@ -2269,6 +3036,9 @@ pub fn main() !u8 {
 
     var n_discipline: u32 = 0;
     var n_pairing: u32 = 0;
+    var n_foreign_arch_deferred: u32 = 0;
+    const db_arch = (try loadDbArch(&db, &st)) orelse "";
+    const foreign_arch_prefix = foreignArchPrefix(db_arch);
 
     var discipline_findings: ArrayList(DisciplineFinding) = .empty;
     defer {
@@ -2292,30 +3062,181 @@ pub fn main() !u8 {
         pairing_lines.deinit(gpa);
     }
 
-    for (acquires.items) |acq| {
-        if (!irq_classes.contains(acq.class_id)) continue;
-        // Find owning fn idx.
-        var fn_idx: usize = 0;
-        for (fn_rows.items, 0..) |fr, i| {
-            if (fr.id == acq.fn_entity_id) {
-                fn_idx = i;
-                break;
+    // One acquire site is scanned once per entity whose byte span covers
+    // it, and in Zig a generic container is itself a fn entity — so
+    // `SlabRef.lock`'s acquire is attributed both to `lock` and to the
+    // enclosing `SlabRef`. Keep the INNERMOST (smallest-span) attribution
+    // per (file, line, class): that is the real enclosing function, and
+    // it is what the lock-API-forwarder exemption below has to see. The
+    // outer attribution would otherwise both duplicate the finding and
+    // mislabel it with the container's name.
+    var best_site = StringHashMap(u32).init(gpa);
+    defer {
+        var bit = best_site.keyIterator();
+        while (bit.next()) |k| gpa.free(k.*);
+        best_site.deinit();
+    }
+    for (acquires.items, 0..) |acq, ai| {
+        const fi = fn_by_entity.get(acq.fn_entity_id) orelse continue;
+        const span = fn_rows.items[fi].byte_end - fn_rows.items[fi].byte_start;
+        const key = try std.fmt.allocPrint(
+            gpa,
+            "{s}:{d}:{s}",
+            .{ acq.file_path, acq.line, acq.class_id },
+        );
+        const gop = try best_site.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(ai);
+            continue;
+        }
+        gpa.free(key);
+        const cur = acquires.items[gop.value_ptr.*];
+        const cfi = fn_by_entity.get(cur.fn_entity_id) orelse continue;
+        const cspan = fn_rows.items[cfi].byte_end - fn_rows.items[cfi].byte_start;
+        if (span < cspan) gop.value_ptr.* = @intCast(ai);
+    }
+
+    for (acquires.items, 0..) |acq, ai| {
+        const info = irq_classes.get(acq.class_id) orelse continue;
+        const fn_idx = fn_by_entity.get(acq.fn_entity_id) orelse continue;
+
+        // The class must be reachable from an ASYNCHRONOUS, maskable
+        // entry — not merely from "some entry in the IDT".
+        //
+        // This check's entire remedy is "use an IRQ-saving acquire
+        // variant". That remedy only answers the asynchronous hazard:
+        // a core holds L with IRQs enabled, a timer/IPI/NMI arrives,
+        // and the handler spins on L forever. A SYNCHRONOUS trap —
+        // page fault, #GP, sync abort — is raised BY the critical
+        // section's own instructions and is not maskable by `cli` or
+        // `msr daifset`, so `lockIrqSave` would change nothing about
+        // it. Marking a class IRQ-acquired off a `trap_sync` path
+        // therefore produces a finding whose recommended fix is a
+        // no-op, and pushes developers to "fix" it by paying for an
+        // IRQ save that buys no safety. (Faulting while holding a
+        // spinlock is a real bug, but it is a different bug with a
+        // different remedy, and it is not this check's job.)
+        //
+        // trap_sync reachability is still COLLECTED and printed in the
+        // "IRQ-acquired lock classes" listing, because it is genuinely
+        // useful context — it just does not on its own demand IrqSave.
+        if (info.kinds & masked_kind_bits == 0) continue;
+
+        // Only the innermost attribution of this site speaks for it.
+        {
+            var kbuf: [512]u8 = undefined;
+            const key = std.fmt.bufPrint(
+                &kbuf,
+                "{s}:{d}:{s}",
+                .{ acq.file_path, acq.line, acq.class_id },
+            ) catch null;
+            if (key) |k| {
+                if (best_site.get(k)) |chosen| {
+                    if (chosen != ai) continue;
+                }
             }
         }
-        if (reached_from_irq[fn_idx] & masked_kind_bits != 0) continue;
+
+        // Rule (a) — "already masked on entry".
+        //
+        // This previously read `reached_from_irq[fn_idx] & masked != 0`,
+        // i.e. "reachable from an IRQ entry", and that single missing
+        // word made the whole check very nearly vacuous. A class only
+        // becomes IRQ-acquired BECAUSE some acquire of it is reachable
+        // from an IRQ entry — so the old test exempted exactly the
+        // functions that put the class in scope in the first place. The
+        // live `stack.freelist_lock` self-deadlock (timer IRQ →
+        // preempt → yieldTo → finalizeDestroyMarkedDead → destroyKernel
+        // → quarantineSlot) sat inside that hole: `quarantineSlot` is
+        // reachable from `schedTimerHandler`, so its plain `lock()` was
+        // skipped, and check 6 reported zero violations on a tree that
+        // had a real one.
+        //
+        // The exemption is only sound when the CPU is *guaranteed* to
+        // have IRQs masked, which requires the acquire to be reachable
+        // from a masked-on-entry interrupt and from NOTHING ELSE. A
+        // function that both an IRQ and a syscall can reach runs with
+        // IRQs enabled on the syscall path, and that is the deadlock.
+        const masked_only = (reached_from_irq[fn_idx] & masked_kind_bits != 0) and
+            !reached_from_proc[fn_idx];
+        if (masked_only) continue;
+
+        // Rule (b): an IRQ-saving acquire variant.
         if (acq.is_irq_save) continue;
+        // Rule (c): a syntactic saveAndDisableInterrupts/restore bracket
+        // in the acquire's own body.
         if (acq.syntactic_save_bracket) continue;
+        // Rule (c2): every caller masks (see the fixpoint above).
+        if (masked_ctx[fn_idx]) continue;
+
+        // Foreign-arch code: DEFERRED to the other arch's run, not
+        // dismissed.
+        //
+        // `kernel/arch/aarch64/**` contributes no `ir_fn` / `ir_call`
+        // rows to an x86_64 DB — it is behind a resolved comptime arch
+        // branch and was never compiled — so for those sites this run
+        // has no IR at all and every conclusion about them rests on
+        // short-name text edges. That is how the four `enterGuest`
+        // findings arose: in the arch where the code IS compiled, rule
+        // (c2) sees `scheduler.zig:598`'s mask bracket over the sole
+        // call site and correctly exempts them; in the other arch there
+        // is nothing to see.
+        //
+        // The site is still analyzed — by the run for the arch that
+        // compiles it. That makes this a deferral rather than a
+        // suppression, and it is only sound if BOTH arches are actually
+        // run. The count is reported on the summary line so a
+        // single-arch invocation cannot hide sites silently, and
+        // `--summary` callers can see the number is nonzero.
+        if (foreign_arch_prefix) |fap| {
+            if (mem.startsWith(u8, acq.file_path, fap)) {
+                n_foreign_arch_deferred += 1;
+                continue;
+            }
+        }
+
+        // The lock API implementing itself. `SpinLock.lock` forwards to
+        // `self.lockOrdered`, `SlabRef.lock` forwards to
+        // `self.ptr._gen_lock.lockWithGen`, and so on. These are the
+        // primitive, not a user of it: reporting them says only "the
+        // lock implementation acquires the lock", and the IRQ-discipline
+        // question belongs to the callers, which are checked on their
+        // own merits. Keyed on the enclosing fn being itself an acquire
+        // or release method, so it exempts the forwarders WITHOUT
+        // exempting the allocator's real critical sections in the same
+        // files (`SecureSlab.create`, `destroyLockedInner`, …).
+        if (isAnyAcquire(acq.fn_name) or isAnyRelease(acq.fn_name)) continue;
+
+        // Weakest link on the evidence chain, surfaced so a human can
+        // weigh the finding instead of having to re-derive it.
+        const prov: Prov = if (info.prov <= @intFromEnum(Prov.text))
+            @enumFromInt(info.prov)
+        else
+            .text;
+        const hedge: []const u8 = if (prov == .exact)
+            ""
+        else
+            prov.label();
+
         n_discipline += 1;
-        const ln = try std.fmt.allocPrint(
+        const ln = if (prov == .exact) try std.fmt.allocPrint(
             gpa,
             "  {s}:{d}  ({s}) currently uses {s} on class {s}\n",
             .{ acq.file_path, acq.line, acq.fn_name, acq.method, acq.class_id },
+        ) else try std.fmt.allocPrint(
+            gpa,
+            "  {s}:{d}  ({s}) currently uses {s} on class {s} [IRQ reachability via {s}]\n",
+            .{ acq.file_path, acq.line, acq.fn_name, acq.method, acq.class_id, hedge },
         );
         try discipline_lines.append(gpa, ln);
-        const struct_msg = try std.fmt.allocPrint(
+        const struct_msg = if (prov == .exact) try std.fmt.allocPrint(
             gpa,
             "({s}) currently uses {s} on class {s} — needs IRQ-saving acquire variant",
             .{ acq.fn_name, acq.method, acq.class_id },
+        ) else try std.fmt.allocPrint(
+            gpa,
+            "({s}) currently uses {s} on class {s} — needs IRQ-saving acquire variant [IRQ reachability via {s}]",
+            .{ acq.fn_name, acq.method, acq.class_id, hedge },
         );
         try discipline_findings.append(gpa, .{ .file_path = acq.file_path, .line = acq.line, .message = struct_msg });
     }
@@ -2554,9 +3475,16 @@ pub fn main() !u8 {
         while (ck_it.next()) |k| try class_keys.append(gpa, k.*);
         std.sort.heap([]const u8, class_keys.items, {}, lessStr);
         for (class_keys.items) |class_id| {
-            const kinds = irq_classes.get(class_id).?;
+            const info = irq_classes.get(class_id).?;
             try w.print("class  {s}  reachable_from=", .{class_id});
-            try renderKindList(w, kinds);
+            try renderKindList(w, info.kinds);
+            if (info.prov != @intFromEnum(Prov.exact)) {
+                const p: Prov = if (info.prov <= @intFromEnum(Prov.text))
+                    @enumFromInt(info.prov)
+                else
+                    .text;
+                try w.print("  via={s}", .{p.label()});
+            }
             try w.writeAll("\n");
         }
     }
@@ -2572,6 +3500,13 @@ pub fn main() !u8 {
         "\nIRQ-discipline summary: {d} IRQ-acquired classes, {d} discipline violations, {d} pairing violations\n",
         .{ @as(u32, @intCast(irq_classes.count())), n_discipline, n_pairing },
     );
+    if (n_foreign_arch_deferred > 0) {
+        try w.print(
+            "  ({d} acquire site(s) deferred to the other arch's run: arch={s}, not compiled here.\n" ++
+                "   Run this analyzer against BOTH arch DBs — these sites are only covered there.)\n",
+            .{ n_foreign_arch_deferred, db_arch },
+        );
+    }
 
     total_errs += n_discipline + n_pairing;
 

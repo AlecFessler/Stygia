@@ -37,7 +37,7 @@ fi
 TMP_ROOT="$(mktemp -d -t check_gen_lock_test.XXXXXX)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
-mkdir -p "$TMP_ROOT/kernel/syscall"
+mkdir -p "$TMP_ROOT/kernel/syscall" "$TMP_ROOT/kernel/arch/x64"
 # Slab-type backing module — every fixture needs at least one
 # slab-backed type discoverable by the analyzer (`_gen_lock` field).
 cat > "$TMP_ROOT/kernel/slab.zig" <<'EOF'
@@ -51,8 +51,13 @@ pass=0
 fail=0
 fail_list=()
 
+> "$TMP_ROOT/kernel/arch/x64/.keep"
+
 for fixture in "$FIXTURES_DIR"/*.zig; do
     name="$(basename "$fixture" .zig)"
+    # `<fixture>.aux.zig` sidecars are materialized alongside the
+    # fixture, not iterated as fixtures themselves.
+    case "$name" in *.aux) continue ;; esac
     expect_line="$(head -n 1 "$fixture")"
     expected=""
     if [[ "$expect_line" =~ ^//[[:space:]]*EXPECT:[[:space:]]*(.*)$ ]]; then
@@ -64,6 +69,20 @@ for fixture in "$FIXTURES_DIR"/*.zig; do
     fi
 
     cp "$fixture" "$TMP_ROOT/kernel/syscall/$name.zig"
+    # Optional sidecar, materialized OUTSIDE kernel/syscall/. Needed for
+    # any fixture that has to own an interrupt entry point: when the
+    # indexer runs without --ir (as it does here) its syscall-entry
+    # fallback claims every fn under `syscall/*.zig` as kind='syscall',
+    # and because entry_point.entity_id is the primary key, stage 5a's
+    # `INSERT OR IGNORE` for a `registerVector`-bound handler in that
+    # same directory is silently dropped. Putting the handler under
+    # `arch/x64/` keeps it out of the fallback's reach.
+    aux_src="$FIXTURES_DIR/$name.aux.zig"
+    aux_dst=""
+    if [[ -f "$aux_src" ]]; then
+        aux_dst="$TMP_ROOT/kernel/arch/x64/${name}_aux.zig"
+        cp "$aux_src" "$aux_dst"
+    fi
     db_path="$TMP_ROOT/$name.db"
     rm -f "$db_path" "$db_path.tmp"
     # Build DB. The indexer expects to be run from the repo root for
@@ -72,6 +91,7 @@ for fixture in "$FIXTURES_DIR"/*.zig; do
     (cd "$TMP_ROOT" && "$INDEXER" --kernel-root kernel --out "$db_path" --arch x86_64 --commit-sha fixture) >/dev/null 2>&1
     out="$("$ANALYZER" --db "$db_path" --summary 2>&1 || true)"
     rm "$TMP_ROOT/kernel/syscall/$name.zig"
+    [[ -n "$aux_dst" ]] && rm -f "$aux_dst"
     rm -f "$db_path"
 
     # Debug a single fixture by uncommenting:

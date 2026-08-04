@@ -179,6 +179,32 @@ the suite from single-core to genuinely concurrent, which is the point — but i
 would also expose the suite to cross-core races it has never run against, so
 expect new failures that are pre-existing bugs rather than regressions.
 
+### Update 2026-07-30: the suite no longer relies on this, but the kernel decision is still open
+
+`tests/suite` gained `-Dspread_cores` (default true): the runner now spawns test
+domain N with `initial_ec_affinity = 1 << (N % cores)` instead of 0. A non-zero
+mask is honoured by `pickCoreForAffinity` on every enqueue *and* every wake, so
+placement is deterministic and no longer depends on who created or woke the EC.
+
+This **sidesteps the item above, it does not fix it.** The kernel's affinity-0
+policy is untouched, so any non-test workload that passes 0 is still pinned for
+life to its creator's core, and the choice between remedies (1)/(2)/(3) is still
+open. What changed is that the *validation loop* no longer has the single-core
+blind spot, so that blind spot stops hiding kernel bugs from the gate.
+
+The prediction above held on first contact, both directions:
+
+- x86-64 KVM, 4 cores: still 485/485, but `stygia-1im`
+  (`[NOROUTE] memory_fault subcode=0 ... why=unbound`) now reproduces there —
+  1–2 per run at a single repeating payload address. It had looked
+  aarch64-specific; it was cross-core all along.
+- Bare-metal Pi 5, 4 cores: panics inside two batches on the smp=4
+  "kernel page fault on user VA with no current EC" race that
+  `kernel/utils/ec_log.zig` was built to investigate (`stygia-723`).
+
+Both are pre-existing bugs that the old placement made unreachable, which is
+the outcome this section predicted.
+
 ---
 
 ## 3. `stygia-5pw` (P2) — self-park clears `on_cpu` while still on the EC's kstack

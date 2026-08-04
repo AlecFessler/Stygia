@@ -114,7 +114,7 @@
 //   3. create_page_frame(caps = copy|r, props = sz=0, pages = 1)
 //      — must succeed (PF_B, source for the move=0 entry).
 //   4. Publish port_id via release store; create_execution_context
-//      pointing at deleterEntry, target = self, priority = 0,
+//      pointing at deleterEntry, target = self, priority = 1,
 //      affinity = 0.
 //      — must succeed.
 //   5. Issue suspend(self_ec=1, port, [pair_a (move=1, PF_A, caps=r),
@@ -336,12 +336,13 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: publish the port id then mint the deleter sibling. The
     // release store pairs with the acquire load in `deleterEntry` so
     // the sibling reads the just-written id even if the kernel
-    // schedules it on another core. priority = 0, affinity = 0
-    // (kernel chooses) keep us inside the runner-granted ceilings.
+    // schedules it on another core. priority = 1 keeps this required
+    // progress helper out of the idle bucket without letting it outrun
+    // the test EC before the self-suspend is actually parked.
     @atomicStore(u32, &deleter_port_id, @as(u32, port_handle), .release);
 
     const deleter_caps = caps.EcCap{ .restart_policy = 0 };
-    const deleter_caps_word: u64 = @as(u64, deleter_caps.toU16());
+    const deleter_caps_word: u64 = @as(u64, deleter_caps.toU16()) | (@as(u64, 1) << 32);
     const deleter_entry_addr: u64 = @intFromPtr(&deleterEntry);
     const cec = syscall.createExecutionContext(
         deleter_caps_word,

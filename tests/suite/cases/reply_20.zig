@@ -47,11 +47,8 @@
 //
 //   reply's pair entries live at the *high* end of the vreg space —
 //   vregs [128-N..127] per §[handle_attachments]. For N = 2 that's
-//   vreg 126 and vreg 127, which spec §[syscall_abi] places at
-//   [rsp + (126-13)*8 = +904] and [rsp + (127-13)*8 = +912] *after*
-//   the syscall word is pushed onto the stack at [rsp+0]. The libz
-//   `reply` wrapper covers only the bare-reply path, so we issue the
-//   syscall directly via inline asm.
+//   vreg 126 and vreg 127. The libz `replyTransfer` wrapper owns the
+//   arch-specific high-vreg syscall frame.
 //
 //   Post-call probe: we use `restrict(donor, donor_initial_caps)` to
 //   distinguish "slot still valid" from "slot released". Restrict on
@@ -244,89 +241,13 @@ pub fn main(cap_table_base: u64) void {
         .move = false,
     }).toU64();
 
-    // Step 7: reply with pair_count = 2. Per §[handle_attachments]
-    // pair entries live at vregs [128-N..127] — the high end of the
-    // vreg space. For N = 2 that's vreg 126 and vreg 127, which the
-    // spec §[syscall_abi] places at [rsp + (N-13)*8] *after* the
-    // syscall word push:
-    //   vreg 126 → [rsp + 113*8] = [rsp + 904]
-    //   vreg 127 → [rsp + 114*8] = [rsp + 912]
-    //
-    // The libz `reply` wrapper covers only the bare-reply path, so we
-    // emit the asm directly. Layout when SYSCALL executes:
-    //   [rsp + 0]   = syscall_word (52 | (N << 12) = 0x2034 for N=2)
-    //   [rsp + 8]   = vreg 14   (zero — first slot in the pad)
-    //   ...
-    //   [rsp + 904] = vreg 126  (pair_m)
-    //   [rsp + 912] = vreg 127  (pair_c)
-    // Total stack carved out: 920 = 8 (word) + 114 * 8 (vregs 14..127).
-    //
-    // Per §[reply] the pair entries are listed in the order
-    // [128-N..127]; the call site treats vreg (128-N) as
-    // pair_entries[0]. For N = 2 that's vreg 126 = pair_entries[0],
-    // vreg 127 = pair_entries[1]. We place pair_m at vreg 126 so the
-    // first entry is the move=1 donor and pair_c at vreg 127 so the
-    // second is the move=0 donor — matches the assertion-id pairing
-    // below.
-    const N: u64 = 2;
-    // Per §[reply] ABI: bits 0-11 = syscall_num, bits 12-19 =
-    // pair_count, bits 20-31 = reply_handle_id.
-    const syscall_word: u64 =
-        (@as(u64, @intFromEnum(syscall.SyscallNum.reply)) & 0xFFF) |
-        (N << 12) |
-        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
-
-    // Stash the values the asm needs to write into the high-vreg pad
-    // in a small memory-backed buffer keyed by [scratch+offset]. Using
-    // a single base register for all loads keeps the asm's register
-    // pressure minimal — one scratch (`rdx`, restored from the kernel
-    // result anyway) is all we need now that the reply_handle_id rides
-    // in the syscall word rather than rax.
-    var scratch: [3]u64 = .{ syscall_word, pair_m, pair_c };
-
-    var rax_out: u64 = undefined;
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\ subq $920, %%rsp
-                \\ movq 0(%%rdx), %%rcx
-                \\ movq %%rcx, 0(%%rsp)
-                \\ movq 8(%%rdx), %%rcx
-                \\ movq %%rcx, 904(%%rsp)
-                \\ movq 16(%%rdx), %%rcx
-                \\ movq %%rcx, 912(%%rsp)
-                \\ syscall
-                \\ addq $920, %%rsp
-                : [out_rax] "={rax}" (rax_out),
-                : [base] "{rdx}" (&scratch),
-                : .{ .rcx = true, .rdx = true, .r11 = true, .memory = true });
-        },
-        .aarch64 => {
-            // aarch64: vreg 126 = [sp + 760], vreg 127 = [sp + 768];
-            // reserve 784 bytes. scratch[0]=word, [1]=pair_m, [2]=pair_c.
-            asm volatile (
-                \\ sub sp, sp, #784
-                \\ ldr x13, [%[base], #0]
-                \\ str x13, [sp]
-                \\ ldr x13, [%[base], #8]
-                \\ str x13, [sp, #760]
-                \\ ldr x13, [%[base], #16]
-                \\ str x13, [sp, #768]
-                \\ svc #0
-                \\ add sp, sp, #784
-                : [out] "={x0}" (rax_out),
-                : [base] "r" (&scratch),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
-
-    if (rax_out != @intFromEnum(errors.Error.OK)) {
+    // Step 7: reply with pair_count = 2. Per §[reply], pair entries
+    // are listed in vreg order [128-N..127]. For N = 2, pair_m is
+    // pair_entries[0] and pair_c is pair_entries[1], matching the
+    // assertion-id pairing below.
+    const pairs = [_]u64{ pair_m, pair_c };
+    const reply_result = syscall.replyTransfer(reply_handle_id, pairs[0..]);
+    if (reply_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);
         return;
     }

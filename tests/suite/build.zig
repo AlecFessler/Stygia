@@ -662,7 +662,7 @@ fn buildTestElf(
     // ld.lld layout (4-PT_LOAD per-perm split, contiguous .dyn*) is
     // exactly what kernel/boot/userspace_init.zig expects for both
     // test ELFs and the libz_c image.
-    exe.linkLibrary(ctx.libz);
+    exe.root_module.linkLibrary(ctx.libz);
     // Force LLVM + LLD: same reason as libz_c — Zig 0.15's self-hosted
     // x86_64 backend chokes on the inline-asm syscall wrappers in
     // libz/syscall_x64.zig (replyTransferAsm "ran out of registers")
@@ -753,22 +753,11 @@ pub fn build(b: *std.Build) void {
     // iteration counts without paying kernel-build / boot cost per rep.
     const repeat = b.option(u32, "repeat", "Number of times to replay the test manifest per boot (default 1)") orelse 1;
 
-    // How the runner stops the machine once every run has reported.
-    //
-    // Default `power_shutdown` is what every emulated target wants: under QEMU it
-    // exits the process, which is how `zig build run` terminates and how
-    // tests/precommit.sh distinguishes a finished run from its own timeout.
-    //
-    // Bare metal wants the opposite. On the Raspberry Pi 5 rig a genuine power-off
-    // leaves the board dark and unrecoverable over ssh, so an unattended
-    // N-runs-in-a-row loop would stall on its first *successful* pass. A reboot
-    // instead lands in PSCI SYSTEM_RESET, and because the Pi's firmware injects
-    // `reboot=w` the reset is warm — DRAM survives, so the loader's early log is
-    // still readable afterwards — and tryboot's one-shot fallback brings Pi OS
-    // back so the harness can start the next run.
-    //
-    // Off by default precisely so no existing gate changes behaviour.
-    const reboot_at_end = b.option(bool, "reboot_at_end", "End the run with power_reboot instead of power_shutdown (for bare-metal rigs that must return to the host OS; default false)") orelse false;
+    // The test-suite image always reboots after its final aggregate. This is
+    // required for Raspberry Pi tryboot: a successful bare-metal pass must
+    // return to Pi OS without physical intervention. QEMU gates run with
+    // `-no-reboot`, so the reboot request still terminates the VM process.
+    const reboot_at_end = true;
 
     // Debug aid for lost-result bugs (stygia-ojs): when a batch drain
     // hits its recv timeout, freeze instead of carrying on, so the
@@ -791,6 +780,16 @@ pub fn build(b: *std.Build) void {
         bool,
         "halt_on_miss",
         "On a batch recv timeout, freeze the runner instead of continuing, so the corpse stays inspectable over the gdb stub (default false)",
+    ) orelse false;
+
+    // Runner-side diagnostic chatter. Keep this separate from kernel
+    // spawn diagnostics so formal stability logs can stay bounded while
+    // miss hunts can still re-enable per-batch/per-spawn/per-deliver
+    // attribution from the userspace runner.
+    const runner_diag = b.option(
+        bool,
+        "runner_diag",
+        "Enable detailed runner spawn/deliver/probe diagnostics (default false)",
     ) orelse false;
 
     // In-flight test count for the runner's spawn/drain interleave.
@@ -823,6 +822,36 @@ pub fn build(b: *std.Build) void {
         "Concurrent in-flight tests in the runner's spawn/drain interleave (default 16; use -Dbatch=4 for the historical low-contention behaviour)",
     ) orelse 16;
     if (batch == 0) @panic("-Dbatch must be >= 1");
+
+    // Spread test domains across cores instead of letting them all pile
+    // onto the runner's core.
+    //
+    // The runner used to pass `initial_ec_affinity = 0` ("kernel picks
+    // any core") for every test domain. The kernel resolves 0 to *the
+    // calling core*, and nothing ever moves an affinity-0 EC afterwards
+    // — no work stealing, no pull path, and the preemption re-enqueue
+    // re-picks the current core. The runner is a single EC, so "the
+    // calling core" was always the same core and the entire 485-test
+    // suite executed on one core while the rest idled
+    // (docs/kernel/open-design-questions.md §2, stygia-yxj).
+    //
+    // With this on, test N is pinned to core `N % cores` via a
+    // single-bit mask, which the kernel honours on every enqueue *and*
+    // every wake (`pickCoreForAffinity` returns `@ctz(mask)` for a
+    // non-zero mask). Deterministic placement rather than
+    // load-dependent, which is what a stability rig wants: a failure
+    // reproduces on the same core on the next boot.
+    //
+    // This sidesteps rather than fixes stygia-yxj — the kernel's
+    // affinity-0 policy is unchanged, and picking among its three
+    // candidate shapes is still an open design decision. Set
+    // `-Dspread_cores=false` to A/B against the historical single-core
+    // behaviour without editing code.
+    const spread_cores = b.option(
+        bool,
+        "spread_cores",
+        "Pin test domain N to core N % cores instead of spawning every test with affinity 0, which the kernel resolves to the runner's core (default true)",
+    ) orelse true;
 
     // Build the filtered list of test entries up front. The same
     // selection drives both per-test ELF builds and the manifest the
@@ -1057,7 +1086,7 @@ pub fn build(b: *std.Build) void {
     // suspend-event vreg into a manifest index in O(1).
     var manifest = std.array_list.Managed(u8).init(b.allocator);
     defer manifest.deinit();
-    manifest.writer().print(
+    manifest.print(
         "pub const TOTAL_TEST_COUNT: u16 = {d};\n\n",
         .{selected_entries.len},
     ) catch unreachable;
@@ -1073,7 +1102,7 @@ pub fn build(b: *std.Build) void {
     ) catch unreachable;
     for (selected_entries, 0..) |t, i| {
         const manifest_tag: u16 = @intCast(@as(u16, @intCast(i)) | tag_magic);
-        manifest.writer().print(
+        manifest.print(
             "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}.elf\"), .tag = {d} }},\n",
             .{ t.name, t.name, manifest_tag },
         ) catch unreachable;
@@ -1082,24 +1111,36 @@ pub fn build(b: *std.Build) void {
     // Surface libz.elf to the runner via the same @embedFile root.
     manifest.appendSlice("pub const libz_elf = @embedFile(\"libz.elf\");\n") catch unreachable;
     // Comptime repeat count. Runner reads this to wrap its batch loop.
-    manifest.writer().print(
+    manifest.print(
         "pub const repeat: u32 = {d};\n",
         .{repeat},
     ) catch unreachable;
-    // Comptime end-of-run action; see the -Dreboot_at_end option.
-    manifest.writer().print(
+    // Comptime end-of-run action. Always true so Pi tryboot can recover after
+    // successful bare-metal runs without depending on every invocation to pass
+    // a build flag.
+    manifest.print(
         "pub const reboot_at_end: bool = {};\n",
         .{reboot_at_end},
     ) catch unreachable;
     // Comptime corpse-preservation flag; see the -Dhalt_on_miss option.
-    manifest.writer().print(
+    manifest.print(
         "pub const halt_on_miss: bool = {};\n",
         .{halt_on_miss},
     ) catch unreachable;
+    // Comptime runner diagnostic flag; see the -Drunner_diag option.
+    manifest.print(
+        "pub const runner_diag: bool = {};\n",
+        .{runner_diag},
+    ) catch unreachable;
     // Comptime spawn/drain batch width; see the -Dbatch option.
-    manifest.writer().print(
+    manifest.print(
         "pub const batch: u32 = {d};\n",
         .{batch},
+    ) catch unreachable;
+    // Comptime per-core spread flag; see the -Dspread_cores option.
+    manifest.print(
+        "pub const spread_cores: bool = {};\n",
+        .{spread_cores},
     ) catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 

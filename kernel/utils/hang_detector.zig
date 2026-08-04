@@ -16,9 +16,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const execution_context = stygia.sched.execution_context;
+const capability_domain = stygia.caps.capability_domain;
+const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const State = stygia.sched.execution_context.State;
@@ -191,6 +194,9 @@ fn dump(elapsed_ns: u64) void {
         core_id += 1;
     }
 
+    dumpLifecycleCounters();
+    dumpSpawnTraceSamples();
+
     // Walk every alive EC slab slot and emit its state. Catches
     // orphaned waiters parked in port wait queues that don't show up
     // in any per-core current_ec / run_queue. Bounded by the slab
@@ -199,6 +205,171 @@ fn dump(elapsed_ns: u64) void {
     execution_context.slab_instance.forEachAlive(@as(*u8, @ptrCast(&dump_visit_dummy)), dumpAliveEc);
 
     rawWrite("[HANG] (end)\n");
+}
+
+fn dumpLifecycleCounters() void {
+    rawWrite("[HANG] lifecycle counters:");
+    rawWrite(" p2=");
+    printDecimal(loadCounter(&capability_domain.p2_enter));
+    rawWrite("/");
+    printDecimal(loadCounter(&capability_domain.p2_after_reap));
+    rawWrite("/");
+    printDecimal(loadCounter(&capability_domain.p2_walk_done));
+    rawWrite("/");
+    printDecimal(loadCounter(&capability_domain.p2_exit));
+    rawWrite(" p2_residue=");
+    printDecimal(loadCounter(&capability_domain.p2_residue));
+    rawWrite(" abandoned_p2=");
+    printDecimal(loadCounter(&capability_domain.abandoned_in_p2));
+    rawWrite(" abandoned_other=");
+    printDecimal(loadCounter(&capability_domain.abandoned_other));
+    rawWrite(" walk=");
+    printDecimal(loadCounter(&execution_context.walk_visit_enter));
+    rawWrite("/");
+    printDecimal(loadCounter(&execution_context.walk_visit_done));
+    rawWrite(" slow_post=");
+    printDecimal(loadCounter(&execution_context.slow_post_spins));
+    rawWrite("/");
+    printDecimal(loadCounter(&execution_context.slow_post_done));
+    rawWrite(" slow_self=");
+    printDecimal(loadCounter(&execution_context.slow_post_self));
+    rawWrite(" inline=");
+    printDecimal(loadCounter(&execution_context.inline_finalize_ok));
+    rawWrite("/");
+    printDecimal(loadCounter(&execution_context.inline_finalize_no));
+    rawWrite(" park=");
+    printDecimal(loadCounter(&execution_context.park_calls));
+    rawWrite("\n");
+
+    dumpPreReportTerminalSamples();
+}
+
+fn loadCounter(counter: *u64) u64 {
+    return @atomicLoad(u64, counter, .monotonic);
+}
+
+fn dumpPreReportTerminalSamples() void {
+    if (!build_options.kernel_spawn_diag) return;
+    const max_seq = @atomicLoad(u64, &execution_context.pre_report_terminal_seq, .monotonic);
+    rawWrite("[HANG] pre-report terminal samples: seq=");
+    printDecimal(max_seq);
+    rawWrite("\n");
+    if (max_seq == 0) return;
+
+    const ring_len = execution_context.PRE_REPORT_TERMINAL_RING_LEN;
+    const first_seq = if (max_seq > ring_len) max_seq - ring_len + 1 else 1;
+    var seq = first_seq;
+    while (seq <= max_seq) : (seq += 1) {
+        const idx: usize = @intCast(seq % ring_len);
+        const slot = &execution_context.pre_report_terminal_ring[idx];
+        const before = slot.publish_seq.load(.acquire);
+        if (before != seq) continue;
+        const sample_seq = slot.seq;
+        const tag = slot.tag;
+        const cd = slot.cd;
+        const ec = slot.ec;
+        const reason = slot.reason;
+        const after = slot.publish_seq.load(.acquire);
+        if (after != before or sample_seq != seq) continue;
+
+        rawWrite("[HANG]   term seq=");
+        printDecimal(sample_seq);
+        rawWrite(" tag=");
+        printHex(tag);
+        rawWrite(" index=");
+        printDecimal(tag - 0x8000);
+        rawWrite(" cd=");
+        printHex(@as(u64, cd));
+        rawWrite(" ec=");
+        printHex(@as(u64, ec));
+        rawWrite(" reason=");
+        rawWrite(reason);
+        rawWrite("\n");
+    }
+}
+
+fn dumpSpawnTraceSamples() void {
+    if (!build_options.kernel_spawn_diag) return;
+    const max_seq = @atomicLoad(u64, &execution_context.spawn_trace_seq, .monotonic);
+    rawWrite("[HANG] spawn trace samples: seq=");
+    printDecimal(max_seq);
+    rawWrite("\n");
+    if (max_seq == 0) return;
+
+    const ring_len = execution_context.SPAWN_TRACE_RING_LEN;
+    const first_seq = if (max_seq > ring_len) max_seq - ring_len + 1 else 1;
+    var seq = first_seq;
+    while (seq <= max_seq) : (seq += 1) {
+        const idx: usize = @intCast(seq % ring_len);
+        const slot = &execution_context.spawn_trace_ring[idx];
+        const before = slot.publish_seq.load(.acquire);
+        if (before != seq) continue;
+        const sample_seq = slot.seq;
+        const event = slot.event;
+        const tag = slot.tag;
+        const core = slot.core;
+        const ec = slot.ec;
+        const cd = slot.cd;
+        const gen = slot.gen;
+        const state = slot.state;
+        const owner = slot.owner;
+        const queue_core = slot.queue_core;
+        const aux = slot.aux;
+        const after = slot.publish_seq.load(.acquire);
+        if (after != before or sample_seq != seq) continue;
+
+        rawWrite("[HANG]   trace seq=");
+        printDecimal(sample_seq);
+        rawWrite(" ev=");
+        printSpawnTraceEvent(event);
+        rawWrite(" tag=");
+        printHex(tag);
+        rawWrite(" index=");
+        printDecimal(tag - 0x8000);
+        rawWrite(" core=");
+        printDecimal(core);
+        rawWrite(" ec=");
+        printHex(@as(u64, ec));
+        rawWrite(" cd=");
+        printHex(@as(u64, cd));
+        rawWrite(" gen=");
+        printHex(gen);
+        rawWrite(" st=");
+        printTraceState(state);
+        rawWrite(" owner=");
+        printDecimal(owner);
+        rawWrite(" q=");
+        printDecimal(queue_core);
+        rawWrite(" aux=");
+        printHex(aux);
+        rawWrite("\n");
+    }
+}
+
+fn printSpawnTraceEvent(event: execution_context.SpawnTraceEvent) void {
+    rawWrite(switch (event) {
+        .spawn_child => "spawn",
+        .enqueue_attempt => "enq-attempt",
+        .enqueue_publish => "enq-publish",
+        .enqueue_skip_not_live => "enq-skip-live",
+        .enqueue_skip_not_publishable => "enq-skip-pub",
+        .enqueue_skip_state => "enq-skip-state",
+        .dequeue_select => "deq-select",
+        .dequeue_skip_not_publishable => "deq-skip-pub",
+        .dispatch_tail => "dispatch-tail",
+        .report_enter => "report-enter",
+        .terminal => "terminal",
+        .retire => "retire",
+        .finalize => "finalize",
+    });
+}
+
+fn printTraceState(state: u8) void {
+    if (state == 0xff) {
+        rawWrite("none");
+        return;
+    }
+    printState(@enumFromInt(state));
 }
 
 var dump_visit_dummy: u8 = 0;
@@ -210,11 +381,11 @@ fn dumpAliveEc(_: *u8, ec: *ExecutionContext, gen: u63) bool {
     rawWrite(" gen=");
     printHex(@as(u64, gen));
     rawWrite(" state=");
-    printState(ec.state);
-    rawWrite(" on_cpu=");
-    rawWrite(if (ec.on_cpu.load(.acquire)) "1" else "0");
-    rawWrite(" last_disp=");
-    printDecimal(@as(u64, ec.last_dispatched_core));
+    printState(lifecycle.load(ec));
+    rawWrite(" owner=");
+    printDecimal(@as(u64, ec.owner_core));
+    rawWrite(" wait=");
+    printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
     if (ec.suspend_port) |sp| {
         rawWrite(" susp_port=");
         printHex(@intFromPtr(sp.ptr));
@@ -232,20 +403,19 @@ fn dumpCore(core_id: u8) void {
 
     const pc = &scheduler.core_states[core_id];
 
-    if (pc.current_ec) |ref| {
+    if (pc.current_ec) |ec| {
         rawWrite(" current_ec=");
-        printHex(@intFromPtr(ref.ptr));
+        printHex(@intFromPtr(ec));
         rawWrite(" ref_gen=");
-        printHex(@as(u64, ref.gen));
-        const ec = ref.ptr;
+        printHex(@as(u64, pc.current_ec_gen));
         rawWrite(" slot_gen=");
         printHex(@as(u64, ec._gen_lock.currentGen()));
         rawWrite(" state=");
-        printState(ec.state);
-        rawWrite(" on_cpu=");
-        rawWrite(if (ec.on_cpu.load(.acquire)) "1" else "0");
-        rawWrite(" last_disp_core=");
-        printDecimal(@as(u64, ec.last_dispatched_core));
+        printState(lifecycle.load(ec));
+        rawWrite(" owner=");
+        printDecimal(@as(u64, ec.owner_core));
+        rawWrite(" wait=");
+        printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
         if (ec.suspend_port) |sp| {
             rawWrite(" suspend_port=");
             printHex(@intFromPtr(sp.ptr));
@@ -257,17 +427,7 @@ fn dumpCore(core_id: u8) void {
         rawWrite(" current_ec=null");
     }
 
-    {
-        var pending_count: usize = 0;
-        var i: usize = 0;
-        while (i < pc.pending_zombie.len) : (i += 1) {
-            if (pc.pending_zombie[i] != null) pending_count += 1;
-        }
-        if (pending_count != 0) {
-            rawWrite(" pending_zombies=");
-            printDecimal(pending_count);
-        }
-    }
+    if (pc.teardown_pending != null) rawWrite(" teardown_pending=1");
 
     rawWrite("\n");
 
@@ -304,10 +464,11 @@ fn printState(s: State) void {
     rawWrite(switch (s) {
         .running => "RUN",
         .ready => "RDY",
-        .suspended_on_port => "SUSP",
-        .futex_wait => "FUTX",
-        .idle_wait => "IDLE",
-        .exited => "EXIT",
+        .parking => "PARK",
+        .waiting => "WAIT",
+        .claimed => "CLAM",
+        .pended => "PEND",
+        .retired => "RETD",
     });
 }
 

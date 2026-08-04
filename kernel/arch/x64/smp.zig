@@ -118,7 +118,7 @@ pub fn smpInit() !void {
         }
 
         if (!map_ok) {
-            stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+            stack_mod.destroyKernel(ap_stack);
             continue;
         }
 
@@ -140,7 +140,35 @@ pub fn smpInit() !void {
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
-                stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+                // Deliberately LEAK the stack instead of reclaiming it.
+                // The SIPI above was already delivered and is never
+                // rescinded, so this AP is not stopped — merely late. It
+                // is somewhere between the trampoline's first instruction
+                // and `coreInit`, and `params.stack_top` still points into
+                // `ap_stack`. `destroyKernel` unmaps those pages and hands
+                // them back to the PMM, where `stack.zig`'s LIFO freelist
+                // makes the reuse deterministic: the very next
+                // `createKernel` gets the same pages. That turns "AP is
+                // late" into a live core executing on someone else's
+                // kernel stack, on a core the BSP has stopped accounting
+                // for — silent cross-core stack corruption rather than a
+                // clean failure.
+                //
+                // This mirrors the aarch64 bring-up path, which already
+                // leaks here for exactly this reason after it was measured
+                // on the bare-metal Pi 5 (all three APs timed out, then
+                // faulted their way into the log hundreds of batches
+                // later, two concurrently). QEMU/KVM brings APs up fast
+                // enough that the x86 timeout effectively never fires,
+                // which is why this side kept the unsafe reclaim.
+                //
+                // A bounded, one-time leak of one kstack, paid only on a
+                // bring-up failure that has already gone wrong.
+                serial.print(
+                    "[smp] core (apic {d}): SIPI sent but core never signalled online" ++
+                        " (kstack leaked; it may still arrive)\n",
+                    .{la.apic_id},
+                );
                 break;
             }
             std.atomic.spinLoopHint();
@@ -151,6 +179,14 @@ pub fn smpInit() !void {
     // bumping `cores_online` (see coreInit below); the BSP did the same
     // at the top of this function. Safe to flip the global RDPID flag.
     apic.enableRdpidFastPath();
+
+    // Every AP that is going to come up has come up, so an ack-waiting
+    // remote shootdown can no longer block on a core that was never
+    // started. Arms `paging.publishKernelUnmapEpoch`'s remote half —
+    // before this point it degrades to a local flush, which is exactly
+    // what the bring-up path above needs when it tears down a kstack
+    // whose mapping failed.
+    arch_paging.armRemoteShootdown();
 }
 
 /// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"

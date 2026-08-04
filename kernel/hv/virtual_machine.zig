@@ -17,8 +17,10 @@ const capability = stygia.caps.capability;
 const cd_mod = stygia.caps.capability_domain;
 const ec_mod = stygia.sched.execution_context;
 const errors = stygia.syscall.errors;
+const lifecycle = stygia.sched.lifecycle;
 const page_frame_mod = stygia.memory.page_frame;
 const port_mod = stygia.sched.port;
+const scheduler = stygia.sched.scheduler;
 const vm_dispatch = stygia.arch.dispatch.vm;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
@@ -234,78 +236,143 @@ pub fn createVcpu(
     const requested_caps: u16 = @truncate(caps);
     const requested_priority: Priority = @enumFromInt(@as(u2, @truncate((caps >> 32) & 0x3)));
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const created_slot = blk: {
+        const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const domain = dlr.ptr;
+        defer caller.domain.unlockIrqRestore(dlr.irq_state);
 
-    const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
-    if (!self_caps_struct.crec) return errors.E_PERM;
-    if (@intFromEnum(requested_priority) > self_caps_struct.pri) return errors.E_PERM;
+        const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
+        if (!self_caps_struct.crec) return errors.E_PERM;
+        if (@intFromEnum(requested_priority) > self_caps_struct.pri) return errors.E_PERM;
 
-    const ec_inner_ceiling: u8 = @truncate(readSelfField0(domain));
-    if ((requested_caps & ec_inner_ceiling) != requested_caps) return errors.E_PERM;
+        const ec_inner_ceiling: u8 = @truncate(readSelfField0(domain));
+        if ((requested_caps & ec_inner_ceiling) != requested_caps) return errors.E_PERM;
 
-    if (affinity != 0) {
-        const cores = arch_smp.coreCount();
-        const valid_mask: u64 = if (cores >= 64)
-            std.math.maxInt(u64)
-        else
-            (@as(u64, 1) << @as(u6, @intCast(cores))) - 1;
-        if (affinity & ~valid_mask != 0) return errors.E_INVAL;
-    }
+        if (affinity != 0) {
+            const cores = arch_smp.coreCount();
+            const valid_mask: u64 = if (cores >= 64)
+                std.math.maxInt(u64)
+            else
+                (@as(u64, 1) << @as(u6, @intCast(cores))) - 1;
+            if (affinity & ~valid_mask != 0) return errors.E_INVAL;
+        }
 
-    const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
-        return errors.E_BADCAP;
+        const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
+            return errors.E_BADCAP;
 
-    const port = lookupPort(domain, @truncate(exit_port)) orelse
-        return errors.E_BADCAP;
+        const port = lookupPort(domain, @truncate(exit_port)) orelse
+            return errors.E_BADCAP;
 
-    // Spec §[port] lifetime: the vCPU pins exit_port via
-    // bind_refcount for as long as the vCPU exists (vm_exit events
-    // fire spontaneously on the bound port — same lifetime class as
-    // event_routes and bind-cap holders). The matching dec runs in
-    // `destroyExecutionContextLocked`. observed_zero is structurally
-    // impossible — `lookupPort` resolved against the caller's CD
-    // whose handle pins the port.
-    const vcpu_ec = allocVcpu(vm, domain, affinity, port) catch
-        return errors.E_NOMEM;
-    vcpu_ec.priority = requested_priority;
+        // Spec §[port] lifetime: the vCPU pins exit_port via
+        // bind_refcount for as long as the vCPU exists (vm_exit events
+        // fire spontaneously on the bound port — same lifetime class as
+        // event_routes and bind-cap holders). The matching dec runs in
+        // `destroyExecutionContextLocked`. observed_zero is structurally
+        // impossible — `lookupPort` resolved against the caller's CD
+        // whose handle pins the port.
+        const vcpu_ec = allocVcpu(vm, domain, affinity, port) catch
+            return errors.E_NOMEM;
+        vcpu_ec.priority = requested_priority;
 
-    // Inc + list-link under one port-lock acquire. Published into
-    // vcpu_list_head only after the inc, so cascade walks see a
-    // consistent view.
-    {
-        const irq = port._gen_lock.lockIrqSave(@src());
-        port_mod.incBindRef(port) catch unreachable;
-        vcpu_ec.vcpu_list_next = port.vcpu_list_head;
-        port.vcpu_list_head = vcpu_ec;
-        port._gen_lock.unlockIrqRestore(irq);
-    }
+        // Take the vCPU's private exit-port pin before minting the
+        // handle, but do not publish it on port.vcpu_list_head yet:
+        // recv-side teardown cascades are allowed to destroy every
+        // listed vCPU, and an EC without a minted handle is still
+        // private to this syscall.
+        {
+            const port_ref = vcpu_ec.exit_port orelse unreachable;
+            const port_lr = port_ref.lockIrqSave(@src()) catch {
+                vcpu_ec.exit_port = null;
+                ec_mod.destroyExecutionContextLocked(vcpu_ec, domain);
+                return errors.E_BADCAP;
+            };
+            port_mod.incBindRef(port_lr.ptr) catch unreachable;
+            port_ref.unlockIrqRestore(port_lr.irq_state);
+        }
 
-    const ec_gen = vcpu_ec._gen_lock.currentGen();
-    const erased = capability.ErasedSlabRef{
-        .ptr = @ptrCast(vcpu_ec),
-        .gen = @intCast(ec_gen),
+        const ec_gen = vcpu_ec._gen_lock.currentGen();
+        const erased = capability.ErasedSlabRef{
+            .ptr = @ptrCast(vcpu_ec),
+            .gen = @intCast(ec_gen),
+        };
+
+        const slot = cd_mod.mintHandle(
+            domain,
+            erased,
+            .execution_context,
+            requested_caps,
+            @intFromEnum(requested_priority),
+            affinity,
+        ) catch {
+            rollbackPrivateVcpu(vcpu_ec, domain);
+            return errors.E_FULL;
+        };
+        // Hold a lifecycle pin across port-list publication and scheduler
+        // enqueue. The handle is minted before the pin can make the vCPU
+        // externally visible; the pin then blocks cross-domain port cascade
+        // teardown from retiring/finalizing this EC after it sees the list
+        // node but before enqueue has linked it into a run queue.
+        if (!lifecycle.tryPinLive(vcpu_ec)) {
+            capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
+            rollbackPrivateVcpu(vcpu_ec, domain);
+            return errors.E_BADCAP;
+        }
+        publishMintedVcpuAndEnqueue(vcpu_ec) catch {
+            lifecycle.releasePin(vcpu_ec);
+            capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
+            rollbackPrivateVcpu(vcpu_ec, domain);
+            return errors.E_BADCAP;
+        };
+
+        // `publishMintedVcpuAndEnqueue` keeps the exit-port lock held until
+        // the run-queue link is committed, so a recv-side cross-domain close
+        // cannot detach and mark this vCPU before it becomes runnable. The
+        // create pin remains held until that commit returns; any adjacent
+        // destroy waits for the pin to drain before recycling the slab slot.
+        //
+        // Its first dispatch emits the initial vm_exit via the same
+        // running->parking lifecycle used for later exits; calling
+        // `fireVmExit` here would attempt to claim a private ready EC
+        // that is not in any run queue.
+        lifecycle.releasePin(vcpu_ec);
+        break :blk slot;
     };
-
-    const slot = cd_mod.mintHandle(
-        domain,
-        erased,
-        .execution_context,
-        requested_caps,
-        @intFromEnum(requested_priority),
-        affinity,
-    ) catch return errors.E_FULL;
-
-    // Spec §[virtual_machine].create_vcpu test 12: an initial vm_exit
-    // event is delivered immediately so the creator installs real
-    // entry state through the standard recv/reply lifecycle.
-    port_mod.fireVmExit(vcpu_ec, INITIAL_STATE_SUBCODE, .{ 0, 0, 0 });
 
     // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
     // tag in bits 12..15 disambiguates a real handle word from the
     // small-positive error range 1..15.
-    return @intCast(capability.Word0.pack(slot, .execution_context, requested_caps));
+    return @intCast(capability.Word0.pack(created_slot, .execution_context, requested_caps));
+}
+
+fn rollbackPrivateVcpu(
+    vcpu_ec: *ExecutionContext,
+    domain: *CapabilityDomain,
+) void {
+    if (vcpu_ec.exit_port) |port_ref| {
+        const port_lr = port_ref.lockIrqSave(@src()) catch null;
+        if (port_lr) |plr| {
+            port_mod.decBindRef(plr.ptr);
+            port_ref.unlockIrqRestore(plr.irq_state);
+        }
+        vcpu_ec.exit_port = null;
+    }
+    vcpu_ec.vcpu_list_next = null;
+    ec_mod.destroyExecutionContextLocked(vcpu_ec, domain);
+}
+
+fn publishMintedVcpuAndEnqueue(
+    vcpu_ec: *ExecutionContext,
+) error{StaleHandle}!void {
+    const port_ref = vcpu_ec.exit_port orelse return error.StaleHandle;
+    const port_lr = port_ref.lockIrqSave(@src()) catch {
+        return error.StaleHandle;
+    };
+    const port = port_lr.ptr;
+    const vcpu_ref = SlabRef(ExecutionContext).init(vcpu_ec, vcpu_ec._gen_lock.currentGen());
+    vcpu_ec.vcpu_list_next = port.vcpu_list_head;
+    port.vcpu_list_head = vcpu_ref;
+    scheduler.enqueue(vcpu_ec);
+    port_ref.unlockIrqRestore(port_lr.irq_state);
 }
 
 /// `map_guest` syscall handler. Spec §[virtual_machine].map_guest.

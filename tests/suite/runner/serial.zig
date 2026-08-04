@@ -51,6 +51,26 @@ pub const Serial = struct {
             b[0] = buf[i];
         }
     }
+
+    pub fn printHex(self: *const Serial, n: u64) void {
+        const b = self.base orelse return;
+        var buf: [16]u8 = undefined;
+        var i: usize = buf.len;
+        var v = n;
+        if (v == 0) {
+            b[0] = '0';
+            return;
+        }
+        while (v != 0) {
+            i -= 1;
+            const d: u8 = @intCast(v & 0xF);
+            buf[i] = if (d < 10) d + '0' else d - 10 + 'a';
+            v >>= 4;
+        }
+        while (i < buf.len) : (i += 1) {
+            b[0] = buf[i];
+        }
+    }
 };
 
 pub const DISABLED: Serial = .{ .base = null };

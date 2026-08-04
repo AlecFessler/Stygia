@@ -20,16 +20,10 @@
 //   the same wall and stops at the initial_state handshake.
 //
 //   What we observe end-to-end here without a guest payload is the
-//   path §[vm_set_policy] takes through the kernel when a vCPU is
-//   *already live* against the same VM, exercising the runtime-
-//   mutable promise of §[vm_policy] ("Tables seed with
-//   `create_virtual_machine` and are mutable at runtime by VMs
-//   holding the `policy` cap via `vm_set_policy`"). The kernel-side
-//   enforcement seam reads `vm.policy_pf`'s VmPolicy on every CPUID
-//   exit; for that lookup to be reachable the policy frame must
-//   remain pinned through vCPU creation, the initial vm_exit
-//   delivery, and any subsequent vm_set_policy mutation. We exercise
-//   each of those steps.
+//   syscall-visible replacement contract: a policy-bearing VM accepts
+//   a kind=0 table, accepts an empty replacement, and accepts a later
+//   replacement. This does not prove live-vCPU CPUID interception; it
+//   proves the mutable table update path exposed by the syscall.
 //
 //   To isolate the success path we need every earlier gate to be
 //   inert:
@@ -64,27 +58,16 @@
 //   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
 //   2. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
 //      (or smoke-pass on E_NODEV).
-//   3. createPort(caps={bind, recv}) — exit_port for the vCPU.
-//   4. createVcpu(caps={susp, read, write}, vm_handle, affinity=0,
-//      exit_port) — bound to the policy-bearing VM.
-//   5. recv(exit_port) — must succeed and deliver the initial vm_exit
-//      with sub-code = `initial_state` (13 on x86-64, 10 on aarch64,
-//      §[vm_exit_state]) in vreg 2. Witnesses that the policy frame
-//      and VM structure are coherent enough for create_vcpu's
-//      synthetic initial-exit injection; the kernel-side
-//      cpuid-policy reader path will be reached on every future
-//      CPUID exit on this vCPU.
-//   6. vmSetPolicy(vm, kind=0, count=1, entries=&entry) — must return
+//   3. vmSetPolicy(vm, kind=0, count=1, entries=&entry) — must return
 //      OK, witnessing live-mutable replacement of the cpuid_responses
-//      table after the VM has an active vCPU bound to it.
-//   7. vmSetPolicy(vm, kind=0, count=0, entries=&.{}) — clears the
+//      table.
+//   4. vmSetPolicy(vm, kind=0, count=0, entries=&.{}) — clears the
 //      table; must return OK. Witnesses that count=0 replacement is a
-//      valid clear and that the runtime-mutability path tolerates
-//      back-to-back replacements while a vCPU is live.
-//   8. vmSetPolicy(vm, kind=0, count=1, &entry) — re-installs the
-//      same entry; must return OK. Closes the loop on "tables are
-//      mutable at runtime" — the third successive replacement must
-//      land cleanly.
+//      valid clear.
+//   5. vmSetPolicy(vm, kind=0, count=1, &entry) — re-installs the
+//      same entry; must return OK. Closes the loop on repeated
+//      replacement of the current table — the third successive
+//      replacement must land cleanly.
 //
 // Assertions
 //   1: setup — create_page_frame for the policy frame returned an
@@ -94,20 +77,11 @@
 //   3: setup — map_pf for the policy mapping returned non-OK.
 //   4: setup — create_virtual_machine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
-//   5: setup — create_port returned an error word.
-//   6: setup — create_vcpu returned an error word.
-//   7: recv on the exit_port did not return OK in vreg 1 (initial
-//      vm_exit must already be queued at create_vcpu time per
-//      §[create_vcpu]).
-//   8: the recv'd event's sub-code (vreg 2) is not the initial-state
-//      sub-code — would indicate the policy install corrupted the
-//      synthetic-init machinery.
 //   9: vm_set_policy on the success path with one entry returned a
 //      value other than OK (the spec assertion under test —
-//      successful replacement of the cpuid_responses table while a
-//      vCPU is live).
+//      successful replacement of the cpuid_responses table).
 //  10: vm_set_policy with count=0 (clear) returned a value other than
-//      OK — the runtime-mutable replacement path is broken.
+//      OK — empty-table replacement is broken.
 //  11: vm_set_policy with the re-installed entry returned a value
 //      other than OK — the third successive replacement failed.
 
@@ -203,65 +177,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Mint the exit port. `bind` is required as create_vcpu's [4]
-    //    handle (§[create_vcpu] test 05). `recv` lets us pull the
-    //    kernel-injected initial vm_exit. Both bits live within
-    //    runner-granted port_ceiling = 0x5C (xfer/recv/bind/suspend).
-    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
-    const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
-    if (testing.isHandleError(cport.v1)) {
-        testing.fail(5);
-        return;
-    }
-    const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
-
-    // 6. Stand up a vCPU bound to the policy-bearing VM. caps include
-    //    `read` + `write` so any future state-transfer reply lands on
-    //    the §[vm_exit_state] writeback path; `susp` keeps suspend's
-    //    vCPU-target check (§[suspend] test 06) reachable. The vCPU's
-    //    presence ensures `vm.policy_pf` is held live across the
-    //    whole subsequent vm_set_policy sequence — the kernel-side
-    //    cpuid-policy reader reads the policy frame on every CPUID
-    //    exit, so policy install + vCPU coexistence is the
-    //    load-bearing prereq for spec §[vm_policy] enforcement.
-    const vcpu_caps = caps.EcCap{
-        .susp = true,
-        .read = true,
-        .write = true,
-    };
-    const cvcpu = syscall.createVcpu(
-        @as(u64, vcpu_caps.toU16()),
-        vm_handle,
-        0, // affinity = any core
-        exit_port,
-    );
-    if (testing.isHandleError(cvcpu.v1)) {
-        testing.fail(6);
-        return;
-    }
-
-    // 7. Recv the kernel-injected initial vm_exit. §[create_vcpu]
-    //    guarantees this is enqueued at create_vcpu time, so recv
-    //    returns immediately with vreg 1 = OK.
-    const initial = syscall.recv(exit_port, 0);
-    if (initial.regs.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(7);
-        return;
-    }
-
-    // 8. The synthetic initial vm_exit's sub-code lives in vreg 2 per
-    //    §[vm_exit_state] / kernel `setEventSubcode`. The expected
-    //    sentinel is `INITIAL_STATE_SUBCODE` (13 on x86-64, 10 on
-    //    aarch64). Witnessing it here proves the kernel reached
-    //    create_vcpu's success-path tail with the policy-bearing VM
-    //    intact and the synthetic-init injection landed in the
-    //    receiver's vreg 2 slot.
-    if (initial.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
-        testing.fail(8);
-        return;
-    }
-
-    // 9. Build the entry. Each u64 packs two u32 fields per the kind=0
+    // 5. Build the entry. Each u64 packs two u32 fields per the kind=0
     //    layout: low 32 bits = first field, high 32 bits = second.
     const entry: [3]u64 = .{
         (@as(u64, SEED_SUBLEAF) << 32) | @as(u64, SEED_LEAF),
@@ -269,39 +185,33 @@ pub fn main(cap_table_base: u64) void {
         (@as(u64, SEED_EDX) << 32) | @as(u64, SEED_ECX),
     };
 
-    // 10. Replace cpuid_responses with one entry. count = 1 <
+    // 6. Replace cpuid_responses with one entry. count = 1 <
     //     MAX_CPUID_POLICIES = 32 (test 03 inert); the libz wrapper
     //     takes the handle as u12 so reserved bits in [1] are clean
     //     (test 04 inert); each entry u64 is fully populated by spec
     //     layout, so no per-entry reserved bits are set. The remaining
-    //     failure surface is the test 05 success path itself —
-    //     specifically, replacement while a vCPU is live, which would
-    //     surface any race between the kernel's policy writer and the
-    //     CPUID-exit policy reader.
+    //     failure surface is the test 05 success path itself.
     const replace_result = syscall.vmSetPolicy(vm_handle, 0, 1, &entry);
     if (replace_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(9);
         return;
     }
 
-    // 11. Clear the cpuid_responses table by replacing it with count=0.
+    // 7. Clear the cpuid_responses table by replacing it with count=0.
     //     §[vm_set_policy] does not special-case count=0; the spec
     //     sentence "the table is replaced by the count entries" admits
-    //     count=0 as the empty replacement. The runtime-mutable
-    //     promise from §[vm_policy] requires this to land cleanly on
-    //     a live VM.
+    //     count=0 as the empty replacement.
     const clear_result = syscall.vmSetPolicy(vm_handle, 0, 0, &.{});
     if (clear_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
     }
 
-    // 12. Re-install the same entry. Three back-to-back replacements
+    // 8. Re-install the same entry. Three back-to-back replacements
     //     (1 entry → 0 entries → 1 entry) close the loop on
-    //     "subsequent guest CPUIDs match against this table" requiring
     //     the *current* table state, not stale state from a prior
-    //     install. Any storage-of-prior-table bug would surface as a
-    //     failure on this third call.
+    //     install. Any failure to accept repeated replacement would
+    //     surface on this third call.
     const reinstall_result = syscall.vmSetPolicy(vm_handle, 0, 1, &entry);
     if (reinstall_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(11);

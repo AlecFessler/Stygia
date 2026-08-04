@@ -103,7 +103,58 @@ pub const PageFaultContext = struct {
     is_exec: bool,
     rip: u64 = 0,
     user_ctx: ?*ArchCpuContext = null,
+    /// Interrupted context's x29 — root of its frame-record chain. The
+    /// panic backtrace cannot recover this: `StackIterator` stops at the
+    /// naked exception trampoline, but the x29 saved in the exception
+    /// frame predates the break in the chain.
+    fp: u64 = 0,
+    /// Interrupted context's x30. When the faulting PC is a leaf
+    /// (memset, memcpy), this names the caller.
+    lr: u64 = 0,
+    /// Full saved register frame, for the fatal-fault reporter's GPR
+    /// dump. Unlike `user_ctx` this is set for kernel-mode faults too.
+    frame_ctx: ?*const ArchCpuContext = null,
+    /// True when the faulting access happened inside a marked
+    /// copy-in/out window (`arch.dispatch.cpu.userAccessBegin` ..
+    /// `userAccessEnd`). On aarch64 that window is PSTATE.PAN=0.
+    /// See the x86-64 twin for how `memory.fault` consumes it.
+    ///
+    /// Defaults to `true` so a context built by a path that cannot
+    /// determine the window degrades to the pre-existing (accessor)
+    /// behaviour rather than a spurious kernel panic.
+    in_user_access_window: bool = true,
 };
+
+/// SPSR_EL1.PAN — Arm ARM D17.2.116. PAN=1 means privileged access to
+/// user-accessible memory traps; PAN=0 means the kernel is inside a
+/// `userAccessBegin`/`userAccessEnd` window (or PAN is unimplemented).
+pub const SPSR_PAN: u64 = 1 << 22;
+
+/// Dump every saved GPR of a fault frame. printRaw only — this runs on
+/// the fatal-fault path where `serial.print_lock` may already be held by
+/// this core (see memory.fault.reportKernelFault).
+pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
+    // Own-arch printer, not the dispatch facade — see the x64 twin.
+    const boot = stygia.arch.aarch64.serial;
+    const panic_mod = stygia.panic;
+    inline for (@typeInfo(Registers).@"struct".fields, 0..) |f, i| {
+        boot.printRaw(if (i % 4 == 0) "  " else " ");
+        boot.printRaw(f.name ++ "=0x");
+        panic_mod.printHex(@field(ctx.regs, f.name));
+        if (i % 4 == 3) boot.printRaw("\n");
+    }
+    boot.printRaw("\n  sp_el0=0x");
+    panic_mod.printHex(ctx.sp_el0);
+    boot.printRaw(" elr=0x");
+    panic_mod.printHex(ctx.elr_el1);
+    boot.printRaw(" spsr=0x");
+    panic_mod.printHex(ctx.spsr_el1);
+    // Interrupted kernel SP: the vector stub pushed a 16-byte save area,
+    // then the trampoline allocated the ArchCpuContext directly below it.
+    boot.printRaw(" ksp=0x");
+    panic_mod.printHex(@intFromPtr(ctx) + @sizeOf(ArchCpuContext) + 16);
+    boot.printRaw("\n");
+}
 
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x0 = value;

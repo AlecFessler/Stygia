@@ -161,6 +161,20 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     return arch_impl.issueRawNoStack(word, in);
 }
 
+/// Internal test/bootstrap escape hatch for a fire-and-forget syscall with an
+/// exact raw word. This exists for call sites such as the spec runner's report
+/// suspend, where word 0 deliberately selects the L4 fast-suspend ABI and the
+/// returned registers must stay unobservable. Normal syscall wrappers should
+/// use `issueReg` / `issueRegDiscard`; do not add production libz call sites
+/// here unless the raw word encoding is itself the behavior under test.
+pub fn issueRawDiscard(word: u64, in: Regs) void {
+    arch_impl.issueRegDiscard(word, in);
+}
+
+pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
+    return arch_impl.issueRawCaptureWord(word_in, in);
+}
+
 pub fn issueReg(num: SyscallNum, extra: u64, in: Regs) Regs {
     return issueRawNoStack(buildWord(num, extra), in);
 }

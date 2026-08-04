@@ -3,7 +3,6 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
-const cpu = stygia.arch.dispatch.cpu;
 const device_region = stygia.devices.device_region;
 const errors = stygia.syscall.errors;
 const port = stygia.sched.port;
@@ -62,7 +61,7 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 /// [test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 /// [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 /// [test 07] on success, the suspended EC is resumed.
-pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
+pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     // Spec §[reply] unified syscall word:
     //   bits  0-11: syscall_num
     //   bits 12-19: pair_count (0..63; 0 = bare reply)
@@ -98,7 +97,7 @@ pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
     }
 
     const reply_result = if (pair_count > 0)
-        replyTransferInternal(ec, syscall_word, pair_count)
+        replyTransferInternal(ec, syscall_word, pair_count, args)
     else blk: {
         const slot: u12 = @truncate(reply_handle);
         const cd_ref = ec.domain;
@@ -161,7 +160,7 @@ pub fn reply(caller: *anyopaque, syscall_word: u64) i64 {
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended EC is resumed.
-fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8) i64 {
+fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8, args: []const u64) i64 {
     // Caller (`reply`) already validated the unified-syscall reserved
     // bits (44-63) and N ≤ 63. N == 0 is the bare-reply path and never
     // reaches here.
@@ -199,35 +198,27 @@ fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8) i6
     // Test 02 — xfer-cap check on a confirmed reply handle.
     if (reply_present and !has_xfer) return errors.E_PERM;
 
-    // Read pair entries from the user stack. Spec §[syscall_abi]: vreg
-    // M for `firstStackVreg() ≤ M ≤ 127` lives at
-    // `[user_sp + (M - firstStackVreg() + 1) * 8]` when the syscall
-    // executes. Spec §[handle_attachments] places N entries at vregs
-    // `[128-N..127]`. SMAP/PAN gates the load via userAccess{Begin,End}.
     var entries: [PAIR_BUF_LEN]u64 = undefined;
     const len: usize = n;
-    const user_rsp = cpu.userStackPointer(ec.ctx);
-    const first_stack_vreg = cpu.firstStackVreg();
-    const first_vreg: u64 = 128 - @as(u64, n);
-    const first_off: u64 = (first_vreg - first_stack_vreg + 1) * 8;
-
-    cpu.userAccessBegin();
+    const first_vreg: usize = 128 - @as(usize, n);
+    if (args.len < 127) return errors.E_INVAL;
     var i: usize = 0;
     while (i < len) {
-        const off = first_off + i * 8;
-        const ptr: *const u64 = @ptrFromInt(user_rsp + off);
-        entries[i] = ptr.*;
+        entries[i] = args[first_vreg + i - 1];
         i += 1;
     }
-    cpu.userAccessEnd();
 
     const pair_entries: []const u64 = entries[0..len];
 
     // Test 04b: per-entry reserved-bit check (fires before test 01 per
     // the reply_transfer_04 ladder).
-    if (validatePairEntryBits(pair_entries)) |err| return err;
+    if (validatePairEntryBits(pair_entries)) |err| {
+        return err;
+    }
     // Test 09: intra-batch duplicate source ids.
-    if (hasDuplicateSources(pair_entries)) return errors.E_INVAL;
+    if (hasDuplicateSources(pair_entries)) {
+        return errors.E_INVAL;
+    }
 
     // Test 01: reply handle resolves as a reply. Deferred to here so
     // test 04b fires first against in-domain non-reply slots.
@@ -243,7 +234,7 @@ fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8) i6
     const lr2 = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr2.ptr;
     if (validatePairEntrySources(cd, ec, pair_entries)) |err| {
-        ec.pending_pair_count = 0;
+        port.releasePendingPairEntries(ec);
         cd_ref.unlockIrqRestore(lr2.irq_state);
         return err;
     }
@@ -275,6 +266,10 @@ fn validatePairEntrySources(
     ec: *ExecutionContext,
     entries: []const u64,
 ) ?i64 {
+    const source_domain: capability.ErasedSlabRef = .{
+        .ptr = cd,
+        .gen = @intCast(cd._gen_lock.currentGen()),
+    };
     var idx: usize = 0;
     while (idx < entries.len) : (idx += 1) {
         const entry = entries[idx];
@@ -283,7 +278,11 @@ fn validatePairEntrySources(
         const move_flag: bool = (entry & PAIR_MOVE_BIT) != 0;
 
         // Test 05: source handle must resolve in the caller's domain.
-        const src = capability.resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+        const src = capability.resolveHandleOnDomain(cd, slot, null) orelse {
+            ec.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(ec);
+            return errors.E_BADCAP;
+        };
 
         const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
 
@@ -291,16 +290,28 @@ fn validatePairEntrySources(
         // handle's current caps. Bitwise subset is correct for every
         // transferable handle type (none of them carry `restrict`'s
         // restart_policy enum special-case).
-        if (entry_caps & ~src_caps != 0) return errors.E_PERM;
+        if (entry_caps & ~src_caps != 0) {
+            ec.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(ec);
+            return errors.E_PERM;
+        }
 
         // Tests 07/08: move/copy authority. Bit 0 = `move`, bit 1 =
         // `copy` in the cap layout shared by transferable handle types.
         const has_move = (src_caps & 0x1) != 0;
         const has_copy = (src_caps & 0x2) != 0;
         if (move_flag) {
-            if (!has_move) return errors.E_PERM;
+            if (!has_move) {
+                ec.pending_pair_count = @intCast(idx);
+                port.releasePendingPairEntries(ec);
+                return errors.E_PERM;
+            }
         } else {
-            if (!has_copy) return errors.E_PERM;
+            if (!has_copy) {
+                ec.pending_pair_count = @intCast(idx);
+                port.releasePendingPairEntries(ec);
+                return errors.E_PERM;
+            }
         }
 
         // Stash the decoded entry. Captures the source object's
@@ -309,10 +320,20 @@ fn validatePairEntrySources(
         const obj_type = Word0.typeTag(cd.user_table[slot].word0);
         ec.pending_pair_entries[idx] = .{
             .obj_ref = src.ref,
+            .source_domain = source_domain,
+            .source_instance = src.instance,
             .obj_type = obj_type,
+            .source_caps = src_caps,
+            .pending_ref_caps = 0,
             .caps = entry_caps,
             .move = move_flag,
             .src_slot = slot,
+        };
+        ec.pending_pair_entries[idx].pending_ref_caps = port.pendingRefCapsForEntry(ec.pending_pair_entries[idx]);
+        port.acquirePendingPairEntryRef(ec.pending_pair_entries[idx]) catch {
+            ec.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(ec);
+            return errors.E_BADCAP;
         };
     }
     ec.pending_pair_count = @intCast(entries.len);

@@ -24,15 +24,10 @@
 //   the same wall and stops at the initial_state reply.
 //
 //   What we observe end-to-end here without a guest payload is the
-//   path §[vm_set_policy] takes through the kernel when a vCPU is
-//   *already live* against the same VM. The kernel's cr-exit policy
-//   reader inspects `vm.policy_pf`'s VmPolicy on every CR access; for
-//   that lookup to be reachable the policy frame must remain pinned
-//   through vCPU creation, the initial vm_exit delivery, and any
-//   subsequent vm_set_policy mutation. We exercise each of those
-//   steps and close the loop with three back-to-back kind=1
-//   replacements (1 entry → 0 → 1) so a prior-table-storage bug
-//   surfaces on the third call.
+//   syscall-visible replacement contract: a policy-bearing VM accepts
+//   a kind=1 table, accepts an empty replacement, and accepts a later
+//   replacement. This does not prove live-vCPU CR interception; it
+//   proves the mutable table update path exposed by the syscall.
 //
 //   To isolate the success path every prior-numbered gate must be
 //   defused so vm_set_policy actually returns OK:
@@ -79,14 +74,9 @@
 //      in the seed policy (well under both MAX_* bounds).
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
-//   5. createPort(caps={bind, recv}) — exit_port for the vCPU.
-//   6. createVcpu(caps={susp, read, write}, vm_handle, affinity=0,
-//      exit_port).
-//   7. recv(exit_port) — must succeed and surface the initial-state
-//      sentinel in vreg 2.
-//   8. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
-//   9. vmSetPolicy(vm_handle, kind=1, count=0, &.{}) — must return OK.
-//  10. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
+//   5. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
+//   6. vmSetPolicy(vm_handle, kind=1, count=0, &.{}) — must return OK.
+//   7. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
 //
 // Assertions
 //   1: setup — create_page_frame returned an error word.
@@ -94,16 +84,11 @@
 //   3: setup — map_pf returned non-OK in vreg 1.
 //   4: setup — create_virtual_machine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
-//   5: setup — create_port returned an error word.
-//   6: setup — create_vcpu returned an error word.
-//   7: recv on the exit_port did not return OK in vreg 1.
-//   8: the recv'd event's sub-code (vreg 2) is not the initial-state
-//      sub-code.
 //   9: vm_set_policy with kind=1 and a valid 1-entry CR policy table
 //      returned a value other than OK (the spec assertion under test
 //      via the syscall-ABI observable).
 //  10: vm_set_policy with kind=1 count=0 (clear) returned a value
-//      other than OK — the runtime-mutable replacement path is broken.
+//      other than OK — empty-table replacement is broken.
 //  11: vm_set_policy with the re-installed kind=1 entry returned a
 //      value other than OK — the third successive replacement failed.
 
@@ -187,59 +172,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Mint the exit port. `bind` is required as create_vcpu's [4]
-    //    handle. `recv` lets us pull the kernel-injected initial
-    //    vm_exit. Both bits live within runner-granted
-    //    port_ceiling = 0x5C.
-    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
-    const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
-    if (testing.isHandleError(cport.v1)) {
-        testing.fail(5);
-        return;
-    }
-    const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
-
-    // 6. Stand up a vCPU bound to the policy-bearing VM. The vCPU's
-    //    presence pins `vm.policy_pf` live across the subsequent
-    //    vm_set_policy sequence — the kernel-side CR-policy reader
-    //    consults the policy frame on every CR-access exit, so
-    //    policy install + vCPU coexistence is the load-bearing
-    //    prereq for spec §[vm_policy] enforcement.
-    const vcpu_caps = caps.EcCap{
-        .susp = true,
-        .read = true,
-        .write = true,
-    };
-    const cvcpu = syscall.createVcpu(
-        @as(u64, vcpu_caps.toU16()),
-        vm_handle,
-        0, // affinity = any core
-        exit_port,
-    );
-    if (testing.isHandleError(cvcpu.v1)) {
-        testing.fail(6);
-        return;
-    }
-
-    // 7. Recv the kernel-injected initial vm_exit. §[create_vcpu]
-    //    guarantees this is enqueued at create_vcpu time.
-    const initial = syscall.recv(exit_port, 0);
-    if (initial.regs.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(7);
-        return;
-    }
-
-    // 8. The synthetic initial vm_exit's sub-code lives in vreg 2 per
-    //    §[vm_exit_state] / kernel `setEventSubcode`. Witnessing the
-    //    `INITIAL_STATE_SUBCODE` sentinel proves the kernel reached
-    //    create_vcpu's success-path tail with the policy-bearing VM
-    //    intact.
-    if (initial.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
-        testing.fail(8);
-        return;
-    }
-
-    // 9. vm_set_policy with kind=1 and one CrPolicy entry.
+    // 5. vm_set_policy with kind=1 and one CrPolicy entry.
     //    Per §[vm_set_policy] x86-64, the entry occupies vregs
     //    [2..4] (3 vregs) starting at vreg 2:
     //       vreg 2 = { cr_num u8, _pad u8[7] }
@@ -265,21 +198,19 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 10. Clear the cr_policies table by replacing it with count=0.
-    //     The runtime-mutable promise from §[vm_policy] requires this
-    //     to land cleanly on a live VM.
+    // 6. Clear the cr_policies table by replacing it with count=0.
+    //     Count=0 is the empty replacement and must land cleanly.
     const clear_result = syscall.vmSetPolicy(vm_handle, 1, 0, &.{});
     if (clear_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
     }
 
-    // 11. Re-install the same entry. Three back-to-back replacements
+    // 7. Re-install the same entry. Three back-to-back replacements
     //     (1 entry → 0 entries → 1 entry) close the loop on
-    //     "subsequent guest CR accesses match against this table"
-    //     requiring the *current* table state, not stale state from a
-    //     prior install. Any storage-of-prior-table bug would surface
-    //     as a failure on this third call.
+    //     the *current* table state, not stale state from a prior
+    //     install. Any failure to accept repeated replacement would
+    //     surface on this third call.
     const reinstall_result = syscall.vmSetPolicy(vm_handle, 1, 1, &entry);
     if (reinstall_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(11);

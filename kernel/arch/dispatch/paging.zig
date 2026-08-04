@@ -432,6 +432,38 @@ pub fn unmapPageNoShootdown(addr_space_root: PAddr, virt: VAddr) ?PAddr {
     };
 }
 
+/// Publish a globals-inclusive cross-core TLB invalidation for a KERNEL
+/// virtual range whose leaf PTEs have just been cleared, and return an
+/// opaque epoch. The backing physical frames may only be recycled once
+/// `kernelUnmapEpochRetired(epoch)` is true — otherwise a remote core
+/// with a stale (global, hence CR3-switch-proof) translation keeps
+/// reaching frames the PMM has already handed to someone else.
+///
+/// Never blocks: see `x64.paging.publishKernelUnmapEpoch` for why an
+/// ack-wait on this path deadlocks against the IPC fast path.
+///
+/// x86-64: one whole-TLB `flush_all_global` arm, polled. aarch64:
+/// returns 0 (immediately retired) — `TLBI ... IS` is an architectural
+/// inner-shareable broadcast with `dsb ish` ordering, so `unmapPage` has
+/// already made the invalidation visible to every PE.
+pub fn publishKernelUnmapEpoch() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.publishKernelUnmapEpoch(),
+        .aarch64 => 0,
+        else => unreachable,
+    };
+}
+
+/// Companion of `publishKernelUnmapEpoch`: true once every core has
+/// honoured the invalidation published at `epoch`.
+pub fn kernelUnmapEpochRetired(epoch: u64) bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.kernelUnmapEpochRetired(epoch),
+        .aarch64 => true,
+        else => unreachable,
+    };
+}
+
 /// Cross-core TLB shootdown over the same page range, addressed by
 /// `addr_space_id` so remote cores can filter quickly. Issues a
 /// shootdown IPI and waits for ack from every core that may hold a

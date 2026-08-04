@@ -73,6 +73,7 @@ const stygia = @import("stygia");
 
 const cpu = stygia.arch.aarch64.cpu;
 const panic = stygia.panic;
+const serial = stygia.arch.aarch64.serial;
 
 /// Kernel VA of the PM block base, or 0 for "do not pet". Zero covers three
 /// distinct states that all want identical behaviour: no PM node in the
@@ -132,13 +133,36 @@ const RELOAD_TICKS: u32 = (15 * TICKS_PER_SEC) & PM_WDOG_TIME_SET;
 /// risks truncating a real run, which is exactly the failure this module was
 /// written to remove.
 ///
-/// 600 s accordingly. A single boot may legitimately run for many minutes: the
-/// suite has an internal loop mode that runs the whole 485-test set N times back
-/// to back in one boot, so run length is a harness parameter rather than a fixed
-/// cost, and there is no bare-metal timing for even one iteration yet (the only
-/// datapoint is that a run reached `batch 16..32` of ~31 inside the loader's
-/// single 15 s window). Raise this before raising N far enough to approach it.
-const CEILING_SECONDS: u64 = 600;
+/// A single boot may legitimately run for many minutes: the suite has an
+/// internal loop mode that runs the whole 485-test set N times back to back in
+/// one boot, so run length is a harness parameter rather than a fixed cost.
+/// The original value was 600 s, chosen when there was no bare-metal timing for
+/// even one iteration, together with the standing instruction "raise this
+/// before raising N far enough to approach it".
+///
+/// N=100 passed that point and the instruction was missed, silently, for three
+/// cycles. MEASURED: four independent `-Drepeat=100` runs on this board, on
+/// four different kernel builds, ended after 668 s, 670 s, 674 s and 669 s
+/// — a 6 s spread — having completed 64, 68, 73 and 77 passes respectively, a
+/// 20 % spread. A stochastic kernel wedge cannot produce a constant wall clock
+/// across builds; a fixed deadline can, and this is the only one in the system.
+/// Each run died the same way: the last line is a normal `[runner] spawned
+/// 16/16` mid-pass, then nothing, then the board resets and Pi OS comes back.
+/// That is exactly `pet()` taking the `cntvct >= pet_deadline` branch — which
+/// calls `stopPetting()` and returns without a word — followed by the armed
+/// BCM2712 watchdog firing ≤15 s later.
+///
+/// The implied per-pass costs (600 s / passes) are 9.4, 8.8, 8.2 and 7.8 s, in
+/// the order the fixes landed. So the run lengths were not a cliff that kept
+/// moving; they were one constant divided by a shrinking per-pass cost, and
+/// reading them as a kernel bug ("the spawn-loop wedge") cost three cycles.
+///
+/// 1200 s accordingly: 100 passes at the measured 7.8 s/pass is ~780 s, so this
+/// leaves ~54 % headroom while still bounding an IRQ-servicing hang at ~20 min
+/// — inside the harness's own wait (`bm_stability.sh` MAX_WAIT=280 ⇒ 1400 s),
+/// which is the property that keeps the board unattended-recoverable. Raising N
+/// again requires raising BOTH, in that order.
+const CEILING_SECONDS: u64 = 1200;
 
 /// Point the pet at a PM block whose MMIO page is already mapped, `va` being
 /// the kernel VA of the block's base (not of PM_WDOG), and start the
@@ -179,6 +203,17 @@ pub inline fn pet() void {
     const base = @atomicLoad(usize, &pm_base, .monotonic);
     if (base == 0) return;
     if (cpu.readCntvct() >= pet_deadline) {
+        // SAY SO. This branch used to stop petting in total silence, so the
+        // board simply went quiet mid-pass and reset ~15 s later, which reads
+        // on the captured serial exactly like a kernel wedge in whatever the
+        // runner was doing at the time. Three cycles diagnosed it as one. A
+        // deliberate exit path must never be indistinguishable from a hang.
+        //
+        // `printRaw` because this runs from the timer IRQ, where the lock the
+        // normal printer takes may already be held by this core — same reason
+        // the fault reporters use it. One-shot: `stopPetting` zeroes `pm_base`,
+        // so the `base == 0` early return above makes every later pet a no-op.
+        serial.printRaw("\n[wdog] CEILING_SECONDS budget exhausted — petting stops, board resets within 15s\n");
         stopPetting();
         return;
     }

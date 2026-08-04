@@ -2480,7 +2480,7 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
 
 #### Description
 
-The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events. Immediately upon creation, the kernel enqueues a vm_exit-style delivery on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
+The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events and publishes the new vCPU as runnable. On the vCPU's first dispatch, the kernel delivers a vm_exit-style event on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
 
 #### Capabilities
 
@@ -2528,7 +2528,7 @@ The vCPU EC is bound to the capability domain that holds the VM handle. `create_
 
 [test 11] on success, the EC's affinity is set to `[3]`.
 
-[test 12] immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the `initial_state` sub-code.
+[test 12] after creation, the initial vCPU dispatch delivers a vm_exit event on `[4] exit_port` with zeroed guest state in the vregs and the `initial_state` sub-code; a waiting `recv` observes that delivery before guest entry.
 
 
 ### map_guest
@@ -4265,4 +4265,3 @@ power_set_idle([1] core_id, [2] policy) -> void
 [test 14] returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
 
 [test 15] returns E_INVAL if [2] is greater than 2.
-

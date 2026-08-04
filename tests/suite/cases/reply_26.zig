@@ -16,15 +16,25 @@
 //       turn required to attach pair entries via the unified reply.
 //     - Test EC mints port_B (caps={bind,recv}). xfer is unnecessary
 //       on port_B — pair_count=0 across the X→test wakeup leg.
-//     - Test EC mints sibling W (caps={susp,term}, priority 1). W
-//       self-suspends on port_A via raw asm so its post-resume
+//     - Test EC pins itself to its current core for this scenario, then
+//       mints sibling W (caps={susp,term}, priority 1,
+//       affinity=same core). W
+//       self-suspends on port_A via libz's raw capture helper so its post-resume
 //       syscall word lands at the kernel's chosen syscall pad (an
 //       externally-suspended EC has no pad to write — same trick as
-//       reply_transfer_12.zig).
-//     - Test EC mints sibling X (caps={susp,term}, priority 1). X
-//       gates on g_ready_x and self-suspends on port_B AFTER the
-//       test EC has parked itself on port_B via replyTransferRecv,
-//       so the wakeup the test EC observes is X's suspension event.
+//       reply_transfer_12.zig). W stays at normal priority: it is
+//       gated by test-published globals before suspension, so making it
+//       higher priority can starve that setup path. Pinning the test EC
+//       and W to the same single core prevents W from running
+//       concurrently with the test EC while the combo syscall is still
+//       between its resume and recv halves.
+//     - Test EC mints sibling X (caps={susp,term}, priority 1,
+//       affinity=same core). X gates on g_ready_x. W releases that
+//       gate only after W returns from the replyTransferRecv resume,
+//       then keeps yielding to X until X has entered its suspend path,
+//       so X cannot queue its port_B event before the combo syscall
+//       has resumed W and armed the test EC's recv-mode park on
+//       port_B.
 //     - Test EC mints a page frame whose handle rides as the single
 //       pair entry attached to the W-resume side. Page frame is a
 //       non-IDC type, so the install caps land verbatim — no
@@ -40,17 +50,18 @@
 //   1. create_port(caps={bind,recv,xfer})         — port_A
 //   2. create_port(caps={bind,recv})              — port_B
 //   3. create_page_frame(caps={move,r,w}, sz=4K)  — pair-entry source
-//   4. create_execution_context W                 — gates on g_ready_w
-//   5. create_execution_context X                 — gates on g_ready_x
-//   6. release W via g_ready_w                    — W self-suspends on A
-//   7. recv(port_A, 0)                            — get reply_handle_A
-//   8. release X via g_ready_x                    — X gated, will susp B
+//   4. pin test EC to current core
+//   5. create_execution_context W                 — gates on g_ready_w
+//   6. create_execution_context X                 — gates on g_ready_x
+//   7. release W via g_ready_w                    — W self-suspends on A
+//   8. recv(port_A, 0)                            — get reply_handle_A
 //   9. replyTransferRecv(reply_handle_A, [pf_pair], port_B)
 //      — atomically: resume W with pf installed, park test EC on B,
 //        wake when X suspends on B with the recv contract
-//   10. validate W's post-resume word: pair_count == 1, tstart names
+//  10. W returns from suspend and releases X via g_ready_x
+//  11. validate W's post-resume word: pair_count == 1, tstart names
 //       a slot containing the page_frame handle with caps verbatim
-//   11. validate test EC's post-recv word: event_type == suspension,
+//  12. validate test EC's post-recv word: event_type == suspension,
 //       new reply_handle_id != 0 (kernel minted X's reply handle in
 //       our table), pair_count == 0 (X attached nothing)
 //
@@ -77,12 +88,14 @@
 //   1: setup — create_port for port_A returned an error word
 //   2: setup — create_port for port_B returned an error word
 //   3: setup — create_page_frame returned an error word
-//   4: setup — create_execution_context for W returned an error
+//   4: setup — self-affinity pin failed, or create_execution_context
+//      for W returned an error
 //   5: setup — create_execution_context for X returned an error
 //   6: recv on port_A did not return OK
 //   7: recv on port_A returned reply_handle_id == 0
 //   8: replyTransferRecv did not return OK in vreg 1
-//   9: W's post-resume syscall word reports pair_count != 1
+//   9: W did not publish its post-resume syscall word, or that word
+//      reports pair_count != 1
 //  10: W's post-resume tstart slot does not contain a page_frame
 //      handle, or its caps differ from the entry's caps
 //  11: post-recv syscall word event_type field != suspension (4)
@@ -120,6 +133,7 @@ var g_w_self_handle: u64 = 0;
 var g_x_self_handle: u64 = 0;
 var g_ready_w: u32 = 0;
 var g_ready_x: u32 = 0;
+var g_x_entered: u32 = 0;
 var g_w_observed_word: u64 = 0;
 var g_w_done: u32 = 0;
 
@@ -127,7 +141,7 @@ fn parkForever() noreturn {
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfe"),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
             else => @compileError("unsupported target architecture"),
         }
     }
@@ -142,72 +156,30 @@ fn siblingW_entry() callconv(.c) noreturn {
         }
     }
 
-    const port_id: u64 = g_port_a_handle;
-    const self_ec_id: u64 = g_w_self_handle;
+    const port_id = @atomicLoad(u64, &g_port_a_handle, .acquire);
+    const self_ec_id = @atomicLoad(u64, &g_w_self_handle, .acquire);
 
-    // Self-suspend on port_A. syscall_num = 14 (.suspend); no
-    // attachments from the sender side. Capture the post-resume
-    // syscall word so we can read pair_count / tstart on the W side
-    // (same trick as reply_transfer_12.zig's sibling).
-    const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
-    var word_out: u64 = undefined;
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            var rax_out: u64 = undefined;
-            var rbx_out: u64 = undefined;
-            asm volatile (
-                \\ pushq %%rcx
-                \\ syscall
-                \\ popq %%rcx
-                : [wo] "={rcx}" (word_out),
-                  [v1o] "={rax}" (rax_out),
-                  [v2o] "={rbx}" (rbx_out),
-                : [wi] "{rcx}" (word_in),
-                  [v1i] "{rax}" (self_ec_id),
-                  [v2i] "{rbx}" (port_id),
-                : .{
-                    .rdx = true,
-                    .rbp = true,
-                    .rsi = true,
-                    .rdi = true,
-                    .r8 = true,
-                    .r9 = true,
-                    .r10 = true,
-                    .r11 = true,
-                    .r12 = true,
-                    .r13 = true,
-                    .r14 = true,
-                    .r15 = true,
-                    .memory = true,
-                });
-        },
-        .aarch64 => {
-            var x0_out: u64 = undefined;
-            var x1_out: u64 = undefined;
-            asm volatile (
-                \\ sub sp, sp, #16
-                \\ str %[wi], [sp]
-                \\ svc #0
-                \\ ldr %[wo], [sp]
-                \\ add sp, sp, #16
-                : [wo] "=&r" (word_out),
-                  [v1o] "={x0}" (x0_out),
-                  [v2o] "={x1}" (x1_out),
-                : [wi] "r" (word_in),
-                  [v1i] "{x0}" (self_ec_id),
-                  [v2i] "{x1}" (port_id),
-                : .{ .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true,
-                     .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true,
-                     .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true,
-                     .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true,
-                     .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true,
-                     .x28 = true, .x29 = true, .x30 = true, .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
+    // Raw word 0 selects the no-attachment fast-suspend ABI. Capture the
+    // post-resume syscall word so we can read pair_count / tstart on the
+    // W side (same trick as reply_transfer_12.zig's sibling).
+    const suspended = syscall.issueRawCaptureWord(0, .{
+        .v1 = self_ec_id,
+        .v2 = port_id,
+    });
+    const word_out = suspended.word;
 
     @atomicStore(u64, &g_w_observed_word, word_out, .release);
     @atomicStore(u32, &g_w_done, 1, .release);
+    @atomicStore(u32, &g_ready_x, 1, .release);
+    const x_ec = @atomicLoad(u64, &g_x_self_handle, .acquire);
+    while (@atomicLoad(u32, &g_x_entered, .acquire) == 0) {
+        _ = syscall.yieldEc(x_ec);
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+            else => @compileError("unsupported target architecture"),
+        }
+    }
 
     parkForever();
 }
@@ -221,62 +193,14 @@ fn siblingX_entry() callconv(.c) noreturn {
         }
     }
 
-    const port_id: u64 = g_port_b_handle;
-    const self_ec_id: u64 = g_x_self_handle;
+    const port_id = @atomicLoad(u64, &g_port_b_handle, .acquire);
+    const self_ec_id = @atomicLoad(u64, &g_x_self_handle, .acquire);
+    @atomicStore(u32, &g_x_entered, 1, .release);
 
     // X's self-suspend on port_B. We don't care about the post-resume
     // word on this side — the test EC verifies the wakeup contract
     // through its own recv-side return.
-    const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\ pushq %%rcx
-                \\ syscall
-                \\ popq %%rcx
-                :
-                : [wi] "{rcx}" (word_in),
-                  [v1i] "{rax}" (self_ec_id),
-                  [v2i] "{rbx}" (port_id),
-                : .{
-                    .rcx = true,
-                    .rax = true,
-                    .rbx = true,
-                    .rdx = true,
-                    .rbp = true,
-                    .rsi = true,
-                    .rdi = true,
-                    .r8 = true,
-                    .r9 = true,
-                    .r10 = true,
-                    .r11 = true,
-                    .r12 = true,
-                    .r13 = true,
-                    .r14 = true,
-                    .r15 = true,
-                    .memory = true,
-                });
-        },
-        .aarch64 => {
-            asm volatile (
-                \\ sub sp, sp, #16
-                \\ str %[wi], [sp]
-                \\ svc #0
-                \\ add sp, sp, #16
-                :
-                : [wi] "r" (word_in),
-                  [v1i] "{x0}" (self_ec_id),
-                  [v2i] "{x1}" (port_id),
-                : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true,
-                     .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true,
-                     .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true,
-                     .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true,
-                     .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true,
-                     .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true,
-                     .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
+    _ = syscall.suspendEc(@truncate(self_ec_id), @truncate(port_id), &.{});
 
     parkForever();
 }
@@ -312,7 +236,7 @@ pub fn main(cap_table_base: u64) void {
     // 3. Mint the page frame attached as the single pair entry. A
     //    page frame is a non-IDC type, so the receiver's idc_rx does
     //    NOT mask the entry's caps — they land verbatim, which is the
-    //    branch we assert in step 10 (matches reply_transfer_12.zig).
+    //    branch we assert in step 11 (matches reply_transfer_12.zig).
     const cpf = syscall.createPageFrame(
         @as(u64, ATTACH_PF_CAPS.toU16()),
         0, // props: sz = 0 (4 KiB)
@@ -324,10 +248,39 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 4. Mint sibling W with susp|term, priority 1, restart_policy = 0.
-    //    susp authorizes W's self-suspend on port_A; priority 1 lets W
-    //    be dispatched alongside the test EC (also priority 1) so it
-    //    can reach its self-suspend.
+    const pinned_core = testing.currentCoreId();
+    const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(4);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(4);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((sibling_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(4);
+        return;
+    }
+
+    // 5. Mint sibling W with susp|term, priority 1, restart_policy = 0.
+    //    susp authorizes W's self-suspend on port_A. W is a required
+    //    progress helper after reply_transfer resumes it, but before
+    //    g_ready_w is published it is just a gated spinner; normal
+    //    priority lets the test EC finish setup. The test EC is pinned
+    //    to the same core so W cannot run concurrently with it between
+    //    the combo syscall's reply-transfer and recv-mode park phases.
     const ec_caps = caps.EcCap{
         .susp = true,
         .term = true,
@@ -339,7 +292,7 @@ pub fn main(cap_table_base: u64) void {
         @intFromPtr(&siblingW_entry),
         1, // stack_pages
         0, // target = self (this domain)
-        0, // affinity_mask
+        sibling_affinity,
     );
     if (testing.isHandleError(cec_w.v1)) {
         testing.fail(4);
@@ -347,13 +300,14 @@ pub fn main(cap_table_base: u64) void {
     }
     const w_ec: HandleId = @truncate(cec_w.v1 & 0xFFF);
 
-    // 5. Mint sibling X with the same cap profile.
+    // 6. Mint sibling X with the same cap profile at normal priority
+    //    and the same single-core affinity.
     const cec_x = syscall.createExecutionContext(
         ec_caps_word,
         @intFromPtr(&siblingX_entry),
         1,
         0,
-        0,
+        sibling_affinity,
     );
     if (testing.isHandleError(cec_x.v1)) {
         testing.fail(5);
@@ -367,13 +321,13 @@ pub fn main(cap_table_base: u64) void {
     @atomicStore(u64, &g_w_self_handle, @as(u64, w_ec), .release);
     @atomicStore(u64, &g_x_self_handle, @as(u64, x_ec), .release);
 
-    // 6. Release W. W self-suspends on port_A; the kernel queues the
+    // 7. Release W. W self-suspends on port_A; the kernel queues the
     //    suspension event. X stays gated on g_ready_x — we don't want
     //    X to race onto port_B before the test EC has had a chance to
     //    park itself there via the recv-mode reply.
     @atomicStore(u32, &g_ready_w, 1, .release);
 
-    // 7. recv on port_A. Returns the reply_handle for W's suspension.
+    // 8. recv on port_A. Returns the reply_handle for W's suspension.
     //    §[recv] return word: reply_handle_id at bits 32-43.
     const got_a = syscall.recv(port_a, 0);
     if (got_a.regs.v1 != @intFromEnum(errors.Error.OK)) {
@@ -386,20 +340,13 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 8. Release X. X self-suspends on port_B, which is the wakeup
-    //    the test EC observes once it parks via replyTransferRecv.
-    //    Release here (not earlier) keeps the sequencing readable —
-    //    the kernel will buffer X's suspension event on port_B even
-    //    if X reaches its syscall before the test EC parks, so the
-    //    timing window is loose.
-    @atomicStore(u32, &g_ready_x, 1, .release);
-
     // 9. Combo unified reply: pair_count=1 (pf attached) AND
     //    recv_port_handle_id=port_b. Per spec test 26 the kernel
     //    atomically (a) resumes W with the page_frame installed in
     //    its (= our) domain at a kernel-chosen tstart slot, and
-    //    (b) parks the test EC on port_B for the next event. X's
-    //    self-suspend on port_B feeds that recv.
+    //    (b) parks the test EC on port_B for the next event. X remains
+    //    gated until W returns from this resume path, so X cannot
+    //    prequeue the port_B event before the combo syscall.
     const pair_entry = caps.PairEntry{
         .id = pf_handle,
         .caps = ATTACH_PF_CAPS.toU16(),
@@ -416,14 +363,15 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 10. Wait for W to report its post-resume syscall word, then
+    // 11. Wait for W to report its post-resume syscall word, then
     //     decode pair_count / tstart on the W side.
-    while (@atomicLoad(u32, &g_w_done, .acquire) == 0) {
-        switch (builtin.cpu.arch) {
-            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
-            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
-            else => @compileError("unsupported target architecture"),
-        }
+    var wait_w: usize = 0;
+    while (wait_w < 1024 and @atomicLoad(u32, &g_w_done, .acquire) == 0) : (wait_w += 1) {
+        _ = syscall.yieldEc(@as(u64, w_ec));
+    }
+    if (@atomicLoad(u32, &g_w_done, .acquire) == 0) {
+        testing.fail(9);
+        return;
     }
     const w_word = @atomicLoad(u64, &g_w_observed_word, .acquire);
 
@@ -450,7 +398,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 11. Decode the test EC's recv-side return word for the X→test
+    // 12. Decode the test EC's recv-side return word for the X→test
     //     wakeup. §[event_state] return-word layout:
     //       bits 12-19: pair_count
     //       bits 32-43: reply_handle_id (the new one for X's event)

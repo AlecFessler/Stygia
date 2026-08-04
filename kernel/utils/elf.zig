@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const stygia = @import("stygia");
 
@@ -44,6 +45,21 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     if (bytes.len < hdr_sz) return error.InvalidElfMagic;
     var rd = std.Io.Reader.fixed(bytes[0..hdr_sz]);
     const elf_hdr = try elf.Header.read(&rd);
+
+    // Refuse a foreign-architecture image. Without this the loader
+    // happily maps, say, an x86-64 payload on aarch64 and the spawned
+    // initial EC executes those bytes under the wrong decoder: measured
+    // as an A64 `adr x17, …` / `stxrh w0, w0, [x0]` pair that stores
+    // through the child's read-only cap_table_base and dies as a
+    // routeless `memory_fault`. The EC is unrunnable by construction, so
+    // reject at the syscall boundary (callers map parse errors to
+    // E_INVAL) rather than spawning a domain that can only fault.
+    const want_machine: elf.EM = switch (builtin.cpu.arch) {
+        .x86_64 => .X86_64,
+        .aarch64 => .AARCH64,
+        else => @compileError("unsupported target architecture"),
+    };
+    if (elf_hdr.machine != want_machine) return error.ElfWrongMachine;
 
     result.entry = VAddr.fromInt(elf_hdr.entry);
     result.e_type = @intFromEnum(elf_hdr.type);
@@ -132,19 +148,22 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     // Bounds-check the section header table before slicing. A truncated
     // ELF (e.g. user-staged page frame whose size doesn't cover shoff)
     // would otherwise panic the kernel inside `bytes[shoff..end]`.
-    const shtbl_size = @as(u64, elf_hdr.shentsize) * @as(u64, elf_hdr.shnum);
-    if (elf_hdr.shoff + shtbl_size > bytes.len) return error.InvalidElfMagic;
+    if (elf_hdr.shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidElfMagic;
+    const shtbl_size_mul = @mulWithOverflow(@as(u64, elf_hdr.shentsize), @as(u64, elf_hdr.shnum));
+    if (shtbl_size_mul[1] != 0) return error.InvalidElfMagic;
+    const shtbl_end = @addWithOverflow(elf_hdr.shoff, shtbl_size_mul[0]);
+    if (shtbl_end[1] != 0 or shtbl_end[0] > bytes.len) return error.InvalidElfMagic;
 
     const shdrs = std.mem.bytesAsSlice(
         elf.Elf64_Shdr,
-        bytes[elf_hdr.shoff .. elf_hdr.shoff + elf_hdr.shentsize * elf_hdr.shnum],
+        bytes[elf_hdr.shoff..shtbl_end[0]],
     );
 
     if (elf_hdr.shstrndx >= shdrs.len) return error.InvalidElfMagic;
     const shstr_shdr = shdrs[elf_hdr.shstrndx];
-    const shstr_end = shstr_shdr.sh_offset + shstr_shdr.sh_size;
-    if (shstr_end > bytes.len) return error.InvalidElfMagic;
-    const shstr = bytes[shstr_shdr.sh_offset..shstr_end];
+    const shstr_end = @addWithOverflow(shstr_shdr.sh_offset, shstr_shdr.sh_size);
+    if (shstr_end[1] != 0 or shstr_end[0] > bytes.len) return error.InvalidElfMagic;
+    const shstr = bytes[shstr_shdr.sh_offset..shstr_end[0]];
 
     while (try shdr_itr.next()) |shdr| {
         const name = getCStrAt(shstr, @intCast(shdr.sh_name)) orelse "<bad name>";

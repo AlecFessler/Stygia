@@ -34,6 +34,40 @@ pub const PANIC_OWNER_NONE: u32 = 0xff;
 
 pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OWNER_NONE);
 
+/// Set by `panic` on entry and never cleared. Distinct from `panic_owner`,
+/// which deliberately lets the SAME core back in so a fault-handler
+/// diagnostic can claim the gate and then `@panic` — see `claimPanic`.
+/// That allowance is also a recursion hole, because everything `panic`
+/// does after the first line needs stack: `printRaw` calls, a 64-frame
+/// `StackIterator` walk, symbolization, and three ring dumps.
+///
+/// When the panic IS a kernel stack overflow, that work faults on the
+/// guard page. The fault handler classifies it, calls
+/// `@panic("Kernel stack overflow")`, re-enters here, `claimPanic`
+/// returns true again for this core, and the next `printRaw` faults at
+/// the same depth. Each turn of the loop makes no forward progress and
+/// emits nothing, so the observable result is output that stops
+/// mid-sentence and a machine that never comes back.
+///
+/// Measured on the aarch64 KVM rig under 4-core spread: the entire panic
+/// output was the single line `KERNEL PANIC: user page fault with no
+/// current EC` — not even the `\n` that follows the message, let alone a
+/// frame. With this guard the second entry halts immediately, so the
+/// first panic's message is the last thing written and stays readable.
+///
+/// This cannot fully rescue an aarch64 stack overflow: the vector entry
+/// at `exceptions.exceptionVectorTable` does `stp x0, x30, [sp, #-16]!`
+/// with no stack switch, so once SP is below the guard the *hardware*
+/// takes a nested abort before any of this code runs. Reporting that
+/// properly needs a per-core exception stack (the moral equivalent of
+/// x86's IST), which is not attempted here.
+var panicking: [MAX_PANIC_CORES]bool = [_]bool{false} ** MAX_PANIC_CORES;
+
+/// Bound for the `panicking` flags. `smp.MAX_CORES` is 256 in the
+/// scheduler; a byte each is cheap and indexing is bounds-checked below so
+/// an out-of-range core id degrades to "no guard" rather than corruption.
+const MAX_PANIC_CORES: usize = 256;
+
 /// Try to claim the panic gate. Used both by pre-panic diagnostic prints
 /// (e.g. fault-handler dumps) and by `panic()` itself. The winning core
 /// is the only one allowed to print; loser cores halt silently.
@@ -41,6 +75,15 @@ pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OW
 /// `core_id` should be the calling core's APIC id. The first call wins;
 /// any subsequent call from a DIFFERENT core returns false. Repeat calls
 /// from the SAME core (e.g. fault-handler print → `@panic`) return true.
+/// True when a DIFFERENT core owns the panic gate. Used by the locked
+/// printers to stop competing with an in-progress panic report for the
+/// UART — the loser halts rather than shredding the evidence.
+pub fn claimedByOtherCore() bool {
+    const o = panic_owner.load(.monotonic);
+    if (o == PANIC_OWNER_NONE) return false;
+    return o != @as(u32, @truncate(stygia.arch.dispatch.smp.coreID()));
+}
+
 pub fn claimPanic() bool {
     const self_core: u32 = @truncate(stygia.arch.dispatch.smp.coreID());
     const prev = panic_owner.cmpxchgStrong(
@@ -53,11 +96,124 @@ pub fn claimPanic() bool {
     return prev.? == self_core;
 }
 
+/// Root-module panic interface — installed via `pub const panic` in
+/// kernel/main.zig, REPLACING the implicit `std.debug.FullPanic` wrap.
+///
+/// FullPanic routes every formatted safety panic (index out of bounds,
+/// switch on corrupt value, sentinel mismatch, ...) through
+/// `std.debug.panicExtra`, which stack-allocates a 4 KiB format buffer —
+/// and in Debug the compiler pre-fills that `undefined` buffer. Caught in
+/// the act on the Pi 5 rig: a safety panic taken on a busy kernel stack
+/// had the fill march through the stack guard, so the PANIC ITSELF became
+/// a kernel-stack overflow that trampled the frames of the context it was
+/// reporting on, replacing saved fp/lr with fill bytes
+/// (`ret=0x0101010101010101`, `lr=1`) and burying the original fault.
+///
+/// This interface keeps the exact std messages, but the six formatted
+/// hooks render into a 128-byte buffer (values truncate rather than the
+/// stack dying), and the static ones pass their literal through directly.
+pub const interface = struct {
+    pub fn call(msg: []const u8, ret_addr: ?usize) noreturn {
+        panic(msg, null, ret_addr);
+    }
+    fn callFmt(ret_addr: ?usize, comptime fmt: []const u8, args: anytype) noreturn {
+        @branchHint(.cold);
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
+        panic(msg, null, ret_addr);
+    }
+    pub fn sentinelMismatch(expected: anytype, found: @TypeOf(expected)) noreturn {
+        callFmt(@returnAddress(), "sentinel mismatch: expected {any}, found {any}", .{ expected, found });
+    }
+    pub fn unwrapError(err: anyerror) noreturn {
+        callFmt(@returnAddress(), "attempt to unwrap error: {s}", .{@errorName(err)});
+    }
+    pub fn outOfBounds(index: usize, len: usize) noreturn {
+        callFmt(@returnAddress(), "index out of bounds: index {d}, len {d}", .{ index, len });
+    }
+    pub fn startGreaterThanEnd(start: usize, end: usize) noreturn {
+        callFmt(@returnAddress(), "start index {d} is larger than end index {d}", .{ start, end });
+    }
+    pub fn inactiveUnionField(active: anytype, accessed: @TypeOf(active)) noreturn {
+        callFmt(@returnAddress(), "access of union field '{s}' while field '{s}' is active", .{ @tagName(accessed), @tagName(active) });
+    }
+    pub fn sliceCastLenRemainder(src_len: usize) noreturn {
+        callFmt(@returnAddress(), "slice length '{d}' does not divide exactly into destination elements", .{src_len});
+    }
+    pub fn reachedUnreachable() noreturn {
+        call("reached unreachable code", @returnAddress());
+    }
+    pub fn unwrapNull() noreturn {
+        call("attempt to use null value", @returnAddress());
+    }
+    pub fn castToNull() noreturn {
+        call("cast causes pointer to be null", @returnAddress());
+    }
+    pub fn incorrectAlignment() noreturn {
+        call("incorrect alignment", @returnAddress());
+    }
+    pub fn invalidErrorCode() noreturn {
+        call("invalid error code", @returnAddress());
+    }
+    pub fn integerOutOfBounds() noreturn {
+        call("integer does not fit in destination type", @returnAddress());
+    }
+    pub fn integerOverflow() noreturn {
+        call("integer overflow", @returnAddress());
+    }
+    pub fn shlOverflow() noreturn {
+        call("left shift overflowed bits", @returnAddress());
+    }
+    pub fn shrOverflow() noreturn {
+        call("right shift overflowed bits", @returnAddress());
+    }
+    pub fn divideByZero() noreturn {
+        call("division by zero", @returnAddress());
+    }
+    pub fn exactDivisionRemainder() noreturn {
+        call("exact division produced remainder", @returnAddress());
+    }
+    pub fn integerPartOutOfBounds() noreturn {
+        call("integer part of floating point value out of bounds", @returnAddress());
+    }
+    pub fn corruptSwitch() noreturn {
+        call("switch on corrupt value", @returnAddress());
+    }
+    pub fn shiftRhsTooBig() noreturn {
+        call("shift amount is greater than the type size", @returnAddress());
+    }
+    pub fn invalidEnumValue() noreturn {
+        call("invalid enum value", @returnAddress());
+    }
+    pub fn forLenMismatch() noreturn {
+        call("for loop over objects with non-equal lengths", @returnAddress());
+    }
+    pub fn copyLenMismatch() noreturn {
+        call("source and destination arguments have non-equal lengths", @returnAddress());
+    }
+    pub fn memcpyAlias() noreturn {
+        call("@memcpy arguments alias", @returnAddress());
+    }
+    pub fn noreturnReturned() noreturn {
+        call("'noreturn' function returned", @returnAddress());
+    }
+};
+
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {
     @branchHint(.cold);
     _ = trace;
 
     if (!claimPanic()) arch.cpu.halt();
+
+    // Re-entry on this core means the panic path itself faulted. Halt
+    // without touching the serial port or the stack: whatever we already
+    // emitted is the evidence, and any further work re-faults at the same
+    // depth. See `panicking`.
+    const self: usize = @truncate(stygia.arch.dispatch.smp.coreID());
+    if (self < MAX_PANIC_CORES) {
+        if (panicking[self]) arch.cpu.halt();
+        panicking[self] = true;
+    }
 
     arch.boot.printRaw("KERNEL PANIC: ");
     arch.boot.printRaw(msg);
@@ -73,31 +229,54 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
             }
         }
     }
+    arch.boot.printRaw(" core=0x");
+    printHex(stygia.arch.dispatch.smp.coreID());
     arch.boot.printRaw("\n");
 
-    const first = @returnAddress();
-    var it = std.debug.StackIterator.init(first, null);
+    // Validated frame walk. `std.debug.StackIterator` loads each frame
+    // record with no checks, and panics are exactly where the chain may
+    // be garbage — measured on the Pi 5 rig as a `switch on corrupt
+    // value @ 0x2` panic (ret_addr slot held 2) whose walker then
+    // faulted on the corrupt chain and hit the `panicking` re-entry
+    // guard, eating the entire backtrace. Gate every load on the
+    // address actually resolving, exactly like memory.fault's
+    // dumpFrameChain, and symbolize what survives.
+    var fp: u64 = @frameAddress();
     var frames: u64 = 0;
-
     while (frames < 64) : (frames += 1) {
-        const pc = it.next() orelse break;
+        if (fp == 0 or fp % 16 != 0) break;
+        // Canonical kernel-half base, not user.end: `resolveVaddr` walks
+        // VA index bits [47:12], so a non-canonical pointer aliasing a
+        // mapped kernel VA passes the resolve and faults on the load —
+        // see memory.fault.dumpFrameChain for the autopsy.
+        const kernel_half_base = comptime @min(
+            stygia.memory.address.AddrSpacePartition.kernel.start,
+            stygia.memory.address.AddrSpacePartition.kernel_code.start,
+        );
+        if (fp < kernel_half_base) break;
+        const page = stygia.memory.address.VAddr.fromInt(
+            std.mem.alignBackward(u64, fp, stygia.memory.paging.PAGE4K),
+        );
+        if (arch.paging.resolveVaddr(stygia.memory.init.kernel_addr_space_root, page) == null) break;
+        const rec: *const [2]u64 = @ptrFromInt(fp);
+        const pc = rec[1];
+        if (pc == 0) break;
 
-        if (debug_info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(pc - debug_info.kaslr_slide);
-            if (sym_name) |sym| {
-                arch.boot.printRaw(sym);
-                arch.boot.printRaw("\n");
-            } else {
-                arch.boot.printRaw("PC: 0x");
-                printHex(pc);
-                arch.boot.printRaw(" (no symbol)\n");
-            }
+        const sym: ?[]const u8 = if (debug_info.global_ptr) |dbg_info|
+            dbg_info.getSymbolName(pc - debug_info.kaslr_slide)
+        else
+            null;
+        arch.boot.printRaw("PC: 0x");
+        printHex(pc);
+        if (sym) |s| {
+            arch.boot.printRaw(" ");
+            arch.boot.printRaw(s);
+            arch.boot.printRaw("\n");
         } else {
-            arch.boot.printRaw("PC: 0x");
-            printHex(pc);
             arch.boot.printRaw(" (no symbol)\n");
         }
-        if (pc == 0) break;
+        if (rec[0] <= fp) break;
+        fp = rec[0];
     }
 
     ctx_trace.dumpAllRingsToSerial();
@@ -107,7 +286,13 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     arch.cpu.halt();
 }
 
-fn printHex(n: u64) void {
+/// Print `n` as uppercase hex with no lock and no allocator.
+///
+/// Public because the panic path is not the only place that has to report
+/// something while `print_lock` may already be held by this very core —
+/// `memory.fault`'s kernel-fault diagnostic is in exactly that position.
+/// See the module doc above for why a locked printer cannot be used there.
+pub fn printHex(n: u64) void {
     var buf: [16]u8 = undefined;
     var i: usize = buf.len;
     var v = n;

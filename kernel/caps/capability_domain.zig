@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const elf_util = stygia.utils.elf;
@@ -186,9 +187,25 @@ pub const CapabilityDomain = struct {
     /// doesn't double-free.
     user_stack_phys: u64 = 0,
     user_stack_bytes: u64 = 0,
+
+    /// TEMP DIAGNOSTIC (Rawls x86 MISS attribution, REMOVE). Kernel-only
+    /// test identity inferred from the child ELF. Does not touch cap
+    /// words, handle metadata, affinity, or any user-visible ABI.
+    diag_test_tag: u64 = 0,
+    diag_elf_pf_slot: u12 = 0,
+    diag_elf_pf_ptr: u64 = 0,
 };
 
 pub const Allocator = SecureSlab(CapabilityDomain, 256);
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE) — print budget for handle-table
+/// exhaustion reports; see `allocFreeSlot`.
+var slot_full_prints: u32 = 0;
+const DIAG_TEST_TAG_MAGIC: u32 = 0x8000;
+const DIAG_TEST_TAG_LIMIT: u32 = 0x9000;
+const DIAG_TEST_TAG_COUNT: usize = DIAG_TEST_TAG_LIMIT - DIAG_TEST_TAG_MAGIC;
+const SPAWN_CHILD_PRINT_BUDGET: u32 = 4096;
+var spawn_child_prints: u32 = 0;
+
 pub var slab_instance: Allocator = undefined;
 
 pub fn initSlab(
@@ -242,12 +259,34 @@ pub fn createCapabilityDomain(
 
     // Resolve the ELF page frame in the caller's table. Spec §[14].
     const pf_slot: u12 = @truncate(elf_pf & 0xFFF);
-    const pf_kh = stygia.caps.capability.resolveHandleOnDomain(
-        caller_dom,
-        pf_slot,
-        .page_frame,
-    ) orelse return errors.E_BADCAP;
-    const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
+    const pf: *PageFrame = blk: {
+        const caller_lr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        defer caller.domain.unlockIrqRestore(caller_lr.irq_state);
+        const pf_kh = stygia.caps.capability.resolveHandleOnDomain(
+            caller_lr.ptr,
+            pf_slot,
+            .page_frame,
+        ) orelse return errors.E_BADCAP;
+        const resolved_pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
+        stygia.memory.page_frame.incHandleRef(resolved_pf) catch return errors.E_BADCAP;
+        break :blk resolved_pf;
+    };
+    defer stygia.memory.page_frame.releaseHandle(pf);
+
+    // Spec §[create_capability_domain] test 18: duplicate source slots in
+    // passed_handles are structural E_INVAL inputs. Validate them before
+    // parsing the ELF or minting/bumping any aliases, so early exits have
+    // no partially-created child state to clean up.
+    var seen_passed_slots: [MAX_HANDLES_PER_DOMAIN]bool = .{false} ** MAX_HANDLES_PER_DOMAIN;
+    var validate_pass_idx: usize = 0;
+    while (validate_pass_idx < passed_handles.len) : (validate_pass_idx += 1) {
+        const entry = passed_handles[validate_pass_idx];
+        if (entry == 0) break;
+
+        const src_slot: u12 = @truncate(entry & 0xFFF);
+        if (seen_passed_slots[src_slot]) return errors.E_INVAL;
+        seen_passed_slots[src_slot] = true;
+    }
 
     // Read the ELF bytes through the kernel physmap mapping of the page
     // frame's backing pages. The page frame's contents are contiguous in
@@ -278,6 +317,7 @@ pub fn createCapabilityDomain(
         else => return errors.E_INVAL,
     };
     const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
+    const diag_test_tag = extractDiagTestTag(elf_bytes);
 
     // Allocate the child capability domain. Self caps come from caps[0..15];
     // self-handle field0 layout differs from the [2] ceilings_inner shape —
@@ -297,6 +337,9 @@ pub fn createCapabilityDomain(
         ceilings_outer,
         slid_entry,
     ) catch return errors.E_NOMEM;
+    child_cd.diag_test_tag = diag_test_tag;
+    child_cd.diag_elf_pf_slot = pf_slot;
+    child_cd.diag_elf_pf_ptr = @intFromPtr(pf);
 
     // Re-mirror kernel-half PML4 entries into the child's PML4 (per
     // boot's userspace_init — fresh L3/L2 paging structures the kernel
@@ -346,6 +389,8 @@ pub fn createCapabilityDomain(
         cleanupPartiallyCreatedCd(child_cd, null);
         return errors.E_NOMEM;
     };
+    child_ec.diag_test_tag = diag_test_tag;
+    child_ec.diag_report_entered = false;
 
     // Patch the initial EC's iret frame for user-mode dispatch.
     stygia.arch.dispatch.cpu.patchUserModeIretFrame(
@@ -383,7 +428,32 @@ pub fn createCapabilityDomain(
     // self-handle's field0 at bits 32-39 — already populated by
     // `allocCapabilityDomain` from `[1] caps[16:24]` above.
     const child_idc_rx: u16 = @truncate((child_cd.user_table[0].field0 >> 32) & 0xFF);
+    const DeriveRecord = struct {
+        caller_ref: ErasedSlabRef,
+        src_slot: u12,
+        src_ref: ErasedSlabRef,
+        src_type: CapabilityType,
+        src_caps: u16,
+        src_instance: u64,
+        child_ref: ErasedSlabRef,
+        child_slot: u12,
+    };
+    var moved_sources: [128]stygia.caps.derivation.ExpectedDelete = undefined;
+    var moved_count: usize = 0;
+    var derive_records: [128]DeriveRecord = undefined;
+    var derive_count: usize = 0;
     var pass_idx: usize = 0;
+    const caller_dom_ref = caller.domain;
+    const caller_ref: ErasedSlabRef = @bitCast(caller_dom_ref);
+    const child_ref: ErasedSlabRef = .{
+        .ptr = child_cd,
+        .gen = @intCast(child_cd._gen_lock.currentGen()),
+    };
+    const caller_lr = caller_dom_ref.lockIrqSave(@src()) catch {
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return errors.E_BADCAP;
+    };
+    const caller_irq_state = caller_lr.irq_state;
     while (pass_idx < passed_handles.len) {
         const entry = passed_handles[pass_idx];
         if (entry == 0) break;
@@ -396,18 +466,21 @@ pub fn createCapabilityDomain(
             src_slot,
             null,
         ) orelse {
+            caller_dom_ref.unlockIrqRestore(caller_irq_state);
             cleanupPartiallyCreatedCd(child_cd, child_ec);
             return errors.E_BADCAP;
         };
 
         const src_user = caller_dom.user_table[src_slot];
         const src_type = Word0.typeTag(src_user.word0);
+        const src_ref = src_kh.ref;
+        const src_instance = src_kh.instance;
         const installed_caps: u16 = if (src_type == .capability_domain)
             new_caps & child_idc_rx
         else
             new_caps;
 
-        const new_child_slot = mintHandle(
+        const minted = mintHandleReporting(
             child_cd,
             src_kh.ref,
             src_type,
@@ -415,6 +488,7 @@ pub fn createCapabilityDomain(
             src_user.field0,
             src_user.field1,
         ) catch {
+            caller_dom_ref.unlockIrqRestore(caller_irq_state);
             cleanupPartiallyCreatedCd(child_cd, child_ec);
             return errors.E_FULL;
         };
@@ -422,25 +496,20 @@ pub fn createCapabilityDomain(
         // Spec §[capabilities].revoke: hang the new alias under the
         // source handle in the caller's domain so a future revoke on
         // any ancestor of `(caller_dom, src_slot)` reaches the alias.
-        // `mintHandle` may have coalesced onto an existing slot in
-        // `child_cd`; in that case the new_child_slot is already in the
-        // tree from a prior derive and we leave it alone.
-        if (child_cd.kernel_table[new_child_slot].parent.domain.ptr == null and
-            child_cd.kernel_table[new_child_slot].first_child.domain.ptr == null and
-            child_cd.kernel_table[new_child_slot].next_sibling.domain.ptr == null)
-        {
-            const caller_ref: ErasedSlabRef = @bitCast(caller.domain);
-            const child_ref: ErasedSlabRef = .{
-                .ptr = child_cd,
-                .gen = @intCast(child_cd._gen_lock.currentGen()),
+        // Coalesced aliases do not install a new child handle, so they
+        // also do not get an extra derivation edge or object-side ref.
+        if (minted.installed_new) {
+            derive_records[derive_count] = .{
+                .caller_ref = caller_ref,
+                .src_slot = src_slot,
+                .src_ref = src_ref,
+                .src_type = src_type,
+                .src_caps = Word0.caps(src_user.word0),
+                .src_instance = src_instance,
+                .child_ref = child_ref,
+                .child_slot = minted.slot,
             };
-            _ = stygia.caps.derivation.derive(
-                caller_ref,
-                src_slot,
-                child_ref,
-                new_child_slot,
-                null,
-            );
+            derive_count += 1;
         }
 
         // For refcount-lifetime types (page_frame, timer, port,
@@ -452,64 +521,118 @@ pub fn createCapabilityDomain(
         // child. observed_zero is structurally impossible here — the
         // caller's source handle pins the object — so failures are
         // unreachable.
-        switch (src_type) {
-            .page_frame => {
-                const alias_pf: *stygia.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                stygia.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
-            },
-            .timer => {
-                const alias_t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                stygia.sched.timer.incHandleRef(alias_t) catch unreachable;
-            },
-            .port => {
-                const alias_p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                const port_irq = alias_p._gen_lock.lockIrqSave(@src());
-                defer alias_p._gen_lock.unlockIrqRestore(port_irq);
-                stygia.sched.port.onHandleAcquire(alias_p, new_caps) catch unreachable;
-            },
-            .device_region => {
-                const alias_dr: *stygia.devices.device_region.DeviceRegion = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                stygia.devices.device_region.incHandleRef(alias_dr) catch unreachable;
-            },
-            else => {},
-        }
-
-        if (move) {
-            // move=1: remove the source handle from the caller's table.
-            // The alias bump above is the new owner's ref; the caller's
-            // old handle goes away, so balance with a matching release.
+        if (minted.installed_new) {
             switch (src_type) {
-                .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
-                .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(src_kh.ref.ptr.?))),
+                .page_frame => {
+                    const alias_pf: *stygia.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    stygia.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
+                },
+                .timer => {
+                    const alias_t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    stygia.sched.timer.incHandleRef(alias_t) catch unreachable;
+                },
                 .port => {
-                    const p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                    const src_caps_word: u16 = @truncate(src_user.word0 >> 48);
-                    stygia.sched.port.releaseHandle(p, src_caps_word);
+                    const alias_p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    const port_irq = alias_p._gen_lock.lockIrqSave(@src());
+                    defer alias_p._gen_lock.unlockIrqRestore(port_irq);
+                    stygia.sched.port.onHandleAcquire(alias_p, new_caps) catch unreachable;
                 },
                 .device_region => {
-                    // Unlink the source slot's IRQ-propagation node
-                    // before dropping the per-handle refcount; see the
-                    // matching path in `caps.capability.releaseHandle`.
-                    const dr: *stygia.devices.device_region.DeviceRegion =
-                        @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                    const dr_irq = dr._gen_lock.lockIrqSave(@src());
-                    stygia.devices.device_region.removeHandleListNodeLocked(dr, &caller_dom.kernel_table[src_slot].dr_node);
-                    stygia.devices.device_region.releaseHandleLocked(dr, dr_irq);
+                    const alias_dr: *stygia.devices.device_region.DeviceRegion = @ptrCast(@alignCast(src_kh.ref.ptr.?));
+                    stygia.devices.device_region.incHandleRef(alias_dr) catch unreachable;
                 },
                 else => {},
             }
-            caller_dom.user_table[src_slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
-            caller_dom.kernel_table[src_slot].ref = .{};
+        }
+
+        if (move) {
+            moved_sources[moved_count] = .{
+                .slot = src_slot,
+                .ref = src_ref,
+                .type_tag = src_type,
+                .caps = Word0.caps(src_user.word0),
+                .instance = src_instance,
+            };
+            moved_count += 1;
         }
 
         pass_idx += 1;
     }
 
-    // Mint the IDC handle in the CALLER's table that references the new
-    // child domain. Per spec §[19]: caps = caller's cridc_ceiling.
+    // Reserve the caller's returned IDC slot before deleting moved
+    // sources. Because moved source slots are still occupied here, the
+    // returned IDC cannot reuse one. Because the slot remains unpublished
+    // until after move cleanup, another EC in the caller's domain cannot
+    // observe both the moved source and the new child IDC alias.
     const caller_cridc: u16 = @truncate((readSelfField0(caller_dom) >> 24) & 0xFF);
-    const idc_slot = mintHandle(
-        caller_dom,
+    const idc_slot = reserveHandleSlot(caller_dom) catch {
+        caller_dom_ref.unlockIrqRestore(caller_irq_state);
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return errors.E_FULL;
+    };
+    caller_dom_ref.unlockIrqRestore(caller_irq_state);
+
+    var derive_idx: usize = 0;
+    while (derive_idx < derive_count) : (derive_idx += 1) {
+        const rec = derive_records[derive_idx];
+        if (!stygia.caps.derivation.deriveExpected(
+            rec.caller_ref,
+            rec.src_slot,
+            rec.src_ref,
+            rec.src_type,
+            rec.src_caps,
+            rec.src_instance,
+            rec.child_ref,
+            rec.child_slot,
+        )) {
+            const cleanup_lr = caller_dom_ref.lockIrqSave(@src()) catch null;
+            if (cleanup_lr) |lr| {
+                releaseReservedHandleSlot(lr.ptr, idc_slot);
+                caller_dom_ref.unlockIrqRestore(lr.irq_state);
+            }
+            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            return errors.E_BADCAP;
+        }
+    }
+
+    // move=1: remove all sources through the normal delete path so their
+    // derivation children are reparented, per-type release semantics run
+    // once, each slot rejoins the free list, and each per-slot instance
+    // witness advances. The batch delete prevalidates every moved source
+    // under tree_mutex -> caller CD before consuming any of them; therefore
+    // this failure path does not return after partially moving the caller's
+    // source handles. The caller's return IDC slot was already reserved
+    // above, so these deletes cannot make the returned handle reuse a moved
+    // source slot.
+    const delete_result = stygia.caps.derivation.deleteAndDetachExpectedBatch(
+        caller_ref,
+        moved_sources[0..moved_count],
+    );
+    if (delete_result != 0) {
+        const cleanup_lr = caller_dom_ref.lockIrqSave(@src()) catch null;
+        if (cleanup_lr) |lr| {
+            releaseReservedHandleSlot(lr.ptr, idc_slot);
+            caller_dom_ref.unlockIrqRestore(lr.irq_state);
+        }
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return delete_result;
+    }
+
+    // Publish the returned IDC in the pre-reserved caller slot only after
+    // all moved source handles have been deleted. Per spec §[19]: caps =
+    // caller's cridc_ceiling.
+    const publish_lr = caller_dom_ref.lockIrqSave(@src()) catch {
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return errors.E_BADCAP;
+    };
+    if (!stygia.caps.capability.isReservedHandleSlot(&publish_lr.ptr.kernel_table[idc_slot])) {
+        caller_dom_ref.unlockIrqRestore(publish_lr.irq_state);
+        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        return errors.E_BADCAP;
+    }
+    mintHandleAt(
+        publish_lr.ptr,
+        idc_slot,
         .{
             .ptr = child_cd,
             .gen = @intCast(child_cd._gen_lock.currentGen()),
@@ -518,10 +641,9 @@ pub fn createCapabilityDomain(
         caller_cridc,
         0,
         0,
-    ) catch {
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
-        return errors.E_FULL;
-    };
+    );
+    caller_dom_ref.unlockIrqRestore(publish_lr.irq_state);
+    maybePrintSpawnChild(child_cd, child_ec);
 
     // Enqueue the initial EC on a core that satisfies its affinity
     // mask. With affinity = 0 (any core) or a mask containing the
@@ -572,6 +694,98 @@ inline fn pageFrameSizeBytes(sz: stygia.memory.vmar.PageSize) u64 {
     };
 }
 
+fn extractDiagTestTag(elf_bytes: []const u8) u64 {
+    if (!build_options.kernel_spawn_diag) return 0;
+
+    const aarch64_tag = extractAarch64DiagTestTag(elf_bytes);
+    if (aarch64_tag != 0) return aarch64_tag;
+
+    var mov_imm_seen: [DIAG_TEST_TAG_COUNT]bool = .{false} ** DIAG_TEST_TAG_COUNT;
+    var i: usize = 0;
+    while (i + 4 <= elf_bytes.len) : (i += 1) {
+        const v = readLeU32(elf_bytes, i);
+        if (v < DIAG_TEST_TAG_MAGIC or v >= DIAG_TEST_TAG_LIMIT) continue;
+        if (i >= 1 and elf_bytes[i - 1] >= 0xB8 and elf_bytes[i - 1] <= 0xBF) {
+            mov_imm_seen[v - DIAG_TEST_TAG_MAGIC] = true;
+        }
+    }
+
+    // x86 ReleaseSmall test ELFs can contain many unrelated 0x8xxx-looking
+    // immediates (stack offsets, displacements, embedded child ELFs). The
+    // report helper's tag is the only candidate that appears both as the
+    // report-entry marker's `mov r32, imm32` and as the `Regs.v5` immediate
+    // store (`48 c7 /0 + disp8=0x20 + imm32`). If that shape is absent or
+    // ambiguous, leave the child untagged.
+    var found: u32 = 0;
+    i = 0;
+    while (i + 4 <= elf_bytes.len) : (i += 1) {
+        const v = readLeU32(elf_bytes, i);
+        if (v < DIAG_TEST_TAG_MAGIC or v >= DIAG_TEST_TAG_LIMIT) continue;
+        if (!mov_imm_seen[v - DIAG_TEST_TAG_MAGIC]) continue;
+        if (!(i >= 4 and
+            elf_bytes[i - 4] == 0x48 and
+            elf_bytes[i - 3] == 0xC7 and
+            elf_bytes[i - 1] == 0x20))
+        {
+            continue;
+        }
+
+        if (found == 0) {
+            found = v;
+        } else if (found != v) {
+            return 0;
+        }
+    }
+    return found;
+}
+
+fn extractAarch64DiagTestTag(elf_bytes: []const u8) u32 {
+    var found: u32 = 0;
+    var i: usize = 0;
+    while (i + 4 <= elf_bytes.len) : (i += 4) {
+        const insn = readLeU32(elf_bytes, i);
+        if ((insn & 0x7F80_0000) != 0x5280_0000) continue;
+
+        const v = (insn >> 5) & 0xFFFF;
+        if (v < DIAG_TEST_TAG_MAGIC or v >= DIAG_TEST_TAG_LIMIT) continue;
+        if (found == 0) {
+            found = v;
+        } else if (found != v) {
+            return 0;
+        }
+    }
+    return found;
+}
+
+inline fn readLeU32(bytes: []const u8, i: usize) u32 {
+    return @as(u32, bytes[i]) |
+        (@as(u32, bytes[i + 1]) << 8) |
+        (@as(u32, bytes[i + 2]) << 16) |
+        (@as(u32, bytes[i + 3]) << 24);
+}
+
+fn maybePrintSpawnChild(cd: *CapabilityDomain, ec: *ExecutionContext) void {
+    if (!build_options.kernel_spawn_diag) return;
+    if (cd.diag_test_tag == 0) return;
+
+    execution_context_mod.recordSpawnTrace(ec, cd, .spawn_child, 0);
+
+    const n = @atomicRmw(u32, &spawn_child_prints, .Add, 1, .monotonic);
+    if (n >= SPAWN_CHILD_PRINT_BUDGET) return;
+
+    arch.boot.print(
+        "[spawn-child] tag=0x{x} index={x} cd=0x{x} ec=0x{x} elf_slot={x} elf_pf=0x{x}\n",
+        .{
+            cd.diag_test_tag,
+            cd.diag_test_tag - DIAG_TEST_TAG_MAGIC,
+            @intFromPtr(cd),
+            @intFromPtr(ec),
+            cd.diag_elf_pf_slot,
+            cd.diag_elf_pf_ptr,
+        },
+    );
+}
+
 /// Tear down a partially-constructed CD whose `createCapabilityDomain`
 /// hit a post-`allocCapabilityDomain` error. The CD is published-live
 /// at this point (gen-lock is odd / unlocked), so the destroy follows
@@ -586,7 +800,8 @@ inline fn pageFrameSizeBytes(sz: stygia.memory.vmar.PageSize) u64 {
 /// kernel slab class fills after ~10 reps of the test runner and any
 /// subsequent `createPort` / `createTimer` returns E_NOMEM.
 fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionContext) void {
-    _ = partial_ec; // covered by destroyEcsInDomain's slab-walk match
+    execution_context_mod.printPreReportTerminal(partial_ec, cd, "partial_create_cleanup");
+    // `partial_ec` itself is covered by destroyEcsInDomain's slab-walk match.
     const cd_gen = cd._gen_lock.currentGen();
     const cd_ref: SlabRef(CapabilityDomain) = .{ .ptr = cd, .gen = @intCast(cd_gen) };
 
@@ -622,7 +837,6 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     destroyPhase2(deferred);
 }
 
-
 /// `acquire_ecs` syscall handler.
 /// Spec §[capability_domain].acquire_ecs.
 ///
@@ -642,7 +856,45 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
 ///     helpers. v0 spawns one EC per test domain, so N is bounded at 1
 ///     in the spec test surface; vregs 6+ remain TODO until a test
 ///     spawns a multi-EC domain through acquire_ecs.
+/// Derivation-tree link work recorded by the acquire_ecs/acquire_vmars
+/// mint loops for execution AFTER the caller's CD gen-lock drops.
+/// `derive` takes `tree_mutex` and must never run under a CD gen-lock
+/// (see the order contract on `caps.derivation.tree_mutex`) — the old
+/// inline derive (with the held CD passed as `held_dom`) established
+/// the `CD → tree_mutex` edge that deadlocks against the teardown /
+/// revoke tree walks. Both acquire paths are same-CD (self-IDC) only,
+/// so one domain ref covers parent and child sides.
+const DeferredAcquireDerives = struct {
+    dom: ErasedSlabRef = .{ .ptr = null, .gen = 0 },
+    n: u8 = 0,
+    src: [127]u12 = undefined,
+    dst: [127]u12 = undefined,
+
+    /// Caller must hold NO CD gen-lock. Safe to run after the mint's
+    /// critical section: the minted handles belong to the calling EC,
+    /// which is right here in this syscall; every `derive` re-validates
+    /// the domain gen and bails on slots a racer touched.
+    fn run(self: *const DeferredAcquireDerives) void {
+        var k: u8 = 0;
+        while (k < self.n) : (k += 1) {
+            _ = stygia.caps.derivation.derive(
+                self.dom,
+                self.src[k],
+                self.dom,
+                self.dst[k],
+            );
+        }
+    }
+};
+
 pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
+    var deferred: DeferredAcquireDerives = .{};
+    const ret = acquireEcsInner(caller, target_idc, &deferred);
+    deferred.run();
+    return ret;
+}
+
+fn acquireEcsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -742,26 +994,17 @@ pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
             cd.kernel_table[new_slot].first_child.domain.ptr == null and
             cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
         {
-            const target_cd_ref: ErasedSlabRef = .{
-                .ptr = target_cd,
-                .gen = @intCast(target_cd._gen_lock.currentGen()),
-            };
-            const cd_ref_local: ErasedSlabRef = .{
+            // Same-CD case (self-IDC): cd === target_cd (cross-CD is
+            // bailed E_BADCAP above). RECORDED, not derived inline —
+            // `derive` takes `tree_mutex` and this CD's gen-lock is
+            // held; see `DeferredAcquireDerives`.
+            deferred.dom = .{
                 .ptr = cd,
                 .gen = @intCast(cd._gen_lock.currentGen()),
             };
-            // Same-CD case (self-IDC): cd === target_cd, so pass `cd`
-            // as `held_dom` (the lock is held for the duration of the
-            // walk). Cross-CD case is bailed E_BADCAP above so this
-            // branch is currently unreachable, but encoded for the
-            // future when cross-CD acquire lands.
-            _ = stygia.caps.derivation.derive(
-                target_cd_ref,
-                @intCast(i),
-                cd_ref_local,
-                new_slot,
-                cd,
-            );
+            deferred.src[deferred.n] = @intCast(i);
+            deferred.dst[deferred.n] = new_slot;
+            deferred.n += 1;
         }
 
         minted_slots[n] = new_slot;
@@ -832,6 +1075,13 @@ inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
 /// target IDC's referenced domain. MMIO and DMA-only VARs (`map=0` / `map=2`)
 /// are excluded — see §[acquire_vmars] [test 07].
 pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
+    var deferred: DeferredAcquireDerives = .{};
+    const ret = acquireVmarsInner(caller, target_idc, &deferred);
+    deferred.run();
+    return ret;
+}
+
+fn acquireVmarsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -954,21 +1204,15 @@ pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
                 break;
             }
             if (src_found) {
-                const target_cd_ref: ErasedSlabRef = .{
-                    .ptr = target_cd,
-                    .gen = @intCast(target_cd._gen_lock.currentGen()),
-                };
-                const cd_ref_local: ErasedSlabRef = .{
+                // Same-CD (self-IDC) only — RECORDED, not derived
+                // inline; see `DeferredAcquireDerives`.
+                deferred.dom = .{
                     .ptr = cd,
                     .gen = @intCast(cd._gen_lock.currentGen()),
                 };
-                _ = stygia.caps.derivation.derive(
-                    target_cd_ref,
-                    src_slot,
-                    cd_ref_local,
-                    new_slot,
-                    cd,
-                );
+                deferred.src[deferred.n] = src_slot;
+                deferred.dst[deferred.n] = new_slot;
+                deferred.n += 1;
             }
         }
 
@@ -1036,8 +1280,9 @@ pub fn allocCapabilityDomain(
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return error.OutOfMemory;
 
-    // Handle tables live in kernel physmap RAM. PMM zero-on-free
-    // guarantees the pages come up cleared.
+    // Handle tables live in kernel physmap RAM. Start from an explicit
+    // zero base before rebuilding free-list links so a recycled table
+    // block cannot carry stale refs into `mintHandle`'s coalescing scan.
     const user_buf = pmm_mgr.allocBlock(USER_TABLE_BYTES) orelse return error.OutOfMemory;
     errdefer pmm_mgr.freeBlock(user_buf[0..USER_TABLE_BYTES]);
     const kernel_buf = pmm_mgr.allocBlock(KERNEL_TABLE_BYTES) orelse return error.OutOfMemory;
@@ -1048,6 +1293,9 @@ pub fn allocCapabilityDomain(
 
     cd.user_table = user_table;
     cd.kernel_table = kernel_table;
+
+    @memset(user_table[0..], .{ .word0 = 0, .field0 = 0, .field1 = 0 });
+    @memset(kernel_table[0..], .{});
 
     // Free-list links cover slots 3..MAX-1; slots 0/1/2 are reserved by
     // spec and are NOT on the free list.
@@ -1169,6 +1417,11 @@ pub const DestroyDeferred = struct {
     user_buf: [*]u8,
     kernel_buf: [*]u8,
     addr_space_id: u16,
+    /// VMAR refs captured while the CD is still gen-live. Phase 2 walks this
+    /// snapshot instead of dereferencing the dead-marked CD's `vars[]` /
+    /// `var_count` fields.
+    vars: [MAX_VARS_PER_DOMAIN]?SlabRef(VMAR),
+    var_count: u16,
     /// Phys base + size of the contiguous user-stack buddy block.
     /// `pmm.freeBlock`'d wholesale at destroy and skipped by the
     /// per-page `freeUserAddrSpace` walk (the leaves point into this
@@ -1197,7 +1450,7 @@ pub const DestroyDeferred = struct {
 /// `detachDyingDomainFromTree`'s cross-domain CD acquires inside
 /// `lockEntrySkip` (also `TREE_DOMAIN_GROUP`) trip lockdep's
 /// same-class overlap check.
-pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) DestroyDeferred {
+pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext)) DestroyDeferred {
     stygia.sched.timer.disarmTimerHandlesInDomain(cd);
 
     // Spec §[capabilities].revoke / Lifetimes: every live handle in
@@ -1211,24 +1464,34 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
     // §[capabilities].revoke test 04 generalized to domain destroy).
     stygia.caps.derivation.detachDyingDomainFromTree(cd);
 
-    // Tear down every VMAR bound to the domain. The destroy-path
-    // variant clears leaf PTEs (so `freeUserAddrSpace` can distinguish
-    // PF-backed leaves from singleton PMM leaves) and decrements
-    // `pf.mapcnt` for every still-installed page_frame, but skips the
-    // per-page TLB shootdown — no core has the dying CD's CR3 active.
-    // removeVar tail-swaps so iterating from the tail each step lets
-    // the array shrink under us without reordering un-walked entries.
-    while (cd.var_count > 0) {
-        const last = cd.var_count - 1;
-        const v_ref = cd.vars[last] orelse {
-            cd.var_count = last;
-            continue;
-        };
-        // caller-pinned: VMAR's domain.ptr is cd; we hold cd._gen_lock.
-        stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref.ptr);
-    }
-
+    // NOTE (stygia-1im): the `cd.vars[]` teardown deliberately does NOT
+    // run here. It moved to `destroyPhase2`, immediately after
+    // `awaitDomainQuiesced`. Unmapping in phase 1 was unsound: phase 1
+    // only dead-marks the CD, and this function's callers hold locks
+    // that forbid the quiesce barrier, so at this point a still-live EC
+    // of this domain can be executing on ANOTHER core — typically
+    // sitting in the kernel mid-syscall, about to `sysretq` back to
+    // user. Clearing its leaf PTEs here pulls the user text out from
+    // under it, and the moment it returns to user mode it takes an
+    // instruction-fetch fault on an address with no VMAR. The resulting
+    // `memory_fault` is then unroutable (this CD's gen is already even,
+    // so the fault port cannot be resolved) and the EC is parked with
+    // `[NOROUTE] ... why=unbound`.
+    //
+    // Observed on x86-64 with the suite spread across 4 cores: the
+    // victim faults at the return address of libz's syscall stub
+    // (`syscall.issueRawNoStack` + 0x20) or at the `memcpy` it calls two
+    // instructions later, depending on which page was still TLB-hot.
+    // The old single-core test placement serialized the runner against
+    // its children and hid it entirely.
+    //
+    // The per-page-shootdown skip that the destroy-path VMAR teardown
+    // relies on ("no core has the dying CD's CR3 active") is likewise
+    // only TRUE after the barrier — so the unmap belongs there and
+    // nowhere else.
     const cd_gen = cd._gen_lock.currentGen();
+    var vars_snapshot: [MAX_VARS_PER_DOMAIN]?SlabRef(VMAR) = undefined;
+    @memcpy(vars_snapshot[0..], cd.vars[0..]);
     const deferred = DestroyDeferred{
         .cd_ref = SlabRef(CapabilityDomain).init(cd, cd_gen),
         .cd_addr_space_root = cd.addr_space_root,
@@ -1236,12 +1499,11 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
         .user_buf = @ptrCast(cd.user_table),
         .kernel_buf = @ptrCast(cd.kernel_table),
         .addr_space_id = cd.addr_space_id,
+        .vars = vars_snapshot,
+        .var_count = cd.var_count,
         .user_stack_phys = cd.user_stack_phys,
         .user_stack_bytes = cd.user_stack_bytes,
-        .caller_ec = if (caller_ec) |ec|
-            SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
-        else
-            null,
+        .caller_ec = caller_ec,
     };
 
     // Dead-mark ONLY (gen → even, bytes intact, off the freelist).
@@ -1270,7 +1532,66 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?*ExecutionContext) Destr
 /// The visitor matches ECs by `ec.domain.ptr == cd && gen == cd_gen`;
 /// the gen check rejects any new CD that lands on the freed slab slot
 /// between phase 1 and phase 2.
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frame-abandonment discriminator.
+/// The standing hypothesis is that `destroyEcsInDomain` re-enables IRQs
+/// (via `destroyExecutionContextLocked`'s postZombie spin), a preempt
+/// lands, the phase-2 frame is abandoned mid-walk, and every not-yet-
+/// visited EC of the already-dead-marked domain is stranded forever.
+/// If that is true, `p2_enter` must exceed `p2_walk_done`. If the three
+/// counters stay equal the whole premise is dead regardless of how many
+/// ECs leak. `p2_residue` counts ECs that STILL match the dying CD after
+/// the walk returned — a completed-but-incomplete walk, a different bug.
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). ATOMIC, deliberately: the first
+/// version of these were plain `+= 1` and four cores raced them, which
+/// showed up as `p2_exit` (4876) EXCEEDING `p2_walk_done` (4874) — an
+/// ordering that is impossible in the code and proved increments were
+/// being lost. A lossy counter cannot discriminate "the walk was
+/// abandoned" from "the increment evaporated", so the whole 22%-gap
+/// reading rested on nothing. Monotonic RMW makes the gap real evidence.
+pub var p2_enter: u64 = 0;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Reached only if the caller-EC
+/// reap returned. `p2_enter - p2_after_reap` isolates the abandonment to
+/// that reap; `p2_after_reap - p2_walk_done` isolates it to the walk.
+pub var p2_after_reap: u64 = 0;
+pub var p2_walk_done: u64 = 0;
+pub var p2_exit: u64 = 0;
+pub var p2_residue: u64 = 0;
+
+fn bump(counter: *u64, n: u64) void { // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+    _ = @atomicRmw(u64, counter, .Add, n, .monotonic);
+}
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Per-core "this core's C stack is
+/// currently inside `destroyPhase2`". Set on entry, cleared on the normal
+/// exit path. `scheduler.yieldTo` consults it at the ONE point where a
+/// frame is provably lost — `current_ec == null` and we `switchTo` some
+/// other EC, which never returns — so an abandonment is COUNTED at the
+/// moment it happens rather than inferred from a gap between two
+/// counters. Plain bools: each entry is written only by its own core.
+pub var in_phase2: [stygia.sched.scheduler.MAX_CORES]bool =
+    [_]bool{false} ** stygia.sched.scheduler.MAX_CORES;
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frames abandoned while inside
+/// phase 2, and frames abandoned outside it (those are harmless: the
+/// disowned frames of a parking EC, which has nothing left to run).
+pub var abandoned_in_p2: u64 = 0;
+pub var abandoned_other: u64 = 0;
+
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Called by `scheduler.yieldTo`
+/// immediately before a `switchTo` that cannot return to this stack.
+pub fn noteFrameAbandoned() void {
+    const core: usize = @truncate(arch.smp.coreID());
+    if (core < in_phase2.len and in_phase2[core]) {
+        bump(&abandoned_in_p2, 1);
+        // The stack that owned this flag is gone; whatever runs on this
+        // core next is not in phase 2.
+        in_phase2[core] = false;
+    } else {
+        bump(&abandoned_other, 1);
+    }
+}
+
 pub fn destroyPhase2(deferred: DestroyDeferred) void {
+    bump(&p2_enter, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
     // Mask IRQs across the whole of phase 2. With the deferred caller_ec
     // reap, freeUserAddrSpace, and per-handle release walk, the
     // post-Phase1 work is no longer trivially short — a preempt landing
@@ -1280,6 +1601,65 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // cleanup never runs and resources accumulate across reps.
     const irq = arch.cpu.saveAndDisableInterrupts();
     defer arch.cpu.restoreInterrupts(irq);
+
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). Mark this core's stack as a
+    // phase-2 frame for `scheduler.yieldTo`'s abandonment detector.
+    {
+        const dcore: usize = @truncate(arch.smp.coreID());
+        if (dcore < in_phase2.len) in_phase2[dcore] = true;
+    }
+    defer {
+        const dcore: usize = @truncate(arch.smp.coreID());
+        if (dcore < in_phase2.len) in_phase2[dcore] = false;
+    }
+
+    // The mask above is NOT sufficient on its own, and the reason is
+    // worth stating precisely because the obvious repair does not work.
+    // `destroyPhase2` calls `destroyExecutionContextLocked` — once for
+    // the caller EC just below, then once per victim inside
+    // `destroyEcsInDomain` — and that helper used to re-enable
+    // interrupts UNCONDITIONALLY around its `postZombie` spin. Each such
+    // window is a chance for a preempt tick to land on a frame whose
+    // `current_ec` was already cleared by `parkSelfFaulted`, at which
+    // point `yieldTo` dispatches something else and hops to the park
+    // kstack — this frame's remaining teardown never runs, and because
+    // the CD is already dead-marked, nothing ever walks it again.
+    //
+    // REFUTED REPAIR (do not re-try): a `preempt_block` depth counter on
+    // `PerCore` that made `yieldTo` return instead of switching. It
+    // deadlocks the machine inside the FIRST suite pass. Blocking the
+    // switch also blocks the two protocols that are *implemented by*
+    // switching: `PerCore.pending_kstack_release` is consumed only by
+    // the park-kstack hop, so a stashed EC keeps `on_cpu == true`
+    // forever and every peer in `markReady`'s kstack barrier spins
+    // without bound; and a core only publishes `active_root = 0` on its
+    // way through `run()`, so a peer in `awaitNoActiveRoot` waits on a
+    // core that has been told never to leave. Measured: wedge at run
+    // 1, batch 16..32, no output thereafter.
+    //
+    // The window is closed at its source instead — see the two escapes in
+    // `destroyExecutionContextLocked`. Stage one (stygia-afo cycle 1): try
+    // `postZombie` ONCE under the caller's mask, and only pay for the
+    // IRQ-enabling spin when that fails. That closed the caller-EC reap
+    // completely (`p2_enter == p2_after_reap` over 10428 destroys, against
+    // 1354/6228 abandoned before) but left the walk leaking.
+    //
+    // Stage two (cycle 2) is what closed the walk, and the measurement is
+    // the interesting part: the failing posts were not contention at all.
+    // Phase 2 pins THIS core's own `pending_zombie` slot with the caller
+    // EC it reaps at the top, and this frame stands on that EC's kstack
+    // until it returns, so the drain can never evict it. Every same-core
+    // victim post from `destroyEcsInDomain` then spun on a condition that
+    // could not change: over 25 aarch64 TCG passes, 1176 of 1176 failing
+    // posts were same-core and 0 of 1176 ever completed. Each one hung
+    // until a preempt abandoned this frame. `claimOwnZombieInline` skips
+    // the column when this core is provably off the victim's kstack.
+    //
+    // Do NOT read the mask above as an invariant even so: the cross-core
+    // fallback still enables IRQs, by design, because only the target core
+    // drains its own column and it may itself be blocked on us. That path
+    // has never once been observed to execute; if it ever does, the frame
+    // it runs on is abandonable and the teardown below is skippable again.
 
     // Self-destroy hazard (stygia-rs6 layer 2): when the caller EC is
     // destroying its OWN domain, this core is still executing with the
@@ -1305,11 +1685,54 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
+    // Reap the caller EC FIRST, before anything that can drop the IRQ
+    // mask (stygia-2u0).
+    //
+    // The mask taken above is what keeps this frame alive — its own
+    // comment warns that an abandoned frame means "the rest of the
+    // cleanup never runs and resources accumulate across reps". But
+    // `destroyEcsInDomain` below reaches `destroyExecutionContextLocked`,
+    // which deliberately RE-ENABLES interrupts around its `postZombie`
+    // spin (otherwise a cross-core spin here would block the very IPIs
+    // it is waiting on). That reopens the preempt window mid-phase-2:
+    // `yieldTo` sees `current_ec == null` — cleared by the earlier
+    // `parkSelfFaulted` — dequeues something else and switches away, and
+    // this frame never resumes. Everything below the abandonment point
+    // is silently skipped.
+    //
+    // The caller EC used to be reaped at the END of phase 2, so it was
+    // the most likely casualty: left exactly as `parkSelfFaulted` made
+    // it (state `.exited`, gen still ODD, never posted as a zombie), it
+    // is then invisible to every reap path forever. Measured at ~8
+    // orphaned ECs per suite pass — a per-writer tag showed 100% of the
+    // leaked population came from `parkSelfFaulted` — accumulating until
+    // the run stops delivering results around pass 11.
+    //
+    // Doing it here costs nothing and cannot be skipped: the reap only
+    // dead-marks and posts a zombie (the finalize is deferred to a core
+    // that is provably off the kstack), and the `destroyEcsInDomain`
+    // walk below then skips this EC on its now-even gen rather than via
+    // `keep_ref`.
+    if (deferred.caller_ec) |caller_ref| {
+        // caller-pinned: `deferred.cd_ref.ptr` is an identity-only key
+        // for the pending-reply comparison inside the destroy helper;
+        // the CD slot is dead-marked but bytes-intact and is never
+        // dereferenced through here.
+        stygia.sched.execution_context.destroyExecutionContextRefLocked(
+            caller_ref,
+            deferred.cd_ref.ptr, // caller-pinned: identity-only key, never dereferenced
+        );
+    }
+    bump(&p2_after_reap, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
+
     stygia.sched.execution_context.destroyEcsInDomain(
         deferred.cd_ref,
         deferred.cd_addr_space_root,
         deferred.caller_ec,
     );
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE).
+    bump(&p2_walk_done, 1);
+    bump(&p2_residue, stygia.sched.execution_context.countEcsInDomain(deferred.cd_ref));
 
     // Translation barrier (stygia-rs6): the EC walk above only POSTS
     // zombies + wake IPIs for victims still executing on remote cores.
@@ -1338,31 +1761,37 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         deferred.cd_ref.ptr,
     );
 
-    // Reap the destroying-domain's caller EC's slab slot. `parkSelfFaulted`
-    // left it at gen=odd / state=.exited / off-freelist — `destroyEcsInDomain`
-    // skipped it via `keep_ref` because we are still standing on its kstack.
-    // Route through the standard deferred-destroy path: `bumpDeadGenLocked`
-    // flips gen → even immediately, `postZombie` hands the EC to this
-    // core's pending_zombie column, and the next dispatch
-    // (`yieldTo` / `parkAndAwaitIRQ` / `switchTo` `takeOwnPendingZombie`)
-    // finalizes it once `rsp` is no longer in the EC's kstack range.
-    // Without this, every domain-destroy leaks one EC slab slot — slabs
-    // are capped at 256 unique indices, so the test runner's
-    // ~481 destroys/rep starve `allocExecutionContext` at ~rep 5.
-    if (deferred.caller_ec) |caller_ref| {
-        // caller-pinned: `deferred.cd_ref.ptr` is passed for identity-only
-        // comparison against `ec.pending_reply_domain.ptr` inside
-        // `destroyExecutionContextLocked`; the CD slab slot is already
-        // dead-marked (Phase 1 ran `bumpDeadGenLocked`; the zero +
-        // freelist push runs at the end of this function) and we only
-        // use the raw pointer value as a key, never deref it.
-        const cd_for_identity = deferred.cd_ref.ptr;
-        stygia.sched.execution_context.destroyExecutionContextLocked(
-            caller_ref.ptr,
-            deferred.cd_addr_space_root,
-            cd_for_identity,
-        );
+    // Tear down every VMAR bound to the domain (stygia-1im: moved here
+    // from destroyPhase1 — see the note there). The destroy-path
+    // variant clears leaf PTEs (so `freeUserAddrSpace` below can
+    // distinguish PF-backed leaves from singleton PMM leaves) and
+    // decrements `pf.mapcnt` for every still-installed page_frame, but
+    // skips the per-page TLB shootdown. That skip is sound precisely
+    // BECAUSE the barrier above has already run: no core has the dying
+    // CD's root loaded and no core holds a dying-domain EC in its
+    // dispatch slot, so there is no live translation left to shoot
+    // down. Running it before the barrier is what produced the
+    // spurious user instruction-fetch faults this ordering fixes.
+    //
+    // Phase 1 captured `vars[]`, `var_count`, and `addr_space_root` before
+    // dead-marking the CD. Walk only that snapshot here: after
+    // `bumpDeadGenLocked`, the CD pointer may be used as an identity token
+    // for EC/barrier comparisons, but phase 2 must not dereference it to
+    // rediscover teardown work.
+    var var_idx = deferred.var_count;
+    while (var_idx > 0) {
+        var_idx -= 1;
+        const v_ref = deferred.vars[var_idx] orelse continue;
+        stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref, deferred.cd_addr_space_root);
     }
+
+    // NOTE (stygia-2u0): the caller-EC reap used to live HERE, at the end
+    // of phase 2. It moved to the top of this function — see the long
+    // comment there. Anything below the first point that drops the IRQ
+    // mask can be skipped entirely by a preempt abandoning this frame,
+    // and this reap was the casualty that leaked ~8 ECs per suite pass.
+    // `destroyExecutionContextLocked` early-returns on an already-even
+    // gen, so the move is safe even if some path reaches both.
 
     if (deferred.vm_ref) |vm_slab_ref| {
         stygia.hv.virtual_machine.releaseHandleAfterDomainDestroyed(vm_slab_ref.ptr);
@@ -1373,7 +1802,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // device_region per spec proposal §3). With the alias-side
     // `incHandleRef`/`onHandleAcquire` in passed_handles processing,
     // every such handle is a real lifetime contributor and must be
-    // released here. VMARs are owned by destroyPhase1's `cd.vars[]`
+    // released here. VMARs are owned by destroyPhase2's `cd.vars[]`
     // walk; capability_domain / execution_context / reply / vm are
     // domain-or-system-lifetime and have nothing to release here.
     //
@@ -1446,7 +1875,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // page-table walker frees PT/PD/PDPT/PML4 pages and any leaf
     // physical page that came from a single-page PMM.create — i.e.
     // mapUserStack and loadElfSegments allocations. Page-frame leaves
-    // were already cleared by the destroyPhase1 vars[] walk; the leaves
+    // were already cleared by the destroyPhase2 vars[] walk above; the leaves
     // shared with `user_buf` (mapUserTableView aliases the user_buf
     // pages into user space at `table_base`) are skipped via the
     // [user_buf_phys, user_buf_phys + USER_TABLE_BYTES) range so the
@@ -1479,11 +1908,28 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // asserts exactly that and this phase-2 tail is the slot's sole
     // owner.
     slab_instance.destroyAlreadyMarked(deferred.cd_ref.ptr);
+    bump(&p2_exit, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
 }
 
 /// Pop the head of the free-slot list. Returns `null` (E_FULL) if the
 /// table is full.
 fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Handle-table exhaustion is
+    // silent: this returns null, the caller maps it to E_FULL, and the
+    // suite reports MISS with no marker. MAX_HANDLES_PER_DOMAIN is 4096
+    // and the runner spawns ~427 domains per pass, so its own table
+    // would be exhausted at ~pass 10 — exactly where the collapse
+    // starts, and without any allocBlock ever failing (the buddy probe
+    // stayed silent through a full collapse).
+    if (cd.free_count == 0 or cd.free_head == stygia.caps.capability.FREE_LIST_TAIL) {
+        if (slot_full_prints < 8) {
+            slot_full_prints += 1;
+            arch.boot.print(
+                "[2u0] handle table FULL cd=0x{x} free_count={d} free_head={d}\n",
+                .{ @intFromPtr(cd), cd.free_count, cd.free_head },
+            );
+        }
+    }
     if (cd.free_count == 0) return null;
     const head = cd.free_head;
     if (head == stygia.caps.capability.FREE_LIST_TAIL) return null;
@@ -1492,6 +1938,39 @@ fn allocFreeSlot(cd: *CapabilityDomain) ?u12 {
     cd.free_head = next;
     cd.free_count -= 1;
     return slot;
+}
+
+/// Remove one free slot from `cd` without publishing a handle into it
+/// yet. The non-null reserved sentinel keeps both free-list and
+/// contiguous-scan allocators from treating the slot as free, while
+/// `resolveHandleOnDomain` keeps it invisible to callers until
+/// `mintHandleAt` overwrites it with the returned IDC handle.
+fn reserveHandleSlot(cd: *CapabilityDomain) !u12 {
+    const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
+    cd.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+    cd.kernel_table[slot].ref = .{
+        .ptr = stygia.caps.capability.RESERVED_HANDLE_SLOT_PTR,
+        .gen = 0,
+    };
+    cd.kernel_table[slot].parent = .{};
+    cd.kernel_table[slot].first_child = .{};
+    cd.kernel_table[slot].next_sibling = .{};
+    cd.kernel_table[slot].dr_node = .{};
+    return slot;
+}
+
+fn releaseReservedHandleSlot(cd: *CapabilityDomain, slot: u12) void {
+    const entry = &cd.kernel_table[slot];
+    if (!stygia.caps.capability.isReservedHandleSlot(entry)) return;
+    entry.instance +%= 1;
+    cd.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
+    entry.ref = .{};
+    entry.parent = stygia.caps.capability.encodeFreeNext(cd.free_head);
+    entry.first_child = .{};
+    entry.next_sibling = .{};
+    entry.dr_node = .{};
+    cd.free_head = @as(u16, slot);
+    cd.free_count += 1;
 }
 
 /// Linear scan for an existing handle to `obj` in this domain, used
@@ -1510,6 +1989,28 @@ fn findExistingHandle(cd: *CapabilityDomain, obj: ErasedSlabRef, t: CapabilityTy
     return null;
 }
 
+const MintHandleResult = struct {
+    slot: u12,
+    installed_new: bool,
+};
+
+fn mintHandleReporting(
+    cd: *CapabilityDomain,
+    obj: ErasedSlabRef,
+    obj_type: CapabilityType,
+    caps: u16,
+    field0: u64,
+    field1: u64,
+) !MintHandleResult {
+    if (findExistingHandle(cd, obj, obj_type)) |existing| {
+        return .{ .slot = existing, .installed_new = false };
+    }
+
+    const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
+    writeHandleSlot(cd, slot, obj, obj_type, caps, field0, field1);
+    return .{ .slot = slot, .installed_new = true };
+}
+
 /// Mint a handle into `cd`'s table at a fresh slot. Allocates from the
 /// free list, writes both halves, returns the slot id. Coalesces with
 /// existing handle to the same object per the at-most-one invariant.
@@ -1521,15 +2022,7 @@ pub fn mintHandle(
     field0: u64,
     field1: u64,
 ) !u12 {
-    if (findExistingHandle(cd, obj, obj_type)) |existing| {
-        // Coalesce: keep the original entry, return its slot. Spec
-        // semantics: at most one handle per (domain, object).
-        return existing;
-    }
-
-    const slot = allocFreeSlot(cd) orelse return error.OutOfHandles;
-    writeHandleSlot(cd, slot, obj, obj_type, caps, field0, field1);
-    return slot;
+    return (try mintHandleReporting(cd, obj, obj_type, caps, field0, field1)).slot;
 }
 
 /// Variant of `mintHandle` that bypasses the at-most-one-per-(domain,
@@ -1775,8 +2268,12 @@ pub fn releaseSelf(cd: *CapabilityDomain) DestroyDeferred {
     //
     // Capture the caller EC BEFORE `parkSelfFaulted` clears it from
     // `current_ec`; the phase-2 EC walk must skip this EC.
-    const caller_ec = stygia.sched.scheduler.currentEc();
-    if (caller_ec) |ec| {
+    const caller_ec = if (stygia.sched.scheduler.currentEc()) |ec|
+        SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
+    else
+        null;
+    if (caller_ec) |ec_ref| {
+        const ec = ec_ref.ptr;
         stygia.sched.execution_context.parkSelfFaulted(ec);
     }
     return destroyPhase1(cd, caller_ec);

@@ -60,10 +60,19 @@ pub const GenLock = extern struct {
     /// escape hides real AB-BA deadlocks.
     pub fn lockOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) void {
         debug.acquire(self, self.class, ordered_group, src);
+        var iters: u64 = 0;
+        var published = false;
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
-                if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) return;
+                if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) {
+                    if (published) debug.clearWaiting();
+                    return;
+                }
+            }
+            if (!published) {
+                debug.publishWaiting(self, self.class, src);
+                published = true;
             }
             // Ack-while-spinning (stygia-rs6 mechanism 9): an
             // IRQs-masked contender here is deaf to the shootdown
@@ -73,6 +82,10 @@ pub const GenLock = extern struct {
             // none are pending.
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
+            iters +%= 1;
+            if (iters == debug.SPIN_PANIC_ITERS) {
+                debug.reportStuckLock(self, self.class, self.word.load(.monotonic), src);
+            }
         }
     }
 
@@ -180,12 +193,22 @@ pub const GenLock = extern struct {
         debug.acquire(self, self.class, ordered_group, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
+        var iters: u64 = 0;
+        var published = false;
         while (true) {
-            if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+            if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) {
+                if (published) debug.clearWaiting();
+                return;
+            }
             const cur = self.word.load(.monotonic);
             if ((cur >> 1) != expected_gen) {
+                if (published) debug.clearWaiting();
                 debug.release(self);
                 return error.StaleHandle;
+            }
+            if (!published) {
+                debug.publishWaiting(self, self.class, src);
+                published = true;
             }
             // Ack-while-spinning — see `lockOrdered`. Captured live:
             // fireMemoryFault (#PF context, IRQs off) spinning here on
@@ -193,6 +216,10 @@ pub const GenLock = extern struct {
             // shootdown ack (stygia-rs6 mechanism 9).
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
+            iters +%= 1;
+            if (iters == debug.SPIN_PANIC_ITERS) {
+                debug.reportStuckLock(self, self.class, self.word.load(.monotonic), src);
+            }
         }
     }
 
@@ -369,6 +396,39 @@ pub fn SecureSlab(
 
         /// Allocator-internal lock guarding the freelist / cursors /
         /// bump pointers. Orthogonal to per-slot GenLocks.
+        ///
+        /// Always taken with `lockIrqSave`, never plain `lock`.
+        ///
+        /// This is a MIXED-MODE class: it is taken from process context
+        /// with IRQs enabled (every `alloc*` / `destroy*` entry point —
+        /// `allocExecutionContext`, `allocPort`, `allocTimer`,
+        /// `destroyVmar`, `destroyTimer`, … — none of which runs inside
+        /// an IRQ-mask bracket) AND from asynchronous interrupt context.
+        /// Two concrete async chains, both established from the IR call
+        /// graph rather than by inspection:
+        ///
+        ///   `arch.x64.amd.pmu.pmiHandler` → `sched.port.firePmuOverflow`
+        ///   → `fireRouted` → `suspendOnPort` → `rendezvousWithReceiver`
+        ///   → `deliverEvent` → `sched.timer.decHandleRef` →
+        ///   `decHandleRefLocked` → `destroyTimer` → `destroy` →
+        ///   `destroyLockedInner`
+        ///
+        ///   `schedTimerHandler` → `preempt` → `yieldTo` → `switchTo` →
+        ///   `finalizeDestroyMarkedDead` (the reaper cited on
+        ///   `destroyAlreadyMarked`'s acquire below)
+        ///
+        /// A core holding this lock in process context with IRQs enabled
+        /// that then takes the timer or PMI interrupt will re-enter the
+        /// same class on the same core and spin forever on a lock it
+        /// already holds — an unbreakable single-core self-deadlock, and
+        /// `debug.checkIrqModeOn`'s `panic_irq_mode_mix`. Lockdep has
+        /// already caught this pair once in the wild: see the
+        /// `IRQ-mode mix` panic cited on `destroyAlreadyMarked`.
+        ///
+        /// Masking here makes the requirement local and self-enforcing
+        /// instead of caller-dependent and unchecked. Every critical
+        /// section under this lock is a bounded run of array and cursor
+        /// writes, so the masked window stays short.
         lock: SpinLock = .{ .class = "SecureSlab(" ++ @typeName(T) ++ ").lock" },
 
         pub const Ref = SlabRef(T);
@@ -441,8 +501,11 @@ pub fn SecureSlab(
         /// otherwise drive: while gen is even, `lockWithGen` rejects
         /// the slot and `forEachAlive` skips it.
         pub fn create(self: *Self) AllocError!Pending {
-            self.lock.lock(@src());
-            defer self.lock.unlock();
+            // IRQ-masked: mixed-mode class, reached from the PMI and
+            // timer entries via `destroy`/`destroyLockedInner`. See the
+            // `lock` field doc.
+            const irq = self.lock.lockIrqSave(@src());
+            defer self.lock.unlockIrqRestore(irq);
 
             if (self.count_free == 0) {
                 try self.growOne();
@@ -500,8 +563,39 @@ pub fn SecureSlab(
             // lockWithGen asserts this too; stating it here makes the
             // destroy-side contract explicit for readers.
             std.debug.assert(expected_gen % 2 == 1);
-            try ptr._gen_lock.lockWithGen(expected_gen, @src());
+
+            // IRQ-masked across the whole destroy. `_gen_lock` is one
+            // lockdep class shared by every slot of every T (see
+            // `publish`'s `slot_ptr._gen_lock.class = "SecureSlab(" ++
+            // @typeName(T) ++ ")._gen_lock"`), and it is taken from
+            // asynchronous interrupt context by every `SlabRef` deref.
+            //
+            // The concrete self-deadlock: process context enters
+            // `destroy` for slot A and takes A's gen-lock with IRQs
+            // enabled. A timer or PMI lands on that core. The handler
+            // still holds a `SlabRef` to A that verifies — the gen has
+            // NOT been bumped yet, that only happens in
+            // `destroyLockedInner` below — so its `lockWithGen` passes
+            // the gen check and then spins on the lock bit its own core
+            // is holding. Nothing can release it. `device_region.zig`'s
+            // `onIrq` already masks for exactly this hazard; `destroy`
+            // is the generic path every slab type funnels through and
+            // was missing the same treatment.
+            const irq = try ptr._gen_lock.lockWithGenIrqSave(expected_gen, @src());
             self.destroyLockedInner(ptr, expected_gen);
+
+            // NOT `unlockIrqRestore` — do not "fix" this to match the
+            // usual IrqSave pairing. `destroyLockedInner` has already
+            // released: its `setGenRelease(expected_gen + 1)` clears the
+            // lock bit as part of the gen bump, and it issues the
+            // matching `debug.release`. `unlockIrqRestore` would
+            // `debug.release` a second time and then `fetchAnd(~1)` a
+            // word whose bit 0 is already clear, tripping its
+            // `assert(prev & 1 == 1)`. Only the IRQ state is left to
+            // restore. (The error path needs nothing:
+            // `lockWithGenIrqSaveOrdered` restores interrupts itself
+            // before propagating, so the `try` above is safe.)
+            arch.cpu.restoreInterrupts(irq);
         }
 
         /// Destroy a slot whose gen-lock the caller already holds at
@@ -564,16 +658,14 @@ pub fn SecureSlab(
 
             zeroExceptGenLock(ptr);
 
-            // Mixed-mode acquire: this slab lock is taken from both
-            // process-context (`destroyExecutionContextLocked`'s
-            // self-help drain in `terminate` / domain-destroy paths,
-            // IRQs enabled) and IRQ-context (preempt → `yieldTo` →
-            // `switchTo` → `finalizeDestroyMarkedDead` reaper, IRQs
-            // disabled). Use IrqSave so an interrupt landing while the
-            // process-context site holds the lock can't trap into the
-            // same class on an IPI/preempt and deadlock. Lockdep (see
-            // `IRQ-mode mix` panic at this site under N>>1 reps)
-            // explicitly diagnoses this exact pair.
+            // IRQ-masked: mixed-mode class — see the `lock` field doc.
+            // Reached from process context by
+            // `destroyExecutionContextLocked`'s self-help drain (in
+            // `terminate` / domain-destroy, IRQs enabled) and from IRQ
+            // context by the preempt → `yieldTo` → `switchTo` →
+            // `finalizeDestroyMarkedDead` reaper. This is the site whose
+            // `IRQ-mode mix` lockdep panic under N>>1 reps first proved
+            // the pair is live rather than theoretical.
             const irq = self.lock.lockIrqSave(@src());
             defer self.lock.unlockIrqRestore(irq);
 
@@ -619,8 +711,12 @@ pub fn SecureSlab(
         /// Shared tail of `destroy` / `destroyLocked`. Caller has already
         /// established the slot's gen-lock is held at `expected_gen`.
         fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
-            self.lock.lock(@src());
-            defer self.lock.unlock();
+            // IRQ-masked: this function is itself ON the async chain
+            // (`pmiHandler` → … → `destroyTimer` → `destroy` → here)
+            // while also running from process context with IRQs enabled.
+            // See the `lock` field doc.
+            const irq = self.lock.lockIrqSave(@src());
+            defer self.lock.unlockIrqRestore(irq);
 
             // Defense-in-depth: clear every byte of T *except* `_gen_lock`
             // before releasing the slot. Stale capability data, keys, or

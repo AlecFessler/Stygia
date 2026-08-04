@@ -7,14 +7,14 @@
 //  architecture."
 //
 // Spec semantics
-//   §[create_vcpu] guarantees an initial vm_exit-style delivery on the
-//   exit_port at creation time and that the vCPU is driven through
-//   that port's recv/reply lifecycle, NOT through the explicit
-//   `suspend` syscall — §[suspend] [test 06] codifies that as
-//   E_INVAL when [1] references a vCPU. After consuming the initial
-//   exit and replying, the kernel re-delivers a fresh vm_exit event
-//   on the exit_port whose layout matches §[vm_exit_state] for the
-//   VM's arch.
+//   §[create_vcpu] publishes the new vCPU as runnable; its first
+//   dispatch delivers the initial vm_exit-style event on the exit_port.
+//   From there, the vCPU is driven through that port's recv/reply
+//   lifecycle, NOT through the explicit `suspend` syscall —
+//   §[suspend] [test 06] codifies that as E_INVAL when [1] references
+//   a vCPU. After consuming the initial exit and replying, the kernel
+//   re-delivers a fresh vm_exit event on the exit_port whose layout
+//   matches §[vm_exit_state] for the VM's arch.
 //
 //   Typed-reply routing (§[reply]): reply handles are tagged at recv
 //   time with the originating event_type. For a reply typed
@@ -30,8 +30,9 @@
 //   prelude as create_vcpu_08 / create_vcpu_10, then exercise the
 //   four observable predicates of test 09 in sequence:
 //     (a) suspend(ec_handle, exit_port) returns E_INVAL.
-//     (b) recv(exit_port) consumes the initial vm_exit and yields a
-//         reply handle id in syscall_word bits 32-43.
+//     (b) recv(exit_port) blocks until the first vCPU dispatch delivers
+//         the initial vm_exit, then yields a reply handle id in
+//         syscall_word bits 32-43.
 //     (c) replyVmExit(reply_handle, INITIAL_STATE_SUBCODE) — the
 //         initial_state handshake. Tells the kernel "stay
 //         not-started"; the kernel does not VMLAUNCH and instead
@@ -59,12 +60,12 @@
 //   surfacing E_BADCAP / E_PERM / E_CLOSED / E_FULL.
 //
 // Caps required to reach the success paths under test
-//   - create_port: caps = {bind, recv}. `bind` lets us pass the port
-//     as create_vcpu's exit_port and as suspend's [2] without firing
-//     §[suspend] [test 04] E_PERM. `recv` lets us call recv without
-//     firing §[recv] [test 02] E_PERM. Both bits are within the
-//     runner's port_ceiling = 0x1C (xfer/recv/bind at field-bits
-//     2-4, see runner/primary.zig).
+//   - create_port: caps = {bind, recv, suspend}. `bind` lets us pass
+//     the port as create_vcpu's exit_port. `suspend` lets us reuse it
+//     as suspend's [2] without firing §[suspend] [test 04] E_PERM.
+//     `recv` lets us call recv without firing §[recv] [test 02]
+//     E_PERM. All three bits are within the runner's port_ceiling =
+//     0x5C (xfer/recv/bind/suspend; see runner/primary.zig).
 //   - create_vcpu: caps = {susp, read, write}. `susp` lets us call
 //     suspend on the EC handle without firing §[suspend] [test 03]
 //     E_PERM, so the kernel actually reaches the [test 06]
@@ -101,13 +102,14 @@
 //   3. Zero the VmPolicy region.
 //   4. createVirtualMachine(caps={.policy=true}, policy_pf).
 //      Tolerates E_NODEV (degraded smoke pass).
-//   5. createPort(caps={bind, recv}) — exit_port for the vCPU.
+//   5. createPort(caps={bind, recv, suspend}) — exit_port for the vCPU
+//      and the destination port for the vCPU-rejection suspend probe.
 //   6. createVcpu(caps={susp,read,write}, vm_handle, affinity=0,
 //      exit_port).
 //   7. suspendEc(ec_handle, exit_port) — must return E_INVAL per
 //      §[suspend] [test 06].
-//   8. recv(exit_port) — must succeed (no error word) and yield a
-//      reply handle id.
+//   8. recv(exit_port) — blocks until first vCPU dispatch, then must
+//      succeed (no error word) and yield a reply handle id.
 //   9. replyVmExit(reply_handle, INITIAL_STATE_SUBCODE) — the
 //      initial_state handshake. Reserves the §[vm_exit_state] stack
 //      window above SP, zeroes it, writes the initial_state sub-code
@@ -212,11 +214,12 @@ pub fn main(cap_table_base: u64) void {
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
     // 5. Mint the exit port. `bind` is required for create_vcpu's
-    //    [4] handle and for the suspend syscall's [2] handle that
-    //    test 09 paired against. `recv` is required so we can pull
-    //    the initial vm_exit + the post-reply vm_exit off the port
-    //    without firing §[recv] [test 02]. Both bits live within
-    //    the runner-granted port_ceiling = 0x1C (bits 2-4).
+    //    [4] handle. `suspend` lets the suspend syscall reach the
+    //    vCPU-target check for test 09's paired §[suspend] [test 06]
+    //    assertion. `recv` lets us pull the initial vm_exit and the
+    //    post-reply vm_exit off the port without firing §[recv]
+    //    [test 02]. These bits live within the runner-granted
+    //    port_ceiling = 0x5C (suspend/recv/bind).
     const exit_port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cport.v1)) {
@@ -259,11 +262,10 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 8. recv the initial vm_exit. Per §[create_vcpu], the kernel
-    //    enqueues this at create_vcpu time, so the recv must not
-    //    block. A successful recv leaves vreg 1 untouched by the
-    //    error path; treat any value <= 15 (per §[error_codes]) as
-    //    an error word and fail.
+    // 8. recv the initial vm_exit. Per §[create_vcpu], the first vCPU
+    //    dispatch delivers this event before guest entry. A successful
+    //    recv leaves vreg 1 untouched by the error path; treat any
+    //    value <= 15 (per §[error_codes]) as an error word and fail.
     const first = syscall.recv(exit_port, 0);
     if (errors.isError(first.regs.v1)) {
         testing.fail(3);

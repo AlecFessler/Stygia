@@ -40,6 +40,60 @@ var held_stacks: [MAX_CORES]HeldStack align(64) = [_]HeldStack{.{}} ** MAX_CORES
 var pair_registry: PairRegistry = .{};
 var class_table: ClassTable = .{};
 
+/// Bound on a single uninterrupted spin before a core declares itself
+/// wedged and dumps. Every bare-metal wedge so far has been INVISIBLE —
+/// no panic, no `[HANG]` — because all cores spin with IRQs masked, so
+/// no IRQ-driven watchdog can fire; the board just resets. A spinning
+/// core can still drive the polled UART, so the report comes from here.
+pub const SPIN_PANIC_ITERS: u64 = 200_000_000;
+
+/// Per-core "currently blocked acquiring" publication.
+///
+/// The lockdep held stack registers its entry BEFORE the spin succeeds
+/// (`debug.acquire` runs ahead of the CAS loop), so a core's TOP held
+/// entry is ambiguous: it may be a lock the core owns, or the one it is
+/// stuck waiting for. That ambiguity is what stalled the first
+/// bare-metal wedge autopsy — three cores each listing one CD gen-lock
+/// with no way to tell holder from waiter. This table resolves it: a
+/// core appears here only while genuinely spinning, so
+/// `held \ waiting` is the set it actually owns.
+///
+/// Deliberately NOT gated on `active` (Debug-only) so the waiter view
+/// still works in ReleaseSafe builds where lockdep itself is compiled
+/// out.
+const WaitRecord = struct {
+    lock_ptr: ?*const anyopaque = null,
+    class: [*:0]const u8 = "@none",
+    file: []const u8 = "",
+    fn_name: []const u8 = "",
+    line: u32 = 0,
+};
+var wait_records: [MAX_CORES]WaitRecord align(64) = [_]WaitRecord{.{}} ** MAX_CORES;
+
+/// Publish that this core has entered the contended path for `lock_ptr`.
+/// Call once on first CAS failure, not per iteration.
+pub fn publishWaiting(lock_ptr: *const anyopaque, class: [*:0]const u8, src: SrcLoc) void {
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    wait_records[@intCast(core_id)] = .{
+        .lock_ptr = lock_ptr,
+        .class = class,
+        .file = src.file,
+        .fn_name = src.fn_name,
+        .line = src.line,
+    };
+}
+
+/// Clear this core's wait publication once the lock is acquired (or the
+/// acquire is abandoned, e.g. `StaleHandle`).
+pub fn clearWaiting() void {
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    wait_records[@intCast(core_id)].lock_ptr = null;
+}
+
 /// Per-core async-IRQ-handler nesting depth. Single-writer per slot — only
 /// the local core ever writes its own slot, between IRQ entry and IRQ exit
 /// on that same core — so plain `u8` (no atomics) is sufficient. The
@@ -174,6 +228,91 @@ pub fn release(lock_ptr: *const anyopaque) void {
 /// unrun. Without this, lockdep keeps the stale acquire entries on
 /// the per-core stack and the next syscall on this core sees them as
 /// "held", spuriously closing AB-BA cycles against unrelated paths.
+/// Dump every core's held-lock stack with the raw lock-free printer.
+/// Called from the bounded-spin report, where
+/// IRQs are masked on a wedged core and the locked printer would hang.
+/// This is what names the OTHER side of a deadlock: the stuck core prints
+/// the lock it wants, this prints what each core already holds.
+pub fn dumpHeldStacksRaw() void {
+    var c: usize = 0;
+    while (c < MAX_CORES) : (c += 1) {
+        const stack = &held_stacks[c];
+        const d = stack.depth;
+        if (d == 0) continue;
+        printDecimal("  held core=", c);
+        printDecimal(" depth=", d);
+        arch.boot.printRaw("\n");
+        var i: usize = 0;
+        while (i < d and i < stack.entries.len) : (i += 1) {
+            const e = stack.entries[i];
+            arch.boot.printRaw("    lock=0x");
+            printHex(@intFromPtr(e.lock_ptr));
+            arch.boot.printRaw(" class=");
+            printClass(e.class);
+            arch.boot.printRaw(" at ");
+            printSlice(e.src.file);
+            printDecimal(":", e.src.line);
+            arch.boot.printRaw(" in ");
+            printSlice(e.src.fn_name);
+            arch.boot.printRaw("\n");
+        }
+    }
+}
+
+/// Print the per-core wait publication. Read together with
+/// `dumpHeldStacksRaw`: a lock in a core's held stack that is NOT that
+/// core's wait record is genuinely OWNED by it; the one that matches is
+/// merely being waited for. Without this the two are indistinguishable.
+pub fn dumpWaitTableRaw() void {
+    var c: usize = 0;
+    while (c < MAX_CORES) : (c += 1) {
+        const w = wait_records[c];
+        const lp = w.lock_ptr orelse continue;
+        printDecimal("  WAIT core=", c);
+        arch.boot.printRaw(" lock=0x");
+        printHex(@intFromPtr(lp));
+        arch.boot.printRaw(" class=");
+        printClass(w.class);
+        arch.boot.printRaw(" at ");
+        printSlice(w.file);
+        printDecimal(":", w.line);
+        arch.boot.printRaw(" in ");
+        printSlice(w.fn_name);
+        arch.boot.printRaw("\n");
+    }
+}
+
+/// Shared stuck-spin report for both `SpinLock` and `GenLock`. Only the
+/// first core to claim the panic prints; the rest halt, so the dump
+/// stays legible on the wire. Line numbers print in DECIMAL here — the
+/// first revision of this printer used hex for the acquiring line and
+/// decimal for the held entries, which made two records of the same
+/// source line look like two different sites.
+pub fn reportStuckLock(
+    lock_ptr: *const anyopaque,
+    class: [*:0]const u8,
+    state: u64,
+    src: SrcLoc,
+) void {
+    if (!stygia.panic.claimPanic()) arch.cpu.halt();
+    printDecimal("SPIN STUCK core=", arch.smp.coreID());
+    arch.boot.printRaw(" lock=0x");
+    printHex(@intFromPtr(lock_ptr));
+    arch.boot.printRaw(" state=0x");
+    printHex(state);
+    arch.boot.printRaw(" class=");
+    printClass(class);
+    arch.boot.printRaw("\n  acquiring at ");
+    printSlice(src.file);
+    printDecimal(":", src.line);
+    arch.boot.printRaw(" in ");
+    printSlice(src.fn_name);
+    arch.boot.printRaw("\n");
+    dumpHeldStacksRaw();
+    dumpWaitTableRaw();
+    @panic("spinlock stuck");
+}
+
 pub fn dropAllHeldOnAbandonedStack() void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
@@ -308,7 +447,17 @@ fn handleOutcome(
 /// a `<null:0xPTR>` placeholder so a corrupt class-string pointer can't
 /// page-fault the panic printer (which would recurse through `handlePageFault`
 /// and obscure the original lockdep finding entirely).
-const KERNEL_HALF_BASE: usize = 0xffff_8000_0000_0000;
+/// Derived from the actual partition table rather than hardcoded: the
+/// old literal `0xffff_8000_0000_0000` is the x86-64 base, which sits
+/// ABOVE every legitimate aarch64 kernel pointer (`0xFFFF_0000_...`).
+/// On aarch64 that silently rejected every class / file / fn_name
+/// string in the lockdep dumps, printing `<null:0xPTR>` for pointers
+/// that were perfectly valid — blinding the deadlock diagnostics on
+/// the one arch where the wedges only reproduce on hardware.
+const KERNEL_HALF_BASE: usize = @min(
+    stygia.memory.address.AddrSpacePartition.kernel.start,
+    stygia.memory.address.AddrSpacePartition.kernel_code.start,
+);
 
 /// Print a NUL-terminated lockdep class string. If the pointer is null or
 /// outside the kernel-half canonical range, prints `<null:0xPTR>` instead

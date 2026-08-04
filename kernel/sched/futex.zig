@@ -17,6 +17,7 @@ const arch = stygia.arch.dispatch;
 const arch_syscall = stygia.arch.dispatch.syscall;
 const errors = stygia.syscall.errors;
 const sched = stygia.sched.scheduler;
+const lifecycle = stygia.sched.lifecycle;
 
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const PAddr = stygia.memory.address.PAddr;
@@ -155,6 +156,25 @@ pub fn cancelWait(ec: *ExecutionContext) void {
     ec.futex_wait_nodes = null;
     ec.futex_wait_vaddrs = null;
     ec.futex_deadline_ns = 0;
+    ec.wait.clear();
+}
+
+pub fn repairPriority(ec: *ExecutionContext) void {
+    const nodes = ec.futex_wait_nodes orelse return;
+    const count: usize = ec.futex_bucket_count;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const node = &nodes[i];
+        const bucket = &buckets[bucketIdx(node.paddr)];
+        const birq = bucket.lock.lockIrqSave(@src());
+        if (bucket.pq.remove(node)) {
+            node.priority = ec.priority;
+            bucket.pq.enqueue(node);
+        } else {
+            node.priority = ec.priority;
+        }
+        bucket.lock.unlockIrqRestore(birq);
+    }
 }
 
 /// Remove every node owned by `ec` from its bucket(s), without
@@ -232,6 +252,24 @@ fn pickCoreForEc(ec: *ExecutionContext) u64 {
     return @ctz(ec.affinity);
 }
 
+fn peekFutexWaiter(bucket: *Bucket) ?*WaitNode {
+    var idx: usize = bucket.pq.levels.len;
+    while (idx > 0) {
+        idx -= 1;
+        if (bucket.pq.levels[idx].head) |head| return head;
+    }
+    return null;
+}
+
+fn peekMatchingWaiter(bucket: *Bucket, paddr: PAddr, requeue: *WaitNodePriorityQueue) ?*WaitNode {
+    while (true) {
+        const node = peekFutexWaiter(bucket) orelse return null;
+        if (node.paddr.addr == paddr.addr) return node;
+        _ = bucket.pq.dequeue();
+        requeue.enqueue(node);
+    }
+}
+
 /// `futex_wake` — wake up to `count` ECs blocked on `paddr`.
 /// Spec §[futex].futex_wake. Wake order is priority-ordered (highest
 /// first; FIFO within a priority).
@@ -248,35 +286,59 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     var requeue: WaitNodePriorityQueue = .{};
 
     while (woken < count) {
-        const node = bucket.pq.dequeue() orelse break;
+        const node = peekMatchingWaiter(bucket, paddr, &requeue) orelse break;
 
-        if (node.paddr.addr != paddr.addr) {
-            requeue.enqueue(node);
+        // stygia-qbx: the EC behind this node can be destroyed by a
+        // DOMAIN teardown running on another core at any point in this
+        // iteration. The old comment here claimed the node's residence
+        // in our bucket pinned the EC ("cannot have been freed"); that
+        // is not true. `cancelWait` unlinks a victim's nodes under this
+        // same bucket lock, so while we hold it a concurrent teardown
+        // simply BLOCKS — the node stays visible to us — and the gen
+        // has typically already been bumped dead by then. The first
+        // acquire below catches an EC that is already dead; the danger
+        // was everything after the old unconditional unlock.
+        //
+        // Phase 1 — validate under the EC's gen lock and claim the wait
+        // episode before unlinking it. That keeps the lifecycle state word
+        // as the single winner election: a racing timeout or teardown that
+        // cannot CAS waiting/parking away knows this wake owns the payload.
+        const wake_lr = node.ec.lockIrqSave(@src()) catch {
+            _ = bucket.pq.dequeue();
             continue;
-        }
-
-        // caller-pinned: the node lives in the waiting EC's
-        // `futex_wait_nodes_storage` array — the EC cannot have been
-        // freed while this node is still in our bucket. The gen-locked
-        // SlabRef is for tooling uniformity and the implicit liveness
-        // assertion.
-        const ec_lr = node.ec.lockIrqSave(@src()) catch continue;
-        const ec = ec_lr.ptr;
-        node.ec.unlockIrqRestore(ec_lr.irq_state);
-
+        };
+        const ec = wake_lr.ptr;
         // wake_index is the offset of this node in the EC's
         // wait_nodes array — the index of the address in the original
         // multi-address wait that matched.
-        const nodes = ec.futex_wait_nodes.?;
+        const nodes = ec.futex_wait_nodes orelse {
+            // Raced a cancel that already cleared the array; the node is
+            // stale. Drop it and move on rather than deref a null.
+            _ = bucket.pq.dequeue();
+            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            continue;
+        };
         const node_idx: usize = (@intFromPtr(node) - @intFromPtr(nodes)) / @sizeOf(WaitNode);
-        ec.futex_wake_index = @intCast(node_idx);
+        if (node_idx >= ec.futex_bucket_count or &nodes[node_idx] != node) {
+            _ = bucket.pq.dequeue();
+            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            continue;
+        }
 
+        const claim = lifecycle.beginWaitingClaimPinned(ec);
+        if (claim == .none) {
+            _ = bucket.pq.dequeue();
+            removeNodesExcept(ec, node, wake_idx);
+            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            continue;
+        }
+        const dequeued = bucket.pq.dequeue() orelse unreachable;
+        std.debug.assert(dequeued == node);
         // Drop this EC's other nodes from every bucket they live in
         // (skipping the just-dequeued node and using the held lock
         // for any same-bucket sibling).
         removeNodesExcept(ec, node, wake_idx);
-
-        while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        ec.futex_wake_index = @intCast(node_idx);
         if (ec.futex_deadline_ns != 0) {
             ec.futex_deadline_ns = 0;
             removeTimedWaiter(ec);
@@ -293,8 +355,20 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         ec.futex_bucket_count = 0;
         ec.futex_wait_nodes = null;
         ec.futex_wait_vaddrs = null;
-        ec.state = .ready;
-        sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
+        const dest_core: u8 = @intCast(pickCoreForEc(ec));
+        node.ec.unlockIrqRestore(wake_lr.irq_state);
+
+        // Phase 3 — enqueue OUTSIDE the gen lock. `enqueueOnCore` takes
+        // `core_locks[]`, and nesting that under a gen lock is the
+        // gen-lock→core-lock AB-BA edge qbx flagged. Keeping it out
+        // here means this fix adds no new lock-order edge: the only
+        // nesting is bucket→gen, which the original code already had.
+        switch (claim) {
+            .claimed => sched.enqueueOnCore(dest_core, ec),
+            .pended => lifecycle.publishPendedPayload(ec),
+            .none => unreachable,
+        }
+        lifecycle.releasePin(ec);
         woken += 1;
     }
 
@@ -368,7 +442,15 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
     ec.futex_wait_nodes = nodes;
     ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
-    ec.state = .futex_wait;
+    const owner_core: u8 = @truncate(arch.smp.coreID());
+    if (!lifecycle.prepareRunningPark(ec, owner_core, .futex)) {
+        releaseBucketLocks(&lock_state);
+        ec.futex_wait_nodes = null;
+        ec.futex_wait_vaddrs = null;
+        ec.futex_bucket_count = 0;
+        ec.futex_deadline_ns = 0;
+        return errors.E_INVAL;
+    }
 
     for (0..count) |i| {
         const idx = bucketIdx(addrs[i]);
@@ -381,7 +463,9 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
                 _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
-            ec.state = .running;
+            _ = lifecycle.cas(ec, .parking, .running);
+            ec.owner_core = owner_core;
+            ec.wait.clear();
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
@@ -394,17 +478,17 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 
     // Park the EC: drop currency on the local core. The syscall
     // dispatcher (`arch.x64.interrupts.syscallDispatch`) sees
-    // `current_ec == null` and routes to `scheduler.run()` instead of
-    // iretq'ing back to the now-parked user EC. The wake/timeout path
-    // overwrites this EC's syscall-return slot with the real return
-    // value (vaddr or E_TIMEOUT) before re-marking it ready, so the
-    // placeholder returned here only needs to be a value the parked
-    // EC will never observe.
-    ec.on_cpu.store(false, .release);
-    const core_id: u8 = @truncate(arch.smp.coreID());
-    if (sched.coreCurrentIs(core_id, ec)) {
-        sched.clearCurrentEc(core_id);
-    }
+    // `current_ec == null` and routes to `scheduler.hopParkRun()`
+    // instead of iretq'ing back to the now-parked user EC. The
+    // wake/timeout path overwrites this EC's syscall-return slot with
+    // the real return value (vaddr or E_TIMEOUT) before re-marking it
+    // ready, so the placeholder returned here only needs to be a value
+    // the parked EC will never observe.
+    //
+    // `on_cpu` is NOT cleared here: this core keeps executing on the
+    // EC's kstack until the park-kstack hop, and the wake side's
+    // phase-2 spin gates its enqueue on exactly this flag. Stash the
+    // release for the hop instead (see PerCore.pending_kstack_release).
     return 0;
 }
 
@@ -464,7 +548,15 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
     ec.futex_wait_nodes = nodes;
     ec.futex_wait_vaddrs = vaddrs_storage;
     ec.futex_bucket_count = @intCast(count);
-    ec.state = .futex_wait;
+    const owner_core: u8 = @truncate(arch.smp.coreID());
+    if (!lifecycle.prepareRunningPark(ec, owner_core, .futex)) {
+        releaseBucketLocks(&lock_state);
+        ec.futex_wait_nodes = null;
+        ec.futex_wait_vaddrs = null;
+        ec.futex_bucket_count = 0;
+        ec.futex_deadline_ns = 0;
+        return errors.E_INVAL;
+    }
 
     for (0..count) |i| {
         (&buckets[bucketIdx(addrs[i])]).pq.enqueue(&nodes[i]);
@@ -476,7 +568,9 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
                 _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
-            ec.state = .running;
+            _ = lifecycle.cas(ec, .parking, .running);
+            ec.owner_core = owner_core;
+            ec.wait.clear();
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
             ec.futex_bucket_count = 0;
@@ -487,12 +581,9 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
 
     releaseBucketLocks(&lock_state);
 
-    // Park the EC: see `waitVal` for the full rationale.
-    ec.on_cpu.store(false, .release);
-    const core_id: u8 = @truncate(arch.smp.coreID());
-    if (sched.coreCurrentIs(core_id, ec)) {
-        sched.clearCurrentEc(core_id);
-    }
+    // Park the EC: see `waitVal` for the full rationale, including why
+    // the `on_cpu` release is stashed for the park-kstack hop rather
+    // than performed here.
     return 0;
 }
 
@@ -571,6 +662,10 @@ pub fn expireTimedWaiters() void {
         defer timed_lock.unlockIrqRestore(irq);
         for (&timed_waiters) |*slot| {
             const ec = slot.* orelse continue;
+            if (!lifecycle.tryPinLive(ec)) {
+                slot.* = null;
+                continue;
+            }
             // Cross-core terminate may have rotated this EC's slab gen to
             // even (freed) and left a stale entry here — `terminate` /
             // `destroyExecutionContextLocked` don't reach into this list.
@@ -580,10 +675,15 @@ pub fn expireTimedWaiters() void {
             // batch).
             const gen = ec._gen_lock.currentGen();
             if (gen % 2 == 0) {
+                lifecycle.releasePin(ec);
                 slot.* = null;
                 continue;
             }
-            if (ec.futex_deadline_ns == 0 or now_ns < ec.futex_deadline_ns) continue;
+            const deadline = ec.futex_deadline_ns;
+            if (deadline == 0 or now_ns < deadline) {
+                lifecycle.releasePin(ec);
+                continue;
+            }
             // caller-pinned: `ec` is pinned by the `timed_waiters` slot we
             // just dequeued; capturing its current gen here gives the
             // phase-2 walk a stale-detector if the slot is freed and
@@ -591,8 +691,9 @@ pub fn expireTimedWaiters() void {
             // re-locking still rejects re-registered ECs.
             expired[expired_count] = .{
                 .ec = SlabRef(ExecutionContext).init(ec, gen),
-                .deadline = ec.futex_deadline_ns,
+                .deadline = deadline,
             };
+            lifecycle.releasePin(ec);
             expired_count += 1;
             slot.* = null;
         }
@@ -606,12 +707,23 @@ pub fn expireTimedWaiters() void {
         // by the SlabRef is the structural staleness backstop; the
         // deadline check below catches the wake/re-wait race.
         const ec = entry.ec.ptr;
+        if (!lifecycle.tryPinLive(ec)) continue;
+        if (ec._gen_lock.currentGen() != @as(u63, entry.ec.gen)) {
+            lifecycle.releasePin(ec);
+            continue;
+        }
         // Re-check deadline. If wake() ran between phases, deadline is
         // now 0; if the EC was woken and made a new wait, deadline
         // differs. In both cases this snapshot is stale — skip.
-        if (ec.futex_deadline_ns != entry.deadline) continue;
+        if (ec.futex_deadline_ns != entry.deadline) {
+            lifecycle.releasePin(ec);
+            continue;
+        }
 
-        const nodes = ec.futex_wait_nodes orelse continue;
+        const nodes = ec.futex_wait_nodes orelse {
+            lifecycle.releasePin(ec);
+            continue;
+        };
         const count: usize = ec.futex_bucket_count;
         var removed: bool = false;
         var i: usize = 0;
@@ -625,7 +737,11 @@ pub fn expireTimedWaiters() void {
         }
 
         if (removed) {
-            while (ec.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            const claim = lifecycle.beginWaitingClaimPinned(ec);
+            if (claim == .none) {
+                lifecycle.releasePin(ec);
+                continue;
+            }
             ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
             // [test 06]: timeout returns E_TIMEOUT in vreg 1. The
@@ -636,8 +752,13 @@ pub fn expireTimedWaiters() void {
             ec.futex_bucket_count = 0;
             ec.futex_wait_nodes = null;
             ec.futex_wait_vaddrs = null;
-            ec.state = .ready;
-            sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec);
+            switch (claim) {
+                .claimed => sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec),
+                .pended => lifecycle.publishPendedPayload(ec),
+                .none => unreachable,
+            }
+            lifecycle.releasePin(ec);
         }
+        lifecycle.releasePin(ec);
     }
 }

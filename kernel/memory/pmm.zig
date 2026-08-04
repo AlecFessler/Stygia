@@ -68,15 +68,27 @@ pub const PhysicalMemoryManager = struct {
                 return page;
             }
 
-            self.lock.lock(@src());
+            // `lockIrqSave`, not plain `lock`: this class is reachable
+            // from the async timer entry (`schedTimerHandler → preempt →
+            // yieldTo → finalizeDestroyMarkedDead → stack.destroyKernel
+            // → drainQuarantine → freePage`), so a core holding it with
+            // IRQs enabled would spin on a lock it holds itself.
+            //
+            // The `saveAndDisableInterrupts` above already covers this
+            // window, but it exists for the per-core `page_caches` slot
+            // and must span more than the lock — so it is not where the
+            // buddy lock's IRQ discipline belongs. This nests inside it
+            // and restores the interrupts-off state it saw, leaving the
+            // outer bracket's intent intact.
+            const lock_irq = self.lock.lockIrqSave(@src());
             const bulk = self.buddy.allocBlock(paging.PAGE4K * CACHE_REFILL_PAGES) orelse {
                 const single = self.buddy.allocBlock(paging.PAGE4K);
-                self.lock.unlock();
+                self.lock.unlockIrqRestore(lock_irq);
                 arch.cpu.restoreInterrupts(irq);
                 return single;
             };
             var batch = self.buddy.splitAllocation(@intFromPtr(bulk), 0);
-            self.lock.unlock();
+            self.lock.unlockIrqRestore(lock_irq);
 
             while (batch.pop()) |page| {
                 cache.push(@ptrCast(page));
@@ -109,14 +121,22 @@ pub const PhysicalMemoryManager = struct {
                 return;
             }
 
-            self.lock.lock(@src());
+            // `lockIrqSave`, not plain `lock` — same reasoning as
+            // `allocPage`: the async timer entry reaches this class via
+            // `schedTimerHandler → preempt → yieldTo →
+            // finalizeDestroyMarkedDead → stack.destroyKernel →
+            // drainQuarantine → freePage`, which is THIS function.
+            // Nests inside the per-core cache's
+            // `saveAndDisableInterrupts` bracket above and restores the
+            // interrupts-off state it saw.
+            const lock_irq = self.lock.lockIrqSave(@src());
             var i: u32 = 0;
             while (i < CACHE_MAX_PAGES / 2) {
                 const cached = cache.pop().?;
                 self.buddy.freeBlock(cached[0..paging.PAGE4K]);
                 i += 1;
             }
-            self.lock.unlock();
+            self.lock.unlockIrqRestore(lock_irq);
 
             cache.push(page);
             arch.cpu.restoreInterrupts(irq);
@@ -135,7 +155,30 @@ pub const PhysicalMemoryManager = struct {
     pub fn allocBlock(self: *PhysicalMemoryManager, len: u64) ?[*]u8 {
         const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
-        return self.buddy.allocBlock(len);
+        const got = self.buddy.allocBlock(len);
+        // TEMP DIAGNOSTIC (stygia-2u0, REMOVE). A failed allocBlock is
+        // currently SILENT — it returns null and the caller surfaces at
+        // most a spawn failure — which is why 10 good passes followed by
+        // total collapse produces no marker at all. Distinguish the two
+        // candidate causes in one line: a true leak drains `free_pages`,
+        // whereas fragmentation leaves it high while every freelist at
+        // or above the requested order is empty. Capped so a wedged run
+        // doesn't drown the serial log it is being read from.
+        if (got == null) {
+            if (blk_fail_prints < 8) {
+                blk_fail_prints += 1;
+                var orders: [16]u8 = @splat('.');
+                var o: usize = 0;
+                while (o < self.buddy.freelists.len and o < orders.len) : (o += 1) {
+                    if (self.buddy.freelists[o].head != null) orders[o] = 'x';
+                }
+                arch.boot.print(
+                    "[2u0] allocBlock({d}) FAILED free_pages={d} orders=[{s}]\n",
+                    .{ len, self.buddy.free_pages, orders[0..] },
+                );
+            }
+        }
+        return got;
     }
 
     /// Free a contiguous physical block previously returned by
@@ -167,6 +210,10 @@ pub const PhysicalMemoryManager = struct {
         self.freePage(bytes);
     }
 };
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE) — print budget for failed
+/// `allocBlock` reports; see the call site in `allocBlock`.
+var blk_fail_prints: u32 = 0;
 
 pub var global_pmm: ?PhysicalMemoryManager = null;
 

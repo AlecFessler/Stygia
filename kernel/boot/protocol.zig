@@ -119,7 +119,7 @@ pub const MMapEntry = struct {
     type: MMapEntryType,
 };
 
-pub const STACK_SIZE: u64 = paging.PAGE4K * 6;
+pub const STACK_SIZE: u64 = paging.PAGE4K * 8;
 pub const MAX_MMAP_ENTRIES = 256;
 
 pub fn collapseMMap(

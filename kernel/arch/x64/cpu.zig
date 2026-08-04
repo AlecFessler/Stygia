@@ -8,6 +8,8 @@ const interrupts = stygia.arch.x64.interrupts;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const VAddr = stygia.memory.address.VAddr;
 
+extern fn scheduler_run_after_park() callconv(.c) noreturn;
+
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3
     pclmul = 1 << 1, // Carryless multiply
@@ -456,6 +458,35 @@ pub fn writeCr3(value: u64) void {
         :
         : [val] "r" (value),
     );
+}
+
+/// Invalidate the ENTIRE TLB on this core, **including global pages**.
+///
+/// Intel SDM Vol 3A §5.10.4.1: a MOV to CR3 leaves global translations
+/// (PTE.G with CR4.PGE=1) in place, and INVPCID type 3 is documented as
+/// "all-context, excluding globals". Kernel mappings — kernel stacks
+/// among them — are installed global (`kindAttrs(.kernel_data)`), so
+/// neither of those reaches them. Toggling CR4.PGE off and back on does:
+/// SDM Vol 3A §5.10.4.1 lists "MOV to CR4 that changes CR4.PGE" as
+/// invalidating all TLB entries including global ones.
+///
+/// Needed by the TLB-shootdown ack path: a core that acknowledges a
+/// shootdown arm without dropping global translations is lying to the
+/// initiator, and the initiator then recycles physical frames that this
+/// core can still reach.
+pub fn flushTlbIncludingGlobal() void {
+    const cr4 = asm volatile ("mov %%cr4, %[out]"
+        : [out] "=r" (-> u64),
+    );
+    const pge: u64 = 1 << 7;
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (cr4 & ~pge),
+        : .{ .memory = true });
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (cr4),
+        : .{ .memory = true });
 }
 
 /// Intel SDM Vol 2A, "IN — Input from Port" / "OUT — Output to Port" —
@@ -920,9 +951,42 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         \\sti
         \\hlt
         \\cli
-        \\jmp scheduler_run_after_park
+        \\jmp %[after_park:P]
         :
         : [top] "r" (park_top),
+          [after_park] "X" (&scheduler_run_after_park),
+        : .{ .memory = true });
+    unreachable;
+}
+
+/// Abandon the current kernel stack: swap rsp to `new_top`, publish the
+/// old stack's release by storing 0 to `release_byte`, then tail-call
+/// `entry(arg)`. The store happens AFTER the rsp swap — from that
+/// instruction on, this core provably never reads or writes the old
+/// stack again, so a byte that gates "may another core reuse that
+/// kstack" (an EC's `on_cpu` flag) can be cleared here and nowhere
+/// earlier. x86-TSO gives the plain `movb` store release semantics
+/// against the `.acquire` loads in the wake-side spins.
+///
+/// `release_byte` must always be a valid writable byte; callers with
+/// nothing to release pass a dummy. noreturn: the caller's frames are
+/// abandoned by the rsp swap and `entry` must never return.
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    asm volatile (
+        \\movq %[top], %%rsp
+        \\movb $0, (%[rel])
+        \\movq %[arg], %%rdi
+        \\callq *%[entry]
+        :
+        : [top] "r" (new_top),
+          [rel] "r" (release_byte),
+          [arg] "r" (arg),
+          [entry] "r" (entry),
         : .{ .memory = true });
     unreachable;
 }

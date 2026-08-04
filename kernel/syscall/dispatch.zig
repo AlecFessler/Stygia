@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const capability = stygia.syscall.capability;
 const capability_domain = stygia.syscall.capability_domain;
@@ -110,27 +111,55 @@ inline fn arg(args: []const u64, i: usize) u64 {
 pub fn expectedMaxVreg(syscall_word: u64) u8 {
     const num_raw: u64 = syscall_word & 0xFFF;
     if (num_raw <= 13) return 2; // fast-suspend: target + port
-    const num = std.meta.intToEnum(SyscallNum, num_raw) catch return 13;
+    const num = std.enums.fromInt(SyscallNum, num_raw) orelse return 13;
     const n_reg: u64 = (syscall_word >> 12) & 0xFF;
     return switch (num) {
         // Register-only — at most 5 args, all in vregs 1..N.
-        .restrict, .delete, .revoke, .sync,
-        .acquire_ecs, .acquire_vmars,
-        .self, .terminate, .yield, .priority, .affinity,
-        .perfmon_info, .perfmon_read, .perfmon_stop,
+        .restrict,
+        .delete,
+        .revoke,
+        .sync,
+        .acquire_ecs,
+        .acquire_vmars,
+        .self,
+        .terminate,
+        .yield,
+        .priority,
+        .affinity,
+        .perfmon_info,
+        .perfmon_read,
+        .perfmon_stop,
         .create_execution_context,
-        .create_vmar, .map_mmio, .remap, .snapshot, .idc_read,
-        .create_page_frame, .ack,
-        .create_virtual_machine, .create_vcpu,
+        .create_vmar,
+        .map_mmio,
+        .remap,
+        .snapshot,
+        .idc_read,
+        .create_page_frame,
+        .ack,
+        .create_virtual_machine,
+        .create_vcpu,
         .vm_inject_irq,
-        .create_port, .recv, .bind_event_route, .clear_event_route,
-        .timer_arm, .timer_rearm, .timer_cancel,
+        .create_port,
+        .recv,
+        .bind_event_route,
+        .clear_event_route,
+        .timer_arm,
+        .timer_rearm,
+        .timer_cancel,
         .futex_wake,
-        .time_monotonic, .time_getwall, .time_setwall,
+        .time_monotonic,
+        .time_getwall,
+        .time_setwall,
         .random,
-        .info_system, .info_cores,
-        .power_shutdown, .power_reboot, .power_sleep, .power_screen_off,
-        .power_set_freq, .power_set_idle,
+        .info_system,
+        .info_cores,
+        .power_shutdown,
+        .power_reboot,
+        .power_sleep,
+        .power_screen_off,
+        .power_set_freq,
+        .power_set_idle,
         .kprof_dump,
         => 13,
 
@@ -164,15 +193,45 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .@"suspend" => if (n_reg > 0) @as(u8, 127) else @as(u8, 13),
 
         // reply / reply_transfer: pair_count in bits 12-19; pair entries
-        // in the high band — handler reads them itself via userAccess
-        // gating, so dispatch's args slice does NOT need to carry them.
-        .reply => 13,
+        // in the high band [128-N..127]. The arch entry path has the
+        // syscall-time user SP; the reply handler must consume entries
+        // from `args` rather than re-reading `ec.ctx`, which may still
+        // hold the prior saved user frame for the current syscall.
+        .reply => if (n_reg > 0) @as(u8, 127) else @as(u8, 13),
     };
+}
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). State for `logSpawnError`.
+var spawn_err_prints: u32 = 0;
+var syscall_seq: u64 = 0;
+
+/// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). The multi-pass collapse is
+/// entirely silent: ten clean passes, then decay to zero delivered
+/// results, with no panic, no fault, and — measured — no allocBlock
+/// failure and no handle-table exhaustion. Every candidate resource
+/// tested so far returns its "empty" signal without printing anything,
+/// so instead of guessing at the next one, report which SPAWN syscall
+/// starts refusing and with what code. Restricted to the two spawn
+/// syscalls so the budget is not eaten by tests that fail on purpose,
+/// and stamped with a sequence number so the failures can be located
+/// relative to the runner's own pass summaries in the same log.
+fn logSpawnError(num_raw: u64, res: i64) void {
+    if (!build_options.kernel_spawn_diag) return;
+    if (res >= 0) return;
+    if (num_raw != @intFromEnum(SyscallNum.create_capability_domain) and
+        num_raw != @intFromEnum(SyscallNum.create_execution_context)) return;
+    const n = @atomicRmw(u32, &spawn_err_prints, .Add, 1, .monotonic);
+    if (n >= 24) return;
+    stygia.arch.dispatch.boot.print(
+        "[2u0] spawn syscall {d} -> {d} (seq {d})\n",
+        .{ num_raw, res, syscall_seq },
+    );
 }
 
 pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     kprof.enter(.syscall);
     defer kprof.exit(.syscall);
+    syscall_seq +%= 1;
 
     // Spec §[syscall]: syscall number lives in bits 0-11 of the syscall
     // word. Anything beyond that range is per-syscall metadata
@@ -190,9 +249,9 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         return port.@"suspend"(caller, arg(args, 0), arg(args, 1), 0);
     }
 
-    const num = std.meta.intToEnum(SyscallNum, num_raw) catch return errors.E_INVAL;
+    const num = std.enums.fromInt(SyscallNum, num_raw) orelse return errors.E_INVAL;
 
-    return switch (num) {
+    const dispatch_res = switch (num) {
         .restrict => capability.restrict(caller, arg(args, 0), arg(args, 1)),
         .delete => capability.delete(caller, arg(args, 0)),
         .revoke => capability.revoke(caller, arg(args, 0)),
@@ -336,7 +395,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         ),
         .clear_event_route => event_route.clearEventRoute(caller, arg(args, 0), arg(args, 1)),
 
-        .reply => reply.reply(caller, syscall_word),
+        .reply => reply.reply(caller, syscall_word, args),
 
         .timer_arm => timer.timerArm(
             caller,
@@ -480,4 +539,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             break :blk 0;
         },
     };
+    // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
+    logSpawnError(num_raw, dispatch_res);
+    return dispatch_res;
 }

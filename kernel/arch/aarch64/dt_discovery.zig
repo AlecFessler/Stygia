@@ -38,7 +38,6 @@ const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const power = stygia.arch.aarch64.power;
 const serial = stygia.arch.aarch64.serial;
-const smp = stygia.arch.aarch64.smp;
 const watchdog = stygia.arch.aarch64.watchdog;
 
 const MappingKind = stygia.memory.address.MappingKind;
@@ -357,38 +356,47 @@ fn discoverGic(tree: *const fdt.Fdt) gic.GicDiscovery {
     return discovery;
 }
 
-/// Record the MPIDRs from `/cpus` and decide how many cores to bring up.
+/// Record the MPIDRs from `/cpus` and report how many cores to bring up.
 ///
-/// `core_count` is pinned to 1 (BSP only) even when `/cpus` describes
-/// four, and that is a correctness requirement rather than caution.
-/// `gic.coreID()` derives a core's logical index from MPIDR Aff0
-/// (`gic.zig`: `readMpidr() & 0xFF`), but BCM2712 numbers its cores in
-/// Aff1: the Pi 5 DTB's four `cpu@N` nodes have `reg` = 0x0, 0x100,
-/// 0x200, 0x300, so **every core reports Aff0 == 0** and would alias
-/// core 0 in every per-core array the kernel keeps. `smp.smpInit` drives
-/// PSCI CPU_ON off `gic.coreCount()`, so raising this before
-/// `coreID()` becomes MPIDR-table-driven would bring up three cores that
-/// all believe they are the BSP.
+/// The order of the `cpu@N` nodes defines the kernel's logical core
+/// numbering, and on GICv2 — the only interrupt controller any DT-booted
+/// target here has — that numbering is also the GIC CPU interface number
+/// addressed by `GICD_SGIR.CPUTargetList` and `GICD_ITARGETSR`. The table
+/// must therefore be recorded in devicetree order and never reordered;
+/// `gic.setMpidr` documents the same contract from the other side.
 ///
-/// The MPIDR table itself is populated truthfully, so the fix later is
-/// confined to `coreID()` and this one constant.
+/// Logical core 0 must be the core executing this code, since the whole
+/// kernel treats `coreID() == 0` as "the BSP" (`hyp.init` bails on
+/// non-zero, `exceptions` routes several PPIs on it) and `smpInitFull`
+/// starts its CPU_ON loop at index 1. Every DT so far lists the boot core
+/// first, so this is a diagnostic rather than a fixup: reordering the
+/// table to force it would break the GIC interface numbering above, which
+/// is wired in hardware and not ours to permute.
 fn discoverCpus(tree: *const fdt.Fdt, discovery: *gic.GicDiscovery) void {
     var mpidrs: [max_cpus]u64 = undefined;
     const n = fdt.cpuMpidrs(tree, &mpidrs);
-    for (mpidrs[0..n], 0..) |mpidr, i| smp.setMpidr(i, mpidr);
-    discovery.core_count = 1;
-    if (n > 1) {
+    for (mpidrs[0..n], 0..) |mpidr, i| gic.setMpidr(i, mpidr);
+    discovery.core_count = n;
+
+    // Printed unconditionally: this is the mapping every per-core array in
+    // the kernel is indexed by, and on hardware that numbers cores outside
+    // Aff0 it is the first thing to check when a core misbehaves.
+    serial.print("[dt] {d} core(s) described, MPIDR", .{n});
+    for (mpidrs[0..n]) |mpidr| serial.print(" {x}", .{mpidr});
+    serial.print("\n", .{});
+
+    if (n != 0 and gic.coreID() != 0) {
         serial.print(
-            "[dt] {d} cores described; running BSP-only (coreID() is Aff0-derived)\n",
-            .{n},
+            "[dt] WARNING: boot core is logical {d}, not 0 — /cpus does not list it first\n",
+            .{gic.coreID()},
         );
     }
 }
 
 /// Upper bound on `/cpus` entries read from the devicetree. Sized for the
-/// boot stack, not for `smp.MAX_CORES` (256): no aarch64 target this
-/// kernel runs on has more than a handful, and `smp.setMpidr` bounds-
-/// checks the index anyway.
+/// boot stack, not for the GIC's table (256 entries): no aarch64 target
+/// this kernel runs on has more than a handful, and `gic.setMpidr`
+/// bounds-checks the index anyway.
 const max_cpus: usize = 16;
 
 /// Set the PSCI conduit from `/psci`'s `method`.

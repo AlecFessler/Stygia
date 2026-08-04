@@ -82,6 +82,15 @@ pub fn printRaw(s: []const u8) void {
 pub fn print(comptime format: []const u8, args: anytype) void {
     const base = base_addr orelse return;
 
+    // Once another core has claimed the panic gate, the machine is
+    // dying and only the panic owner may write to the wire. Continuing
+    // here interleaved this printer's output INTO the panic report at
+    // UART-FIFO granularity — every multi-core corpse from the rig had
+    // its first report line shredded by a concurrent [NOROUTE] print.
+    // Halting a non-owner core that is merely trying to print is
+    // strictly better than destroying the evidence.
+    if (stygia.panic.claimedByOtherCore()) stygia.arch.aarch64.cpu.halt();
+
     var temp_buffer: [256]u8 = undefined;
     const s = std.fmt.bufPrint(
         temp_buffer[0..],

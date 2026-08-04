@@ -273,13 +273,28 @@ pub const KernelHandle = extern struct {
     /// / destroyPhase2 before the handle table memory is freed. See
     /// `device_region.HandleListNode`.
     dr_node: device_region.HandleListNode = .{},
+    /// Monotonic per-slot handle instance witness. Captured by deferred
+    /// transfer cleanup/linking paths to prove that a source slot still
+    /// contains the same handle instance, not a delete/reuse lookalike.
+    /// `restrict` leaves this untouched; clear/free bumps it.
+    instance: u64 = 0,
 };
 
 comptime {
-    if (@sizeOf(KernelHandle) != 104) @compileError("KernelHandle must be 104 bytes");
+    if (@sizeOf(KernelHandle) != 112) @compileError("KernelHandle must be 112 bytes");
     if (@offsetOf(KernelHandle, "ref") != 0) @compileError("KernelHandle.ref must be at offset 0");
     if (@offsetOf(KernelHandle, "parent") != 16) @compileError("KernelHandle.parent must be at offset 16");
     if (@offsetOf(KernelHandle, "dr_node") != 88) @compileError("KernelHandle.dr_node must be at offset 88");
+    if (@offsetOf(KernelHandle, "instance") != 104) @compileError("KernelHandle.instance must be at offset 104");
+}
+
+/// Non-null sentinel used by handle-table code for an unpublished,
+/// reserved slot. Allocators must not treat it as free, while normal
+/// handle resolution must not expose it as a valid capability.
+pub const RESERVED_HANDLE_SLOT_PTR: *anyopaque = @ptrFromInt(1);
+
+pub inline fn isReservedHandleSlot(entry: *const KernelHandle) bool {
+    return entry.ref.ptr == RESERVED_HANDLE_SLOT_PTR;
 }
 
 /// Reconstruct a typed `SlabRef(T)` from a kernel entry. Returns `null`
@@ -293,6 +308,7 @@ comptime {
 /// optional level. Field-by-field copy sidesteps that.
 pub fn typedRef(comptime T: type, entry: KernelHandle) ?SlabRefOf(T) {
     const raw = entry.ref.ptr orelse return null;
+    if (raw == RESERVED_HANDLE_SLOT_PTR) return null;
     return SlabRefOf(T){
         .ptr = @ptrCast(@alignCast(raw)),
         .gen = entry.ref.gen,
@@ -377,6 +393,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
             arch.cpu.restoreInterrupts(port_lr.irq_state);
         }
         port.finalizePendingVcpus(dec_result.pending_vcpus);
+        port.finalizeClosedSenders(&dec_result.pending_senders);
     }
 
     refreshSnapshot(cd, slot, entry);
@@ -448,11 +465,11 @@ pub fn resolveHandleOnDomain(
     if (@as(u16, slot) >= MAX_HANDLES_PER_DOMAIN) return null;
 
     const entry = &cd.kernel_table[slot];
-    // Free slots are flagged by `ref.ptr == null` (see KernelHandle
-    // doc comment for the two-state encoding). The free-list link
-    // lives in `parent`; an in-use entry has `ref.ptr` set to the
-    // underlying kernel object.
+    // Free slots are flagged by `ref.ptr == null`; reserved slots carry
+    // a private non-null sentinel so allocators cannot reuse them before
+    // publication, but they are not visible as valid handles.
     if (entry.ref.ptr == null) return null;
+    if (isReservedHandleSlot(entry)) return null;
 
     if (expected) |t| {
         const user_word0 = cd.user_table[slot].word0;
@@ -560,6 +577,7 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
 /// and unlinked the handle from any copy-derivation tree it participated
 /// in (see `caps.derivation`).
 pub fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+    entry.instance +%= 1;
     holder.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     entry.ref = .{};
     entry.parent = encodeFreeNext(holder.free_head);

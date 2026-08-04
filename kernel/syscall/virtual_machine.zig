@@ -151,14 +151,14 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 ///
 /// The vCPU EC is bound to the capability domain that holds the VM
 /// handle. `create_vcpu` binds `exit_port` as the destination for its
-/// vm_exit events. Immediately upon creation, the kernel enqueues a
-/// vm_exit-style delivery on `exit_port` representing the initial "not
-/// yet started" condition: the reply cap is valid, all guest-state vregs
-/// are zero, and the exit sub-code is the initial-state sub-code. The
-/// creator recvs this event, writes the real initial guest state into the
-/// vregs, and replies with a resume action to enter guest mode. All
-/// subsequent guest exits flow through the same port and the same
-/// reply-cap lifecycle.
+/// vm_exit events and publishes the new vCPU as runnable. On the vCPU's
+/// first dispatch, the kernel delivers a vm_exit-style event on
+/// `exit_port` representing the initial "not yet started" condition:
+/// the reply cap is valid, all guest-state vregs are zero, and the exit
+/// sub-code is the initial-state sub-code. The creator recvs this event,
+/// writes the real initial guest state into the vregs, and replies with
+/// a resume action to enter guest mode. All subsequent guest exits flow
+/// through the same port and the same reply-cap lifecycle.
 ///
 /// Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the
 /// caller's handle table has no free slot.
@@ -174,7 +174,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 /// [test 09] on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 /// [test 10] on success, the EC's priority is set to `[1].priority`.
 /// [test 11] on success, the EC's affinity is set to `[3]`.
-/// [test 12] immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
+/// [test 12] after creation, the initial vCPU dispatch delivers a vm_exit event on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code; a waiting `recv` observes that delivery before guest entry.
 pub fn createVcpu(
     caller: *anyopaque,
     caps: u64,

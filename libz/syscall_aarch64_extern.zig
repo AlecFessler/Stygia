@@ -12,20 +12,18 @@
 // design note in syscall.zig — every existing test populates only
 // these, and aarch64 happens to back them with x0..x12 directly. The
 // remaining GPR-backed vregs (vregs 14..31 = x13..x30) are not exposed
-// through the libz API; that band is reserved for future use and the
-// inline asm preserves it via clobbers so no caller-frame value is
-// trampled.
+// through the libz API; x13..x17 are treated as scratch, x18 is saved
+// around the trap, and the aarch64 exception path preserves x19..x30.
 //
 // AAPCS64 detail (relevant to the inline asm clobber lists):
-//   - x0..x18 are caller-saved general-purpose registers.
-//   - x19..x28 are callee-saved — the asm must NOT clobber these
-//     without restoring them. We declare them clobbered in the
-//     clobber list anyway (LLVM will spill/reload around the asm) so
-//     the kernel is free to scribble vregs 20..29 without surprising
-//     us. Same idea for x29 (FP) — Zig modules are compiled with
-//     -fomit-frame-pointer, so x29 is just another scratch.
-//   - x30 is LR; we must restore it (or treat it as clobbered, which
-//     LLVM then handles around the call site).
+//   - x0..x18 are caller-saved general-purpose registers. LLVM may keep
+//     libz bootstrap state in x18 across these asm blocks, so the shim
+//     preserves x18 around `svc` instead of listing it as clobbered; the
+//     tied syscall operands otherwise exhaust the aarch64 allocator.
+//   - x19..x28 are callee-saved, x29 is FP, and x30 is LR. Do not list
+//     them as asm clobbers here: normal syscalls preserve that band, and
+//     the high-output syscall wrappers otherwise exceed LLVM's available
+//     aarch64 registers.
 //   - There is no AAPCS64 red zone — the stack pointer is the lowest
 //     valid address — so the issueRawCaptureWord helper does not
 //     need the 144-byte over-reservation that x86-64 requires.
@@ -38,11 +36,12 @@ const SyscallNum = syscall.SyscallNum;
 
 // Issues an svc with the syscall word at [sp + 0] and vregs 1..13 in
 // x0..x12. Returns updated v1..v13 (kernel writes back into the same
-// registers). Reserves 784 bytes so the kernel's slow-path arg
-// collector can read vregs 32..127 at `[sp + (N-31)*8]` without
-// walking past the upper guard page; sp stays 16-byte aligned per
-// AAPCS64. Unread bytes in the reservation are inert — the handler
-// bound-checks count from the syscall word before consuming any vreg.
+// registers). Reserves the 784-byte kernel slow-path arg window plus
+// one private x18 save slot, so the collector can read vregs 32..127 at
+// `[sp + (N-31)*8]` without walking past the upper guard page; sp stays
+// 16-byte aligned per AAPCS64. Unread bytes in the kernel window are
+// inert — the handler bound-checks count from the syscall word before
+// consuming any vreg.
 pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -58,10 +57,12 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #784
+        \\ sub sp, sp, #800
+        \\ str x18, [sp, #784]
         \\ str %[word], [sp]
         \\ svc #0
-        \\ add sp, sp, #784
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #800
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -89,10 +90,7 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
           [iv11] "{x10}" (in.v11),
           [iv12] "{x11}" (in.v12),
           [iv13] "{x12}" (in.v13),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true });
     return .{
         .v1 = ov1,
         .v2 = ov2,
@@ -116,10 +114,12 @@ pub fn issueRawNoStack(word: u64, in: Regs) Regs {
 /// clobber plus `volatile` keep emission required.
 pub fn issueRegDiscard(word: u64, in: Regs) void {
     asm volatile (
-        \\ sub sp, sp, #784
+        \\ sub sp, sp, #800
+        \\ str x18, [sp, #784]
         \\ str %[word], [sp]
         \\ svc #0
-        \\ add sp, sp, #784
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #800
         :
         : [word] "r" (word),
           [iv1] "{x0}" (in.v1),
@@ -135,23 +135,16 @@ pub fn issueRegDiscard(word: u64, in: Regs) void {
           [iv11] "{x10}" (in.v11),
           [iv12] "{x11}" (in.v12),
           [iv13] "{x12}" (in.v13),
-        : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true,
-             .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true,
-             .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true,
-             .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true,
-             .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true,
-             .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true,
-             .memory = true });
+        : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true });
 }
 
 // Mirrors issueRawNoStack but reads the post-syscall vreg-0 word back
 // out of [sp + 0] into `RecvReturn.word`. The recv path packs
 // reply_handle_id / event_type / pair_count / tstart there per the
 // spec; vreg 1 / x0 carries the success/error code. No red zone on
-// aarch64, so the 16-byte reservation suffices for the syscall word
-// slot — the kernel may also write vreg 32 at [sp + 8] during a recv
-// rendezvous (carrying the suspended EC's PC per §[event_state]),
-// which still falls inside the reservation.
+// aarch64, so the 800-byte reservation covers the kernel-visible
+// receive window (vreg 0 at [sp + 0], vregs 32..127 at [sp + 8..768])
+// and keeps the private x18 save slot outside that window at [sp + 784].
 pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -168,11 +161,13 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #16
+        \\ sub sp, sp, #800
+        \\ str x18, [sp, #784]
         \\ str %[word], [sp]
         \\ svc #0
         \\ ldr %[oword], [sp]
-        \\ add sp, sp, #16
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #800
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -186,7 +181,7 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
           [v11] "={x10}" (ov11),
           [v12] "={x11}" (ov12),
           [v13] "={x12}" (ov13),
-          [oword] "=&r" (oword),
+          [oword] "={x17}" (oword),
         : [word] "r" (word_in),
           [iv1] "{x0}" (in.v1),
           [iv2] "{x1}" (in.v2),
@@ -201,10 +196,7 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
           [iv11] "{x10}" (in.v11),
           [iv12] "{x11}" (in.v12),
           [iv13] "{x12}" (in.v13),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .memory = true });
     return .{
         .word = oword,
         .regs = .{
@@ -228,38 +220,17 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
 // Stack-arg path. Spec §[syscall_abi] aarch64: vreg N at `[sp + (N-31)*8]`
 // for 32 <= N <= 127, with vreg 0 (the syscall word) at `[sp + 0]`.
 //
-// Uses a static .bss-resident scratch buffer (`stack_vreg_buf_arm`)
-// the way `replyVmExitAsm` uses `vm_exit_reply_buf_arm` — Zig
-// populates the 97-slot kernel-visible vreg window (vreg 0 at index
-// 0, vregs 32..127 at indices 1..96), then the asm swaps sp to point
-// at the buffer for the svc instruction. The 31 GPR-backed vregs
-// (vregs 1..31 = x0..x30) ride through tied `{x0..x30}` operands;
-// libz's narrow API populates only x0..x12 (vregs 1..13) and treats
-// vregs 14..31 (x13..x30) as scratch. sp is restored from a saved-sp
-// slot after the syscall returns.
-// Hidden visibility: the inline asm uses direct adrp/:lo12:
-// relocations which require non-preemptible symbols under PIC rules.
-var stack_vreg_buf_arm: [97]u64 align(16) = .{0} ** 97;
-var stack_vreg_saved_sp: u64 align(8) = 0;
-comptime {
-    @export(&stack_vreg_buf_arm, .{ .name = "stack_vreg_buf_arm", .visibility = .hidden });
-    @export(&stack_vreg_saved_sp, .{ .name = "stack_vreg_saved_sp", .visibility = .hidden });
-}
-
-// Buffer fill is split out so the asm-bearing function below has no
-// stack-spilled locals competing with the tied vreg input registers.
-fn stagestackVregBufArm(word: u64, slots: *const [16]u64, n: usize) callconv(.c) void {
-    @memset(stack_vreg_buf_arm[0..97], 0);
-    stack_vreg_buf_arm[0] = word; // vreg 0
+// Reserve the kernel-visible vreg window on the caller stack for the
+// svc instant. That keeps libz's shared image read-only in test
+// domains; a process-global .bss scratch page would alias across every
+// concurrently running child.
+pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
+    var window: [97]u64 align(16) = .{0} ** 97;
+    window[0] = word;
     var i: usize = 0;
     while (i < n and i < 16) : (i += 1) {
-        // slots[i] -> vreg (32 + i) -> stage index (1 + i).
-        stack_vreg_buf_arm[1 + i] = slots[i];
+        window[1 + i] = slots[i];
     }
-}
-
-pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
-    stagestackVregBufArm(word, slots, n);
 
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -275,18 +246,20 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-        \\ adrp x13, stack_vreg_saved_sp
-        \\ add x13, x13, :lo12:stack_vreg_saved_sp
+        \\ sub sp, sp, #800
+        \\ str x18, [sp, #784]
+        \\ mov x13, %[window_ptr]
         \\ mov x14, sp
-        \\ str x14, [x13]
-        \\ adrp x13, stack_vreg_buf_arm
-        \\ add x13, x13, :lo12:stack_vreg_buf_arm
-        \\ mov sp, x13
+        \\ mov x16, #97
+        \\1: ldr x15, [x13]
+        \\ str x15, [x14]
+        \\ add x13, x13, #8
+        \\ add x14, x14, #8
+        \\ subs x16, x16, #1
+        \\ b.ne 1b
         \\ svc #0
-        \\ adrp x13, stack_vreg_saved_sp
-        \\ add x13, x13, :lo12:stack_vreg_saved_sp
-        \\ ldr x14, [x13]
-        \\ mov sp, x14
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #800
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -300,7 +273,8 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
           [v11] "={x10}" (ov11),
           [v12] "={x11}" (ov12),
           [v13] "={x12}" (ov13),
-        : [iv1] "{x0}" (in.v1),
+        : [window_ptr] "r" (&window),
+          [iv1] "{x0}" (in.v1),
           [iv2] "{x1}" (in.v2),
           [iv3] "{x2}" (in.v3),
           [iv4] "{x3}" (in.v4),
@@ -313,10 +287,7 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
           [iv11] "{x10}" (in.v11),
           [iv12] "{x11}" (in.v12),
           [iv13] "{x12}" (in.v13),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true });
     return .{
         .v1 = ov1,
         .v2 = ov2,
@@ -337,9 +308,9 @@ pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) R
 // Reply-transfer high-vreg path. Spec §[handle_attachments]: pair
 // entries occupy vregs `[128-N..127]`. On aarch64 vregs 32..127 sit
 // at `[sp + (N-31)*8]`, so vreg 32 = [sp + 8] and vreg 127 = [sp + 768].
-// We reserve 784 bytes (16-byte aligned, covers vreg 0 at [sp+0] and
-// vregs 32..127 at [sp + 8..768]), zero it so the kernel reads 0 for
-// vregs we don't explicitly set, write the attachment u64s into the
+// We reserve the 784-byte kernel window (vreg 0 at [sp+0] and vregs
+// 32..127 at [sp + 8..768]) plus one private x18 save slot, zero the
+// kernel window so unread vregs are 0, write attachment u64s into the
 // high band, drop the syscall word at [sp+0], and `svc #0`.
 // Reply path for vm_exit-typed replies (spec §[reply] / §[vm_exit_state]).
 // On aarch64 the kernel reads vregs 32..127 from [sp + 8 .. sp + 776],
@@ -375,7 +346,9 @@ pub fn replyVmExitAsm(word: u64, subcode: u64) Regs {
         \\ adrp x13, vm_exit_reply_buf_arm
         \\ add x13, x13, :lo12:vm_exit_reply_buf_arm
         \\ mov sp, x13
+        \\ str x18, [sp, #784]
         \\ svc #0
+        \\ ldr x18, [sp, #784]
         \\ adrp x13, vm_exit_reply_saved_sp
         \\ add x13, x13, :lo12:vm_exit_reply_saved_sp
         \\ ldr x14, [x13]
@@ -446,7 +419,9 @@ pub fn replyTransferVmExitAsm(word: u64, attachments_ptr: [*]const u64, n: u64, 
         \\ adrp x13, vm_exit_reply_buf_arm
         \\ add x13, x13, :lo12:vm_exit_reply_buf_arm
         \\ mov sp, x13
+        \\ str x18, [sp, #784]
         \\ svc #0
+        \\ ldr x18, [sp, #784]
         \\ adrp x13, vm_exit_reply_saved_sp
         \\ add x13, x13, :lo12:vm_exit_reply_saved_sp
         \\ ldr x14, [x13]
@@ -499,7 +474,8 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #784
+        \\ sub sp, sp, #800
+        \\ str x18, [sp, #784]
         \\ mov x13, sp
         \\ mov x14, #97
         \\1: str xzr, [x13]
@@ -521,7 +497,8 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
         \\ str %[word], [sp]
         \\ svc #0
         \\ ldr %[oword], [sp]
-        \\ add sp, sp, #784
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #800
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -535,25 +512,42 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
           [v11] "={x10}" (ov11),
           [v12] "={x11}" (ov12),
           [v13] "={x12}" (ov13),
-          [oword] "=&r" (oword),
+          [oword] "={x17}" (oword),
         : [word] "r" (word),
           [atts_ptr] "r" (attachments_ptr),
           [n] "r" (n),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .memory = true });
     return .{
         .word = oword,
         .regs = .{
-            .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4, .v5 = ov5,
-            .v6 = ov6, .v7 = ov7, .v8 = ov8, .v9 = ov9, .v10 = ov10,
-            .v11 = ov11, .v12 = ov12, .v13 = ov13,
+            .v1 = ov1,
+            .v2 = ov2,
+            .v3 = ov3,
+            .v4 = ov4,
+            .v5 = ov5,
+            .v6 = ov6,
+            .v7 = ov7,
+            .v8 = ov8,
+            .v9 = ov9,
+            .v10 = ov10,
+            .v11 = ov11,
+            .v12 = ov12,
+            .v13 = ov13,
         },
     };
 }
 
 pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
+    const InputBlock = extern struct {
+        word: u64,
+        attachments_ptr: [*]const u64,
+        n: u64,
+    };
+    var input_block: InputBlock = .{
+        .word = word,
+        .attachments_ptr = attachments_ptr,
+        .n = n,
+    };
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
     var ov3: u64 = undefined;
@@ -568,9 +562,19 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-    // Reserve 784 bytes: vreg 0 at [sp+0] and vregs 32..127 at
-    // [sp + 8 .. sp + 768]. 16-byte aligned per AAPCS64.
-        \\ sub sp, sp, #784
+    // Reserve the kernel-visible 784-byte window, one x18 save slot,
+    // and three saved input words. Copy the compiler-assigned input
+    // pointer out before reusing the scratch registers below; the input
+    // must not be pinned to a register that is also declared clobbered.
+        \\ sub sp, sp, #832
+        \\ str x18, [sp, #784]
+        \\ mov x13, %[input]
+        \\ ldr x14, [x13]
+        \\ str x14, [sp, #792]
+        \\ ldr x14, [x13, #8]
+        \\ str x14, [sp, #800]
+        \\ ldr x14, [x13, #16]
+        \\ str x14, [sp, #808]
         // Zero-fill the 97 reserved slots (1 word + 96 high vregs) so
         // any vreg the kernel reads but we don't explicitly set comes
         // back as 0 instead of caller-frame stack garbage.
@@ -583,12 +587,12 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         // Write attachments into vregs [128-N..127] at offsets
         // [sp + (128-N-31)*8 .. sp + 768]. x15 = src ptr, x14 = N,
         // x13 = first dst offset = (97 - N) * 8 + sp.
-        \\ mov x15, %[atts_ptr]
-        \\ mov x14, %[n]
+        \\ ldr x15, [sp, #800]
+        \\ ldr x14, [sp, #808]
         \\ mov x13, #97
         \\ sub x13, x13, x14
         \\ lsl x13, x13, #3
-        \\ add x13, x13, sp
+        \\ add x13, sp, x13
         \\2: ldr x16, [x15]
         \\ str x16, [x13]
         \\ add x15, x15, #8
@@ -596,9 +600,11 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         \\ subs x14, x14, #1
         \\ b.ne 2b
         // Syscall word at [sp+0].
-        \\ str %[word], [sp]
+        \\ ldr x13, [sp, #792]
+        \\ str x13, [sp]
         \\ svc #0
-        \\ add sp, sp, #784
+        \\ ldr x18, [sp, #784]
+        \\ add sp, sp, #832
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -612,13 +618,8 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
           [v11] "={x10}" (ov11),
           [v12] "={x11}" (ov12),
           [v13] "={x12}" (ov13),
-        : [word] "r" (word),
-          [atts_ptr] "r" (attachments_ptr),
-          [n] "r" (n),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : [input] "r" (&input_block),
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .memory = true });
     return .{
         .v1 = ov1,
         .v2 = ov2,

@@ -24,7 +24,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stygia = @import("stygia");
 
-
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const VAddr = stygia.memory.address.VAddr;
 
@@ -205,6 +204,8 @@ pub fn fpuStateInit(area: *[576]u8) void {
 /// at large still can't emit them.
 pub fn fpuSave(area: *[576]u8) void {
     asm volatile (
+        \\.arch_extension fp
+        \\.arch_extension simd
         \\stp  q0,  q1,  [%[a], #0]
         \\stp  q2,  q3,  [%[a], #32]
         \\stp  q4,  q5,  [%[a], #64]
@@ -233,6 +234,8 @@ pub fn fpuSave(area: *[576]u8) void {
 /// Restore V0-V31, FPCR, FPSR from `area`. Inverse of `fpuSave`.
 pub fn fpuRestore(area: *[576]u8) void {
     asm volatile (
+        \\.arch_extension fp
+        \\.arch_extension simd
         \\ldp  q0,  q1,  [%[a], #0]
         \\ldp  q2,  q3,  [%[a], #32]
         \\ldp  q4,  q5,  [%[a], #64]
@@ -428,79 +431,8 @@ export fn restoreContextAndEret() callconv(.naked) noreturn {
 /// DDI 0487 §D1.10.1 (ERET) restores PC from ELR_EL1 and PSTATE from
 /// SPSR_EL1, switching exception level per SPSR.M.
 pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
-    // Drain pending zombies parked on this core's slab. Walks all
-    // per-poster columns; under cross-core load multiple peers can
-    // queue zombies here simultaneously and single-take would let the
-    // backlog grow unbounded. Mirrors the x86 reaper in
-    // arch/x64/interrupts.zig switchTo. The per-core lock serializes
-    // the read-modify-write against remote postZombie writers; we drop
-    // the lock before finalize so its own locks aren't nested.
-    {
-        const cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
-        const sched_mod = stygia.sched.scheduler;
-        while (true) {
-            const zombie_to_reap: ?*ExecutionContext = blk: {
-                const lock = &sched_mod.core_locks[cid];
-                const irq = lock.lockIrqSaveOrdered(@src(), sched_mod.SCHED_CORE_GROUP);
-                defer lock.unlockIrqRestore(irq);
-                const slots = &(&sched_mod.core_states[cid]).pending_zombie;
-                const sp_addr = asm volatile ("mov %[out], sp"
-                    : [out] "=r" (-> u64),
-                );
-                var i: u8 = 0;
-                while (i < sched_mod.MAX_CORES) : (i += 1) {
-                    const zr = slots[i] orelse continue;
-                    const z = zr.ptr;
-                    if (z.on_cpu.load(.acquire)) continue;
-                    const z_top = z.kernel_stack.top.addr;
-                    const z_base = z.kernel_stack.base.addr;
-                    const standing_on_zombie = sp_addr >= z_base and sp_addr < z_top;
-                    if (standing_on_zombie or ec == z) continue;
-                    slots[i] = null;
-                    break :blk z;
-                }
-                break :blk null;
-            };
-            const z = zombie_to_reap orelse break;
-            stygia.sched.execution_context.finalizeDestroyMarkedDead(z);
-        }
-
-        // Publish "this EC's kernel stack is live on a CPU" (stygia-3ys).
-        //
-        // This write was MISSING on aarch64 entirely. Every `on_cpu =
-        // true` writer lived under arch/x64 (`interrupts.zig` :1399,
-        // :2535, :2875); aarch64 only ever READ the flag — the reap gate
-        // ten lines above — and cleared it (scheduler's switchTo
-        // prev-clear and `post_park_clear_on_cpu`). So on aarch64 the
-        // flag was false for every EC, always, and that gate never once
-        // fired.
-        //
-        // With the gate dead, the only surviving protections in the reap
-        // loop are `standing_on_zombie` (compares the LOCAL core's sp)
-        // and `ec == z` (the EC being dispatched right now). Neither
-        // says anything about a REMOTE core that is currently executing
-        // on the zombie's kernel stack. So core A could finalize a
-        // zombie — unmapping and recycling its kstack — while core B was
-        // running on it. Observed exactly that in the stygia-3ys corpse:
-        // CPU#1 and CPU#2 stack pointers 1408 bytes apart inside one
-        // 64 KiB EC kstack, CPU#1's frames shredded (class=0x8,
-        // ordered_group=0xFFFF0000, a return address pointing into
-        // CPU#2's exception frame), and CPU#2 then panicking out of
-        // handleSyncCurrentEl with "kernel page fault on user VA with no
-        // current EC" — the last domino, not the bug.
-        //
-        // Ordering mirrors x64 `interrupts.zig:2875`: `setCurrentEc` has
-        // already run in `scheduler.switchTo`, so `current_ec` names
-        // `ec` before the flag goes up; a remote terminate therefore
-        // sees a consistent (current_ec, on_cpu) pair. `.release` pairs
-        // with the reaper's `.acquire` load.
-        //
-        // The clear side already existed on aarch64 (it lives in the
-        // shared scheduler), which is why this was easy to miss: all the
-        // machinery for retiring the flag was present and correct, and
-        // only the arch-local raise was absent.
-        ec.on_cpu.store(true, .release);
-    }
+    const cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
+    stygia.sched.scheduler.drainTeardown(cid, ec);
 
     // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half
     // translation walks the right tree. Kernel half lives in TTBR1 and
@@ -521,11 +453,8 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // quiesce barrier keys on this before freeing the dying domain's
     // tables — and retire the locked dispatch commitment. Mirrors
     // arch/x64/interrupts.zig switchTo.
-    {
-        const pub_cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
-        stygia.sched.scheduler.publishActiveRoot(pub_cid, new_root.addr);
-        (&stygia.sched.scheduler.core_states[pub_cid]).committed_ec = null;
-    }
+    stygia.sched.scheduler.publishActiveRoot(cid, new_root.addr);
+    std.debug.assert((&stygia.sched.scheduler.core_states[cid]).current_ec == ec);
 
     // Spec §[syscall_abi]: flush the recv-deferred syscall word into
     // user `[ec.ctx.sp_el0 + 0]` while we are guaranteed to be in the
@@ -698,6 +627,35 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         \\b scheduler_run_after_park
         :
         : [top] "r" (park_top),
+        : .{ .memory = true });
+    unreachable;
+}
+
+/// Abandon the current kernel stack: swap SP to `new_top`, publish the
+/// old stack's release by storing 0 to `release_byte` (store-release,
+/// pairing with the `.acquire` loads in the wake-side `on_cpu` spins),
+/// then tail-branch to `entry(arg)`. The store happens AFTER the SP
+/// swap — from that instruction on this core never touches the old
+/// stack again, which is the only point at which "may another core
+/// reuse that kstack" may be published. `release_byte` must always be
+/// valid; callers with nothing to release pass a dummy. noreturn: the
+/// caller's frames are abandoned and `entry` must never return.
+pub fn hopToStackAndCall(
+    new_top: u64,
+    release_byte: *u8,
+    entry: *const fn (u64) callconv(.c) noreturn,
+    arg: u64,
+) noreturn {
+    asm volatile (
+        \\mov sp, %[top]
+        \\stlrb wzr, [%[rel]]
+        \\mov x0, %[arg]
+        \\br %[entry]
+        :
+        : [top] "r" (new_top),
+          [rel] "r" (release_byte),
+          [arg] "r" (arg),
+          [entry] "r" (entry),
         : .{ .memory = true });
     unreachable;
 }
