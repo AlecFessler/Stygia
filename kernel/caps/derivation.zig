@@ -38,15 +38,17 @@
 const std = @import("std");
 const stygia = @import("stygia");
 
-const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
 const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
+const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
+const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const HandleLink = capability.HandleLink;
 const KernelHandle = capability.KernelHandle;
+const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
 
 /// Defensive bound on tree-walk depth. Caps both the max depth a single
@@ -55,7 +57,6 @@ const SpinLock = stygia.utils.sync.SpinLock;
 /// single-domain depth, but a tree spanning N domains can reach
 /// `N * 4096`. A flat 1<<20 ceiling is generous in practice.
 const MAX_DEPTH: u32 = 1 << 20;
-
 /// Single global mutex serializing every tree mutation. See module-
 /// level note. Acquired by `derive` and `revoke` for the full duration
 /// of their work. Each per-domain access still goes through that
@@ -194,6 +195,48 @@ pub fn derive(
     child_dom_ref: ErasedSlabRef,
     child_slot: u12,
 ) bool {
+    return deriveInternal(parent_dom_ref, parent_slot, null, child_dom_ref, child_slot);
+}
+
+pub fn deriveExpected(
+    parent_dom_ref: ErasedSlabRef,
+    parent_slot: u12,
+    expected_parent_ref: ErasedSlabRef,
+    expected_parent_type: CapabilityType,
+    expected_parent_caps: u16,
+    expected_parent_instance: u64,
+    child_dom_ref: ErasedSlabRef,
+    child_slot: u12,
+) bool {
+    _ = expected_parent_caps;
+    return deriveInternal(parent_dom_ref, parent_slot, .{
+        .ref = expected_parent_ref,
+        .type_tag = expected_parent_type,
+        .instance = expected_parent_instance,
+    }, child_dom_ref, child_slot);
+}
+
+const ExpectedHandle = struct {
+    ref: ErasedSlabRef,
+    type_tag: CapabilityType,
+    instance: u64,
+};
+
+pub const ExpectedDelete = struct {
+    slot: u12,
+    ref: ErasedSlabRef,
+    type_tag: CapabilityType,
+    caps: u16,
+    instance: u64,
+};
+
+fn deriveInternal(
+    parent_dom_ref: ErasedSlabRef,
+    parent_slot: u12,
+    expected_parent: ?ExpectedHandle,
+    child_dom_ref: ErasedSlabRef,
+    child_slot: u12,
+) bool {
     const parent_link: HandleLink = .{ .domain = parent_dom_ref, .slot = parent_slot };
     const child_link: HandleLink = .{ .domain = child_dom_ref, .slot = child_slot };
 
@@ -202,6 +245,13 @@ pub fn derive(
 
     const parent_le = lockEntrySkip(parent_link, .{}) orelse return false;
     defer unlockEntrySkip(parent_le, .{});
+    if (expected_parent) |expected| {
+        if (parent_le.entry.instance != expected.instance) return false;
+        if (!erasedRefMatches(parent_le.entry.ref, expected.ref)) return false;
+        const parent_dom: *CapabilityDomain = @ptrCast(@alignCast(parent_le.dom_ref.ptr.?));
+        const parent_word0 = parent_dom.user_table[parent_slot].word0;
+        if (capability.Word0.typeTag(parent_word0) != expected.type_tag) return false;
+    }
 
     // Every further entry acquire in this call (the ancestor hops, the
     // child) must skip the domain whose gen-lock the parent acquire
@@ -248,6 +298,83 @@ pub fn derive(
     return true;
 }
 
+/// Like `deleteAndDetach`, but only consumes the slot if it still names
+/// the object captured by the transfer validator. This keeps delayed
+/// move cleanup from deleting an unrelated handle after source
+/// delete/reuse in the original domain.
+pub fn deleteAndDetachExpected(
+    caller_domain: ErasedSlabRef,
+    slot: u12,
+    expected_ref: ErasedSlabRef,
+    expected_type: CapabilityType,
+    expected_caps: u16,
+    expected_instance: u64,
+) i64 {
+    _ = expected_caps;
+    if (slot == 0) return errors.E_BADCAP;
+
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
+    defer tree_mutex.unlockIrqRestore(tree_irq);
+
+    const cd_lr = caller_domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch
+        return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
+
+    const entry = capability.resolveHandleOnDomain(cd, slot, null) orelse
+        return errors.E_BADCAP;
+    if (entry.instance != expected_instance) return errors.E_BADCAP;
+    if (!erasedRefMatches(entry.ref, expected_ref)) return errors.E_BADCAP;
+    const word0 = cd.user_table[slot].word0;
+    if (capability.Word0.typeTag(word0) != expected_type) return errors.E_BADCAP;
+
+    detachForDelete(cd, slot, entry);
+    capability.releaseHandle(cd, slot, entry);
+    capability.clearAndFreeSlot(cd, slot, entry);
+    return 0;
+}
+
+/// Atomically consume a batch of move sources from one caller domain.
+///
+/// Every source is validated while holding `tree_mutex` and the caller CD
+/// gen-lock; deletion starts only after the full batch still names the
+/// expected handle instances. This gives transfer-style callers an
+/// all-or-nothing failure surface for moved source handles: stale input
+/// discovered here reports E_BADCAP without consuming any earlier source.
+pub fn deleteAndDetachExpectedBatch(
+    caller_domain: ErasedSlabRef,
+    expected: []const ExpectedDelete,
+) i64 {
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
+    defer tree_mutex.unlockIrqRestore(tree_irq);
+
+    const cd_lr = caller_domain.lockTypedIrqSaveOrdered(CapabilityDomain, TREE_DOMAIN_GROUP) catch
+        return errors.E_BADCAP;
+    const cd = cd_lr.ptr;
+    defer caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
+
+    for (expected) |item| {
+        _ = item.caps;
+        if (item.slot == 0) return errors.E_BADCAP;
+
+        const entry = capability.resolveHandleOnDomain(cd, item.slot, null) orelse
+            return errors.E_BADCAP;
+        if (entry.instance != item.instance) return errors.E_BADCAP;
+        if (!erasedRefMatches(entry.ref, item.ref)) return errors.E_BADCAP;
+        const word0 = cd.user_table[item.slot].word0;
+        if (capability.Word0.typeTag(word0) != item.type_tag) return errors.E_BADCAP;
+    }
+
+    for (expected) |item| {
+        const entry = capability.resolveHandleOnDomain(cd, item.slot, null) orelse unreachable;
+        detachForDelete(cd, item.slot, entry);
+        capability.releaseHandle(cd, item.slot, entry);
+        capability.clearAndFreeSlot(cd, item.slot, entry);
+    }
+
+    return 0;
+}
+
 /// Walk `start.parent.parent...` looking for a link that names `target`.
 /// Returns true if `target` is an ancestor of (or equal to) `start`.
 /// Used by `derive` to reject cycles: refusing to install
@@ -275,6 +402,10 @@ fn ancestorChainContains(
 
 inline fn linkMatchesLink(a: HandleLink, b: HandleLink) bool {
     return a.domain.ptr == b.domain.ptr and a.slot == b.slot;
+}
+
+inline fn erasedRefMatches(a: ErasedSlabRef, b: ErasedSlabRef) bool {
+    return a.ptr == b.ptr and a.gen == b.gen;
 }
 
 /// `delete` syscall driver. Spec §[capabilities].delete.
@@ -307,17 +438,25 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
         };
         const cd = cd_lr.ptr;
 
-        // `destroyPhase1` releases `cd._gen_lock` via `destroyLocked`
-        // before returning; restore the captured IRQ state manually
-        // because the deferred `unlockTypedIrqRestore` would assert
-        // `prev & 1 == 1` on a word whose lock bit was just cleared.
-        const deferred = capability_domain.releaseSelf(cd);
-        arch.cpu.restoreInterrupts(cd_lr.irq_state);
-
+        const cd_ref = SlabRef(CapabilityDomain).init(cd, cd._gen_lock.currentGen());
+        const caller_ec = stygia.sched.scheduler.currentEc();
+        caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
         tree_mutex.unlockIrqRestore(tree_irq);
 
-        capability_domain.destroyPhase2(deferred);
-        return 0;
+        stygia.sched.execution_context.printPreReportTerminal(caller_ec, cd, "delete_slot_self");
+
+        stygia.sched.scheduler.queueCurrentTeardown(.{
+            .kind = .self_delete,
+            .cd = cd_ref,
+            .caller_ec = if (caller_ec) |ec|
+                SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
+            else
+                null,
+        });
+        if (caller_ec) |ec| {
+            stygia.sched.execution_context.parkSelfFaulted(ec);
+        }
+        stygia.sched.scheduler.hopParkRun();
     }
 
     const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);

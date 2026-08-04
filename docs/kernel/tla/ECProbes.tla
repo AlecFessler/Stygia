@@ -17,13 +17,13 @@ ProbeNoRvPendedReceiver ==
     ~(ecs[e].pc = "rvC" /\ ecs[e].tg # NULL
         /\ ecs[ecs[e].tg].st = "pended")
 
-(* ROUND-10 M-D. `t1full`'s LiveTerm PASS was billed as machine-checking  *)
-(* the W3 -> W5 -> W3 cycle (A terminates B while B suspends A). That is  *)
-(* worth nothing if the configuration is never REACHED in those 477,468   *)
-(* states -- LiveTerm holds vacuously over a shape that never occurs.     *)
-(* This is the probe standard applied to the artifact's own certificate:  *)
-(* TLC violating it proves the cycle is constructible, so the PASS is     *)
-(* about something.                                                       *)
+(* ROUND-10 M-D, updated in revision 16. `t1full`'s old LiveTerm PASS was *)
+(* billed as machine-checking the W3 -> W5 -> W3 cycle (A terminates B    *)
+(* while B suspends A), but revision 15's t1full scope no longer          *)
+(* converges: 8,131,498 distinct states and a temporal-phase timeout.     *)
+(* `t1d` is the current directive-bearing LiveTerm rung, and `pr4d` is    *)
+(* its exact CONSTANTS mirror. TLC violating this probe proves that rung  *)
+(* actually reaches the cycle it exists to cover.                         *)
 ProbeNoTermSuspendCycle ==
   \A a, b \in ECs:
     ~(/\ a # b

@@ -64,7 +64,7 @@ const physmap = address.AddrSpacePartition.physmap;
 /// is confusing the two, and a struct field named `_phys` next to one named
 /// `_virt` is harder to mix up than two calls to `VAddr.fromPAddr`.
 pub const Handoff = struct {
-    /// Base of the 6-page kernel stack, physical.
+    /// Base of the kernel stack, physical.
     stack_base_phys: u64,
     /// One byte past the last stack byte, physical. Not itself mapped.
     stack_top_phys: u64,

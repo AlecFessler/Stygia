@@ -241,6 +241,14 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 
+    if (from_user) {
+        if (scheduler.currentEc()) |ec| {
+            if (execution_context.consumeSuspendDirective(ec, ctx)) {
+                scheduler.hopParkRun();
+            }
+        }
+    }
+
     // Lazy-FPU trap. CR0.TS was set by switchTo when this EC last got
     // dispatched (because it wasn't the last FPU owner on this core).
     // Userspace's first FP/SSE instruction trapped #NM here — swap

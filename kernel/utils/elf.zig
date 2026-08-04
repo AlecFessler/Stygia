@@ -148,19 +148,22 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     // Bounds-check the section header table before slicing. A truncated
     // ELF (e.g. user-staged page frame whose size doesn't cover shoff)
     // would otherwise panic the kernel inside `bytes[shoff..end]`.
-    const shtbl_size = @as(u64, elf_hdr.shentsize) * @as(u64, elf_hdr.shnum);
-    if (elf_hdr.shoff + shtbl_size > bytes.len) return error.InvalidElfMagic;
+    if (elf_hdr.shentsize != @sizeOf(elf.Elf64_Shdr)) return error.InvalidElfMagic;
+    const shtbl_size_mul = @mulWithOverflow(@as(u64, elf_hdr.shentsize), @as(u64, elf_hdr.shnum));
+    if (shtbl_size_mul[1] != 0) return error.InvalidElfMagic;
+    const shtbl_end = @addWithOverflow(elf_hdr.shoff, shtbl_size_mul[0]);
+    if (shtbl_end[1] != 0 or shtbl_end[0] > bytes.len) return error.InvalidElfMagic;
 
     const shdrs = std.mem.bytesAsSlice(
         elf.Elf64_Shdr,
-        bytes[elf_hdr.shoff .. elf_hdr.shoff + elf_hdr.shentsize * elf_hdr.shnum],
+        bytes[elf_hdr.shoff..shtbl_end[0]],
     );
 
     if (elf_hdr.shstrndx >= shdrs.len) return error.InvalidElfMagic;
     const shstr_shdr = shdrs[elf_hdr.shstrndx];
-    const shstr_end = shstr_shdr.sh_offset + shstr_shdr.sh_size;
-    if (shstr_end > bytes.len) return error.InvalidElfMagic;
-    const shstr = bytes[shstr_shdr.sh_offset..shstr_end];
+    const shstr_end = @addWithOverflow(shstr_shdr.sh_offset, shstr_shdr.sh_size);
+    if (shstr_end[1] != 0 or shstr_end[0] > bytes.len) return error.InvalidElfMagic;
+    const shstr = bytes[shstr_shdr.sh_offset..shstr_end[0]];
 
     while (try shdr_itr.next()) |shdr| {
         const name = getCStrAt(shstr, @intCast(shdr.sh_name)) orelse "<bad name>";

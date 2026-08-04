@@ -15,10 +15,10 @@
 //     - The test EC mints a port with bind|recv|xfer (xfer is required
 //       to mint a reply handle whose `xfer` cap is set, which is in
 //       turn required by reply with pair_count > 0 per §[reply]).
-//     - It mints a sibling EC bound to the same domain with susp+term
-//       (rp=0). The sibling self-suspends on the port via raw asm so
-//       that on resume the kernel populates ITS syscall word with
-//       pair_count and tstart per §[event_state]; an externally-
+//     - It pins itself and a sibling EC to the same current core, then
+//       the sibling self-suspends on the port through libz's raw capture
+//       helper so that on resume the kernel populates ITS syscall word
+//       with pair_count and tstart per §[event_state]; an externally-
 //       suspended EC has no syscall pad to write.
 //     - The test EC blocks in recv on the port; the kernel mints a
 //       reply handle in the test EC's table and returns its slot in
@@ -27,10 +27,7 @@
 //       entry referencing a page frame handle (a non-IDC type so the
 //       caps land verbatim — no idc_rx intersection to disentangle).
 //       The pair entry is in vreg 127 per §[handle_attachments]; the
-//       libz `reply` wrapper covers only the bare-reply path, so we
-//       issue the syscall inline. Reservation pad: 920 bytes (912 for
-//       vregs 14..127 plus 8 for the syscall word pushed last). Vreg
-//       127 lands at [rsp+912] after the push.
+//       libz `replyTransfer` wrapper owns that high-vreg layout.
 //
 //   The test EC's domain is the resumed EC's domain (we created the
 //   sibling with target=self), so the inserted handle slot is visible
@@ -117,69 +114,13 @@ fn siblingEntry() callconv(.c) noreturn {
     const port_id: u64 = g_port_handle_id;
     const self_ec_id: u64 = g_sibling_self_handle_id;
 
-    // Self-suspend on the port. syscall_num = 14 (suspend), no pair
-    // attachments from the sender side. Capture the post-resume syscall
-    // word so we can read pair_count / tstart.
-    const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
-    var word_out: u64 = undefined;
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            var rax_out: u64 = undefined;
-            var rbx_out: u64 = undefined;
-            asm volatile (
-                \\ pushq %%rcx
-                \\ syscall
-                \\ popq %%rcx
-                : [wo] "={rcx}" (word_out),
-                  [v1o] "={rax}" (rax_out),
-                  [v2o] "={rbx}" (rbx_out),
-                : [wi] "{rcx}" (word_in),
-                  [v1i] "{rax}" (self_ec_id),
-                  [v2i] "{rbx}" (port_id),
-                : .{
-                    .rdx = true,
-                    .rbp = true,
-                    .rsi = true,
-                    .rdi = true,
-                    .r8 = true,
-                    .r9 = true,
-                    .r10 = true,
-                    .r11 = true,
-                    .r12 = true,
-                    .r13 = true,
-                    .r14 = true,
-                    .r15 = true,
-                    .memory = true,
-                });
-        },
-        .aarch64 => {
-            // Self-suspend: vreg 0 = syscall word at [sp+0],
-            // vreg 1 = x0 = self EC handle, vreg 2 = x1 = port handle.
-            // Capture post-resume word from [sp+0]. Reserve 16 bytes
-            // (16-byte aligned, no high vregs needed).
-            var x0_out: u64 = undefined;
-            var x1_out: u64 = undefined;
-            asm volatile (
-                \\ sub sp, sp, #16
-                \\ str %[wi], [sp]
-                \\ svc #0
-                \\ ldr %[wo], [sp]
-                \\ add sp, sp, #16
-                : [wo] "=&r" (word_out),
-                  [v1o] "={x0}" (x0_out),
-                  [v2o] "={x1}" (x1_out),
-                : [wi] "r" (word_in),
-                  [v1i] "{x0}" (self_ec_id),
-                  [v2i] "{x1}" (port_id),
-                : .{ .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true,
-                     .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true,
-                     .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true,
-                     .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true,
-                     .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true,
-                     .x28 = true, .x29 = true, .x30 = true, .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
+    // Raw word 0 selects the no-attachment fast-suspend ABI. Capture the
+    // post-resume syscall word so we can read pair_count / tstart.
+    const suspended = syscall.issueRawCaptureWord(0, .{
+        .v1 = self_ec_id,
+        .v2 = port_id,
+    });
+    const word_out = suspended.word;
 
     @atomicStore(u64, &g_sibling_observed_word, word_out, .release);
     @atomicStore(u32, &g_sibling_done, 1, .release);
@@ -187,7 +128,7 @@ fn siblingEntry() callconv(.c) noreturn {
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfe"),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
             else => @compileError("unsupported target architecture"),
         }
     }
@@ -242,12 +183,37 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, ec_caps.toU16()) | (@as(u64, 1) << 32);
+    const pinned_core = testing.currentCoreId();
+    const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((sibling_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(3);
+        return;
+    }
+
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         @intFromPtr(&siblingEntry),
         1, // stack_pages
         0, // target = self (this domain)
-        0, // affinity_mask = 0 means kernel chooses
+        sibling_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
         testing.fail(3);
@@ -275,69 +241,17 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 5. Issue reply with pair_count=1 attaching the page frame handle.
-    //    libz `reply` covers only the bare-reply path, so we do the
-    //    inline-asm path:
-    //
-    //      sub  $912, %rsp           # space for vregs 14..127
-    //      mov  pair_entry, 904(%rsp) # vreg 127
-    //      push %rcx                  # syscall word at [rsp]; vreg 127 now at [rsp+912]
-    //      syscall
-    //      add  $920, %rsp            # discard pad + word
-    //
-    //    Syscall word: syscall_num=52 (reply) | (pair_count=1)<<12 |
-    //    (reply_handle_id<<20). Per §[reply] the reply_handle_id rides
-    //    in syscall-word bits 20-31 rather than in vreg 1.
+    //    Per §[reply], the reply_handle_id rides in syscall-word bits
+    //    20-31 rather than in vreg 1; libz owns the high-vreg pair layout.
     const pair_entry = caps.PairEntry{
         .id = pf_handle,
         .caps = ATTACH_PF_CAPS.toU16(),
         .move = true, // remove from our table on resume; matches PfCap.move = true above
     };
     const entry_u64: u64 = pair_entry.toU64();
-    const word: u64 =
-        @as(u64, @intFromEnum(syscall.SyscallNum.reply)) |
-        (@as(u64, 1) << 12) |
-        ((@as(u64, reply_handle_id) & 0xFFF) << 20);
+    const rt = syscall.replyTransfer(reply_handle_id, &.{entry_u64});
 
-    var rt_v1_out: u64 = undefined;
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\ subq $912, %%rsp
-                \\ movq %[entry], 904(%%rsp)
-                \\ pushq %%rcx
-                \\ syscall
-                \\ addq $920, %%rsp
-                : [v1o] "={rax}" (rt_v1_out),
-                : [wi] "{rcx}" (word),
-                  [entry] "r" (entry_u64),
-                : .{
-                    .rcx = true,
-                    .r11 = true,
-                    .memory = true,
-                });
-        },
-        .aarch64 => {
-            // aarch64: vreg 127 = [sp + 768]; reserve 784 bytes.
-            asm volatile (
-                \\ sub sp, sp, #784
-                \\ str %[word], [sp]
-                \\ str %[entry], [sp, #768]
-                \\ svc #0
-                \\ add sp, sp, #784
-                : [v1o] "={x0}" (rt_v1_out),
-                : [word] "r" (word),
-                  [entry] "r" (entry_u64),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
-
-    if (rt_v1_out != @intFromEnum(errors.Error.OK)) {
+    if (rt.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);
         return;
     }
@@ -356,6 +270,7 @@ pub fn main(cap_table_base: u64) void {
     //    safe — both ECs are bound to this domain on the same scheduler;
     //    the kernel will schedule the sibling.
     while (@atomicLoad(u32, &g_sibling_done, .acquire) == 0) {
+        _ = syscall.yieldEc(@as(u64, sibling_ec));
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
             .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),

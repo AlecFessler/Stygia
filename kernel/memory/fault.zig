@@ -1,8 +1,10 @@
 const std = @import("std");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const address = stygia.memory.address;
 const arch = stygia.arch.dispatch;
+const errors = stygia.syscall.errors;
 const kprof = stygia.kprof.trace_id;
 const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
@@ -20,6 +22,43 @@ const PAddr = stygia.memory.address.PAddr;
 const PageFaultContext = stygia.arch.dispatch.cpu.PageFaultContext;
 const VAddr = stygia.memory.address.VAddr;
 const DbgArchCpuContext = stygia.arch.dispatch.cpu.ArchCpuContext;
+
+const PF_DIAG_BUDGET: u32 = 4096;
+var pf_diag_prints: u32 = 0;
+
+fn diagTag(ec: *const stygia.sched.execution_context.ExecutionContext) u64 {
+    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
+    return ec.domain.ptr.diag_test_tag;
+}
+
+fn logPfDiag(
+    site: []const u8,
+    ec: ?*const stygia.sched.execution_context.ExecutionContext,
+    fault: *const PageFaultContext,
+    rc: i64,
+    subcode: u8,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &pf_diag_prints, .Add, 1, .monotonic);
+    if (n >= PF_DIAG_BUDGET) return;
+    const tag: u64 = if (ec) |e| diagTag(e) else 0;
+    arch.boot.print(
+        "[pfdiag] site={s} tag=0x{x} ec=0x{x} far=0x{x} rip=0x{x} kpriv={d} w={d} x={d} uaccess={d} rc={d} sub={d}\n",
+        .{
+            site,
+            tag,
+            if (ec) |e| @intFromPtr(e) else 0,
+            fault.faulting_address,
+            fault.rip,
+            @intFromBool(fault.is_kernel_privilege),
+            @intFromBool(fault.is_write),
+            @intFromBool(fault.is_exec),
+            @intFromBool(fault.in_user_access_window),
+            rc,
+            subcode,
+        },
+    );
+}
 
 // TEMP DIAGNOSTIC (stygia-idc, REMOVE).
 //
@@ -264,21 +303,18 @@ fn dumpCoreStatesRaw() void {
             panic_mod.printHex(cur.kernel_stack.base.addr);
             arch.boot.printRaw("..0x");
             panic_mod.printHex(cur.kernel_stack.top.addr);
-            arch.boot.printRaw(if (cur.on_cpu.load(.monotonic)) " on_cpu=1" else " on_cpu=0");
+            arch.boot.printRaw(" owner=");
+            panic_mod.printHex(cur.owner_core);
+            arch.boot.printRaw(" wait=");
+            panic_mod.printHex(@intFromEnum(cur.wait.kind));
         } else {
             arch.boot.printRaw(" cur=null");
         }
-        // Raw pending-zombie slots, column index included: the column IS
-        // the posting core, so a corrupt value here names its writer's
-        // core without another hardware cycle.
-        var zi: usize = 0;
-        while (zi < cs.pending_zombie.len) : (zi += 1) {
-            if (cs.pending_zombie[zi]) |zr| {
-                arch.boot.printRaw(" z[");
-                panic_mod.printHex(zi);
-                arch.boot.printRaw("]=0x");
-                panic_mod.printHex(@intFromPtr(zr.ptr));
-            }
+        if (cs.teardown_pending) |req| {
+            arch.boot.printRaw(" td_kind=");
+            panic_mod.printHex(@intFromEnum(req.kind));
+            arch.boot.printRaw(" td_cd=0x");
+            panic_mod.printHex(@intFromPtr(req.cd.ptr));
         }
         arch.boot.printRaw("\n");
     }
@@ -431,7 +467,9 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // memory remain set — that is a separate (pre-existing) leak.
         sync_debug.dropAllHeldOnAbandonedStack();
         dbgStashFault(fault, 3); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
-        port.fireMemoryFault(ec, @intFromEnum(accessSubcode(is_write, is_exec)), faulting_virt.addr);
+        const subcode: u8 = @intFromEnum(accessSubcode(is_write, is_exec));
+        logPfDiag("kernel_user_accessor", ec, fault, errors.E_BADADDR, subcode);
+        port.fireMemoryFault(ec, subcode, faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack
         // release stashed on this core; an IRQ handler here could
@@ -529,7 +567,9 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
         dbgStashFault(fault, 2); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
-        port.fireMemoryFault(ec, @intFromEnum(MemoryFaultSubcode.unmapped), faulting_virt.addr);
+        const subcode: u8 = @intFromEnum(MemoryFaultSubcode.unmapped);
+        logPfDiag("user_domain_gone", ec, fault, errors.E_BADCAP, subcode);
+        port.fireMemoryFault(ec, subcode, faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack
         // release stashed on this core; an IRQ handler here could
@@ -574,6 +614,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         else
             accessSubcode(is_write, is_exec);
         dbgStashFault(fault, 1); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
+        logPfDiag("user_invalid", ec, fault, rc, @intFromEnum(subcode));
         port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the EC with its kstack

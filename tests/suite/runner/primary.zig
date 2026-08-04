@@ -30,6 +30,7 @@
 //     affinity pinning above is half of that design; the port
 //     sharding is the half still outstanding.
 
+const builtin = @import("builtin");
 const std = @import("std");
 
 const lib = @import("lib");
@@ -97,6 +98,17 @@ pub const ResultCode = enum(u64) {
 pub const TestResult = struct {
     code: ResultCode,
     assertion_id: u64,
+};
+
+const EventFields = struct {
+    recv_status: u64,
+    pair_count: u64,
+    tstart: u64,
+    reply_handle_id: caps.HandleId,
+    event_type: u64,
+    result_code: ResultCode,
+    assertion_id: u64,
+    tag: u64,
 };
 
 const TOTAL_TESTS: usize = embedded_tests.TOTAL_TEST_COUNT;
@@ -241,9 +253,11 @@ pub fn main(cap_table_base: u64) void {
         if (reported == 0) break :blk 1;
         break :blk @min(reported, 64);
     };
-    serial.print("[runner] spreading tests over ");
-    serial.printU64(spread_cores);
-    serial.print(" core(s)\n");
+    if (embedded_tests.runner_diag) {
+        serial.print("[runner] spreading tests over ");
+        serial.printU64(spread_cores);
+        serial.print(" core(s)\n");
+    }
 
     // Aggregate counters across all repeats — used by the final
     // multi-run summary at end. Per-run summaries print after each.
@@ -263,193 +277,198 @@ pub fn main(cap_table_base: u64) void {
             for (&results) |*r| r.* = .{ .code = .not_run, .assertion_id = 0 };
         }
 
-    var successful_spawns: usize = 0;
-    var collected: usize = 0;
-    var batch_idx: usize = 0;
-    while (batch_idx < embedded_tests.manifest.len) {
-        const batch_end = @min(batch_idx + BATCH, embedded_tests.manifest.len);
-        // Per-batch progress so a stalled batch isn't ambiguous with
-        // a stalled test ELF or a stalled spawn syscall.
-        serial.print("[runner] batch ");
-        serial.printU64(batch_idx);
-        serial.print("..");
-        serial.printU64(batch_end);
-        serial.print("\n");
-        var batch_started: usize = 0;
-        var i = batch_idx;
-        while (i < batch_end) : (i += 1) {
-            // Round-robin on the *manifest* index, not the in-batch
-            // index, so the spread stays even across batch boundaries
-            // (BATCH is 16 and cores is typically 4, so both would work
-            // here — but only the manifest index survives a -Dbatch
-            // change that is not a multiple of the core count).
-            const affinity: u64 = @as(u64, 1) << @truncate(i % spread_cores);
-            if (spawnOne(embedded_tests.manifest[i], port_handle, affinity)) {
-                successful_spawns += 1;
-                batch_started += 1;
-            }
-        }
-        serial.print("[runner]   spawned ");
-        serial.printU64(batch_started);
-        serial.print("/");
-        serial.printU64(batch_end - batch_idx);
-        serial.print("\n");
-        // Drain this batch's events before staging the next.
-        var batch_collected: usize = 0;
-        var batch_recv_timed_out = false;
-        while (batch_collected < batch_started) {
-            const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
-
-            // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
-            // Drop the batch on the floor (its survivors stay `.not_run` =
-            // MISS in summarize). Hung sender ECs are reaped at domain
-            // teardown when the runner returns / power_shutdown.
-            if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
-                serial.print("[runner] recv timeout after ");
-                serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
-                serial.print("s with ");
-                serial.printU64(collected);
-                serial.print(" / ");
-                serial.printU64(successful_spawns);
-                serial.print(" results — skipping rest of batch\n");
-                // Name the tests that are still outstanding at the
-                // timeout instant. `summarize` reports these later as
-                // MISS anyway, but by then the batch boundary is lost,
-                // and it is the batch shape that discriminates the two
-                // stygia-ojs severities: exactly one outstanding (a
-                // single EC's result lost) versus the whole batch
-                // outstanding (nothing delivered at all, which is not
-                // BATCH independent losses).
-                serial.print("[runner]   outstanding in batch ");
+        var successful_spawns: usize = 0;
+        var collected: usize = 0;
+        var batch_idx: usize = 0;
+        while (batch_idx < embedded_tests.manifest.len) {
+            const batch_end = @min(batch_idx + BATCH, embedded_tests.manifest.len);
+            if (embedded_tests.runner_diag) {
+                // Per-batch progress so a stalled batch isn't ambiguous
+                // with a stalled test ELF or a stalled spawn syscall.
+                serial.print("[runner] batch ");
                 serial.printU64(batch_idx);
                 serial.print("..");
                 serial.printU64(batch_end);
-                serial.print(":");
-                var oi = batch_idx;
-                while (oi < batch_end) : (oi += 1) {
-                    if (results[oi].code == .not_run) {
-                        serial.print(" ");
-                        serial.print(embedded_tests.manifest[oi].name);
-                    }
-                }
                 serial.print("\n");
-                // Classify the timeout before abandoning the batch.
-                // Three outcomes are possible and they point at three
-                // different bugs, so guessing is not good enough:
-                //
-                //   fast=N (N > 0)  The result was already queued on the
-                //     port when the 30 s recv returned E_TIMEOUT. A 1 ms
-                //     recv cannot have waited for a test to finish, so
-                //     this is a KERNEL bug on the receive side — a lost
-                //     wake or a spurious timeout — not a stuck test.
-                //   slow=N          The sender ECs were merely late;
-                //     something starved them past 30 s.
-                //   both zero       The sender ECs never produced a
-                //     result at all (dead, parked, or faulted silently).
-                //
-                // Probed events are deliberately NOT recorded: they stay
-                // MISS in the summary. This is instrumentation, and it
-                // must not turn a real failure into a pass.
-                var probe_fast: usize = 0;
-                var probe_slow: usize = 0;
-                {
-                    const want = batch_started - batch_collected;
-                    while (probe_fast + probe_slow < want) {
-                        const p = syscall.recv(port_handle, PROBE_FAST_NS);
-                        if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
-                            probe_fast += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    var round: usize = 0;
-                    while (round < PROBE_SLOW_ROUNDS and
-                        probe_fast + probe_slow < want) : (round += 1)
-                    {
-                        const p = syscall.recv(port_handle, PROBE_SLOW_NS);
-                        if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
-                            probe_slow += 1;
-                        }
-                    }
-                }
-                serial.print("[runner]   probe: fast=");
-                serial.printU64(probe_fast);
-                serial.print(" slow=");
-                serial.printU64(probe_slow);
-                serial.print(" of ");
-                serial.printU64(batch_started - batch_collected);
-                serial.print(" outstanding\n");
-                if (embedded_tests.halt_on_miss) {
-                    // Freeze so the corpse stays inspectable — see the
-                    // -Dhalt_on_miss rationale in build.zig. Spin in
-                    // user mode rather than exiting: the kernel keeps
-                    // the lost EC, its port state and the per-core
-                    // scheduler state exactly as they are, and the
-                    // qemu gdb stub stays attachable. The harness sees
-                    // "no summary" and preserves the VM.
-                    serial.print("[runner] halt_on_miss — freezing for inspection (gdb stub)\n");
-                    while (true) {
-                        std.atomic.spinLoopHint();
-                    }
-                }
-                batch_recv_timed_out = true;
-                break;
             }
+            var batch_started: usize = 0;
+            var i = batch_idx;
+            while (i < batch_end) : (i += 1) {
+                // Round-robin on the *manifest* index, not the in-batch
+                // index, so the spread stays even across batch boundaries
+                // (BATCH is 16 and cores is typically 4, so both would work
+                // here — but only the manifest index survives a -Dbatch
+                // change that is not a multiple of the core count).
+                const affinity: u64 = @as(u64, 1) << @truncate(i % spread_cores);
+                if (spawnOne(i, embedded_tests.manifest[i], port_handle, affinity)) {
+                    successful_spawns += 1;
+                    batch_started += 1;
+                }
+            }
+            if (embedded_tests.runner_diag) {
+                serial.print("[runner]   spawned ");
+                serial.printU64(batch_started);
+                serial.print("/");
+                serial.printU64(batch_end - batch_idx);
+                serial.print("\n");
+            }
+            // Drain this batch's events before staging the next.
+            var batch_collected: usize = 0;
+            var batch_recv_timed_out = false;
+            while (batch_collected < batch_started) {
+                const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
 
-            // §[event_state] return word — composed by sched.port.deliverEvent
-            // and written to the receiver's `[user_rsp + 0]` (vreg 0,
-            // captured into `got.word` by issueRawCaptureWord). vreg 1
-            // (rax) carries the syscall success/error code (0 on a
-            // delivered event, E_TIMEOUT on the deadline path).
-            // Previous code read vreg 1 here, so `reply_handle_id`
-            // came back as 0 and every reply syscall hit
-            // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
-            // sender ECs stayed parked on the result port, their CDs
-            // (and any periodic timer they'd armed) lived
-            // indefinitely, and accumulated wheel-tick load starved
-            // the runner past iter ~416 — the cascade-MISS root cause.
-            //
-            // Layout: pair_count [12..19], tstart [20..31],
-            // reply_handle_id [32..43], event_type [44..].
-            const reply_handle_id: caps.HandleId = @truncate((got.word >> 32) & 0xFFF);
-            const result_code: ResultCode = @enumFromInt(got.regs.v3);
-            const assertion_id: u64 = got.regs.v4;
-            const tag: u64 = got.regs.v5;
+                // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
+                // Drop the batch on the floor (its survivors stay `.not_run` =
+                // MISS in summarize). Hung sender ECs are reaped at domain
+                // teardown when the runner returns / power_shutdown.
+                if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
+                    serial.print("[runner] recv timeout after ");
+                    serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
+                    serial.print("s with ");
+                    serial.printU64(collected);
+                    serial.print(" / ");
+                    serial.printU64(successful_spawns);
+                    serial.print(" results — skipping rest of batch\n");
+                    // Name the tests that are still outstanding at the
+                    // timeout instant. `summarize` reports these later as
+                    // MISS anyway, but by then the batch boundary is lost,
+                    // and it is the batch shape that discriminates the two
+                    // stygia-ojs severities: exactly one outstanding (a
+                    // single EC's result lost) versus the whole batch
+                    // outstanding (nothing delivered at all, which is not
+                    // BATCH independent losses).
+                    serial.print("[runner]   outstanding in batch ");
+                    serial.printU64(batch_idx);
+                    serial.print("..");
+                    serial.printU64(batch_end);
+                    serial.print(":");
+                    var oi = batch_idx;
+                    while (oi < batch_end) : (oi += 1) {
+                        if (results[oi].code == .not_run) {
+                            serial.print(" ");
+                            serial.printU64(oi);
+                            serial.print(":");
+                            serial.print(embedded_tests.manifest[oi].name);
+                        }
+                    }
+                    serial.print("\n");
+                    // Classify the timeout before abandoning the batch.
+                    // Three outcomes are possible and they point at three
+                    // different bugs, so guessing is not good enough:
+                    //
+                    //   fast=N (N > 0)  The result was already queued on the
+                    //     port when the 30 s recv returned E_TIMEOUT. A 1 ms
+                    //     recv cannot have waited for a test to finish, so
+                    //     this is a KERNEL bug on the receive side — a lost
+                    //     wake or a spurious timeout — not a stuck test.
+                    //   slow=N          The sender ECs were merely late;
+                    //     something starved them past 30 s.
+                    //   both zero       The sender ECs never produced a
+                    //     result at all (dead, parked, or faulted silently).
+                    //
+                    // Probed events are deliberately NOT recorded: they stay
+                    // MISS in the summary. This is instrumentation, and it
+                    // must not turn a real failure into a pass.
+                    var probe_fast: usize = 0;
+                    var probe_slow: usize = 0;
+                    {
+                        const want = batch_started - batch_collected;
+                        while (probe_fast + probe_slow < want) {
+                            const p = syscall.recv(port_handle, PROBE_FAST_NS);
+                            if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
+                                probe_fast += 1;
+                                drainProbeEvent("fast", probe_fast + probe_slow, p);
+                                continue;
+                            }
+                            break;
+                        }
+                        var round: usize = 0;
+                        while (round < PROBE_SLOW_ROUNDS and
+                            probe_fast + probe_slow < want) : (round += 1)
+                        {
+                            const p = syscall.recv(port_handle, PROBE_SLOW_NS);
+                            if (p.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) {
+                                probe_slow += 1;
+                                drainProbeEvent("slow", probe_fast + probe_slow, p);
+                            }
+                        }
+                    }
+                    serial.print("[runner]   probe: fast=");
+                    serial.printU64(probe_fast);
+                    serial.print(" slow=");
+                    serial.printU64(probe_slow);
+                    serial.print(" of ");
+                    serial.printU64(batch_started - batch_collected);
+                    serial.print(" outstanding\n");
+                    if (embedded_tests.halt_on_miss) {
+                        // Freeze so the corpse stays inspectable — see the
+                        // -Dhalt_on_miss rationale in build.zig. Spin in
+                        // user mode rather than exiting: the kernel keeps
+                        // the lost EC, its port state and the per-core
+                        // scheduler state exactly as they are, and the
+                        // qemu gdb stub stays attachable. The harness sees
+                        // "no summary" and preserves the VM.
+                        serial.print("[runner] halt_on_miss — freezing for inspection (gdb stub)\n");
+                        while (true) {
+                            std.atomic.spinLoopHint();
+                        }
+                    }
+                    batch_recv_timed_out = true;
+                    break;
+                }
 
-            record(tag, .{
-                .code = result_code,
-                .assertion_id = assertion_id,
-            });
+                // §[event_state] return word — composed by sched.port.deliverEvent
+                // and written to the receiver's `[user_rsp + 0]` (vreg 0,
+                // captured into `got.word` by issueRawCaptureWord). vreg 1
+                // (rax) carries the syscall success/error code (0 on a
+                // delivered event, E_TIMEOUT on the deadline path).
+                // Previous code read vreg 1 here, so `reply_handle_id`
+                // came back as 0 and every reply syscall hit
+                // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
+                // sender ECs stayed parked on the result port, their CDs
+                // (and any periodic timer they'd armed) lived
+                // indefinitely, and accumulated wheel-tick load starved
+                // the runner past iter ~416 — the cascade-MISS root cause.
+                //
+                // Layout: pair_count [12..19], tstart [20..31],
+                // reply_handle_id [32..43], event_type [44..].
+                const event = decodeEvent(got);
 
-            // Resume the child so it can return out of testing.report,
-            // fall through to start.zig, and tear down its self-handle.
-            //
-            // Use the discard variant of issueReg directly. The plain
-            // `_ = syscall.reply(…)` chain (issueRawNoStack with 13
-            // output operands → Regs return → discard) is provably
-            // dead from LLVM's POV: every output operand traces to a
-            // discarded slot, which lets ReleaseSmall strip the entire
-            // chain INCLUDING the inner `asm volatile`. The visible
-            // failure was the runner emitting ~10 of ~420 expected
-            // reply syscalls, every elided reply leaving a test EC
-            // parked on the result port and the test's CD (with any
-            // periodic timer it armed) live indefinitely. The
-            // accumulated wheel-tick load starved the runner past
-            // iter ~416 and produced the cascade-MISS tail in
-            // `timer_arm_07..yield_04`.
-            //
-            // Spec §[reply]: reply_handle_id rides in syscall-word bits
-            // 12-23 — pass it through `extraReplyHandle`, leave vregs
-            // 1..13 untouched. (Pre-spec-update this slotted reply_handle
-            // into vreg 1 / rax, which conflicted with the §[vm_exit_state]
-            // GPR layout and broke the L4-style fast path.)
-            syscall.issueRegDiscard(.reply, syscall.extraReplyHandle(reply_handle_id), .{});
+                _ = record(event.tag, .{
+                    .code = event.result_code,
+                    .assertion_id = event.assertion_id,
+                }, event.reply_handle_id);
 
-            collected += 1;
-            batch_collected += 1;
+                // Resume the child so it can return out of testing.report,
+                // fall through to start.zig, and tear down its self-handle.
+                //
+                // Use the discard variant of issueReg directly. The plain
+                // `_ = syscall.reply(…)` chain (issueRawNoStack with 13
+                // output operands → Regs return → discard) is provably
+                // dead from LLVM's POV: every output operand traces to a
+                // discarded slot, which lets ReleaseSmall strip the entire
+                // chain INCLUDING the inner `asm volatile`. The visible
+                // failure was the runner emitting ~10 of ~420 expected
+                // reply syscalls, every elided reply leaving a test EC
+                // parked on the result port and the test's CD (with any
+                // periodic timer it armed) live indefinitely. The
+                // accumulated wheel-tick load starved the runner past
+                // iter ~416 and produced the cascade-MISS tail in
+                // `timer_arm_07..yield_04`.
+                //
+                // Spec §[reply]: reply_handle_id rides in syscall-word bits
+                // 20-31 — pass it through `extraReplyHandle`, leave vregs
+                // 1..13 untouched. (Pre-spec-update this slotted reply_handle
+                // into vreg 1 / rax, which conflicted with the §[vm_exit_state]
+                // GPR layout and broke the L4-style fast path.)
+                syscall.issueRegDiscard(.reply, syscall.extraReplyHandle(event.reply_handle_id), .{});
+
+                collected += 1;
+                batch_collected += 1;
+            }
+            batch_idx = batch_end;
         }
-        batch_idx = batch_end;
-    }
 
         const counts = summarize();
         agg_pass += counts.pass;
@@ -482,13 +501,11 @@ pub fn main(cap_table_base: u64) void {
     // Reached once, after every run in the -Drepeat loop has reported and
     // the aggregate is printed — not per run.
     //
-    // -Dreboot_at_end picks a reboot instead, for bare-metal rigs where a
-    // real power-off cannot be undone remotely: on the Raspberry Pi 5 it
-    // becomes PSCI SYSTEM_RESET, which is warm on that board, so the host
-    // OS comes back by itself and an unattended N-runs-in-a-row harness can
-    // start the next boot. Under emulation the shutdown is what makes QEMU
-    // exit, which is how precommit tells a finished run from its own
-    // timeout, so the default must stay `powerShutdown`.
+    // The generated test manifest always requests reboot now. On the
+    // Raspberry Pi 5 that becomes PSCI SYSTEM_RESET, so tryboot falls back
+    // to Pi OS and the board comes back over ssh after a successful run.
+    // QEMU gates run with `-no-reboot`, so the same request still terminates
+    // the VM process for local/precommit runs.
     if (embedded_tests.reboot_at_end) {
         _ = syscall.powerReboot();
     } else {
@@ -500,7 +517,7 @@ pub fn main(cap_table_base: u64) void {
 // port. Returns true on success, false if create_capability_domain
 // reported an error in vreg 1 — the caller skips queueing a recv for
 // failed spawns so the recv loop's iteration count stays accurate.
-fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u64) bool {
+fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u64) bool {
     const pf_handle = stageElfIntoPageFrame(entry.bytes);
 
     // Grant the child:
@@ -547,15 +564,10 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u
     const child_libz_caps = caps.PfCap{
         .move = false,
         .r = true,
-        // libz carries a writable scratch buffer (`stack_vreg_buf` in
-        // libz/syscall_x64.zig + the `_arm` twin) that the slow-path
-        // syscall wrappers @memset on every >11-vreg call. Without `w`
-        // the child's mapPf intersects (cur_rwx ∩ pf_rwx) down to R+X
-        // and the first such syscall (e.g. perfmon_read_05) faults
-        // inside @memset. See start.zig for the structural-fix caveat
-        // (libz pf is shared across all test domains, so writable libz
-        // .bss aliases across ECs).
-        .w = true,
+        // x86 still uses a shared .bss scratch window for high-vreg
+        // syscalls. aarch64 uses caller-stack storage instead, so keep
+        // the shared libz image non-writable there.
+        .w = builtin.target.cpu.arch == .x86_64,
         .x = true,
     };
     // Per §[create_capability_domain] passed-handle entry encoding
@@ -679,9 +691,11 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u
     );
 
     if (lib.testing.isHandleError(r.v1)) {
-        serial.print("[runner] spawn FAILED (");
+        serial.print("[runner] spawn FAILED ");
+        serial.printU64(index);
+        serial.print(":");
         serial.print(entry.name);
-        serial.print(")\n");
+        serial.print("\n");
         // Even on failure, drop the per-spawn ELF page_frame handle the
         // runner staged in its own table — otherwise the runner's 4096
         // handle slots fill up over many reps and the next spawn loop
@@ -705,6 +719,15 @@ fn spawnOne(entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = pf_handle });
     const idc_slot: caps.HandleId = @truncate(r.v1 & 0xFFF);
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = idc_slot });
+    if (embedded_tests.runner_diag) {
+        serial.print("[runner] spawn ");
+        serial.printU64(index);
+        serial.print(":");
+        serial.print(entry.name);
+        serial.print(" aff=0x");
+        serial.printHex(affinity);
+        serial.print("\n");
+    }
     return true;
 }
 
@@ -841,6 +864,71 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
     return pf_handle;
 }
 
+fn decodeEvent(got: syscall.RecvReturn) EventFields {
+    return .{
+        .recv_status = got.regs.v1,
+        .pair_count = (got.word >> 12) & 0xFF,
+        .tstart = (got.word >> 20) & 0xFFF,
+        .reply_handle_id = @truncate((got.word >> 32) & 0xFFF),
+        .event_type = got.word >> 44,
+        .result_code = @enumFromInt(got.regs.v3),
+        .assertion_id = got.regs.v4,
+        .tag = got.regs.v5,
+    };
+}
+
+fn drainProbeEvent(kind: []const u8, ordinal: usize, got: syscall.RecvReturn) void {
+    const event = decodeEvent(got);
+    if (embedded_tests.runner_diag) {
+        serial.print("[runner]   probe ");
+        serial.print(kind);
+        serial.print(" #");
+        serial.printU64(ordinal);
+        serial.print(" recv_v1=");
+        serial.printU64(event.recv_status);
+        serial.print(" word=0x");
+        serial.printHex(got.word);
+        serial.print(" event=");
+        serial.printU64(event.event_type);
+        serial.print(" pairs=");
+        serial.printU64(event.pair_count);
+        serial.print(" tstart=");
+        serial.printU64(event.tstart);
+        serial.print(" reply=");
+        serial.printU64(event.reply_handle_id);
+        serial.print(" tag=0x");
+        serial.printHex(event.tag);
+        serial.print(" code=");
+        serial.printU64(@intFromEnum(event.result_code));
+        serial.print(" aid=");
+        serial.printU64(event.assertion_id);
+
+        if ((event.tag & TAG_MAGIC) != 0) {
+            const index = event.tag & TAG_INDEX_MASK;
+            if (index < TOTAL_TESTS) {
+                serial.print(" name=");
+                serial.print(embedded_tests.manifest[@intCast(index)].name);
+            }
+        }
+
+        serial.print(" -> probe-only");
+    }
+
+    if (event.reply_handle_id == 0) {
+        if (embedded_tests.runner_diag) {
+            serial.print(" reply=skip-zero-handle\n");
+        }
+        return;
+    }
+
+    const rr = syscall.reply(event.reply_handle_id);
+    if (embedded_tests.runner_diag) {
+        serial.print(" reply_v1=");
+        serial.printU64(rr.v1);
+        serial.print("\n");
+    }
+}
+
 // Writes the result for a tag into the table. Events whose tag does
 // not carry `TAG_MAGIC` are silently dropped — they come from
 // suspensions that landed on the result port outside of
@@ -850,8 +938,21 @@ fn stageElfIntoPageFrame(bytes: []const u8) caps.HandleId {
 // out-of-range check). Out-of-range real tags after stripping the
 // magic are dropped with a diagnostic so unexpected build/runtime
 // drift surfaces immediately.
-fn record(tag: u64, r: TestResult) void {
-    if ((tag & TAG_MAGIC) == 0) return;
+fn record(tag: u64, r: TestResult, reply_handle_id: caps.HandleId) bool {
+    if ((tag & TAG_MAGIC) == 0) {
+        if (embedded_tests.runner_diag) {
+            serial.print("[runner] deliver tag=0x");
+            serial.printHex(tag);
+            serial.print(" reply=");
+            serial.printU64(reply_handle_id);
+            serial.print(" code=");
+            serial.printU64(@intFromEnum(r.code));
+            serial.print(" aid=");
+            serial.printU64(r.assertion_id);
+            serial.print(" -> drop missing-magic\n");
+        }
+        return false;
+    }
     const index = tag & TAG_INDEX_MASK;
     if (index >= TOTAL_TESTS) {
         // Sentinel TAG = 0x7FFF (post-strip from 0xFFFF) lands here for
@@ -859,13 +960,44 @@ fn record(tag: u64, r: TestResult) void {
         // and then somehow ends up suspending on the result port. The
         // runner-internal primary uses the sentinel so we don't print
         // for it, but anything else gets a diagnostic.
-        if (index == TAG_INDEX_MASK) return;
-        serial.print("[runner] OOB tag=");
-        serial.printU64(index);
-        serial.print(" — dropping\n");
-        return;
+        if (index == TAG_INDEX_MASK) {
+            if (embedded_tests.runner_diag) {
+                serial.print("[runner] deliver tag=0x");
+                serial.printHex(tag);
+                serial.print(" reply=");
+                serial.printU64(reply_handle_id);
+                serial.print(" -> drop sentinel\n");
+            }
+            return false;
+        }
+        if (embedded_tests.runner_diag) {
+            serial.print("[runner] OOB tag=");
+            serial.printU64(index);
+            serial.print(" raw=0x");
+            serial.printHex(tag);
+            serial.print(" reply=");
+            serial.printU64(reply_handle_id);
+            serial.print(" -> drop\n");
+        }
+        return false;
     }
     results[@intCast(index)] = r;
+    if (embedded_tests.runner_diag) {
+        serial.print("[runner] deliver ");
+        serial.printU64(index);
+        serial.print(":");
+        serial.print(embedded_tests.manifest[@intCast(index)].name);
+        serial.print(" tag=0x");
+        serial.printHex(tag);
+        serial.print(" reply=");
+        serial.printU64(reply_handle_id);
+        serial.print(" code=");
+        serial.printU64(@intFromEnum(r.code));
+        serial.print(" aid=");
+        serial.printU64(r.assertion_id);
+        serial.print(" -> record\n");
+    }
+    return true;
 }
 
 const RunCounts = struct { pass: usize, fail: usize, miss: usize };

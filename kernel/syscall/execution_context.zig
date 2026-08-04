@@ -1,4 +1,5 @@
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
@@ -6,6 +7,7 @@ const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -34,6 +36,49 @@ const SELF_HANDLE_SLOT: u12 = 0;
 /// Reserved-bit mask for `new_priority` argument of `priority` syscall —
 /// only bits 0-1 are valid.
 const PRIORITY_ARG_MASK: u64 = 0b11;
+
+const YIELD_DIAG_BUDGET: u32 = 96;
+var yield_diag_prints: u32 = 0;
+
+fn diagTag(ec: *ExecutionContext) u64 {
+    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
+    return ec.domain.ptr.diag_test_tag;
+}
+
+fn logYieldDiag(
+    caller_ec: *ExecutionContext,
+    site: []const u8,
+    target: u64,
+    slot: u12,
+    got_type: u64,
+    ref_gen: u64,
+    current_word: u64,
+    state: u64,
+    mark_state: u64,
+    queue_core: u64,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &yield_diag_prints, .Add, 1, .monotonic);
+    if (n >= YIELD_DIAG_BUDGET) return;
+    arch.boot.print(
+        "[yielddiag] site={s} tag=0x{x} caller_cd=0x{x} caller_cd_gen={x} target={x} slot={x} got_type={x} ref_gen={x} obj_word=0x{x} live_gen={x} state={x} mark={x} qcore={x}\n",
+        .{
+            site,
+            diagTag(caller_ec),
+            @intFromPtr(caller_ec.domain.ptr),
+            caller_ec.domain.gen,
+            target,
+            slot,
+            got_type,
+            ref_gen,
+            current_word,
+            current_word >> 1,
+            state,
+            mark_state,
+            queue_core,
+        },
+    );
+}
 
 /// Creates a new execution context either in the caller's own domain or
 /// in a target domain referenced by an IDC handle.
@@ -434,14 +479,24 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
     }
 
     const cd_ref = ec.domain;
-    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const cd_lr = cd_ref.lockIrqSave(@src()) catch {
+        logYieldDiag(ec, "caller_domain_lock", target, 0, 0, cd_ref.gen, 0, 0, 0, execution_context.NOT_IN_RUN_QUEUE);
+        return errors.E_BADCAP;
+    };
     const cd = cd_lr.ptr;
     const slot: u12 = @truncate(target);
     const entry = capability.resolveHandleOnDomain(cd, slot, .execution_context) orelse {
+        const raw_entry = &cd.kernel_table[slot];
+        const got_type: u64 = if (raw_entry.ref.ptr == null or capability.isReservedHandleSlot(raw_entry))
+            0xffff
+        else
+            @intFromEnum(Word0.typeTag(cd.user_table[slot].word0));
+        logYieldDiag(ec, "target_lookup", target, slot, got_type, raw_entry.ref.gen, 0, 0, 0, execution_context.NOT_IN_RUN_QUEUE);
         cd_ref.unlockIrqRestore(cd_lr.irq_state);
         return errors.E_BADCAP;
     };
     const ref = capability.typedRef(ExecutionContext, entry.*) orelse {
+        logYieldDiag(ec, "target_typed_ref", target, slot, @intFromEnum(Word0.typeTag(cd.user_table[slot].word0)), entry.ref.gen, 0, 0, 0, execution_context.NOT_IN_RUN_QUEUE);
         cd_ref.unlockIrqRestore(cd_lr.irq_state);
         return errors.E_BADCAP;
     };
@@ -457,10 +512,22 @@ pub fn yield(caller: *anyopaque, target: u64) i64 {
 
     // Resolve the target EC pointer under its own gen lock just long
     // enough to hand it off — `yieldTo` consumes a stable pointer.
-    const target_lr = ref.lockIrqSave(@src()) catch return errors.E_TERM;
+    const target_lr = ref.lockIrqSave(@src()) catch {
+        logYieldDiag(ec, "target_lock_term", target, slot, @intFromEnum(capability.CapabilityType.execution_context), ref.gen, 0, 0, 0, execution_context.NOT_IN_RUN_QUEUE);
+        return errors.E_TERM;
+    };
     const target_ec = target_lr.ptr;
+    const target_state = lifecycle.load(target_ec);
+    if (target_state != .ready) {
+        logYieldDiag(ec, "target_not_ready", target, slot, @intFromEnum(capability.CapabilityType.execution_context), ref.gen, target_ec._gen_lock.word.load(.monotonic), @intFromEnum(target_state), target_ec.mark_state.load(.acquire), target_ec.current_queue_core.load(.acquire));
+    }
+    if (!lifecycle.pinLiveLocked(target_ec)) {
+        logYieldDiag(ec, "target_pin_term", target, slot, @intFromEnum(capability.CapabilityType.execution_context), ref.gen, target_ec._gen_lock.word.load(.monotonic), @intFromEnum(target_state), target_ec.mark_state.load(.acquire), target_ec.current_queue_core.load(.acquire));
+        ref.unlockIrqRestore(target_lr.irq_state);
+        return errors.E_TERM;
+    }
     ref.unlockIrqRestore(target_lr.irq_state);
-    scheduler.yieldTo(target_ec);
+    scheduler.yieldToPinned(target_ec);
     return 0;
 }
 

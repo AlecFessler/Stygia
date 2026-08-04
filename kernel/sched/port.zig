@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const arch_syscall = stygia.arch.dispatch.syscall;
@@ -34,6 +35,7 @@ const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
@@ -49,6 +51,50 @@ const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
 const Word0 = capability.Word0;
+const ROUTE_DIAG_BUDGET: u32 = 4096;
+
+var route_diag_prints: u32 = 0;
+
+fn diagTag(ec: *ExecutionContext) u64 {
+    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
+    return ec.domain.ptr.diag_test_tag;
+}
+
+fn logRouteDiag(
+    site: []const u8,
+    ec: *ExecutionContext,
+    event: EventType,
+    subcode: u8,
+    addr: u64,
+    route_gen: u64,
+    port_word: u64,
+    bind_raw: i32,
+    suspend_rc: i64,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &route_diag_prints, .Add, 1, .monotonic);
+    if (n >= ROUTE_DIAG_BUDGET) return;
+    arch.boot.print(
+        "[routediag] site={s} tag=0x{x} ec=0x{x} event={d} sub={d} addr=0x{x} route_gen={x} port_word=0x{x} port_gen={x} bind_raw={d} rc={d} state={x} wait={x} owner={x} qcore={x}\n",
+        .{
+            site,
+            diagTag(ec),
+            @intFromPtr(ec),
+            @intFromEnum(event),
+            subcode,
+            addr,
+            route_gen,
+            port_word,
+            port_word >> 1,
+            bind_raw,
+            suspend_rc,
+            @intFromEnum(lifecycle.load(ec)),
+            @intFromEnum(ec.wait.kind),
+            ec.owner_core,
+            ec.current_queue_core.load(.acquire),
+        },
+    );
+}
 
 // ── Timed recv waiters ───────────────────────────────────────────────
 //
@@ -134,6 +180,10 @@ pub fn expireTimedRecvWaiters() void {
         defer timed_recv_lock.unlockIrqRestore(irq);
         for (&timed_recv_waiters) |*slot| {
             const ec = slot.* orelse continue;
+            if (!lifecycle.tryPinLive(ec)) {
+                slot.* = null;
+                continue;
+            }
             // Cross-core terminate may have rotated this EC's slab gen
             // to even (freed) and left a stale entry here — `terminate`
             // / `destroyExecutionContextLocked` don't reach into this
@@ -142,10 +192,15 @@ pub fn expireTimedRecvWaiters() void {
             // tick.
             const gen = ec._gen_lock.currentGen();
             if (gen % 2 == 0) {
+                lifecycle.releasePin(ec);
                 slot.* = null;
                 continue;
             }
-            if (now_ns < ec.recv_deadline_ns) continue;
+            const deadline = ec.recv_deadline_ns;
+            if (now_ns < deadline) {
+                lifecycle.releasePin(ec);
+                continue;
+            }
             // caller-pinned: `ec` is pinned by the `timed_recv_waiters`
             // slot we just dequeued; capturing its current gen here
             // gives the phase-2 walk a stale-detector if the slot is
@@ -153,8 +208,9 @@ pub fn expireTimedRecvWaiters() void {
             // re-check below still catches the wake/re-wait race.
             expired[expired_count] = .{
                 .ec = SlabRef(ExecutionContext).init(ec, gen),
-                .deadline = ec.recv_deadline_ns,
+                .deadline = deadline,
             };
+            lifecycle.releasePin(ec);
             expired_count += 1;
             slot.* = null;
         }
@@ -166,13 +222,27 @@ pub fn expireTimedRecvWaiters() void {
         // unwinds the recv-waiter from its port queue. The deadline
         // check below catches a sender-wake / fresh-recv race.
         const ec = entry.ec.ptr;
+        if (!lifecycle.tryPinLive(ec)) continue;
+        if (ec._gen_lock.currentGen() != @as(u63, entry.ec.gen)) {
+            lifecycle.releasePin(ec);
+            continue;
+        }
         // Re-check deadline. If a sender wake ran between phases the
         // deadline is now 0; if the EC was woken and made a fresh recv
         // it'd be a different value. Either way this snapshot is stale.
-        if (ec.recv_deadline_ns != entry.deadline) continue;
+        if (ec.recv_deadline_ns != entry.deadline) {
+            lifecycle.releasePin(ec);
+            continue;
+        }
 
-        const port_ref = ec.suspend_port orelse continue;
-        const p = port_ref.lock(@src()) catch continue;
+        const port_ref = ec.suspend_port orelse {
+            lifecycle.releasePin(ec);
+            continue;
+        };
+        const p = port_ref.lock(@src()) catch {
+            lifecycle.releasePin(ec);
+            continue;
+        };
 
         // Remove from the port's receiver queue if still present.
         // (`waiters.remove` is a no-op if the EC was already dequeued
@@ -181,32 +251,29 @@ pub fn expireTimedRecvWaiters() void {
         if (removed and p.waiters.isEmpty()) p.waiter_kind = .none;
         port_ref.unlock();
 
-        if (!removed) continue;
+        if (!removed) {
+            lifecycle.releasePin(ec);
+            continue;
+        }
 
-        // EC has been removed from the wait queue; safe to wake.
-        while (ec.on_cpu.load(.acquire)) {
-            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-            // matching note on `scheduler.markReady`'s kstack barrier.
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            std.atomic.spinLoopHint();
+        const claim = lifecycle.beginWaitingClaimPinned(ec);
+        if (claim == .none) {
+            lifecycle.releasePin(ec);
+            continue;
         }
         ec.recv_deadline_ns = 0;
         ec.suspend_port = null;
         ec.event_type = .none;
-        // Claim the wake BEFORE stamping anything into `ec.ctx`. This is
-        // the timer half of a timed recv; the event half is a sender
-        // delivering on another core at this very moment. Both used to
-        // write `.ready` and enqueue unconditionally, which is how one
-        // EC ended up with a run-queue node on two cores and got resumed
-        // twice off a single saved frame. Losing is normal: the event
-        // arrived first, it owns the wake, and our E_TIMEOUT would be
-        // both a lie and a second writer into a frame the winner is
-        // already resuming.
-        if (!execution_context.tryClaimWake(ec, .suspended_on_port)) continue;
         // Stash E_TIMEOUT in the syscall return slot. The scheduler's
         // resume path restores the syscall-return register on iretq.
         arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
-        scheduler.enqueue(ec);
+        switch (claim) {
+            .claimed => scheduler.enqueue(ec),
+            .pended => lifecycle.publishPendedPayload(ec),
+            .none => unreachable,
+        }
+        lifecycle.unpin(ec);
+        lifecycle.releasePin(ec);
     }
 }
 
@@ -238,6 +305,8 @@ pub const ReplyCaps = packed struct(u16) {
     abandoned: bool = false,
     _reserved: u12 = 0,
 };
+
+const pending_port_ref_caps: u16 = @bitCast(PortCaps{ .recv = true });
 
 /// Names which side currently owns `Port.waiters`. A port can never
 /// hold both senders and receivers at once: if a sender arrives with
@@ -282,10 +351,10 @@ pub const Port = struct {
     /// `bind_refcount`; the cascade walk on `recv_refcount → 0`
     /// terminates each bound vCPU before the slab is freed. Mutated
     /// under `_gen_lock` only.
-    /// caller-pinned: every EC on this chain holds a `bind_refcount`
-    /// reference on `self`, and exactly mirrors the same pin running
-    /// the EC's slab slot — list membership keeps both ends alive.
-    vcpu_list_head: ?*ExecutionContext = null,
+    /// Each node is a `SlabRef(ExecutionContext)` stamped when the vCPU is
+    /// published, so port-cascade teardown destroys only the EC generation
+    /// that actually held the exit-port pin.
+    vcpu_list_head: ?SlabRef(ExecutionContext) = null,
 
     /// Wait queue, holding either suspended senders OR blocked receivers
     /// — never both. `waiter_kind` names which.
@@ -326,8 +395,297 @@ const PAIR_COUNT_SHIFT: u6 = 12;
 const TSTART_SHIFT: u6 = 20;
 const REPLY_HANDLE_SHIFT: u6 = 32;
 const EVENT_TYPE_SHIFT: u6 = 44;
+const REPORT_TAG_MAGIC: u64 = 0x8000;
+const REPORT_PRINT_BUDGET: u32 = 4096;
+var report_deliver_prints: u32 = 0;
+const NO_ROUTE_PRINT_BUDGET: u32 = 64;
+var no_route_prints: u32 = 0;
 
 // ── External API ─────────────────────────────────────────────────────
+
+fn hasContiguousFreeSlots(cd: *CapabilityDomain, n: u8) bool {
+    if (n == 0) return true;
+    if (cd.free_count < n) return false;
+    var run_len: u16 = 0;
+    var i: u16 = 3;
+    while (i < capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
+        if (cd.kernel_table[i].ref.ptr == null) {
+            run_len += 1;
+            if (run_len >= n) return true;
+        } else {
+            run_len = 0;
+        }
+    }
+    return false;
+}
+
+fn canFitReplyAndAttachments(cd: *CapabilityDomain, pair_count: u8) bool {
+    return cd.free_count >= 1 + @as(u32, pair_count) and
+        hasContiguousFreeSlots(cd, pair_count);
+}
+
+fn pinReceiver(receiver: *ExecutionContext) bool {
+    return lifecycle.pinLiveLocked(receiver);
+}
+
+fn publishReceiverAndUnpin(receiver: *ExecutionContext, claim: lifecycle.ClaimResult) void {
+    if (lifecycle.isDestroyMarked(receiver)) {
+        switch (claim) {
+            .claimed => {},
+            .pended => lifecycle.publishPendedPayload(receiver),
+            .none => unreachable,
+        }
+        lifecycle.unpin(receiver);
+        return;
+    }
+    switch (claim) {
+        .claimed => scheduler.enqueue(receiver),
+        .pended => lifecycle.publishPendedPayload(receiver),
+        .none => unreachable,
+    }
+    lifecycle.unpin(receiver);
+}
+
+fn publishFailedReceiverAndUnpin(receiver: *ExecutionContext, claim: lifecycle.ClaimResult, err: i64) void {
+    const target_ctx = receiver.iret_frame orelse receiver.ctx;
+    arch.syscall.setSyscallReturn(target_ctx, @bitCast(err));
+    publishReceiverAndUnpin(receiver, claim);
+}
+
+fn dropTempRecvRefLocked(p: *Port, irq_state: u64) void {
+    var result = decRecvRef(p);
+    if (!result.destroyed) {
+        p._gen_lock.unlockIrqRestore(irq_state);
+    } else {
+        arch.cpu.restoreInterrupts(irq_state);
+    }
+    finalizePendingVcpus(result.pending_vcpus);
+    finalizeClosedSenders(&result.pending_senders);
+}
+
+fn acquireHandleRefForCaps(entry: execution_context.PairEntryStashed, caps_word: u16) error{BadCap}!void {
+    switch (entry.obj_type) {
+        .page_frame => {
+            const pf: *stygia.memory.page_frame.PageFrame =
+                @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+            try stygia.memory.page_frame.incHandleRef(pf);
+        },
+        .timer => {
+            const t: *stygia.sched.timer.Timer =
+                @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+            try stygia.sched.timer.incHandleRef(t);
+        },
+        .port => {
+            const alias_ref = SlabRef(Port){
+                .ptr = @ptrCast(@alignCast(entry.obj_ref.ptr.?)),
+                .gen = entry.obj_ref.gen,
+                ._pad = entry.obj_ref._pad,
+            };
+            const alias_lr = alias_ref.lockIrqSave(@src()) catch return error.BadCap;
+            defer alias_ref.unlockIrqRestore(alias_lr.irq_state);
+            try onHandleAcquire(alias_lr.ptr, caps_word);
+        },
+        .device_region => {
+            const dr: *stygia.devices.device_region.DeviceRegion =
+                @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+            try stygia.devices.device_region.incHandleRef(dr);
+        },
+        else => {},
+    }
+}
+
+fn acquireTransferredHandleRef(entry: execution_context.PairEntryStashed, caps_word: u16) void {
+    acquireHandleRefForCaps(entry, caps_word) catch unreachable;
+}
+
+pub fn acquirePendingPairEntryRef(entry: execution_context.PairEntryStashed) error{BadCap}!void {
+    try acquireHandleRefForCaps(entry, entry.pending_ref_caps);
+}
+
+fn releaseHandleRefForCaps(entry: execution_context.PairEntryStashed, caps_word: u16, held_port: ?*Port) void {
+    switch (entry.obj_type) {
+        .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(entry.obj_ref.ptr.?))),
+        .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(entry.obj_ref.ptr.?))),
+        .port => {
+            const sp: *Port = @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+            if (held_port != null and held_port.? == sp) {
+                const result = onHandleRelease(sp, caps_word);
+                std.debug.assert(!result.destroyed);
+                std.debug.assert(result.pending_vcpus == null);
+            } else {
+                releaseHandle(sp, caps_word);
+            }
+        },
+        .device_region => {
+            const sdr: *stygia.devices.device_region.DeviceRegion =
+                @ptrCast(@alignCast(entry.obj_ref.ptr.?));
+            stygia.devices.device_region.releaseHandle(sdr);
+        },
+        else => {},
+    }
+}
+
+fn releasePendingPairEntryRef(entry: execution_context.PairEntryStashed, held_port: ?*Port) void {
+    releaseHandleRefForCaps(entry, entry.pending_ref_caps, held_port);
+}
+
+fn releasePendingPairEntriesMaybeHeldPort(ec: *ExecutionContext, held_port: ?*Port) void {
+    const count = ec.pending_pair_count;
+    ec.pending_pair_count = 0;
+    var k: u8 = 0;
+    while (k < count) : (k += 1) {
+        releasePendingPairEntryRef(ec.pending_pair_entries[k], held_port);
+    }
+}
+
+pub fn releasePendingPairEntries(ec: *ExecutionContext) void {
+    releasePendingPairEntriesMaybeHeldPort(ec, null);
+}
+
+pub fn pendingRefCapsForEntry(entry: execution_context.PairEntryStashed) u16 {
+    if (entry.obj_type == .port) return pending_port_ref_caps;
+    return entry.source_caps;
+}
+
+fn clearReplyTransferPendingAndReturn(caller: *ExecutionContext, err: i64) i64 {
+    releasePendingPairEntries(caller);
+    return err;
+}
+
+fn disarmSuspendDirectiveForFallback(target_ec: *ExecutionContext, arm_word: u32) bool {
+    if (!lifecycle.disarmDirectiveWord(target_ec, arm_word)) return false;
+    target_ec.directive_port = null;
+    target_ec.directive_owner = null;
+    target_ec.originating_write_cap = false;
+    target_ec.originating_read_cap = false;
+    return true;
+}
+
+fn waitForSuspendDirectiveFailure(target_ec: *ExecutionContext, failed_word: u32) ?i64 {
+    if (target_ec.directive_state.load(.acquire) != failed_word) return null;
+    const result = target_ec.directive_result.load(.acquire);
+    if (!lifecycle.clearFailedDirectiveWord(target_ec, failed_word)) return null;
+    return if (result != 0) result else errors.E_BUSY;
+}
+
+fn waitForSuspendDirective(
+    target_ref: SlabRef(ExecutionContext),
+    target_ec: *ExecutionContext,
+    port_ref: SlabRef(Port),
+    owner_slot: u24,
+) i64 {
+    const arm_word = lifecycle.packDirective(.armed, owner_slot);
+    const failed_word = lifecycle.packDirective(.failed, owner_slot);
+    var spins: u32 = 0;
+    while (true) {
+        var disarmed_not_running = false;
+        var fallback_suspend = false;
+        var fallback_owner: ?*ExecutionContext = null;
+        var fallback_write_cap = false;
+        var fallback_read_cap = false;
+
+        while (target_ec.directive_state.load(.acquire) == arm_word) {
+            const state = lifecycle.load(target_ec);
+            if (state != .running) {
+                if (state == .retired and disarmSuspendDirectiveForFallback(target_ec, arm_word)) {
+                    disarmed_not_running = true;
+                    break;
+                }
+                if (lifecycle.canSuspendTarget(target_ec)) {
+                    fallback_owner = target_ec.directive_owner;
+                    fallback_write_cap = target_ec.originating_write_cap;
+                    fallback_read_cap = target_ec.originating_read_cap;
+                    fallback_suspend = true;
+                    break;
+                }
+                continue;
+            }
+            spins +%= 1;
+            if ((spins & 1023) == 0) {
+                const owner_core = target_ec.owner_core;
+                if (owner_core < scheduler.MAX_CORES) {
+                    arch.smp.triggerSchedulerInterrupt(owner_core);
+                }
+            }
+            std.atomic.spinLoopHint();
+        }
+
+        if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+
+        const target_lr = target_ref.lockIrqSave(@src()) catch {
+            if (disarmSuspendDirectiveForFallback(target_ec, arm_word)) return errors.E_TERM;
+            if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+            return 0;
+        };
+        const final_state = lifecycle.load(target_lr.ptr);
+        target_ref.unlockIrqRestore(target_lr.irq_state);
+
+        if (disarmed_not_running) {
+            if (final_state == .retired) return errors.E_TERM;
+            return errors.E_INVAL;
+        }
+        if (final_state == .retired) {
+            if (disarmSuspendDirectiveForFallback(target_ec, arm_word)) return errors.E_TERM;
+            if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+            return 0;
+        }
+
+        const port_lr = port_ref.lockIrqSave(@src()) catch {
+            if (disarmSuspendDirectiveForFallback(target_ec, arm_word)) return errors.E_BADCAP;
+            if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+            return 0;
+        };
+        port_ref.unlockIrqRestore(port_lr.irq_state);
+
+        if (fallback_suspend) {
+            const owner = fallback_owner orelse {
+                if (disarmSuspendDirectiveForFallback(target_ec, arm_word)) return errors.E_BUSY;
+                if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+                return 0;
+            };
+            const port_lr2 = port_ref.lockIrqSave(@src()) catch {
+                if (disarmSuspendDirectiveForFallback(target_ec, arm_word)) return errors.E_BADCAP;
+                if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+                return 0;
+            };
+            const ret = execution_context.suspendOnPortWithPairHandoffDirectiveGen(
+                target_ec,
+                owner,
+                port_lr2.ptr,
+                .suspension,
+                0,
+                0,
+                fallback_write_cap,
+                fallback_read_cap,
+                port_lr2.irq_state,
+                target_ref.gen,
+                arm_word,
+            );
+            if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |failed_ret| return failed_ret;
+            if (ret == errors.E_BUSY and target_ec.directive_state.load(.acquire) != arm_word) {
+                if (lifecycle.isPortSuspended(target_ec)) return 0;
+                return errors.E_BUSY;
+            }
+            if ((ret == errors.E_INVAL or ret == errors.E_BUSY) and target_ec.directive_state.load(.acquire) == arm_word) {
+                const owner_core = target_ec.owner_core;
+                if (owner_core < scheduler.MAX_CORES) {
+                    arch.smp.triggerSchedulerInterrupt(owner_core);
+                }
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            if (ret != 0 and disarmSuspendDirectiveForFallback(target_ec, arm_word)) return ret;
+            if (ret != 0) {
+                if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |failed_ret| return failed_ret;
+            }
+            return ret;
+        }
+        if (lifecycle.isPortSuspended(target_ec)) return 0;
+        if (target_ec.directive_state.load(.acquire) == arm_word) continue;
+        if (waitForSuspendDirectiveFailure(target_ec, failed_word)) |ret| return ret;
+        return errors.E_BUSY;
+    }
+}
 
 /// `create_port` syscall handler. Spec §[port].create_port.
 ///
@@ -420,6 +778,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     };
     cd_ref.unlockIrqRestore(cd_irq_state);
 
+    if (!lifecycle.selfMarkSuspending(caller)) return errors.E_BUSY;
+    defer lifecycle.clearSelfDirective(caller);
+
     const tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const target_ec = tlr.ptr;
     const target_irq_state = tlr.irq_state;
@@ -427,7 +788,7 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
-    if (target_ec.state != .running and target_ec.state != .ready and target_ec.state != .idle_wait) {
+    if (!lifecycle.canSuspendTarget(target_ec)) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_INVAL;
     }
@@ -436,39 +797,69 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     // caller's domain in `validatePairEntries` and stashed on the
     // caller's EC. The actual move/copy at recv time runs against
     // the suspended EC (which is what `deliverEvent` sees), so we
-    // hand the stash off to the target before the suspension is
-    // committed. A self-suspend leaves the stash where it already
-    // lives.
-    if (target_ec != caller and caller.pending_pair_count > 0) {
-        target_ec.pending_pair_count = caller.pending_pair_count;
-        var k: usize = 0;
-        while (k < caller.pending_pair_count) {
-            target_ec.pending_pair_entries[k] = caller.pending_pair_entries[k];
-            k += 1;
+    // hand the stash off only after the target commits the remote
+    // directive into a real port suspension. A self-suspend leaves the
+    // stash where it already lives.
+    const target_state = lifecycle.load(target_ec);
+    if (target_ec != caller and target_state == .running) {
+        if (!lifecycle.tryPinLive(target_ec)) {
+            target_ref.unlockIrqRestore(target_irq_state);
+            return errors.E_INVAL;
         }
-        caller.pending_pair_count = 0;
+        const owner_slot_u32 = execution_context.slab_instance.indexOf(caller);
+        const owner_slot: u24 = @intCast(owner_slot_u32);
+        if (!lifecycle.claimRemoteSuspend(target_ec, owner_slot)) {
+            lifecycle.releasePin(target_ec);
+            target_ref.unlockIrqRestore(target_irq_state);
+            return errors.E_BUSY;
+        }
+        target_ec.directive_port = port_ref;
+        target_ec.directive_owner = caller;
+        target_ec.originating_write_cap = ec_caps.write;
+        target_ec.originating_read_cap = ec_caps.read;
+        if (!lifecycle.armRemoteSuspend(target_ec, owner_slot)) {
+            target_ec.directive_port = null;
+            target_ec.directive_owner = null;
+            target_ec.originating_write_cap = false;
+            target_ec.originating_read_cap = false;
+            lifecycle.releasePin(target_ec);
+            target_ref.unlockIrqRestore(target_irq_state);
+            return errors.E_BUSY;
+        }
+        const owner_core = target_ec.owner_core;
+        target_ref.unlockIrqRestore(target_irq_state);
+        if (owner_core < scheduler.MAX_CORES) {
+            arch.smp.triggerSchedulerInterrupt(owner_core);
+        }
+        const ret = waitForSuspendDirective(target_ref, target_ec, port_ref, owner_slot);
+        lifecycle.releasePin(target_ec);
+        return ret;
     }
-
+    const target_pinned = target_ec != caller;
+    if (target_pinned and !lifecycle.tryPinLive(target_ec)) {
+        target_ref.unlockIrqRestore(target_irq_state);
+        return errors.E_INVAL;
+    }
     target_ref.unlockIrqRestore(target_irq_state);
 
-    const plr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const plr = port_ref.lockIrqSave(@src()) catch {
+        if (target_pinned) lifecycle.releasePin(target_ec);
+        return errors.E_BADCAP;
+    };
     const p = plr.ptr;
-    // Re-validate target state under the port lock. Between the pre-port
-    // EC validation above and here, a concurrent `terminate` or
-    // `suspend(target=target_ec, ...)` from another core could have flipped
-    // the state to `.exited` or `.suspended_on_port`; without this check
-    // `suspendOnPort` trips the `assert(state ∈ {.running,.ready,.idle_wait})`
-    // at execution_context.zig:1339 and panics the kernel.
-    //
-    // Re-locking the EC's gen-lock here would invert the (Port → EC) order
-    // — the canonical kernel-wide order is EC → Port, established by
-    // bindEventRoute. Read the state without the EC lock: a torn read of
-    // the small enum is impossible (single-byte) and any post-check change
-    // is harmless: the suspend completes against a target that has just
-    // become `.exited` (the EC slab and kstack stay pinned by domain
-    // ownership; the target was already going to be unrunnable).
-    if (target_ec.state != .running and target_ec.state != .ready and target_ec.state != .idle_wait) {
+    // Re-validate target state under the destination port lock. If a
+    // remote ready target won a dispatch race after the EC-side check
+    // above, it must be handled by the directive path on its owner core;
+    // the generic suspend helper is allowed to park only this core's
+    // current running EC.
+    if (target_ec != caller and lifecycle.load(target_ec) == .running) {
         port_ref.unlockIrqRestore(plr.irq_state);
+        if (target_pinned) lifecycle.releasePin(target_ec);
+        return errors.E_BUSY;
+    }
+    if (!lifecycle.canSuspendTarget(target_ec)) {
+        port_ref.unlockIrqRestore(plr.irq_state);
+        if (target_pinned) lifecycle.releasePin(target_ec);
         return errors.E_INVAL;
     }
     // `suspendOnPort` releases the port lock before returning (directly
@@ -480,7 +871,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     // §[reply] tests 05/06) and so recv-time gates the suspended EC's
     // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
     // The caps were captured into `ec_caps` above under the domain lock.
-    return execution_context.suspendOnPort(target_ec, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, plr.irq_state);
+    const ret = execution_context.suspendOnPortWithPairHandoffGen(target_ec, caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, plr.irq_state, target_ref.gen);
+    if (target_pinned) lifecycle.releasePin(target_ec);
+    return ret;
 }
 
 /// `recv` syscall handler. Spec §[port].recv.
@@ -505,12 +898,20 @@ pub fn recv(caller: *ExecutionContext, port: u64, timeout_ns: u64) i64 {
     // freshly-minted slots belong to `caller`, who is right here in
     // this syscall and cannot race its own handles.
     var deferred: DeferredDerives = .{};
-    const ret = recvInner(caller, port, timeout_ns, &deferred);
+    var moves: DeferredMoveClears = .{};
+    const ret = recvInner(caller, port, timeout_ns, &deferred, &moves);
     deferred.run();
+    moves.run();
     return ret;
 }
 
-fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *DeferredDerives) i64 {
+fn recvInner(
+    caller: *ExecutionContext,
+    port: u64,
+    timeout_ns: u64,
+    deferred: *DeferredDerives,
+    moves: *DeferredMoveClears,
+) i64 {
     kprof.enter(.recv);
     defer kprof.exit(.recv);
     const cd_ref = caller.domain;
@@ -539,11 +940,10 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
         // the sender's resume state. (The check moved past the pop
         // because the slot count depends on the sender's stash, but
         // we reset and re-enqueue if we bail.)
-        const need: u32 = 1 + @as(u32, sender.pending_pair_count);
-        if (cd.free_count < need) {
+        if (!canFitReplyAndAttachments(cd, sender.pending_pair_count)) {
             // Re-enqueue: the sender was popped from the head; push
             // it back so a future recv can match it.
-            p.waiters.enqueue(sender);
+            p.waiters.enqueueFront(sender);
             p.waiter_kind = .senders;
             port_ref.unlockIrqRestore(port_irq_state);
             return errors.E_FULL;
@@ -564,7 +964,7 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         const port_xfer = port_caps_typed.xfer;
         port_ref.unlockIrqRestore(port_irq_state);
-        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer, deferred);
+        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer, deferred, moves);
     }
 
     // No sender ready. Spec §[recv] test 04: if the port has no
@@ -598,7 +998,13 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
     // `popHighest*` walk would then return that pointer (gen now odd
     // again from reallocation, state=.ready from the new owner) as a
     // phantom receiver.
+    const caller_core: u8 = @truncate(arch.smp.coreID());
+    if (!lifecycle.prepareRunningPark(caller, caller_core, .port_receiver)) {
+        port_ref.unlockIrqRestore(port_irq_state);
+        return errors.E_INVAL;
+    }
     caller.suspend_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
+    caller.wait.port = caller.suspend_port;
     caller.event_type = .none;
     enqueueReceiver(p, caller);
     // Spec §[reply]: cache the recv'ing port's xfer cap so the
@@ -610,7 +1016,6 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         caller.recv_port_xfer = port_caps_typed.xfer;
     }
-    caller.state = .suspended_on_port;
     caller.pending_reply_holder = null;
     caller.pending_reply_domain = null;
     caller.pending_reply_slot = 0;
@@ -634,17 +1039,6 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
 
     port_ref.unlockIrqRestore(port_irq_state);
 
-    const core_id: u8 = @truncate(arch.smp.coreID());
-    if (scheduler.coreCurrentIs(core_id, caller)) {
-        scheduler.clearCurrentEc(core_id);
-        // Defer the `on_cpu` release to the park-kstack hop — see the
-        // comment at the `.suspended_on_port` transition above.
-        scheduler.stashKstackRelease(core_id, caller);
-    } else {
-        // Not this core's current EC (fast-path fallback shapes) — the
-        // kstack is not ours, release immediately as before.
-        caller.on_cpu.store(false, .release);
-    }
     return 0;
 }
 
@@ -659,10 +1053,10 @@ fn recvInner(caller: *ExecutionContext, port: u64, timeout_ns: u64, deferred: *D
 /// of `port.recv` against the now-unlocked port. Slow-path recv sees
 /// `.senders`, pops the highest-priority sender, calls `deliverEvent`
 /// (mints reply handle, stages event_state in
-/// `caller.pending_event_word`), and returns; we then transition the
-/// caller from `.running` to `.ready` and enqueue it on this core's
-/// run queue so the asm's R14 swap to the original replyee can proceed
-/// while the caller awaits dispatch with the event ready to deliver.
+/// `caller.pending_event_word`), and returns; we then park the caller
+/// as a local requeue so the asm's R14 swap to the original replyee can
+/// proceed without publishing the caller `.ready` from its own kstack.
+/// The scheduler discharges that requeue on a later park-stack entry.
 ///
 /// The asm has already cleared the reply slot (R6) and resumed the
 /// replyee (R9/R10 sender state writes), so a true bail to the
@@ -684,19 +1078,16 @@ pub export fn replyAtomicRecvSendersFallback(
     _ = recv(caller, recv_port_handle, 0);
 
     // After recv:
-    //   - Rendezvous case: `caller.state == .running` (deliverEvent
+    //   - Rendezvous case: `caller` is still running (deliverEvent
     //     doesn't transition state — it expects the syscall epilogue
-    //     to handle the post-syscall flow). We need to enqueue the
-    //     caller as `.ready` so the next dispatch picks it up; the
-    //     asm's R14 swap to the original replyee dispatches a
-    //     different EC on this core, leaving the caller in the run
-    //     queue with `pending_event_word` ready to flush at iretq.
-    //   - Park case: `caller.state == .suspended_on_port` (recv
+    //     to handle the post-syscall flow). Defer a local requeue so
+    //     the asm's R14 swap to the original replyee dispatches a
+    //     different EC on this core before the caller becomes ready
+    //     with `pending_event_word` ready to flush at iretq.
+    //   - Park case: `caller` is parking (recv
     //     parked it on the port wait queue). Nothing more to do.
-    if (caller.state == .running) {
-        caller.state = .ready;
-        const calling_core: u8 = @truncate(arch.smp.coreID());
-        scheduler.enqueueOnCore(calling_core, caller);
+    if (lifecycle.load(caller) == .running) {
+        _ = scheduler.deferLocalRunningRequeue(caller);
     }
 }
 
@@ -786,13 +1177,15 @@ pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
 ///   2. Lock the resumed sender's domain (== `sender.domain`) and
 ///      reserve N contiguous slots via `allocContiguousFreeSlots`. On
 ///      failure, drop locks and return E_FULL with the reply handle
-///      still in the caller's table and the stash untouched (test 11).
+///      still in the caller's table (test 11), releasing the
+///      validation-time pending object refs.
 ///   3. With contiguous slots reserved, install each pair entry via
 ///      `mintHandleAt` at `[tstart, tstart+N)` in the sender's domain.
-///   4. Drop the sender's CD lock; re-acquire the caller's CD lock to
-///      clear `move == 1` source slots and free the reply slot. The
-///      reply handle is consumed last so test 11's "[1] is NOT
-///      consumed on E_FULL" stays observably true above.
+///   4. Drop the sender's CD lock; run derivation links and moved-source
+///      deletes through the original source domains with no CD lock
+///      held, then consume the reply slot. The reply handle is consumed
+///      last so test 11's "[1] is NOT consumed on E_FULL" stays
+///      observably true above.
 ///   5. Stage the §[event_state] return word (`pair_count`, `tstart`)
 ///      on the resumed sender's `pending_event_word` so the iretq
 ///      flush writes it to `[user_rsp + 0]` while CR3 is the sender's.
@@ -809,15 +1202,16 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // discipline observed by `terminate` (which holds CD across an EC
     // lock and so registers the order CD → EC with lockdep). Holding
     // CD across an EC acquire here would otherwise invert that.
-    const lr_phase1 = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const lr_phase1 = caller_cd_ref.lockIrqSave(@src()) catch
+        return clearReplyTransferPendingAndReturn(caller, errors.E_BADCAP);
     const cd_phase1 = lr_phase1.ptr;
     const entry = capability.resolveHandleOnDomain(cd_phase1, slot, .reply) orelse {
         caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
-        return errors.E_BADCAP;
+        return clearReplyTransferPendingAndReturn(caller, errors.E_BADCAP);
     };
     const sender_ref = capability.typedRef(ExecutionContext, entry.*) orelse {
         caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
-        return errors.E_BADCAP;
+        return clearReplyTransferPendingAndReturn(caller, errors.E_BADCAP);
     };
     // Spec §[terminate] test 07: a reply handle whose suspended sender
     // was destroyed via terminate carries the `abandoned` bit.
@@ -833,13 +1227,14 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         // sender was destroyed via `terminate`, and reply_transfer
         // surfaces that as E_TERM. The reply slot is consumed in
         // either case so subsequent ops don't loop on the same id.
-        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
+            return clearReplyTransferPendingAndReturn(caller, errors.E_TERM);
         const cd_clear = cd_clear_lr.ptr;
         if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
             capability.clearAndFreeSlot(cd_clear, slot, e);
         }
         caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
-        caller.pending_pair_count = 0;
+        releasePendingPairEntries(caller);
         return errors.E_TERM;
     }
 
@@ -851,13 +1246,14 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // released. Holding the EC lock here while taking the CD lock
     // would invert the kernel-wide CD → EC order.
     const sender_lr = sender_ref.lockIrqSave(@src()) catch {
-        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
+            return clearReplyTransferPendingAndReturn(caller, errors.E_TERM);
         const cd_clear = cd_clear_lr.ptr;
         if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
             capability.clearAndFreeSlot(cd_clear, slot, e);
         }
         caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
-        caller.pending_pair_count = 0;
+        releasePendingPairEntries(caller);
         return errors.E_TERM;
     };
     const sender = sender_lr.ptr;
@@ -871,13 +1267,16 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     // Phase 3 — sender's CD: reserve N contiguous slots and install
     // each pair entry. CD-at-a-time: caller's CD is unlocked here, no
     // other lock is held.
-    const sender_cd_lr = sender_cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const sender_cd_lr = sender_cd_ref.lockIrqSave(@src()) catch {
+        releasePendingPairEntries(caller);
+        return errors.E_BADCAP;
+    };
     const sender_cd = sender_cd_lr.ptr;
     const tstart = capability_domain.allocContiguousFreeSlots(sender_cd, n) catch {
         // Test 11: [1] is NOT consumed and the caller's table is
         // unchanged on E_FULL.
         sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
-        caller.pending_pair_count = 0;
+        releasePendingPairEntries(caller);
         return errors.E_FULL;
     };
 
@@ -892,6 +1291,7 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
             stash.caps & sender_idc_rx
         else
             stash.caps;
+        acquireTransferredHandleRef(stash, installed_caps);
         capability_domain.mintHandleAt(
             sender_cd,
             target_slot,
@@ -911,8 +1311,8 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
     // Spec §[capabilities].revoke: hang each new alias in the sender's
-    // domain under the source handle in the caller's (replier's)
-    // domain. Runs AFTER the sender-CD gen-lock dropped: `derive`
+    // domain under the source handle in its original holder domain.
+    // Runs AFTER the sender-CD gen-lock dropped: `derive`
     // takes `tree_mutex`, and the old in-loop call (with the CD held
     // via `held_dom`) was one half of a live AB-BA against the
     // domain-teardown tree walk — this core spinning on `tree_mutex`
@@ -925,10 +1325,13 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     k = 0;
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
-        const caller_dom_ref: capability.ErasedSlabRef = @bitCast(caller.domain);
-        _ = stygia.caps.derivation.derive(
-            caller_dom_ref,
+        _ = stygia.caps.derivation.deriveExpected(
+            stash.source_domain,
             stash.src_slot,
+            stash.obj_ref,
+            stash.obj_type,
+            stash.source_caps,
+            stash.source_instance,
             sender_dom_ref_for_derive,
             @intCast(@as(u16, tstart) + k),
         );
@@ -942,13 +1345,29 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
     const receiver_frame = caller.iret_frame orelse caller.ctx;
     const new_rip = arch.syscall.readUserVreg14(receiver_frame);
 
-    // Phase 4 — caller's CD: clear `move = 1` source slots and consume
-    // the reply slot. Same single-CD-at-a-time pattern.
+    k = 0;
+    while (k < n) : (k += 1) {
+        const stash = caller.pending_pair_entries[k];
+        if (!stash.move) continue;
+        _ = stygia.caps.derivation.deleteAndDetachExpected(
+            stash.source_domain,
+            stash.src_slot,
+            stash.obj_ref,
+            stash.obj_type,
+            stash.source_caps,
+            stash.source_instance,
+        );
+    }
+
+    // Phase 4 — caller's CD: consume the reply slot. Same
+    // single-CD-at-a-time pattern; moved source slots were consumed
+    // above through derivation.deleteAndDetachExpected so their
+    // children are reparented before the source is cleared.
     const cd_phase4_lr = caller_cd_ref.lockIrqSave(@src()) catch {
         // Caller's CD is gone mid-transfer. The sender-side install
         // already committed; resume the sender so the test EC's death
         // doesn't strand a parked sender forever.
-        caller.pending_pair_count = 0;
+        releasePendingPairEntries(caller);
         const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
         const sender2 = sender2_lr.ptr;
         defer sender_ref.unlockIrqRestore(sender2_lr.irq_state);
@@ -956,21 +1375,12 @@ pub fn replyTransfer(caller: *ExecutionContext, reply_handle: u64, n: u8) i64 {
         return errors.OK;
     };
     const cd_phase4 = cd_phase4_lr.ptr;
-    k = 0;
-    while (k < n) : (k += 1) {
-        const stash = caller.pending_pair_entries[k];
-        if (!stash.move) continue;
-        const src_slot = stash.src_slot;
-        if (capability.resolveHandleOnDomain(cd_phase4, src_slot, null)) |src_entry| {
-            capability.clearAndFreeSlot(cd_phase4, src_slot, src_entry);
-        }
-    }
     if (capability.resolveHandleOnDomain(cd_phase4, slot, .reply)) |reply_entry| {
         capability.clearAndFreeSlot(cd_phase4, slot, reply_entry);
     }
     caller_cd_ref.unlockIrqRestore(cd_phase4_lr.irq_state);
 
-    caller.pending_pair_count = 0;
+    releasePendingPairEntries(caller);
 
     // Phase 5 — sender's EC: stage the §[event_state] return word and
     // resume. Re-lock the sender; if the slab gen has moved between
@@ -1033,48 +1443,156 @@ fn deliverReplyTransferResume(
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
-/// Install `port` as `ec.event_routes[slot_idx]`, replacing any prior
-/// binding. Caller has already locked `ec` and `port` and validated caps.
-/// Bumps `port.bind_refcount` (routes contribute to bind-side
-/// liveness) and decrements the prior port's bind_refcount (if any)
-/// under their respective `_gen_lock`s. The new port's increment runs
-/// BEFORE the prior port's decrement so the rebind is observably
-/// monotonic to event firing.
-pub fn installEventRoute(ec: *ExecutionContext, port: *Port, slot_idx: u8) i64 {
-    // Inc on the new port first so a route-only-refcount window where
-    // the destination flips between (decremented prior, not-yet-inc'd
-    // new) cannot drive the new port's bind_refcount through 0 and
-    // close it before the bind even publishes. Caller already resolved
-    // `port` via SlabRef.lock so observed_zero would mean concurrent
-    // close-via-bind-drop is in flight; surface E_BADCAP.
-    incBindRef(port) catch return errors.E_BADCAP;
-    if (ec.event_routes[slot_idx]) |prior_ref| {
-        // Caller already holds `port._gen_lock` and `ec._gen_lock`. The
-        // prior port is a different slab slot; reach in to dec its route
-        // count without re-acquiring `port`'s lock. Tag the acquisition
-        // with `PORT_REROUTE_GROUP` so lockdep doesn't fire same-class
-        // overlap on the second `Port._gen_lock` — the caller is the
-        // sole writer of `ec.event_routes[slot_idx]` (it holds `ec`'s
-        // gen-lock) and never inverts the (new_port → prior_port)
-        // acquire order, so same-class detection here is a false
-        // positive.
-        if (prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src())) |prior_lr| {
-            decBindRef(prior_lr.ptr);
-            prior_ref.unlockIrqRestore(prior_lr.irq_state);
-        } else |_| {}
+/// Install `port_ref` as `ec.event_routes[slot_idx]`, replacing any
+/// prior binding. Caller has already locked `ec` and validated caps.
+/// This function acquires any involved Port locks itself so cross-port
+/// rebinds can use one global order instead of inheriting the caller's
+/// new-port-first order. The new port's increment runs BEFORE the prior
+/// port's decrement so the rebind is observably monotonic to event
+/// firing.
+pub fn installEventRoute(ec: *ExecutionContext, port_ref: SlabRef(Port), slot_idx: u8) i64 {
+    const prior_ref_opt = ec.event_routes[slot_idx];
+    if (prior_ref_opt) |prior_ref| {
+        if (prior_ref.eql(port_ref)) {
+            const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+            port_ref.unlockIrqRestore(lr.irq_state);
+            return 0;
+        }
     }
-    ec.event_routes[slot_idx] = SlabRef(Port).init(port, port._gen_lock.currentGen());
+
+    const prior_ref = prior_ref_opt orelse {
+        const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        return installEventRouteNewOnly(ec, port_ref, lr.ptr, lr.irq_state, slot_idx);
+    };
+
+    if (prior_ref.ptr == port_ref.ptr) {
+        const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        return installEventRouteNewOnly(ec, port_ref, lr.ptr, lr.irq_state, slot_idx);
+    }
+
+    // caller-pinned: address-order compare only. Neither route slot is
+    // dereferenced through these raw pointers; each object is accessed
+    // only after the matching SlabRef gen-lock acquire below succeeds.
+    const prior_first = @intFromPtr(prior_ref.ptr) < @intFromPtr(port_ref.ptr);
+    if (prior_first) {
+        const prior_lr = prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch {
+            const new_lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+            return installEventRouteNewOnly(ec, port_ref, new_lr.ptr, new_lr.irq_state, slot_idx);
+        };
+        const new_lr = port_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch {
+            prior_ref.unlockIrqRestore(prior_lr.irq_state);
+            return errors.E_BADCAP;
+        };
+        return installEventRouteBothLocked(
+            ec,
+            port_ref,
+            new_lr.ptr,
+            new_lr.irq_state,
+            prior_ref,
+            prior_lr.ptr,
+            prior_lr.irq_state,
+            slot_idx,
+            true,
+        );
+    }
+
+    const new_lr = port_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch return errors.E_BADCAP;
+    const prior_lr_opt = prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch null;
+    if (prior_lr_opt) |prior_lr| {
+        return installEventRouteBothLocked(
+            ec,
+            port_ref,
+            new_lr.ptr,
+            new_lr.irq_state,
+            prior_ref,
+            prior_lr.ptr,
+            prior_lr.irq_state,
+            slot_idx,
+            false,
+        );
+    }
+    return installEventRouteNewOnly(ec, port_ref, new_lr.ptr, new_lr.irq_state, slot_idx);
+}
+
+fn installEventRouteNewOnly(
+    ec: *ExecutionContext,
+    port_ref: SlabRef(Port),
+    port_ptr: *Port,
+    irq_state: u64,
+    slot_idx: u8,
+) i64 {
+    incBindRef(port_ptr) catch {
+        logRouteDiag(
+            "install_inc_bind_ref",
+            ec,
+            .memory_fault,
+            slot_idx,
+            0,
+            port_ref.gen,
+            port_ptr._gen_lock.word.load(.monotonic),
+            @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire),
+            errors.E_BADCAP,
+        );
+        port_ref.unlockIrqRestore(irq_state);
+        return errors.E_BADCAP;
+    };
+    ec.event_routes[slot_idx] = port_ref;
+    port_ref.unlockIrqRestore(irq_state);
     return 0;
 }
 
-/// `Port._gen_lock` ordered_group used by `installEventRoute` when it
-/// acquires a *prior* route's port lock while already holding the
-/// *new* route's port lock. The caller (bind_event_route) is the
-/// sole writer of `ec.event_routes[slot_idx]` and never inverts the
-/// (new_port → prior_port) acquire order, so the same-class lockdep
-/// panic on the second `Port._gen_lock` is a false positive. Caller
-/// discipline: the ordered acquire is always made *while holding*
-/// `port._gen_lock` for the new route, never standalone.
+fn installEventRouteBothLocked(
+    ec: *ExecutionContext,
+    port_ref: SlabRef(Port),
+    port_ptr: *Port,
+    port_irq_state: u64,
+    prior_ref: SlabRef(Port),
+    prior_ptr: *Port,
+    prior_irq_state: u64,
+    slot_idx: u8,
+    prior_first: bool,
+) i64 {
+    incBindRef(port_ptr) catch {
+        logRouteDiag(
+            "install_inc_bind_ref",
+            ec,
+            .memory_fault,
+            slot_idx,
+            0,
+            port_ref.gen,
+            port_ptr._gen_lock.word.load(.monotonic),
+            @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire),
+            errors.E_BADCAP,
+        );
+        unlockEventRouteBoth(port_ref, port_irq_state, prior_ref, prior_irq_state, prior_first);
+        return errors.E_BADCAP;
+    };
+    decBindRef(prior_ptr);
+    ec.event_routes[slot_idx] = port_ref;
+    unlockEventRouteBoth(port_ref, port_irq_state, prior_ref, prior_irq_state, prior_first);
+    return 0;
+}
+
+fn unlockEventRouteBoth(
+    port_ref: SlabRef(Port),
+    port_irq_state: u64,
+    prior_ref: SlabRef(Port),
+    prior_irq_state: u64,
+    prior_first: bool,
+) void {
+    if (prior_first) {
+        port_ref.unlockIrqRestore(port_irq_state);
+        prior_ref.unlockIrqRestore(prior_irq_state);
+    } else {
+        prior_ref.unlockIrqRestore(prior_irq_state);
+        port_ref.unlockIrqRestore(port_irq_state);
+    }
+}
+
+/// `Port._gen_lock` ordered_group used when `installEventRoute`
+/// acquires two distinct route destination ports. The function orders
+/// by slab-slot address before acquiring either lock, so two ECs
+/// swapping A→B and B→A both take the same A-then-B order.
 const PORT_REROUTE_GROUP: u32 = 0x504F; // "PO"
 
 /// Remove the binding at `ec.event_routes[slot_idx]`. Caller has already
@@ -1116,6 +1634,9 @@ pub const NoRouteReason = enum(u8) {
     /// slab generation: the Port was freed (and possibly recycled)
     /// between `bind_event_route` and the fault.
     port_stale,
+    /// A route and live Port existed, but the EC could not be suspended
+    /// onto it. This is a lifecycle rejection, not a missing binding.
+    suspend_failed,
 };
 
 pub const NoRouteInfo = struct {
@@ -1125,6 +1646,12 @@ pub const NoRouteInfo = struct {
     /// The Port gen-lock word as observed at fault time (`port_stale`
     /// only). Bit 0 is the lock bit; `word >> 1` is the live gen.
     current_word: u64 = 0,
+    /// Return code from `suspendOnPort` (`suspend_failed` only).
+    suspend_rc: i64 = 0,
+    /// Faulting EC lifecycle state observed after `suspendOnPort`.
+    ec_state: lifecycle.State = .retired,
+    /// Faulting EC wait kind observed after `suspendOnPort`.
+    wait_kind: lifecycle.WaitKind = .none,
 };
 
 fn fireRouted(
@@ -1136,6 +1663,7 @@ fn fireRouted(
 ) bool {
     const slot_idx = execution_context.eventRouteSlot(event) orelse {
         info.* = .{ .reason = .no_slot };
+        logRouteDiag("no_slot", ec, event, subcode, addr, 0, 0, 0, errors.E_NOENT);
         return false;
     };
     // Snapshot `ec.event_routes[slot_idx]` under `ec._gen_lock` — the
@@ -1151,14 +1679,16 @@ fn fireRouted(
     ec._gen_lock.unlockIrqRestore(ec_irq);
     const route_ref = route_ref_opt orelse {
         info.* = .{ .reason = .unbound };
+        logRouteDiag("unbound", ec, event, subcode, addr, 0, 0, 0, errors.E_NOENT);
         return false;
     };
     const route_lr = route_ref.lockIrqSave(@src()) catch {
         info.* = .{
             .reason = .port_stale,
             .expected_gen = route_ref.gen,
-            .current_word = route_ref.ptr._gen_lock.word.load(.monotonic),
+            .current_word = 0,
         };
+        logRouteDiag("port_stale", ec, event, subcode, addr, route_ref.gen, 0, 0, errors.E_BADCAP);
         return false;
     };
     const port_ptr = route_lr.ptr;
@@ -1181,7 +1711,22 @@ fn fireRouted(
     // §[suspend] test 10 only zeroes the payload when the originating
     // handle explicitly lacks `read`, which the bind_event_route path
     // would record once plumbed through.
-    _ = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true, route_lr.irq_state);
+    const port_word_before = port_ptr._gen_lock.word.load(.monotonic);
+    const bind_raw_before = @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire);
+    logRouteDiag("route_locked", ec, event, subcode, addr, route_ref.gen, port_word_before, bind_raw_before, 0);
+    const suspend_rc = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true, route_lr.irq_state);
+    logRouteDiag("suspend_result", ec, event, subcode, addr, route_ref.gen, port_word_before, bind_raw_before, suspend_rc);
+    if (suspend_rc != 0) {
+        info.* = .{
+            .reason = .suspend_failed,
+            .expected_gen = route_ref.gen,
+            .current_word = port_word_before,
+            .suspend_rc = suspend_rc,
+            .ec_state = lifecycle.load(ec),
+            .wait_kind = ec.wait.kind,
+        };
+        return false;
+    }
     return true;
 }
 
@@ -1228,10 +1773,15 @@ fn fireRouted(
 fn reportNoRouteFault(
     ec: *ExecutionContext,
     kind: []const u8,
+    terminal_reason: []const u8,
     subcode: u8,
     payload: u64,
     info: NoRouteInfo,
 ) void {
+    execution_context.printPreReportTerminal(ec, null, terminal_reason);
+    const n = @atomicRmw(u32, &no_route_prints, .Add, 1, .monotonic);
+    if (n >= NO_ROUTE_PRINT_BUDGET) return;
+
     arch.boot.printRaw("[NOROUTE] ");
     arch.boot.printRaw(kind);
     arch.boot.printRaw(" ec=0x");
@@ -1240,6 +1790,11 @@ fn reportNoRouteFault(
     printHex64(subcode);
     arch.boot.printRaw(" payload=0x");
     printHex64(payload);
+    const maybe_tag = arch_syscall.getEventStateGprs(ec.ctx)[4];
+    if ((maybe_tag & REPORT_TAG_MAGIC) != 0) {
+        arch.boot.printRaw(" tag=0x");
+        printHex64(maybe_tag);
+    }
     // Which of the three no-route conditions fired. `port_stale` means
     // the domain DID bind a route and the kernel dropped the event
     // anyway — a kernel bug, not a userspace omission.
@@ -1248,6 +1803,7 @@ fn reportNoRouteFault(
         .no_slot => "no_slot",
         .unbound => "unbound",
         .port_stale => "port_stale",
+        .suspend_failed => "suspend_failed",
     });
     if (info.reason == .port_stale) {
         arch.boot.printRaw(" bound_gen=");
@@ -1258,7 +1814,19 @@ fn reportNoRouteFault(
         printHex64(info.current_word >> 1);
         arch.boot.printRaw(")");
     }
-    arch.boot.printRaw(" — EC parked, result (if any) will never be delivered\n");
+    if (info.reason == .suspend_failed) {
+        arch.boot.printRaw(" suspend_rc=");
+        printHex64(@bitCast(info.suspend_rc));
+        arch.boot.printRaw(" bound_gen=");
+        printHex64(info.expected_gen);
+        arch.boot.printRaw(" port_word=0x");
+        printHex64(info.current_word);
+        arch.boot.printRaw(" ec_state=");
+        printHex64(@intFromEnum(info.ec_state));
+        arch.boot.printRaw(" wait=");
+        printHex64(@intFromEnum(info.wait_kind));
+    }
+    arch.boot.printRaw(" -- EC parked, result (if any) will never be delivered\n");
 
     // TEMP DIAGNOSTIC (stygia-idc, REMOVE). The bare-metal cap is a
     // single recurring no-route memory_fault (`subcode=0 payload=0x10`,
@@ -1319,11 +1887,11 @@ fn reportNoRouteFault(
     arch.boot.printRaw("..0x");
     printHex64(ec.kernel_stack.top.addr);
     arch.boot.printRaw(" state=");
-    printHex64(@intFromEnum(ec.state));
-    arch.boot.printRaw(" last_disp=");
-    printHex64(ec.last_dispatched_core);
-    arch.boot.printRaw(" oncpu=");
-    printHex64(@intFromBool(ec.on_cpu.load(.monotonic)));
+    printHex64(@intFromEnum(lifecycle.load(ec)));
+    arch.boot.printRaw(" owner=");
+    printHex64(ec.owner_core);
+    arch.boot.printRaw(" wait=");
+    printHex64(@intFromEnum(ec.wait.kind));
     arch.boot.printRaw("\n");
     if (st.live_ctx) |lc| {
         if (@intFromPtr(lc) != @intFromPtr(ec.ctx)) {
@@ -1351,67 +1919,30 @@ fn printHex64(n: u64) void {
     arch.boot.printRaw(buf[i..]);
 }
 
+fn maybePrintReportDelivered(sender: *ExecutionContext, receiver: *ExecutionContext, reply_slot: u12) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const tag = sender.event_state_gprs[4];
+    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+    const n = @atomicRmw(u32, &report_deliver_prints, .Add, 1, .monotonic);
+    if (n >= REPORT_PRINT_BUDGET) return;
+    arch.boot.print(
+        "[rpt-deliver] sender=0x{x} receiver=0x{x} tag=0x{x} reply={x}\n",
+        .{ @intFromPtr(sender), @intFromPtr(receiver), tag, reply_slot },
+    );
+}
+
+fn queueFaultDomainTeardown(ec: *ExecutionContext, kind: scheduler.TeardownKind) void {
+    scheduler.queueCurrentTeardown(.{ .kind = kind, .cd = ec.domain });
+    execution_context.parkSelfFaulted(ec);
+    if (scheduler.currentEc() == ec) scheduler.hopParkRun();
+}
+
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
     var info: NoRouteInfo = .{};
     if (fireRouted(ec, .memory_fault, subcode, fault_addr, &info)) return;
-    reportNoRouteFault(ec, "memory_fault", subcode, fault_addr, info);
+    reportNoRouteFault(ec, "memory_fault", "no_route_memory_fault", subcode, fault_addr, info);
 
-    // No-route destroy. Park the EC first so it leaves the dispatch
-    // queue, then run the standard CD self-destruct via `releaseSelf`.
-    // `releaseSelf` calls `parkSelfFaulted` internally as well, but
-    // only on `currentEc()` — guard for the rare path that fires
-    // memory_fault on an EC that isn't this core's current_ec (e.g.
-    // a cross-core synthetic-fault handler). For the common case
-    // this is a no-op since `releaseSelf` will park it.
-    const cd_ref = ec.domain;
-    // Acquire tree_mutex BEFORE the CD gen-lock, mirroring the
-    // `delete(SLOT_SELF)` path (caps.derivation.deleteAndDetach slot==0
-    // arm) EXACTLY — the previous version took the CD lock first and
-    // tree_mutex second, which is the `CD → tree_mutex` inversion that
-    // deadlocks against every tree walk holding `tree_mutex` while
-    // blocking-acquiring third-party CD locks (see the order contract
-    // on `caps.derivation.tree_mutex`). Tag with `TREE_MUTEX_GROUP`
-    // for symmetry with every other tree_mutex acquisition —
-    // mismatched ordered-group tags on the same lock would still
-    // register a phantom edge in cycle detection.
-    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(@src(), stygia.caps.derivation.TREE_MUTEX_GROUP);
-
-    // Tag the CD acquire with `TREE_DOMAIN_GROUP` so the
-    // `destroyPhase1`-driven `detachDyingDomainFromTree` walk (which
-    // re-locks cross-domain CDs under the same group inside
-    // `lockEntrySkip`) does not trip lockdep's same-class overlap
-    // check. Mirrors the SLOT_SELF arm of
-    // `caps.derivation.deleteAndDetach` and
-    // `caps.capability_domain.cleanupPartiallyCreatedCd`.
-    const cd_lr = cd_ref.lockOrderedIrqSave(stygia.caps.derivation.TREE_DOMAIN_GROUP, @src()) catch {
-        // CD slab gen has moved — domain is already being torn down by
-        // another path. Parking alone used to rely on "the in-flight
-        // teardown will reap it", which only holds if that teardown's
-        // EC walk has not already passed this EC. When it has, the EC
-        // is orphaned forever (stygia-2u0; see the longer note on the
-        // thread-fault no-route fallback below). Destroy it explicitly
-        // instead — `destroyExecutionContextLocked` early-returns on an
-        // already-even gen, so racing the teardown is harmless, and a
-        // teardown walk that arrives later skips it for the same
-        // reason.
-        stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
-        execution_context.parkSelfFaulted(ec);
-        execution_context.destroyExecutionContextLocked(ec, null);
-        return;
-    };
-    const cd = cd_lr.ptr;
-    const cd_irq_state = cd_lr.irq_state;
-
-    // `releaseSelf` releases `cd._gen_lock` via `destroyLocked`
-    // before returning; we restore the captured IRQ state manually
-    // because the standard `unlockIrqRestore` would assert on the
-    // already-cleared lock bit.
-    const deferred = capability_domain.releaseSelf(cd);
-    arch.cpu.restoreInterrupts(cd_irq_state);
-
-    stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
-
-    capability_domain.destroyPhase2(deferred);
+    queueFaultDomainTeardown(ec, .no_route_fault);
 }
 
 /// Fire a thread_fault event. Fallback on no route: park the EC so the
@@ -1419,42 +1950,8 @@ pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void
 pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
     var info: NoRouteInfo = .{};
     if (fireRouted(ec, .thread_fault, subcode, payload, &info)) return;
-    reportNoRouteFault(ec, "thread_fault", subcode, payload, info);
-    // No-route fallback. Earlier this called `execution_context.terminate(
-    // ec, 0)`, but `terminate(caller, target)` resolves `target` as a
-    // handle in the caller's table — slot 0 is the SELF capability_domain
-    // handle, so resolution as `.execution_context` always returned
-    // E_BADCAP. The faulting EC was then iretq'd back onto the same RIP,
-    // faulted again, and (when higher-priority than its peers) starved
-    // every other EC in the domain.
-    //
-    // Park, THEN hand the EC to the standard deferred-destroy path.
-    //
-    // `parkSelfFaulted` clears the local core's `current_ec`, marks
-    // state `.exited` so the scheduler stops re-enqueueing it, and
-    // clears `on_cpu` so the reaper will accept it. What it does NOT do
-    // is bump the gen, post a zombie, or finalize — so on its own it
-    // leaves the EC alive-but-unreachable and delegates reclamation to
-    // "the owning domain is torn down". That delegation is an
-    // assumption, not a mechanism: if the domain's teardown has already
-    // run, or never runs, the EC is orphaned permanently — odd gen,
-    // `.exited`, off every queue, in no `pending_zombie` column, matched
-    // by no reap path. Measured at ~8 leaked ECs per suite pass, which
-    // is what degrades a repeat run to zero delivered results by pass
-    // ~11 (stygia-2u0); a per-state EC census showed `exited` climbing
-    // 7 → 73 while every other state stayed flat, with `pz_occupied`
-    // pinned at 0 proving they were never posted at all.
-    //
-    // `destroyExecutionContextLocked` is the same primitive
-    // `destroyPhase2` uses for the destroying domain's own caller EC,
-    // and it is safe to call while standing on the EC's kstack: it
-    // posts a zombie rather than freeing inline, and both
-    // `takeOwnPendingZombie` and the arch reap loops refuse to finalize
-    // an EC whose kstack contains the current `rsp`. `null` for
-    // `caller_cd` because no domain is being torn down here, so a
-    // pending reply must be ABANDONED rather than silently dropped.
-    execution_context.parkSelfFaulted(ec);
-    execution_context.destroyExecutionContextLocked(ec, null);
+    reportNoRouteFault(ec, "thread_fault", "no_route_thread_fault", subcode, payload, info);
+    queueFaultDomainTeardown(ec, .no_route_fault);
 }
 
 /// Fire a breakpoint event. Fallback: drop, advance past trap, resume.
@@ -1535,15 +2032,20 @@ fn destroyPort(p: *Port) void {
 /// the destroy walk under `p._gen_lock` self-deadlocks. Even routes that
 /// don't loop back create lock-order inversions vs. paths that go
 /// EC-lock-first. Detach under the lock; finalize after release.
-fn cascadeDetachVcpus(p: *Port) ?*ExecutionContext {
-    var head: ?*ExecutionContext = null;
+fn cascadeDetachVcpus(p: *Port) ?SlabRef(ExecutionContext) {
+    var head: ?SlabRef(ExecutionContext) = null;
     var cur = p.vcpu_list_head;
     p.vcpu_list_head = null;
-    while (cur) |ec| {
+    while (cur) |ec_ref| {
+        const ec = ec_ref.ptr;
         const next = ec.vcpu_list_next;
         ec.exit_port = null;
-        ec.vcpu_list_next = head;
-        head = ec;
+        if (lifecycle.tryPinLive(ec)) {
+            ec.vcpu_list_next = head;
+            head = ec_ref;
+        } else {
+            ec.vcpu_list_next = null;
+        }
         cur = next;
     }
     return head;
@@ -1552,17 +2054,23 @@ fn cascadeDetachVcpus(p: *Port) ?*ExecutionContext {
 /// Walk the snapshot returned by `cascadeDetachVcpus` and destroy each
 /// EC. Callers MUST have released `p._gen_lock` (and `p` itself may
 /// already be freed) before invoking this — the snapshot only carries
-/// EC pointers, not the port pointer.
-pub fn finalizePendingVcpus(head: ?*ExecutionContext) void {
+/// EC refs, not the port pointer.
+pub fn finalizePendingVcpus(head: ?SlabRef(ExecutionContext)) void {
     var cur = head;
-    while (cur) |ec| {
+    while (cur) |ec_ref| {
+        const ec = ec_ref.ptr;
         const next = ec.vcpu_list_next;
         ec.vcpu_list_next = null;
-        // caller-pinned: each EC on this detached snapshot holds the
-        // pre-cascade `bind_refcount` contribution and is not yet on
-        // any other reachability path, so its slab slot can't be
-        // reaped before this destroy completes.
-        execution_context.destroyExecutionContextLocked(ec, ec.domain.ptr);
+        // `cascadeDetachVcpus` took a lifecycle pin before publishing this
+        // node into the detached chain. Release it before destruction so
+        // `destroyExecutionContextRefLocked` can drain pins, but destroy
+        // through the captured SlabRef so a stale/recycled EC slot is
+        // rejected by the gen-lock.
+        lifecycle.releasePin(ec);
+        // Port-cascade teardown is not domain teardown: the vCPU's domain is
+        // still live, so pending replies must be abandoned through the normal
+        // live-domain path instead of the same-CD teardown shortcut.
+        execution_context.destroyExecutionContextRefLocked(ec_ref, null);
         cur = next;
     }
 }
@@ -1576,12 +2084,15 @@ pub fn finalizePendingVcpus(head: ?*ExecutionContext) void {
 /// `finalizePendingVcpus(pending_vcpus)` to complete the cascade.
 pub const DecResult = struct {
     destroyed: bool,
-    /// caller-pinned: snapshot head detached under `p._gen_lock` from
-    /// `p.vcpu_list_head`; each EC on the chain still holds a kernel
-    /// reference (the pre-cascade `bind_refcount` contribution) until
-    /// `finalizePendingVcpus` destroys it, so the slab slots stay live
-    /// for the duration of the post-lock-release walk.
-    pending_vcpus: ?*ExecutionContext,
+    /// Snapshot head detached under `p._gen_lock` from `p.vcpu_list_head`.
+    /// Each node is a generation-stamped EC ref, and `cascadeDetachVcpus`
+    /// holds one lifecycle pin per pending node until
+    /// `finalizePendingVcpus` consumes it.
+    pending_vcpus: ?SlabRef(ExecutionContext),
+    /// Sender waiters detached under the closing port lock. They are
+    /// completed after the port lock drops so releasing stashed
+    /// attachments cannot nest arbitrary cross-port port locks.
+    pending_senders: EcQueue = .{},
 };
 
 /// Refcount adjusters. Each `inc*` returns `error.BadCap` when it
@@ -1619,7 +2130,8 @@ pub fn incRecvRef(p: *Port) error{BadCap}!void {
 pub fn decRecvRef(p: *Port) DecResult {
     const result = p.recv_refcount.dec();
     if (result == .observed_zero) {
-        propagateClosedToSenders(p);
+        var pending_senders: EcQueue = .{};
+        detachClosedSenders(p, &pending_senders);
         // A blocked recv whose handle was deleted while parked sees
         // its port die from underneath it. Wake with E_CLOSED so the
         // EC doesn't sit on a stale waiter list past the slab's gen
@@ -1627,7 +2139,7 @@ pub fn decRecvRef(p: *Port) DecResult {
         propagateClosedToReceivers(p);
         const pending = cascadeDetachVcpus(p);
         destroyPort(p);
-        return .{ .destroyed = true, .pending_vcpus = pending };
+        return .{ .destroyed = true, .pending_vcpus = pending, .pending_senders = pending_senders };
     }
     return .{ .destroyed = false, .pending_vcpus = null };
 }
@@ -1680,7 +2192,8 @@ fn onHandleRelease(p: *Port, caps: u16) DecResult {
 
     if (bind_zero) propagateClosedToReceivers(p);
     if (recv_zero) {
-        propagateClosedToSenders(p);
+        var pending_senders: EcQueue = .{};
+        detachClosedSenders(p, &pending_senders);
         // A blocked recv whose handle was the same one being dropped
         // here observes E_CLOSED through the bind-side wake above; the
         // recv-side wake catches the rare race where a different
@@ -1689,7 +2202,7 @@ fn onHandleRelease(p: *Port, caps: u16) DecResult {
         if (!bind_zero) propagateClosedToReceivers(p);
         const pending = cascadeDetachVcpus(p);
         destroyPort(p);
-        return .{ .destroyed = true, .pending_vcpus = pending };
+        return .{ .destroyed = true, .pending_vcpus = pending, .pending_senders = pending_senders };
     }
     return .{ .destroyed = false, .pending_vcpus = null };
 }
@@ -1699,7 +2212,7 @@ fn onHandleRelease(p: *Port, caps: u16) DecResult {
 /// the cascade snapshot after `p._gen_lock` is released.
 pub fn releaseHandle(p: *Port, caps: u16) void {
     const irq_state = p._gen_lock.lockIrqSave(@src());
-    const result = onHandleRelease(p, caps);
+    var result = onHandleRelease(p, caps);
     // `destroyPort` released the lock via `destroyLocked` on teardown;
     // teardown bumps gen via setGenRelease without touching IRQ state,
     // so restore it explicitly. Otherwise `unlockIrqRestore` does both.
@@ -1709,6 +2222,7 @@ pub fn releaseHandle(p: *Port, caps: u16) void {
         arch.cpu.restoreInterrupts(irq_state);
     }
     finalizePendingVcpus(result.pending_vcpus);
+    finalizeClosedSenders(&result.pending_senders);
 }
 
 /// `releaseHandle` for callers that already hold `p._gen_lock`. The
@@ -1717,13 +2231,14 @@ pub fn releaseHandle(p: *Port, caps: u16) void {
 /// restoring IRQs. The vCPU finalize walk runs only AFTER the lock
 /// has been released.
 pub fn releaseHandleLocked(p: *Port, caps: u16, held_irq: u64) void {
-    const result = onHandleRelease(p, caps);
+    var result = onHandleRelease(p, caps);
     if (!result.destroyed) {
         p._gen_lock.unlockIrqRestore(held_irq);
     } else {
         arch.cpu.restoreInterrupts(held_irq);
     }
     finalizePendingVcpus(result.pending_vcpus);
+    finalizeClosedSenders(&result.pending_senders);
 }
 
 /// Wait queue ops — assert empty or matching kind, transition kind
@@ -1739,7 +2254,7 @@ fn popHighestPrioritySender(p: *Port) ?*ExecutionContext {
         if (p.waiters.isEmpty()) p.waiter_kind = .none;
         // Cross-core terminate may have left a dead EC parked here;
         // skip it so callers never resume an exited slot.
-        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        if (lifecycle.isDestroyMarked(ec) or lifecycle.load(ec) == .retired or ec._gen_lock.currentGen() % 2 == 0) continue;
         return ec;
     }
     return null;
@@ -1748,7 +2263,7 @@ fn popHighestPriorityReceiver(p: *Port) ?*ExecutionContext {
     if (p.waiter_kind != .receivers) return null;
     while (p.waiters.dequeue()) |ec| {
         if (p.waiters.isEmpty()) p.waiter_kind = .none;
-        if (ec.state == .exited or ec._gen_lock.currentGen() % 2 == 0) continue;
+        if (lifecycle.isDestroyMarked(ec) or lifecycle.load(ec) == .retired or ec._gen_lock.currentGen() % 2 == 0) continue;
         return ec;
     }
     return null;
@@ -1777,10 +2292,14 @@ fn popHighestPriorityReceiver(p: *Port) ?*ExecutionContext {
 /// `deliverEvent`'s mint loop deadlocked against the domain-teardown
 /// tree walk. `src_slots` is bounded by the pair-transfer stash size.
 pub const DeferredDerives = struct {
-    parent_dom: capability.ErasedSlabRef = .{ .ptr = null, .gen = 0 },
     child_dom: capability.ErasedSlabRef = .{ .ptr = null, .gen = 0 },
     tstart: u12 = 0,
     count: u8 = 0,
+    parent_doms: [execution_context.MAX_PAIR_ENTRIES_PER_EC]capability.ErasedSlabRef = undefined,
+    parent_refs: [execution_context.MAX_PAIR_ENTRIES_PER_EC]capability.ErasedSlabRef = undefined,
+    parent_types: [execution_context.MAX_PAIR_ENTRIES_PER_EC]capability.CapabilityType = undefined,
+    parent_caps: [execution_context.MAX_PAIR_ENTRIES_PER_EC]u16 = undefined,
+    parent_instances: [execution_context.MAX_PAIR_ENTRIES_PER_EC]u64 = undefined,
     src_slots: [execution_context.MAX_PAIR_ENTRIES_PER_EC]u12 = undefined,
 
     /// Run the recorded links. Caller must hold NO CD gen-lock. Every
@@ -1790,14 +2309,49 @@ pub const DeferredDerives = struct {
     pub fn run(self: *const DeferredDerives) void {
         var k: u8 = 0;
         while (k < self.count) : (k += 1) {
-            _ = stygia.caps.derivation.derive(
-                self.parent_dom,
+            _ = stygia.caps.derivation.deriveExpected(
+                self.parent_doms[k],
                 self.src_slots[k],
+                self.parent_refs[k],
+                self.parent_types[k],
+                self.parent_caps[k],
+                self.parent_instances[k],
                 self.child_dom,
                 @intCast(@as(u16, self.tstart) + k),
             );
         }
     }
+};
+
+pub const DeferredMoveClears = struct {
+    count: u8 = 0,
+    entries: [execution_context.MAX_PAIR_ENTRIES_PER_EC]execution_context.PairEntryStashed = undefined,
+
+    pub fn record(self: *DeferredMoveClears, entry: execution_context.PairEntryStashed) void {
+        self.entries[self.count] = entry;
+        self.count += 1;
+    }
+
+    pub fn run(self: *const DeferredMoveClears) void {
+        var k: u8 = 0;
+        while (k < self.count) : (k += 1) {
+            const entry = self.entries[k];
+            _ = stygia.caps.derivation.deleteAndDetachExpected(
+                entry.source_domain,
+                entry.src_slot,
+                entry.obj_ref,
+                entry.obj_type,
+                entry.source_caps,
+                entry.source_instance,
+            );
+        }
+    }
+};
+
+pub const RendezvousResult = union(enum) {
+    no_receiver,
+    delivered,
+    parked,
 };
 
 fn deliverEvent(
@@ -1810,6 +2364,7 @@ fn deliverEvent(
     pair_count: u8,
     port_xfer: bool,
     deferred: *DeferredDerives,
+    moves: *DeferredMoveClears,
 ) i64 {
     kprof.enter(.deliver_event);
     defer kprof.exit(.deliver_event);
@@ -1818,7 +2373,7 @@ fn deliverEvent(
     // through from the recv-time port-handle resolution (it is NOT
     // derived from `pair_count`).
     const xfer_allowed = port_xfer;
-    const reply_slot = mintReply(dom, sender, xfer_allowed) catch {
+    if (!canFitReplyAndAttachments(dom, pair_count)) {
         // Receiver's table is full — surface E_FULL into the receiver's
         // iret frame so the rendezvous wake path delivers it correctly.
         // The synchronous recv path (where caller == receiver) overwrites
@@ -1829,7 +2384,7 @@ fn deliverEvent(
         const target_ctx = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
         return errors.E_FULL;
-    };
+    }
 
     // Spec §[handle_attachments]: when the sender stashed pair entries
     // at suspend time, install them now in `[tstart, tstart+N)` of the
@@ -1841,12 +2396,15 @@ fn deliverEvent(
     // coalescing (spec test 08 requires N fresh slots even when the
     // receiver already holds a handle to the same object).
     var tstart: u12 = 0;
+    var reply_slot: u12 = 0;
     if (pair_count > 0) {
         tstart = capability_domain.allocContiguousFreeSlots(dom, pair_count) catch {
             // Couldn't reserve a contiguous run — should have been
             // caught by the free_count pre-check, but the contiguous
             // requirement can fail even when there are enough total
             // free slots (fragmented table). Surface E_FULL.
+            const target_ctx = receiver.iret_frame orelse receiver.ctx;
+            arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
             return errors.E_FULL;
         };
         // Spec §[idc_rx] test 01: when a domain receives an IDC handle
@@ -1857,41 +2415,18 @@ fn deliverEvent(
         while (k < pair_count) {
             const entry = sender.pending_pair_entries[k];
             const target_slot: u12 = @intCast(@as(u16, tstart) + k);
-            // Spec §[handle_attachments]: refcount-lifetime types
-            // (page_frame, timer, port, device_region) must take an
-            // object-side refcount on the new alias so a `delete` of
-            // the source slot cannot destroy the object out from under
-            // the receiver's freshly minted handle.
-            switch (entry.obj_type) {
-                .page_frame => {
-                    const pf: *stygia.memory.page_frame.PageFrame =
-                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    stygia.memory.page_frame.incHandleRef(pf) catch unreachable;
-                },
-                .timer => {
-                    const t: *stygia.sched.timer.Timer =
-                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    stygia.sched.timer.incHandleRef(t) catch unreachable;
-                },
-                .port => {
-                    const alias_p: *Port = @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    const alias_irq = alias_p._gen_lock.lockIrqSave(@src());
-                    defer alias_p._gen_lock.unlockIrqRestore(alias_irq);
-                    onHandleAcquire(alias_p, entry.caps) catch unreachable;
-                },
-                .device_region => {
-                    const dr: *stygia.devices.device_region.DeviceRegion =
-                        @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-                    stygia.devices.device_region.incHandleRef(dr) catch unreachable;
-                },
-                else => {},
-            }
             // Spec §[idc_rx] test 01: when receiving an IDC handle over
             // IDC, installed caps = granted ∩ receiver's idc_rx.
             const installed_caps: u16 = if (entry.obj_type == .capability_domain)
                 entry.caps & dom_idc_rx
             else
                 entry.caps;
+            // Spec §[handle_attachments]: refcount-lifetime types
+            // (page_frame, timer, port, device_region) must take an
+            // object-side refcount on the new alias so a `delete` of
+            // the source slot cannot destroy the object out from under
+            // the receiver's freshly minted handle.
+            acquireTransferredHandleRef(entry, installed_caps);
             capability_domain.mintHandleAt(
                 dom,
                 target_slot,
@@ -1903,9 +2438,9 @@ fn deliverEvent(
             );
 
             // Spec §[capabilities].revoke: hang the new alias in the
-            // receiver's domain under the source handle in the sender's
-            // domain so a future revoke on any ancestor of
-            // `(sender.domain, entry.src_slot)` reaches the alias.
+            // receiver's domain under the source handle in its original
+            // holder domain so a future revoke on any ancestor of that
+            // source reaches the alias.
             // RECORDED, not executed: `derive` takes `tree_mutex`, and
             // the receiver's CD gen-lock is held here — running it
             // inline is the `CD → tree_mutex` inversion that
@@ -1914,73 +2449,38 @@ fn deliverEvent(
             // the rendezvous path, before the receiver is marked
             // ready, so the fresh slots cannot be raced by their
             // owner).
-            deferred.parent_dom = @bitCast(sender.domain);
             deferred.child_dom = .{
                 .ptr = dom,
                 .gen = @intCast(dom._gen_lock.currentGen()),
             };
             deferred.tstart = tstart;
+            deferred.parent_doms[deferred.count] = entry.source_domain;
+            deferred.parent_refs[deferred.count] = entry.obj_ref;
+            deferred.parent_types[deferred.count] = entry.obj_type;
+            deferred.parent_caps[deferred.count] = entry.source_caps;
+            deferred.parent_instances[deferred.count] = entry.source_instance;
             deferred.src_slots[deferred.count] = entry.src_slot;
             deferred.count += 1;
 
             k += 1;
         }
 
-        // Spec §[handle_attachments] test 09: on recv, source entries
-        // with `move = 1` are removed from the sender's table; entries
-        // with `move = 0` are not removed. Mirrors the source-slot
-        // clear in `replyTransfer` (port.zig:861-867) and the
-        // copy/move alias path in capability_domain.zig:444-468.
-        //
-        // Same-CD common case: the sender and receiver share a single
-        // CapabilityDomain (the suspend-target-self single-process
-        // tests live here). Receiver CD lock is already held, so we
-        // can clear the source slot directly. The acquire+release on
-        // refcount-lifetime types nets to zero — the new alias bumped
-        // above is the heir to the source handle's lifetime
-        // contribution, and the source's release here balances it.
-        //
-        // Cross-CD: skipping the source clear here is a known
-        // limitation. Honoring it would require dropping the receiver
-        // CD lock and re-locking the sender's CD via the same
-        // single-CD-at-a-time pattern as `replyTransfer`. The
-        // single-process spec tests (test 09) don't exercise the
-        // cross-CD path; the multi-process IPC path will need that
-        // refactor to be observably move-correct. TODO: extend the
-        // recv-time delivery to phase out receiver-CD before
-        // acquiring sender-CD for the source clear (matches the
-        // reply-transfer phase split).
-        if (sender.domain.ptr == dom) {
-            k = 0;
-            while (k < pair_count) : (k += 1) {
-                const entry = sender.pending_pair_entries[k];
-                if (!entry.move) continue;
-                const src_slot = entry.src_slot;
-                if (capability.resolveHandleOnDomain(dom, src_slot, null)) |src_entry| {
-                    // Apply the per-type release for refcount-lifetime
-                    // handles before clearing the slot. Mirrors the
-                    // copy/move-alias `move=1` arm in
-                    // capability_domain.zig:444-467.
-                    switch (entry.obj_type) {
-                        .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
-                        .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(src_entry.ref.ptr.?))),
-                        .port => {
-                            const sp: *Port = @ptrCast(@alignCast(src_entry.ref.ptr.?));
-                            const src_caps_word: u16 = @truncate(Word0.caps(dom.user_table[src_slot].word0));
-                            releaseHandle(sp, src_caps_word);
-                        },
-                        .device_region => {
-                            const sdr: *stygia.devices.device_region.DeviceRegion =
-                                @ptrCast(@alignCast(src_entry.ref.ptr.?));
-                            const sdr_irq = sdr._gen_lock.lockIrqSave(@src());
-                            stygia.devices.device_region.removeHandleListNodeLocked(sdr, &dom.kernel_table[src_slot].dr_node);
-                            stygia.devices.device_region.releaseHandleLocked(sdr, sdr_irq);
-                        },
-                        else => {},
-                    }
-                    capability.clearAndFreeSlot(dom, src_slot, src_entry);
-                }
-            }
+        // Mint the reply handle before recording moved-source deletes.
+        // In a same-domain recv, deleting first returns the moved source
+        // slot to the receiver's free list, letting the reply handle
+        // reuse it and making the source look occupied immediately
+        // after recv.
+        reply_slot = mintReply(dom, sender, xfer_allowed) catch {
+            const target_ctx = receiver.iret_frame orelse receiver.ctx;
+            arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
+            return errors.E_FULL;
+        };
+
+        k = 0;
+        while (k < pair_count) : (k += 1) {
+            const entry = sender.pending_pair_entries[k];
+            releasePendingPairEntryRef(entry, null);
+            if (entry.move) moves.record(entry);
         }
 
         // Consume the stash — the move/copy completes here. Spec
@@ -1989,6 +2489,12 @@ fn deliverEvent(
         // copied; clearing only on the recv-success path preserves
         // that contract.
         sender.pending_pair_count = 0;
+    } else {
+        reply_slot = mintReply(dom, sender, xfer_allowed) catch {
+            const target_ctx = receiver.iret_frame orelse receiver.ctx;
+            arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
+            return errors.E_FULL;
+        };
     }
 
     // Compose §[event_state] syscall return word: pair_count, tstart,
@@ -2000,6 +2506,7 @@ fn deliverEvent(
         (@as(u64, tstart) << TSTART_SHIFT) |
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
         (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
+    if (event_type == .suspension) maybePrintReportDelivered(sender, receiver, reply_slot);
 
     // §[event_state] vregs 1..13 = the suspending EC's GPRs snapshotted
     // at `suspendOnPort` time, projected onto the receiver's matching
@@ -2085,12 +2592,12 @@ fn deliverEvent(
 /// event-state syscall return into the receiver's iret frame, and
 /// enqueue the receiver as ready.
 ///
-/// Caller MUST hold `p._gen_lock`. On a successful match (`true`
+/// Caller MUST hold `p._gen_lock`. On a successful match (`.delivered`
 /// returned) the function RELEASES that Port lock before acquiring the
 /// receiver's CD lock — canonical kernel order is CD → Port and Port
 /// must be dropped before deliverEvent reaches mintReply. Callers must
 /// therefore not also unlock `p` themselves on the success path.
-/// Returns `false` (with `p._gen_lock` still held) if no receiver was
+/// Returns `.no_receiver` (with `p._gen_lock` still held) if no receiver was
 /// eligible — the caller resumes the slow-path enqueue.
 pub fn rendezvousWithReceiver(
     sender: *ExecutionContext,
@@ -2099,79 +2606,114 @@ pub fn rendezvousWithReceiver(
     subcode: u8,
     event_addr: u64,
     port_irq_state: u64,
-) bool {
-    const receiver = popHighestPriorityReceiver(p) orelse return false;
-    // SMP race: a receiver popped here may still be on its previous core
-    // mid-context-save (the dequeuing core is the sender's CPU, distinct
-    // from where the receiver last ran). Mutating `receiver.ctx` /
-    // `receiver.event_*` before its prior core has cleared `on_cpu`
-    // would race the saving core's GPR writes. Mirror the standard
-    // wake-side pattern from futex.zig:239,588 and port.zig:187 — spin
-    // until the prior core releases the EC.
-    while (receiver.on_cpu.load(.acquire)) {
-        // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-        // matching note on `scheduler.markReady`'s kstack barrier.
-        arch.paging.serviceTlbMaintenanceWhileSpinning();
-        std.atomic.spinLoopHint();
+) RendezvousResult {
+    var current_port_irq_state = port_irq_state;
+    var temp_recv_ref = false;
+    while (true) {
+        const receiver = popHighestPriorityReceiver(p) orelse {
+            if (temp_recv_ref) {
+                p.waiters.enqueue(sender);
+                p.waiter_kind = .senders;
+                dropTempRecvRefLocked(p, current_port_irq_state);
+                return .parked;
+            }
+            return .no_receiver;
+        };
+        if (!pinReceiver(receiver)) continue;
+        const receiver_claim = lifecycle.beginWaitingClaim(receiver);
+        if (receiver_claim == .none) {
+            lifecycle.unpin(receiver);
+            continue;
+        }
+        if (lifecycle.isDestroyMarked(receiver)) {
+            if (receiver_claim == .pended) lifecycle.publishPendedPayload(receiver);
+            lifecycle.unpin(receiver);
+            continue;
+        }
+        receiver.event_type = .none;
+        receiver.suspend_port = null;
+
+        // Cancel any pending recv-with-timeout deadline before delivery.
+        // Setting deadline to 0 also makes a stale-snapshot phase-2 expiry
+        // skip this EC.
+        if (receiver.recv_deadline_ns != 0) {
+            receiver.recv_deadline_ns = 0;
+            removeTimedRecvWaiter(receiver);
+        }
+
+        // Snapshot receiver's CD ref under the port lock, then drop the
+        // port lock before acquiring the CD lock. The receiver is no
+        // longer queued on the port; the short lifecycle pin above keeps
+        // its slab slot live until delivery/failure publication finishes.
+        // Holding port across the CD acquisition would re-introduce the
+        // AB-BA cycle that lockdep catches against the
+        // `delete → releaseHandle` path.
+        const receiver_dom_ref = receiver.domain;
+        if (!temp_recv_ref) {
+            incRecvRef(p) catch unreachable;
+            temp_recv_ref = true;
+        }
+        p._gen_lock.unlockIrqRestore(current_port_irq_state);
+
+        const domlr = receiver_dom_ref.lockIrqSave(@src()) catch {
+            const plr = p._gen_lock.lockIrqSave(@src());
+            current_port_irq_state = plr;
+            if (p.waiter_kind == .receivers) {
+                publishFailedReceiverAndUnpin(receiver, receiver_claim, errors.E_CLOSED);
+                continue;
+            }
+            p.waiters.enqueue(sender);
+            p.waiter_kind = .senders;
+            dropTempRecvRefLocked(p, current_port_irq_state);
+            publishFailedReceiverAndUnpin(receiver, receiver_claim, errors.E_CLOSED);
+            return .parked;
+        };
+        const dom = domlr.ptr;
+
+        var deferred: DeferredDerives = .{};
+        var moves: DeferredMoveClears = .{};
+        const deliver_ret = deliverEvent(
+            sender,
+            receiver,
+            dom,
+            event_type,
+            subcode,
+            event_addr,
+            sender.pending_pair_count,
+            receiver.recv_port_xfer,
+            &deferred,
+            &moves,
+        );
+        // Drop the receiver-CD lock BEFORE running the recorded derivation
+        // links: `derive` takes `tree_mutex`, and holding a CD gen-lock
+        // across that acquire is the AB-BA against the teardown tree walk
+        // (see `caps.derivation.tree_mutex`). Running the links BEFORE
+        // `markReady` keeps the fresh slots unracable: the receiver — the
+        // only legitimate user of the minted handles — cannot run until it
+        // is enqueued below.
+        receiver_dom_ref.unlockIrqRestore(domlr.irq_state);
+        if (deliver_ret == errors.OK) {
+            deferred.run();
+            moves.run();
+            const plr = p._gen_lock.lockIrqSave(@src());
+            dropTempRecvRefLocked(p, plr);
+            temp_recv_ref = false;
+            publishReceiverAndUnpin(receiver, receiver_claim);
+            return .delivered;
+        }
+
+        const plr = p._gen_lock.lockIrqSave(@src());
+        current_port_irq_state = plr;
+        if (p.waiter_kind == .receivers) {
+            publishFailedReceiverAndUnpin(receiver, receiver_claim, deliver_ret);
+            continue;
+        }
+        p.waiters.enqueue(sender);
+        p.waiter_kind = .senders;
+        dropTempRecvRefLocked(p, current_port_irq_state);
+        publishFailedReceiverAndUnpin(receiver, receiver_claim, deliver_ret);
+        return .parked;
     }
-    receiver.event_type = .none;
-    receiver.suspend_port = null;
-
-    // Cancel any pending recv-with-timeout deadline before delivery.
-    // Setting deadline to 0 also makes a stale-snapshot phase-2 expiry
-    // skip this EC.
-    if (receiver.recv_deadline_ns != 0) {
-        receiver.recv_deadline_ns = 0;
-        removeTimedRecvWaiter(receiver);
-    }
-
-    // Snapshot receiver's CD ref under the port lock, then drop the
-    // port lock before acquiring the CD lock. The receiver is no
-    // longer queued on the port; its slab slot stays alive while
-    // state is `.suspended_on_port`. Holding port across the CD
-    // acquisition would re-introduce the AB-BA cycle that lockdep
-    // catches against the `delete → releaseHandle` path.
-    const receiver_dom_ref = receiver.domain;
-    p._gen_lock.unlockIrqRestore(port_irq_state);
-
-    const domlr = receiver_dom_ref.lockIrqSave(@src()) catch {
-        // Receiver's CD was torn down between the pop and our lock —
-        // the receiver itself is doomed via the same teardown. Drop
-        // the rendezvous; the sender remains parked (state already set
-        // by suspendOnPort) and will be woken by E_CLOSED when the
-        // port's last refcount drops, or be reaped at sender teardown.
-        return true;
-    };
-    const dom = domlr.ptr;
-
-    var deferred: DeferredDerives = .{};
-    _ = deliverEvent(
-        sender,
-        receiver,
-        dom,
-        event_type,
-        subcode,
-        event_addr,
-        sender.pending_pair_count,
-        receiver.recv_port_xfer,
-        &deferred,
-    );
-    // Drop the receiver-CD lock BEFORE running the recorded derivation
-    // links: `derive` takes `tree_mutex`, and holding a CD gen-lock
-    // across that acquire is the AB-BA against the teardown tree walk
-    // (see `caps.derivation.tree_mutex`). Running the links BEFORE
-    // `markReady` keeps the fresh slots unracable: the receiver — the
-    // only legitimate user of the minted handles — cannot run until it
-    // is enqueued below.
-    receiver_dom_ref.unlockIrqRestore(domlr.irq_state);
-    deferred.run();
-
-    // No manual `.ready` stamp: `markReady` claims the wait->ready
-    // transition itself, so a racing recv-timeout expiry on the timer
-    // core cannot also enqueue this receiver. Pre-stamping `.ready` here
-    // would defeat that claim (it would no longer see a wait state).
-    scheduler.markReady(receiver);
-    return true;
 }
 
 /// Mint a reply handle in `receiver_domain`'s table pointing at the
@@ -2202,6 +2744,7 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *ExecutionContext, xfer
         receiver_domain._gen_lock.currentGen(),
     );
     sender.pending_reply_slot = slot;
+    sender.wait.kind = .reply;
     return slot;
 }
 
@@ -2259,10 +2802,7 @@ fn consumeReply(
 /// `.suspended_on_port` — a sender on the queue side or already woken
 /// is not eligible.
 pub fn resumeWithAbandoned(sender: *ExecutionContext) void {
-    // Sender may have been pulled off the port by an earlier wake path
-    // (e.g. a concurrent E_CLOSED propagation). resumeFromReply asserts
-    // .suspended_on_port — gate to avoid asserting in those races.
-    if (sender.state != .suspended_on_port) return;
+    if (!lifecycle.isPortSuspended(sender) or sender.wait.kind != .reply) return;
 
     if (sender.iret_frame) |frame| {
         arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_ABANDONED));
@@ -2277,25 +2817,39 @@ pub fn resumeWithAbandoned(sender: *ExecutionContext) void {
 fn propagateClosedToReceivers(p: *Port) void {
     if (p.waiter_kind != .receivers) return;
     while (p.waiters.dequeue()) |waiter| {
-        // Claim before writing the return slot — a timeout expiry or a
-        // racing delivery is a competing waker for this same wait.
-        if (!execution_context.tryClaimWake(waiter, .suspended_on_port)) continue;
+        const claim = lifecycle.beginWaitingClaimPinned(waiter);
+        if (claim == .none) continue;
         if (waiter.iret_frame) |frame| {
             arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_CLOSED));
         } else {
             arch.syscall.setSyscallReturn(waiter.ctx, @bitCast(errors.E_CLOSED));
         }
         waiter.suspend_port = null;
-        scheduler.enqueue(waiter);
+        switch (claim) {
+            .claimed => scheduler.enqueue(waiter),
+            .pended => lifecycle.publishPendedPayload(waiter),
+            .none => unreachable,
+        }
+        lifecycle.unpin(waiter);
     }
     p.waiter_kind = .none;
 }
 
-/// On recv_refcount → 0: wake all suspended senders with E_CLOSED;
-/// drop their pre-validated attachments without effect.
-fn propagateClosedToSenders(p: *Port) void {
+/// On recv_refcount → 0: detach suspended senders under the closing
+/// port lock. Wake and pending-attachment release run after the lock
+/// drops via `finalizeClosedSenders`.
+fn detachClosedSenders(p: *Port, pending: *EcQueue) void {
     if (p.waiter_kind != .senders) return;
     while (p.waiters.dequeue()) |sender| {
+        pending.enqueue(sender);
+    }
+    p.waiter_kind = .none;
+}
+
+pub fn finalizeClosedSenders(pending: *EcQueue) void {
+    while (pending.dequeue()) |sender| {
+        const claim = lifecycle.beginWaitingClaimPinned(sender);
+        if (claim == .none) continue;
         if (sender.iret_frame) |frame| {
             arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_CLOSED));
         } else {
@@ -2308,14 +2862,15 @@ fn propagateClosedToSenders(p: *Port) void {
         sender.originating_write_cap = false;
         // Spec §[handle_attachments] test 10: an E_CLOSED-resumed
         // sender's pre-validated stash is dropped without effect — no
-        // entry is moved or copied. Clear the count so a subsequent
-        // recv on this EC doesn't observe stale stash from this
-        // closed suspend (`deliverEvent`'s install loop reads
-        // `sender.pending_pair_count` on the next pairing and would
-        // otherwise install ghost handles from the dead session).
-        sender.pending_pair_count = 0;
-        // No manual stamp — `markReady` owns the wait->ready claim.
-        scheduler.markReady(sender);
+        // entry is moved or copied. Drop the pending object refs and
+        // clear the count so a subsequent recv on this EC doesn't
+        // observe stale stash from this closed suspend.
+        releasePendingPairEntries(sender);
+        switch (claim) {
+            .claimed => scheduler.enqueue(sender),
+            .pended => lifecycle.publishPendedPayload(sender),
+            .none => unreachable,
+        }
+        lifecycle.unpin(sender);
     }
-    p.waiter_kind = .none;
 }

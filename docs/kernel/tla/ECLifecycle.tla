@@ -1,7 +1,7 @@
 ---------------------------- MODULE ECLifecycle ----------------------------
 (***************************************************************************)
 (* TLA+ model of the Stygia execution-context lifecycle machine,           *)
-(* docs/kernel/systems.md revision 11 (2026-08-01). Revision 8 carried     *)
+(* docs/kernel/systems.md revision 16 (2026-08-02). Revision 8 carried     *)
 (* three semantic deltas from rev 7, all encoded here: the staged          *)
 (* placement destination is no longer placement authority (placement       *)
 (* computes from the fresh descriptor under the destination lock -- the    *)
@@ -65,12 +65,11 @@ CONSTANTS
   PINLOCK_ON,   \* BOOLEAN: pin-class lock holds (Sec 2.4, F3 surface)
   S7_ON,        \* BOOLEAN: dead-domain dispatch filter + S7 claim route
                 \*          (Sec 3.2, F2 state-machine half)
-  DROP_BUDGET,  \* Nat: stale-port DROP events (round-12: DirDrop is the
+  DROP_BUDGET,  \* Nat: stale/bad-port owner failure events (DirDrop is the
                 \* only unbounded generator in the directive machine --
-                \* arm/drop/arm/drop cycles freely -- and at 3 ECs that
+                \* arm/fail/ack/arm cycles freely -- and at 3 ECs that
                 \* alone drove dirabafix past 274M states and an OOM.
-                \* Bounded like TERM_BUDGET/CR_BUDGET; ONE drop is all
-                \* the C-D ABA needs (A arms, B drops, C re-arms).
+                \* Bounded like TERM_BUDGET/CR_BUDGET.
   TERM_BUDGET,  \* Nat: retire() calls (environment + EC-context terminate)
   CR_BUDGET,    \* Nat: edge-1 creations after Init (slab reuse)
   F1_MODE,      \* "rev5"       : retire pre-waits payload_done (W7, F1 fix)
@@ -110,7 +109,7 @@ CONSTANTS
                 \* RESULT, not a preference. Revision 11 first specified
                 \* a bounded epoch bumped on every exit from `armed`;
                 \* TLC found the epoch is ITSELF an ABA, wrapping in a
-                \* DirDrop/DirClaim/DirArm cycle (mod-4 wrap in four
+                \* DirDrop/DirLoop/DirClaim/DirArm cycle (mod-4 wrap in four
                 \* bumps), and an 8-bit epoch wraps in 256 while the W5
                 \* spinner has NO bound at all (Sec 2.5 terminates by
                 \* assumption, not by a count). Identity does not wrap:
@@ -119,10 +118,10 @@ CONSTANTS
                 \* FALSE = revision 10's value-based break -- the ABA.
                 \* FALSE = revision 10's VALUE-based break -- the ABA:
                 \* a suspender reports success for a suspension that was
-                \* dropped, and can disarm a third party's directive.
-  DIR_DROP,     \* BOOLEAN. TRUE = the owner's stale-port drop arm exists
-                \* (Sec 2.5; round-10 C-D). It is what makes the directive
-                \* word an ABA, and therefore what the epoch defends against.
+                \* dropped/failed, and can disarm a third party's directive.
+  DIR_DROP,     \* BOOLEAN. TRUE = the owner's stale/bad-port failure arm
+                \* exists (Sec 2.5). It publishes dres and armed->failed;
+                \* the matching waiter acks failed->none.
   CYCLE_REJECT, \* "none" | "pair" | "self". SYMMETRIC-SUSPEND
                 \* REJECTION, three machines (round-7 maintainer
                 \* proposal + the round-7 refinement of it):
@@ -201,7 +200,9 @@ ASSUME DIR_GENCHK \in BOOLEAN
 (*         rev-6 simplification; a separate `timed` field was write-only) *)
 (*         shot - the one-shot registration: "none"|"armed"|"consumed"    *)
 (*         own - owner_core (Sec 2.4); NULL outside its validity set      *)
-(*         pin - pin_depth (Sec 2.4)                                      *)
+(*         pin - lifecycle pin depth (Sec 2.4). Claim holders pin the     *)
+(*               TARGET EC whose lifecycle/slab generation they protect;  *)
+(*               pin-class lock holders pin their own executing EC.       *)
 (*         pd  - payload_done handshake bit (Sec 2.2)                     *)
 (*         po  - GHOST ONLY (history): the claim CAS came from `parking`. *)
 (*               Rev 5 keys NOTHING on this: the pend fact lives in the   *)
@@ -273,10 +274,23 @@ VARIABLES
           \*         machine keeps PinAcq/PinRel FUSED (a zero-work
           \*         interleaving point, removed by the same rule that
           \*         removed the pre-hop step -- README removals).
-          \*   dir - directive word: none|claiming|armed|dead (Sec 2.5)
+          \*   dir - directive word:
+          \*         none|suspending|claiming|armed|failed|dead (Sec 2.5)
+          \*   dres- directive result, abstracted to none|fail. Meaningful
+          \*         only while dir = "failed"; it may be stale outside that
+          \*         state. The owner publishes fail before armed -> failed
+          \*         when it cannot consume the directive, including stale/bad
+          \*         port; the matching waiter reads it, acks by clearing
+          \*         failed -> none, and returns the real error.
+          \*   dpin- remote-directive target pin. This models the
+          \*         suspender's tryPinLive(target_ec) through the W5 wait.
+          \*         It blocks retire/finalize but deliberately does NOT
+          \*         gate the target owner's tick or boundary consumption:
+          \*         pin is the EC's own preemption/claim pin abstraction,
+          \*         dpin is an external waiter-held lifetime pin.
           \*   dsrc- the EC that claimed/armed this directive (NULL when
           \*         dir = none|dead). Meaningful only while
-          \*         dir \in {claiming, armed}. This is the word the
+          \*         dir \in {claiming, armed, failed}. This is the word the
           \*         symmetric-suspend check reads: a suspender u of
           \*         target t rejects iff ecs[u].dsrc = t, i.e. "my own
           \*         directive is already claimed BY my target".
@@ -310,6 +324,7 @@ IrqFrames == {NULL} \cup [op: {"wake"}, tgt: ECs,
 \*   termW  - terminator in the eviction + deferred-marking wait (W3/W4)
 EcPCs == {"user","wakeC","suspC","pendC","rvC","relwait",
           "dirM","dirC","dirW","termR","termW"}
+ClaimPCs == {"wakeC","suspC","pendC","rvC","relwait"}
 \*   dirM - CYCLE_REJECT = "self" only: the suspender has marked its OWN
 \*          directive word "suspending" (CAS 1) and has not yet claimed
 \*          its target's (CAS 2). Modelled UNFUSED because the two CASes
@@ -332,7 +347,9 @@ TypeOK ==
                       ks: Cores \cup {NULL},
                       lnk: BOOLEAN,
                       plk: {"none","held","preB","postD"},
-                      dir: {"none","suspending","claiming","armed","dead"},
+                      dir: {"none","suspending","claiming","armed","failed","dead"},
+                      dres: {"none","fail"},
+                      dpin: BOOLEAN,
                       dbad: BOOLEAN, \* GHOST: a foreign disarm happened
                       gen: 0..7,     \* slab gen. ADVANCES at finalize and is
                                      \* INHERITED by CreateEC -- never reset.
@@ -380,6 +397,7 @@ TypeOK ==
   /\ cb \in 0..CR_BUDGET
   /\ db \in 0..1
   /\ pb \in 0..DROP_BUDGET
+  /\ \A e \in ECs: ecs[e].dir = "failed" => ecs[e].dres = "fail"
 
 EcCtx(c) == /\ cores[c].pc = "ecrun"
             /\ cores[c].irq = NULL
@@ -399,6 +417,7 @@ Init ==
               po |-> FALSE, hld |-> NULL, mo |-> FALSE,
               pc |-> "user", tg |-> NULL, ks |-> NULL,
               lnk |-> FALSE, plk |-> "none", dir |-> "none",
+              dres |-> "none", dpin |-> FALSE,
               dbad |-> FALSE, gen |-> 0, dgen |-> 0,
               dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
               dsrc |-> NULL, dd |-> FALSE]]
@@ -448,7 +467,7 @@ S7Retire(c) ==
   /\ cores[c].pc = "s7ret" /\ cores[c].irq = NULL
   /\ ecs[e].st \in {"claimed","retired"}
   /\ ecs' = [ecs EXCEPT ![e].st = "freed", ![e].mo = FALSE,
-                        ![e].hld = NULL, ![e].dir = "none", ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                        ![e].hld = NULL, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
                         ![e].own = NULL,
                         ![e].pc = "user", ![e].tg = NULL]
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
@@ -585,7 +604,7 @@ HopCommitRetired(c) ==
                              ![e].po = FALSE,
                              ![e].pd = FALSE, ![e].own = NULL,
                              ![e].pk = "none",
-                             ![e].hld = NULL, ![e].dir = "none", ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                             ![e].hld = NULL, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
                              ![e].pc = "user", ![e].tg = NULL,
                              (* Rev 6 (FIN_UNWIND): finalize's FIRST act  *)
                              (* is the idempotent container unwind under  *)
@@ -631,6 +650,10 @@ TickPreempt(c) ==
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ e # NULL
   /\ ecs[e].st = "running"
   /\ PIN_GATE => ecs[e].pin = 0
+  /\ PIN_GATE => ecs[e].pc \notin ClaimPCs
+     \* Current claim continuations run in the IRQ-disabled reaching-lock
+     \* section until they publish/drop and release the TARGET pin. Before
+     \* target pins, the claimant's own pin accidentally modelled this gate.
   /\ IF ecs[e].pc = "user" /\ ecs[e].pin = 0 /\ ecs[e].dir = "armed"
         /\ ecs[e].shot = "none"
      THEN (* Sec 3.1 rule 3 (round-6 N5): the tick IS an entry from user  *)
@@ -642,11 +665,11 @@ TickPreempt(c) ==
           (* requeue arm (entry from kernel: no directive arm, rule 3).   *)
           /\ ecs' = IF ecs[e].dsrc # NULL
                     THEN [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                                     ![e].lnk = TRUE, ![e].dir = "none",
+                                     ![e].lnk = TRUE, ![e].dir = "none", ![e].dres = "none",
                                      ![ecs[e].dsrc].dlv = TRUE,  \* the ARMER
                                      ![e].dsrc = NULL]
                     ELSE [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                                     ![e].lnk = TRUE, ![e].dir = "none"]
+                                     ![e].lnk = TRUE, ![e].dir = "none", ![e].dres = "none"]
           /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
      ELSE /\ ecs' = [ecs EXCEPT ![e].st = "parking", ![e].pk = "requeue"]
           /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
@@ -657,7 +680,7 @@ TickPreempt(c) ==
 BoundaryRetired(c) ==
   LET e == cores[c].cur IN
   /\ EcCtx(c) /\ ecs[e].pc = "user" /\ ecs[e].st = "retired"
-  /\ ecs[e].pin = 0    \* claims/pin-class locks discharged pre-hop (2.4)
+  /\ ecs[e].pin = 0    \* own pins/pin-class locks discharged pre-hop (2.4)
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
   /\ UNCHANGED <<ecs, tb, cb, db, pb>>
 
@@ -665,7 +688,8 @@ BoundaryRetired(c) ==
 (* The wake body, syscall context (futex wake / reply / recv-side): claim  *)
 (* under the reaching lock (R-claim), then discharge. The claim and the    *)
 (* discharge are separate steps: the window between them is where X1       *)
-(* lives. pin_depth is incremented at claim-win (Sec 2.4).                 *)
+(* lives. The lifecycle pin is acquired on the target before the claim     *)
+(* CAS, as `tryPinLive`/`begin*ClaimPinned` do in the implementation.      *)
 (***************************************************************************)
 WakeStart(c) ==
   LET w == cores[c].cur IN
@@ -679,8 +703,8 @@ WakeStart(c) ==
          /\ ecs' = [ecs EXCEPT ![t].st = "claimed",
                                ![t].hld = [ty |-> "ec", id |-> w],
                                ![t].shot = "none",
-                               ![t].lnk = FALSE,
-                               ![w].pin = @ + 1, ![w].pc = "wakeC",
+                               ![t].pin = @ + 1, ![t].lnk = FALSE,
+                               ![w].pc = "wakeC",
                                ![w].tg = t]
       \/ (* edge 5b, rev 5: parking -> pended. The claimant's remaining   *)
          (* body (pc = "pendC") is payload + payload_done, then DONE --   *)
@@ -691,8 +715,8 @@ WakeStart(c) ==
                                ![t].pd = FALSE,
                                ![t].hld = [ty |-> "ec", id |-> w],
                                ![t].shot = "none",
-                               ![t].lnk = FALSE,
-                               ![w].pin = @ + 1, ![w].pc = "pendC",
+                               ![t].pin = @ + 1, ![t].lnk = FALSE,
+                               ![w].pc = "pendC",
                                ![w].tg = t]
       \/ (* edge 5b, rev 3: parking -> claimed + EC-context release-wait *)
          /\ ~PENDED
@@ -700,8 +724,8 @@ WakeStart(c) ==
          /\ ecs' = [ecs EXCEPT ![t].st = "claimed",
                                ![t].hld = [ty |-> "ec", id |-> w],
                                ![t].shot = "none",
-                               ![t].lnk = FALSE,
-                               ![w].pin = @ + 1, ![w].pc = "relwait",
+                               ![t].pin = @ + 1, ![t].lnk = FALSE,
+                               ![w].pc = "relwait",
                                ![w].tg = t]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
@@ -715,7 +739,8 @@ WakePlace(c) ==
   /\ ecs[w].pc = "wakeC" /\ ecs[w].st \in {"running","retired"}
   /\ ecs[t].st = "claimed"
   /\ ecs' = [ecs EXCEPT ![t].st = "ready", ![t].hld = NULL,
-                        ![w].pin = @ - 1, ![w].pc = "user", ![w].tg = NULL]
+                        ![t].pin = @ - 1,
+                        ![w].pc = "user", ![w].tg = NULL]
   /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -729,7 +754,8 @@ WakePendDone(c) ==
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ w # NULL
   /\ ecs[w].pc = "pendC" /\ ecs[w].st \in {"running","retired"}
   /\ ecs' = [ecs EXCEPT ![t].pd = TRUE, ![t].hld = NULL,
-                        ![w].pin = @ - 1, ![w].pc = "user", ![w].tg = NULL]
+                        ![t].pin = @ - 1,
+                        ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (* Holder's placement CAS fails (`retired`): deferred marking + finalize   *)
@@ -742,8 +768,9 @@ WakeTgtRetired(c) ==
   /\ ecs[t].st = "retired"     \* no po read: a wakeC claim is 5a-origin
   /\ ecs' = [ecs EXCEPT ![t].st = "freed", ![t].mo = FALSE,
                         ![t].hld = NULL,
-                        ![t].shot = "none", ![t].dir = "none", ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
-                        ![w].pin = @ - 1, ![w].pc = "user", ![w].tg = NULL]
+                        ![t].pin = @ - 1,
+                        ![t].shot = "none", ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
+                        ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (* Rev 3 only: EC-context release-wait -- the claimant of a parking-origin *)
@@ -758,14 +785,14 @@ RelwaitPlace(c) ==
   /\ IF ecs[t].st = "claimed"
      THEN /\ ecs' = [ecs EXCEPT ![t].st = "ready", ![t].hld = NULL,
                                 ![t].own = NULL,
-                                ![t].pk = "none", ![w].pin = @ - 1,
+                                ![t].pk = "none", ![t].pin = @ - 1,
                                 ![w].pc = "user", ![w].tg = NULL]
           /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}]
      ELSE /\ ecs[t].st = "retired"
           /\ ecs' = [ecs EXCEPT ![t].st = "freed", ![t].mo = FALSE,
                                 ![t].hld = NULL,
-                                ![t].dir = "none", ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
-                                ![w].pin = @ - 1,
+                                ![t].pin = @ - 1,
+                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
                                 ![w].pc = "user", ![w].tg = NULL]
           /\ cores' = cores
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -787,7 +814,7 @@ SuspendStart(c) ==
             /\ cores' = [cores EXCEPT ![qc].q = @ \ {t}]
             /\ ecs' = [ecs EXCEPT ![t].st = "claimed",
                                   ![t].hld = [ty |-> "ec", id |-> w],
-                                  ![w].pin = @ + 1, ![w].pc = "suspC",
+                                  ![t].pin = @ + 1, ![w].pc = "suspC",
                                   ![w].tg = t]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -798,8 +825,8 @@ SuspendPlace(c) ==
   /\ ecs[w].pc = "suspC" /\ ecs[w].st \in {"running","retired"}
   /\ ecs[t].st = "claimed"
   /\ ecs' = [ecs EXCEPT ![t].st = "waiting",
-                        ![t].hld = NULL, ![t].lnk = TRUE,
-                        ![w].pin = @ - 1, ![w].pc = "user", ![w].tg = NULL]
+                        ![t].hld = NULL, ![t].pin = @ - 1, ![t].lnk = TRUE,
+                        ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 SuspendTgtRetired(c) ==
@@ -809,8 +836,9 @@ SuspendTgtRetired(c) ==
   /\ ecs[w].pc = "suspC" /\ ecs[w].st \in {"running","retired"}
   /\ ecs[t].st = "retired"
   /\ ecs' = [ecs EXCEPT ![t].st = "freed", ![t].mo = FALSE,
-                        ![t].hld = NULL, ![t].dir = "none", ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
-                        ![w].pin = @ - 1, ![w].pc = "user", ![w].tg = NULL]
+                        ![t].hld = NULL, ![t].pin = @ - 1,
+                        ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
+                        ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (***************************************************************************)
@@ -818,10 +846,9 @@ SuspendTgtRetired(c) ==
 (* the sender `parking(reply_pin)` AND claim the parked receiver in the    *)
 (* same port-lock section, drop the lock; delivery runs in the bounded     *)
 (* post-publish window (Sec 3.2 step 3); place the receiver; hop. The      *)
-(* sender holding the receiver's claim while itself `parking` is T2's      *)
-(* parking x K+C cell -- "the sequence completes delivery (discharging     *)
-(* the claim), reaches its hop, hop finds retired, finalizes." That prose  *)
-(* is what these two actions machine-check. The sender is untimed (the     *)
+(* sender holds the receiver's claim while itself `parking`; current       *)
+(* implementation pins the receiver whose lifecycle is protected, not the  *)
+(* sender. The sender is untimed (the                                      *)
 (* Sec 2.2 untimed-sender assumption: no deadline registration, so no      *)
 (* waker can reach it during the pin write).                               *)
 (***************************************************************************)
@@ -836,25 +863,25 @@ RvStart(c) ==
          /\ ecs[r].st = "waiting"
          /\ ecs' = [ecs EXCEPT
               ![s].st = "parking", ![s].pk = "wait",
-              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r, ![s].pin = 1,
+              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r,
               ![r].st = "claimed", ![r].hld = [ty |-> "ec", id |-> s],
-              ![r].shot = "none", ![r].lnk = FALSE]
+              ![r].pin = @ + 1, ![r].shot = "none", ![r].lnk = FALSE]
       \/ (* receiver itself mid-park: 5b claim -> pended; the receiver's  *)
          (* own core discharges (Sec 8.3)                                 *)
          /\ PENDED
          /\ ecs[r].st = "parking" /\ ecs[r].pk = "wait"
          /\ ecs' = [ecs EXCEPT
               ![s].st = "parking", ![s].pk = "wait",
-              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r, ![s].pin = 1,
+              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r,
               ![r].st = "pended", ![r].po = TRUE, ![r].pd = FALSE,
               ![r].hld = [ty |-> "ec", id |-> s],
-              ![r].shot = "none", ![r].lnk = FALSE]
+              ![r].pin = @ + 1, ![r].shot = "none", ![r].lnk = FALSE]
   /\ cores' = [cores EXCEPT ![c].pc = "rvdeliver", ![c].outg = s]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (* The delivery in the bounded pre-hop window. Runs regardless of the      *)
-(* sender's own state (retire may have hit the parking sender -- the       *)
-(* sequence is the running computation and completes, T2 parking x K+C).   *)
+(* sender's own state; the receiver pin prevents target retirement until   *)
+(* this holder publishes or drops the claim.                               *)
 (* Branches on the claim the sender itself won:                            *)
 (*  - claimed receiver: mint ok -> place (edge 6); mint failure -> relink  *)
 (*    receiver (edge 7 delivery-failure arm) and the sender stays parked   *)
@@ -870,34 +897,39 @@ RvDeliver(c) ==
   /\ \/ /\ ecs[r].st = "claimed"
         /\ \/ /\ ecs' = [ecs EXCEPT            \* mint ok: edge 6 placement
                     ![r].st = "ready", ![r].hld = NULL,
-                    ![s].pin = 0, ![s].pc = "user", ![s].tg = NULL]
+                    ![r].pin = @ - 1,
+                    ![s].pc = "user", ![s].tg = NULL]
               /\ \E d \in Cores:
                    cores' = [cores EXCEPT ![c].pc = "hopRel",
                                           ![d].q = @ \cup {r}]
            \/ /\ ecs' = [ecs EXCEPT           \* mint failure: edge 7
                     ![r].st = "waiting", ![r].hld = NULL,
-                    ![r].lnk = TRUE,
-                    ![s].pin = 0, ![s].pc = "user", ![s].tg = NULL]
+                    ![r].pin = @ - 1, ![r].lnk = TRUE,
+                    ![s].pc = "user", ![s].tg = NULL]
               /\ cores' = [cores EXCEPT ![c].pc = "hopRel"]
      \/ /\ ecs[r].st = "pended"
         /\ ecs' = [ecs EXCEPT
-             ![r].pd = TRUE, ![r].hld = NULL,
-             ![s].pin = 0, ![s].pc = "user", ![s].tg = NULL]
+             ![r].pd = TRUE, ![r].hld = NULL, ![r].pin = @ - 1,
+             ![s].pc = "user", ![s].tg = NULL]
         /\ cores' = [cores EXCEPT ![c].pc = "hopRel"]
      \/ /\ ecs[r].st = "retired"                  \* claimed-origin only:
         (* retire of a pended r pre-waits pd, which only this delivery    *)
         (* could set -- so a retired r here came from `claimed`.          *)
         /\ ecs' = [ecs EXCEPT
              ![r].st = "freed", ![r].mo = FALSE,
-             ![r].hld = NULL, ![r].dir = "none", ![r].gen = (@ + 1) % 8, ![r].dlv = FALSE, ![r].dsrc = NULL,
-             ![s].pin = 0, ![s].pc = "user", ![s].tg = NULL]
+             ![r].hld = NULL, ![r].pin = @ - 1,
+             ![r].dir = "none", ![r].dres = "none", ![r].dpin = FALSE, ![r].gen = (@ + 1) % 8, ![r].dlv = FALSE, ![r].dsrc = NULL,
+             ![s].pc = "user", ![s].tg = NULL]
         /\ cores' = [cores EXCEPT ![c].pc = "hopRel"]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (***************************************************************************)
 (* The suspend directive (Sec 2.5): none -> claiming -> armed -> none |    *)
-(* dead. The suspender holds no claim (pin untouched) and is preemptible   *)
-(* throughout (W5).                                                        *)
+(* failed | dead. `failed` carries dres and is cleared only by the         *)
+(* matching waiter ack; success is only actual consume/rendezvous. The     *)
+(* suspender holds a target lifetime pin (`dpin`) from the successful      *)
+(* directive claim through every waiter return, but remains preemptible    *)
+(* throughout (W5); `dpin` blocks retire, not the owner's tick/consume.    *)
 (***************************************************************************)
 (* CYCLE_REJECT = "self", CAS 1: the suspender marks its OWN directive    *)
 (* word none -> "suspending" before it touches the target's. That single   *)
@@ -980,7 +1012,8 @@ DirClaim(c) ==
        (* The locks are RELEASED before the W5 wait (DirLoop) is         *)
        (* entered -- waiting inside them would rebuild N1.               *)
        /\ CYCLE_REJECT = "pair" => ecs[u].dsrc # t
-       /\ ecs' = [ecs EXCEPT ![t].dir = "claiming", ![t].dsrc = u,
+       /\ ecs' = [ecs EXCEPT ![t].dir = "claiming", ![t].dpin = TRUE,
+                             ![t].dsrc = u,
                              ![u].pc = "dirC", ![u].tg = t,
                              ![u].dgen = ecs[t].gen]
           (* ROUND-12: the gen snapshot belongs HERE, where the suspender  *)
@@ -1014,6 +1047,7 @@ DirArm(c) ==
      THEN ecs' = [ecs EXCEPT ![t].dir = "armed", ![t].pok = TRUE,
                              ![u].pc = "dirW", ![u].dlv = FALSE]
      ELSE ecs' = [ecs EXCEPT ![u].pc = "user", ![u].tg = NULL,
+                             ![t].dpin = FALSE,
                              ![u].dir = IF CYCLE_REJECT = "self"
                                         THEN "none" ELSE @]     \* E_TERM
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
@@ -1040,6 +1074,7 @@ DirLoop(c) ==
   /\ \/ /\ IF DIR_OWNED THEN \/ ecs[t].dir # "armed"
                             \/ ecs[t].dsrc # u      \* not MY arm any more
                        ELSE ecs[t].dir # "armed"
+        /\ ~(ecs[t].dir = "failed" /\ ecs[t].dsrc = u)
         (* LITERAL Sec 2.5: "if directive_state != armed -> break". The   *)
         (* spec's break analysis enumerates only `none` (consumed) and    *)
         (* `dead` (E_TERM), but a third party's fresh `claiming` is also  *)
@@ -1064,12 +1099,27 @@ DirLoop(c) ==
                  /\ ~(DIR_GENCHK /\ staleGen)  \* target gen (rev 12, C-1)
            IN ecs' = [ecs EXCEPT ![u].pc = "user", ![u].tg = NULL,
                                  ![u].dfs = @ \/ concludesSuccess,
+                                 ![t].dpin = FALSE,
                                  ![u].dir = IF CYCLE_REJECT = "self"
                                             THEN "none" ELSE @]
+     \/ /\ ecs[t].dir = "failed"
+        /\ ecs[t].dsrc = u
+        /\ ecs[t].dres = "fail"
+        (* Owner-side consume failure is a terminal result for THIS arm,   *)
+        (* not success. The matching waiter reads dres while the word is   *)
+        (* failed, ACKs by clearing the word, and returns the real error   *)
+        (* abstracted by dres = "fail"; dres may remain stale afterward.   *)
+        /\ ecs' = [ecs EXCEPT ![t].dir = "none",
+                              ![t].dpin = FALSE,
+                              ![t].dsrc = NULL,
+                              ![u].pc = "user", ![u].tg = NULL,
+                              ![u].dir = IF CYCLE_REJECT = "self"
+                                         THEN "none" ELSE @]
      \/ /\ ecs[t].dir = "armed"
         /\ DIR_OWNED => ecs[t].dsrc = u   \* still MY arm (C-D failure 2)
         /\ ecs[t].st # "running"                  \* left `running`
         /\ ecs' = [ecs EXCEPT ![t].dir = "none",  \* disarm CAS wins
+                              ![t].dpin = FALSE,
                               ![t].dbad = @ \/ (ecs[t].dsrc # u),  \* GHOST
                               ![t].dsrc = NULL,
                               ![u].pc = "user", ![u].tg = NULL,
@@ -1077,26 +1127,36 @@ DirLoop(c) ==
                                          THEN "none" ELSE @]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
-(* ROUND-10 C-D: the owner's STALE-PORT DROP arm. Sec 2.5 has always had  *)
-(* this arm ("gen-validate the port; stale => drop") and the model has     *)
-(* never had it -- there is no port and no gen anywhere in this module, so *)
-(* DirConsume consumed unconditionally and the whole ABA family was        *)
-(* unreachable. This action is the drop, abstracted to what the lifecycle  *)
-(* machine can see: the owner CASes `armed -> none` and parks NOTHING,     *)
-(* like every other exit from `armed`. It is what makes C-D's two          *)
-(* failures constructible, and it is also what round-11 C-1 needs: the     *)
-(* drop is what makes the port half of the break disambiguator matter.     *)
+(* Owner-side stale/bad-port consume failure. This keeps the historical    *)
+(* DirDrop name and DROP_BUDGET switch because the configs use them, but   *)
+(* it no longer models stale port as `armed -> none`. The owner publishes  *)
+(* failure and transitions `armed -> failed`; only the matching waiter      *)
+(* acks failed -> none in DirLoop. dres may remain stale after the ack.     *)
 DirDrop(c) ==
   LET e == cores[c].cur IN
   /\ DIR_ON /\ DIR_DROP
   /\ pb > 0 /\ pb' = pb - 1
   /\ EcCtx(c) /\ ecs[e].pc = "user" /\ ecs[e].st = "running"
   /\ ecs[e].dir = "armed"
+  /\ ecs[e].dsrc # NULL
   /\ ecs[e].pin = 0
-  /\ ecs' = [ecs EXCEPT ![e].dir = "none",
-                        ![e].pok = FALSE,     \* the port went stale
-                        ![e].dsrc = NULL]
+  /\ ecs' = [ecs EXCEPT ![e].pok = FALSE,     \* the port went stale
+                        ![e].dres = "fail", ![e].dir = "failed"]
   /\ UNCHANGED <<cores, tb, cb, db>>
+
+(* Other owner-side consume failure with a live target/port. Same result   *)
+(* publication/ack protocol as DirDrop; separate so stale-port failures    *)
+(* can remain budgeted for old ABA scopes.                                 *)
+DirFail(c) ==
+  LET e == cores[c].cur IN
+  /\ DIR_ON
+  /\ EcCtx(c) /\ ecs[e].pc = "user" /\ ecs[e].st = "running"
+  /\ ecs[e].dir = "armed"
+  /\ ecs[e].dsrc # NULL
+  /\ ecs[e].pok
+  /\ ecs[e].shot = "none" /\ ecs[e].pin = 0
+  /\ ecs' = [ecs EXCEPT ![e].dres = "fail", ![e].dir = "failed"]
+  /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (* Owner-side consumption at a user-boundary entry check (Sec 3.1 rule 3): *)
 (* gen-validate the port (abstracted), standard edge-3 park into it.       *)
@@ -1135,7 +1195,7 @@ FireAt(c, e) ==
         /\ ecs[e].st = "waiting"
         /\ ecs' = [ecs EXCEPT ![e].st = "claimed", ![e].shot = "consumed",
                               ![e].hld = [ty |-> "irq", cid |-> c],
-                              ![e].lnk = FALSE]
+                              ![e].pin = @ + 1, ![e].lnk = FALSE]
         /\ cores' = [cores EXCEPT ![c].irq =
                       [op |-> "wake", tgt |-> e, ph |-> "place"]]
      \/ (* 5b from interrupt context, rev 5: pend and be done *)
@@ -1144,7 +1204,7 @@ FireAt(c, e) ==
         /\ ecs' = [ecs EXCEPT ![e].st = "pended", ![e].shot = "consumed",
                               ![e].po = TRUE, ![e].pd = FALSE,
                               ![e].hld = [ty |-> "irq", cid |-> c],
-                              ![e].lnk = FALSE]
+                              ![e].pin = @ + 1, ![e].lnk = FALSE]
         /\ cores' = [cores EXCEPT ![c].irq =
                       [op |-> "wake", tgt |-> e, ph |-> "pend"]]
      \/ (* pop finds the target already `retired` (retire CAS done, its   *)
@@ -1168,7 +1228,7 @@ FireAt(c, e) ==
         /\ ecs[e].own # c
         /\ ecs' = [ecs EXCEPT ![e].st = "claimed", ![e].shot = "consumed",
                               ![e].hld = [ty |-> "irq", cid |-> c],
-                              ![e].lnk = FALSE]
+                              ![e].pin = @ + 1, ![e].lnk = FALSE]
         /\ cores' = [cores EXCEPT ![c].irq =
                       [op |-> "wake", tgt |-> e, ph |-> "relwait"]]
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -1180,14 +1240,14 @@ IrqWakePlace(c) ==
   /\ f # NULL /\ f.op = "wake" /\ f.ph = "place"
   /\ IF ecs[t].st = "claimed"
      THEN /\ ecs' = [ecs EXCEPT ![t].st = "ready", ![t].hld = NULL,
-                                ![t].shot = "none"]
+                                ![t].pin = @ - 1, ![t].shot = "none"]
           /\ \E d \in Cores:
                cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}]
      ELSE /\ ecs[t].st = "retired"          \* holder's placement CAS fails
           /\ ecs' = [ecs EXCEPT ![t].st = "freed", ![t].mo = FALSE,
-                                ![t].hld = NULL,
+                                ![t].hld = NULL, ![t].pin = @ - 1,
                                 ![t].shot = "none",
-                                ![t].dir = "none", ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
+                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1196,7 +1256,8 @@ IrqPendDone(c) ==
   LET f == cores[c].irq
       t == f.tgt IN
   /\ f # NULL /\ f.op = "wake" /\ f.ph = "pend"
-  /\ ecs' = [ecs EXCEPT ![t].pd = TRUE, ![t].hld = NULL]
+  /\ ecs' = [ecs EXCEPT ![t].pd = TRUE, ![t].hld = NULL,
+                        ![t].pin = @ - 1]
   /\ cores' = [cores EXCEPT ![c].irq = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1212,14 +1273,15 @@ IrqRelwait(c) ==
   /\ IF ecs[t].st = "claimed"
      THEN /\ ecs' = [ecs EXCEPT ![t].st = "ready", ![t].hld = NULL,
                                 ![t].own = NULL,
-                                ![t].pk = "none", ![t].shot = "none"]
+                                ![t].pk = "none", ![t].pin = @ - 1,
+                                ![t].shot = "none"]
           /\ \E d \in Cores:
                cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}]
      ELSE /\ ecs[t].st = "retired"
           /\ ecs' = [ecs EXCEPT ![t].st = "freed", ![t].mo = FALSE,
-                                ![t].hld = NULL,
+                                ![t].hld = NULL, ![t].pin = @ - 1,
                                 ![t].shot = "none",
-                                ![t].dir = "none", ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
+                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1235,9 +1297,14 @@ IrqRelwait(c) ==
 (* guarded by the CURRENT state. Sec 9.2: "retire-from-`pended` asserts   *)
 (* `payload_done` before its CAS" is invariant InvRetiredPdOrdered.       *)
 (* In rev 3 (~PENDED) there is no `pended` state and no W7.               *)
+(* Current implementation retire marks the target retiring, waits target  *)
+(* lifecycle pins to drain, then performs retire/dead-gen bump under the   *)
+(* slab lock. The model represents that wait as pin = 0 in RetireEnabled. *)
 (***************************************************************************)
 RetireEnabled(e) ==
   /\ ecs[e].st \in {"ready","waiting","running","parking","claimed","pended"}
+  /\ ecs[e].pin = 0
+  /\ ~ecs[e].dpin
   /\ (ecs[e].st = "pended" /\ F1_MODE = "rev5") => ecs[e].pd
      \* W7 pre-CAS wait (rev 5). Under F1_MODE # "rev5" (the rev-4 F1
      \* gates) retire flips a pended EC with the payload incomplete.
@@ -1258,12 +1325,12 @@ RetireEcsAfter(e) ==
          [ecs EXCEPT ![e].st = "freed", ![e].mo = FALSE,
                      ![e].shot = "none",
                      ![e].own = NULL, ![e].pk = "none",
-                     ![e].lnk = FALSE, ![e].dir = "none", ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                     ![e].lnk = FALSE, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
                      ![e].pc = "user", ![e].tg = NULL]
     [] ecs[e].st = "waiting" ->                    \* inline, after unwind
          [ecs EXCEPT ![e].st = "freed", ![e].mo = FALSE,
                      ![e].shot = "none",
-                     ![e].own = NULL, ![e].lnk = FALSE, ![e].dir = "none", ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                     ![e].own = NULL, ![e].lnk = FALSE, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
                      ![e].pc = "user", ![e].tg = NULL]
     [] ecs[e].st = "running" ->                    \* boundary/hop discovery
          [ecs EXCEPT ![e].st = "retired", ![e].mo = FALSE]
@@ -1464,31 +1531,36 @@ PinUnlock(c) ==
 
 (***************************************************************************)
 (* Edge 1 beyond Init: publish-last creation into a freed slot (slab       *)
-(* reuse), CAS-then-link under the destination lock (S8); a vCPU may       *)
-(* publish into waiting(exit_port) (Sec 8.5). The CD-lock domain-liveness  *)
-(* gate and private-unwind arm are not modelled (domains are one flag).    *)
+(* reuse), then ready placement under the destination run-queue lock (S8). *)
+(* vCPU create uses the same runnable-first shape: the initial vm_exit is  *)
+(* synthesized by first dispatch and the normal running->parking wait      *)
+(* publication, not by publishing the new EC directly into a port wait     *)
+(* container. The exit-port vCPU list/bind pin is outside this model's     *)
+(* wait-container `lnk` bit; the implementation holds a lifecycle pin and *)
+(* the port lock across list publication + enqueue. The CD-lock           *)
+(* domain-liveness gate and private-unwind arm are not modelled (domains  *)
+(* are one flag).                                                         *)
 (***************************************************************************)
 CreateEC(c) ==
   LET w == cores[c].cur IN
   /\ cb > 0 /\ cb' = cb - 1 /\ UNCHANGED <<tb, db, pb>>
   /\ EcCtx(c) /\ ecs[w].pc = "user" /\ ecs[w].st = "running"
   /\ ecs[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
-  /\ \E e \in ECs \ {w}, d \in Cores, vcpu \in BOOLEAN:
+  /\ \E e \in ECs \ {w}, d \in Cores:
        /\ ecs[e].st = "freed"
        /\ ecs' = [ecs EXCEPT ![e] =
-                    [st |-> IF vcpu THEN "waiting" ELSE "ready",
+                    [st |-> "ready",
                      pk |-> "none", shot |-> "none",
                      own |-> NULL, pin |-> 0, pd |-> FALSE, po |-> FALSE,
                      hld |-> NULL, mo |-> FALSE,
                      pc |-> "user", tg |-> NULL,
-                     ks |-> NULL, lnk |-> vcpu, plk |-> "none",
-                     dir |-> "none", dbad |-> FALSE,
+                     ks |-> NULL, lnk |-> FALSE, plk |-> "none",
+                     dir |-> "none", dres |-> "none", dpin |-> FALSE, dbad |-> FALSE,
                      gen |-> ecs[e].gen,   \* INHERIT, never reset (round-12)
                      dgen |-> 0,
                      dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
                      dsrc |-> NULL, dd |-> FALSE]]
-       /\ cores' = IF vcpu THEN cores
-                   ELSE [cores EXCEPT ![d].q = @ \cup {e}]
+       /\ cores' = [cores EXCEPT ![d].q = @ \cup {e}]
 
 (***************************************************************************)
 (* recv with a queued sender (Sec 8.3): pop = 5a claim under the port      *)
@@ -1506,8 +1578,8 @@ RecvPop(c) ==
        /\ ecs[t].st = "waiting"
        /\ ecs' = [ecs EXCEPT ![t].st = "claimed",
                              ![t].hld = [ty |-> "ec", id |-> w],
-                             ![t].shot = "none", ![t].lnk = FALSE,
-                             ![w].pin = @ + 1, ![w].pc = "suspC",
+                             ![t].shot = "none", ![t].pin = @ + 1, ![t].lnk = FALSE,
+                             ![w].pc = "suspC",
                              ![w].tg = t]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
@@ -1580,7 +1652,7 @@ AffMove(c) ==
             /\ cores' = [cores EXCEPT ![qc].q = @ \ {t}]
             /\ ecs' = [ecs EXCEPT ![t].st = "claimed",
                                   ![t].hld = [ty |-> "ec", id |-> w],
-                                  ![w].pin = @ + 1, ![w].pc = "wakeC",
+                                  ![t].pin = @ + 1, ![w].pc = "wakeC",
                                   ![w].tg = t]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1628,7 +1700,7 @@ Request(c) ==
   \/ UserPark(c) \/ WakeStart(c) \/ SuspendStart(c) \/ RecvPop(c)
   \/ FastPath(c) \/ ReplyFP(c) \/ RvStart(c) \/ DirClaim(c)
   \/ DirSelfMark(c)
-  \/ DirConsume(c) \/ DirDrop(c) \/ PinAcq(c) \/ CreateEC(c) \/ TermStart(c)
+  \/ DirConsume(c) \/ DirFail(c) \/ DirDrop(c) \/ PinAcq(c) \/ CreateEC(c) \/ TermStart(c)
   \/ AffMove(c)
 
 Next ==
@@ -1881,19 +1953,22 @@ InvS4Pended ==
       /\ \/ cores[ecs[e].own].outg = e
          \/ cores[ecs[e].own].cur = e
 
-(* Rev 4 T2 unreachable cells (X1 closure): no pinned frame is ever        *)
-(* `ready` or requeue-`parking`, and every hop is entered with the         *)
-(* outgoing EC's claims discharged (Sec 2.4 assert).                       *)
+(* Rev 4 T2 unreachable cells (X1 closure): no pin-class-holding frame is *)
+(* ever requeue-`parking`, and every hop is entered without an outgoing    *)
+(* pin-class lock. Claim continuations may be preempted after pinning the  *)
+(* protected target; the target pin, not the claimant, gates target retire. *)
+(* `ready` may carry a transient target lifecycle pin while a holder       *)
+(* publishes/enqueues it; containment remains the run queue, and           *)
+(* RetireEnabled waits pin = 0.                                           *)
 InvPinCells ==
   \A e \in ECs:
-    /\ ecs[e].st = "ready" => ecs[e].pin = 0
-    /\ (ecs[e].st = "parking" /\ ecs[e].pk = "requeue") => ecs[e].pin = 0
+    (ecs[e].st = "parking" /\ ecs[e].pk = "requeue") => ecs[e].pin = 0
 
 InvHopUnpinned ==
   \A c \in Cores:
     (cores[c].pc \in {"hopRel","hopCommit"}
        /\ cores[c].outg # NULL) =>
-      ecs[cores[c].outg].pin = 0
+      ecs[cores[c].outg].plk = "none"
 
 (* ROUND-7 C1. T2's ready x K justification, stated as an invariant: "a    *)
 (* requeue-preempted frame holds no lock at all -- IRQ-masked sections     *)
@@ -1938,10 +2013,10 @@ InvNoPreemptedLockHolder ==
 (* disarm fires against an arm the disarmer did not place; no protocol     *)
 (* action reads it.                                                        *)
 (*                                                                        *)
-(* C-D failure 1 (reporting SUCCESS for a dropped suspension) is NOT       *)
-(* checkable here and the ledger says so: the disambiguation is a port     *)
-(* GEN re-validation, and this module has no port and no gen. That half    *)
-(* of the fix rests on Sec 2.5's text and the Sec 9.2 assert alone.        *)
+(* C-D failure 1 (reporting SUCCESS for an owner-side failure) is checked  *)
+(* by the `failed`/dres path: owner failures are acked by the matching     *)
+(* waiter and do not set dlv. Port result payloads are abstracted to one   *)
+(* failure value because lifecycle correctness only needs error-vs-success.*)
 InvNoForeignDisarm == \A e \in ECs: ~ecs[e].dbad
 
 (* ROUND-11 C-1. A suspender must never return SUCCESS for a suspension   *)
@@ -2037,7 +2112,14 @@ LiveClaim ==     \* L6: every claim/pend hand-off is discharged
 
 LiveSuspender == \* W5: the suspender's terminal re-check/disarm loop
                  \* returns (Sec 2.5: consumed, disarmed, or E_TERM)
-  \A e \in ECs: ecs[e].pc = "dirW" ~> ecs[e].pc # "dirW"
+                 \* unless another lifecycle operation externally parks or
+                 \* kills the suspender itself. The latter is the same
+                 \* liveness scoping as LiveReady's claimed/retired exits:
+                 \* no property forces a future user resume request.
+  \A e \in ECs:
+    ecs[e].pc = "dirW" ~>
+      \/ ecs[e].pc # "dirW"
+      \/ ecs[e].st \in {"waiting","claimed","pended","retired","freed"}
 
 LiveTerm ==      \* L5/W3/W4: terminate returns (eviction + marking done)
   \A e \in ECs: ecs[e].pc = "termW" ~> ecs[e].pc # "termW"

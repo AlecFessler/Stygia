@@ -17,8 +17,27 @@ const test_tag = @import("test_tag");
 pub const PASS_CODE: u64 = 1;
 pub const FAIL_CODE: u64 = 0;
 
+inline fn markReportEntered(result_code: u64, assertion_id: u64) void {
+    // TEMP DIAGNOSTIC (Rawls x86 MISS attribution, REMOVE). Non-elidable
+    // user-side marker before the raw report suspend. This does not alter
+    // the report ABI; it only gives the compiler a real side effect at the
+    // report entry boundary.
+    asm volatile (""
+        :
+        : [code] "r" (result_code),
+          [aid] "r" (assertion_id),
+          [tag] "r" (@as(u64, test_tag.TAG)),
+        : .{ .memory = true });
+}
+
 pub fn report(result_code: u64, assertion_id: u64) void {
-    _ = syscall.issueRawNoStack(0, .{
+    // This report is intentionally fire-and-forget: the runner resumes
+    // the child by replying after it records the result. Use the discard
+    // syscall form so ReleaseSmall cannot prove the returned Regs dead
+    // and elide the suspend entirely. Keep the raw word at 0 so report
+    // still exercises the no-attachment fast-suspend ABI.
+    markReportEntered(result_code, assertion_id);
+    syscall.issueRawDiscard(0, .{
         .v1 = caps.SLOT_INITIAL_EC,
         .v2 = caps.SLOT_FIRST_PASSED,
         .v3 = result_code,

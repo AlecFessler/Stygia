@@ -266,12 +266,13 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
             dbg_info.getSymbolName(pc - debug_info.kaslr_slide)
         else
             null;
+        arch.boot.printRaw("PC: 0x");
+        printHex(pc);
         if (sym) |s| {
+            arch.boot.printRaw(" ");
             arch.boot.printRaw(s);
             arch.boot.printRaw("\n");
         } else {
-            arch.boot.printRaw("PC: 0x");
-            printHex(pc);
             arch.boot.printRaw(" (no symbol)\n");
         }
         if (rec[0] <= fp) break;

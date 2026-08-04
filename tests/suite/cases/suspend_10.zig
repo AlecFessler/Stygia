@@ -125,62 +125,62 @@ const SENTINEL_Z: u64 = 0xFEED_FACE_BAAD_F00D;
 var observed_r: u64 = 0;
 var observed_z: u64 = 0;
 
-// Phase A trampoline: write the shared-memory witness, pin the vreg-13
-// backing register to the sentinel, then loop. The release store
-// ensures the test EC's acquire load on observed_r happens-after the
-// witness write. The mov is architecturally required to retire before
-// any subsequent instruction the EC executes, so once observed_r ==
-// SENTINEL_R, the backing register holds SENTINEL_R until the EC is
-// rescheduled.
+// Phase A trampoline: pin the vreg-13 backing register to the sentinel,
+// publish the shared-memory witness with release ordering, then loop.
+// The release store ensures the test EC's acquire load on observed_r
+// happens-after the register setup, so once observed_r == SENTINEL_R,
+// the backing register holds SENTINEL_R until the EC is rescheduled.
 //
 // Per §[event_state]:
 //   x86-64: vreg 13 = r15
 //   aarch64: vreg 13 = x12 (vreg 1..31 = x0..x30)
 fn entryR() callconv(.c) noreturn {
-    @atomicStore(u64, &observed_r, SENTINEL_R, .release);
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
             \\ movabsq $0xDEADBEEFCAFEF00D, %%r15
+            \\ movq    %%r15, (%[observed])
             \\ 1: pause
             \\    jmp 1b
             :
-            :
-            : .{ .r15 = true }),
+            : [observed] "r" (&observed_r)
+            : .{ .r15 = true, .memory = true }),
         .aarch64 => asm volatile (
             \\ movz x12, #0xF00D
             \\ movk x12, #0xCAFE, lsl #16
             \\ movk x12, #0xBEEF, lsl #32
             \\ movk x12, #0xDEAD, lsl #48
+            \\ stlr x12, [%[observed]]
             \\ 1: yield
             \\    b 1b
             :
-            :
-            : .{ .x12 = true }),
+            : [observed] "r" (&observed_r)
+            : .{ .x12 = true, .memory = true }),
         else => @compileError("unsupported arch"),
     }
     unreachable;
 }
 
 fn entryZ() callconv(.c) noreturn {
-    @atomicStore(u64, &observed_z, SENTINEL_Z, .release);
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
             \\ movabsq $0xFEEDFACEBAADF00D, %%r15
+            \\ movq    %%r15, (%[observed])
             \\ 1: pause
             \\    jmp 1b
             :
-            :
-            : .{ .r15 = true }),
+            : [observed] "r" (&observed_z)
+            : .{ .r15 = true, .memory = true }),
         .aarch64 => asm volatile (
             \\ movz x12, #0xF00D
             \\ movk x12, #0xBAAD, lsl #16
             \\ movk x12, #0xFACE, lsl #32
             \\ movk x12, #0xFEED, lsl #48
+            \\ stlr x12, [%[observed]]
             \\ 1: yield
             \\    b 1b
             :
-            :
-            : .{ .x12 = true }),
+            : [observed] "r" (&observed_z)
+            : .{ .x12 = true, .memory = true }),
         else => @compileError("unsupported arch"),
     }
     unreachable;

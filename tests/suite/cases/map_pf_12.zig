@@ -84,13 +84,18 @@
 //        bind_event_route accepts the port; recv so the test EC can
 //        dequeue.
 //     c. Mint a worker EC with caps = {term, susp, bind} and entry =
-//        &workerEntry. The EC starts on its own core and spins on
-//        worker_go.
+//        &workerEntry. Affinity 0 places it on the creating core, where
+//        it spins on worker_go.
 //     d. bind_event_route(worker, memory_fault=1, port). Returns OK
 //        because the EC handle has bind and the port has bind.
-//     e. Atomically set worker_go = 1. The worker reads worker_kind,
-//        attempts the access, then either faults (kernel suspends it
-//        on the route's port) or sets worker_done = 1 and halts.
+//     e. Atomically set worker_go = 1, then yield(worker). The targeted
+//        yield is part of the scaffold: without it, a merely ready worker
+//        can sit behind unrelated normal-priority test ECs in a contended
+//        batch, and a short recv timeout would measure scheduler latency
+//        rather than the map_pf permission rule. The worker reads
+//        worker_kind, attempts the access, then either faults (kernel
+//        suspends it on the route's port) or sets worker_done = 1 and
+//        halts.
 //     f. recv(port, timeout). Two outcomes:
 //        - regs.v1 == OK and word's event_type field == 1
 //          (memory_fault): kernel correctly denied. Read the subcode
@@ -159,9 +164,12 @@
 //     3   map_pf failed.
 //     4   allowed-read leg byte fidelity mismatch.
 //     5   allowed-write leg byte fidelity mismatch.
-//     6   denied-write leg: recv returned non-OK, non-E_TIMEOUT.
+//     6   denied-write leg: scaffold syscall or recv returned non-OK,
+//         non-E_TIMEOUT. Detailed aid format below identifies which
+//         operation and its returned status.
 //     7   denied-write leg: recv returned OK with event_type !=
-//         memory_fault, or subcode != invalid_write.
+//         memory_fault, or subcode != invalid_write. Detailed aid format
+//         below reports the actual event_type or subcode.
 //     8   denied-write leg: recv timed out AND worker_done == 1
 //         (kernel allowed the write where spec demands denial).
 //     9   denied-write leg: recv timed out, worker_done == 0, but the
@@ -172,9 +180,12 @@
 //         with.
 //    10   execute-leg setup (side-VMAR for code planting) failed.
 //    11   allowed-execute leg: planted code didn't return cleanly.
-//    12   denied-execute leg: recv returned non-OK, non-E_TIMEOUT.
+//    12   denied-execute leg: scaffold syscall or recv returned non-OK,
+//         non-E_TIMEOUT. Detailed aid format below identifies which
+//         operation and its returned status.
 //    13   denied-execute leg: recv returned OK with event_type !=
-//         memory_fault, or subcode != invalid_execute.
+//         memory_fault, or subcode != invalid_execute. Detailed aid format
+//         below reports the actual event_type or subcode.
 //    14   denied-execute leg: recv timed out AND worker_done == 1
 //         (kernel allowed execute where spec demands denial).
 //    15   denied-execute leg: recv timed out, worker_done == 0, worker
@@ -187,10 +198,28 @@
 //         executed its first instruction (worker_started == 0). The
 //         create_execution_context call returned a handle, so this is
 //         not a creation failure: the EC was never dispatched for the
-//         whole 30 s recv window. Nothing about the mapping under test
-//         can produce that, so a 20 indicts the scheduler, not the
-//         fault path. Split out of id 9 (stygia-ojs).
+//         whole handoff + recv window. Nothing about the mapping under
+//         test can produce that once yield(worker) has targeted it, so a
+//         20 indicts target-aware dispatch, not the fault path. Split out
+//         of id 9 (stygia-ojs).
 //    21   denied-execute leg: same as 20 for the execute leg (was 15).
+//
+// Detailed denied-access aids
+//   The ordinary aid is `cell * 100 + leg`. Denied-leg diagnostics that
+//   need the hidden syscall/event value report:
+//
+//       aid = cell * 10_000_000 + leg * 100_000 + source * 10_000 + value
+//
+//   `source` values:
+//     1 create_port status
+//     2 create_execution_context status
+//     3 bind_event_route status
+//     4 yieldEc status
+//     5 recv unexpected status
+//     6 recv OK, actual event_type
+//     7 recv OK, actual subcode
+//
+//   Example: aid 51240001 means cell 5, leg 12, `yieldEc` returned 1.
 //
 // Read-leg note
 //   The "always-allowed read" arm only fires once per cell (we test
@@ -262,16 +291,17 @@ const KIND_EXECUTE: u8 = 2;
 // and define no aging — and `affinity = 0` places the worker on the
 // CREATING core, where it cannot migrate. So with any `normal` EC
 // runnable on that core the `idle` worker is never dispatched: under
-// -Dbatch=16 the worker never executed a single instruction inside the
-// 30 s recv window (assertion 20), while uncontended it ran instantly
-// and the test passed 50/50.
+// -Dbatch=16 the worker never executed a single instruction before the
+// test's recv timeout (assertion 20/21), while uncontended it ran
+// instantly and the test passed 50/50.
 //
 // Requesting `normal` makes the worker a scheduling peer of the test EC
-// that waits on it, which is what every leg here assumes. It does not
-// soften any assertion: the denied-access legs still require the kernel
-// to raise memory_fault with the right subcode, and a kernel that
-// wrongly PERMITS the access still fails via worker_done == 1
-// (assertions 8 / 14).
+// that waits on it. The denied-access scaffold then uses yield(worker)
+// after route setup to actively hand off to that peer instead of relying
+// on batch-wide FIFO latency. It does not soften any assertion: the
+// denied-access legs still require the kernel to raise memory_fault with
+// the right subcode, and a kernel that wrongly PERMITS the access still
+// fails via worker_done == 1 (assertions 8 / 14).
 const PRIORITY_NORMAL: u64 = 1 << 32;
 
 fn cpuPause() void {
@@ -414,14 +444,49 @@ const RecvOutcome = enum {
     timeout_worker_survived, // kernel allowed; spec violation
     timeout_worker_stuck, // worker ran, then neither faulted nor ran past
     timeout_worker_never_started, // worker EC never dispatched at all
-    other_error,
+    scaffold_error,
+    recv_error,
+    wrong_event,
+    wrong_subcode,
 };
+
+const DetailSource = enum(u64) {
+    create_port = 1,
+    create_execution_context = 2,
+    bind_event_route = 3,
+    yield_ec = 4,
+    recv_status = 5,
+    event_type = 6,
+    subcode = 7,
+};
+
+const DETAIL_SOURCE_SCALE: u64 = 10_000;
+const DETAIL_LEG_SCALE: u64 = 100_000;
+const DETAIL_CELL_SCALE: u64 = 10_000_000;
+const DETAIL_VALUE_MAX: u64 = DETAIL_SOURCE_SCALE - 1;
 
 const RecvResult = struct {
     outcome: RecvOutcome,
     subcode: u64,
-    error_v1: u64,
+    detail: u64,
 };
+
+fn detailCode(source: DetailSource, value: u64) u64 {
+    return @intFromEnum(source) * DETAIL_SOURCE_SCALE + @min(value, DETAIL_VALUE_MAX);
+}
+
+fn detailedLeg(leg_id: u64, detail: u64) u64 {
+    return leg_id * DETAIL_LEG_SCALE + detail;
+}
+
+fn assertionAid(cell_index: usize, leg_or_detail: u64) u64 {
+    if (leg_or_detail >= DETAIL_LEG_SCALE) {
+        const leg_id = leg_or_detail / DETAIL_LEG_SCALE;
+        const detail = leg_or_detail % DETAIL_LEG_SCALE;
+        return @as(u64, cell_index) * DETAIL_CELL_SCALE + leg_id * DETAIL_LEG_SCALE + detail;
+    }
+    return @as(u64, cell_index) * 100 + leg_or_detail;
+}
 
 fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
     @atomicStore(u32, &worker_done, 0, .release);
@@ -434,7 +499,7 @@ fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
     const port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {
-        return .{ .outcome = .other_error, .subcode = 0, .error_v1 = cp.v1 };
+        return .{ .outcome = .scaffold_error, .subcode = 0, .detail = detailCode(.create_port, cp.v1) };
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
@@ -454,7 +519,7 @@ fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
     );
     if (testing.isHandleError(cec.v1)) {
         _ = syscall.delete(port_handle);
-        return .{ .outcome = .other_error, .subcode = 0, .error_v1 = cec.v1 };
+        return .{ .outcome = .scaffold_error, .subcode = 0, .detail = detailCode(.create_execution_context, cec.v1) };
     }
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
@@ -464,36 +529,47 @@ fn driveDeniedAccess(addr: u64, kind: u8, expect_subcode: u64) RecvResult {
         _ = syscall.terminate(w_handle);
         _ = syscall.delete(w_handle);
         _ = syscall.delete(port_handle);
-        return .{ .outcome = .other_error, .subcode = 0, .error_v1 = bind.v1 };
+        return .{ .outcome = .scaffold_error, .subcode = 0, .detail = detailCode(.bind_event_route, bind.v1) };
     }
 
-    // Release the worker.
+    // Release the worker, then explicitly hand off to it. A plain recv
+    // timeout is not a scheduler-progress guarantee under full-suite
+    // contention: the worker shares the parent test's priority and can be
+    // queued behind unrelated normal-priority ECs on the same core.
     @atomicStore(u32, &worker_go, 1, .release);
+    const handoff = syscall.yieldEc(@as(u64, w_handle));
+    if (handoff.v1 != @intFromEnum(errors.Error.OK)) {
+        _ = syscall.terminate(w_handle);
+        _ = syscall.delete(w_handle);
+        _ = syscall.delete(port_handle);
+        return .{ .outcome = .scaffold_error, .subcode = 0, .detail = detailCode(.yield_ec, handoff.v1) };
+    }
 
     // Wait for memory_fault delivery or timeout.
     const got = syscall.recv(port_handle, RECV_TIMEOUT_NS);
 
-    var result: RecvResult = .{ .outcome = .other_error, .subcode = 0, .error_v1 = got.regs.v1 };
+    var result: RecvResult = .{ .outcome = .recv_error, .subcode = 0, .detail = detailCode(.recv_status, got.regs.v1) };
 
     if (got.regs.v1 == @intFromEnum(errors.Error.OK)) {
         const event_type: u64 = (got.word >> 44) & 0x1F;
         if (event_type == EVENT_MEMORY_FAULT and got.regs.v2 == expect_subcode) {
-            result = .{ .outcome = .fault_delivered, .subcode = got.regs.v2, .error_v1 = 0 };
+            result = .{ .outcome = .fault_delivered, .subcode = got.regs.v2, .detail = 0 };
+        } else if (event_type != EVENT_MEMORY_FAULT) {
+            result = .{ .outcome = .wrong_event, .subcode = got.regs.v2, .detail = detailCode(.event_type, event_type) };
         } else {
-            // Wrong event or wrong subcode.
-            result = .{ .outcome = .other_error, .subcode = got.regs.v2, .error_v1 = event_type };
+            result = .{ .outcome = .wrong_subcode, .subcode = got.regs.v2, .detail = detailCode(.subcode, got.regs.v2) };
         }
     } else if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
         if (@atomicLoad(u32, &worker_done, .acquire) == 1) {
-            result = .{ .outcome = .timeout_worker_survived, .subcode = 0, .error_v1 = 0 };
+            result = .{ .outcome = .timeout_worker_survived, .subcode = 0, .detail = 0 };
         } else if (@atomicLoad(u32, &worker_started, .acquire) == 0) {
             // The worker EC was created successfully (create_execution_context
             // returned a handle) but never executed its first instruction in
             // the whole recv window. Nothing about the mapping under test can
             // cause that — it is a dispatch failure.
-            result = .{ .outcome = .timeout_worker_never_started, .subcode = 0, .error_v1 = 0 };
+            result = .{ .outcome = .timeout_worker_never_started, .subcode = 0, .detail = 0 };
         } else {
-            result = .{ .outcome = .timeout_worker_stuck, .subcode = 0, .error_v1 = 0 };
+            result = .{ .outcome = .timeout_worker_stuck, .subcode = 0, .detail = 0 };
         }
     }
 
@@ -639,22 +715,14 @@ fn runCell(vmar_rwx: u3, pf_rwx: u3, failed_assertion: *u64) bool {
                 _ = syscall.delete(pf_handle);
                 return false;
             },
-            .other_error => {
-                // Distinguish "wrong event/subcode" (which surfaces
-                // as outcome=.other_error with error_v1 == 0) from
-                // genuine other errors (port/EC/bind setup
-                // failure). The driveDeniedAccess fault path stores
-                // the OK return as error_v1=event_type when it
-                // mismatches; the timeout/non-OK path stores the
-                // syscall error code. We use assertion 7 for
-                // wrong-event, 6 for general other. error_v1 is the
-                // syscall return; OK=0 means we got into the
-                // wrong-event branch.
-                if (r.error_v1 == 0) {
-                    failed_assertion.* = 7;
-                } else {
-                    failed_assertion.* = 6;
-                }
+            .scaffold_error, .recv_error => {
+                failed_assertion.* = detailedLeg(6, r.detail);
+                _ = syscall.delete(cell.handle);
+                _ = syscall.delete(pf_handle);
+                return false;
+            },
+            .wrong_event, .wrong_subcode => {
+                failed_assertion.* = detailedLeg(7, r.detail);
                 _ = syscall.delete(cell.handle);
                 _ = syscall.delete(pf_handle);
                 return false;
@@ -708,12 +776,14 @@ fn runCell(vmar_rwx: u3, pf_rwx: u3, failed_assertion: *u64) bool {
                 _ = syscall.delete(pf_handle);
                 return false;
             },
-            .other_error => {
-                if (r.error_v1 == 0) {
-                    failed_assertion.* = 13;
-                } else {
-                    failed_assertion.* = 12;
-                }
+            .scaffold_error, .recv_error => {
+                failed_assertion.* = detailedLeg(12, r.detail);
+                _ = syscall.delete(cell.handle);
+                _ = syscall.delete(pf_handle);
+                return false;
+            },
+            .wrong_event, .wrong_subcode => {
+                failed_assertion.* = detailedLeg(13, r.detail);
                 _ = syscall.delete(cell.handle);
                 _ = syscall.delete(pf_handle);
                 return false;
@@ -762,7 +832,7 @@ pub fn main(cap_table_base: u64) void {
 
     for (cell_passed, 0..) |ok, i| {
         if (!ok) {
-            testing.fail(@as(u64, i) * 100 + cell_leg_id[i]);
+            testing.fail(assertionAid(i, cell_leg_id[i]));
             return;
         }
     }

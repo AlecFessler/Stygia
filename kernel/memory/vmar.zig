@@ -99,6 +99,12 @@ pub const MAX_INSTALLED_PFS: usize = 64;
 /// null` marks an empty slot in the inline `installed_pfs` array.
 pub const InstalledPf = struct {
     offset: u64 = 0,
+    /// Effective permissions installed in the PTEs for this mapping:
+    /// VMAR.cur_rwx & page_frame.rwx for map_pf, or VMAR.cur_rwx for
+    /// demand pages. Used by the fault path to distinguish a genuine
+    /// denied access from a stale hardware translation fault on an
+    /// already-installed mapping.
+    effective_rwx: u3 = 0,
     /// Bound page_frame for this offset. `null` ⇒ empty slot. UAF
     /// safety: `map_pf` bumps the PageFrame's refcount; `unmap` /
     /// `destroy` decrement it under the VMAR's gen-lock.
@@ -712,7 +718,8 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
             }
             break :blk 0b111;
         };
-        const eff_perms = rwxToPerms(new_rwx & pf_rwx_for_remap);
+        const effective_rwx = new_rwx & pf_rwx_for_remap;
+        const eff_perms = rwxToPerms(effective_rwx);
         const pf_sz_bytes = pageSizeBytes(pf.sz);
         var p: u32 = 0;
         while (p < pf.page_count) : (p += 1) {
@@ -728,6 +735,7 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
                 eff_perms,
             ) catch {};
         }
+        entry.effective_rwx = effective_rwx;
     }
     dispatch.paging.shootdownTlbRange(
         domain.addr_space_id,
@@ -1007,32 +1015,31 @@ pub fn destroyVmar(v: *VMAR) void {
 
 /// VMAR teardown variant for the capability-domain destroy path:
 /// drops mapcnt for every installed page_frame, clears the leaf PTEs
-/// without issuing per-page TLB shootdowns, removes from
-/// `domain.vars[]`, and frees the slab slot. Used by `destroyPhase2`'s
-/// `cd.vars[]` walk where paying for O(page_count) IPI broadcasts per
-/// VMAR is the dominant cost — a 4 MiB-stack-sized child with multiple
-/// VMARs would otherwise eat thousands of shootdown IPIs per spawn.
+/// without issuing per-page TLB shootdowns, and frees the slab slot.
+/// Used by `destroyPhase2`'s pre-dead-mark VMAR snapshot where paying
+/// for O(page_count) IPI broadcasts per VMAR is the dominant cost — a
+/// 4 MiB-stack-sized child with multiple VMARs would otherwise eat
+/// thousands of shootdown IPIs per spawn.
 ///
 /// Skipping the shootdown is only legal AFTER `awaitDomainQuiesced`
 /// has confirmed that no core has the dying CD's translation root
 /// loaded and no core holds one of its ECs in its dispatch slot
 /// (stygia-1im). Do not call this from a context that cannot make that
 /// guarantee — use `destroyVmar` there instead.
-pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
+pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PAddr) void {
     // caller-pinned: the only caller is `capability_domain.destroyPhase2`
-    // walking `cd.vars[]` after the quiesce barrier. The CD slot is
-    // dead-marked but bytes-intact until `destroyAlreadyMarked` runs at
-    // the end of that function, and its even gen blocks every handle
-    // path from reaching these VMARs, so `v.domain.ptr` stays readable
-    // and the slot can't be reaped out from under us.
-    const domain = v.domain.ptr;
-    const gen = v._gen_lock.currentGen();
+    // walking a `vars[]` snapshot captured before the owning CD was
+    // dead-marked. `addr_space_root` was captured from that same live CD;
+    // this helper deliberately does not touch `v.domain.ptr` or mutate
+    // `domain.vars[]`, because the CD is already in even-gen teardown.
+    const v = v_ref.ptr;
+    const gen: u63 = @intCast(v_ref.gen);
     if (v.map == .page_frame or v.map == .demand) {
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
             _ = dispatch.paging.unmapPageNoShootdown(
-                domain.addr_space_root,
+                addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
             );
             off += sz_bytes;
@@ -1048,13 +1055,12 @@ pub fn destroyVmarDuringDomainTeardown(v: *VMAR) void {
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
             _ = dispatch.paging.unmapPageNoShootdown(
-                domain.addr_space_root,
+                addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
             );
             off += sz_bytes;
         }
     }
-    stygia.caps.capability_domain.removeVar(domain, v);
     slab_instance.destroy(v, gen) catch {};
 }
 
@@ -1331,6 +1337,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     }
     v.installed_pfs[slot_reserved.?] = .{
         .offset = offset,
+        .effective_rwx = effective_rwx,
         .pf = SlabRef(PageFrame).init(pf, pf._gen_lock.currentGen()),
     };
     _ = @atomicRmw(u32, &pf.mapcnt, .Add, 1, .seq_cst);
@@ -1499,6 +1506,19 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             return decodePortIoFault(domain, fault_vaddr, var_base, dev);
         },
         .page_frame => {
+            const fault_offset = fault_vaddr.addr - v.base_vaddr.addr;
+            if (installedEffectiveRwxAt(v, fault_offset)) |effective_rwx| {
+                if ((access_rwx & ~effective_rwx) == 0) {
+                    dispatch.paging.shootdownTlbRange(
+                        domain.addr_space_id,
+                        .fromInt(std.mem.alignBackward(u64, fault_vaddr.addr, pageSizeBytes(v.sz))),
+                        v.sz,
+                        1,
+                    );
+                    v._gen_lock.unlockIrqRestore(v_irq);
+                    return 0;
+                }
+            }
             v._gen_lock.unlockIrqRestore(v_irq);
             return errors.E_PERM;
         },
@@ -1566,6 +1586,17 @@ fn countInstalled(v: *VMAR) u32 {
         if (entry.pf != null) count += 1;
     }
     return count;
+}
+
+fn installedEffectiveRwxAt(v: *VMAR, offset: u64) ?u3 {
+    for (&v.installed_pfs) |*entry| {
+        const pf_ref = entry.pf orelse continue;
+        const pf = pf_ref.ptr;
+        const pf_sz_bytes = pageSizeBytes(pf.sz);
+        const end = entry.offset + @as(u64, pf.page_count) * pf_sz_bytes;
+        if (offset >= entry.offset and offset < end) return entry.effective_rwx;
+    }
+    return null;
 }
 
 /// Tear down every installed PTE / demand page, decrement mapcnts, and
@@ -1645,4 +1676,3 @@ fn decodePortIoFault(
     const ec = scheduler.currentEc() orelse return errors.E_BADADDR;
     return stygia.arch.dispatch.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev);
 }
-

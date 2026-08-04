@@ -43,9 +43,11 @@
 //! - ARM ARM D13.2.40: FAR_EL1
 
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const cpu = stygia.arch.aarch64.cpu;
 const device_region = stygia.devices.device_region;
+const execution_context = stygia.sched.execution_context;
 const fpu = stygia.sched.fpu;
 const futex = stygia.sched.futex;
 const gic = stygia.arch.aarch64.gic;
@@ -68,6 +70,9 @@ const VAddr = stygia.memory.address.VAddr;
 const ArchCpuContext = stygia.arch.aarch64.interrupts.ArchCpuContext;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const PageFaultContext = stygia.arch.aarch64.interrupts.PageFaultContext;
+const A64_PF_DIAG_BUDGET: u32 = 4096;
+
+var a64_pf_diag_prints: u32 = 0;
 
 /// ARM ARM D13.2.37 -- ESR_EL1 Exception Class field, bits [31:26].
 /// Identifies the reason for the exception that was taken to EL1.
@@ -104,6 +109,41 @@ fn extractEc(esr: u64) ExceptionClass {
 /// the fault was caused by a write (1) or a read (0).
 fn isWriteFault(esr: u64) bool {
     return (esr >> 6) & 1 == 1;
+}
+
+fn diagTag(ec: *ExecutionContext) u64 {
+    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
+    return ec.domain.ptr.diag_test_tag;
+}
+
+fn logLowerElAbort(
+    kind: []const u8,
+    ctx: *ArchCpuContext,
+    esr: u64,
+    far: u64,
+    is_write: bool,
+    is_exec: bool,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &a64_pf_diag_prints, .Add, 1, .monotonic);
+    if (n >= A64_PF_DIAG_BUDGET) return;
+    const cur = scheduler.currentEc();
+    serial.print(
+        "[a64pf] kind={s} tag=0x{x} ec=0x{x} esr=0x{x} ec_class=0x{x} fsc=0x{x} far=0x{x} elr=0x{x} w={d} x={d} pan_window={d}\n",
+        .{
+            kind,
+            if (cur) |e| diagTag(e) else 0,
+            if (cur) |e| @intFromPtr(e) else 0,
+            esr,
+            @intFromEnum(extractEc(esr)),
+            esr & 0x3f,
+            far,
+            ctx.elr_el1,
+            @intFromBool(is_write),
+            @intFromBool(is_exec),
+            @intFromBool((ctx.spsr_el1 & interrupts.SPSR_PAN) == 0),
+        },
+    );
 }
 
 /// Stable sub-code values delivered alongside a `thread_fault` event
@@ -525,6 +565,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
     const esr = readEsrEl1();
     const ec = extractEc(esr);
+    const entry_cur = scheduler.currentEc();
 
     switch (ec) {
         // Lazy-FPU trap. CPACR_EL1.FPEN was clamped to 0b01 (trap EL0)
@@ -536,6 +577,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             const ec_ptr = scheduler.currentEc() orelse
                 @panic("FP/SIMD trap with no current EC");
             fpu.handleTrap(ec_ptr);
+            consumeEntrySuspendDirective(ec_ptr, ctx);
             return;
         },
 
@@ -591,7 +633,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // with that remote write and clobber the real wake value
             // back to 0.
             const core: u8 = @truncate(gic.coreID());
-            if (scheduler.coreCurrentIs(core, caller)) {
+            if (scheduler.coreCurrentIsRunning(core, caller)) {
                 ctx.regs.x0 = @bitCast(ret);
             }
 
@@ -607,7 +649,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // caller's saved frame so ERET surfaces it. Mirrors
             // arch/x64/interrupts.zig syscallDispatch.
             if (caller.pending_event_word_valid and
-                scheduler.coreCurrentIs(core, caller))
+                scheduler.coreCurrentIsRunning(core, caller))
             {
                 interrupts.writeUserSyscallWord(ctx, caller.pending_event_word);
                 caller.pending_event_word = 0;
@@ -630,7 +672,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // on the suspended caller's kstack, which is already
             // claimable by wakers on other cores, and the hop also
             // publishes the caller's deferred `on_cpu` release.
-            if (scheduler.coreIsIdle(core)) {
+            if (!scheduler.coreCurrentIsRunning(core, caller)) {
                 scheduler.hopParkRun();
             }
             // Identity check, not just idle check. x64's syscall asm
@@ -647,7 +689,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // `caller`; anything else must go through the scheduler —
             // via the park-kstack hop: this frame IS the caller's
             // kstack, and a caller no longer current is claimable.
-            if (!scheduler.coreCurrentIs(core, caller)) {
+            if (!scheduler.coreCurrentIsRunning(core, caller)) {
                 scheduler.hopParkRun();
             }
         },
@@ -661,11 +703,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             if (interceptPortIoFault(ctx, esr)) return;
 
             const far = readFarEl1();
+            const is_write = isWriteFault(esr);
+            logLowerElAbort("data_lower", ctx, esr, far, is_write, false);
             kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
                 .is_kernel_privilege = false,
-                .is_write = isWriteFault(esr),
+                .is_write = is_write,
                 .is_exec = false,
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
@@ -684,6 +728,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
         .instruction_abort_lower_el => {
             const far = readFarEl1();
+            logLowerElAbort("inst_lower", ctx, esr, far, false, true);
             kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
@@ -720,11 +765,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
         .software_step_lower_el => {
             // Single-step from userspace: resume silently.
+            if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
             return;
         },
 
         .watchpoint_lower_el => {
             // Watchpoint from userspace: resume silently.
+            if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
             return;
         },
 
@@ -846,6 +893,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                     regs_ptr[rt] = mpidr;
                 } // rt == 31 (xzr): result discarded.
                 ctx.elr_el1 += 4; // skip the emulated instruction
+                if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
                 return;
             }
             deliverThreadFault(.illegal_instruction, ctx.elr_el1);
@@ -855,6 +903,28 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             deliverThreadFault(.protection_fault, ctx.elr_el1);
         },
     }
+    if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
+}
+
+fn consumeEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuContext) void {
+    const core: u8 = @truncate(gic.coreID());
+    if (!scheduler.coreCurrentIsRunning(core, ec_ptr)) return;
+    if (execution_context.consumeSuspendDirective(ec_ptr, ctx)) {
+        scheduler.hopParkRun();
+    }
+}
+
+fn consumeIrqEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuContext) void {
+    const core: u8 = @truncate(gic.coreID());
+    if (!scheduler.coreCurrentIsRunning(core, ec_ptr)) return;
+    // Model/spec assumption: an armed user-mode scheduler tick consumes
+    // the suspend directive before the scheduler requeue decision. This
+    // runs after EOI, so the acknowledged IRQ is not left active, but
+    // before `dispatchIrq`, whose SGI/timer arms may enter
+    // `scheduler.preempt()` and never return. Do not hop here: the IRQ
+    // body still has to run; the lower-EL tail's identity guard hops
+    // after any returning handler.
+    _ = execution_context.consumeSuspendDirective(ec_ptr, ctx);
 }
 
 /// Handler for IRQ from Lower EL (EL0 userspace).
@@ -901,6 +971,7 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // same priority (IHI 0069H §4.6: an active interrupt blocks pending).
     const entry_cur = scheduler.currentEc();
     gic.endOfInterrupt(intid);
+    if (entry_cur) |ec_ptr| consumeIrqEntrySuspendDirective(ec_ptr, ctx);
     dispatchIrq(intid, ctx, .user);
     // Identity guard, same rationale as the svc tail: the trampoline
     // epilogue ERETs the INTERRUPTED frame, which is only correct while
@@ -910,7 +981,11 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // scheduler handed elsewhere. Hop, don't run in place: this frame
     // sits on the interrupted EC's kstack, and an EC no longer current
     // is claimable by other cores.
-    if (scheduler.currentEc() != entry_cur) {
+    if (entry_cur) |ec_ptr| {
+        if (!scheduler.coreCurrentIsRunning(@truncate(gic.coreID()), ec_ptr)) {
+            scheduler.hopParkRun();
+        }
+    } else if (scheduler.currentEc() != null) {
         scheduler.hopParkRun();
     }
 }
@@ -998,7 +1073,6 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
             };
             stygia.memory.fault.handlePageFault(&pf_ctx);
         },
-
 
         else => {
             // Lock-free, same protocol as memory.fault.reportKernelFault:

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
@@ -12,6 +13,7 @@ const paging_consts = stygia.memory.paging;
 const perfmon_mod = stygia.sched.perfmon;
 const pmm = stygia.memory.pmm;
 const scheduler = stygia.sched.scheduler;
+const lifecycle = stygia.sched.lifecycle;
 const stack = stygia.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
@@ -39,68 +41,6 @@ pub const MAX_FUTEX_ADDRS_PER_EC: usize = 63;
 /// Maximum handle attachments (pair entries) carried on a suspend.
 /// Mirrors `syscall/port.zig::MAX_PAIR_COUNT`. Spec §[handle_attachments].
 pub const MAX_PAIR_ENTRIES_PER_EC: usize = 63;
-
-/// Sentinel for `ExecutionContext.last_dispatched_core` — never dispatched.
-/// `0xFF` is unreachable as a real core id (`scheduler.MAX_CORES` is 64,
-/// so valid ids occupy 0..63), giving a single byte that doubles as the
-/// "no core to defer-finalize to" signal.
-pub const LAST_DISPATCHED_NEVER: u8 = 0xFF;
-
-/// Atomically claim the right to wake `ec` out of `expected`.
-///
-/// Returns true exactly once per wait: the caller that flips
-/// `expected -> .ready` owns the wake and must be the one to enqueue.
-/// Every loser must do NOTHING — not enqueue, not write `ec.ctx`, not
-/// touch the wait-state fields. Someone else already owns this wake.
-///
-/// Why this exists. Every wake source used to write `state = .ready`
-/// and enqueue unconditionally: `markReady`, both futex paths (event
-/// wake and timeout expiry), timer-wheel expiry, and the port/reply
-/// resumes. An EC in a TIMED wait has two independent wakers — its
-/// timeout, firing on the timer core, and its event, firing on
-/// whichever core signalled. Both would see a waiting EC, both would
-/// set `.ready`, and both would enqueue it, producing two run-queue
-/// nodes on two different cores. Both cores then dispatch it and
-/// resume the SAME saved frame; whichever traps first re-saves over
-/// the other's context.
-///
-/// That is the two-cores-one-frame catastrophe, and it is the source
-/// of the whole corrupt-context family: wild kernel return addresses
-/// (`lr=1/fp=0`, `switch on corrupt value @ 0x2`), near-null user PCs
-/// and pointers (0x54, 0x80, 0xcaa, 0x8000), and the `[NOROUTE]`
-/// subcode=1/2/3 faults those degenerate into once the resumed EC
-/// touches them. Captured on bare metal as a user-privilege fault at
-/// PC=0 on core 1 with `current_ec=null`, while core 0 simultaneously
-/// held that very EC as its current.
-///
-/// Per-core run-queue locks cannot fix this: the two wakers target two
-/// different cores and take two different locks. The only common
-/// serialization point is the EC's own state word, so the claim has to
-/// live there.
-///
-/// `expected` must name a genuine WAIT state. A `.ready -> .ready`
-/// re-enqueue (preemption putting a runnable EC back on a queue) is
-/// not a wake and must not route through here — it would fail the
-/// claim and silently drop the EC off every queue.
-pub fn tryClaimWake(ec: *ExecutionContext, expected: State) bool {
-    return @cmpxchgStrong(
-        State,
-        &ec.state,
-        expected,
-        .ready,
-        .acq_rel,
-        .monotonic,
-    ) == null;
-}
-
-/// Re-send the zombie-drain wake IPI every this many failed
-/// `postZombie` attempts. See the two `postZombie` spin loops: only the
-/// TARGET core can drain its own pending-zombie column, so a halted
-/// target must be woken or the poster spins forever. One wake is not
-/// enough on its own — the target can park in the window between our
-/// wake and our next attempt, and a wake consumed just before it halts
-/// is a wake lost — so the loop re-arms periodically.
-const ZOMBIE_WAKE_RETRY_SPINS: u32 = 1024;
 
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). How many `destroyExecutionContextLocked`
 /// reaps had to fall back to the IRQ-enabling `postZombie` spin. The fix
@@ -140,22 +80,184 @@ pub var walk_visit_done: u64 = 0;
 pub var inline_finalize_ok: u64 = 0;
 pub var inline_finalize_no: u64 = 0;
 
+/// TEMP DIAGNOSTIC (Rawls x86 MISS attribution, REMOVE). Bounded raw
+/// serial budget for report-suspend entry markers. Focused x86 repros
+/// stay below this; full-suite stress runs cannot flood the log forever.
+var report_enter_prints: u32 = 0;
+const REPORT_TAG_MAGIC: u64 = 0x8000;
+const REPORT_PRINT_BUDGET: u32 = 4096;
+const PRE_REPORT_TERMINAL_PRINT_BUDGET: u32 = 64;
+var pre_report_terminal_prints: u32 = 0;
+pub const PRE_REPORT_TERMINAL_RING_LEN: usize = if (build_options.kernel_spawn_diag) 32 else 0;
+pub const SPAWN_TRACE_RING_LEN: usize = if (build_options.kernel_spawn_diag) 128 else 0;
+
+pub const SpawnTraceEvent = enum(u8) {
+    spawn_child,
+    enqueue_attempt,
+    enqueue_publish,
+    enqueue_skip_not_live,
+    enqueue_skip_not_publishable,
+    enqueue_skip_state,
+    dequeue_select,
+    dequeue_skip_not_publishable,
+    dispatch_tail,
+    report_enter,
+    terminal,
+    retire,
+    finalize,
+};
+
+pub const PreReportTerminalSample = struct {
+    publish_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    seq: u64 = 0,
+    tag: u64 = 0,
+    cd: usize = 0,
+    ec: usize = 0,
+    reason: []const u8 = "",
+};
+
+pub const SpawnTraceSample = struct {
+    publish_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    seq: u64 = 0,
+    event: SpawnTraceEvent = .spawn_child,
+    tag: u64 = 0,
+    ec: usize = 0,
+    cd: usize = 0,
+    core: u8 = 0,
+    state: u8 = 0,
+    owner: u8 = NOT_IN_RUN_QUEUE,
+    queue_core: u8 = NOT_IN_RUN_QUEUE,
+    gen: u64 = 0,
+    aux: u64 = 0,
+};
+
+pub var pre_report_terminal_seq: u64 = 0;
+pub var pre_report_terminal_ring: [PRE_REPORT_TERMINAL_RING_LEN]PreReportTerminalSample =
+    [_]PreReportTerminalSample{.{}} ** PRE_REPORT_TERMINAL_RING_LEN;
+pub var spawn_trace_seq: u64 = 0;
+pub var spawn_trace_ring: [SPAWN_TRACE_RING_LEN]SpawnTraceSample =
+    [_]SpawnTraceSample{.{}} ** SPAWN_TRACE_RING_LEN;
+
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Monotonic RMW bump helper.
 pub fn dbump(counter: *u64) void {
     _ = @atomicRmw(u64, counter, .Add, 1, .monotonic);
 }
 
+fn maybePrintReportEntered(ec: *ExecutionContext) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const tag = ec.event_state_gprs[4];
+    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+    ec.diag_report_entered = true;
+    if (ec.diag_test_tag == 0) ec.diag_test_tag = tag;
+    recordSpawnTrace(ec, null, .report_enter, 0);
+    const n = @atomicRmw(u32, &report_enter_prints, .Add, 1, .monotonic);
+    if (n >= REPORT_PRINT_BUDGET) return;
+    arch.boot.print(
+        "[rpt-enter] ec=0x{x} cd=0x{x} tag=0x{x} code={x} aid={x}\n",
+        .{
+            @intFromPtr(ec),
+            @intFromPtr(ec.domain.ptr),
+            tag,
+            ec.event_state_gprs[2],
+            ec.event_state_gprs[3],
+        },
+    );
+}
+
+pub fn printPreReportTerminal(
+    ec: ?*ExecutionContext,
+    cd: ?*CapabilityDomain,
+    reason: []const u8,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    if (ec) |e| {
+        if (e.diag_report_entered) return;
+    }
+    const tag: u64 = blk: {
+        if (ec) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
+        if (cd) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
+        break :blk 0;
+    };
+    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+
+    recordSpawnTrace(ec, cd, .terminal, 0);
+
+    const n = @atomicRmw(u32, &pre_report_terminal_prints, .Add, 1, .monotonic);
+    const seq = @atomicRmw(u64, &pre_report_terminal_seq, .Add, 1, .monotonic) + 1;
+    const slot = &pre_report_terminal_ring[seq % PRE_REPORT_TERMINAL_RING_LEN];
+    slot.publish_seq.store(0, .release);
+    slot.seq = seq;
+    slot.tag = tag;
+    slot.cd = if (cd) |d| @intFromPtr(d) else @as(usize, 0);
+    slot.ec = if (ec) |e| @intFromPtr(e) else @as(usize, 0);
+    slot.reason = reason;
+    slot.publish_seq.store(seq, .release);
+    if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return;
+
+    arch.boot.print(
+        "[pre-report-terminal] tag=0x{x} index={x} cd=0x{x} ec=0x{x} reason={s}\n",
+        .{
+            tag,
+            tag - REPORT_TAG_MAGIC,
+            if (cd) |d| @intFromPtr(d) else @as(usize, 0),
+            if (ec) |e| @intFromPtr(e) else @as(usize, 0),
+            reason,
+        },
+    );
+}
+
+pub fn recordSpawnTrace(
+    ec: ?*ExecutionContext,
+    cd: ?*CapabilityDomain,
+    event: SpawnTraceEvent,
+    aux: u64,
+) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const tag: u64 = blk: {
+        if (ec) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
+        if (cd) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
+        break :blk 0;
+    };
+    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+
+    const seq = @atomicRmw(u64, &spawn_trace_seq, .Add, 1, .monotonic) + 1;
+    const state = if (ec) |e| @intFromEnum(lifecycle.load(e)) else @as(u8, 0xff);
+    const owner = if (ec) |e| e.owner_core else NOT_IN_RUN_QUEUE;
+    const queue_core = if (ec) |e| e.current_queue_core.load(.acquire) else NOT_IN_RUN_QUEUE;
+    const gen = if (ec) |e| e._gen_lock.currentGen() else @as(u64, 0);
+
+    const slot = &spawn_trace_ring[seq % SPAWN_TRACE_RING_LEN];
+    slot.publish_seq.store(0, .release);
+    slot.seq = seq;
+    slot.event = event;
+    slot.tag = tag;
+    slot.ec = if (ec) |e| @intFromPtr(e) else @as(usize, 0);
+    slot.cd = if (cd) |d| @intFromPtr(d) else if (ec) |e| @intFromPtr(e.domain.ptr) else @as(usize, 0);
+    slot.core = @truncate(arch.smp.coreID());
+    slot.state = state;
+    slot.owner = owner;
+    slot.queue_core = queue_core;
+    slot.gen = gen;
+    slot.aux = aux;
+    slot.publish_seq.store(seq, .release);
+}
+
 /// Decoded pair entry stashed on the suspending EC at `validatePairEntries`
 /// time and consumed at recv time in `port.deliverEvent`. Captures the
 /// kernel-side `ErasedSlabRef` to the source object (lock-validated at
-/// stash time so the gen baked here matches the live object), the type
-/// tag to install on the receiver, the caps to install verbatim, the
-/// move flag (drives the sender-side slot-clear at recv), and the
-/// source slot id in the sender's domain (used to clear the sender slot
-/// when `move == true`).
+/// stash time so the gen baked here matches the live object), the
+/// original holder domain and slot, the source caps captured for
+/// expected-source revalidation, the internal caps used for the
+/// pending lifetime ref, the type tag to install on the receiver, the
+/// caps to install verbatim, and the move flag (drives the sender-side
+/// slot clear at recv).
 pub const PairEntryStashed = struct {
     obj_ref: ErasedSlabRef,
+    source_domain: ErasedSlabRef,
+    source_instance: u64,
     obj_type: CapabilityType,
+    source_caps: u16,
+    pending_ref_caps: u16,
     caps: u16,
     move: bool,
     src_slot: u12,
@@ -187,46 +289,32 @@ pub const Priority = enum(u2) {
     realtime = 3,
 };
 
-/// Sentinel for `ExecutionContext.current_queue_core` — EC is not in any
-/// per-core run queue. Same encoding rationale as `LAST_DISPATCHED_NEVER`:
-/// `0xFF` is outside the valid `0..63` core-id range, so a single byte
-/// doubles as a "no queue" signal. Defined past `Priority` so the
-/// dead-code skip.txt SHA pin on `Priority.high` (line 87,
-/// `tools/dead_code_zig/skip.txt:528`) stays valid; the constant
-/// itself is logically a sibling of `LAST_DISPATCHED_NEVER`.
+/// Sentinel for run-queue and owner-core caches. `0xFF` is outside the
+/// scheduler's 0..63 core range.
 pub const NOT_IN_RUN_QUEUE: u8 = 0xFF;
 
-/// Lifecycle state. An EC is in at most one queue at a time; the state
-/// names which one (or none, when running or exited).
-/// Backing type is explicit and byte-wide so `tryClaimWake` can
-/// `cmpxchg` it. Zig would otherwise pick a u3, which has no atomic
-/// form. One byte is also what the x86 IPC fast-path asm already
-/// assumes — it writes this field with `movb` at
-/// `@offsetOf(ExecutionContext, "state")` — so pinning u8 changes no
-/// layout and no existing code.
-pub const State = enum(u8) {
-    /// Currently executing on a CPU.
-    running,
-    /// Enqueued on a per-core run queue, waiting to be dispatched.
-    ready,
-    /// Either parked in a port wait queue OR dequeued by a recv and
-    /// awaiting reply. The flavor of suspension is in `event_type`; the
-    /// two arms are distinguished by `pending_reply_holder` being null vs set.
-    suspended_on_port,
-    /// Blocked on one or more futex addresses. Wait state lives in the
-    /// `futex_*` fields below.
-    futex_wait,
-    /// EC trapped on a hardware wait-for-interrupt-like instruction
-    /// (aarch64 wfi, x86 hlt). Off every queue; consumes no CPU. Stays
-    /// alive until its owning capability domain is destroyed, or until
-    /// a sibling EC explicitly suspends it onto a port (treated like
-    /// `.ready` by `suspend`'s pre-suspend state gate). Saved register
-    /// state in `ctx` reflects the post-wait-instruction frame so
-    /// `suspendOnPort` can snapshot vregs / event_rip without needing
-    /// to re-execute anything.
-    idle_wait,
-    /// Terminated. Awaiting slab destroy.
-    exited,
+pub const State = lifecycle.State;
+pub const WaitKind = lifecycle.WaitKind;
+
+pub const Wait = struct {
+    kind: WaitKind = .none,
+    port: ?SlabRef(Port) = null,
+    deadline_ns: u64 = 0,
+    payload_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn begin(wait: *Wait, kind: WaitKind) void {
+        wait.kind = kind;
+        wait.port = null;
+        wait.deadline_ns = 0;
+        wait.payload_done.store(false, .release);
+    }
+
+    pub fn clear(wait: *Wait) void {
+        wait.kind = .none;
+        wait.port = null;
+        wait.deadline_ns = 0;
+        wait.payload_done.store(false, .release);
+    }
 };
 
 /// Event type carried by a suspension. Matches spec §[event_type] values.
@@ -290,6 +378,12 @@ pub const ExecutionContext = struct {
     /// Bound capability domain. Set at create time; immutable.
     domain: SlabRef(CapabilityDomain),
 
+    /// TEMP DIAGNOSTIC (Rawls x86 MISS attribution, REMOVE). Test-child
+    /// identity copied from the owning CD at spawn time. Kernel-private:
+    /// this does not affect any capability word or public ABI field.
+    diag_test_tag: u64 = 0,
+    diag_report_entered: bool = false,
+
     /// Forward link in whatever queue this EC currently inhabits.
     /// Mutually exclusive across {run queue, port wait queue, exited
     /// list}. Futex waits do NOT use this link — they use per-bucket
@@ -324,35 +418,38 @@ pub const ExecutionContext = struct {
     /// Lifecycle state. See `State` for the queue invariant.
     state: State = .ready,
 
-    /// Cross-core context-switch barrier. Set true while actively
-    /// executing on a CPU; cleared after the outgoing context has been
-    /// fully saved. Remote cores attempting to migrate or destroy this
-    /// EC spin on this until the saving core releases it.
-    on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Owner core while `state` is running, parking, or pended. Sentinel
+    /// means the EC is not currently owned by a CPU core.
+    owner_core: u8 = NOT_IN_RUN_QUEUE,
 
-    /// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Which code path last set
-    /// `state = .exited`: 1 = parkSelfFaulted, 2 = terminate,
-    /// 3 = destroyExecutionContextLocked. ~8 ECs per suite pass end up
-    /// `.exited` with an ODD gen (never dead-marked, never posted, never
-    /// reaped) and accumulate until the run collapses. Fixing the
-    /// parkSelfFaulted sites did not change the rate, so tag the writers
-    /// and let the leaked population say which one it came from instead
-    /// of eliminating candidates one build at a time.
-    leak_tag: u8 = 0,
+    /// Short pin count for lifecycle operations that have claimed an EC
+    /// but have not yet finished moving it between containers.
+    pin_depth: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
-    /// Core id of the most recent dispatch — set by `setCurrentEc` and by
-    /// the FP step-14 / R-14 swap. Sentinel `LAST_DISPATCHED_NEVER` (0xFF)
-    /// means the EC has never been dispatched. Cross-core `terminate` reads
-    /// this to decide where to post the deferred-finalize zombie: posting
-    /// to the last-dispatched core guarantees that core's NEXT `switchTo`
-    /// runs the reap, by which point its asm rsp swap has moved off the
-    /// EC's kstack — closing the kstack-still-in-use window that
-    /// `runningCoreOf(current_ec.ptr == ec)` would otherwise miss
-    /// (current_ec is updated BEFORE the asm rsp swap commits, so a
-    /// cross-core terminate sees a misleading "not running" state).
-    /// Never reset back to the sentinel — once dispatched, the kstack-in-
-    /// use risk is owned by the most recent core indefinitely.
-    last_dispatched_core: u8 = LAST_DISPATCHED_NEVER,
+    /// Destruction marker separate from the slab generation word so
+    /// lifecycle readers can observe retirement without resolving a handle.
+    mark_state: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(lifecycle.MarkState.clear)),
+
+    /// Remote-suspend directive word. Packed as `{ state: u8, owner_slot: u24 }`.
+    directive_state: std.atomic.Value(u32) =
+        std.atomic.Value(u32).init(lifecycle.packDirective(.none, 0)),
+
+    /// Result published when an owner core fails an armed remote-suspend
+    /// directive. The waiter consumes it after observing `.failed`.
+    directive_result: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Port carried by an armed remote suspend directive.
+    directive_port: ?SlabRef(Port) = null,
+
+    /// Caller whose validated pair-entry stash should be handed to this
+    /// EC if an armed remote suspend directive commits.
+    directive_owner: ?*ExecutionContext = null,
+
+    /// Current wait episode descriptor. Container-specific payload fields
+    /// remain below; this descriptor is the lifecycle authority for where
+    /// the EC is parked.
+    wait: Wait = .{},
 
     /// Hint for `scheduler.removeFromQueue`: the core whose run queue
     /// currently holds this EC, or `NOT_IN_RUN_QUEUE` (`0xFF`) when the
@@ -501,10 +598,10 @@ pub const ExecutionContext = struct {
     /// path. Spec §[handle_attachments] mandates that the actual
     /// move/copy happens at recv time, so the entries ride the EC
     /// across the suspend → recv rendezvous. Each entry carries the
-    /// captured `ErasedSlabRef` (gen-validated at stash time), the
-    /// type tag and caps to install verbatim on the receiver, the
-    /// move flag (drives the sender-slot-clear at recv), and the
-    /// source slot id in the sender's domain. Sized to
+    /// captured `ErasedSlabRef` (gen-validated and object-ref pinned
+    /// at stash time), original source domain/slot, source caps, the
+    /// type tag and caps to install verbatim on the receiver, and the
+    /// move flag (drives the source-slot clear at recv). Sized to
     /// `MAX_PAIR_ENTRIES_PER_EC` to match the spec ceiling.
     pending_pair_entries: [MAX_PAIR_ENTRIES_PER_EC]PairEntryStashed = undefined,
 
@@ -626,12 +723,11 @@ pub const ExecutionContext = struct {
     /// exit_port has already been cleared. Reused by
     /// `port.cascadeDetachVcpus` as the chaining field for the
     /// post-lock-release destroy walk.
-    /// caller-pinned: list membership pins each EC's slab slot — every
-    /// vCPU on this chain contributes one to `port.bind_refcount`, so
-    /// the slot can't be freed while it's a list node. The list is
-    /// only walked under `p._gen_lock` (insertion/removal) or owned by
-    /// `cascadeDetachVcpus`'s detached snapshot (caller's destroy walk).
-    vcpu_list_next: ?*ExecutionContext = null,
+    /// The link carries the EC generation captured when the vCPU was
+    /// published onto the port. A cascade finalize must pass that ref
+    /// through the EC destroy helper so a recycled slot cannot be retired
+    /// through a stale pointer.
+    vcpu_list_next: ?SlabRef(ExecutionContext) = null,
 
     /// Per-vCPU arch state cell allocated by `allocVcpuArchState`. On
     /// x86-64 this points at a `vcpu.VcpuArchState` (GuestState + 16-byte-
@@ -767,24 +863,7 @@ pub var park_calls: u64 = 0;
 pub fn parkSelfFaulted(ec: *ExecutionContext) void {
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     park_calls +%= 1;
-    const core_id: u8 = @truncate(arch.smp.coreID());
-    if (scheduler.coreCurrentIs(core_id, ec)) {
-        scheduler.clearCurrentEc(core_id);
-    }
-    // `.exited` is the closest existing state for "will never run again";
-    // no `markReady`/`enqueue*` path observes it, and the EC stays in
-    // the slab so outstanding handles still resolve (just to a parked
-    // EC) until the owning domain is destroyed.
-    ec.state = .exited;
-    ec.leak_tag = 1; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
-    // Clear on_cpu — this EC is no longer running. Without this, a
-    // peer-core terminate posts the EC to its last_dispatched_core's
-    // pending_zombie, but the reaper sees on_cpu=true and refuses to
-    // finalize (correctly, to avoid unmapping a kstack mapped via
-    // TSS.RSP0). With state already .exited and the EC off every
-    // queue, on_cpu has no further legitimate writer; leaving it
-    // `true` permanently wedges the zombie.
-    ec.on_cpu.store(false, .release);
+    _ = retireAndBumpCurrentGen(ec);
 }
 
 /// Park the calling EC into `.idle_wait` — used by the aarch64 wfi/wfe
@@ -804,34 +883,90 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
 /// drop it before yielding to the scheduler.
 pub fn parkIdleWait(ec: *ExecutionContext) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
-    if (scheduler.coreCurrentIs(core_id, ec)) {
-        scheduler.clearCurrentEc(core_id);
-    }
     const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
     if (ec_ref.lockIrqSave(@src())) |lr| {
         defer ec_ref.unlockIrqRestore(lr.irq_state);
-        // A racing suspend / terminate may have flipped state out of
-        // .running already. Only commit .idle_wait if we still see the
-        // .running we trapped from; otherwise the other path now owns
-        // the lifecycle and our park would corrupt their queueing.
-        if (ec.state == .running) {
-            ec.state = .idle_wait;
-        }
-        // Regardless of who won the state race, THIS core trapped out
-        // of `ec` and its hlt/wfi handler is still executing on `ec`'s
-        // kstack all the way into the scheduler — defer the on_cpu
-        // release to the park-kstack hop so a (racing or later)
-        // suspend-then-resume cannot dispatch `ec` onto the kstack we
-        // are standing on. See PerCore.pending_kstack_release. (The
-        // remote-suspend winner deliberately leaves on_cpu alone — the
-        // release is ours either way.)
-        scheduler.stashKstackRelease(core_id, ec);
+        _ = lifecycle.prepareRunningPark(ec, core_id, .idle);
     } else |_| {
         // Slab gen flipped — EC was destroyed mid-trap. Nothing to do;
         // the trampoline will ERET into a freed slot, but the next
         // scheduler dispatch picks a different EC and the freed slot
         // gets recycled lazily.
     }
+}
+
+fn routeRetiredFinalize(
+    ec: *ExecutionContext,
+    pre_bump_gen: u63,
+    retired_from: State,
+    retired_owner: u8,
+    caller: ?*ExecutionContext,
+) void {
+    _ = pre_bump_gen;
+    const owned = switch (retired_from) {
+        .running, .parking, .pended => retired_owner < scheduler.MAX_CORES,
+        else => false,
+    };
+    if (!owned) {
+        finalizeDestroyMarkedDead(ec);
+        return;
+    }
+
+    const self_core: u8 = @truncate(arch.smp.coreID());
+    if (retired_owner == self_core and scheduler.claimOwnTeardownInline(ec)) {
+        finalizeDestroyMarkedDead(ec);
+        return;
+    }
+
+    if (retired_owner != self_core) arch.smp.sendWakeIpi(retired_owner);
+
+    if (caller) |c| {
+        if (c != ec) {
+            while (scheduler.coreCurrentIs(retired_owner, ec)) {
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+            }
+        }
+    }
+}
+
+const RetiredDeadGen = struct {
+    from: State,
+    owner: u8,
+    gen: u63,
+};
+
+fn retireAndBumpDeadGen(
+    ec_ref: SlabRef(ExecutionContext),
+    ec: *ExecutionContext,
+) ?RetiredDeadGen {
+    const wlr = ec_ref.lockIrqSave(@src()) catch return null;
+    const gen: u63 = @intCast(ec._gen_lock.currentGen());
+    _ = lifecycle.markRetiring(ec);
+    lifecycle.waitPinsDrained(ec);
+    if (lifecycle.load(ec) == .ready) {
+        scheduler.removeFromQueue(ec);
+    }
+    const retired_owner = ec.owner_core;
+    const retired_from = lifecycle.retire(ec);
+    recordSpawnTrace(ec, null, .retire, @intFromEnum(retired_from));
+    slab_instance.bumpDeadGenLocked(ec, gen);
+    // bumpDeadGenLocked clears the lock bit as part of the gen flip,
+    // so we cannot use unlockIrqRestore (it would assert held). Just
+    // restore IRQs.
+    arch.cpu.restoreInterrupts(wlr.irq_state);
+    return .{
+        .from = retired_from,
+        .owner = retired_owner,
+        .gen = gen,
+    };
+}
+
+fn retireAndBumpCurrentGen(ec: *ExecutionContext) ?RetiredDeadGen {
+    const gen = ec._gen_lock.currentGen();
+    if (gen % 2 == 0) return null;
+    const ec_ref = SlabRef(ExecutionContext).init(ec, @intCast(gen));
+    return retireAndBumpDeadGen(ec_ref, ec);
 }
 
 pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
@@ -863,9 +998,11 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     cd_ref.unlockIrqRestore(cd_irq_state);
 
     const ec = worker_ref.ptr;
-    const expected_gen: u63 = @intCast(worker_ref.gen);
+    const retired = retireAndBumpDeadGen(worker_ref, ec) orelse return errors.OK;
 
-    // Prepare phase — runs WITHOUT the EC's gen lock held to avoid
+    // Prepare phase — runs after the retire/dead-gen transition to keep
+    // `.retired` fused with the slab generation flip. It still runs
+    // WITHOUT the EC's gen lock held to avoid
     // EC→CD lock-order inversion (abandonPendingReply takes the
     // pending-reply holder's CD; CD→EC is the canonical order, so
     // holding EC across CD acquire would seed an AB-BA cycle in
@@ -894,6 +1031,7 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
             port_ref.unlockIrqRestore(plr.irq_state);
         }
     }
+    stygia.sched.port.releasePendingPairEntries(ec);
     // The EC's WaitNodes live on its kernel stack; later
     // `finalizeDestroyMarkedDead` unmaps the kstack pages, which
     // would leave the futex bucket queues holding pointers into
@@ -915,124 +1053,8 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
         arch.vm.freeVcpuArchState(ec);
     }
 
-    ec.state = .exited;
-    ec.leak_tag = 2; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
-    // Re-sweep run_queues after state=.exited so any yieldTo that
-    // re-enqueued ec during the prepare phase (saw state=.running,
-    // raced ahead of the first sweep) is undone here. The second
-    // sweep also publishes state=.exited via every core_locks[]
-    // acquire/release pairing, so any yieldTo that still owes a
-    // state read sees the new state on its next lock acquire and
-    // refuses to re-enqueue. Without this re-sweep the dangling
-    // pointer in the run_queue is consumed by the next dequeue,
-    // which traverses freed memory once `finalizeDestroyMarkedDead`
-    // has zeroed/unmapped the slab slot.
     scheduler.removeFromQueue(ec);
-
-    // Re-acquire the EC's gen-lock briefly to atomically rotate gen to
-    // the freed parity. After this point any concurrent handle
-    // resolution (`lockWithGen`) on this slot fails with stale-handle.
-    // The data bytes remain intact for the running core to keep
-    // dereferencing until the reap path zeros + freelists. If the
-    // re-acquire fails, another path already raced us through the
-    // bump — the destroy is in progress, return OK and let the
-    // winner finish.
-    const wlr2 = worker_ref.lockIrqSave(@src()) catch return errors.OK;
-    slab_instance.bumpDeadGenLocked(ec, expected_gen);
-    // bumpDeadGenLocked clears the lock bit as part of the gen flip,
-    // so we cannot use unlockIrqRestore (it would assert held). Just
-    // restore IRQs.
-    arch.cpu.restoreInterrupts(wlr2.irq_state);
-
-    // Defer the finalize to whichever core most recently dispatched the
-    // EC. The kstack-in-use window outlives `current_ec.ptr == ec` (slow-
-    // path `switchTo` writes `current_ec` BEFORE the asm rsp swap; FP
-    // step 14 / R-14 swap `current_ec` BEFORE sysretq) — so a
-    // `runningCoreOf(ec)` check that compares `current_ec.ptr` would miss
-    // the window and incorrectly inline-free the kstack while the running
-    // core is still executing on it. Posting to `last_dispatched_core`
-    // closes the window: that core's NEXT `switchTo` runs the reap, and
-    // by then its asm rsp swap has committed onto whatever EC came next.
-    // The existing `cur_is_zombie` skip in `switchTo` defers the reap
-    // one more cycle if the target is *still* `current_ec` on that core.
-    if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
-        const core = ec.last_dispatched_core;
-        const self_core: u8 = @truncate(arch.smp.coreID());
-        // If `target == self`, breaking the spin requires `switchTo` on
-        // this core to drain whatever existing zombie occupies the
-        // slot — but `terminate` is currently the syscall handler, so
-        // `switchTo` won't run until we return. Drain the existing
-        // zombie inline first (we are not on its kstack: we are on the
-        // caller-EC's kstack, and this terminate target is a different
-        // EC). Without this self-help, the spin deadlocks the core.
-        if (core == self_core) {
-            while (scheduler.takeOwnPendingZombie()) |z| {
-                if (z != ec) finalizeDestroyMarkedDead(z);
-            }
-        }
-        // Wake the target core so it runs `switchTo` promptly and
-        // drains the zombie. Without this, an idle target stays in
-        // `arch.cpu.idle()` (sti+hlt) until the next preempt tick;
-        // with the wake IPI it preempts now and the reap fires within
-        // microseconds. Self-IPI is fine — a no-op when we are the
-        // target core (we'll naturally run switchTo on syscall return).
-        //
-        // The wake MUST be inside the retry loop, not merely after it.
-        // `postZombie` returns false while the target's column for this
-        // poster is still occupied, and ONLY the target can drain that
-        // column — via `switchTo` or `parkAndAwaitIRQ`'s pre-park drain.
-        // A target that is ALREADY halted does neither until something
-        // wakes it, so a wake issued only after the post succeeds can
-        // never arrive: we spin forever on a core that is never going to
-        // move again, with IRQs masked on this side.
-        //
-        // That is the N=10 suite hang: target core parked with
-        // `current_ec = null` and RDY ECs sitting in its own run_queue,
-        // poster core live but emitting nothing. Same race family as
-        // stygia-810/qn0f.
-        var post_spins: u32 = 0;
-        while (!scheduler.postZombie(core, ec, expected_gen)) {
-            if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
-                arch.smp.sendWakeIpi(core);
-            }
-            post_spins +%= 1;
-            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-            // matching note on `scheduler.markReady`'s kstack barrier.
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            std.atomic.spinLoopHint();
-        }
-        if (core != self_core) arch.smp.sendWakeIpi(core);
-    } else {
-        // Never dispatched — kstack pages are mapped but no core's rsp
-        // has ever pointed at them. Safe to finalize inline.
-        finalizeDestroyMarkedDead(ec);
-    }
-
-    // Eviction barrier — spec §[terminate] test 04: "on success, the
-    // target EC stops executing." Without this spin, terminate returns
-    // OK while the target may still be executing user code on a remote
-    // core until the wake IPI lands, leaving a window where subsequent
-    // caller actions (unmap, teardown, page_frame release) race the
-    // target's final instructions (stygia-rs6 family). Spin on
-    // dispatch-slot identity, NOT `on_cpu`: a cross-core-migrated EC
-    // sits in the target core's run queue with on_cpu stale-true and
-    // nothing scheduled to clear it (btl8 migration protocol), so an
-    // on_cpu spin deadlocks on queued victims — while a queued victim
-    // was never executing, so the identity spin exits immediately.
-    // For a genuinely-running victim the wake IPI is in flight and the
-    // eviction path (disowned-current escape / switchTo replace /
-    // parkAndAwaitIRQ) rewrites `current_ec` within one IRQ delivery.
-    // The EC is gen-dead here, so no core can re-dispatch it after the
-    // slot stops naming it. Self-terminate is excluded: the caller
-    // cannot wait for its own eviction.
-    if (ec != caller and ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
-        while (scheduler.currentEcPtrOn(ec.last_dispatched_core) == ec) {
-            // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-            // matching note on `scheduler.markReady`'s kstack barrier.
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            std.atomic.spinLoopHint();
-        }
-    }
+    routeRetiredFinalize(ec, retired.gen, retired.from, retired.owner, caller);
     return errors.OK;
 }
 
@@ -1052,6 +1074,8 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
 /// pointer via the even-gen test, but removing it explicitly here
 /// keeps the wait queue's count/size accurate.
 pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
+    recordSpawnTrace(ec, null, .finalize, 0);
+    lifecycle.markDirectiveDead(ec);
     if (ec.suspend_port) |port_ref| {
         if (port_ref.lockIrqSave(@src())) |plr| {
             const p = plr.ptr;
@@ -1092,6 +1116,7 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
     // those two landed is what produced the suite-wide fault storms
     // recorded in the previous version of this comment.
     stack.destroyKernel(ec.kernel_stack);
+    ec.wait.clear();
 
     slab_instance.destroyAlreadyMarked(ec);
 }
@@ -1108,7 +1133,6 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
 /// its own priority queue, starving the lower-pri target. Surfaces
 /// in recv_14 (parent pri=3 yields to worker pri=0; worker must
 /// self-suspend before the parent's blocking recv can complete).
-
 /// `priority` syscall handler. Spec §[execution_context].priority.
 ///
 /// The syscall layer has already validated reserved bits, resolved the
@@ -1133,6 +1157,45 @@ pub fn finalizeDestroyMarkedDead(ec: *ExecutionContext) void {
 /// cycle (cur EC's preempt re-enqueues with the new priority via
 /// `state.run_queue.enqueue` which reads `ec.priority`), so deferring
 /// is acceptable for the spec tests' observable behavior.
+fn repairPriorityPlacement(ec: *ExecutionContext, expected_gen: u32) void {
+    if (!lifecycle.tryPinLive(ec)) return;
+    defer lifecycle.releasePin(ec);
+    if (ec._gen_lock.currentGen() != @as(u63, expected_gen)) return;
+
+    switch (lifecycle.load(ec)) {
+        .ready => {
+            if (!lifecycle.isReadyCacheValid(ec, NOT_IN_RUN_QUEUE)) return;
+            if (!scheduler.claimReadyFromQueue(ec, expected_gen)) return;
+            scheduler.enqueue(ec);
+            lifecycle.releasePin(ec);
+        },
+        .waiting, .parking => switch (ec.wait.kind) {
+            .port_sender, .port_receiver => {
+                const port_ref = ec.suspend_port orelse return;
+                const plr = port_ref.lockIrqSave(@src()) catch return;
+                const p = plr.ptr;
+                if (p.waiters.remove(ec)) p.waiters.enqueue(ec);
+                port_ref.unlockIrqRestore(plr.irq_state);
+            },
+            .futex => stygia.sched.futex.repairPriority(ec),
+            else => {},
+        },
+        else => {},
+    }
+}
+
+fn repairAffinityPlacement(ec: *ExecutionContext, expected_gen: u32) void {
+    if (!lifecycle.tryPinLive(ec)) return;
+    defer lifecycle.releasePin(ec);
+    if (ec._gen_lock.currentGen() != @as(u63, expected_gen)) return;
+
+    if (lifecycle.load(ec) != .ready) return;
+    if (!lifecycle.isReadyCacheValid(ec, NOT_IN_RUN_QUEUE)) return;
+    if (!scheduler.claimReadyFromQueue(ec, expected_gen)) return;
+    scheduler.enqueue(ec);
+    lifecycle.releasePin(ec);
+}
+
 pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i64 {
     if (new_priority > 3) return errors.E_INVAL;
 
@@ -1160,10 +1223,12 @@ pub fn setPriority(caller: *ExecutionContext, target: u64, new_priority: u64) i6
         return errors.E_TERM;
     };
     const target_ec = tlr.ptr;
+    const target_gen: u32 = @intCast(target_ec._gen_lock.currentGen());
 
     const new_pri: Priority = @enumFromInt(@as(u2, @intCast(new_priority)));
     target_ec.priority = new_pri;
     target_ref.unlockIrqRestore(tlr.irq_state);
+    repairPriorityPlacement(target_ec, target_gen);
 
     // Refresh the handle's field0 snapshot (priority is bits 0-1).
     cd.user_table[slot].field0 = (cd.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
@@ -1220,9 +1285,11 @@ pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i6
         return errors.E_TERM;
     };
     const target_ec = tlr.ptr;
+    const target_gen: u32 = @intCast(target_ec._gen_lock.currentGen());
 
     target_ec.affinity = new_affinity;
     target_ref.unlockIrqRestore(tlr.irq_state);
+    repairAffinityPlacement(target_ec, target_gen);
 
     // Refresh the handle's field1 snapshot (affinity occupies bits
     // 0-63 of field1).
@@ -1317,7 +1384,7 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
     cd_ref.unlockIrqRestore(cd_irq_state);
 
     // Spec test 07: target must be the calling EC OR currently suspended.
-    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+    if (target_ec != caller and !lifecycle.isPortSuspended(target_ec)) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
@@ -1424,7 +1491,7 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     };
 
     // Spec test 04: target must be the calling EC OR currently suspended.
-    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+    if (target_ec != caller and !lifecycle.isPortSuspended(target_ec)) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
@@ -1531,7 +1598,7 @@ fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     }
 
     // Spec test 04: target must be the calling EC OR currently suspended.
-    if (target_ec != caller and target_ec.state != .suspended_on_port) {
+    if (target_ec != caller and !lifecycle.isPortSuspended(target_ec)) {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_BUSY;
     }
@@ -1612,17 +1679,182 @@ pub fn suspendOnPort(
     originating_read_cap: bool,
     irq_state: u64,
 ) i64 {
+    return suspendOnPortInner(
+        ec,
+        port,
+        event,
+        subcode,
+        addr,
+        originating_write_cap,
+        originating_read_cap,
+        irq_state,
+        null,
+        null,
+        null,
+    );
+}
+
+pub fn suspendOnPortWithPairHandoff(
+    ec: *ExecutionContext,
+    handoff_from: *ExecutionContext,
+    port: *Port,
+    event: EventType,
+    subcode: u8,
+    addr: u64,
+    originating_write_cap: bool,
+    originating_read_cap: bool,
+    irq_state: u64,
+) i64 {
+    return suspendOnPortInner(
+        ec,
+        port,
+        event,
+        subcode,
+        addr,
+        originating_write_cap,
+        originating_read_cap,
+        irq_state,
+        handoff_from,
+        null,
+        null,
+    );
+}
+
+pub fn suspendOnPortWithPairHandoffGen(
+    ec: *ExecutionContext,
+    handoff_from: *ExecutionContext,
+    port: *Port,
+    event: EventType,
+    subcode: u8,
+    addr: u64,
+    originating_write_cap: bool,
+    originating_read_cap: bool,
+    irq_state: u64,
+    expected_gen: u32,
+) i64 {
+    return suspendOnPortInner(
+        ec,
+        port,
+        event,
+        subcode,
+        addr,
+        originating_write_cap,
+        originating_read_cap,
+        irq_state,
+        handoff_from,
+        expected_gen,
+        null,
+    );
+}
+
+pub fn suspendOnPortWithPairHandoffDirectiveGen(
+    ec: *ExecutionContext,
+    handoff_from: *ExecutionContext,
+    port: *Port,
+    event: EventType,
+    subcode: u8,
+    addr: u64,
+    originating_write_cap: bool,
+    originating_read_cap: bool,
+    irq_state: u64,
+    expected_gen: u32,
+    directive_word: u32,
+) i64 {
+    return suspendOnPortInner(
+        ec,
+        port,
+        event,
+        subcode,
+        addr,
+        originating_write_cap,
+        originating_read_cap,
+        irq_state,
+        handoff_from,
+        expected_gen,
+        directive_word,
+    );
+}
+
+fn clearSuspendDirectiveMetadata(ec: *ExecutionContext) void {
+    ec.directive_port = null;
+    ec.directive_owner = null;
+    ec.originating_write_cap = false;
+    ec.originating_read_cap = false;
+}
+
+fn failSuspendDirective(ec: *ExecutionContext, word: u32, result: i64) void {
+    if (lifecycle.failDirectiveWord(ec, word, result)) {
+        clearSuspendDirectiveMetadata(ec);
+    }
+}
+
+fn suspendOnPortInner(
+    ec: *ExecutionContext,
+    port: *Port,
+    event: EventType,
+    subcode: u8,
+    addr: u64,
+    originating_write_cap: bool,
+    originating_read_cap: bool,
+    irq_state: u64,
+    handoff_from: ?*ExecutionContext,
+    expected_ready_gen: ?u32,
+    directive_word: ?u32,
+) i64 {
     if (ec.vm != null and event != .vm_exit) {
         port._gen_lock.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
-    std.debug.assert(ec.state == .running or ec.state == .ready or ec.state == .idle_wait);
-
-    if (ec.state == .ready) {
-        scheduler.removeFromQueue(ec);
+    const start_state = lifecycle.load(ec);
+    var claimed_suspend = false;
+    switch (start_state) {
+        .running => {
+            const current = scheduler.currentEc() orelse {
+                port._gen_lock.unlockIrqRestore(irq_state);
+                return errors.E_BUSY;
+            };
+            if (current != ec) {
+                port._gen_lock.unlockIrqRestore(irq_state);
+                return errors.E_BUSY;
+            }
+            if (!lifecycle.prepareRunningPark(ec, ec.owner_core, .port_sender)) {
+                port._gen_lock.unlockIrqRestore(irq_state);
+                return errors.E_INVAL;
+            }
+        },
+        .ready => {
+            if (!scheduler.claimReadyFromQueue(ec, expected_ready_gen)) {
+                port._gen_lock.unlockIrqRestore(irq_state);
+                return errors.E_INVAL;
+            }
+            claimed_suspend = true;
+            ec.wait.begin(.port_sender);
+        },
+        .waiting => {
+            if (ec.wait.kind != .idle) {
+                port._gen_lock.unlockIrqRestore(irq_state);
+                return errors.E_INVAL;
+            }
+            switch (lifecycle.beginWaitingClaimPinned(ec)) {
+                .claimed => {},
+                .pended => {
+                    lifecycle.releasePin(ec);
+                    port._gen_lock.unlockIrqRestore(irq_state);
+                    return errors.E_INVAL;
+                },
+                .none => {
+                    port._gen_lock.unlockIrqRestore(irq_state);
+                    return errors.E_INVAL;
+                },
+            }
+            claimed_suspend = true;
+            ec.wait.begin(.port_sender);
+        },
+        else => {
+            port._gen_lock.unlockIrqRestore(irq_state);
+            return errors.E_INVAL;
+        },
     }
-    // `.idle_wait` ECs are off every queue (parkIdleWait removes from
-    // current_ec and never enqueues), so no removal is needed here.
 
     ec.event_type = event;
     ec.event_subcode = subcode;
@@ -1640,13 +1872,29 @@ pub fn suspendOnPort(
     const sender_ctx = ec.iret_frame orelse ec.ctx;
     ec.event_state_gprs = arch.syscall.getEventStateGprs(sender_ctx);
     ec.event_rip = arch.syscall.getEventRip(sender_ctx);
+    if (event == .suspension) maybePrintReportEntered(ec);
     ec.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
-    ec.state = .suspended_on_port;
+    ec.wait.port = ec.suspend_port;
     ec.pending_reply_holder = null;
     ec.pending_reply_domain = null;
     ec.pending_reply_slot = 0;
     ec.originating_write_cap = originating_write_cap;
     ec.originating_read_cap = originating_read_cap;
+    var stash_moved = false;
+    if (handoff_from) |src| {
+        stash_moved = movePendingPairStash(ec, src);
+    }
+    if (start_state != .running and !lifecycle.commitClaimedWaiting(ec)) {
+        if (stash_moved) {
+            _ = movePendingPairStash(handoff_from.?, ec);
+        }
+        if (claimed_suspend) lifecycle.releasePin(ec);
+        if (directive_word) |word| {
+            failSuspendDirective(ec, word, errors.E_INVAL);
+        }
+        port._gen_lock.unlockIrqRestore(irq_state);
+        return errors.E_INVAL;
+    }
     // `on_cpu` handling is split by locality below (after the
     // rendezvous decision): when `ec` is THIS core's current EC we are
     // still executing on its kstack and must defer the release to the
@@ -1667,35 +1915,99 @@ pub fn suspendOnPort(
     //
     // `rendezvousWithReceiver` releases Port internally on the success
     // path so it can take the receiver's CD lock without inverting the
-    // canonical CD → Port order. On `false` it leaves Port held.
+    // canonical CD → Port order. On `.no_receiver` it leaves Port held.
     if (port.waiter_kind == .receivers) {
-        if (stygia.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr, irq_state)) {
-            const core_id: u8 = @truncate(arch.smp.coreID());
-            if (scheduler.coreCurrentIs(core_id, ec)) {
-                scheduler.clearCurrentEc(core_id);
-                scheduler.stashKstackRelease(core_id, ec);
-            }
-            return 0;
+        switch (stygia.sched.port.rendezvousWithReceiver(ec, port, event, subcode, addr, irq_state)) {
+            .delivered => {
+                if (stash_moved and ec.pending_pair_count != 0) {
+                    _ = movePendingPairStash(handoff_from.?, ec);
+                }
+                ec.wait.kind = .reply;
+                if (directive_word) |word| {
+                    _ = lifecycle.disarmDirectiveWord(ec, word);
+                    clearSuspendDirectiveMetadata(ec);
+                }
+                if (claimed_suspend) lifecycle.releasePin(ec);
+                return 0;
+            },
+            .parked => {
+                if (directive_word) |word| {
+                    _ = lifecycle.disarmDirectiveWord(ec, word);
+                    clearSuspendDirectiveMetadata(ec);
+                }
+                if (claimed_suspend) lifecycle.releasePin(ec);
+                return 0;
+            },
+            .no_receiver => {},
         }
     }
 
+    if (directive_word) |word| {
+        _ = lifecycle.disarmDirectiveWord(ec, word);
+        clearSuspendDirectiveMetadata(ec);
+    }
     // No waiting receiver — park as a sender. WaiterKind tracks which
     // side owns the queue; transition .none → .senders here so a
     // subsequent recv() observing waiters knows what to dequeue.
     port.waiters.enqueue(ec);
     if (port.waiter_kind == .none) port.waiter_kind = .senders;
-
-    // Drop currency on the local core if `ec` is the running EC; the
-    // caller's syscall return path will dispatch the next EC. The
-    // kstack release rides the same locality decision — see the
-    // comment above the rendezvous branch.
-    const core_id: u8 = @truncate(arch.smp.coreID());
-    if (scheduler.coreCurrentIs(core_id, ec)) {
-        scheduler.clearCurrentEc(core_id);
-        scheduler.stashKstackRelease(core_id, ec);
-    }
     port._gen_lock.unlockIrqRestore(irq_state);
+    if (claimed_suspend) lifecycle.releasePin(ec);
     return 0;
+}
+
+fn movePendingPairStash(dst: *ExecutionContext, src: *ExecutionContext) bool {
+    if (dst == src or src.pending_pair_count == 0) return false;
+    std.debug.assert(dst.pending_pair_count == 0);
+    dst.pending_pair_count = src.pending_pair_count;
+    var k: usize = 0;
+    while (k < src.pending_pair_count) {
+        dst.pending_pair_entries[k] = src.pending_pair_entries[k];
+        k += 1;
+    }
+    src.pending_pair_count = 0;
+    return true;
+}
+
+pub fn consumeSuspendDirective(ec: *ExecutionContext, frame: *ArchCpuContext) bool {
+    const word = ec.directive_state.load(.acquire);
+    if (lifecycle.directiveTag(word) != .armed) return false;
+    if (lifecycle.load(ec) != .running) {
+        failSuspendDirective(ec, word, errors.E_INVAL);
+        return false;
+    }
+    const port_ref = ec.directive_port orelse {
+        failSuspendDirective(ec, word, errors.E_BADCAP);
+        return false;
+    };
+    const directive_owner = ec.directive_owner;
+    const plr = port_ref.lockIrqSave(@src()) catch {
+        failSuspendDirective(ec, word, errors.E_BADCAP);
+        return false;
+    };
+    // The directive traps on the target's owner core; this live frame is
+    // the sender state reply must resume from even when writes are denied.
+    ec.ctx = frame;
+    ec.iret_frame = frame;
+    const ret = suspendOnPortInner(
+        ec,
+        plr.ptr,
+        .suspension,
+        0,
+        0,
+        ec.originating_write_cap,
+        ec.originating_read_cap,
+        plr.irq_state,
+        directive_owner,
+        null,
+        word,
+    );
+    if (ret != 0) {
+        ec.iret_frame = null;
+        failSuspendDirective(ec, word, ret);
+        return false;
+    }
+    return true;
 }
 
 /// Resume `ec` from a reply. When `apply_writes` is true, the receiver
@@ -1704,10 +2016,11 @@ pub fn suspendOnPort(
 /// `ec` resumes from its saved `ctx` unchanged.
 pub fn resumeFromReply(ec: *ExecutionContext, apply_writes: bool) void {
     _ = apply_writes;
-    std.debug.assert(ec.state == .suspended_on_port);
+    std.debug.assert(lifecycle.isPortSuspended(ec));
     ec.event_type = .none;
     ec.event_subcode = 0;
     ec.event_addr = 0;
+    ec.iret_frame = null;
     ec.suspend_port = null;
     ec.pending_reply_holder = null;
     ec.pending_reply_domain = null;
@@ -1866,14 +2179,11 @@ pub fn allocExecutionContext(
     ec.kernel_stack = kstack;
     ec.user_stack = ustack;
     ec.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
+    ec.diag_test_tag = domain.diag_test_tag;
+    ec.diag_report_entered = false;
     ec.priority = priority;
     ec.affinity = affinity;
-    ec.state = .ready;
-    ec.last_dispatched_core = LAST_DISPATCHED_NEVER;
-    // Slab-zero would leave `current_queue_core` at `0x00`, which is a
-    // valid core id. Stamp the sentinel explicitly so a freshly-allocated
-    // EC isn't mistaken for "in core 0's run queue" by `removeFromQueue`.
-    ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+    lifecycle.initNewEc(ec, NOT_IN_RUN_QUEUE);
     ec.entry_point = entry;
     if (vm) |v| ec.vm = SlabRef(VirtualMachine).init(v, v._gen_lock.currentGen());
     if (exit_port) |p| ec.exit_port = SlabRef(Port).init(p, p._gen_lock.currentGen());
@@ -1934,7 +2244,7 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
     slab_instance.forEachAlive(
         &ctx,
         struct {
-            fn visit(c: *Visitor, ec: *ExecutionContext, _: u63) bool {
+            fn visit(c: *Visitor, ec: *ExecutionContext, gen: u63) bool {
                 if (c.keep_ref) |kr| {
                     // caller-pinned: keep_ref names the EC running this code
                     // path; pointer identity check, no deref.
@@ -1949,7 +2259,7 @@ pub fn destroyEcsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root:
                 // the per-EC destroy helper which only uses the bare
                 // pointer for caller_cd identity comparison.
                 dbump(&walk_visit_enter); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-                destroyExecutionContextLocked(ec, c.cd_ref.ptr); // caller-pinned: identity-only key, never dereferenced
+                destroyExecutionContextRefLocked(SlabRef(ExecutionContext).init(ec, gen), c.cd_ref.ptr); // caller-pinned: identity-only key, never dereferenced
                 dbump(&walk_visit_done); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
                 return true;
             }
@@ -2011,6 +2321,29 @@ pub fn countEcsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
 /// mean dereferencing `ec.domain.ptr` for a domain that may already be
 /// dead, which is exactly the case those call sites exist to handle.
 pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*CapabilityDomain) void {
+    const gen = ec._gen_lock.currentGen();
+    if (gen % 2 == 0) return;
+    destroyExecutionContextRefLocked(SlabRef(ExecutionContext).init(ec, @intCast(gen)), caller_cd);
+}
+
+pub fn destroyExecutionContextRefLocked(ec_ref: SlabRef(ExecutionContext), caller_cd: ?*CapabilityDomain) void {
+    const ec = ec_ref.ptr;
+
+    // Route the slab destroy through the deferred-finalize path
+    // (`bumpDeadGenLocked` + `postZombie` / `finalizeDestroyMarkedDead`)
+    // rather than the synchronous `slab_instance.destroy`. The
+    // synchronous variant goes through `destroyLockedInner` which
+    // zeroes T's bytes — at smp=4 that races with cross-core readers
+    // (port `popHighest*` callers, futex wake's on_cpu spinner,
+    // timer-async expiry path) that hold a bare `*EC` snapshot from
+    // before the gen-flip. Routing through the deferred path leaves
+    // those readers' dereferences valid (slab fields stay intact
+    // until the next allocator pop re-inits them), and the kstack
+    // unmap that `finalizeDestroyMarkedDead` does only fires once the
+    // EC's `last_dispatched_core` has done a `switchTo` — i.e. the
+    // running core is provably off the kstack.
+    const retired = retireAndBumpDeadGen(ec_ref, ec) orelse return;
+
     if (ec.pending_reply_holder != null) {
         if (ec.pending_reply_domain) |dom_ref| {
             if (caller_cd != null and dom_ref.ptr == caller_cd.?) {
@@ -2043,6 +2376,7 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
             port_ref.unlockIrqRestore(plr.irq_state);
         }
     }
+    stygia.sched.port.releasePendingPairEntries(ec);
     stygia.sched.futex.cancelWait(ec);
     if (ec.recv_deadline_ns != 0) stygia.sched.port.cancelRecvDeadline(ec);
     stygia.sched.fpu.clearFromLastFpuOwner(ec);
@@ -2074,7 +2408,8 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
             const p = plr.ptr;
             // Splice this EC out of the port's vcpu list.
             var cursor = &p.vcpu_list_head;
-            while (cursor.*) |node| {
+            while (cursor.*) |node_ref| {
+                const node = node_ref.ptr;
                 if (node == ec) {
                     cursor.* = ec.vcpu_list_next;
                     break;
@@ -2096,154 +2431,9 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
         arch.vm.freeVcpuArchState(ec);
     }
 
-    ec.state = .exited;
-    ec.leak_tag = 3; // TEMP DIAGNOSTIC (stygia-2u0, REMOVE)
-    // Re-sweep run_queues after the state flip — same race as in
-    // `terminate` (see the matching comment there): a yieldTo on the
-    // EC's running core can re-enqueue it during the cleanup window
-    // above (it still reads state == .running), leaving a dangling
-    // queue entry that a later dequeue traverses after the reap has
-    // zeroed the slab slot. The re-sweep undoes any such re-enqueue
-    // and publishes state=.exited via every core_locks[] pairing.
-    // This variant was missing the sweep terminate has had all along.
     scheduler.removeFromQueue(ec);
-    const gen = ec._gen_lock.currentGen();
-    if (gen % 2 == 0) return;
 
-    // Route the slab destroy through the deferred-finalize path
-    // (`bumpDeadGenLocked` + `postZombie` / `finalizeDestroyMarkedDead`)
-    // rather than the synchronous `slab_instance.destroy`. The
-    // synchronous variant goes through `destroyLockedInner` which
-    // zeroes T's bytes — at smp=4 that races with cross-core readers
-    // (port `popHighest*` callers, futex wake's on_cpu spinner,
-    // timer-async expiry path) that hold a bare `*EC` snapshot from
-    // before the gen-flip. Routing through the deferred path leaves
-    // those readers' dereferences valid (slab fields stay intact
-    // until the next allocator pop re-inits them), and the kstack
-    // unmap that `finalizeDestroyMarkedDead` does only fires once the
-    // EC's `last_dispatched_core` has done a `switchTo` — i.e. the
-    // running core is provably off the kstack.
-    const ec_ref = SlabRef(ExecutionContext).init(ec, @intCast(gen));
-    const wlr = ec_ref.lockIrqSave(@src()) catch return;
-    slab_instance.bumpDeadGenLocked(ec, @intCast(gen));
-    arch.cpu.restoreInterrupts(wlr.irq_state);
-
-    if (ec.last_dispatched_core != LAST_DISPATCHED_NEVER) {
-        const core = ec.last_dispatched_core;
-        const self_core: u8 = @truncate(arch.smp.coreID());
-        // Same self-help drain as in `terminate` — see the comment
-        // there for why the spin would otherwise deadlock when
-        // self == target.
-        if (core == self_core) {
-            while (scheduler.takeOwnPendingZombie()) |z| {
-                if (z != ec) finalizeDestroyMarkedDead(z);
-            }
-        }
-        // Try to post ONCE with the caller's interrupt state untouched
-        // (stygia-afo).
-        //
-        // `postZombie` writes `pending_zombie[self_core]` on the target
-        // — a slot only THIS core ever posts into — under
-        // `core_locks[core]`. It fails, and only fails, when our own
-        // previous zombie is still sitting there unreaped.
-        //
-        // CORRECTION (stygia-afo cycle 2). This comment used to claim the
-        // `core == self_core` case "cannot fail at all" because the
-        // self-drain immediately above has just emptied that very slot.
-        // That is false, and it is precisely backwards: the drain SKIPS
-        // the slot when we are standing on its occupant's kstack, which is
-        // the normal state of affairs throughout `destroyPhase2` (it reaps
-        // the caller EC first, and this frame runs on the caller's kstack).
-        // Measured over 25 aarch64 TCG passes: 1176 of 1176 failing posts
-        // were same-core, and 0 of 1176 ever succeeded. See the fallback
-        // below for what replaces the unsatisfiable spin.
-        //
-        // Why the single attempt matters so much. The unconditional
-        // `enableInterrupts()` that used to stand here was the ONLY
-        // unconditional IRQ re-enable in the whole kernel, and
-        // `destroyPhase2` reaches it while running on a frame that
-        // CANNOT be resumed: `parkSelfFaulted` has already cleared
-        // `current_ec`, so a preempt landing in this window makes
-        // `yieldTo` skip its re-enqueue block, dispatch some other EC
-        // and hop to the park kstack. The phase-2 frame is simply
-        // abandoned — its EC walk, address-space free, handle release
-        // and CD slab free never run, and since phase 1 already
-        // dead-marked the domain nothing will ever walk it again.
-        // Measured on aarch64 TCG smp=4: 1354 of 6228 phase-2 destroys
-        // (22%) never reached the end of the caller-EC reap, and the CD
-        // slab's `count_total` tracked that abandonment count to within
-        // ~16 slots for the whole run. The stranded ECs then pile up
-        // (194 alive, 192 of them orphaned from an already-destroyed
-        // domain) until the suite stops delivering results at pass ~14.
-        //
-        // So: keep the escape hatch, but only pay for it when it is
-        // actually needed. An uncontended post — which is what phase 2
-        // does — now completes with the caller's mask intact and the
-        // frame survives.
-        if (!scheduler.postZombie(core, ec, @intCast(gen))) {
-            dbump(&slow_post_spins); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-            if (core == self_core) dbump(&slow_post_self); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-            // A failed SAME-CORE post is not contention that will clear —
-            // it is unsatisfiable (stygia-afo cycle 2). `pending_zombie`
-            // has one slot per (poster, target) pair, and `destroyPhase2`
-            // pins this core's own slot for its whole body with the
-            // caller EC it reaps at the top: we stand on that EC's kstack
-            // until phase 2 returns, so the drain's `standing_on_zombie`
-            // guard can never evict it. Every same-core victim post from
-            // the `destroyEcsInDomain` walk then spins on a condition
-            // that cannot change, with IRQs enabled, until a preempt
-            // lands and abandons the phase-2 frame — taking the rest of
-            // the walk, the address-space free, the handle release and
-            // the CD slab free with it.
-            //
-            // MEASURED, aarch64 TCG smp=4, 25 passes, four independent
-            // instruments agreeing to the unit at seq 2.2M:
-            //   p2_enter-p2_walk 1176 | sp_in-sp_out 1176 (sp_out == 0,
-            //   i.e. not one contended post EVER completed) | sp_self
-            //   1176 (every one same-core; cross-core contention: zero) |
-            //   walk-visit gap 1176 | abandonments counted directly at
-            //   the losing `switchTo` 1176.
-            //
-            // The column is the wrong tool here. It exists to defer a
-            // kstack free until the last-dispatching core is off that
-            // stack — a condition we can simply CHECK, which is exactly
-            // what `takeOwnPendingZombie` does for its own drain. When it
-            // holds, finalize inline and skip the column entirely.
-            if (core == self_core and scheduler.claimOwnZombieInline(ec)) {
-                dbump(&inline_finalize_ok); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-                finalizeDestroyMarkedDead(ec);
-                return;
-            }
-            dbump(&inline_finalize_no); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-            // Genuine cross-core contention (never once observed above).
-            // Only the target core drains its column and it may itself be
-            // blocked waiting on us, so the spin really is unbounded:
-            // snapshot+enable IRQs so wake IPIs and preempts can land;
-            // restore before returning so the gen-flip-finalize sequence
-            // stays IRQ-coherent for the caller.
-            const reap_irq = arch.cpu.saveAndDisableInterrupts();
-            arch.cpu.enableInterrupts();
-            // Wake inside the retry loop, not only after it — a halted
-            // target can never drain the column we are waiting on. See
-            // the matching loop in `terminate` for the full rationale.
-            var post_spins: u32 = 0;
-            while (!scheduler.postZombie(core, ec, @intCast(gen))) {
-                if (core != self_core and post_spins % ZOMBIE_WAKE_RETRY_SPINS == 0) {
-                    arch.smp.sendWakeIpi(core);
-                }
-                post_spins +%= 1;
-                // Ack-while-spinning (stygia-rs6 mechanism 9) — see the
-                // matching note on `scheduler.markReady`'s kstack barrier.
-                arch.paging.serviceTlbMaintenanceWhileSpinning();
-                std.atomic.spinLoopHint();
-            }
-            arch.cpu.restoreInterrupts(reap_irq);
-            dbump(&slow_post_done); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-        }
-        if (core != self_core) arch.smp.sendWakeIpi(core);
-    } else {
-        finalizeDestroyMarkedDead(ec);
-    }
+    routeRetiredFinalize(ec, retired.gen, retired.from, retired.owner, null);
 }
 
 /// Lazy-allocate `perfmon_state` on first perfmon_start.
@@ -2325,4 +2515,3 @@ fn releasePerfmonState(ec: *ExecutionContext) void {
     }
     perfmon_mod.slab_instance.destroy(ref.ptr, ref.gen) catch {};
 }
-

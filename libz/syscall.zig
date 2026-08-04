@@ -151,6 +151,20 @@ fn issueRawNoStack(word: u64, in: Regs) Regs {
     return arch_impl.issueRawNoStack(word, in);
 }
 
+/// Internal test/bootstrap escape hatch for a fire-and-forget syscall with an
+/// exact raw word. This exists for call sites such as the spec runner's report
+/// suspend, where word 0 deliberately selects the L4 fast-suspend ABI and the
+/// returned registers must stay unobservable. Normal syscall wrappers should
+/// use `issueReg` / `issueRegDiscard`; do not add production libz call sites
+/// here unless the raw word encoding is itself the behavior under test.
+pub fn issueRawDiscard(word: u64, in: Regs) void {
+    arch_impl.issueRegDiscard(word, in);
+}
+
+pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
+    return arch_impl.issueRawCaptureWord(word_in, in);
+}
+
 pub fn issueReg(num: SyscallNum, extra: u64, in: Regs) Regs {
     return issueRawNoStack(buildWord(num, extra), in);
 }
@@ -563,7 +577,7 @@ pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
 
 pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
     const word = buildWord(.recv, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
+    return issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
 }
 
 pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
@@ -606,7 +620,7 @@ pub fn replyRecv(reply_handle: u12, recv_port: u12) RecvReturn {
         (@as(u64, @intFromEnum(SyscallNum.reply)) & 0xFFF) |
         (@as(u64, reply_handle) << 20) |
         (@as(u64, recv_port) << 32);
-    return arch_impl.issueRawCaptureWord(word, .{});
+    return issueRawCaptureWord(word, .{});
 }
 
 pub fn replyTransferRecv(
@@ -758,4 +772,3 @@ pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
 pub fn kprofDump() void {
     issueRegDiscard(.kprof_dump, 0, .{});
 }
-

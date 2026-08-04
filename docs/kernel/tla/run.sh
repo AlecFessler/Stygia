@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Reproduces every TLC check for the EC-lifecycle model (systems.md rev 15).
+# Reproduces every TLC check for the EC-lifecycle model (systems.md rev 16).
 #   ./run.sh                 gates + probes + safety + the cheap liveness set
 #   RUN_XLARGE=1 ./run.sh    also the 3-core/4-EC safety run
-#   RUN_SLOW=1   ./run.sh    also the multi-thousand-second liveness runs
+#   RUN_SLOW=1   ./run.sh    also the extended/manual liveness rows
 #
-# Exit status: 0 iff every revision-10 run is clean AND every gate
+# Exit status: 0 iff every configured run is clean AND every gate
 # reproduces its expected violation. Logs land in out/.
 #
 # ROUND-9 C-2: the previous version of this script was a revision-8
@@ -85,13 +85,47 @@ expect_violation() { # expect_violation <name> <module> <pattern> <flags...>
   fi
 }
 
+# expect_unconverged <name> <expected_distinct> <module> <flags...>
+#   PASS iff: rc=124 AND the temporal phase was REACHED AND the graph size
+#   is within 2x of the recorded figure. Anything else fails, loudly.
+expect_unconverged() {
+  local name="$1" want="$2" mod="$3"; shift 3
+  tlc "$name" "$mod" "$@"
+  local rc=$?
+  if [ $rc -ne 124 ]; then
+    if grep -q "No error has been found" "out/$name.log"; then
+      printf 'FAIL  %-14s CONVERGED - the recorded measurement is STALE; re-measure and promote to expect_pass\n' "$name"
+    else
+      printf 'FAIL  %-14s expected a temporal-phase timeout; see out/%s.log\n' "$name" "$name"
+    fi
+    fail=1; return
+  fi
+  if ! grep -q "Checking .* branches of temporal properties" "out/$name.log"; then
+    printf 'FAIL  %-14s timed out during GENERATION, not the temporal check - a DIFFERENT defect\n' "$name"
+    fail=1; return
+  fi
+  local got
+  got=$(grep -oE '[0-9,]+ distinct states found' "out/$name.log" | tail -1 | tr -d ', ' | sed 's/distinctstatesfound//')
+  if [ -z "$got" ]; then
+    printf 'FAIL  %-14s temporal phase reached but the distinct-state count did not parse\n' "$name"
+    fail=1; return
+  fi
+  if [ "$got" -gt $(( want * 2 )) ] || [ "$got" -lt $(( want / 2 )) ]; then
+    printf 'FAIL  %-14s GRAPH DRIFT: %s distinct now, %s recorded (outside 2x) - re-measure the row\n' \
+      "$name" "$got" "$want"
+    fail=1; return
+  fi
+  printf 'PASS  %-14s UNCONVERGED as measured (temporal phase reached; %s distinct, recorded %s)\n' \
+    "$name" "$got" "$want"
+}
+
 echo "== syntax =="
 if java -cp "$JAR" tla2sany.SANY ECLifecycle.tla > out/sany.log 2>&1 \
    && java -cp "$JAR" tla2sany.SANY ECProbes.tla >> out/sany.log 2>&1; then
   echo "PASS  sany"
 else echo "FAIL  sany (see out/sany.log)"; fail=1; fi
 
-echo "== falsification gates: every fix must be shown load-bearing =="
+echo "== falsification gates and stale-gate closures =="
 # rev-3 machine (PENDED=FALSE, PIN_GATE=FALSE)
 expect_violation x1 ECLifecycle.tla "Invariant InvS4Holder is violated" \
   -deadlock -config ECLifecycle_rev3_x1.cfg
@@ -99,9 +133,11 @@ expect_violation x2 ECLifecycle.tla "Deadlock reached" \
   -config ECLifecycle_rev3_x2.cfg
 expect_violation x3 ECLifecycle.tla "Invariant InvNoLostOneShot is violated" \
   -deadlock -config ECLifecycle_rev3_x3.cfg
-# rev-4 F1, both readings of the hop-side iff
-expect_violation f1a ECLifecycle.tla "Invariant InvNoUAF is violated" \
-  -deadlock -config ECLifecycle_rev4_f1a.cfg
+# rev-4 F1, don't-wait reading. With normative target claim pins,
+# RetireEnabled's pin drain now prevents the old pending-claim UAF even
+# when the retired hop arm does not wait on payload_done.
+expect_pass f1a ECLifecycle.tla -deadlock -config ECLifecycle_rev4_f1a.cfg
+# rev-4 F1, always-wait reading of the hop-side iff.
 expect_violation f1b ECLifecycle.tla "Deadlock reached" \
   -config ECLifecycle_rev4_f1b.cfg
 # rev-5 literal unwind ordering (N4)
@@ -118,6 +154,10 @@ expect_violation crcyc ECLifecycle.tla "Invariant InvNoSuspendCycle2 is violated
   -deadlock -config ECLifecycle_crcyc.cfg
 expect_violation cr3 ECLifecycle.tla "Invariant InvNoSuspendCycle3 is violated" \
   -deadlock -config ECLifecycle_cr3.cfg
+# LiveSuspender calibration: no rejection, no N6 assumptions, no stale/bad
+# port owner-failure branch. dpin+dres made the old SpecFairN3/drop-bearing
+# temporal phase non-calibrating; the N6 mutual-suspend lasso still fires
+# at the focused SpecSus scope.
 expect_violation crfals ECLifecycle.tla "Temporal properties were violated" \
   -lncheck final -config ECLifecycle_crfals.cfg
 # round-8 C-1: mutual terminate. THIS is the gate that was missing.
@@ -128,11 +168,12 @@ expect_violation mterm ECLifecycle.tla "Deadlock reached" \
 # looping on, and disarming, a third party's directive.
 expect_violation diraba ECLifecycle.tla "Invariant InvNoForeignDisarm is violated" \
   -deadlock -config ECLifecycle_diraba.cfg
-# round-11 C-1: finalize's own `slot zero` destroys F6's `dead` marker, so
-# the W5 break returns SUCCESS for a TERMINATED target. Needs non-zero
-# TERM/CR budgets: the defect requires a real finalize and a real reuse.
-expect_violation dirf6 ECLifecycle.tla "Invariant InvNoFalseSuspendSuccess is violated" \
-  -deadlock -config ECLifecycle_dirf6.cfg
+# round-11 C-1 stale-gate closure: before dpin, finalize's own `slot zero`
+# could destroy F6's `dead` marker and make the W5 break return SUCCESS for
+# a TERMINATED target. With dpin, the running-target directive waiter pins
+# the target through ack/return, so finalize/reuse is blocked and this stale
+# falsifier is expected clean.
+expect_pass dirf6 ECLifecycle.tla -deadlock -config ECLifecycle_dirf6.cfg
 
 echo "== reachability probes: the violation IS the pass =="
 expect_violation pr1 ECProbes.tla "Invariant ProbeNoRetiredRvSender is violated" \
@@ -151,7 +192,7 @@ expect_violation pr4 ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated
 expect_violation pr5 ECProbes.tla "Invariant ProbeNoDisarm is violated" \
   -deadlock -config ECLifecycle_pr5.cfg
 
-echo "== revision 15: safety, TLC deadlock detection ON =="
+echo "== current safety, TLC deadlock detection ON =="
 expect_pass mtermfix  ECLifecycle.tla -config ECLifecycle_mtermfix.cfg
 # NOT RUN, and the reason is round-12 M-3's own finding: under
 # DIR_OWNED = TRUE the disarm guard forces dsrc = u, so InvNoForeignDisarm's
@@ -171,20 +212,48 @@ expect_pass dirf6fix  ECLifecycle.tla -config ECLifecycle_dirf6fix.cfg
 expect_pass small    ECLifecycle.tla -config ECLifecycle_small.cfg
 expect_pass large    ECLifecycle.tla -config ECLifecycle_large.cfg
 expect_pass cr3self  ECLifecycle.tla -deadlock -config ECLifecycle_cr3self.cfg
-expect_pass medium   ECLifecycle.tla -config ECLifecycle_medium.cfg
+expect_pass medium_nodir ECLifecycle.tla -config ECLifecycle_medium_nodir.cfg
 if [ "${RUN_XLARGE:-0}" = "1" ]; then
   expect_pass xlarge ECLifecycle.tla -config ECLifecycle_xlarge.cfg
 fi
 
-echo "== revision 15: liveness (all carry -lncheck final) =="
+echo "== current liveness (all carry -lncheck final) =="
 # LiveTerm ladder under SpecTrm, its per-property MINIMAL fairness set.
 expect_pass t1min ECLifecycle.tla -lncheck final -config ECLifecycle_t1min.cfg
 expect_pass t1s   ECLifecycle.tla -lncheck final -config ECLifecycle_t1s.cfg
 expect_pass t1r   ECLifecycle.tla -lncheck final -config ECLifecycle_t1r.cfg
-# LiveSuspender under SpecFairN3 (neither N6 assumption).
+# LADDER RUNG 3d-min - LiveTerm WITH the directive. PAIRED with pr4d_min, which
+# MUST fire: without it this PASS is vacuous over the W3 -> W5 -> W3 shape
+# the rung exists to cover. Keep these two adjacent and edit their
+# CONSTANTS together (both .cfg headers say so).
+expect_pass t1d_min ECLifecycle.tla -lncheck final -config ECLifecycle_t1d_min.cfg
+expect_violation pr4d_min ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
+  -deadlock -config ECLifecycle_pr4d_min.cfg
+# LiveSuspender under SpecSus (neither N6 assumption), paired with crfals.
 expect_pass cr1minself ECLifecycle.tla -lncheck final -config ECLifecycle_cr1minself.cfg
 if [ "${RUN_SLOW:-0}" = "1" ]; then
-  expect_pass t1full      ECLifecycle.tla -lncheck final -config ECLifecycle_t1full.cfg
+  # Full directive 2c x 3e medium is preserved on disk as the extended
+  # aggregate target, but it is NOT a slow-battery verdict: after dpin/dres
+  # it was stopped after >1h at ~598M generated / ~133.6M distinct /
+  # ~11.9M queued states. The default evidence is split between
+  # medium_nodir and the directive-specific rows above.
+  #   manual remeasure target: full medium aggregate config
+  # MEASURED NOT TO CONVERGE at revision 15 - 8,131,498 distinct /
+  # 16,262,996 product nodes, 17.0x its revision-11 size. Kept in the
+  # battery deliberately: a config that cannot converge at HEAD scope is a
+  # real finding about the model's checkable boundary, and that boundary is
+  # what a future revision needs to know. Its directive coverage moved to
+  # t1d_min. See the SCOPE NOTE in ECLifecycle_t1full.cfg.
+  # The 8131498 is the DRIFT ALARM's recorded figure - if the graph moves
+  # outside 2x of it, this row fails and demands a re-measurement rather
+  # than quietly continuing to "pass" about a different machine.
+  expect_unconverged t1full 8131498 ECLifecycle.tla -lncheck final -config ECLifecycle_t1full.cfg
+  # Full directive-bearing LiveTerm row. Preserved as extended/manual
+  # measured-unconverged evidence after the current dpin/dres/failed-result
+  # graph reached final temporal checking and timed out at 1,548,068
+  # distinct / 3,096,136 product states. Its default coverage moved to the
+  # bounded t1d_min/pr4d_min pair above; do not cite full t1d as a PASS.
+  expect_unconverged t1d 1548068 ECLifecycle.tla -lncheck final -config ECLifecycle_t1d.cfg
   expect_pass cr1fullself ECLifecycle.tla -lncheck final -config ECLifecycle_cr1fullself.cfg
   expect_pass liveness_a  ECLifecycle.tla -lncheck final -config ECLifecycle_liveness_a.cfg
   expect_pass liveness_b  ECLifecycle.tla -lncheck final -config ECLifecycle_liveness_b.cfg

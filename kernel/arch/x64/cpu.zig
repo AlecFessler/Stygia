@@ -8,6 +8,8 @@ const interrupts = stygia.arch.x64.interrupts;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const VAddr = stygia.memory.address.VAddr;
 
+extern fn scheduler_run_after_park() callconv(.c) noreturn;
+
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3
     pclmul = 1 << 1, // Carryless multiply
@@ -949,9 +951,10 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
         \\sti
         \\hlt
         \\cli
-        \\jmp scheduler_run_after_park
+        \\jmp %[after_park:P]
         :
         : [top] "r" (park_top),
+          [after_park] "X" (&scheduler_run_after_park),
         : .{ .memory = true });
     unreachable;
 }

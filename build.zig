@@ -124,6 +124,11 @@ pub fn build(b: *std.Build) void {
     // stalled (the smp=4 lost-wakeup signature: all cores idle hlt with
     // current_ec=null and run-queues empty).
     const kernel_hang_watchdog = b.option(bool, "kernel_hang_watchdog", "Enable HPET-NMI hang watchdog (default: off)") orelse false;
+    const kernel_spawn_diag = b.option(
+        bool,
+        "spawn_diag",
+        "Enable test-child spawn/terminal attribution diagnostics (default: on under -Dprofile=test)",
+    ) orelse (profile_name != null and std.mem.eql(u8, profile_name.?, "test"));
     // Test-only fixture devices (synthetic device_regions handed to the
     // root service so spec tests targeting `device_region` / IRQ / DMA
     // surfaces have something to scan for). Defaults on under
@@ -246,6 +251,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_ec_log", kernel_ec_log);
     build_opts.addOption(bool, "kernel_pf_log", kernel_pf_log);
     build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
+    build_opts.addOption(bool, "kernel_spawn_diag", kernel_spawn_diag);
     build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
     const build_opts_mod = build_opts.createModule();
     stygia_mod.addImport("build_options", build_opts_mod);
@@ -325,7 +331,6 @@ pub fn build(b: *std.Build) void {
     loader.root_module.addImport("stygia", stygia_mod);
     install_loader.step.dependOn(&loader.step);
     b.getInstallStep().dependOn(&install_loader.step);
-
 
     // ── Kernel ──────────────────────────────────────────────────────────
     const kernel = b.addExecutable(.{
@@ -601,16 +606,26 @@ pub fn build(b: *std.Build) void {
         const db_out = b.fmt("{s}/{s}", .{ db_dir, db_filename });
         const run_indexer = b.addSystemCommand(&.{
             "tools/indexer/zig-out/bin/indexer",
-            "--kernel-root",      "kernel",
-            "--extra-source-root", "bootloader",
-            "--extra-source-root", "tools",
-            "--extra-source-root", "tests",
-            "--extra-source-root", "libz",
-            "--out",              db_out,
-            "--arch",             @tagName(arch),
-            "--commit-sha",       commit_sha,
-            "--ir",               installed_ir,
-            "--elf",              installed_elf,
+            "--kernel-root",
+            "kernel",
+            "--extra-source-root",
+            "bootloader",
+            "--extra-source-root",
+            "tools",
+            "--extra-source-root",
+            "tests",
+            "--extra-source-root",
+            "libz",
+            "--out",
+            db_out,
+            "--arch",
+            @tagName(arch),
+            "--commit-sha",
+            commit_sha,
+            "--ir",
+            installed_ir,
+            "--elf",
+            installed_elf,
         });
         run_indexer.step.dependOn(&install_kernel.step);
         if (maybe_install_ir) |ir| run_indexer.step.dependOn(&ir.step);
@@ -771,7 +786,8 @@ pub fn build(b: *std.Build) void {
 
     if (wants_nvme) {
         const create_nvme_img = b.addSystemCommand(&[_][]const u8{
-            "sh", "-c", b.fmt(
+            "sh", "-c",
+            b.fmt(
                 "mkdir -p {s} && test -f {s}/nvme.img || dd if=/dev/zero of={s}/nvme.img bs=1M count=64 2>/dev/null",
                 .{ b.install_path, b.install_path, b.install_path },
             ),

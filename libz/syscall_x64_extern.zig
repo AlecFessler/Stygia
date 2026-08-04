@@ -133,10 +133,7 @@ pub fn issueRegDiscard(word: u64, in: Regs) void {
           [iv11] "{r13}" (in.v11),
           [iv12] "{r14}" (in.v12),
           [iv13] "{r15}" (in.v13),
-        : .{ .rax = true, .rbx = true, .rdx = true, .rbp = true,
-             .rsi = true, .rdi = true, .r8 = true, .r9 = true,
-             .r10 = true, .r12 = true, .r13 = true, .r14 = true,
-             .r15 = true, .rcx = true, .r11 = true, .memory = true });
+        : .{ .rax = true, .rbx = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .rcx = true, .r11 = true, .memory = true });
 }
 
 // Spec §[syscall_abi]: vreg 0 (`[rsp + 0]`) is the syscall word — on
@@ -528,10 +525,10 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        // Reserve 944 bytes. vreg 0 lives at [rsp+16] (after the 16-
-        // byte input stash); vregs 14..127 at [rsp + 24..936]. We
-        // advance rsp by +16 right before syscall so the kernel sees
-        // vreg 0 at [rsp+0], then restore +928 after the syscall.
+    // Reserve 944 bytes. vreg 0 lives at [rsp+16] (after the 16-
+    // byte input stash); vregs 14..127 at [rsp + 24..936]. We
+    // advance rsp by +16 right before syscall so the kernel sees
+    // vreg 0 at [rsp+0], then restore +928 after the syscall.
         \\ subq $944, %%rsp
         // Stash all three inputs IMMEDIATELY, before clobbering any
         // scratch. Use r11 as the load reg — r11 is in the clobber
@@ -632,6 +629,16 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
 }
 
 pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
+    const InputBlock = extern struct {
+        word: u64,
+        attachments_ptr: [*]const u64,
+        n: u64,
+    };
+    var input_block: InputBlock = .{
+        .word = word,
+        .attachments_ptr = attachments_ptr,
+        .n = n,
+    };
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
     var ov3: u64 = undefined;
@@ -646,9 +653,16 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
     var ov12: u64 = undefined;
     var ov13: u64 = undefined;
     asm volatile (
-    // Reserve 928 bytes — covers vreg 0 at [rsp+0] and vregs 14..127
-    // at [rsp + 8..920]. Aligned to 16.
-        \\ subq $928, %%rsp
+    // Reserve 928 bytes for the ABI window plus three saved input
+    // words. Spilling the operands first keeps LLVM-assigned input
+    // registers from being overwritten by the scratch registers below.
+        \\ subq $960, %%rsp
+        \\ movq 0(%%rcx), %%rax
+        \\ movq %%rax, 928(%%rsp)
+        \\ movq 8(%%rcx), %%rax
+        \\ movq %%rax, 936(%%rsp)
+        \\ movq 16(%%rcx), %%rax
+        \\ movq %%rax, 944(%%rsp)
         // Zero-fill the reserved region so vregs the kernel reads but
         // we don't explicitly set come back as 0 rather than caller-
         // frame stack garbage.
@@ -662,8 +676,8 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         // [rsp + (128-N-13)*8 .. rsp + 912]. Loop in a way that handles
         // arbitrary N (1..63). %rsi = src ptr, %rdi = first vreg offset
         // = (128-N-13)*8 = (115-N)*8, %rcx = N.
-        \\ movq %[atts_ptr], %%rsi
-        \\ movq %[n], %%rcx
+        \\ movq 936(%%rsp), %%rsi
+        \\ movq 944(%%rsp), %%rcx
         \\ movq %%rcx, %%rdi
         \\ negq %%rdi
         \\ addq $115, %%rdi
@@ -676,10 +690,10 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
         \\ decq %%rcx
         \\ jnz 2b
         // Syscall word at [rsp+0].
-        \\ movq %[word], %%rax
+        \\ movq 928(%%rsp), %%rax
         \\ movq %%rax, (%%rsp)
         \\ syscall
-        \\ addq $928, %%rsp
+        \\ addq $960, %%rsp
         : [v1] "={rax}" (ov1),
           [v2] "={rbx}" (ov2),
           [v3] "={rdx}" (ov3),
@@ -693,9 +707,7 @@ pub fn replyTransferAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Regs {
           [v11] "={r13}" (ov11),
           [v12] "={r14}" (ov12),
           [v13] "={r15}" (ov13),
-        : [word] "r" (word),
-          [atts_ptr] "r" (attachments_ptr),
-          [n] "r" (n),
+        : [input] "{rcx}" (&input_block),
         : .{ .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
     return .{
         .v1 = ov1,

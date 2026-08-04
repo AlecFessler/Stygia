@@ -127,11 +127,7 @@ const testing = lib.testing;
 
 fn dummyEntry() callconv(.c) noreturn {
     while (true) {
-        switch (builtin.cpu.arch) {
-            .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfi"),
-            else => @compileError("unsupported arch"),
-        }
+        _ = syscall.yieldEc(0);
     }
 }
 
@@ -165,12 +161,7 @@ fn suspendWithOneAttachmentArm(word: u64, w_handle: u64, port_handle: u64, pair_
           [v1in] "{x0}" (w_handle),
           [v2in] "{x1}" (port_handle),
           [pair] "r" (pair_word),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return ret_v1;
 }
 

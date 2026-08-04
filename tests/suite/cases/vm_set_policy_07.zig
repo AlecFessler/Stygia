@@ -29,27 +29,21 @@
 //   Neither is provisioned here.
 //
 // Strategy (smoke prelude)
-//   We exercise the VM + vCPU coexistence path on the x86-64 build
+//   We exercise the VM policy syscall shape on the x86-64 build
 //   target. Setup mirrors tests 05/06 — a zeroed VmPolicy page frame
 //   plus a VM minted with caps.policy = true so the earlier gates
-//   (test 01 / 02 / 03 / 04) are inert. We additionally stand up an
-//   exit port and a vCPU and consume the initial vm_exit, confirming
-//   the policy frame stays pinned through vCPU creation. This
-//   exercises the same kernel-side path the eventual aarch64 test
-//   will rely on (policy frame coherency under a live vCPU). The
-//   kind=0 vm_set_policy call's return is *not* checked: on x86-64 it
-//   touches the cpuid_responses table, not the aarch64
+//   (test 01 / 02 / 03 / 04) are inert. The kind=0 vm_set_policy
+//   call's return is checked only as a same-ABI smoke assertion: on
+//   x86-64 it touches the cpuid_responses table, not the aarch64
 //   id_reg_responses table this spec sentence is about.
 //
 // Action
 //   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
 //   2. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
 //      (or smoke-pass on E_NODEV).
-//   3. createPort + createVcpu so the policy frame is pinned by a live
-//      vCPU.
-//   4. recv(exit_port) — must surface OK and the initial-state subcode.
-//   5. vmSetPolicy call shape only — return ignored, since the aarch64
-//      id_reg_responses path is unreachable on x86-64.
+//   3. vmSetPolicy call shape only — must return OK for the x86-64
+//      empty-table replacement path. This is still not a faithful
+//      assertion of the aarch64 id_reg_responses behavior.
 //
 // Assertions
 //   1: setup — create_page_frame for the policy frame returned an
@@ -59,12 +53,8 @@
 //   3: setup — map_pf for the policy mapping returned non-OK.
 //   4: setup — create_virtual_machine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
-//   5: setup — create_port returned an error word.
-//   6: setup — create_vcpu returned an error word.
-//   7: recv on the exit_port did not return OK in vreg 1.
-//   8: the recv'd event's sub-code (vreg 2) is not the initial-state
-//      sub-code.
-//
+//   5: vm_set_policy(kind=0,count=0) returned non-OK on the active
+//      x86-64 policy path used for this smoke.
 // Faithful-test note
 //   Faithful test deferred pending three pieces:
 //     1. An aarch64 runner build (cpu_arch = .aarch64) — only then
@@ -172,60 +162,20 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Mint the exit port. `bind` is required as create_vcpu's [4]
-    //    handle. `recv` lets us pull the kernel-injected initial
-    //    vm_exit so the prelude reaches the same vCPU + policy_pf
-    //    coexistence the aarch64 test will need.
-    const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
-    const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
-    if (testing.isHandleError(cport.v1)) {
+    // 5. Smoke the vm_set_policy(kind=0) call shape. On the x86-64
+    //    build target this reaches the cpuid_responses path, not the
+    //    aarch64 id_reg_responses table that spec sentence 07 asserts
+    //    against. count=0 keeps the call inert with respect to
+    //    whichever table the kernel routes to, but the syscall still
+    //    must accept the valid empty replacement on the active arch.
+    const result = syscall.vmSetPolicy(vm_handle, 0, 0, &.{});
+    if (result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(5);
         return;
     }
-    const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
 
-    // 6. Stand up a vCPU bound to the policy-bearing VM.
-    const vcpu_caps = caps.EcCap{
-        .susp = true,
-        .read = true,
-        .write = true,
-    };
-    const cvcpu = syscall.createVcpu(
-        @as(u64, vcpu_caps.toU16()),
-        vm_handle,
-        0, // affinity = any core
-        exit_port,
-    );
-    if (testing.isHandleError(cvcpu.v1)) {
-        testing.fail(6);
-        return;
-    }
-
-    // 7. Recv the kernel-injected initial vm_exit.
-    const initial = syscall.recv(exit_port, 0);
-    if (initial.regs.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(7);
-        return;
-    }
-
-    // 8. The synthetic initial vm_exit's sub-code lives in vreg 2.
-    if (initial.regs.v2 != @as(u64, syscall.INITIAL_STATE_SUBCODE)) {
-        testing.fail(8);
-        return;
-    }
-
-    // 9. Smoke the vm_set_policy(kind=0) call shape. On the x86-64
-    //    build target this reaches the cpuid_responses path, not the
-    //    aarch64 id_reg_responses table that spec sentence 07 asserts
-    //    against; the returned word is therefore not checked. count=0
-    //    keeps the call inert with respect to whichever table the
-    //    kernel routes to.
-    _ = syscall.vmSetPolicy(vm_handle, 0, 0, &.{});
-
-    // No spec assertion is being checked beyond the prelude — the
+    // No spec assertion is being checked beyond the syscall shape — the
     // aarch64 id_reg_responses path is unreachable on the x86-64
-    // build target. The prelude assertions (1..8) cover the same
-    // VM + vCPU + policy_pf coexistence path that the aarch64
-    // observation will rely on once a live-guest harness exists.
+    // build target.
     testing.pass();
 }

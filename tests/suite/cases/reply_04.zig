@@ -28,17 +28,20 @@
 //   the spec line names.
 //
 //   W's `restart_policy = 0` (kill) keeps the EC creation cap word
-//   inside the runner-granted ceiling and prevents any post-resume
-//   scheduling of W from interfering with this test's pass path; the
-//   test asserts that `reply` returned OK and the slot is gone before
-//   any further activity matters.
+//   inside the runner-granted ceiling. W's entry is a user-mode busy
+//   loop rather than `testing.dummyEntry`: on x86-64 the shared helper
+//   executes `hlt`, which is privileged at CPL3 and can put W through
+//   the fault/termination path if W wins a scheduling race before the
+//   external suspend lands. That fault path is outside the reply-handle
+//   consumption assertion under test.
 //
 // Action
 //   1. create_port(caps={bind, recv})        — must succeed
 //   2. create_execution_context(target=self,
 //        caps={susp, rp=0})                  — must succeed
-//      (entry = dummyEntry; W is suspended via suspend before it
-//      executes meaningfully)
+//      (entry = workerEntry; W is suspended via suspend before it
+//      executes meaningfully; if it wins an early timeslice, it does
+//      not fault)
 //   3. suspend(W, port)                      — must return OK
 //      (non-blocking on the test EC since [1] != self)
 //   4. recv(port)                            — must return OK and
@@ -57,12 +60,23 @@
 //   6: post-reply restrict did not return E_BADCAP (the reply slot
 //      was not consumed)
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+fn workerEntry() noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -80,7 +94,7 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, w_caps.toU16());
-    const entry: u64 = @intFromPtr(&testing.dummyEntry);
+    const entry: u64 = @intFromPtr(&workerEntry);
     const cec = syscall.createExecutionContext(
         ec_caps_word,
         entry,

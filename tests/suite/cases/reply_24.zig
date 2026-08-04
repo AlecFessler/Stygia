@@ -28,9 +28,9 @@
 //       the test EC has installed the handles and given them the go
 //       signal. Same single-domain in-process mailbox pattern as
 //       reply_transfer_12.zig.
-//     - Self-suspend is open-coded in inline asm (syscall_num=14) so
-//       the test EC can sequence the start gates and observe a real
-//       cross-EC suspend handoff.
+//     - Self-suspend uses the libz suspend wrapper so the test EC can
+//       sequence the start gates and observe a real cross-EC suspend
+//       handoff without carrying architecture-local syscall asm.
 //     - The test EC then issues `syscall.replyRecv(reply_handle_A,
 //       port_B)` (the new spec-v3 unified-reply libz wrapper). The
 //       kernel atomically: consumes reply_handle_A and resumes W, then
@@ -97,67 +97,14 @@ var g_ready_w: u32 = 0;
 var g_ready_x: u32 = 0;
 
 fn selfSuspendOnPort(self_ec_id: u64, port_id: u64) void {
-    // syscall_num = 14 (.suspend). vreg 0 = syscall word, vreg 1 =
-    // self EC handle, vreg 2 = port handle. No attachments. After
-    // resume we don't care about any return — the sibling exits to
-    // the parked-forever loop.
-    const word_in: u64 = @intFromEnum(syscall.SyscallNum.@"suspend");
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\ pushq %%rcx
-                \\ syscall
-                \\ popq %%rcx
-                :
-                : [wi] "{rcx}" (word_in),
-                  [v1i] "{rax}" (self_ec_id),
-                  [v2i] "{rbx}" (port_id),
-                : .{
-                    .rcx = true,
-                    .rax = true,
-                    .rbx = true,
-                    .rdx = true,
-                    .rbp = true,
-                    .rsi = true,
-                    .rdi = true,
-                    .r8 = true,
-                    .r9 = true,
-                    .r10 = true,
-                    .r11 = true,
-                    .r12 = true,
-                    .r13 = true,
-                    .r14 = true,
-                    .r15 = true,
-                    .memory = true,
-                });
-        },
-        .aarch64 => {
-            asm volatile (
-                \\ sub sp, sp, #16
-                \\ str %[wi], [sp]
-                \\ svc #0
-                \\ add sp, sp, #16
-                :
-                : [wi] "r" (word_in),
-                  [v1i] "{x0}" (self_ec_id),
-                  [v2i] "{x1}" (port_id),
-                : .{ .x0 = true, .x1 = true, .x2 = true, .x3 = true, .x4 = true,
-                     .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true,
-                     .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true,
-                     .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true,
-                     .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true,
-                     .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true,
-                     .memory = true });
-        },
-        else => @compileError("unsupported target architecture"),
-    }
+    _ = syscall.suspendEc(@truncate(self_ec_id), @truncate(port_id), &.{});
 }
 
 fn parkForever() noreturn {
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfe"),
+            .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
             else => @compileError("unsupported target architecture"),
         }
     }
@@ -172,7 +119,9 @@ fn siblingW_entry() callconv(.c) noreturn {
         }
     }
 
-    selfSuspendOnPort(g_w_self_handle, g_port_a_handle);
+    const self_ec_id = @atomicLoad(u64, &g_w_self_handle, .acquire);
+    const port_id = @atomicLoad(u64, &g_port_a_handle, .acquire);
+    selfSuspendOnPort(self_ec_id, port_id);
     parkForever();
 }
 
@@ -185,7 +134,9 @@ fn siblingX_entry() callconv(.c) noreturn {
         }
     }
 
-    selfSuspendOnPort(g_x_self_handle, g_port_b_handle);
+    const self_ec_id = @atomicLoad(u64, &g_x_self_handle, .acquire);
+    const port_id = @atomicLoad(u64, &g_port_b_handle, .acquire);
+    selfSuspendOnPort(self_ec_id, port_id);
     parkForever();
 }
 
@@ -219,12 +170,37 @@ pub fn main(cap_table_base: u64) void {
         .restart_policy = 0,
     };
     const ec_caps_word: u64 = @as(u64, ec_caps.toU16()) | (@as(u64, 1) << 32);
+    const pinned_core = testing.currentCoreId();
+    const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((sibling_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(3);
+        return;
+    }
+
     const cec_w = syscall.createExecutionContext(
         ec_caps_word,
         @intFromPtr(&siblingW_entry),
         1, // stack_pages
         0, // target = self
-        0, // affinity
+        sibling_affinity,
     );
     if (testing.isHandleError(cec_w.v1)) {
         testing.fail(3);
@@ -238,7 +214,7 @@ pub fn main(cap_table_base: u64) void {
         @intFromPtr(&siblingX_entry),
         1,
         0,
-        0,
+        sibling_affinity,
     );
     if (testing.isHandleError(cec_x.v1)) {
         testing.fail(4);
