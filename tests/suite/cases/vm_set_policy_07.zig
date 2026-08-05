@@ -4,80 +4,71 @@
 //  is replaced by the count entries; subsequent guest reads of matching
 //  ID_AA64* registers return the configured values per §[vm_policy]."
 //
-// DEGRADED SMOKE VARIANT
-//   The faithful shape of test 07 is "guest read of an ID_AA64* sysreg
-//   matching an entry's (op0, op1, crn, crm, op2) tuple resumes with
-//   the entry's value, while ID-reg accesses absent from the table
-//   deliver a vm_exit." Reaching that property requires the kernel
-//   build target to be aarch64: per §[vm_set_policy] the kind selector
-//   is overloaded across architectures, and on aarch64 with kind=0 the
-//   syscall replaces `id_reg_responses`; on x86-64 with kind=0 it
-//   replaces `cpuid_responses` (test 05).
+// Demonstrated stale-test weakness
+//   The previous version was a degraded x86-only smoke: it hard-coded
+//   x86-64's 976-byte VmPolicy layout, then called
+//   vmSetPolicy(kind=0,count=0,&.{}). That is vacuous for this spec
+//   sentence. On x86-64, kind=0 selects `cpuid_responses`, not
+//   aarch64 `id_reg_responses`, and count=0 only proves that an empty
+//   replacement is accepted on the active architecture. It neither
+//   installed an IdRegResponse entry nor reached the aarch64 table.
 //
-//   The runner builds for x86-64 only — `tests/suite/build.zig`
-//   resolves the test target with `cpu_arch = .x86_64`, and there is
-//   no in-tree aarch64 runner image. On the x86-64 build target a
-//   vm_set_policy(kind=0) call dispatches to the cpuid_responses path,
-//   so the syscall cannot exercise the aarch64 id_reg_responses table
-//   regardless of how the entries are framed.
+// Strategy — partial aarch64 coverage, not guest-read proof
+//   This test now follows the local pattern from vm_set_policy_08:
+//     1. On non-aarch64 builds, return an explicit degraded pass. The
+//        same kind selector owns `cpuid_responses` there, and
+//        vm_set_policy_05 owns that x86-64 surface.
+//     2. On aarch64 with no hardware virtualization, tolerate E_NODEV
+//        from create_virtual_machine. Without a VM, the replacement
+//        path is unreachable.
+//     3. On aarch64 with virtualization, install a non-empty
+//        kind=0,count=1 IdRegResponse for ID_AA64PFR0_EL1, clear the
+//        table with count=0, then reinstall the non-empty entry. This
+//        proves the syscall-visible mutable replacement path for the
+//        real aarch64 id_reg_responses table, including repeated
+//        replacement.
 //
-//   Reaching the faithful path needs:
-//     - an aarch64 runner build (cpu_arch = .aarch64) that boots the
-//       same root_service against the aarch64 kernel; or
-//     - a per-test arch override in the manifest so test 07 ships only
-//       on aarch64 builds.
-//   Neither is provisioned here.
+//   This still does not claim the second half of the spec sentence:
+//   observing a guest read return the configured value requires a
+//   suite harness that can map guest code, create/run a vCPU, execute
+//   an MRS ID_AA64* instruction, and inspect the result. The aarch64
+//   kernel run loop does consult `id_reg_responses`; the remaining
+//   blocker is the suite-level guest/vCPU witness.
 //
-// Strategy (smoke prelude)
-//   We exercise the VM policy syscall shape on the x86-64 build
-//   target. Setup mirrors tests 05/06 — a zeroed VmPolicy page frame
-//   plus a VM minted with caps.policy = true so the earlier gates
-//   (test 01 / 02 / 03 / 04) are inert. The kind=0 vm_set_policy
-//   call's return is checked only as a same-ABI smoke assertion: on
-//   x86-64 it touches the cpuid_responses table, not the aarch64
-//   id_reg_responses table this spec sentence is about.
+// Defusing other vm_set_policy error paths
+//   - test 01 (E_BADCAP not a valid VM handle): we mint a real VM.
+//   - test 02 (E_PERM no `policy` cap): we mint with
+//     VmCap{ .policy = true }; the runner grants vm_ceiling = 0x01.
+//   - test 03 (E_INVAL count exceeds MAX_*): count = 1, well under
+//     MAX_ID_REG_RESPONSES (62).
+//   - test 04 (E_INVAL reserved bits): the handle slot is low 12 bits
+//     only, and the entry tuple uses bytes 0..4 with pad bytes 5..7
+//     zero.
 //
 // Action
-//   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
-//   2. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
-//      (or smoke-pass on E_NODEV).
-//   3. vmSetPolicy call shape only — must return OK for the x86-64
-//      empty-table replacement path. This is still not a faithful
-//      assertion of the aarch64 id_reg_responses behavior.
+//   1. Non-aarch64 builds return degraded pass because kind=0 targets
+//      cpuid_responses there.
+//   2. Stage VmPolicy (PF + VMAR + map_pf + zero).
+//   3. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
+//      (or degraded pass on E_NODEV).
+//   4. vmSetPolicy(vm_handle, kind=0, count=1, one IdRegResponse entry)
+//      must return OK.
+//   5. vmSetPolicy(vm_handle, kind=0, count=0, &.{}) must return OK.
+//   6. vmSetPolicy(vm_handle, kind=0, count=1, same entry) must return
+//      OK.
 //
 // Assertions
-//   1: setup — create_page_frame for the policy frame returned an
-//      error word.
-//   2: setup — create_vmar for the policy mapping returned an error
-//      word.
-//   3: setup — map_pf for the policy mapping returned non-OK.
-//   4: setup — create_virtual_machine returned an unexpected error
+//   1: setup — createPageFrame returned an error word.
+//   2: setup — createVmar returned an error word.
+//   3: setup — mapPf returned non-OK in vreg 1.
+//   4: setup — createVirtualMachine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
-//   5: vm_set_policy(kind=0,count=0) returned non-OK on the active
-//      x86-64 policy path used for this smoke.
-// Faithful-test note
-//   Faithful test deferred pending three pieces:
-//     1. An aarch64 runner build (cpu_arch = .aarch64) — only then
-//        does kind=0 dispatch to id_reg_responses.
-//     2. A guest-execution harness that can stage guest code into
-//        the VM and drive the vCPU through an ID_AA64* read so the
-//        kernel sees a sysreg exit it could match against the table.
-//     3. Kernel-side `id_reg_responses` consultation. The aarch64
-//        vm_runloop today does not read the policy table on sysreg
-//        exits — see kernel/arch/aarch64/vm_runloop.zig — so even
-//        with (1) and (2), the spec post-condition would not hold
-//        until the kernel feature lands.
-//   Once those three exist, the action becomes:
-//     <build runner with cpu_arch = .aarch64>
-//     <test: build IdRegResponse entry per §[vm_set_policy] aarch64
-//      kind=0 layout — vreg [2+2i+0] packs (op0, op1, crn, crm, op2,
-//      _pad u8[3]); vreg [2+2i+1] is value u64>
-//     <test: vmSetPolicy(vm, kind=0, count=1, &entry) — assert OK>
-//     <test: drive guest read of ID_AA64<X>_EL1 — assert resumed
-//      value matches entry's `value`>
-//   That guest-side assertion would replace this smoke's
-//   pass-with-id-0.
+//   9: vm_set_policy(kind=0,count=1) returned non-OK for a valid
+//      aarch64 IdRegResponse entry.
+//  10: vm_set_policy(kind=0,count=0) returned non-OK for a clear.
+//  11: vm_set_policy(kind=0,count=1) returned non-OK on reinstall.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -87,15 +78,20 @@ const testing = lib.testing;
 
 const HandleId = caps.HandleId;
 
-// §[vm_policy] x86-64: 32 cpuid + count + pad + 8 cr + count + pad
-// = 976 bytes. Same constant as create_virtual_machine_06 / map_guest_05.
-// The x86-64 layout drives the prelude here because the build target
-// is x86-64; the aarch64 layout (id_reg + sysreg tables) is not reached
-// from this binary regardless of what the test exercises.
-const VM_POLICY_BYTES: usize = 32 * 24 + 8 + 8 * 24 + 8;
+// §[vm_policy] aarch64 sizeof(VmPolicy) = 1776; x86-64 = 976. Both
+// fit in 4 KiB. We zero the larger layout so this source builds under
+// either arch, while only aarch64 reaches the meaningful path.
+const VM_POLICY_BYTES: usize = 1776;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
+
+    if (builtin.cpu.arch != .aarch64) {
+        // Non-aarch64 builds cannot exercise `id_reg_responses`: kind=0
+        // selects the x86-64 CPUID table there, covered by test 05.
+        testing.pass();
+        return;
+    }
 
     // 1. Page frame backing the VmPolicy struct.
     const policy_pf_caps = caps.PfCap{ .r = true, .w = true };
@@ -133,7 +129,8 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 3. Zero the VmPolicy region. Volatile keeps ReleaseSmall from
-    //    folding the stores against the kernel's read.
+    //    folding the stores against the kernel's later read on the
+    //    create_virtual_machine path.
     const policy_dst: [*]volatile u8 = @ptrFromInt(policy_base);
     var i: usize = 0;
     while (i < VM_POLICY_BYTES) {
@@ -141,18 +138,15 @@ pub fn main(cap_table_base: u64) void {
         i += 1;
     }
 
-    // 4. Mint the VM with caps.policy = true. Runner grants `crvm` and
-    //    vm_ceiling = 0x01, so policy stays subset of the ceiling. The
-    //    VM handle therefore carries the `policy` cap — earlier gates
-    //    (test 01 / 02) are inert.
+    // 4. Mint the VM with caps.policy = true so vmSetPolicy can
+    //    authorize. On no-virt hosts this returns E_NODEV; the aarch64
+    //    table replacement path is unreachable, so degrade with pass.
     const vm_caps = caps.VmCap{ .policy = true };
     const cvm = syscall.createVirtualMachine(
         @as(u64, vm_caps.toU16()),
         policy_pf,
     );
     if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
-        // No hardware virtualization — test 07 unreachable through any
-        // construction. Smoke-pass.
         testing.pass();
         return;
     }
@@ -162,20 +156,44 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Smoke the vm_set_policy(kind=0) call shape. On the x86-64
-    //    build target this reaches the cpuid_responses path, not the
-    //    aarch64 id_reg_responses table that spec sentence 07 asserts
-    //    against. count=0 keeps the call inert with respect to
-    //    whichever table the kernel routes to, but the syscall still
-    //    must accept the valid empty replacement on the active arch.
-    const result = syscall.vmSetPolicy(vm_handle, 0, 0, &.{});
-    if (result.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(5);
+    // 5. Install a real aarch64 IdRegResponse entry. We use
+    //    ID_AA64PFR0_EL1:
+    //      op0=3, op1=0, CRn=0, CRm=4, op2=0
+    //    The tuple is packed into bytes 0..4 of vreg 2; bytes 5..7
+    //    are the reserved pad and remain zero. The value is
+    //    intentionally non-zero so this is not an empty-table smoke.
+    const id_aa64pfr0_el1_tuple: u64 =
+        (@as(u64, 3) << 0) |
+        (@as(u64, 0) << 8) |
+        (@as(u64, 0) << 16) |
+        (@as(u64, 4) << 24) |
+        (@as(u64, 0) << 32);
+    const configured_value: u64 = 0x1122_3344_5566_7788;
+    const entry: [2]u64 = .{ id_aa64pfr0_el1_tuple, configured_value };
+
+    const replace_result = syscall.vmSetPolicy(vm_handle, 0, 1, &entry);
+    if (replace_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(9);
         return;
     }
 
-    // No spec assertion is being checked beyond the syscall shape — the
-    // aarch64 id_reg_responses path is unreachable on the x86-64
-    // build target.
+    // 6. Clear the ID register response table. This retains the
+    //    empty-replacement case, but only after a real entry has been
+    //    accepted.
+    const clear_result = syscall.vmSetPolicy(vm_handle, 0, 0, &.{});
+    if (clear_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+
+    // 7. Reinstall the non-empty entry to prove replacement remains
+    //    live after a clear. Guest-side readback remains blocked on a
+    //    suite harness that can run MRS ID_AA64PFR0_EL1 inside the VM.
+    const reinstall_result = syscall.vmSetPolicy(vm_handle, 0, 1, &entry);
+    if (reinstall_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(11);
+        return;
+    }
+
     testing.pass();
 }
