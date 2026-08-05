@@ -23,8 +23,11 @@ const execution_context = stygia.sched.execution_context;
 const capability_domain = stygia.caps.capability_domain;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
+const timer = stygia.sched.timer;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const EventType = stygia.sched.execution_context.EventType;
 const State = stygia.sched.execution_context.State;
+const WaitKind = stygia.sched.execution_context.WaitKind;
 
 /// 4s of no-newline-progress = hang. Used as a backstop only — the
 /// primary detector on this branch is `allCoresIdle()` driven from the
@@ -194,6 +197,7 @@ fn dump(elapsed_ns: u64) void {
         core_id += 1;
     }
 
+    dumpTimerWheels(num_cores);
     dumpLifecycleCounters();
     dumpSpawnTraceSamples();
 
@@ -384,15 +388,16 @@ fn dumpAliveEc(_: *u8, ec: *ExecutionContext, gen: u63) bool {
     printState(lifecycle.load(ec));
     rawWrite(" owner=");
     printDecimal(@as(u64, ec.owner_core));
+    rawWrite(" q=");
+    printQueueCore(ec);
+    rawWrite(" pin=");
+    printDecimal(@as(u64, ec.pin_depth.load(.acquire)));
+    rawWrite(" mark=");
+    printHex(@as(u64, ec.mark_state.load(.acquire)));
+    rawWrite(" dir=");
+    printDirective(ec);
     rawWrite(" wait=");
-    printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
-    if (ec.suspend_port) |sp| {
-        rawWrite(" susp_port=");
-        printHex(@intFromPtr(sp.ptr));
-    }
-    if (ec.pending_reply_holder) |_| {
-        rawWrite(" has_pending_reply");
-    }
+    printWaitSummary(ec);
     rawWrite("\n");
     return true;
 }
@@ -414,26 +419,28 @@ fn dumpCore(core_id: u8) void {
         printState(lifecycle.load(ec));
         rawWrite(" owner=");
         printDecimal(@as(u64, ec.owner_core));
+        rawWrite(" q=");
+        printQueueCore(ec);
+        rawWrite(" pin=");
+        printDecimal(@as(u64, ec.pin_depth.load(.acquire)));
+        rawWrite(" mark=");
+        printHex(@as(u64, ec.mark_state.load(.acquire)));
+        rawWrite(" dir=");
+        printDirective(ec);
         rawWrite(" wait=");
-        printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
-        if (ec.suspend_port) |sp| {
-            rawWrite(" suspend_port=");
-            printHex(@intFromPtr(sp.ptr));
-        }
-        if (ec.pending_reply_holder) |_| {
-            rawWrite(" has_pending_reply");
-        }
+        printWaitSummary(ec);
     } else {
         rawWrite(" current_ec=null");
     }
 
     if (pc.teardown_pending != null) rawWrite(" teardown_pending=1");
+    if (pc.idle_parked) rawWrite(" idle_parked=1");
 
     rawWrite("\n");
 
-    // Dump run-queue contents (head per level — full walk is a pointer
-    // chase that can fault if a queue link is corrupt; we want signal,
-    // not noise).
+    // Dump run-queue heads plus a short bounded walk per level. This is
+    // enough to distinguish "idle and empty" from "ready work stranded"
+    // without turning a recovered watchdog event into a giant log.
     var any_q = false;
     var lvl: usize = 0;
     while (lvl < pc.run_queue.levels.len) {
@@ -449,6 +456,10 @@ fn dumpCore(core_id: u8) void {
             printHex(@intFromPtr(e));
             rawWrite("(st=");
             printState(e.state);
+            rawWrite(" q=");
+            printQueueCore(e);
+            rawWrite(" n=");
+            printDecimal(countQueueLevelBounded(e));
             rawWrite(")");
         }
         lvl += 1;
@@ -460,6 +471,151 @@ fn dumpCore(core_id: u8) void {
     }
 }
 
+fn dumpTimerWheels(num_cores: u64) void {
+    rawWrite("[HANG] timer wheels:");
+    const now_ns = arch.time.currentMonotonicNs();
+    var core_id: u8 = 0;
+    while (core_id < num_cores) : (core_id += 1) {
+        const heap = &timer.wheels[core_id];
+        rawWrite(" c");
+        printDecimal(core_id);
+        rawWrite(" len=");
+        printDecimal(@as(u64, heap.len));
+        if (heap.len != 0) {
+            const top = heap.entries[0];
+            rawWrite(" top=");
+            printHex(@intFromPtr(top.timer.ptr));
+            rawWrite(" due=");
+            printDeadlineDelta(top.deadline_ns, now_ns);
+        }
+    }
+    rawWrite("\n");
+}
+
+fn countQueueLevelBounded(head: *ExecutionContext) u64 {
+    var count: u64 = 0;
+    var cur: ?*ExecutionContext = head;
+    while (cur) |ec| {
+        count += 1;
+        if (count == 8) {
+            if (ec.next != null) return 9; // 9 means "8+"
+            return count;
+        }
+        cur = ec.next;
+    }
+    return count;
+}
+
+fn printWaitSummary(ec: *ExecutionContext) void {
+    printWaitKind(ec.wait.kind);
+    rawWrite("(");
+    printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
+    rawWrite(")");
+    rawWrite(" payload_done=");
+    printBool(ec.wait.payload_done.load(.acquire));
+
+    if (ec.wait.port) |p| {
+        rawWrite(" wait_port=");
+        printHex(@intFromPtr(p.ptr));
+        rawWrite("/g=");
+        printHex(@as(u64, p.gen));
+    }
+    if (ec.wait.deadline_ns != 0) {
+        rawWrite(" wait_due=");
+        printDeadlineDelta(ec.wait.deadline_ns, arch.time.currentMonotonicNs());
+    }
+    if (ec.recv_deadline_ns != 0) {
+        rawWrite(" recv_due=");
+        printDeadlineDelta(ec.recv_deadline_ns, arch.time.currentMonotonicNs());
+    }
+    if (ec.futex_deadline_ns != 0) {
+        rawWrite(" futex_due=");
+        printDeadlineDelta(ec.futex_deadline_ns, arch.time.currentMonotonicNs());
+    }
+    if (ec.futex_bucket_count != 0) {
+        rawWrite(" futex_n=");
+        printDecimal(@as(u64, ec.futex_bucket_count));
+        rawWrite(" wake_idx=");
+        printDecimal(@as(u64, ec.futex_wake_index));
+    }
+    if (ec.suspend_port) |sp| {
+        rawWrite(" susp_port=");
+        printHex(@intFromPtr(sp.ptr));
+        rawWrite("/g=");
+        printHex(@as(u64, sp.gen));
+    }
+    if (ec.pending_pair_count != 0) {
+        rawWrite(" pairs=");
+        printDecimal(@as(u64, ec.pending_pair_count));
+    }
+    if (ec.pending_reply_holder) |holder| {
+        rawWrite(" reply_holder=");
+        printHex(@intFromPtr(holder));
+        if (ec.pending_reply_domain) |prd| {
+            rawWrite(" reply_cd=");
+            printHex(@intFromPtr(prd.ptr));
+            rawWrite("/slot=");
+            printDecimal(@as(u64, ec.pending_reply_slot));
+        }
+    }
+    if (ec.pending_event_word_valid) rawWrite(" event_word_pending");
+    if (ec.pending_event_rip_valid) rawWrite(" event_rip_pending");
+    if (ec.event_type != .none) {
+        rawWrite(" event=");
+        printEventType(ec.event_type);
+        rawWrite("/");
+        printDecimal(@as(u64, ec.event_subcode));
+        rawWrite(" addr=");
+        printHex(ec.event_addr);
+    }
+}
+
+fn printQueueCore(ec: *ExecutionContext) void {
+    const q = ec.current_queue_core.load(.acquire);
+    if (q == stygia.sched.execution_context.NOT_IN_RUN_QUEUE) {
+        rawWrite("none");
+    } else {
+        printDecimal(@as(u64, q));
+    }
+}
+
+fn printDirective(ec: *ExecutionContext) void {
+    const word = ec.directive_state.load(.acquire);
+    printDirectiveTag(lifecycle.directiveTag(word));
+    const slot = lifecycle.directiveOwnerSlot(word);
+    if (slot != 0) {
+        rawWrite("/slot=");
+        printDecimal(@as(u64, slot));
+    }
+    if (ec.directive_port) |p| {
+        rawWrite("/port=");
+        printHex(@intFromPtr(p.ptr));
+    }
+    if (ec.directive_owner) |owner| {
+        rawWrite("/owner=");
+        printHex(@intFromPtr(owner));
+    }
+}
+
+fn printDeadlineDelta(deadline_ns: u64, now_ns: u64) void {
+    if (deadline_ns == std.math.maxInt(u64)) {
+        rawWrite("timeout");
+        return;
+    }
+    if (deadline_ns <= now_ns) {
+        rawWrite("-");
+        printDecimal((now_ns - deadline_ns) / 1_000_000);
+    } else {
+        rawWrite("+");
+        printDecimal((deadline_ns - now_ns) / 1_000_000);
+    }
+    rawWrite("ms");
+}
+
+fn printBool(v: bool) void {
+    rawWrite(if (v) "1" else "0");
+}
+
 fn printState(s: State) void {
     rawWrite(switch (s) {
         .running => "RUN",
@@ -469,6 +625,41 @@ fn printState(s: State) void {
         .claimed => "CLAM",
         .pended => "PEND",
         .retired => "RETD",
+    });
+}
+
+fn printWaitKind(kind: WaitKind) void {
+    rawWrite(switch (kind) {
+        .none => "none",
+        .port_sender => "port_sender",
+        .port_receiver => "port_receiver",
+        .reply => "reply",
+        .futex => "futex",
+        .idle => "idle",
+        .requeue => "requeue",
+    });
+}
+
+fn printDirectiveTag(tag: lifecycle.DirectiveTag) void {
+    rawWrite(switch (tag) {
+        .none => "none",
+        .suspending => "susp",
+        .claiming => "claim",
+        .armed => "armed",
+        .dead => "dead",
+        .failed => "failed",
+    });
+}
+
+fn printEventType(event_type: EventType) void {
+    rawWrite(switch (event_type) {
+        .none => "none",
+        .memory_fault => "mem_fault",
+        .thread_fault => "thread_fault",
+        .breakpoint => "breakpoint",
+        .suspension => "suspension",
+        .vm_exit => "vm_exit",
+        .pmu_overflow => "pmu_overflow",
     });
 }
 
