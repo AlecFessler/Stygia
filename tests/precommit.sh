@@ -8,8 +8,9 @@
 #   0d. EC-closure analyzer          (REPORT-ONLY — never affects exit status)
 #   0e. spec ↔ test coverage         (verify_coverage.py)
 #   1. x86_64 kernel test suite      (KVM on this dev PC, 3 reps)
-#   2. aarch64 kernel test suite     (KVM on the Pi 5 @ 192.168.86.106 via SSH; TCG fallback)
-#   2a. aarch64 VM-TCG vCPU subset   (local TCG, gic-version=3)
+#   2. aarch64 kernel test suite     (Pi 5 bare-metal tryboot @ .107; QEMU/KVM fallback on .106/.104)
+#   2a. aarch64 VM-TCG vCPU subset   (local TCG, gic-version=3, EL2 exposed)
+#   2b. aarch64 VM E_NODEV negative  (Pi-hosted QEMU/KVM, no nested EL2)
 #   3. linux_guest VMM boot          (x86-64, KVM on this PC)
 #   4. linux_guest VMM boot          (aarch64, local TCG with virtualization=on)
 #   5. perf regression               (idc_pp under -Dkernel_profile=trace; 5% threshold)
@@ -19,8 +20,11 @@
 #   ./tests/precommit.sh --git-hook  # only required stages — used by .githooks/pre-commit
 #
 # Env knobs:
-#   PI_HOST=user@ip      # override Pi SSH target
-#   PI_REMOTE_DIR=path   # override Pi-side artifact dir (default \$HOME/stygia-test)
+#   PI_BARE_HOST=user@ip       # Pi 5 bare-metal tryboot SSH target (default .107)
+#   PI_BARE_SERIAL_DEV=path    # local USB serial device for the .107 console
+#   PI_QEMU_HOSTS='user@ip ...' # Pi-hosted aarch64 QEMU/KVM fallback targets (default .106 .104)
+#   PI_HOST=user@ip            # legacy override for the first QEMU/KVM target
+#   PI_REMOTE_DIR=path         # override Pi-side QEMU/KVM artifact dir (default \$HOME/stygia-test)
 
 set -u
 
@@ -142,7 +146,21 @@ if ! resolve_zig; then
     exit 1
 fi
 
+PI_BARE_HOST="${PI_BARE_HOST:-alecfessler@192.168.86.107}"
+PI_BARE_SERIAL_DEV="${PI_BARE_SERIAL_DEV:-/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG03CX6R-if00-port0}"
+PI_BARE_SERIAL_BAUD="${PI_BARE_SERIAL_BAUD:-115200}"
+PI_BARE_SERIAL_DRAIN_TIMEOUT="${PI_BARE_SERIAL_DRAIN_TIMEOUT:-2}"
+PI_BARE_REPEAT="${PI_BARE_REPEAT:-3}"
+PI_BARE_RETURN_TIMEOUT="${PI_BARE_RETURN_TIMEOUT:-900}"
+PI_BARE_DEPLOY_SCRIPT="${PI_BARE_DEPLOY_SCRIPT:-~/stygia-tools/deploy_stub.sh}"
+PI_BARE_LOG_DIR="${PI_BARE_LOG_DIR:-$STYGIA_ROOT/out/precommit/pi5-bare}"
+
+# PI_HOST is kept as a compatibility knob, but it is a QEMU/KVM host, not
+# the bare-metal tryboot target. The hv=false proof must not silently move
+# onto .107, where Stygia runs on real EL2 and hardware virtualization is
+# present.
 PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
+PI_QEMU_HOSTS="${PI_QEMU_HOSTS:-$PI_HOST alecfessler@192.168.86.104}"
 # Stays as a relative path so both ssh-shell-expansion contexts
 # (`cd $PI_REMOTE_DIR …`) and scp destinations (`host:$PI_REMOTE_DIR/x`,
 # which scp treats relative to login dir, NOT through a shell) resolve
@@ -172,8 +190,8 @@ FAILURES=()
 # outside the gauntlet still gets `-s` and port 1234 — the gauntlet just
 # stops fighting for that port.
 #
-# aarch64 stages (2, 2a, 4) launch qemu-system-aarch64 directly without
-# `-s`, so no shim is needed there.
+# aarch64 stages (2, 2a, 2b, 4) launch qemu-system-aarch64 directly
+# without `-s` (locally or over SSH), so no shim is needed there.
 QEMU_SHIM_DIR=$(mktemp -d -t stygia-qemu-shim.XXXXXX)
 QEMU_REAL_X86="$(command -v qemu-system-x86_64 || echo /usr/bin/qemu-system-x86_64)"
 cat > "$QEMU_SHIM_DIR/qemu-system-x86_64" <<EOF
@@ -206,6 +224,7 @@ REQUIRED_STAGES=(
     x86_kernel_tests
     aarch64_kernel_tests_pi
     aarch64_vm_tests_tcg
+    aarch64_vm_nodev_pi_kvm
     linux_guest_x86_boot
     linux_guest_aarch64_boot
     perf_regression
@@ -847,9 +866,245 @@ stage_x86_kernel_tests() {
 }
 
 aarch64_pi_reachable() {
+    local host="${1:-$PI_HOST}"
     # 5s connect timeout, batch mode (no password prompt). Returns
     # 0 if SSH succeeded, non-zero otherwise.
-    ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI_HOST" 'true' 2>/dev/null
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" 'true' 2>/dev/null
+}
+
+select_aarch64_qemu_host() {
+    local host
+    for host in $PI_QEMU_HOSTS; do
+        # .107 is the bare-metal tryboot rig. It is intentionally excluded
+        # from Pi-hosted QEMU/KVM selection so the only hv=false aarch64 path
+        # remains nested-EL2-missing QEMU/KVM on .106/.104.
+        [[ "$host" == "$PI_BARE_HOST" ]] && continue
+        if aarch64_pi_reachable "$host"; then
+            echo "$host"
+            return 0
+        fi
+    done
+    return 1
+}
+
+wait_for_ssh_up() {
+    local host="$1" timeout_s="$2" waited=0
+    while [[ $waited -lt $timeout_s ]]; do
+        if aarch64_pi_reachable "$host"; then
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    return 1
+}
+
+wait_for_ssh_down() {
+    local host="$1" timeout_s="$2" waited=0
+    while [[ $waited -lt $timeout_s ]]; do
+        if ! aarch64_pi_reachable "$host"; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
+
+start_pi5_serial_capture() {
+    local log="$1"
+    if [[ ! -r "$PI_BARE_SERIAL_DEV" ]]; then
+        echo "[FAIL] Pi5 serial device '$PI_BARE_SERIAL_DEV' is not readable" >&2
+        echo "       Set PI_BARE_SERIAL_DEV to the local USB serial adapter for $PI_BARE_HOST." >&2
+        return 1
+    fi
+    if ! stty -F "$PI_BARE_SERIAL_DEV" "$PI_BARE_SERIAL_BAUD" raw -echo -echoe -echok -echoctl -echoke -icanon min 0 time 1; then
+        echo "[FAIL] could not configure Pi5 serial device '$PI_BARE_SERIAL_DEV'" >&2
+        return 1
+    fi
+    # Drop bytes already sitting in the tty buffer. Freshness is enforced by
+    # requiring the reboot command to drop SSH and then accepting only an
+    # ordered Pi5-loader -> runner-start -> clean-verdict sequence from this
+    # drained capture.
+    timeout "$PI_BARE_SERIAL_DRAIN_TIMEOUT" cat "$PI_BARE_SERIAL_DEV" >/dev/null 2>&1 || true
+    if ! stty -F "$PI_BARE_SERIAL_DEV" "$PI_BARE_SERIAL_BAUD" raw -echo -echoe -echok -echoctl -echoke -icanon min 1 time 0; then
+        echo "[FAIL] could not configure blocking Pi5 serial capture on '$PI_BARE_SERIAL_DEV'" >&2
+        return 1
+    fi
+    stdbuf -o0 cat "$PI_BARE_SERIAL_DEV" >> "$log" &
+    PI5_SERIAL_PID="$!"
+}
+
+stop_pi5_serial_capture() {
+    local pid="${1:-}"
+    [[ -z "$pid" ]] && return 0
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+verify_aarch64_bare_tryboot_log() {
+    local serial_log="$1" label="$2"
+    local current_log verdict=""
+
+    current_log=$(mktemp)
+    LC_ALL=C tr -d '~\000' < "$serial_log" > "$current_log"
+
+    verdict=$(LC_ALL=C awk -v repeat="$PI_BARE_REPEAT" '
+        index($0, "[stygia pi5 loader] entering kernel") {
+            if (state == 0) state = 1
+            next
+        }
+        index($0, "[runner] starting ") == 1 {
+            if (state == 1) {
+                if (repeat > 1) {
+                    suffix = " x " repeat " runs"
+                    if (substr($0, length($0) - length(suffix) + 1) == suffix) {
+                        state = 2
+                    }
+                } else {
+                    state = 2
+                }
+            }
+            next
+        }
+        index($0, "[runner] === aggregate over ") == 1 {
+            if (state == 2 && repeat > 1) {
+                prefix = "[runner] === aggregate over " repeat " runs:"
+                suffix = " / 0 fail / 0 miss ==="
+                if (index($0, prefix) == 1 && substr($0, length($0) - length(suffix) + 1) == suffix) {
+                    print
+                    found = 1
+                    exit
+                }
+            }
+            next
+        }
+        index($0, "[runner] ") == 1 {
+            if (state == 2 && repeat <= 1) {
+                suffix = " / 0 fail / 0 miss"
+                if (index($0, " total / ") > 0 && substr($0, length($0) - length(suffix) + 1) == suffix) {
+                    print
+                    found = 1
+                    exit
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$current_log" || true)
+    if [[ -z "$verdict" ]]; then
+        echo "[FAIL] $label: no ordered current-run tryboot verdict"
+        echo "       Required order after observed SSH-down reboot: Pi5 loader handoff -> runner start -> clean verdict."
+        echo "--- Pi5 serial tail ---"
+        tail -40 "$current_log"
+        echo "--- end ---"
+        rm -f "$current_log"
+        FAILURES+=("$label: no ordered current-run bare-metal verdict")
+        return 1
+    fi
+    if ! verify_no_kernel_faults "$current_log" "$label"; then
+        rm -f "$current_log"
+        return 1
+    fi
+    rm -f "$current_log"
+    echo "[OK]   $label: ${verdict#'[runner] '}"
+    return 0
+}
+
+run_aarch64_bare_tryboot() {
+    local label="$1"
+    local serial_log deploy_log reboot_log serial_pid run_log_dir
+    mkdir -p "$PI_BARE_LOG_DIR"
+    run_log_dir="$PI_BARE_LOG_DIR/$(date +%Y%m%d_%H%M%S)-$$"
+    mkdir -p "$run_log_dir"
+    serial_log="$run_log_dir/serial.log"
+    deploy_log="$run_log_dir/deploy.log"
+    reboot_log="$run_log_dir/reboot.log"
+    : > "$serial_log"
+    : > "$deploy_log"
+    : > "$reboot_log"
+    serial_pid=""
+
+    echo "Checking $PI_BARE_HOST tryboot helpers..."
+    if ! ssh "$PI_BARE_HOST" "test -f $PI_BARE_DEPLOY_SCRIPT && command -v stygia-reboot >/dev/null"; then
+        echo "[FAIL] $PI_BARE_HOST is reachable but missing tryboot helpers"
+        echo "       Need $PI_BARE_DEPLOY_SCRIPT and stygia-reboot from the Pi5 stability rig."
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal tryboot helpers unavailable")
+        return 1
+    fi
+
+    echo "Staging Pi5 bare-metal image on $PI_BARE_HOST..."
+    if ! scp -q "$STYGIA_ROOT/zig-out/pi5/kernel_stygia.img" "$PI_BARE_HOST:/tmp/kernel_stygia.img"; then
+        echo "[FAIL] scp kernel_stygia.img to $PI_BARE_HOST failed"
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal image scp")
+        return 1
+    fi
+
+    if ! ssh "$PI_BARE_HOST" "bash $PI_BARE_DEPLOY_SCRIPT" > "$deploy_log" 2>&1; then
+        echo "[FAIL] tryboot deploy on $PI_BARE_HOST failed"
+        echo "--- deploy output ---"
+        tail -60 "$deploy_log"
+        echo "--- end ---"
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal tryboot deploy")
+        return 1
+    fi
+
+    PI5_SERIAL_PID=""
+    if ! start_pi5_serial_capture "$serial_log"; then
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal serial capture unavailable")
+        return 1
+    fi
+    serial_pid="$PI5_SERIAL_PID"
+
+    echo "Booting $PI_BARE_HOST into one-shot tryboot; waiting for Pi OS fallback..."
+    ssh "$PI_BARE_HOST" 'stygia-reboot tryboot' > "$reboot_log" 2>&1
+    local reboot_rc=$?
+    if [[ $reboot_rc -ne 0 ]] && ! grep -qE 'one-shot boot into tryboot|closed by remote host' "$reboot_log"; then
+        stop_pi5_serial_capture "$serial_pid"
+        echo "[FAIL] stygia-reboot tryboot failed before reboot"
+        echo "--- reboot output ---"
+        tail -60 "$reboot_log"
+        echo "--- end ---"
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal tryboot reboot command")
+        return 1
+    fi
+
+    if ! wait_for_ssh_down "$PI_BARE_HOST" 60; then
+        stop_pi5_serial_capture "$serial_pid"
+        echo "[FAIL] $PI_BARE_HOST did not drop SSH after stygia-reboot tryboot"
+        echo "--- reboot output ---"
+        tail -60 "$reboot_log"
+        echo "--- end ---"
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal tryboot did not reboot")
+        return 1
+    fi
+    if ! wait_for_ssh_up "$PI_BARE_HOST" "$PI_BARE_RETURN_TIMEOUT"; then
+        stop_pi5_serial_capture "$serial_pid"
+        echo "[FAIL] $PI_BARE_HOST did not return to Pi OS within ${PI_BARE_RETURN_TIMEOUT}s"
+        echo "--- last 40 lines of Pi5 serial output ---"
+        LC_ALL=C tr -d '~\000' < "$serial_log" | tail -40
+        echo "--- end ---"
+        echo "       logs: $run_log_dir"
+        FAILURES+=("aarch64 bare-metal tryboot did not return")
+        return 1
+    fi
+    # Let the last UART bytes drain after SSH comes back.
+    sleep 2
+    stop_pi5_serial_capture "$serial_pid"
+
+    if ! verify_aarch64_bare_tryboot_log "$serial_log" "$label"; then
+        echo "       logs: $run_log_dir"
+        return 1
+    fi
+
+    rm -rf "$run_log_dir"
+    echo "[PASS] $label on Pi5 bare metal tryboot"
+    return 0
 }
 
 # Run an aarch64 in-kernel test bundle 3× under local QEMU+TCG and
@@ -963,52 +1218,132 @@ stage_aarch64_vm_tests_tcg() {
     run_aarch64_tcg_3reps "aarch64 VM spec tests (TCG)" "aarch64 vm-tests"
 }
 
+stage_aarch64_vm_nodev_pi_kvm() {
+    echo ""
+    echo "=================================================="
+    echo "[2b/4] aarch64 create_virtual_machine_03 E_NODEV test (Pi QEMU/KVM, no nested EL2, 3 reps)"
+    echo "=================================================="
+    local qemu_host
+    if ! qemu_host=$(select_aarch64_qemu_host); then
+        echo "[FAIL] no Pi QEMU/KVM host reachable in PI_QEMU_HOSTS='$PI_QEMU_HOSTS'"
+        echo "       This focused hv=false proof must run on .106/.104-style QEMU/KVM, not bare-metal $PI_BARE_HOST."
+        FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM proof unavailable")
+        return 1
+    fi
+
+    echo "Building aarch64 root_service (create_virtual_machine_03 only, runner diagnostics on)..."
+    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
+          zig build -Darch=arm -Dtests='create_virtual_machine_03' -Drunner_diag=true); then
+        FAILURES+=("aarch64 create_virtual_machine_03 root_service build")
+        return 1
+    fi
+    # Build a fresh aarch64 image after the positive-EL2 TCG stage. This
+    # stage runs it under Pi-hosted QEMU/KVM, which does not expose
+    # nested EL2 to Stygia. That is the matrix's legitimate
+    # no-hardware-virtualization environment for
+    # create_virtual_machine_03's exact E_NODEV assertion.
+    rm -rf "$STYGIA_ROOT/zig-out"
+    echo "Building aarch64 kernel..."
+    if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
+        FAILURES+=("aarch64 create_virtual_machine_03 kernel build")
+        return 1
+    fi
+
+    echo "Syncing focused E_NODEV artifacts to $qemu_host..."
+    if ! ssh "$qemu_host" "mkdir -p $PI_REMOTE_DIR/img/efi/boot"; then
+        FAILURES+=("ssh mkdir on Pi for create_virtual_machine_03")
+        return 1
+    fi
+    if ! scp -q "$STYGIA_ROOT/zig-out/img/kernel.elf" \
+        "$qemu_host:$PI_REMOTE_DIR/img/kernel.elf"; then
+        FAILURES+=("scp kernel.elf to Pi for create_virtual_machine_03")
+        return 1
+    fi
+    if ! scp -q "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
+        "$qemu_host:$PI_REMOTE_DIR/img/efi/boot/BOOTAA64.EFI"; then
+        FAILURES+=("scp BOOTAA64.EFI to Pi for create_virtual_machine_03")
+        return 1
+    fi
+    if ! scp -q "$SCRIPT_DIR/suite/bin/root_service.elf" \
+        "$qemu_host:$PI_REMOTE_DIR/root_service-nodev.elf"; then
+        FAILURES+=("scp root_service-nodev.elf to Pi")
+        return 1
+    fi
+
+    local rep
+    for rep in 1 2 3; do
+        echo "Boot ${rep}/3 under qemu-system-aarch64 + KVM on $qemu_host (no nested EL2)..."
+        local pi_log
+        pi_log=$(mktemp)
+        if ! ssh "$qemu_host" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service-nodev.elf \$wd/root_service.elf && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rc=\$?; rm -rf \$wd; exit \$rc" > "$pi_log" 2>&1; then
+            echo "[FAIL] Pi KVM run ${rep}/3 on $qemu_host failed or timed out"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 create_virtual_machine_03: Pi KVM run timeout/qemu error (rep ${rep}/3)")
+            return 1
+        fi
+        local total
+        total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
+        if [[ -z "$total" ]]; then
+            echo "[FAIL] rep ${rep}/3 (create_virtual_machine_03 Pi KVM on $qemu_host): no [runner] total"
+            echo "--- last 30 lines of Pi output ---"
+            tail -30 "$pi_log"
+            echo "--- end ---"
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 create_virtual_machine_03: no [runner] total (rep ${rep}/3)")
+            return 1
+        fi
+        if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
+            echo "[FAIL] rep ${rep}/3 (create_virtual_machine_03 Pi KVM on $qemu_host): $total"
+            grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM rep ${rep}/3: ${total#'[runner] '}")
+            return 1
+        fi
+        if ! grep -Eq '^\[runner\] deliver [0-9]+:create_virtual_machine_03 .* code=1 aid=8 -> record$' "$pi_log"; then
+            echo "[FAIL] rep ${rep}/3: create_virtual_machine_03 did not report PASS aid=8 (E_NODEV)"
+            echo "--- runner diagnostics ---"
+            grep -E '^\[runner\] (deliver|PASS|FAIL|MISS|[0-9]+ total)' "$pi_log" | tail -20
+            echo "--- end ---"
+            rm -f "$pi_log"
+            FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM rep ${rep}/3: missing PASS aid=8 evidence")
+            return 1
+        fi
+        if ! verify_no_kernel_faults "$pi_log" "aarch64 create_virtual_machine_03 Pi KVM on $qemu_host (rep ${rep}/3)"; then
+            rm -f "$pi_log"
+            return 1
+        fi
+        echo "[OK]   rep ${rep}/3: ${total#'[runner] '} (PASS aid=8/E_NODEV observed)"
+        rm -f "$pi_log"
+    done
+
+    echo "[PASS] aarch64 create_virtual_machine_03 E_NODEV on Pi KVM ($qemu_host) - 3/3 green"
+    return 0
+}
+
 stage_aarch64_kernel_tests_pi() {
     echo ""
     echo "=================================================="
-    echo "[2/4] aarch64 kernel test suite (in-kernel runner; Pi KVM, TCG fallback)"
+    echo "[2/4] aarch64 kernel test suite (Pi5 bare-metal tryboot; QEMU/KVM fallback)"
     echo "=================================================="
 
-    local using_tcg_fallback=0
-    if ! aarch64_pi_reachable; then
-        using_tcg_fallback=1
+    local bare_reachable=0
+    if aarch64_pi_reachable "$PI_BARE_HOST"; then
+        bare_reachable=1
     fi
 
-    # The TCG-fallback path drops the hv-prefix groups (per
-    # TEST_OWNERSHIP.toml [hv]) from the embedded manifest; the Pi-KVM
-    # happy path does not.
-    #
-    # Historically both branches dropped them, for two stated reasons:
-    #   - "Pi 4/5 aarch64 hardware has no nested virt support, so these
-    #     tests would surface as MISS/FAIL on the Pi KVM backend."
-    #     bd-Zag-Subsystems-Agents-0mvk.
-    #   - The full suite under -smp 4 TCG saturates emulation throughput
-    #     and overruns the 600s outer wallclock — the slow edge is the
-    #     VM-touching tests doing real stage-2 install work.
-    #     bd-Zag-Subsystems-Agents-1jds.
-    #
-    # The first reason was measured and is false (stygia-39p): across 57
-    # Pi 5 KVM boots of the full 485-test set, the only failure from any
-    # of the seven hv groups was a single MISS of
-    # port_io_virtualization_04 — a ~2% flake, the same order as the
-    # other residual aarch64 singletons, not a "this cannot run here"
-    # signal. Every other hv test passed every boot. So the Pi branch
-    # runs the whole suite: +58 tests of real aarch64 coverage, and the
-    # port_io_virtualization_04 flake is visible instead of hidden.
-    #
-    # The second reason is independent of hardware capability and still
-    # holds, so the TCG fallback keeps the exclusion. On that branch
-    # hv-prefix tests remain stage [2a/4]'s responsibility (TCG with
-    # gic-version=3,virtualization=on); per-test transitive coverage is
-    # on x86 KVM stage [1/4] (VMX).
-    local suite_excludes=()
-    if [[ $using_tcg_fallback -eq 1 ]]; then
-        suite_excludes=(-Dtests_exclude='create_vcpu_*,create_virtual_machine_*,map_guest_*,unmap_guest_*,port_io_virtualization_*,vm_inject_irq_*,vm_set_policy_*')
+    echo "Building aarch64 root_service (full suite with embedded test ELFs)..."
+    local suite_args=(-Darch=arm)
+    if [[ $bare_reachable -eq 1 ]]; then
+        # Bare metal gets one tryboot cycle; repeat inside the runner preserves
+        # this stage's historical three-suite coverage without three remote
+        # firmware reboot cycles. The QEMU/KVM fallback keeps the current
+        # three separate boots and therefore does not use this repeat knob.
+        suite_args+=("-Drepeat=$PI_BARE_REPEAT")
     fi
-
-    echo "Building aarch64 root_service (in-kernel runner with embedded test ELFs)..."
-    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
-          zig build -Darch=arm "${suite_excludes[@]}"); then
+    if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && zig build "${suite_args[@]}"); then
         FAILURES+=("aarch64 root_service build")
         return 1
     fi
@@ -1017,39 +1352,56 @@ stage_aarch64_kernel_tests_pi() {
     # builds both arches back-to-back, so clear it before producing an image
     # that will actually be booted (build.zig also refuses a mixed one).
     rm -rf "$STYGIA_ROOT/zig-out"
-    echo "Building aarch64 kernel..."
+    echo "Building aarch64 UEFI/QEMU kernel artifacts..."
     if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test); then
         FAILURES+=("aarch64 kernel build")
         return 1
     fi
 
-    if [[ $using_tcg_fallback -eq 1 ]]; then
+    if [[ $bare_reachable -eq 1 ]]; then
         echo ""
-        echo "Pi (${PI_HOST}) unreachable via SSH — falling back to local TCG."
-        echo "(Suite minus hv-prefix tests under emulation; canonical TCG VM coverage runs in stage [2a/4].)"
-        run_aarch64_tcg_3reps "aarch64 kernel tests (TCG fallback)" "aarch64 kernel tests"
+        echo "(Full suite first targets bare-metal Pi5 tryboot on $PI_BARE_HOST; hv=true, real EL2.)"
+        # The pi5 build embeds the already-built full-suite root_service into
+        # zig-out/pi5/kernel_stygia.img for the existing .107 deploy_stub.sh +
+        # stygia-reboot tryboot workflow. The UEFI/QEMU artifacts above remain
+        # available in zig-out/img for the fallback topology when .107 is down.
+        echo "Building aarch64 Pi5 bare-metal image..."
+        if ! (cd "$STYGIA_ROOT" && zig build -Darch=arm -Dprofile=test pi5); then
+            FAILURES+=("aarch64 bare-metal pi5 image build")
+            return 1
+        fi
+        run_aarch64_bare_tryboot "aarch64 kernel tests (bare-metal tryboot)"
         return $?
     fi
 
+    local qemu_host
+    if ! qemu_host=$(select_aarch64_qemu_host); then
+        echo "[FAIL] bare-metal Pi5 ($PI_BARE_HOST) unreachable, and no QEMU/KVM fallback host reachable in PI_QEMU_HOSTS='$PI_QEMU_HOSTS'"
+        FAILURES+=("aarch64 kernel tests unavailable")
+        return 1
+    fi
+
     echo ""
-    echo "(Full suite on Pi KVM, hv groups included — see stygia-39p.)"
-    echo "Syncing artifacts to $PI_HOST..."
-    if ! ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/img/efi/boot"; then
+    echo "Bare-metal Pi5 ($PI_BARE_HOST) unreachable — falling back to Pi-hosted QEMU/KVM on $qemu_host."
+    echo "(Fallback is hv=false: QEMU/KVM on Pi has no nested EL2. Stage [2b/4] still pins create_virtual_machine_03 explicitly.)"
+
+    echo "Syncing artifacts to $qemu_host..."
+    if ! ssh "$qemu_host" "mkdir -p $PI_REMOTE_DIR/img/efi/boot"; then
         FAILURES+=("ssh mkdir on Pi")
         return 1
     fi
     if ! scp -q "$STYGIA_ROOT/zig-out/img/kernel.elf" \
-        "$PI_HOST:$PI_REMOTE_DIR/img/kernel.elf"; then
+        "$qemu_host:$PI_REMOTE_DIR/img/kernel.elf"; then
         FAILURES+=("scp kernel.elf to Pi")
         return 1
     fi
     if ! scp -q "$STYGIA_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
-        "$PI_HOST:$PI_REMOTE_DIR/img/efi/boot/BOOTAA64.EFI"; then
+        "$qemu_host:$PI_REMOTE_DIR/img/efi/boot/BOOTAA64.EFI"; then
         FAILURES+=("scp BOOTAA64.EFI to Pi")
         return 1
     fi
     if ! scp -q "$SCRIPT_DIR/suite/bin/root_service.elf" \
-        "$PI_HOST:$PI_REMOTE_DIR/root_service.elf"; then
+        "$qemu_host:$PI_REMOTE_DIR/root_service.elf"; then
         FAILURES+=("scp root_service.elf to Pi")
         return 1
     fi
@@ -1058,11 +1410,11 @@ stage_aarch64_kernel_tests_pi() {
     # Catches flakes that a single run wouldn't surface.
     local rep
     for rep in 1 2 3; do
-        echo "Boot ${rep}/3 under qemu-system-aarch64 + KVM on Pi..."
+        echo "Boot ${rep}/3 under qemu-system-aarch64 + KVM on $qemu_host..."
         local pi_log
         pi_log=$(mktemp)
-        if ! ssh "$PI_HOST" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rm -rf \$wd" > "$pi_log" 2>&1; then
-            echo "[FAIL] Pi qemu run ${rep}/3 failed or timed out"
+        if ! ssh "$qemu_host" "cd $PI_REMOTE_DIR && wd=\$(mktemp -d) && mkdir -p \$wd/efi/boot && cp img/efi/boot/BOOTAA64.EFI \$wd/efi/boot/ && cp img/kernel.elf \$wd/ && cp root_service.elf \$wd/ && timeout 240 qemu-system-aarch64 -M virt,gic-version=2 -m 2G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=kvm -cpu host -smp cores=4 -drive file=fat:rw:\$wd,format=raw 2>&1; rc=\$?; rm -rf \$wd; exit \$rc" > "$pi_log" 2>&1; then
+            echo "[FAIL] Pi qemu run ${rep}/3 on $qemu_host failed or timed out"
             echo "--- last 30 lines of Pi output ---"
             tail -30 "$pi_log"
             echo "--- end ---"
@@ -1093,7 +1445,7 @@ stage_aarch64_kernel_tests_pi() {
 
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
-        if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests (rep ${rep}/3)"; then
+        if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests on $qemu_host (rep ${rep}/3)"; then
             rm -f "$pi_log"
             return 1
         fi
@@ -1352,6 +1704,7 @@ run_stage verify_coverage
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi
 run_stage aarch64_vm_tests_tcg
+run_stage aarch64_vm_nodev_pi_kvm
 run_stage linux_guest_x86_boot
 run_stage linux_guest_aarch64_boot
 run_stage perf_regression
