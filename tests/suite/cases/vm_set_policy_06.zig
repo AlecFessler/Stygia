@@ -31,6 +31,11 @@
 //
 //   To isolate the success path every prior-numbered gate must be
 //   defused so vm_set_policy actually returns OK:
+//     - non-x86-64 builds:             kind=1 names a different table
+//                                      on aarch64 (`sysreg_policies`),
+//                                      so this x86 CR-policy test
+//                                      returns a degraded skip/pass
+//                                      before setup.
 //     - test 01 (E_BADCAP no valid VM):  we mint a real VM via
 //                                        create_virtual_machine.
 //     - test 02 (E_PERM no `policy`):    runner grants `crvm` and
@@ -50,8 +55,9 @@
 //                                         keep them zero to avoid any
 //                                         `_reserved` interpretation.
 //
-//   On x86-64 we choose cr_num = 0 (CR0) — a CR the guest will touch
-//   in any realistic boot — and a read_value / write_mask combo that
+//   On x86-64 we choose cr_num = 0 (CR0), which would be a natural
+//   target for a future guest-side MOV-CR smoke, and a read_value /
+//   write_mask combo that
 //   names a non-zero policy: read_value = 0x0000_0000_8000_0011 (PE,
 //   ET, PG bits — a typical post-paging CR0 silhouette), write_mask =
 //   0xFFFF_FFFF_FFFF_FFFF (allow all writes). These specific bit
@@ -68,15 +74,17 @@
 //   / create_vcpu_10 / map_guest_05.
 //
 // Action
-//   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
-//   2. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
-//   3. Zero VM_POLICY_BYTES so num_cpuid_responses = num_cr_policies = 0
+//   1. Non-x86-64 builds return a degraded skip/pass because kind=1
+//      targets the wrong policy table there.
+//   2. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
+//   3. createVmar(caps={r,w}, cur_rwx=r|w, pages=1) + mapPf at offset 0.
+//   4. Zero VM_POLICY_BYTES so num_cpuid_responses = num_cr_policies = 0
 //      in the seed policy (well under both MAX_* bounds).
-//   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
+//   5. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerates
 //      E_NODEV (degraded smoke pass).
-//   5. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
-//   6. vmSetPolicy(vm_handle, kind=1, count=0, &.{}) — must return OK.
-//   7. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
+//   6. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
+//   7. vmSetPolicy(vm_handle, kind=1, count=0, &.{}) — must return OK.
+//   8. vmSetPolicy(vm_handle, kind=1, count=1, &entry) — must return OK.
 //
 // Assertions
 //   1: setup — create_page_frame returned an error word.
@@ -92,6 +100,7 @@
 //  11: vm_set_policy with the re-installed kind=1 entry returned a
 //      value other than OK — the third successive replacement failed.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -107,6 +116,14 @@ const VM_POLICY_BYTES: usize = 32 * 24 + 8 + 8 * 24 + 8;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
+
+    if (builtin.cpu.arch != .x86_64) {
+        // On aarch64, kind=1 selects `sysreg_policies`, not x86
+        // `cr_policies`. vm_set_policy_08 owns that coverage; this
+        // x86-specific test reports an explicit degraded skip/pass.
+        testing.pass();
+        return;
+    }
 
     // 1. Page frame backing the VmPolicy struct.
     const policy_pf_caps = caps.PfCap{ .r = true, .w = true };
