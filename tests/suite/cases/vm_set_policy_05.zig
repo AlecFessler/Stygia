@@ -5,28 +5,42 @@
 //  against this table per §[vm_policy], and the prior contents are no
 //  longer matched."
 //
-// Strategy
+// Strategy — partial x86-64 coverage, not guest-CPUID proof
+//   The old vacuous shape for this bead was kind=0,count=0 only: that
+//   merely proved an empty replacement was accepted. This test now
+//   installs one non-empty CPUID response, clears the table, then
+//   reinstalls the non-empty response. That proves the syscall-visible
+//   mutable replacement path for the x86-64 cpuid_responses table,
+//   including repeated replacement, but it still does not satisfy the
+//   maintainer's close bar for vm_set_policy_* success tests.
+//
 //   The strict observable shape of test 05 is "guest CPUID at (leaf,
 //   subleaf) of an entry returns the entry's (eax, ebx, ecx, edx),
 //   while leaves that were in the *prior* table no longer match." That
 //   end-to-end witness requires a fully-driven vCPU running real guest
-//   code that issues CPUID and a recv loop on the exit_port that
-//   inspects the resumed sub-code in the post-started vreg-70 stack
-//   slot. That stack-window protocol (vregs 14..73 at [user_rsp + 8 ..
-//   + 488]) is implemented in the libz `replyVmExit` wrapper; staging
-//   real guest code (instruction bytes + GDT/IDT/segs/CR0/CR3/EFER)
-//   into the VM's guest physical address space and driving CPUID is
-//   not provisioned by this single-EC runner — create_vcpu_09 hits
-//   the same wall and stops at the initial_state handshake.
+//   code that issues CPUID and a recv/reply loop on the exit_port that
+//   starts the guest from a valid x86 state and inspects the subsequent
+//   exit state. The wide stack-window protocol (vregs 14..73 at
+//   [user_rsp + 8 .. + 488]) is implemented for synthetic vm_exit
+//   handshakes in libz, and the linux_guest VMM has full guest bringup
+//   machinery, but this single-EC suite runner does not provide a
+//   focused harness for staging a tiny guest payload (instruction bytes
+//   + GDT/IDT/segs/CR0/CR3/EFER), starting it, and observing the CPUID
+//   result. create_vcpu_09 / reply_08 / reply_21 stop at the safe
+//   initial_state handshake for the same reason.
 //
-//   What we observe end-to-end here without a guest payload is the
-//   syscall-visible replacement contract: a policy-bearing VM accepts
-//   a kind=0 table, accepts an empty replacement, and accepts a later
-//   replacement. This does not prove live-vCPU CPUID interception; it
-//   proves the mutable table update path exposed by the syscall.
+//   What we observe end-to-end here without a guest payload is only the
+//   syscall-visible replacement contract: a policy-bearing VM accepts a
+//   kind=0 table, accepts an empty replacement, and accepts a later
+//   replacement. This does not prove live-vCPU CPUID interception.
 //
 //   To isolate the success path we need every earlier gate to be
 //   inert:
+//     - non-x86-64 builds:          — kind=0 names a different table
+//                                     on aarch64 (`id_reg_responses`);
+//                                     vm_set_policy_07 owns that
+//                                     coverage, so this x86-specific
+//                                     test returns a degraded pass.
 //     - test 01 (invalid VM)         — pass a freshly-minted VM.
 //     - test 02 (missing policy cap) — mint the VM with caps.policy=
 //                                      true.
@@ -55,16 +69,18 @@
 //   smoke-pass.
 //
 // Action
-//   1. Stage VmPolicy (PF + VMAR + map_pf + zero).
-//   2. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
+//   1. Non-x86-64 builds return degraded pass because kind=0 targets
+//      id_reg_responses there, not cpuid_responses.
+//   2. Stage VmPolicy (PF + VMAR + map_pf + zero).
+//   3. createVirtualMachine(caps={.policy=true}, policy_pf) — VM handle
 //      (or smoke-pass on E_NODEV).
-//   3. vmSetPolicy(vm, kind=0, count=1, entries=&entry) — must return
+//   4. vmSetPolicy(vm, kind=0, count=1, entries=&entry) — must return
 //      OK, witnessing live-mutable replacement of the cpuid_responses
-//      table.
-//   4. vmSetPolicy(vm, kind=0, count=0, entries=&.{}) — clears the
+//      table at the syscall boundary.
+//   5. vmSetPolicy(vm, kind=0, count=0, entries=&.{}) — clears the
 //      table; must return OK. Witnesses that count=0 replacement is a
 //      valid clear.
-//   5. vmSetPolicy(vm, kind=0, count=1, &entry) — re-installs the
+//   6. vmSetPolicy(vm, kind=0, count=1, &entry) — re-installs the
 //      same entry; must return OK. Closes the loop on repeated
 //      replacement of the current table — the third successive
 //      replacement must land cleanly.
@@ -78,13 +94,14 @@
 //   4: setup — create_virtual_machine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
 //   9: vm_set_policy on the success path with one entry returned a
-//      value other than OK (the spec assertion under test —
-//      successful replacement of the cpuid_responses table).
+//      value other than OK (partial success-path witness: syscall-
+//      visible replacement of the cpuid_responses table).
 //  10: vm_set_policy with count=0 (clear) returned a value other than
 //      OK — empty-table replacement is broken.
 //  11: vm_set_policy with the re-installed entry returned a value
 //      other than OK — the third successive replacement failed.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -111,6 +128,14 @@ const SEED_EDX: u32 = 0x9ABC_DEF0;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
+
+    if (builtin.cpu.arch != .x86_64) {
+        // On aarch64, kind=0 selects `id_reg_responses`, not x86
+        // `cpuid_responses`. vm_set_policy_07 owns that surface; this
+        // x86-specific test reports an explicit degraded skip/pass.
+        testing.pass();
+        return;
+    }
 
     // 1. Page frame backing the VmPolicy struct.
     const policy_pf_caps = caps.PfCap{ .r = true, .w = true };
