@@ -16,35 +16,37 @@
 //   The full assertion ("subsequent guest sysreg accesses match against
 //   this table") requires running guest code that issues a sysreg access
 //   covered by the replacement table, and observing either the matching
-//   resume value (read) or the masked write effect. That requires a
-//   running vCPU on aarch64 hardware exposed to the test domain — neither
-//   piece is available to a v0 mock-runner test on x86-64.
+//   resume value (read) or the masked write effect. The aarch64 kernel
+//   now has the runloop-side consultation path
+//   (kernel/arch/aarch64/vm_runloop.zig: tryHandleSysregPolicy), but
+//   this suite child still cannot stage and execute a guest payload.
 //
-// SPEC AMBIGUITY — degraded test, full assertion unreachable here
-//   1. Architecture mismatch. Tests in this suite build for x86-64 (see
-//      tests/suite/build.zig — cpu_arch = .x86_64 fixed). On x86-64 the
-//      `vm_set_policy` kind selector overloads to `cr_policies` (kind=1
-//      x86-64 row), not `sysreg_policies`. The aarch64-specific
-//      assertion under test is unreachable from this rig because no
-//      aarch64 guest can be constructed.
-//   2. No guest-execution harness. Even on aarch64 the spec assertion
-//      is observable only through guest sysreg execution, and the
-//      runner cannot stage guest code into a VM. create_vcpu_09 hits
-//      the same wall and stops at the initial_state reply.
-//   3. Kernel-side `sysreg_policies` consultation absent. The aarch64
-//      vm_runloop (kernel/arch/aarch64/vm_runloop.zig) does not read
-//      `sysreg_policies` on sysreg exits today; the policy table is
-//      stored on the VM but never consulted. Even with (1) and (2)
-//      the spec post-condition would not hold until the kernel
-//      feature lands.
+// Strategy — partial aarch64 coverage, not guest-access proof
+//   The old version used kind=1,count=0, which was a vacuous empty
+//   replacement and did not prove that an aarch64 SysregPolicy entry
+//   can be accepted. This version is intentionally aarch64-only for
+//   the meaningful path:
+//     1. On x86-64, `kind=1` selects `cr_policies`, not
+//        `sysreg_policies`, and the aarch64 tuple word would be
+//        rejected as reserved-bit pollution by the x86 CR layout. We
+//        therefore return a degraded skip/pass on non-aarch64 builds.
+//     2. On aarch64 with no hardware virtualization, VM creation
+//        returns E_NODEV. Without a VM there is no policy table to
+//        replace, so we degrade with pass-with-id-0.
+//     3. On aarch64 with virtualization, install a non-empty
+//        kind=1,count=1 SysregPolicy entry, clear the table with
+//        count=0, then reinstall the non-empty entry. This proves the
+//        syscall-visible replacement path for a real sysreg policy
+//        table, including repeated replacement, but it still does not
+//        prove that a subsequent guest MRS/MSR matched the entry.
 //
-//   This test is preserved as a tripwire / smoke for the syscall path:
-//   we mint a VM with the `policy` cap, then issue vm_set_policy with
-//   kind=1 and count=0
-//   (empty replacement, valid on both archs since count <=
-//   MAX_SYSREG_POLICIES = 32 on aarch64 and <= MAX_CR_POLICIES = 8 on
-//   x86-64). The full aarch64 sysreg replacement semantic is left for
-//   an aarch64 runner pass.
+// Blocker for full bead closure
+//   A full feature proof still needs a guest-execution harness in the
+//   suite: map guest code, create/run a vCPU, issue an MRS/MSR for the
+//   selected tuple, and assert the runloop resumes with `read_value`
+//   or applies `(old & ~write_mask) | (guest & write_mask)` without
+//   delivering a vm_exit. That is harness work, not a kernel-consultation
+//   gap in the current source.
 //
 //   E_NODEV degradation
 //     `create_virtual_machine` returns E_NODEV on platforms without
@@ -59,28 +61,27 @@
 //   - test 02 (E_PERM no `policy` cap on [1]): we mint with
 //     VmCap{ .policy = true }; the runner grants vm_ceiling = 0x01
 //     (the policy bit) so the cap is in-range.
-//   - test 03 (E_INVAL count exceeds MAX_*): count = 0, well under
-//     MAX_SYSREG_POLICIES (32) and MAX_CR_POLICIES (8).
+//   - test 03 (E_INVAL count exceeds MAX_*): count = 1, well under
+//     MAX_SYSREG_POLICIES (32).
 //   - test 04 (E_INVAL reserved bits in [1] or any entry): handle slot
 //     is in the low 12 bits of [1]; upper 52 bits stay zero by
-//     construction (vmSetPolicy wrapper). count = 0 means there are no
-//     entry vregs to police.
+//     construction (vmSetPolicy wrapper). The entry's tuple uses only
+//     bytes 0..4; pad bytes 5..7 stay zero.
 //
 // Action
-//   1. createPageFrame(caps={r,w}, props=0, pages=1) — smallest valid
+//   1. Non-aarch64 builds return a degraded skip/pass because kind=1
+//      targets the wrong table there.
+//   2. createPageFrame(caps={r,w}, props=0, pages=1) — smallest valid
 //      frame, backs the VmPolicy struct.
-//   2. createVmar + mapPf so userspace can plant a known-zero VmPolicy.
-//      (zero counts ⇒ valid empty policy on both archs.)
-//   3. Zero the VmPolicy region with volatile stores.
-//   4. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerate
+//   3. createVmar + mapPf so userspace can plant a known-zero VmPolicy.
+//   4. Zero the VmPolicy region with volatile stores.
+//   5. createVirtualMachine(caps={.policy=true}, policy_pf). Tolerate
 //      E_NODEV with degraded pass since the kind=1 replacement path
 //      is unreachable without a VM.
-//   5. vmSetPolicy(vm_handle, kind=1, count=0, entries=&.{}). This
-//      exercises the kind=1 replacement path end-to-end and must
-//      return OK for the active architecture. On x86-64 the call
-//      routes to cr_policies (test 06's territory), so this remains a
-//      smoke rather than a faithful assertion of the aarch64
-//      sysreg_policies guarantee.
+//   6. vmSetPolicy(vm_handle, kind=1, count=1, one SysregPolicy entry)
+//      must return OK.
+//   7. vmSetPolicy(vm_handle, kind=1, count=0, &.{}) must return OK.
+//   8. vmSetPolicy(vm_handle, kind=1, count=1, same entry) must return OK.
 //
 // Assertions
 //   1: setup — createPageFrame returned an error word.
@@ -88,10 +89,12 @@
 //   3: setup — mapPf returned non-OK in vreg 1.
 //   4: setup — createVirtualMachine returned an unexpected error
 //      (anything other than a valid handle or E_NODEV).
-//   5: vm_set_policy(kind=1,count=0) returned non-OK on the active
-//      arch's policy path. The aarch64 sysreg-replacement guarantee
-//      still cannot be observed from this rig.
+//   9: vm_set_policy(kind=1,count=1) returned non-OK for a valid
+//      aarch64 SysregPolicy entry.
+//  10: vm_set_policy(kind=1,count=0) returned non-OK for a clear.
+//  11: vm_set_policy(kind=1,count=1) returned non-OK on reinstall.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -108,6 +111,14 @@ const VM_POLICY_BYTES: usize = 1776;
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
+
+    if (builtin.cpu.arch != .aarch64) {
+        // Non-aarch64 builds cannot exercise `sysreg_policies`: the
+        // same kind bit selects a different table. Report an explicit
+        // degraded skip/pass instead of proving the wrong primitive.
+        testing.pass();
+        return;
+    }
 
     // 1. Page frame backing the VmPolicy struct.
     const policy_pf_caps = caps.PfCap{ .r = true, .w = true };
@@ -172,18 +183,43 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Smoke the kind=1 replacement path with an empty entry list.
-    //    On aarch64 this clears sysreg_policies (count = 0 entries
-    //    replace the prior table); on x86-64 it clears cr_policies.
-    //    The aarch64 spec assertion ("the table is _replaced by the
-    //    count entries_") is satisfied trivially for count = 0; the
-    //    "subsequent guest accesses match against this table" half
-    //    requires a running vCPU which the v0 runner does not provide.
-    //    This is still only a smoke for test 08 on x86-64, but the
-    //    active arch's valid empty replacement path must return OK.
-    const result = syscall.vmSetPolicy(vm_handle, 1, 0, &.{});
-    if (result.v1 != @intFromEnum(errors.Error.OK)) {
-        testing.fail(5);
+    // 5. Install a real aarch64 SysregPolicy entry. We use SCTLR_EL1:
+    //       op0=3, op1=0, CRn=1, CRm=0, op2=0
+    //    The tuple is packed into bytes 0..4 of vreg 2; bytes 5..7
+    //    are the reserved pad and remain zero. The read/write values
+    //    are intentionally non-zero so this is not an empty-table
+    //    acceptance smoke.
+    const sctlr_el1_tuple: u64 =
+        (@as(u64, 3) << 0) |
+        (@as(u64, 0) << 8) |
+        (@as(u64, 1) << 16) |
+        (@as(u64, 0) << 24) |
+        (@as(u64, 0) << 32);
+    const read_value: u64 = 0x0000_0000_00C5_18D1;
+    const write_mask: u64 = 0x0000_0000_0000_FFFF;
+    const entry: [3]u64 = .{ sctlr_el1_tuple, read_value, write_mask };
+
+    const replace_result = syscall.vmSetPolicy(vm_handle, 1, 1, &entry);
+    if (replace_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(9);
+        return;
+    }
+
+    // 6. Clear the sysreg policy table. This leg keeps the original
+    //    empty replacement covered, but only after a non-empty table
+    //    has already been accepted.
+    const clear_result = syscall.vmSetPolicy(vm_handle, 1, 0, &.{});
+    if (clear_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+
+    // 7. Reinstall the non-empty entry to prove replacement remains
+    //    live after a clear. Guest-side matching remains blocked on a
+    //    suite harness that can run an MRS/MSR in the VM.
+    const reinstall_result = syscall.vmSetPolicy(vm_handle, 1, 1, &entry);
+    if (reinstall_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(11);
         return;
     }
 
