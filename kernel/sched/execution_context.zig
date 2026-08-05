@@ -458,16 +458,12 @@ pub const ExecutionContext = struct {
     /// matching `core_locks[core]`, and on the `removeFromQueue`
     /// success path itself.
     ///
-    /// The IPC fast-path asm in `arch/x64/interrupts.zig` (R13 main
-    /// branch and R13 fallback) bypasses this maintenance: it enqueues
-    /// a freshly-replied receiver onto the local run queue without
-    /// writing this field. To stay correct against that population,
-    /// `removeFromQueue` falls back to the legacy 64-way per-core
-    /// sweep when the field reads `NOT_IN_RUN_QUEUE`. The bd-vzdh /
-    /// bd-wrg8 contention scenario (destroyExecutionContextLocked on
-    /// faulted ECs that never touched the IPC fast path) tracks
-    /// correctly via this field and exits O(1) without entering the
-    /// fallback.
+    /// The x64 IPC fast-path asm in `arch/x64/interrupts.zig` mirrors
+    /// this discipline in its R13 ready-enqueue branches: it writes the
+    /// queue links first, then publishes this byte to the local core id
+    /// before releasing that core's run-queue lock. Readers still treat
+    /// it as a hint and revalidate actual queue membership under the
+    /// named lock.
     ///
     /// Read with `.acquire`, written with `.release`, so the queue
     /// linkage written under `core_locks[core]` immediately before
@@ -854,10 +850,10 @@ pub fn self(caller: *ExecutionContext) i64 {
 ///
 /// An earlier version of this probe also tried to classify each park by
 /// whether the EC's domain was still alive, via `ec.domain.lockIrqSave`.
-/// That DEADLOCKED the boot: `releaseSelf` calls `parkSelfFaulted` while
-/// already holding `cd._gen_lock` (the `destroyPhase1` invariant), so
-/// the probe was a recursive gen-lock acquire. Nothing in this function
-/// may take the domain lock.
+/// That DEADLOCKED the boot: SLOT_SELF teardown can call
+/// `parkSelfFaulted` while already holding `cd._gen_lock` (the
+/// `destroyPhase1` invariant), so the probe was a recursive gen-lock
+/// acquire. Nothing in this function may take the domain lock.
 pub var park_calls: u64 = 0;
 
 pub fn parkSelfFaulted(ec: *ExecutionContext) void {
@@ -883,7 +879,9 @@ pub fn parkSelfFaulted(ec: *ExecutionContext) void {
 /// drop it before yielding to the scheduler.
 pub fn parkIdleWait(ec: *ExecutionContext) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
-    const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    const gen = ec._gen_lock.currentGen();
+    if (gen % 2 == 0) return;
+    const ec_ref = SlabRef(ExecutionContext).init(ec, gen);
     if (ec_ref.lockIrqSave(@src())) |lr| {
         defer ec_ref.unlockIrqRestore(lr.irq_state);
         _ = lifecycle.prepareRunningPark(ec, core_id, .idle);
@@ -1335,6 +1333,27 @@ pub fn perfmonStart(caller: *ExecutionContext, target: u64, num_configs: u8, con
     return result;
 }
 
+fn stampPerfmonConfig(ps: *PerfmonState, configs: []const u64, pair_count: usize, active_mask: u8, threshold_mask: u8) void {
+    var k: usize = 0;
+    while (k < pair_count) {
+        const cfg_word = configs[2 * k];
+        const threshold = configs[2 * k + 1];
+        const event_idx: u8 = @truncate(cfg_word & PERFMON_CONFIG_EVENT_MASK);
+        ps.counter_events[k] = event_idx;
+        ps.counter_thresholds[k] = threshold;
+        k += 1;
+    }
+
+    while (k < perfmon_mod.MAX_COUNTERS) {
+        ps.counter_events[k] = 0;
+        ps.counter_thresholds[k] = 0;
+        k += 1;
+    }
+
+    ps.active_counters = active_mask;
+    ps.has_threshold = threshold_mask;
+}
+
 fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, configs: []const u64) i64 {
     // Validate per-config words against supported_events / overflow /
     // reserved bits per spec tests 04/05/06. The userspace ABI packs
@@ -1390,10 +1409,11 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
     }
 
     // Lazy-allocate per-EC PerfmonState and program hardware.
-    const ps = ensurePerfmonState(target_ec) catch {
+    _ = ensurePerfmonState(target_ec) catch {
         target_ref.unlockIrqRestore(target_irq_state);
         return errors.E_NOMEM;
     };
+    const ps_ref = target_ec.perfmon_state.?;
 
     var decoded: [perfmon_mod.MAX_COUNTERS]stygia.syscall.pmu.PmuCounterConfig = undefined;
     var active_mask: u8 = 0;
@@ -1413,28 +1433,19 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
         const slot_bit: u8 = @as(u8, 1) << @intCast(k);
         active_mask |= slot_bit;
         if (has_threshold) threshold_mask |= slot_bit;
-        ps.counter_events[k] = event_idx;
-        ps.counter_thresholds[k] = threshold;
         k += 1;
     }
-
-    // Zero trailing slots so a smaller-N reprogramming doesn't leave
-    // stale entries visible.
-    while (k < perfmon_mod.MAX_COUNTERS) {
-        ps.counter_events[k] = 0;
-        ps.counter_thresholds[k] = 0;
-        k += 1;
-    }
-
-    ps.active_counters = active_mask;
-    ps.has_threshold = threshold_mask;
 
     // For the calling EC the hardware MSRs are programmed live via
     // `pmuStart`; for a suspended sibling we stamp the state without
     // touching MSRs (the next `pmuRestore` reprograms when scheduled).
     var program_err: bool = false;
     if (target_ec == caller) {
-        arch.pmu.pmuStart(&ps.arch_state, decoded[0..pair_count]) catch {
+        target_ref.unlockIrqRestore(target_irq_state);
+        const this_core: u8 = @truncate(arch.smp.coreID());
+        const locked = scheduler.claimPmuHardwareOwner(this_core, ps_ref) orelse return errors.E_INVAL;
+        stampPerfmonConfig(locked.ptr, configs, pair_count, active_mask, threshold_mask);
+        arch.pmu.pmuStart(&locked.ptr.arch_state, decoded[0..pair_count]) catch {
             program_err = true;
         };
         // `pmuStart` programmed THIS core's counter file, so this core
@@ -1442,15 +1453,45 @@ fn perfmonStartInner(caller: *ExecutionContext, target: u64, num_configs: u8, co
         // next `switchTo` would decline to save them (see
         // `scheduler.pmuSwitch`) and the first quantum's counts would be
         // dropped on the EC's next dispatch.
-        ps.hw_core = @truncate(arch.smp.coreID());
+        locked.ptr.hw_core = this_core;
+        locked.ptr.handoff_pending = false;
+        scheduler.unlockPmuState(locked);
     } else {
-        arch.pmu.pmuConfigureState(&ps.arch_state, decoded[0..pair_count]);
+        target_ref.unlockIrqRestore(target_irq_state);
+        if (!scheduler.retirePmuStateHardware(ps_ref)) return errors.E_INVAL;
+        const relr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const revalidated_ec = relr.ptr;
+        if (revalidated_ec.perfmon_state) |current_ref| {
+            if (!current_ref.eql(ps_ref)) {
+                target_ref.unlockIrqRestore(relr.irq_state);
+                return errors.E_INVAL;
+            }
+        } else {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_INVAL;
+        }
+        if (!lifecycle.isPortSuspended(revalidated_ec)) {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_BUSY;
+        }
+
+        const pslr = ps_ref.lockIrqSave(@src()) catch {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_INVAL;
+        };
+        const ps_locked = pslr.ptr;
+        stampPerfmonConfig(ps_locked, configs, pair_count, active_mask, threshold_mask);
+        arch.pmu.pmuConfigureState(&ps_locked.arch_state, decoded[0..pair_count]);
         // State-only stamp — no hardware was touched, so `arch_state`
         // stays authoritative until the target is dispatched and
         // `pmuSwitch` restores it.
-        ps.hw_core = null;
+        scheduler.assertNoPmuHardwareRef(ps_ref);
+        ps_locked.hw_core = null;
+        scheduler.assertNoPmuHardwareRef(ps_ref);
+        ps_locked.handoff_pending = false;
+        ps_ref.unlockIrqRestore(pslr.irq_state);
+        target_ref.unlockIrqRestore(relr.irq_state);
     }
-    target_ref.unlockIrqRestore(target_irq_state);
     if (program_err) return errors.E_INVAL;
     return errors.OK;
 }
@@ -1496,21 +1537,17 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
         return errors.E_BUSY;
     }
 
-    const pslr = ps_ref.lockIrqSave(@src()) catch {
-        target_ref.unlockIrqRestore(target_irq_state);
-        return errors.E_INVAL;
-    };
-    const ps = pslr.ptr;
-    const ps_irq_state = pslr.irq_state;
+    const is_caller = target_ec == caller;
+    target_ref.unlockIrqRestore(target_irq_state);
 
     // For the calling EC the hardware counters are running live; the
     // cached `ps.arch_state.values` was last refreshed by the most
     // recent context switch out (`scheduler.pmuSwitch`) and is stale by
     // the duration of the current quantum. Snapshot the live registers
     // into the state, read, and restore so the counters keep
-    // accumulating after the read. IRQs are masked for the whole window
-    // by the gen-lock acquires above, so the EC cannot migrate between
-    // the save and the restore.
+    // accumulating after the read. The PMU state lock masks IRQs for the
+    // save/read/restore window, so the EC cannot migrate between the save
+    // and the restore.
     //
     // The `hw_core` gate on the save is load-bearing. Not every
     // dispatch runs `scheduler.pmuSwitch`: the x86 IPC fast path
@@ -1525,14 +1562,46 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     // the restore below then adopts the counters onto this core (where
     // the EC is demonstrably running) so counting resumes from them.
     const this_core: u8 = @truncate(arch.smp.coreID());
-    if (target_ec == caller and ps.hw_core == this_core) {
-        arch.pmu.pmuSave(&ps.arch_state);
-    }
+    var revalidated_target_irq_state: ?u64 = null;
+    const claimed = if (is_caller)
+        scheduler.claimPmuHardwareOwner(this_core, ps_ref) orelse return errors.E_INVAL
+    else blk: {
+        if (!scheduler.retirePmuStateHardware(ps_ref)) return errors.E_INVAL;
+        const relr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const revalidated_ec = relr.ptr;
+        if (revalidated_ec.perfmon_state) |current_ref| {
+            if (!current_ref.eql(ps_ref)) {
+                target_ref.unlockIrqRestore(relr.irq_state);
+                return errors.E_INVAL;
+            }
+        } else {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_INVAL;
+        }
+        if (!lifecycle.isPortSuspended(revalidated_ec)) {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_BUSY;
+        }
+
+        const pslr = ps_ref.lockIrqSave(@src()) catch {
+            target_ref.unlockIrqRestore(relr.irq_state);
+            return errors.E_INVAL;
+        };
+        revalidated_target_irq_state = relr.irq_state;
+        break :blk scheduler.LockedPerfmonState{
+            .ref = ps_ref,
+            .ptr = pslr.ptr,
+            .irq_state = pslr.irq_state,
+        };
+    };
+    const ps = claimed.ptr;
+    if (is_caller) arch.pmu.pmuSave(&ps.arch_state);
     var sample: stygia.syscall.pmu.PmuSample = .{ .counters = [_]u64{0} ** perfmon_mod.MAX_COUNTERS };
     arch.pmu.pmuRead(&ps.arch_state, &sample);
-    if (target_ec == caller) {
+    if (is_caller) {
         arch.pmu.pmuRestore(&ps.arch_state);
         ps.hw_core = this_core;
+        ps.handoff_pending = false;
     }
 
     // Spec ABI: vregs [1..num_counters] = counter values, [num_counters + 1] = ts.
@@ -1554,8 +1623,10 @@ fn perfmonReadInner(caller: *ExecutionContext, target: u64) i64 {
     }
     arch.syscall.setEventStateGprs(caller.ctx, gprs);
 
-    ps_ref.unlockIrqRestore(ps_irq_state);
-    target_ref.unlockIrqRestore(target_irq_state);
+    scheduler.unlockPmuState(claimed);
+    if (revalidated_target_irq_state) |irq_state| {
+        target_ref.unlockIrqRestore(irq_state);
+    }
     // Return value sets vreg 1 (rax). gprs[0] above wrote vreg 1 too,
     // but the syscall epilogue overwrites rax with this return —
     // both paths agree on `sample.counters[0]`.
@@ -1604,25 +1675,9 @@ fn perfmonStopInner(caller: *ExecutionContext, target: u64) i64 {
     }
 
     const ps_ref = target_ec.perfmon_state.?;
-    const pslr = ps_ref.lockIrqSave(@src()) catch {
-        target_ref.unlockIrqRestore(target_irq_state);
-        return errors.E_INVAL;
-    };
-    const ps = pslr.ptr;
-    const ps_irq_state = pslr.irq_state;
-    if (target_ec == caller) {
-        arch.pmu.pmuStop(&ps.arch_state);
-    } else {
-        arch.pmu.pmuClearState(&ps.arch_state);
-    }
-    // Counting is off either way, so no core's register file holds
-    // this EC's counts any more.
-    ps.hw_core = null;
-    ps.active_counters = 0;
-    ps.has_threshold = 0;
-    ps_ref.unlockIrqRestore(ps_irq_state);
-    releasePerfmonState(target_ec);
+    target_ec.perfmon_state = null;
     target_ref.unlockIrqRestore(target_irq_state);
+    scheduler.releasePmuState(ps_ref);
     return errors.OK;
 }
 
@@ -1694,32 +1749,6 @@ pub fn suspendOnPort(
     );
 }
 
-pub fn suspendOnPortWithPairHandoff(
-    ec: *ExecutionContext,
-    handoff_from: *ExecutionContext,
-    port: *Port,
-    event: EventType,
-    subcode: u8,
-    addr: u64,
-    originating_write_cap: bool,
-    originating_read_cap: bool,
-    irq_state: u64,
-) i64 {
-    return suspendOnPortInner(
-        ec,
-        port,
-        event,
-        subcode,
-        addr,
-        originating_write_cap,
-        originating_read_cap,
-        irq_state,
-        handoff_from,
-        null,
-        null,
-    );
-}
-
 pub fn suspendOnPortWithPairHandoffGen(
     ec: *ExecutionContext,
     handoff_from: *ExecutionContext,
@@ -1778,13 +1807,17 @@ pub fn suspendOnPortWithPairHandoffDirectiveGen(
 fn clearSuspendDirectiveMetadata(ec: *ExecutionContext) void {
     ec.directive_port = null;
     ec.directive_owner = null;
+}
+
+fn clearFailedSuspendDirectiveMetadata(ec: *ExecutionContext) void {
+    clearSuspendDirectiveMetadata(ec);
     ec.originating_write_cap = false;
     ec.originating_read_cap = false;
 }
 
 fn failSuspendDirective(ec: *ExecutionContext, word: u32, result: i64) void {
     if (lifecycle.failDirectiveWord(ec, word, result)) {
-        clearSuspendDirectiveMetadata(ec);
+        clearFailedSuspendDirectiveMetadata(ec);
     }
 }
 
@@ -2326,6 +2359,20 @@ pub fn destroyExecutionContextLocked(ec: *ExecutionContext, caller_cd: ?*Capabil
     destroyExecutionContextRefLocked(SlabRef(ExecutionContext).init(ec, @intCast(gen)), caller_cd);
 }
 
+/// Discharge a run-queue steal claim whose EC became unpublishable while the
+/// thief had dropped core locks. Caller owns the stolen holder pin.
+pub fn dischargeClaimedHolderDead(ec: *ExecutionContext) void {
+    const gen = ec._gen_lock.currentGen();
+    if (gen % 2 == 0) {
+        lifecycle.releasePin(ec);
+        return;
+    }
+
+    const ec_ref = SlabRef(ExecutionContext).init(ec, @intCast(gen));
+    lifecycle.releasePin(ec);
+    destroyExecutionContextRefLocked(ec_ref, null);
+}
+
 pub fn destroyExecutionContextRefLocked(ec_ref: SlabRef(ExecutionContext), caller_cd: ?*CapabilityDomain) void {
     const ec = ec_ref.ptr;
 
@@ -2479,6 +2526,8 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
     }
     pending.ptr.has_threshold = 0;
     pending.ptr.hw_core = null;
+    pending.ptr.release_pending = false;
+    pending.ptr.handoff_pending = false;
     pending.ptr.arch_state.num_counters = 0;
     {
         var i: usize = 0;
@@ -2491,27 +2540,15 @@ fn ensurePerfmonState(ec: *ExecutionContext) !*PerfmonState {
     return ref.ptr;
 }
 
-/// Free `perfmon_state` on perfmon_stop or implicit on EC destroy.
+/// Free `perfmon_state` on implicit EC destroy.
 ///
-/// The destroy path can reach here with counting still enabled — an EC
-/// terminated mid-quantum never runs the `perfmon_stop` that would
-/// disarm the hardware. If THIS core is the one holding the EC's live
-/// counts (`hw_core`), disarm them before the slot goes away, so a
-/// threshold-armed counter can't keep running and fire a PMI against
-/// whatever EC is dispatched next. A remote `hw_core` is left alone:
-/// its register file belongs to that core, and `pmiHandler`'s
-/// no-perfmon-state path already clears and masks a stray overflow
-/// there.
+/// Stop detaches under the EC gen-lock and then calls
+/// `scheduler.releasePmuState` after dropping it. Destroy paths that reach
+/// here have already removed the EC from publication and run without the EC
+/// gen-lock held. The release side may wait for a remote hardware owner, so
+/// callers must not wrap this in an EC gen-lock/IRQ-masked section.
 fn releasePerfmonState(ec: *ExecutionContext) void {
     const ref = ec.perfmon_state orelse return;
     ec.perfmon_state = null;
-    // caller-pinned: `ec` is locked by the caller and `ref` is its own
-    // state slot, about to be destroyed with this same (ptr, gen) pair.
-    if (ref.ptr.hw_core) |core| {
-        if (core == @as(u8, @truncate(arch.smp.coreID()))) {
-            arch.pmu.pmuStop(&ref.ptr.arch_state);
-            ref.ptr.hw_core = null;
-        }
-    }
-    perfmon_mod.slab_instance.destroy(ref.ptr, ref.gen) catch {};
+    scheduler.releasePmuState(ref);
 }

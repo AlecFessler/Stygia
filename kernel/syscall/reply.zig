@@ -1,7 +1,6 @@
 const std = @import("std");
 const stygia = @import("stygia");
 
-const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
 const device_region = stygia.devices.device_region;
 const errors = stygia.syscall.errors;

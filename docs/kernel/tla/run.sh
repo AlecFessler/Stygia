@@ -209,6 +209,9 @@ expect_pass mtermfix  ECLifecycle.tla -config ECLifecycle_mtermfix.cfg
 # two-part disambiguator introduces no wedge, only that the invariant
 # holds -- and the wedge is the whole point of a fix-check.
 expect_pass dirf6fix  ECLifecycle.tla -config ECLifecycle_dirf6fix.cfg
+expect_pass pmu_release ECLifecycle.tla -deadlock -config ECLifecycle_pmu_release.cfg
+expect_violation pmu_remote ECLifecycle.tla "Invariant InvPmuHwCoreRefCoherent is violated" \
+  -deadlock -config ECLifecycle_pmu_remote_falsifier.cfg
 expect_pass small    ECLifecycle.tla -config ECLifecycle_small.cfg
 expect_pass large    ECLifecycle.tla -config ECLifecycle_large.cfg
 expect_pass cr3self  ECLifecycle.tla -deadlock -config ECLifecycle_cr3self.cfg

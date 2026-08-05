@@ -1,5 +1,6 @@
 const stygia = @import("stygia");
 
+const apic = stygia.arch.x64.apic;
 const cpu = stygia.arch.x64.cpu;
 const ctx_trace = stygia.utils.ctx_trace;
 const hang_detector = stygia.utils.hang_detector;
@@ -242,6 +243,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     const from_user = (ctx.cs & ring_3) == ring_3;
 
     if (from_user) {
+        scheduler.clearYieldHandoffGuard(@truncate(apic.coreID()));
         if (scheduler.currentEc()) |ec| {
             if (execution_context.consumeSuspendDirective(ec, ctx)) {
                 scheduler.hopParkRun();
@@ -256,6 +258,9 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     if (exception == .device_not_available) {
         const ec = scheduler.currentEc() orelse
             @panic("#NM with no current EC");
+        if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), ec)) {
+            scheduler.hopParkRun();
+        }
         fpu.handleTrap(ec);
         return;
     }
@@ -281,6 +286,9 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         {
             const ec = scheduler.currentEc() orelse
                 @panic("hlt trap with no current EC");
+            if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), ec)) {
+                scheduler.hopParkRun();
+            }
             ctx.rip += 1; // advance past the 1-byte HLT opcode
             execution_context.parkIdleWait(ec);
             // Hop to the park kstack, do NOT run the scheduler loop in

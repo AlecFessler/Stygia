@@ -650,14 +650,10 @@ pub fn createCapabilityDomain(
     // calling core, prefer the calling core; otherwise use the lowest
     // bit set in the mask. Spec §[create_capability_domain] [5].
     //
-    // NOTE: this placement is PERMANENT, not a first guess. There is no
-    // work stealing and no pull path — `scheduler.zig` says so at the
-    // affinity check in `yieldTo` ("there is no other migration trigger
-    // — `setAffinity` writes the mask without repositioning, and
-    // `preempt` re-enters this same path"), and for `affinity == 0` the
-    // preemption re-enqueue re-picks the current core every time. So an
-    // `affinity = 0` child is pinned for life to whichever core created
-    // it, even though the spec calls 0 "kernel picks any core".
+    // NOTE: this is only initial placement. `affinity == 0` remains
+    // local-biased here and on ordinary re-enqueue, but x64's scheduler
+    // pull path may later steal the ready EC to any core. aarch64 keeps
+    // stealing disabled until EC migration has FP-state parity.
     //
     // That matters most for a single spawner: the test runner creates
     // every test domain from one EC with affinity 0, so the entire suite
@@ -1381,15 +1377,15 @@ pub fn allocCapabilityDomain(
 /// `kernel_table` releasing every used slot per type, tears down the
 /// address space, frees the table pages, frees slab.
 ///
-/// Step 10 minimal teardown. The caller invokes this from `releaseSelf`
-/// AFTER the calling EC has been retired via `parkSelfFaulted` (it is
-/// the bound initial EC by spec — `delete(SLOT_SELF)` from inside the
-/// child runs on this very EC). At entry the EC is no longer the
-/// current_ec on its core; its kernel stack frame is the one we are
-/// currently executing on, so we MUST not free the kernel stack pages
-/// here. The scheduler's noreturn dispatch will iretq off this stack
-/// once we return; the next preemption tick observes the EC as
-/// `terminated` and reaps it via the slab generation flip.
+/// Step 10 minimal teardown. SLOT_SELF and no-route teardown callers
+/// invoke this AFTER the calling EC has been retired via
+/// `parkSelfFaulted` (it is the bound initial EC by spec —
+/// `delete(SLOT_SELF)` from inside the child runs on this very EC). At
+/// entry the EC is no longer the current_ec on its core; its kernel stack
+/// frame is the one we are currently executing on, so we MUST not free
+/// the kernel stack pages here. The scheduler's noreturn dispatch will
+/// iretq off this stack once we return; the next preemption tick observes
+/// the EC as `terminated` and reaps it via the slab generation flip.
 ///
 /// What this does free now: the user/kernel handle-table PMM blocks,
 /// the address-space PCID, and the CD slab slot itself. What is
@@ -2225,56 +2221,4 @@ pub fn checkVaRangeOverlap(cd: *const CapabilityDomain, base: VAddr, bytes: u64)
         i += 1;
     }
     return 0;
-}
-
-/// Phase-1 entry for SLOT_SELF tear-down. The caller
-/// (`caps.derivation.deleteAndDetach` SLOT_SELF arm, or
-/// `port.fireMemoryFault`'s no-route destroy) holds `tree_mutex`
-/// (`TREE_MUTEX_GROUP`) and the CD's `_gen_lock`
-/// (`TREE_DOMAIN_GROUP`); this returns a `DestroyDeferred`
-/// capturing the work the caller must finish via `destroyPhase2`
-/// AFTER releasing both. See `destroyPhase1` for the lockdep-group
-/// requirement and rationale.
-///
-/// `delete(SLOT_SELF)` runs on an EC bound to the very domain being
-/// destroyed (commonly the initial EC, which on test ELFs falls
-/// through to start.zig's `_start`-tail `delete(SLOT_SELF)` after main
-/// returns). We cannot reclaim the kernel stack of the calling EC
-/// from here — it is the stack we are currently executing on — so
-/// this path frees the heaviest per-domain allocations (handle-table
-/// PMM blocks, slab slot, PCID) and lets the EC frame iretq off into
-/// scheduler.run() via the normal post-syscall fall-through. The
-/// caller's `_start` then enters its `while(true) hlt` until the next
-/// tick preempts; the EC is no longer reachable from any handle (its
-/// owning domain's slab gen flipped) so it is unrunnable past that.
-///
-/// Without this, every child domain spawned by the test runner leaks
-/// ~256 KiB of buddy-allocated handle-table pages and a slab slot. By
-/// ~iteration 416 the runner exhausts buddy-allocator capacity, and
-/// further `createCapabilityDomain` syscalls hang on the failed
-/// allocBlock (no E_NOMEM is currently surfaced from that path —
-/// see TODO in allocCapabilityDomain).
-pub fn releaseSelf(cd: *CapabilityDomain) DestroyDeferred {
-    // Park the calling EC before tearing the domain down. The caller
-    // is the running EC of `cd` (delete(SLOT_SELF) is dispatched on
-    // its own kernel stack); without this `parkSelfFaulted` it would
-    // continue executing user-mode code at the post-syscall RIP after
-    // iretq, but the `user_table` PMM block has just been freed and
-    // the user-mode pages backing the read-only cap-table view are
-    // unmapped. Park as `.exited` so syscallDispatch's
-    // `scheduler.run()` epilogue picks up the next ready EC instead
-    // of iretq'ing the now-doomed test EC. Mirrors the
-    // `fireThreadFault` no-route fallback.
-    //
-    // Capture the caller EC BEFORE `parkSelfFaulted` clears it from
-    // `current_ec`; the phase-2 EC walk must skip this EC.
-    const caller_ec = if (stygia.sched.scheduler.currentEc()) |ec|
-        SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
-    else
-        null;
-    if (caller_ec) |ec_ref| {
-        const ec = ec_ref.ptr;
-        stygia.sched.execution_context.parkSelfFaulted(ec);
-    }
-    return destroyPhase1(cd, caller_ec);
 }

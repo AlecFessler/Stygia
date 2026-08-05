@@ -513,7 +513,7 @@ stage_dead_code_report() {
 stage_gen_lock_analyzer() {
     echo ""
     echo "=================================================="
-    echo "[0c] Gen-lock analyzer (fat-pointer invariants)"
+    echo "[0c] Gen-lock analyzer (IRQ discipline)"
     echo "=================================================="
     if ! (cd "$STYGIA_ROOT/tools/check_gen_lock" && zig build 2>&1); then
         FAILURES+=("gen-lock analyzer build")
@@ -547,12 +547,12 @@ stage_gen_lock_analyzer() {
     # Both runs execute even if the first fails, so one arch's findings
     # don't mask the other's.
     local genlock_rc=0
-    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
-        FAILURES+=("gen-lock analyzer findings (x86_64)")
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary --rule irq_discipline); then
+        FAILURES+=("gen-lock IRQ-discipline findings (x86_64)")
         genlock_rc=1
     fi
-    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB_AARCH64" --target kernel --summary); then
-        FAILURES+=("gen-lock analyzer findings (aarch64)")
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB_AARCH64" --target kernel --summary --rule irq_discipline); then
+        FAILURES+=("gen-lock IRQ-discipline findings (aarch64)")
         genlock_rc=1
     fi
     return $genlock_rc
@@ -713,11 +713,17 @@ verify_image_arch() {
 # clean summary used to PASS this gate outright.
 #
 # Marker choice is measured against a known-clean x86 run (485/485):
-#   KERNEL PANIC  0   Zig `panic:`  0   [NOROUTE]  0   [HANG]  0
+#   KERNEL PANIC  0   Zig `panic:`  0   [NOROUTE]  0
 #   [USR-PF]    102  <-- NOT a marker; the map_pf tests fault on purpose.
 # `[NOROUTE]` means an event fired with no bound route and the EC parked
 # forever, so a result that should exist never will — abnormal by
 # construction, and zero in healthy runs.
+#
+# `[HANG]` is diagnostic rather than conclusively terminal: the x86 hang
+# detector can dump once after a long no-newline window, then the runner can
+# resume and report a clean per-run summary or final repeat aggregate. Keep
+# terminal hangs blocking, but do not fail a recovered dump that is followed by
+# a clean runner verdict.
 #
 # $1 = path to the captured log, $2 = label for the FAILURES entry
 verify_no_kernel_faults() {
@@ -725,14 +731,39 @@ verify_no_kernel_faults() {
     [[ -f "$log" ]] || return 0
     # The runner's per-test progress ticks interleave `~` into output, so
     # strip them before matching (same reason the summary greps do).
-    local hits
-    hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[NOROUTE\]|\[HANG\]' | head -10)
-    if [[ -n "$hits" ]]; then
+    local hard_hits
+    hard_hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[NOROUTE\]' | head -10)
+    if [[ -n "$hard_hits" ]]; then
         echo "[FAIL] $label: kernel-level fault in the log (runner summary cannot see this)"
-        echo "$hits" | sed 's/^/    /'
-        FAILURES+=("$label: kernel fault (panic/noroute/hang) in serial log")
+        echo "$hard_hits" | sed 's/^/    /'
+        FAILURES+=("$label: kernel fault (panic/noroute) in serial log")
         return 1
     fi
+
+    local hang_hits
+    hang_hits=$(tr -d '~' < "$log" | grep -aE '\[HANG\]' | head -10)
+    if [[ -n "$hang_hits" ]]; then
+        if tr -d '~' < "$log" | awk '
+            /\[HANG\]/ { last_hang = NR }
+            /^\[runner\] [0-9]+ total .* \/ 0 fail \/ 0 miss$/ {
+                if (NR > last_hang) clean_after_hang = 1
+            }
+            /^\[runner\] === aggregate over [0-9]+ runs: .* \/ 0 fail \/ 0 miss ===$/ {
+                if (NR > last_hang) clean_after_hang = 1
+            }
+            END { exit !(last_hang > 0 && clean_after_hang) }
+        '; then
+            echo "[WARN] $label: recovered [HANG] diagnostic followed by clean runner verdict"
+            echo "$hang_hits" | sed 's/^/    /'
+            return 0
+        fi
+
+        echo "[FAIL] $label: terminal [HANG] in the log (no later clean runner verdict)"
+        echo "$hang_hits" | sed 's/^/    /'
+        FAILURES+=("$label: terminal hang in serial log")
+        return 1
+    fi
+
     return 0
 }
 

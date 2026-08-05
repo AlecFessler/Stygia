@@ -781,99 +781,154 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
     if (!lifecycle.selfMarkSuspending(caller)) return errors.E_BUSY;
     defer lifecycle.clearSelfDirective(caller);
 
-    const tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const target_ec = tlr.ptr;
-    const target_irq_state = tlr.irq_state;
-    if (target_ec.vm != null) {
-        target_ref.unlockIrqRestore(target_irq_state);
-        return errors.E_INVAL;
-    }
-    if (!lifecycle.canSuspendTarget(target_ec)) {
-        target_ref.unlockIrqRestore(target_irq_state);
-        return errors.E_INVAL;
-    }
-    // Spec §[handle_attachments]: when the caller is suspending a
-    // different EC, the pair entries were validated against the
-    // caller's domain in `validatePairEntries` and stashed on the
-    // caller's EC. The actual move/copy at recv time runs against
-    // the suspended EC (which is what `deliverEvent` sees), so we
-    // hand the stash off only after the target commits the remote
-    // directive into a real port suspension. A self-suspend leaves the
-    // stash where it already lives.
-    const target_state = lifecycle.load(target_ec);
-    if (target_ec != caller and target_state == .running) {
-        if (!lifecycle.tryPinLive(target_ec)) {
+    const SuspendRetry = struct {
+        fn fromState(ec: *ExecutionContext, state: lifecycle.State) bool {
+            return switch (state) {
+                .running, .ready, .claimed => true,
+                .waiting => ec.wait.kind == .idle,
+                // User-mode hlt/wfi parks through a short owner-stack
+                // handoff state before becoming `.waiting(.idle)`.
+                // The settled idle waiter is suspendable; treating the
+                // handoff as final E_INVAL makes suspend race the hlt
+                // trap on SMP.
+                .parking => ec.wait.kind == .idle,
+                else => false,
+            };
+        }
+
+        fn check(ec: *ExecutionContext) bool {
+            return fromState(ec, lifecycle.load(ec));
+        }
+    };
+
+    while (true) {
+        var tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        var target_ec = tlr.ptr;
+        var target_irq_state = tlr.irq_state;
+        var target_state = lifecycle.load(target_ec);
+        while (true) {
+            if (target_ec.vm != null) {
+                target_ref.unlockIrqRestore(target_irq_state);
+                return errors.E_INVAL;
+            }
+            if (lifecycle.canSuspendTarget(target_ec)) break;
+            if (!SuspendRetry.fromState(target_ec, target_state)) {
+                target_ref.unlockIrqRestore(target_irq_state);
+                return errors.E_INVAL;
+            }
+            target_ref.unlockIrqRestore(target_irq_state);
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+            tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+            target_ec = tlr.ptr;
+            target_irq_state = tlr.irq_state;
+            target_state = lifecycle.load(target_ec);
+        }
+        // Spec §[handle_attachments]: when the caller is suspending a
+        // different EC, the pair entries were validated against the
+        // caller's domain in `validatePairEntries` and stashed on the
+        // caller's EC. The actual move/copy at recv time runs against
+        // the suspended EC (which is what `deliverEvent` sees), so we
+        // hand the stash off only after the target commits the remote
+        // directive into a real port suspension. A self-suspend leaves the
+        // stash where it already lives.
+        if (target_ec != caller and target_state == .running) {
+            if (!lifecycle.tryPinLive(target_ec)) {
+                target_ref.unlockIrqRestore(target_irq_state);
+                return errors.E_INVAL;
+            }
+            const owner_slot_u32 = execution_context.slab_instance.indexOf(caller);
+            const owner_slot: u24 = @intCast(owner_slot_u32);
+            if (!lifecycle.claimRemoteSuspend(target_ec, owner_slot)) {
+                lifecycle.releasePin(target_ec);
+                target_ref.unlockIrqRestore(target_irq_state);
+                return errors.E_BUSY;
+            }
+            target_ec.directive_port = port_ref;
+            target_ec.directive_owner = caller;
+            target_ec.originating_write_cap = ec_caps.write;
+            target_ec.originating_read_cap = ec_caps.read;
+            if (!lifecycle.armRemoteSuspend(target_ec, owner_slot)) {
+                target_ec.directive_port = null;
+                target_ec.directive_owner = null;
+                target_ec.originating_write_cap = false;
+                target_ec.originating_read_cap = false;
+                lifecycle.releasePin(target_ec);
+                target_ref.unlockIrqRestore(target_irq_state);
+                return errors.E_BUSY;
+            }
+            const owner_core = target_ec.owner_core;
+            target_ref.unlockIrqRestore(target_irq_state);
+            if (owner_core < scheduler.MAX_CORES) {
+                arch.smp.triggerSchedulerInterrupt(owner_core);
+            }
+            const ret = waitForSuspendDirective(target_ref, target_ec, port_ref, owner_slot);
+            const should_retry = (ret == errors.E_BUSY or ret == errors.E_INVAL) and
+                SuspendRetry.check(target_ec);
+            lifecycle.releasePin(target_ec);
+            if (should_retry) {
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            return ret;
+        }
+        const target_pinned = target_ec != caller;
+        if (target_pinned and !lifecycle.tryPinLive(target_ec)) {
             target_ref.unlockIrqRestore(target_irq_state);
             return errors.E_INVAL;
         }
-        const owner_slot_u32 = execution_context.slab_instance.indexOf(caller);
-        const owner_slot: u24 = @intCast(owner_slot_u32);
-        if (!lifecycle.claimRemoteSuspend(target_ec, owner_slot)) {
-            lifecycle.releasePin(target_ec);
-            target_ref.unlockIrqRestore(target_irq_state);
-            return errors.E_BUSY;
-        }
-        target_ec.directive_port = port_ref;
-        target_ec.directive_owner = caller;
-        target_ec.originating_write_cap = ec_caps.write;
-        target_ec.originating_read_cap = ec_caps.read;
-        if (!lifecycle.armRemoteSuspend(target_ec, owner_slot)) {
-            target_ec.directive_port = null;
-            target_ec.directive_owner = null;
-            target_ec.originating_write_cap = false;
-            target_ec.originating_read_cap = false;
-            lifecycle.releasePin(target_ec);
-            target_ref.unlockIrqRestore(target_irq_state);
-            return errors.E_BUSY;
-        }
-        const owner_core = target_ec.owner_core;
         target_ref.unlockIrqRestore(target_irq_state);
-        if (owner_core < scheduler.MAX_CORES) {
-            arch.smp.triggerSchedulerInterrupt(owner_core);
+
+        const plr = port_ref.lockIrqSave(@src()) catch {
+            if (target_pinned) lifecycle.releasePin(target_ec);
+            return errors.E_BADCAP;
+        };
+        const p = plr.ptr;
+        // Re-validate target state under the destination port lock. If a
+        // remote ready target won a dispatch race after the EC-side check
+        // above, it must be handled by the directive path on its owner core;
+        // the generic suspend helper is allowed to park only this core's
+        // current running EC.
+        if (target_ec != caller and lifecycle.load(target_ec) == .running) {
+            port_ref.unlockIrqRestore(plr.irq_state);
+            if (target_pinned) lifecycle.releasePin(target_ec);
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+            continue;
         }
-        const ret = waitForSuspendDirective(target_ref, target_ec, port_ref, owner_slot);
-        lifecycle.releasePin(target_ec);
+        if (!lifecycle.canSuspendTarget(target_ec)) {
+            port_ref.unlockIrqRestore(plr.irq_state);
+            const should_retry = SuspendRetry.check(target_ec);
+            if (target_pinned) lifecycle.releasePin(target_ec);
+            if (should_retry) {
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            return errors.E_INVAL;
+        }
+        // `suspendOnPort` releases the port lock before returning (directly
+        // on the no-receiver path, transitively via `rendezvousWithReceiver`
+        // on the success path) so we MUST NOT add `defer port_ref.unlockIrqRestore(...)`.
+
+        // Snapshot the originating EC handle's `write` and `read` caps so
+        // reply-time can decide whether receiver mutations apply (Spec
+        // §[reply] tests 05/06) and so recv-time gates the suspended EC's
+        // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
+        // The caps were captured into `ec_caps` above under the domain lock.
+        const ret = execution_context.suspendOnPortWithPairHandoffGen(target_ec, caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, plr.irq_state, target_ref.gen);
+        const should_retry = target_pinned and
+            (ret == errors.E_BUSY or ret == errors.E_INVAL) and
+            SuspendRetry.check(target_ec);
+        if (target_pinned) lifecycle.releasePin(target_ec);
+        if (should_retry) {
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+            continue;
+        }
         return ret;
     }
-    const target_pinned = target_ec != caller;
-    if (target_pinned and !lifecycle.tryPinLive(target_ec)) {
-        target_ref.unlockIrqRestore(target_irq_state);
-        return errors.E_INVAL;
-    }
-    target_ref.unlockIrqRestore(target_irq_state);
-
-    const plr = port_ref.lockIrqSave(@src()) catch {
-        if (target_pinned) lifecycle.releasePin(target_ec);
-        return errors.E_BADCAP;
-    };
-    const p = plr.ptr;
-    // Re-validate target state under the destination port lock. If a
-    // remote ready target won a dispatch race after the EC-side check
-    // above, it must be handled by the directive path on its owner core;
-    // the generic suspend helper is allowed to park only this core's
-    // current running EC.
-    if (target_ec != caller and lifecycle.load(target_ec) == .running) {
-        port_ref.unlockIrqRestore(plr.irq_state);
-        if (target_pinned) lifecycle.releasePin(target_ec);
-        return errors.E_BUSY;
-    }
-    if (!lifecycle.canSuspendTarget(target_ec)) {
-        port_ref.unlockIrqRestore(plr.irq_state);
-        if (target_pinned) lifecycle.releasePin(target_ec);
-        return errors.E_INVAL;
-    }
-    // `suspendOnPort` releases the port lock before returning (directly
-    // on the no-receiver path, transitively via `rendezvousWithReceiver`
-    // on the success path) so we MUST NOT add `defer port_ref.unlockIrqRestore(...)`.
-
-    // Snapshot the originating EC handle's `write` and `read` caps so
-    // reply-time can decide whether receiver mutations apply (Spec
-    // §[reply] tests 05/06) and so recv-time gates the suspended EC's
-    // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
-    // The caps were captured into `ec_caps` above under the domain lock.
-    const ret = execution_context.suspendOnPortWithPairHandoffGen(target_ec, caller, p, .suspension, 0, 0, ec_caps.write, ec_caps.read, plr.irq_state, target_ref.gen);
-    if (target_pinned) lifecycle.releasePin(target_ec);
-    return ret;
 }
 
 /// `recv` syscall handler. Spec §[port].recv.
@@ -1736,19 +1791,19 @@ fn fireRouted(
 /// is restarted if its self-handle has the `restart` cap (per
 /// §[restart_semantics]); otherwise the capability domain is destroyed".
 ///
-/// Restart engine is not yet wired in this kernel. We honor the
-/// destroy arm here: drive the standard SLOT_SELF tear-down via
-/// `releaseSelf` (parks the calling EC, then runs phase1 + phase2 of
-/// `destroyCapabilityDomain`). Without this — when this path used to
-/// just `parkSelfFaulted` — a faulting child stayed parked but its
-/// domain leaked, and any peer EC in the same domain kept running
-/// over a half-broken address space until the test runner timed out.
+/// Restart engine is not yet wired in this kernel. We honor the destroy
+/// arm here: drive the standard SLOT_SELF-style teardown by parking the
+/// calling EC, then queueing phase1 + phase2 of `destroyCapabilityDomain`.
+/// Without this — when this path used to just `parkSelfFaulted` — a
+/// faulting child stayed parked but its domain leaked, and any peer EC in
+/// the same domain kept running over a half-broken address space until the
+/// test runner timed out.
 ///
-/// Lock discipline: `releaseSelf` acquires the CD `_gen_lock`. The
-/// in-tree fault paths reach this fallback with the CD lock already
-/// dropped (see fault.zig: the user-fault arm `defer`s the unlock
-/// before `fireMemoryFault`; the catch arm runs without taking the
-/// lock at all). `tree_mutex` is also untaken on these paths. If a
+/// Lock discipline: phase1 acquires the CD `_gen_lock`. The in-tree
+/// fault paths reach this fallback with the CD lock already dropped (see
+/// fault.zig: the user-fault arm `defer`s the unlock before
+/// `fireMemoryFault`; the catch arm runs without taking the lock at all).
+/// `tree_mutex` is also untaken on these paths. If a
 /// future caller arrives with the CD lock held, `lockIrqSave` would
 /// dead-spin — hence the explicit lock-state contract documented on
 /// each call site under fault.zig / arch/*/exceptions.zig.

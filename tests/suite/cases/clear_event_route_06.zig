@@ -219,13 +219,12 @@ pub fn main(cap_table_base: u64) void {
     // `create_execution_context`'s priority field at [1] bits 32-33 —
     // a bare caps word silently requests priority 0 = `Priority.idle`,
     // the lowest of four bands (stygia-zzy). Dispatch is strict-priority
-    // with no aging and no work stealing, and `affinity = 0` pins the EC
-    // to the creating core for life (stygia-yxj), so an `idle` worker on
-    // a busy core can go unscheduled indefinitely even with other cores
-    // free. Both workers here spin on `worker_go` and must actually run
-    // for the test to progress, so an unscheduled worker times out
-    // phase 1's recv and trips assertion 4 — observed once in 42 boots
-    // of the full suite on aarch64 Pi 5 KVM at -Dbatch=16.
+    // with no aging, and aarch64 still has no steal path, so an `idle`
+    // worker can go unscheduled behind normal-priority work. Both
+    // workers here spin on `worker_go` and must actually run for the
+    // test to progress, so an unscheduled worker times out phase 1's
+    // recv and trips assertion 4 — observed once in 42 boots of the
+    // full suite on aarch64 Pi 5 KVM at -Dbatch=16.
     //
     // Requesting `normal` makes the workers scheduling peers of the test
     // EC that waits on them, which is what both phases already assume.

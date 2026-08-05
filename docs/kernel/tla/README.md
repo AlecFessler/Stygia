@@ -333,7 +333,7 @@ gitignored; keep all generated output under them.
 
 | File | Purpose |
 |---|---|
-| `ECLifecycle.tla` | the model: rev 15, plus every older/defective machine as a switch |
+| `ECLifecycle.tla` | the model: rev 16 plus the dispatch-tail/PMU hardware-owner extension, with older/defective machines as switches |
 | `ECProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
 | `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
 | `ECLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
@@ -343,6 +343,7 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
 | `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
 | `ECLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
+| `ECLifecycle_pmu_release.cfg` | focused PMU release/destruction lifetime check with per-core `phw` hardware refs and safe remote migration enabled; default battery |
 | `ECLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
 | `ECLifecycle_t1{min,s,r,d_min,d,full}.cfg` | **`LiveTerm` ladder under `SpecTrm`**, its minimal fairness set; `t1d_min` is the default directive-bearing replacement rung, while full `t1d` and `t1full` are extended/manual measured-unconverged rows |
 | `ECLifecycle_cr1minself.cfg` | focused `LiveSuspender` under `SpecSus` (neither N6 assumption), paired with `crfals` |
@@ -359,6 +360,7 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_cr3.cfg` | round-7 C3, `"pair"` at 3 ECs: expects `InvNoSuspendCycle3` |
 | `ECLifecycle_crfals.cfg` | round-7 C3, no rejection + no N6 assumptions at the focused no-drop `SpecSus` scope: expects a temporal violation |
 | `ECLifecycle_mterm.cfg` | **round-8 C-1, no retired-terminator escape: expects a DEADLOCK** |
+| `ECLifecycle_pmu_remote_falsifier.cfg` | remote PMU stale-ref bug: `PMU_SAFE_MIGRATION = FALSE` expects `InvPmuHwCoreRefCoherent` |
 | `ECLifecycle_pr{1,2,3}.cfg` | the reachability probes (violation = pass) |
 | **not in `run.sh`** | |
 | `ECLifecycle_q{1..7}.cfg`, `q7d` | per-property liveness at 2c × 3e. `q7` did not converge in 90 min; kept because the scope question is open, NOT because they pass |
@@ -371,8 +373,8 @@ gitignored; keep all generated output under them.
 `ls ECLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
-9–11 and the taxonomy kept describing them. There are **48 `.cfg` files**
-and `run.sh` invokes **37**; the 11 it does not are `q1`–`q7`, `q7d`,
+	9–11 and the taxonomy kept describing them. There are **50 `.cfg` files**
+	and `run.sh` invokes **39**; the 11 it does not are `q1`–`q7`, `q7d`,
 `dirabafix`, full `medium`, and full `pr4d`, each with its reason
 recorded in `run.sh` itself.
 
@@ -412,7 +414,7 @@ window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
 | §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-EC words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
-| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `committed_ec` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
+| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` now distinguishes `dispatchPmu` and `dispatchLoad` from `ecrun`; `committed_ec` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
 | §2.4 `owner_core` | `own`, NULL outside validity set | poison = NULL |
 | §2.4 `pin_depth` + pin class (F3) | `pin`; wake/suspend claim actions pin the protected target EC, pin-class locks pin the executing EC via `PinAcq`/`PinRel`; `dpin` is the running-target remote-directive lifetime pin | "computed membership" is the analyzer's job; model has one representative class. `RetireEnabled` gates on target `pin = 0` and `dpin = FALSE`; `InvPinCells` permits transient ready publish pins because containment is still the run queue. `dpin` is deliberately separate because Zig's directive waiter pin blocks retire/finalize but must not block the target owner's tick/boundary directive consumption |
 | §2.4 `pin_depth` ORDER (C1) | `PIN_BUMP_FIRST` + `plk \in {none,held,preB,postD}` + `PinBump`/`PinUnlock` + `InvNoPreemptedLockHolder` | **pin-class half CHECKED** (the `pinord` falsifier); **claim half BELOW GRANULARITY and not checked** — see finding C1 |
@@ -433,24 +435,24 @@ window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
 | §8.1 `yieldTo` target side (M-4) | `DispatchEC(c,e)` requires `e \in cores[c].q` — local-only by construction | the S7 filter is `~ecs[e].dd`; the affinity-mask check is below granularity (masks unmodelled) |
 | §9.4 both fused shapes | `FastPath` (suspend FP), `ReplyFP` (reply FP main) | asm conformance out of boundary (`stygia-qde`) |
 | §3.2 edge-4 claimability-at-the-hop | `E4_AT_HOP` switch + the e4 falsifier | the Phase-3b barrier-zero question, answered with teeth |
-| §3.2 dispatch sequence + S7 (F2) | `DispatchEC`; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary |
+| §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchEC` (selected/current commit) -> `DispatchPmu` (`pmuSwitch`) -> `DispatchLoad` (final context load); `DispatchAbort{Pre,After}Pmu` for lifecycle loss after commit; `PmuRelease` for perfmon-state release/destruction completion; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary. `InvPmuTailOwned` checks that at most one per-core PMU hardware ref names an EC; `InvPmuHwCoreRefCoherent` checks both `hw -> phw` and reverse `phw -> hw`; `InvPmuNoReleasedHw` checks release/destruction cannot complete while any PMU hardware token is live |
 | §3.2 wake body | `WakeStart` (5a/5b) + `WakePlace`/`WakePendDone`; `FireAt` + irq frame bodies | |
 | §3.3 IRQ discipline | masked sections = atomic actions; handler-active = masked (no nesting) | sync-exception rule outside boundary |
 | §3.5 R-claim | claims only inside container-atomic actions (pop+claim fused) or retire | gen-lock half abstracted (no gen) |
 | §3.6 T3 spins (**10 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W7 = `RetireEnabled` pd guard | W6, W8, W9 **not modelled** — and **W5-N (the domain-pause predicate wait) is not modelled either**, which revision 15's row omitted entirely: it accounted for 9 of 10 rows and read as complete. W5-N is the only PREDICATE-shaped wait in §3.6 and it belongs to G12 |
 | §3.6 assumption (3), no interrupt storm | `SF_vars(BaseStep)` (STRONG, not weak) | rev 7 claimed the set was complete at two; this is the third, and it was always encoded — just not counted |
 | §4 hop | `HopRelease` (release first) -> `HopCommit{Wait,Requeue,Pended,Retired,Claimed}` | retired arm waits for NOTHING (F1); **rev 8: every commit arm that places picks its destination at placement time (M-2)** |
-| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC`; 3 = `UserPark`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove`; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` | every edge has >= 1 action |
+| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the split dispatch tail; 3 = `UserPark`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
 | §5.1 T1 sources | one generic one-shot (`shot`) = deadline/wheel/device rows; rendezvous row = `RvStart` | periodic-scan loser protocol below granularity |
 | §5.2 T2 matrix | `RetireEcsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
 | §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin |
 | §8.3 rendezvous | `RvStart` + `RvDeliver` | G-RV1 |
 | §8.5 creation | `CreateEC` (publish-last) | CD-lock liveness gate not modelled |
-| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC |
+| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, `InvPmuTailOwned`, `InvPmuHwCoreRefCoherent`, `InvPmuNoReleasedHw`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC. The PMU invariants are hardware-owner/release ownership assertions, not a full PMU counter model |
 | S1/S3/S4/S8 | `InvS1`, `InvS3`, `InvS4Holder`+`InvS4Pended`; S8 by construction | S2/S5/S6 and S7's lock half outside boundary |
 | L1-L6, W3/W4/W5 | `LiveParking/Retired/Ready/Wake/Mark/Claim/Term/Suspender` | L3 states DISPATCH, not merely "leaves ready" |
 | §0.3 / §3.4 domain pause (`cd.paused`), §2.2 `wait.kind = .domain_pause`, §3.1 rule 3's third arm, §5 edge 1's gated publish, §3.6 W5-N | **NOTHING. No variable, no action, no invariant.** | **G12** — the largest open gap. The model has no domains beyond a per-EC `dd` flag. Round-13 C-1's whole fix, plus revision 16's quiesced-resume rule and boundary-leg fix, are doc-only. G12 carries the four lost properties and the design for closing it. `waiting(domain_pause)` is a boundary edge-3/edge-4 route, not edge 7 |
-| §3.4 `current_queue_core` | **no model field** | **G13** — MP. Run-queue membership IS `cores[c].q`; the field is a cache of a fact the model computes, so a field would add no reachability. What is lost is CACHE INCOHERENCE, which needs two words and the model has one — and the x64 asm fast path is a real writer that does not maintain it |
+| §3.4 `current_queue_core` | **no model field** | **G13** — MP. Run-queue membership IS `cores[c].q`; the field is a cache of a fact the model computes, so a coherent field would add no reachability. What is still lost is generic CACHE INCOHERENCE, which needs two words and the model has one; the prior x64 asm writer gap is closed by the R13 ready-enqueue metadata repair |
 | §3.3 quiesced-resume rule (rev 16) | **not modelled, and not modellable here** | user memory is entirely below this model's granularity — there is no user address space in the state. Enforcement is §9.2's assert pair and §9.3(2)'s analyzer clause; §11.13 records the HEAD violation. Folded into G12 |
 
 ## Divergence & ambiguity ledger
@@ -467,6 +469,21 @@ incomparable/reconstruction.
   sequential, no other named party); the parking/claimed/pended rows are
   NOT compressed.
 - **U5** — frame death: finalize resets the dead frame's `pc`/`tg`.
+- **U6 (PMU hardware-owner ghost)** — compression, stated. `ecs[e].hw`
+  abstracts `PerfmonState.hw_core`, and `phw[c]` abstracts
+  `pmu_hw_refs[c]`. The pair is persistent across `DispatchLoad`, so it
+  now covers the long-running ownership interval rather than only the
+  dispatch tail. With `PMU_SAFE_MIGRATION = TRUE`, `DispatchPmu` retires
+  every old per-core ref for the EC before installing the new owner. With
+  `PMU_SAFE_MIGRATION = FALSE`, it reproduces the reviewed old behavior:
+  `hw` migrates while a remote `phw` entry remains live, and the
+  non-caller remote syscall falsifier can clear `hw` while leaving that
+  `phw` entry behind. `InvPmuTailOwned` covers duplicate hardware refs;
+  `InvPmuHwCoreRefCoherent` covers both `hw -> phw` and reverse
+  `phw -> hw`. `ecs[e].prel` models perfmon-state release/destruction
+  completion separately from the hardware token. The model still abstracts
+  actual counter values, threshold PMI re-arm cadence, `perfmon_read`
+  sampling values, and the bounded duration of release-pending waits.
 - **G1** — INC, gate-only. Rev 3's hop behavior on a commit-CAS observing
   an already-advanced state is unspecified; the gate machine has an
   "owner proceeds" arm or it wedges on benign schedules.
@@ -659,7 +676,7 @@ incomparable/reconstruction.
   unimplemented, and the whole point of the deferral is that it gets a
   validated model BEFORE an implementation, which is the one discipline
   the reverted rev-7 refactor violated.
-- **G13 (NEW, rev 14/16, MP — LEDGERED, not modelled).**
+- **G13 (rev 14/16, MP — LEDGERED, not modelled; x64 writer gap closed in the scheduler-steal implementation).**
   **`current_queue_core` has no model field.** §3.4 gave it a row in
   revision 14 (1 byte, `NOT_IN_RUN_QUEUE` sentinel, written by the party
   holding the DESTINATION queue lock at the CAS-then-link of edges
@@ -672,7 +689,8 @@ incomparable/reconstruction.
   `cores[c].q`, so "which core's queue is `e` in" is
   `CHOOSE c \in Cores : e \in cores[c].q`, computed rather than stored.
   Every model action that would write the field already updates the set
-  in the same atomic step, so a model field would be a redundant
+  in the same atomic step, including `StealClaim`'s victim removal and
+  `StealAbandon`'s republish. A model field would be a redundant
   projection with no independent behaviour — adding it could only add
   states, never reachability. Marked MP rather than LP for that reason.
 
@@ -682,18 +700,13 @@ incomparable/reconstruction.
   is not expressible here.** §3.4 argues that away structurally (written
   and cleared only under the queue lock that owns the membership it
   names, in the same section as the state CAS, and a stale read is
-  re-validated by §3.5's drop-and-retry). That argument is sound for
-  every writer that takes the lock — **and the tree has a writer that
-  does not.** DERIVED (`grep -rn current_queue_core kernel --include=*.zig`
-  → 14 sites, all Zig, none in asm): the x86-64 IPC fast path places ECs
-  from assembly and maintains no such field, which is the measured
-  `stygia-qde` population — 485 illegal transitions per boot on x86-64,
-  zero on aarch64, arithmetic closing exactly. So on x86-64 the field can
-  lie, the model cannot see it lying, and **a §9.2 S1-containment
-  assertion built on it would be checking a field that is wrong on one
-  arch**. That is the note to carry into the refactor; it is not a reason
-  to model the field, because modelling a coherent copy would not
-  reproduce an incoherence the model has no second word to hold.
+  re-validated by §3.5's drop-and-retry). The known x86-64 IPC fast-path
+  exception is closed: R13's direct ready enqueue and atomic-recv
+  fallback now write `current_queue_core` to the local core id after the
+  queue links/tail and before the core-lock release, and poison
+  `owner_core` to `NOT_IN_RUN_QUEUE`. The model still cannot express a
+  future incoherent cache writer without adding a second word, so the
+  row remains MP and ledgered rather than modelled.
 - **G14 (NEW, rev 16, LP — round-14 PARITY review's headline finding, and
   the one nobody would have caught by reading the model or the doc alone,
   because it is only visible where the two MEET).**

@@ -41,13 +41,14 @@
 //
 //   Sibling-EC mechanic: ECs created with target = self (the test EC's
 //   own capability domain) share the same handle table per
-//   §[create_execution_context]. The test EC stores the port handle id
-//   into a process-global with release ordering; the sibling EC's
-//   entry function loads it with acquire ordering, calls
-//   `delete(port_id)`, and halts. When the test EC suspends itself the
-//   sibling becomes the only runnable EC in the domain and the
-//   scheduler picks it up; once it executes the delete the recv
-//   refcount transition fires and the test EC's suspend resumes.
+//   §[create_execution_context]. The test EC pins itself to its current
+//   core, creates the sibling on that same core at idle priority, and
+//   stores the port handle id into a process-global with release
+//   ordering. The sibling EC's entry function loads it with acquire
+//   ordering, calls `delete(port_id)`, and halts. Once the test EC
+//   suspends itself, the sibling can run; until then, same-core affinity
+//   plus lower priority prevents x86 work-stealing from deleting the
+//   recv-cap handle before the suspend has actually parked.
 //
 //   Pair-entry mechanic: §[handle_attachments] says "When N > 0, the
 //   entries occupy vregs [128-N..127]". libz's `suspendEc` panics on
@@ -113,9 +114,9 @@
 //      — must succeed (PF_A, source for the move=1 entry).
 //   3. create_page_frame(caps = copy|r, props = sz=0, pages = 1)
 //      — must succeed (PF_B, source for the move=0 entry).
-//   4. Publish port_id via release store; create_execution_context
-//      pointing at deleterEntry, target = self, priority = 1,
-//      affinity = 0.
+//   4. Pin the test EC to its current core. Publish port_id via release
+//      store; create_execution_context pointing at deleterEntry, target
+//      = self, priority = 0, affinity = that same core.
 //      — must succeed.
 //   5. Issue suspend(self_ec=1, port, [pair_a (move=1, PF_A, caps=r),
 //                                       pair_b (move=0, PF_B, caps=r)])
@@ -142,6 +143,7 @@
 //      `move = 0` entry somehow released the source)
 //   9: PF_B's caps lost the `copy` bit after resume (partial mutation
 //      of the source on the copy path)
+//   10: affinity setup failed.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -249,12 +251,7 @@ fn suspendWithTwoAttachmentsArm(
           [iv2] "{x1}" (v2),
           [ea] "r" (entry_a),
           [eb] "r" (entry_b),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     return x0_out;
 }
@@ -333,23 +330,45 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_b_handle: u12 = @truncate(cpfb.v1 & 0xFFF);
 
+    const pinned_core = testing.currentCoreId();
+    const deleter_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, deleter_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((deleter_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(10);
+        return;
+    }
+
     // Step 4: publish the port id then mint the deleter sibling. The
     // release store pairs with the acquire load in `deleterEntry` so
-    // the sibling reads the just-written id even if the kernel
-    // schedules it on another core. priority = 1 keeps this required
-    // progress helper out of the idle bucket without letting it outrun
-    // the test EC before the self-suspend is actually parked.
+    // the sibling reads the just-written id.
     @atomicStore(u32, &deleter_port_id, @as(u32, port_handle), .release);
 
     const deleter_caps = caps.EcCap{ .restart_policy = 0 };
-    const deleter_caps_word: u64 = @as(u64, deleter_caps.toU16()) | (@as(u64, 1) << 32);
+    const deleter_caps_word: u64 = @as(u64, deleter_caps.toU16());
     const deleter_entry_addr: u64 = @intFromPtr(&deleterEntry);
     const cec = syscall.createExecutionContext(
         deleter_caps_word,
         deleter_entry_addr,
         1, // stack_pages
         0, // target = self (same domain → shared handle table)
-        0, // affinity = any core
+        deleter_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
         testing.fail(4);

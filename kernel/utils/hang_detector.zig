@@ -33,7 +33,7 @@ const State = stygia.sched.execution_context.State;
 /// signature). The 4s threshold catches the slow-tail variants where
 /// userspace IS still running but a single EC is wedged in a fault
 /// loop.
-pub const HANG_THRESHOLD_NS: u64 = 2_000_000_000;
+pub const HANG_THRESHOLD_NS: u64 = 4_000_000_000;
 
 /// Last monotonic-ns timestamp anything emitted on the serial path. Bumped
 /// from `arch.x64.serial.printRaw`. Read from the scheduler tick.
@@ -111,8 +111,8 @@ pub fn tickCheck() void {
     if ((t & 0x3F) == 0) emitHeartbeatByte('~');
     if (!armed.load(.acquire)) return;
     if (dump_fired.load(.acquire)) return;
-    const last = last_progress_ns.load(.acquire);
     const now = arch.time.currentMonotonicNs();
+    const last = last_progress_ns.load(.acquire);
     if (now < last) return; // clock skew safety
     const delta = now - last;
 

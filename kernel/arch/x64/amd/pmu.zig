@@ -454,8 +454,9 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
 
 /// AMD PMU overflow handler. Registered on the LAPIC PerfMon vector
 /// via `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
-/// `dispatchInterrupt` issues the LAPIC EOI after this returns — the
-/// handler MUST NOT EOI here.
+/// `dispatchInterrupt` issues the LAPIC EOI after normal returns. If PMU
+/// delivery parks the interrupted EC, the non-returning scheduler escape path
+/// EOIs explicitly before tail-dispatching away.
 ///
 /// Behavior (mirrors aarch64 PMUv3 PMI in `arch/aarch64/pmu.zig`):
 ///   1. Detect which PMCs overflowed.
@@ -568,7 +569,11 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     const core: u8 = @truncate(apic.coreID());
     if (!scheduler.coreCurrentIs(core, ec)) {
-        scheduler.preempt();
+        // We are escaping the generic interrupt dispatcher; its normal
+        // post-handler EOI will not run. Ack the PMI first so later
+        // scheduler IPIs in the same LAPIC priority class can arrive.
+        apic.endOfInterrupt();
+        scheduler.hopParkRun();
     }
 }
 

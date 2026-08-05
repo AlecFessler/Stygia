@@ -670,7 +670,7 @@ entity:boot/protocol.zig::boot.protocol.PixelFormat.bgr8    sha256:cb164419e06a7
 entity:boot/protocol.zig::boot.protocol.PixelFormat.rgb8    sha256:567b847b353f00a18afdcb39a4a0d77839a89b7d363dd49fb370c27357d06072
 entity:boot/protocol.zig::boot.protocol.PixelFormat.bitmask    sha256:9af4e5e8f4b965430b4c98385cbcdc7baad5eb2cc61c746f260fe1bf6d4f0911
 entity:boot/protocol.zig::boot.protocol.PixelFormat.blt_only    sha256:bbbbb802161ac3fd420b2a173ef2f3f4325b23149ee5832176b28feded79812b
-entity:boot/protocol.zig::boot.protocol.STACK_SIZE    sha256:14abbf24d363b6fcf88ea06113ba45cd57e20643492dd703df5558b44b3251e7
+entity:boot/protocol.zig::boot.protocol.STACK_SIZE    sha256:8bd8770e55e6712337af7f72dd938bf885f751f87b2f42099f96e19d7c424a8a
 entity:boot/protocol.zig::boot.protocol.getMmap    sha256:9018758ff5d70fc857d36464715bb42229817d855fab628d12e688b30b0e4819
 entity:boot/protocol.zig::boot.protocol.findXSDP    sha256:4d28b12fc1f9a11954920baa74eedcab0a8fa89b35c779eeba6bacf3d87509c1
 entity:libz/caps.zig::libz.caps.framebufferFields    sha256:280cde88cbb49470c95f89812f263995931231038d20c1e56d4d0ff4b19e0939
@@ -679,7 +679,6 @@ entity:libz/errors.zig::libz.errors.Error.E_REFUSED    sha256:a1d11d87ec3ed36b6e
 entity:libz/errors.zig::libz.errors.fromRaw    sha256:1065dc24ad81cfa6f2383b000c3d3f060852a33ee5cb949218b0a0464fa5068e
 entity:libz/syscall.zig::libz.syscall.extraReplyRecvPort    sha256:e81ce85d990ad19b25138abe9ec224bf2c1d8a5904a9de52eeafe765729400f5
 entity:libz/syscall_extern.zig::libz.syscall_extern.extraReplyRecvPort    sha256:e81ce85d990ad19b25138abe9ec224bf2c1d8a5904a9de52eeafe765729400f5
-entity:libz/syscall_aarch64.zig::libz.syscall_aarch64.stack_vreg_saved_sp    sha256:fc83e4df74d4cb509739e19cd57f7e6359c9eb13c013fcb5481ab37156a7d636
 entity:libz/libc/src/libc.zig::libz.libc.src.libc.panic    sha256:4ba535d9708c98dba07e44a4b0e079af66d275feb318383f5c0c1ba885a6c14b
 entity:libz/libc/src/process.zig::libz.libc.src.process.Rusage    sha256:43b3c609c0cd33ad2fb322fcd4f7d52e253f0432d746f463c6834f61bc3f0e38
 entity:libz/libc/src/process.zig::libz.libc.src.process.Rusage._padding    sha256:25625a29b118547aab4eed939e16d6fc11666dc81ad02dd2c723fd7919c08568

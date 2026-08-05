@@ -51,6 +51,12 @@ PLAIN_HEADING_RE = re.compile(r"^###\s+(.+?)\s*$")
 # Test file name `<section>_<NN>.zig` where NN is alphanumeric.
 TEST_FILE_RE = re.compile(r"^(?P<section>[A-Za-z][A-Za-z0-9_]*?)_(?P<num>[0-9]+[a-z]?)\.zig$")
 
+# Regression/smoke ELFs that are intentionally part of the suite manifest
+# but are not one-to-one assertions from docs/kernel/specv3.md.
+NON_SPEC_TEST_FILES = {
+    "scheduler_balance_01.zig",
+}
+
 
 def section_name_from_heading(heading_line: str) -> str | None:
     """Return canonical section name for a `### ...` heading, or None.
@@ -140,6 +146,8 @@ def parse_tests(tests_dir: str) -> dict[str, set[str]]:
 
     for fname in sorted(os.listdir(tests_dir)):
         if not fname.endswith(".zig"):
+            continue
+        if fname in NON_SPEC_TEST_FILES:
             continue
         m = TEST_FILE_RE.match(fname)
         if not m:

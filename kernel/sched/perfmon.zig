@@ -52,6 +52,21 @@ pub const PerfmonState = struct {
     /// `scheduler.pmuSwitch` for the full rationale.
     hw_core: ?u8 = null,
 
+    /// Destruction was requested while `hw_core` named another core.
+    /// The releasing core leaves this state live and waits; the owner
+    /// core saves/disables its hardware file, clears `hw_core`, and then
+    /// destroys the state. This keeps `hw_core` from naming freed memory.
+    release_pending: bool = false,
+
+    /// Another core wants to restore this state into its own PMU file.
+    /// The requester cannot read the old core's hardware registers, so it
+    /// marks this bit and interrupts `hw_core`. The owner core saves,
+    /// disables, clears `hw_core`, and leaves the slab state live for the
+    /// requester to restore. Mutually exclusive with live migration by
+    /// construction: `hw_core` may change only after this drain reaches
+    /// null.
+    handoff_pending: bool = false,
+
     /// Arch PMU control state — MSR snapshots, hardware counter
     /// assignment, sub-counter event-select encodings. Carried inline
     /// because the kernel has no general-purpose heap; the only
@@ -69,4 +84,3 @@ pub fn initSlab(
 ) void {
     slab_instance = Allocator.init(data_range, ptrs_range, links_range);
 }
-

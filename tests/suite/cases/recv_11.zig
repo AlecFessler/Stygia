@@ -36,17 +36,21 @@
 //   `[rsp + 8]` (relative to the syscall-time rsp) and read it back
 //   after the kernel writes it.
 //
-//   Setup parallels terminate_07.zig: the test EC owns both ends — it
-//   mints the port (so `bind` cap stays live and recv won't return
-//   E_CLOSED), mints W with `susp` + `read` (the susp cap to enqueue
-//   it, `read` to satisfy the gate the spec line names), suspends W
-//   onto the port, and recvs. `[1]` may reference a non-self EC and
-//   the call returns immediately without blocking the caller per
-//   §[suspend], so the test EC stays runnable through recv.
+//   Setup parallels terminate_07.zig with one SMP guard: the test EC
+//   first pins itself to its current core and creates W with that same
+//   one-core affinity. W is lower priority than the running test EC, so
+//   it cannot be stolen onto a sibling core and execute `hlt` before the
+//   suspend snapshot. The test EC owns both ends — it mints the port (so
+//   `bind` cap stays live and recv won't return E_CLOSED), mints W with
+//   `susp` + `read` (the susp cap to enqueue it, `read` to satisfy the
+//   gate the spec line names), suspends W onto the port, and recvs. `[1]`
+//   may reference a non-self EC and the call returns immediately without
+//   blocking the caller per §[suspend], so the test EC stays runnable
+//   through recv.
 //
 // Action
 //   1. create_port(caps={bind, recv})         — must succeed
-//   2. create_execution_context(target=self,
+//   2. pin self and create_execution_context(target=self,
 //        caps={susp, read, term, rp=0})       — must succeed
 //      (entry = dummyEntry; W never executes — suspend fires before
 //      it would be scheduled. term lets the test clean up if needed
@@ -69,6 +73,7 @@
 //      either the kernel zeroed the state vregs (the test 12 path,
 //      indicating `read` was not honored) or the kernel wrote the
 //      wrong EC's state.
+//   6: setup affinity pin failed, so W could run before suspension.
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -195,6 +200,37 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
+    // Keep W non-dispatched until the suspend syscall snapshots it.
+    // With affinity=0, x86 work stealing may dispatch W on a sibling
+    // core between create_execution_context and suspend; W then executes
+    // the first `hlt`, and the HLT trap advances saved RIP by one byte.
+    // That is legal scheduler behavior but violates this test's "fresh
+    // EC has entry RIP" witness precondition.
+    const pinned_core = testing.currentCoreId();
+    const helper_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, helper_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(6);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(6);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((helper_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(6);
+        return;
+    }
+
     // Step 2: mint W. susp to queue it as a suspended sender; read so
     // the kernel exposes W's state to the receiver per the spec line
     // under test. term is held for completeness but not exercised
@@ -218,7 +254,7 @@ pub fn main(cap_table_base: u64) void {
         entry,
         1,
         0,
-        0,
+        helper_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
         testing.fail(2);

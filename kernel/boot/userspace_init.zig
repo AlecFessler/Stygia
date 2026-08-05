@@ -368,14 +368,19 @@ pub fn loadElfSegments(
         }
     }
 
-    // Apply R_X86_64_RELATIVE dynamic relocations. The runner is built
-    // PIE; any pointer in initialized .data (notably the embedded test
-    // ELF manifest's `bytes.ptr` slots) is encoded as a RELATIVE
-    // relocation in `.rela.dyn` whose addend is the unslided VA. The
-    // patched value is `addend + slide`; the relocation target's VA is
-    // also slid before the kernel walks the page tables to find the
-    // backing physical page.
+    // Apply R_*_RELATIVE dynamic relocations. The runner is built PIE;
+    // any pointer in initialized .data (notably the embedded test ELF
+    // manifest's `bytes.ptr` slots) is encoded as a RELATIVE relocation
+    // in `.rela.dyn` whose addend is the unslided VA. The patched value
+    // is `addend + slide`; the relocation target's VA is also slid before
+    // the kernel walks the page tables to find the backing physical page.
     try applyRelativeRelocations(root_cd, elf_bytes, slide);
+
+    // aarch64 has non-coherent I/D caches: bytes copied through the
+    // physmap above are data-cache writes, but the child fetches through
+    // its user executable mapping. Publish every executable page after
+    // all loader writes, including relocations. No-op on x86-64.
+    try syncExecutableElfPages(root_cd, elf_bytes, slide);
 }
 
 /// Walk PT_LOADs and return the union of perms across every segment
@@ -467,6 +472,35 @@ fn applyRelativeRelocations(
             const new_val: u64 = @as(u64, @bitCast(rela.r_addend)) +% slide;
             const slot: *align(1) u64 = @ptrFromInt(km_va);
             slot.* = new_val;
+        }
+    }
+}
+
+fn syncExecutableElfPages(
+    root_cd: *CapabilityDomain,
+    elf_bytes: []const u8,
+    slide: u64,
+) !void {
+    const hdr_sz = @sizeOf(std.elf.Elf64_Ehdr);
+    var rd = std.Io.Reader.fixed(elf_bytes[0..hdr_sz]);
+    const hdr = try std.elf.Header.read(&rd);
+
+    var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
+    while (try phdr_itr.next()) |phdr| {
+        if (phdr.p_type != std.elf.PT_LOAD) continue;
+        if ((phdr.p_flags & std.elf.PF_X) == 0) continue;
+
+        const slid_vaddr = phdr.p_vaddr + slide;
+        const seg_start = std.mem.alignBackward(u64, slid_vaddr, paging_consts.PAGE4K);
+        const seg_end = std.mem.alignForward(u64, slid_vaddr + phdr.p_memsz, paging_consts.PAGE4K);
+
+        var off: u64 = 0;
+        while (seg_start + off < seg_end) : (off += paging_consts.PAGE4K) {
+            const target_vaddr = VAddr.fromInt(seg_start + off);
+            const phys = arch.paging.resolveVaddr(root_cd.addr_space_root, target_vaddr) orelse
+                return error.RelocationTargetUnmapped;
+            const kva = VAddr.fromPAddr(phys, null);
+            arch.cpu.syncInstructionCacheRange(kva.addr, paging_consts.PAGE4K);
         }
     }
 }
@@ -785,7 +819,7 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
         (@as(u64, COM1_BASE) << 4) |
         (@as(u64, COM1_COUNT) << 20);
     const dr_caps: u16 = 0; // No move/copy/dma/irq required; runner only
-                             //   needs the slot to exist for map_mmio.
+    //   needs the slot to exist for map_mmio.
 
     const erased: stygia.caps.capability.ErasedSlabRef = .{
         .ptr = @ptrCast(dr),

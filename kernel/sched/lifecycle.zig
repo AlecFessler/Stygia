@@ -39,7 +39,6 @@ pub const WaitKind = enum(u8) {
     futex,
     idle,
     requeue,
-    domain_pause,
 };
 
 pub const MarkState = enum(u8) {
@@ -65,13 +64,6 @@ pub const ClaimResult = enum {
     none,
     claimed,
     pended,
-};
-
-pub const ReadySource = enum {
-    created,
-    claimed,
-    pended,
-    requeue,
 };
 
 pub fn packDirective(tag: DirectiveTag, owner_slot: u24) u32 {
@@ -108,14 +100,6 @@ pub fn cas(ec: anytype, expected: State, desired: State) bool {
         .acq_rel,
         .acquire,
     ) == null;
-}
-
-pub fn assertState(ec: anytype, expected: State) void {
-    std.debug.assert(load(ec) == expected);
-}
-
-pub fn isTerminal(ec: anytype) bool {
-    return load(ec) == .retired;
 }
 
 pub fn isDestroyMarked(ec: anytype) bool {
@@ -294,6 +278,14 @@ pub fn finishClaimedReady(ec: anytype, not_in_queue: u8) bool {
     return true;
 }
 
+pub fn finishClaimedDispatch(ec: anytype, core: u8, not_in_queue: u8) bool {
+    if (!cas(ec, .claimed, .running)) return false;
+    ec.owner_core = core;
+    ec.current_queue_core.store(not_in_queue, .release);
+    ec.wait.clear();
+    return true;
+}
+
 pub fn retire(ec: anytype) State {
     while (true) {
         const from = load(ec);
@@ -366,15 +358,6 @@ pub fn armRemoteSuspend(target: anytype, owner_slot: u24) bool {
         .acquire,
     );
     return false;
-}
-
-pub fn clearRemoteDirective(target: anytype, owner_slot: u24) void {
-    _ = target.directive_state.cmpxchgStrong(
-        packDirective(.armed, owner_slot),
-        packDirective(.none, 0),
-        .acq_rel,
-        .acquire,
-    );
 }
 
 pub fn disarmDirectiveWord(target: anytype, word: u32) bool {

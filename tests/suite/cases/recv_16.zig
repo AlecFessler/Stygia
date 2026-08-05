@@ -43,10 +43,13 @@
 //
 //   Both ECs run in the same capability domain (target=0 on the
 //   create_execution_context call), so they share the address space —
-//   `worker_self_slot`, `worker_result`, and `worker_done` are
-//   process-global side channels reachable from both ends. The handle
-//   table is also shared, so the slot id the test EC sees for W is the
-//   same id W uses on its self-suspend.
+//   `worker_self_slot`, `worker_port_slot`, `worker_ready`,
+//   `worker_result`, and `worker_done` are process-global side
+//   channels reachable from both ends. The handle table is also shared,
+//   so the slot id the test EC sees for W is the same id W uses on its
+//   self-suspend. The ready flag is the release/acquire publication
+//   edge: after parallel scheduling/work stealing, W may run before
+//   create_execution_context returns to the creator.
 //
 //   Pre-call gates the test must clear so no other failure path can
 //   mask the assertion under test:
@@ -83,7 +86,8 @@
 //   2. create_execution_context(target=self, caps={susp, term, rp=0},
 //        entry=&workerEntry, stack_pages=1, affinity=0)
 //                                                 — must succeed
-//   3. publish worker_self_slot, worker_port_slot to W; yield(W)
+//   3. publish worker_self_slot, worker_port_slot to W; release
+//      worker_ready; yield(W)
 //      so W reaches its blocking suspend syscall (best-effort —
 //      multi-core may run W concurrently; either path resolves to W
 //      blocked on the port by the time recv runs)
@@ -110,6 +114,7 @@
 //      the sender with E_ABANDONED
 
 const builtin = @import("builtin");
+const std = @import("std");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -120,28 +125,29 @@ const testing = lib.testing;
 // Process-global side channels. Both ECs run in the same capability
 // domain, so they share the address space and the handle table.
 //   - worker_self_slot: the slot id of W's own EC handle, published by
-//     the test EC after createExecutionContext returns. W reads it on
-//     entry to issue suspend(self, port).
+//     the test EC after createExecutionContext returns. W reads it
+//     after observing worker_ready to issue suspend(self, port).
 //   - worker_port_slot: the slot id of the port the test EC mints. W
-//     uses it as the suspend target port.
+//     uses it as the suspend target port after observing worker_ready.
+//   - worker_ready: release/acquire gate that makes both slot ids
+//     visible before W can call suspendEc.
 //   - worker_result: the vreg-1 return value of W's suspend syscall.
 //     The test EC reads it after worker_done flips to 1 to verify
 //     E_ABANDONED.
 //   - worker_done: release-store flag W flips after suspend returns;
 //     the test EC acquire-loads it as the synchronisation edge.
-var worker_self_slot: u12 = 0;
-var worker_port_slot: u12 = 0;
+var worker_self_slot: u64 = 0;
+var worker_port_slot: u64 = 0;
+var worker_ready: u32 = 0;
 var worker_result: u64 = 0;
 var worker_done: u64 = 0;
 
 fn workerEntry() callconv(.c) noreturn {
-    // The test EC publishes both slot ids before createExecutionContext
-    // returns, so the worker's first read sees them. No synchronisation
-    // is needed: createExecutionContext happens-before the worker's
-    // first instruction (the EC literally does not exist before the
-    // call returns).
-    const self_slot = worker_self_slot;
-    const port_slot = worker_port_slot;
+    while (@atomicLoad(u32, &worker_ready, .acquire) == 0) {
+        std.atomic.spinLoopHint();
+    }
+    const self_slot: u12 = @truncate(@atomicLoad(u64, &worker_self_slot, .acquire));
+    const port_slot: u12 = @truncate(@atomicLoad(u64, &worker_port_slot, .acquire));
     // §[suspend] [1] = self_slot suspends the calling EC and blocks the
     // syscall until the suspension is resolved. With no attachments the
     // libz wrapper is the safe path (it panics on N>0; N=0 here).
@@ -160,6 +166,10 @@ fn workerEntry() callconv(.c) noreturn {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
+    @atomicStore(u32, &worker_ready, 0, .release);
+    @atomicStore(u64, &worker_result, 0, .release);
+    @atomicStore(u64, &worker_done, 0, .release);
+
     // Step 1: mint the port. bind keeps the test EC as a live bind-cap
     // holder so recv does not return E_CLOSED on the bind path; recv
     // gates the recv call itself. xfer is unused — no handles attached.
@@ -170,7 +180,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
-    worker_port_slot = port_handle;
+    @atomicStore(u64, &worker_port_slot, @as(u64, port_handle), .release);
 
     // Step 2: mint W. susp lets W self-suspend onto the port (the spec
     // line under test names "the dequeued sender" — W is that sender).
@@ -201,7 +211,8 @@ pub fn main(cap_table_base: u64) void {
     }
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
     const w_target: u64 = @as(u64, w_handle);
-    worker_self_slot = w_handle;
+    @atomicStore(u64, &worker_self_slot, @as(u64, w_handle), .release);
+    @atomicStore(u32, &worker_ready, 1, .release);
 
     // Step 3: yield to W so it reaches the blocking suspend syscall
     // before the test EC calls recv. On a uniprocessor this serialises

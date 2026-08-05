@@ -92,15 +92,17 @@ fn pickCoreForAffinity(affinity: u64) u8 {
 ```
 
 "Any core" resolves to "whichever core happens to be running the creator". That
-is defensible as an *initial* placement, but:
+is defensible as an *initial* placement. Historical note: before the x64
+pull-side steal path, this initial choice became permanent because:
 
-1. There is no work stealing anywhere in `kernel/sched/scheduler.zig`.
+1. There was no work stealing anywhere in `kernel/sched/scheduler.zig`.
 2. The preemption re-enqueue (`scheduler.zig:673`) re-picks with
    `pickCoreForAffinity(cur.affinity)` — for `affinity = 0`, the current core
    again.
 
-So the arbitrary initial choice is **permanent**. An `affinity = 0` EC is pinned
-for life to whichever core created it, despite being eligible for all of them.
+On current x64, the arbitrary initial choice is no longer permanent:
+affinity-0 ready ECs are steal-admissible by any core. aarch64 remains
+local-only until EC migration has FP-state parity.
 
 Combined with strict priority and no aging, a low-priority `affinity = 0` EC on
 a busy core never runs *even when three of four cores are idle*. That is the
@@ -108,24 +110,24 @@ amplifier that made `stygia-ojs` fatal rather than merely slow.
 
 Not filed as a spec violation — the kernel did "pick a core".
 
-### Decision needed
+### Decision
 
-Which shape:
+The implemented shape is (3) for x64:
 
 1. Resolve `affinity = 0` to the **least-loaded** core at enqueue.
 2. **Re-evaluate placement on re-enqueue** rather than only at creation.
 3. Add **work stealing** for ECs whose affinity mask permits more than one core.
 
-(1) is the smallest change and fixes the common case. (3) is the general fix and
-the largest. (2) interacts with cache locality and with the `last_dispatched_core`
-/ `on_cpu` invariants that `stygia-3ys` and item 3 depend on — treat it as the
-risky one.
+(1) was the smallest change and fixes the common case. (3) is the general fix
+and is now implemented for x64 using bounded pull-side stealing. (2) still
+interacts with cache locality and migration invariants — treat it as the risky
+one.
 
-### Blast radius: the entire test suite runs on one core
+### Historical blast radius: the entire test suite ran on one core
 
-This is bigger than "an unlucky EC can starve". Following the affinity-0 path all
-the way through shows the whole 485-test suite executes its test ECs on a single
-core, for the entire run.
+This was bigger than "an unlucky EC can starve". Following the old affinity-0
+path all the way through showed the whole 485-test suite executing its test ECs
+on a single core, for the entire run.
 
 The chain, all four links verified in source:
 
@@ -141,43 +143,34 @@ The chain, all four links verified in source:
    `scheduler.zig:617-620` computes `local_allowed = cur.affinity == 0 or ...`,
    which is unconditionally true for `affinity == 0`, so the EC goes back on the
    core it just ran on.
-4. **Nothing else ever moves it.** The scheduler says so directly at
-   `scheduler.zig:612`: *"there is no other migration trigger — `setAffinity`
-   writes the mask without repositioning, and `preempt` re-enters this same
-   path"*. There is no work stealing and no pull path; the only
-   `migrate`-shaped function in the file, `migrateFlush`, is an FPU-state
-   helper.
+4. **Nothing else moved it.** At the time, there was no work stealing and no
+   pull path; the only `migrate`-shaped function in the file, `migrateFlush`,
+   was an FPU-state helper.
 
-Tests create their worker ECs from the test EC, also with affinity 0, so those
-land on the same core too. Net effect: on a 4-core target, test workloads use one
-core and three sit idle.
+Tests created their worker ECs from the test EC, also with affinity 0, so those
+landed on the same core too. Net effect: on a 4-core target, test workloads used
+one core and three sat idle.
 
 Two consequences worth separating:
 
-- **Correctness/robustness.** This is the amplifier behind the whole starvation
+- **Correctness/robustness.** This was the amplifier behind the whole starvation
   family (`stygia-zzy`, `stygia-ojs`, `stygia-yj0`) and the leading mechanism for
   `stygia-9tt`, where all 16 ECs of one batch went MISS together. Sixteen ECs
   starving *simultaneously* is a single-core queueing phenomenon, not sixteen
   independent accidents.
-- **Coverage.** The primary validation loop structurally cannot exercise
-  cross-core scheduling of test ECs. Any bug that needs two test ECs on two
-  different cores is invisible to it. That is a blind spot in the main gate, and
-  it is worth knowing before reading "485/485" as broad multi-core assurance.
+- **Coverage.** The primary validation loop structurally could not exercise
+  cross-core scheduling of test ECs. `-Dspread_cores` now gives deterministic
+  inter-test placement, and x64 pull-side stealing gives affinity-0 workers a
+  real cross-core path.
 
-It also explains the latency numbers measured for `stygia-dk6`: 16-29 ms for an
+It also explained the latency numbers measured for `stygia-dk6`: 16-29 ms for an
 always-runnable EC and up to ~70 ms for a freshly-woken one are what
 single-core queueing with ~16 resident ECs looks like, not what a 4-core box
 should produce.
 
-One stale comment was corrected while establishing this:
-`capability_domain.zig` claimed "The scheduler's pull path can still migrate it
-later" next to the affinity-0 enqueue. There is no pull path; the comment
-described a mechanism that does not exist and made the pinning look temporary.
-
-Note this cuts both ways for remedy (3) above: adding work stealing would change
-the suite from single-core to genuinely concurrent, which is the point — but it
-would also expose the suite to cross-core races it has never run against, so
-expect new failures that are pre-existing bugs rather than regressions.
+Adding work stealing changes affinity-0 worker execution from single-core to
+genuinely concurrent on x64, which is the point, but it can expose cross-core
+races that older single-core runs could not reach.
 
 ### Update 2026-07-30: the suite no longer relies on this, but the kernel decision is still open
 
@@ -204,6 +197,14 @@ The prediction above held on first contact, both directions:
 
 Both are pre-existing bugs that the old placement made unreachable, which is
 the outcome this section predicted.
+
+### Update 2026-08-04: x64 pull-side stealing implemented
+
+The kernel now implements remedy (3) for x64: idle cores perform a bounded
+pull-side scan of other per-core run queues and may steal ready ECs whose
+affinity admits the thief. `affinity = 0` remains local-biased for initial
+placement and ordinary enqueue, but it is no longer immobile on x64. aarch64
+keeps stealing disabled until EC migration has FP-state parity.
 
 ---
 

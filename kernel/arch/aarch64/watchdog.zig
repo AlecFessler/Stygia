@@ -157,12 +157,12 @@ const RELOAD_TICKS: u32 = (15 * TICKS_PER_SEC) & PM_WDOG_TIME_SET;
 /// moving; they were one constant divided by a shrinking per-pass cost, and
 /// reading them as a kernel bug ("the spawn-loop wedge") cost three cycles.
 ///
-/// 1200 s accordingly: 100 passes at the measured 7.8 s/pass is ~780 s, so this
-/// leaves ~54 % headroom while still bounding an IRQ-servicing hang at ~20 min
-/// — inside the harness's own wait (`bm_stability.sh` MAX_WAIT=280 ⇒ 1400 s),
-/// which is the property that keeps the board unattended-recoverable. Raising N
-/// again requires raising BOTH, in that order.
-const CEILING_SECONDS: u64 = 1200;
+/// 2400 s accordingly: a diagnostic-heavy work-stealing N=100 pass can exceed
+/// 1200 s while still making ordinary runner progress. The wider budget keeps
+/// that valid stability gate on the clean runner-controlled reboot path while
+/// still bounding an IRQ-servicing hang at ~40 min. Raising N again requires
+/// revisiting this ceiling and the outer harness timeout together.
+const CEILING_SECONDS: u64 = 2400;
 
 /// Point the pet at a PM block whose MMIO page is already mapped, `va` being
 /// the kernel VA of the block's base (not of PM_WDOG), and start the

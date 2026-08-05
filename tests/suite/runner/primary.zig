@@ -19,8 +19,9 @@
 //   - Tests are pinned round-robin across cores via
 //     `create_capability_domain` `[5] initial_ec_affinity` (see
 //     `-Dspread_cores`). Passing 0 there — "kernel picks any core" —
-//     had the kernel resolve it to the runner's own core and never
-//     migrate, so the whole suite ran single-core (stygia-yxj).
+//     uses local-biased initial placement; x64 can now pull-steal
+//     affinity-0 ready ECs, but deterministic runner placement is still
+//     better for stability triage.
 //
 // Future work (per task brief, deferred for the v3 lockdep cycle and
 // build-budget reasons):
@@ -179,6 +180,16 @@ pub fn main(cap_table_base: u64) void {
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
+    serial.print("[runner] starting ");
+    serial.printU64(embedded_tests.manifest.len);
+    if (embedded_tests.repeat > 1) {
+        serial.print(" tests x ");
+        serial.printU64(embedded_tests.repeat);
+        serial.print(" runs\n");
+    } else {
+        serial.print(" tests\n");
+    }
+
     // Stage libz.elf into a page_frame at startup. Each child spawned
     // below receives this pf in its passed_handles array; its _start
     // mapPfs it at LIBZ_SLIDE and patches own GOT/PLT against it via
@@ -199,16 +210,6 @@ pub fn main(cap_table_base: u64) void {
     // child by accident.
     fixture_dma_irq_handle = findFixtureMmio(cap_table_base, FIXTURE_DMA_IRQ_PHYS_BASE) orelse 0;
     fixture_plain_handle = findFixtureMmio(cap_table_base, FIXTURE_PLAIN_PHYS_BASE) orelse 0;
-
-    serial.print("[runner] starting ");
-    serial.printU64(embedded_tests.manifest.len);
-    if (embedded_tests.repeat > 1) {
-        serial.print(" tests x ");
-        serial.printU64(embedded_tests.repeat);
-        serial.print(" runs\n");
-    } else {
-        serial.print(" tests\n");
-    }
 
     // Phase 1+2 interleaved. Spawn `BATCH` tests, then drain `BATCH`
     // results before spawning the next batch. Bounded in-flight test
@@ -672,15 +673,14 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
 
     // Spec §[create_capability_domain] [5] initial_ec_affinity — a
     // single-core mask under `-Dspread_cores` (the default), else 1,
-    // which pins everything to core 0. Never 0: the kernel resolves
-    // "any core" to the caller's core and then never migrates the EC,
-    // so 0 silently meant "the runner's core, forever" (stygia-yxj).
+    // which pins runner-created test domains to core 0. We keep this
+    // deterministic even though affinity-0 ready ECs can now be
+    // pull-stolen on x64.
     //
-    // Worker ECs the tests create for themselves still pass affinity 0
-    // and so land on their parent test's core. That is deliberate —
-    // intra-test locality with inter-test spread — and it leaves the
-    // priority/starvation tests, which need contender and worker
-    // sharing a run queue, behaving exactly as before.
+    // Worker ECs the tests create for themselves still pass whatever
+    // affinity the test requests. Affinity 0 remains local-biased at
+    // creation time but is steal-admissible on x64, so tests that need
+    // simple local contender placement should pin explicitly.
     const r = syscall.createCapabilityDomain(
         self_caps,
         ceilings_inner,

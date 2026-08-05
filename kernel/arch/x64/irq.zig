@@ -291,6 +291,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // whatever entry sits at the heap top after draining (no-op when
     // empty). Spec §[timer].
     timer_wheel.wheelExpireDue();
+    if (sched.consumeYieldHandoffGuard(@truncate(apic.coreID()))) return;
     sched.preempt();
 }
 

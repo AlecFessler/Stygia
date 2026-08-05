@@ -83,20 +83,23 @@
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer}) → P.
-//   2. create_execution_context(target=self, caps={term, susp,
+//   2. Pin the test EC to its current core; create W and C with the
+//      same affinity so work-stealing cannot run them concurrently
+//      before the suspend-side validation.
+//   3. create_execution_context(target=self, caps={term, susp,
 //      restart_policy=0}) → W (the suspend target; never executes
 //      meaningfully — entry = dummyEntry).
-//   3. create_execution_context(target=self, caps={copy, saff,
+//   4. create_execution_context(target=self, caps={copy, saff,
 //      restart_policy=0}) → C (the attachment source; never
 //      executes meaningfully — entry = dummyEntry).
-//   4. Build a PairEntry{ id=C, caps=EcCap{.copy=1, .saff=1}.toU16(),
+//   5. Build a PairEntry{ id=C, caps=EcCap{.copy=1, .saff=1}.toU16(),
 //      move=0 } and stage it for vreg 127.
-//   5. Issue `suspend(W, P)` with pair_count=1 in the syscall word
+//   6. Issue `suspend(W, P)` with pair_count=1 in the syscall word
 //      and the entry at vreg 127 via inline asm.
-//   6. recv(P), capture the return word, decode pair_count, tstart,
+//   7. recv(P), capture the return word, decode pair_count, tstart,
 //      reply_handle_id.
-//   7. Verify pair_count == 1.
-//   8. Read cap_table[tstart], verify handleType == execution_context
+//   8. Verify pair_count == 1.
+//   9. Read cap_table[tstart], verify handleType == execution_context
 //      and caps == 0x06 (copy + saff).
 //
 // Assertions
@@ -116,6 +119,7 @@
 //      §[handle_attachments] requires the delivered handle to be a
 //      fully usable copy, so an op authorized by the entry's caps
 //      must succeed against it.
+//   10: affinity setup failed.
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -182,7 +186,32 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2: mint W (the suspend target). term + susp let the test
+    const pinned_core = testing.currentCoreId();
+    const helper_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
+    var self_pinned = false;
+    defer {
+        if (self_pinned) {
+            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+        }
+    }
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, helper_affinity);
+    if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+    self_pinned = true;
+    const self_yield = syscall.yieldEc(0);
+    if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(10);
+        return;
+    }
+    const observed_core = testing.currentCoreId();
+    if ((helper_affinity & (@as(u64, 1) << @truncate(observed_core))) == 0) {
+        testing.fail(10);
+        return;
+    }
+
+    // Step 3: mint W (the suspend target). term + susp let the test
     // queue/destroy W; restart_policy = 0 keeps the call inside the
     // runner-granted ceiling.
     const w_caps = caps.EcCap{
@@ -197,7 +226,7 @@ pub fn main(cap_table_base: u64) void {
         entry,
         1,
         0,
-        0,
+        helper_affinity,
     );
     if (testing.isHandleError(cec_w.v1)) {
         testing.fail(2);
@@ -205,7 +234,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const w_handle: u12 = @truncate(cec_w.v1 & 0xFFF);
 
-    // Step 3: mint C (the carry/attachment source). copy + saff are
+    // Step 4: mint C (the carry/attachment source). copy + saff are
     // the caps we will request to be installed verbatim on the
     // receiver side; copy is required as the source-side gate per
     // §[handle_attachments] test 05 (move=0 path).
@@ -220,7 +249,7 @@ pub fn main(cap_table_base: u64) void {
         entry,
         1,
         0,
-        0,
+        helper_affinity,
     );
     if (testing.isHandleError(cec_c.v1)) {
         testing.fail(3);
@@ -228,7 +257,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const c_handle: u12 = @truncate(cec_c.v1 & 0xFFF);
 
-    // Step 4: build the pair entry. The entry's caps field carries
+    // Step 5: build the pair entry. The entry's caps field carries
     // the caps the kernel will install verbatim on the receiver-side
     // handle (EC, non-IDC). bits 0-11 = id, bits 16-31 = caps,
     // bit 32 = move, all others reserved (= 0).
@@ -240,7 +269,7 @@ pub fn main(cap_table_base: u64) void {
     };
     const pair_word: u64 = pair.toU64();
 
-    // Step 5: issue suspend(W, P) with pair_count=1 in the syscall
+    // Step 6: issue suspend(W, P) with pair_count=1 in the syscall
     // word and the pair entry at vreg 127. Hand-rolled because
     // libz's suspendEc panics on N>0 (high-vreg stack pad not yet
     // wired). Layout details:
@@ -268,7 +297,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 6: recv(P). The port has the test EC as a live bind-cap
+    // Step 7: recv(P). The port has the test EC as a live bind-cap
     // holder and W queued as a suspended sender, so recv returns
     // immediately. The kernel has had its chance to perform the
     // attachment move/copy at recv time per §[handle_attachments].
@@ -278,7 +307,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 7: decode the receiver's syscall word per §[recv] /
+    // Step 8: decode the receiver's syscall word per §[recv] /
     // §[event_state]. pair_count in bits 12-19, tstart in bits
     // 20-31, reply_handle_id in bits 32-43.
     const word = got.word;
@@ -290,7 +319,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 8: read the inserted handle and verify type + caps. EC
+    // Step 9: read the inserted handle and verify type + caps. EC
     // is a non-IDC handle so caps install verbatim per the spec line
     // under test.
     const inserted = caps.readCap(cap_table_base, @as(u32, @intCast(tstart)));
@@ -303,7 +332,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 9: liveness probe. Without an op against the delivered
+    // Step 10: liveness probe. Without an op against the delivered
     // handle, the assertions above only inspect cap_table fields —
     // a kernel that didn't actually bump the source EC's refcount
     // would still pass. Invoke `affinity` (authorized by the entry's

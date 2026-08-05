@@ -19,6 +19,7 @@ const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
 const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
+const perfmon_mod = stygia.sched.perfmon;
 const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
@@ -33,10 +34,12 @@ const Stack = stygia.memory.stack.Stack;
 const VAddr = stygia.memory.address.VAddr;
 
 const YIELD_SELECT_DIAG_BUDGET: u32 = 4096;
+const DISPATCH_TAIL_DIAG_BUDGET: u32 = 64;
 var yield_select_diag_prints: u32 = 0;
+var dispatch_tail_diag_prints: u32 = 0;
+const PMU_STATE_GROUP: u32 = 0x506D75;
 
 const YIELD_TARGET_PINNED_BIT: u64 = 1;
-
 const YieldTarget = struct {
     ec: ?*ExecutionContext = null,
     pinned: bool = false,
@@ -89,6 +92,27 @@ pub const TeardownRequest = struct {
 pub const MAX_CORES: u8 = 64;
 
 var deferred_requeues: [MAX_CORES]EcQueue = [_]EcQueue{.{}} ** MAX_CORES;
+var yield_handoff_targets: [MAX_CORES]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_CORES;
+var yield_handoff_preempt_guard: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
+
+/// Per-core PMU state whose counter file is currently loaded in hardware.
+/// This is deliberately outside `PerCore`: x64 assembly references that
+/// struct's offsets. The value is a `SlabRef` so dispatch can save/disable a
+/// stale hardware file even if the owning EC's `perfmon_state` field is
+/// concurrently being released.
+var pmu_hw_refs: [MAX_CORES]?SlabRef(PerfmonState) = [_]?SlabRef(PerfmonState){null} ** MAX_CORES;
+
+const WORK_STEALING_ENABLED = switch (builtin.cpu.arch) {
+    // aarch64 stays local-only until EC migration has FPU parity:
+    // scheduler.migrateFlush, sched/fpu.migrateFlush via SGI, V0-V31 plus
+    // FPCR/FPSR save/restore, and CPACR_EL1.FPEN trap-state handoff.
+    .aarch64 => false,
+    else => true,
+};
+
+/// Per-thief rotating victim cursor. Scheduler-local on purpose: `PerCore`
+/// layout is referenced by x64 assembly and must not grow for policy state.
+var steal_victim_cursors: [MAX_CORES]u8 = [_]u8{0} ** MAX_CORES;
 
 /// Per-EC quantum between preemption ticks. Spec doesn't pin this.
 ///
@@ -350,18 +374,289 @@ pub fn perCoreInit() void {
 
 // ── Dispatch ─────────────────────────────────────────────────────────
 
-/// The EC's `PerfmonState` if perfmon is armed on it and the slab slot
-/// still names the generation the EC's ref was minted against. Null
-/// when perfmon was never started, was stopped, or the state has been
-/// released underneath us (EC destroy).
-inline fn livePerfmonState(ec: *ExecutionContext) ?*PerfmonState {
+pub const LockedPerfmonState = struct {
+    ref: SlabRef(PerfmonState),
+    ptr: *PerfmonState,
+    irq_state: u64,
+};
+
+/// The EC's `PerfmonState` ref if perfmon is armed on it and the slab slot
+/// still names the generation the EC's ref was minted against. Null when
+/// perfmon was never started, was stopped, or the state has been released
+/// underneath us.
+inline fn livePerfmonRef(ec: *ExecutionContext) ?SlabRef(PerfmonState) {
     const ref = ec.perfmon_state orelse return null;
-    // caller-pinned: the gen compare below IS the liveness check — we
-    // cannot take the gen-lock here because `pmuSwitch` runs in the
-    // dispatch path with IRQs masked and no lock-order slot. A stale
-    // gen means the slot was freed and we skip it entirely.
+    // caller-pinned: the gen compare below IS the liveness check for the
+    // ref snapshot. The later `lockPmuRef` is the authoritative acquire.
     if (ref.ptr._gen_lock.currentGen() != @as(u64, ref.gen)) return null;
-    return ref.ptr;
+    return ref;
+}
+
+fn lockPmuRef(ref: SlabRef(PerfmonState)) ?LockedPerfmonState {
+    const lr = ref.lockOrderedIrqSave(PMU_STATE_GROUP, @src()) catch return null;
+    return .{ .ref = ref, .ptr = lr.ptr, .irq_state = lr.irq_state };
+}
+
+pub fn unlockPmuState(locked: LockedPerfmonState) void {
+    locked.ref.unlockIrqRestore(locked.irq_state);
+}
+
+fn destroyLockedPmuState(locked: LockedPerfmonState) void {
+    perfmon_mod.slab_instance.destroyLocked(locked.ptr, locked.ref.gen);
+    arch.cpu.restoreInterrupts(locked.irq_state);
+}
+
+fn assertNoPmuHardwareRefLocked(locked: LockedPerfmonState) void {
+    var core: u8 = 0;
+    while (core < MAX_CORES) : (core += 1) {
+        if (pmu_hw_refs[core]) |owned| {
+            std.debug.assert(!owned.eql(locked.ref));
+        }
+    }
+}
+
+pub fn assertNoPmuHardwareRef(ref: SlabRef(PerfmonState)) void {
+    var core: u8 = 0;
+    while (core < MAX_CORES) : (core += 1) {
+        if (pmu_hw_refs[core]) |owned| {
+            std.debug.assert(!owned.eql(ref));
+        }
+    }
+}
+
+fn clearPmuHardwareOwnerLocked(core: u8, locked: LockedPerfmonState) void {
+    if (pmu_hw_refs[core]) |ref| {
+        if (ref.eql(locked.ref)) pmu_hw_refs[core] = null;
+    }
+    if (locked.ptr.hw_core == core) {
+        locked.ptr.hw_core = null;
+        assertNoPmuHardwareRefLocked(locked);
+    }
+    if (locked.ptr.hw_core == null) locked.ptr.handoff_pending = false;
+}
+
+fn finishPmuOwnerLocked(core: u8, locked: LockedPerfmonState) void {
+    clearPmuHardwareOwnerLocked(core, locked);
+    if (locked.ptr.release_pending) {
+        locked.ptr.release_pending = false;
+        locked.ptr.handoff_pending = false;
+        destroyLockedPmuState(locked);
+    } else {
+        unlockPmuState(locked);
+    }
+}
+
+fn retirePmuHardwareOwnerExcept(core: u8, keep: ?SlabRef(PerfmonState)) void {
+    const prev_ref = pmu_hw_refs[core] orelse return;
+    if (keep) |keep_ref| {
+        if (prev_ref.eql(keep_ref)) return;
+    }
+
+    if (lockPmuRef(prev_ref)) |prev| {
+        if (prev.ptr.hw_core == core) {
+            arch.pmu.pmuSave(&prev.ptr.arch_state);
+            finishPmuOwnerLocked(core, prev);
+        } else {
+            clearPmuHardwareOwnerLocked(core, prev);
+            unlockPmuState(prev);
+        }
+    } else {
+        pmu_hw_refs[core] = null;
+        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
+        arch.pmu.pmuStop(&empty);
+    }
+}
+
+fn stopStaleLocalPmuOwner(core: u8, ref: SlabRef(PerfmonState)) void {
+    if (pmu_hw_refs[core]) |owned| {
+        if (!owned.eql(ref)) return;
+        pmu_hw_refs[core] = null;
+        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
+        arch.pmu.pmuStop(&empty);
+    }
+}
+
+fn requestRemotePmuHandoffLocked(core: u8, locked: LockedPerfmonState) void {
+    const owner_core = locked.ptr.hw_core orelse return;
+    if (owner_core == core) return;
+    if (owner_core >= MAX_CORES) {
+        locked.ptr.hw_core = null;
+        locked.ptr.handoff_pending = false;
+        assertNoPmuHardwareRefLocked(locked);
+        return;
+    }
+    if (pmu_hw_refs[owner_core]) |owner_ref| {
+        if (!owner_ref.eql(locked.ref)) {
+            locked.ptr.hw_core = null;
+            locked.ptr.handoff_pending = false;
+            assertNoPmuHardwareRefLocked(locked);
+            return;
+        }
+    } else {
+        locked.ptr.hw_core = null;
+        locked.ptr.handoff_pending = false;
+        assertNoPmuHardwareRefLocked(locked);
+        return;
+    }
+    locked.ptr.handoff_pending = true;
+    arch.smp.triggerSchedulerInterrupt(owner_core);
+}
+
+/// Claim this core's PMU hardware file for `ref`.
+///
+/// PMU state migration is a two-phase ownership transfer. The requester
+/// first retires this core's old file, then locks only `ref`. If `ref` is
+/// live on a remote core, the requester sets `handoff_pending`, drops the
+/// lock, pokes the owner, and spins while servicing TLB maintenance until
+/// the owner saves/disables and clears `hw_core`. Only then does the
+/// requester restore and set `hw_core = core`.
+///
+/// Lock contract: callers must not hold any EC gen-lock, PMU gen-lock, or
+/// core lock across this call. The helper may wait for a remote scheduler
+/// IPI and may acquire one PMU state at a time; allowing callers to hold
+/// another object lock would recreate the EC->PMU and PMU->PMU deadlocks
+/// this protocol is meant to avoid.
+pub fn claimPmuHardwareOwner(core: u8, ref: SlabRef(PerfmonState)) ?LockedPerfmonState {
+    retirePmuHardwareOwnerExcept(core, ref);
+
+    while (true) {
+        const locked = lockPmuRef(ref) orelse {
+            stopStaleLocalPmuOwner(core, ref);
+            return null;
+        };
+        if (locked.ptr.release_pending) {
+            if (locked.ptr.hw_core == core) {
+                arch.pmu.pmuSave(&locked.ptr.arch_state);
+                finishPmuOwnerLocked(core, locked);
+            } else if (locked.ptr.hw_core == null) {
+                locked.ptr.handoff_pending = false;
+                destroyLockedPmuState(locked);
+            } else {
+                requestRemotePmuHandoffLocked(core, locked);
+                unlockPmuState(locked);
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+            }
+            return null;
+        }
+        if (locked.ptr.hw_core) |owner_core| {
+            if (owner_core == core) {
+                locked.ptr.handoff_pending = false;
+                pmu_hw_refs[core] = ref;
+                return locked;
+            }
+            requestRemotePmuHandoffLocked(core, locked);
+            unlockPmuState(locked);
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        arch.pmu.pmuRestore(&locked.ptr.arch_state);
+        locked.ptr.hw_core = core;
+        locked.ptr.handoff_pending = false;
+        pmu_hw_refs[core] = ref;
+        return locked;
+    }
+}
+
+/// Save/disable whatever core currently owns `ref` without adopting it on
+/// the caller's core. Used by syscalls that inspect or reconfigure a
+/// suspended EC: they need `arch_state` to be authoritative, but they must
+/// not start counting on the syscalling core for an EC that is not running.
+pub fn retirePmuStateHardware(ref: SlabRef(PerfmonState)) bool {
+    const this_core: u8 = @truncate(arch.smp.coreID());
+    while (true) {
+        const locked = lockPmuRef(ref) orelse return false;
+        if (locked.ptr.release_pending) {
+            if (locked.ptr.hw_core == this_core) {
+                arch.pmu.pmuSave(&locked.ptr.arch_state);
+                finishPmuOwnerLocked(this_core, locked);
+            } else if (locked.ptr.hw_core == null) {
+                locked.ptr.handoff_pending = false;
+                destroyLockedPmuState(locked);
+            } else {
+                requestRemotePmuHandoffLocked(this_core, locked);
+                unlockPmuState(locked);
+                arch.paging.serviceTlbMaintenanceWhileSpinning();
+                std.atomic.spinLoopHint();
+            }
+            return false;
+        }
+        if (locked.ptr.hw_core) |owner_core| {
+            if (owner_core == this_core) {
+                arch.pmu.pmuSave(&locked.ptr.arch_state);
+                finishPmuOwnerLocked(this_core, locked);
+                return true;
+            }
+            requestRemotePmuHandoffLocked(this_core, locked);
+            const done = locked.ptr.hw_core == null;
+            unlockPmuState(locked);
+            if (done) continue;
+            arch.paging.serviceTlbMaintenanceWhileSpinning();
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        locked.ptr.handoff_pending = false;
+        unlockPmuState(locked);
+        return true;
+    }
+}
+
+/// Destroy a detached PerfmonState. The owning EC's `perfmon_state` field
+/// must already be null, and callers must not hold that EC's gen-lock. This
+/// function may wait for a remote PMU owner to run its scheduler IPI, but it
+/// services TLB maintenance while spinning and holds at most this PMU state.
+pub fn releasePmuState(ref: SlabRef(PerfmonState)) void {
+    const this_core: u8 = @truncate(arch.smp.coreID());
+    while (true) {
+        const locked = lockPmuRef(ref) orelse return;
+        if (locked.ptr.hw_core) |owner_core| {
+            if (owner_core == this_core) {
+                arch.pmu.pmuStop(&locked.ptr.arch_state);
+                clearPmuHardwareOwnerLocked(this_core, locked);
+            } else if (owner_core < MAX_CORES) {
+                if (pmu_hw_refs[owner_core]) |owner_ref| {
+                    if (owner_ref.eql(ref)) {
+                        locked.ptr.release_pending = true;
+                        locked.ptr.handoff_pending = false;
+                        unlockPmuState(locked);
+                        arch.smp.triggerSchedulerInterrupt(owner_core);
+                        arch.paging.serviceTlbMaintenanceWhileSpinning();
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                }
+                locked.ptr.hw_core = null;
+                locked.ptr.handoff_pending = false;
+                assertNoPmuHardwareRefLocked(locked);
+            } else {
+                locked.ptr.hw_core = null;
+                locked.ptr.handoff_pending = false;
+                assertNoPmuHardwareRefLocked(locked);
+            }
+        }
+
+        locked.ptr.release_pending = false;
+        locked.ptr.handoff_pending = false;
+        destroyLockedPmuState(locked);
+        return;
+    }
+}
+
+fn drainPendingPmuRelease(core: u8) void {
+    const ref = pmu_hw_refs[core] orelse return;
+    const locked = lockPmuRef(ref) orelse {
+        pmu_hw_refs[core] = null;
+        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
+        arch.pmu.pmuStop(&empty);
+        return;
+    };
+    if ((locked.ptr.release_pending or locked.ptr.handoff_pending) and locked.ptr.hw_core == core) {
+        arch.pmu.pmuSave(&locked.ptr.arch_state);
+        finishPmuOwnerLocked(core, locked);
+        return;
+    }
+    unlockPmuState(locked);
 }
 
 /// Hand the per-core PMU counter file from the outgoing EC to `next`.
@@ -401,42 +696,47 @@ inline fn livePerfmonState(ec: *ExecutionContext) ?*PerfmonState {
 /// but cannot violate monotonicity, because the EC's next dispatch
 /// re-`pmuRestore`s from its own saved values on whatever core it
 /// lands on.
-fn pmuSwitch(core: u8, next: *ExecutionContext) void {
-    const state = &core_states[core];
+fn pmuSwitch(core: u8, next: *ExecutionContext) ?LockedPerfmonState {
+    const next_ref = livePerfmonRef(next);
 
-    const next_ps = livePerfmonState(next);
-    var prev_ps: ?*PerfmonState = null;
-    if (state.current_ec) |prev| {
-        // caller-pinned: identity read of this core's own `current_ec`
-        // slot, gen-checked before the deref. This is the sole consumer
-        // of `current_ec_gen`, and it runs on the slot's owning core, so
-        // the pointer and the gen cannot have been republished between
-        // the two reads.
-        if (prev._gen_lock.currentGen() == @as(u64, state.current_ec_gen)) {
-            prev_ps = livePerfmonState(prev);
+    if (pmu_hw_refs[core]) |prev_ref| {
+        if (next_ref == null or !prev_ref.eql(next_ref.?)) {
+            if (lockPmuRef(prev_ref)) |prev| {
+                if (prev.ptr.hw_core == core) {
+                    arch.pmu.pmuSave(&prev.ptr.arch_state);
+                    finishPmuOwnerLocked(core, prev);
+                } else {
+                    clearPmuHardwareOwnerLocked(core, prev);
+                    unlockPmuState(prev);
+                }
+            } else {
+                // The invariant says this should be unreachable: release must
+                // not destroy a state while this core owns its hardware token.
+                // Disable the hardware defensively if a stale ref is observed.
+                pmu_hw_refs[core] = null;
+                var empty: stygia.arch.dispatch.pmu.PmuState = .{};
+                arch.pmu.pmuStop(&empty);
+            }
         }
     }
 
-    // Fast path: no perfmon anywhere near this dispatch. Every context
-    // switch in a system that never called `perfmon_start` lands here,
-    // so it must not touch the PMU registers (each is a trap-and-emulate
-    // exit under KVM on aarch64).
-    if (prev_ps == null and next_ps == null) return;
+    const ref = next_ref orelse return null;
+    return claimPmuHardwareOwner(core, ref);
+}
 
-    if (prev_ps) |ps| {
-        // `ps != next_ps` skips the pointless save/restore round trip
-        // when the same EC is being re-dispatched on the same core.
-        if (ps.hw_core == core and ps != next_ps) {
-            arch.pmu.pmuSave(&ps.arch_state);
-            ps.hw_core = null;
-        }
+fn abandonPmuDispatch(core: u8, locked: ?LockedPerfmonState) void {
+    const ps = locked orelse return;
+    if (ps.ptr.hw_core == core) {
+        // `pmuSwitch` may have restored this EC's counters before a racing
+        // retire/park changed the lifecycle word. Once dispatch is abandoned,
+        // no user frame will run on this counter file, so save the exact
+        // post-restore value and disable/mask the hardware before dropping the
+        // ownership token. `pmuSave` is the context-switch cleanup primitive:
+        // x64 disables EN/GLOBAL_CTRL before readback; aarch64 clears PMCNTEN
+        // and PMINTEN before readback.
+        arch.pmu.pmuSave(&ps.ptr.arch_state);
     }
-    if (next_ps) |ps| {
-        if (ps.hw_core != core) {
-            arch.pmu.pmuRestore(&ps.arch_state);
-            ps.hw_core = core;
-        }
-    }
+    finishPmuOwnerLocked(core, ps);
 }
 
 /// Context switch to `ec` on the current core. Saves outgoing EC's
@@ -632,13 +932,21 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
     }
     // Hand the per-core PMU counter file over before `current_ec` is
     // rewritten — `pmuSwitch` reads the slot to find the outgoing EC.
-    pmuSwitch(core, current);
+    const next_pmu = pmuSwitch(core, current);
     if ((&core_states[core]).current_ec != current) {
+        abandonPmuDispatch(core, next_pmu);
         @panic("scheduler.dispatchTailBody: current_ec changed after pmuSwitch");
     }
-    if (lifecycle.load(current) != .running) {
-        @panic("scheduler.dispatchTailBody: current not running after pmuSwitch");
+    const post_pmu_state = lifecycle.load(current);
+    if (post_pmu_state != .running) {
+        logDispatchTailAbortDiag(core, current, post_pmu_state);
+        abandonPmuDispatch(core, next_pmu);
+        dischargeOwnedParking(core);
+        run();
     }
+    if (next_pmu) |ps| unlockPmuState(ps);
+    yield_handoff_preempt_guard[core] = yield_handoff_targets[core] == current;
+    yield_handoff_targets[core] = null;
     // Give the committed EC a fresh quantum at the dispatch boundary.
     // The old deadline belongs to the outgoing EC; carrying it across a
     // voluntary targeted yield can let an already-due tick preempt the
@@ -957,6 +1265,8 @@ export fn scheduler_hop_run(arg: u64) callconv(.c) noreturn {
 
 pub fn run() noreturn {
     while (true) {
+        const core: u8 = @truncate(arch.smp.coreID());
+        drainPendingPmuRelease(core);
         if (dequeueOrIdle()) |next| {
             switchTo(next);
         }
@@ -1155,6 +1465,43 @@ fn diagTag(ec: *ExecutionContext) u64 {
     return ec.domain.ptr.diag_test_tag;
 }
 
+fn logDispatchTailAbortDiag(core: u8, current: *ExecutionContext, observed_state: lifecycle.State) void {
+    if (!build_options.kernel_spawn_diag) return;
+    const n = @atomicRmw(u32, &dispatch_tail_diag_prints, .Add, 1, .monotonic);
+    if (n >= DISPATCH_TAIL_DIAG_BUDGET) return;
+
+    var pmu_hw: u8 = NOT_IN_RUN_QUEUE;
+    var pmu_live: bool = false;
+    if (current.perfmon_state) |ref| {
+        pmu_live = true;
+        if (ref.ptr._gen_lock.currentGen() == @as(u64, ref.gen)) {
+            pmu_hw = ref.ptr.hw_core orelse NOT_IN_RUN_QUEUE;
+        }
+    }
+    const cur_raw: u64 = if ((&core_states[core]).current_ec) |cur| @intFromPtr(cur) else 0;
+
+    const dref = current.domain;
+    arch.boot.print(
+        "[dtaildiag] site=post_pmu_abandon tag=0x{x} core={d} ec=0x{x} state={x} wait={x} owner={x} qcore={x} gen={x} mark={x} domain_gen={x} domain_live_gen={x} pmu_live={d} pmu_hw={x} cur=0x{x}\n",
+        .{
+            diagTag(current),
+            core,
+            @intFromPtr(current),
+            @intFromEnum(observed_state),
+            @intFromEnum(current.wait.kind),
+            current.owner_core,
+            current.current_queue_core.load(.acquire),
+            current._gen_lock.currentGen(),
+            current.mark_state.load(.acquire),
+            dref.gen,
+            dref.ptr._gen_lock.currentGen(),
+            @intFromBool(pmu_live),
+            pmu_hw,
+            cur_raw,
+        },
+    );
+}
+
 fn logYieldSelectDiag(core: u8, target: *ExecutionContext, reason: []const u8, publishable: bool) void {
     if (!build_options.kernel_spawn_diag) return;
     const n = @atomicRmw(u32, &yield_select_diag_prints, .Add, 1, .monotonic);
@@ -1192,6 +1539,19 @@ fn dequeueOrIdle() ?*ExecutionContext {
 fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
     const state = &core_states[core];
     drainDeferredRequeuesLocked(core);
+    if (dequeueLocalReadyLocked(core)) |ec| return ec;
+    if (tryStealReadyLocked(core)) |ec| return ec;
+    // Nothing to run: the caller parks this core. Publish that decision
+    // under `core_locks[core]` so a concurrent `enqueueOnCore` knows to
+    // send the wake IPI even though `current_ec` has not been cleared
+    // yet. See `PerCore.idle_parked`.
+    state.idle_parked = true;
+    return null;
+}
+
+fn dequeueLocalReadyLocked(core: u8) ?*ExecutionContext {
+    const state = &core_states[core];
+    yield_handoff_targets[core] = null;
     while (state.run_queue.dequeue()) |ec| {
         // Clear queue residency on every popped EC, regardless of
         // whether we end up dispatching it or skipping it as stale —
@@ -1211,11 +1571,116 @@ fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
         execution_context.recordSpawnTrace(ec, null, .dequeue_select, core);
         return ec;
     }
-    // Nothing to run: the caller parks this core. Publish that decision
-    // under `core_locks[core]` so a concurrent `enqueueOnCore` knows to
-    // send the wake IPI even though `current_ec` has not been cleared
-    // yet. See `PerCore.idle_parked`.
-    state.idle_parked = true;
+    return null;
+}
+
+fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*ExecutionContext {
+    const state = &core_states[victim];
+    var idx: usize = state.run_queue.levels.len;
+    while (idx > 0) {
+        idx -= 1;
+        var cur = state.run_queue.levels[idx].head;
+        while (cur) |ec| {
+            cur = ec.next;
+            if (!affinityAdmitsCore(ec.affinity, thief)) continue;
+            if (!canPublishReady(ec)) continue;
+            if (ec.owner_core != NOT_IN_RUN_QUEUE) continue;
+            if (lifecycle.load(ec) != .ready) continue;
+
+            const queue_core = ec.current_queue_core.load(.acquire);
+            if (queue_core != victim and queue_core != NOT_IN_RUN_QUEUE) continue;
+            if (!runQueueContains(&state.run_queue, ec)) continue;
+            if (!lifecycle.beginReadyClaimPinned(ec)) continue;
+
+            const removed = state.run_queue.remove(ec);
+            std.debug.assert(removed);
+            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+            return ec;
+        }
+    }
+    return null;
+}
+
+fn stealFromVictimsUnlocked(thief: u8) ?*ExecutionContext {
+    if (!WORK_STEALING_ENABLED) return null;
+
+    const core_count_u64 = @min(arch.smp.coreCount(), @as(u64, MAX_CORES));
+    if (core_count_u64 <= 1) return null;
+    const core_count: usize = @intCast(core_count_u64);
+
+    var victim = @as(usize, steal_victim_cursors[thief]) % core_count;
+    var checked: usize = 0;
+    while (checked < core_count - 1) {
+        if (victim == @as(usize, thief)) {
+            victim = (victim + 1) % core_count;
+            continue;
+        }
+
+        const victim_core: u8 = @intCast(victim);
+        const lock = &core_locks[victim];
+        const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        const stolen = stealCandidateFromVictimLocked(thief, victim_core);
+        lock.unlockIrqRestore(irq);
+
+        checked += 1;
+        const next_victim = (victim + 1) % core_count;
+        if (stolen) |ec| {
+            steal_victim_cursors[thief] = @intCast(next_victim);
+            return ec;
+        }
+        victim = next_victim;
+    }
+
+    steal_victim_cursors[thief] = @intCast(victim);
+    return null;
+}
+
+fn abandonStolenReadyUnlocked(ec: *ExecutionContext) void {
+    if (!canPublishReady(ec)) {
+        execution_context.dischargeClaimedHolderDead(ec);
+        return;
+    }
+    switch (enqueuePinnedClaimed(ec)) {
+        .published, .not_claimed => {},
+        .not_publishable, .claimed_unpublishable => {
+            execution_context.dischargeClaimedHolderDead(ec);
+            return;
+        },
+    }
+    lifecycle.releasePin(ec);
+}
+
+fn commitStolenDispatchLocked(core: u8, ec: *ExecutionContext) bool {
+    if (!canPublishReady(ec)) return false;
+    if (!lifecycle.finishClaimedDispatch(ec, core, NOT_IN_RUN_QUEUE)) return false;
+    setCurrentEc(core, ec);
+    yield_handoff_targets[core] = null;
+    (&core_states[core]).idle_parked = false;
+    lifecycle.releasePin(ec);
+    execution_context.recordSpawnTrace(ec, null, .dequeue_select, core);
+    return true;
+}
+
+fn tryStealReadyLocked(core: u8) ?*ExecutionContext {
+    if (!WORK_STEALING_ENABLED) return null;
+
+    const thief_lock = &core_locks[core];
+    thief_lock.unlock();
+    const stolen = stealFromVictimsUnlocked(core);
+    const thief_irq = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+
+    const ec = stolen orelse return null;
+    if (dequeueLocalReadyLocked(core)) |local| {
+        thief_lock.unlockIrqRestore(thief_irq);
+        abandonStolenReadyUnlocked(ec);
+        _ = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+        return local;
+    }
+    if (commitStolenDispatchLocked(core, ec)) return ec;
+
+    thief_lock.unlockIrqRestore(thief_irq);
+    abandonStolenReadyUnlocked(ec);
+    _ = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     return null;
 }
 
@@ -1256,6 +1721,7 @@ fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*ExecutionContext {
             if (lifecycle.prepareDispatchLocked(t, core, NOT_IN_RUN_QUEUE)) {
                 logYieldSelectDiag(core, t, "selected", true);
                 setCurrentEc(core, t);
+                yield_handoff_targets[core] = t;
                 state.idle_parked = false;
                 return t;
             }
@@ -1267,75 +1733,15 @@ fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*ExecutionContext {
 
 // ── Enqueue / current accessors ──────────────────────────────────────
 
-/// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
-/// futex wake, timer fires, and the boot path.
-///
-/// Wake / preempt policy after queueing:
-///   - target idle (no `current_ec`) or parking (`idle_parked`, set
-///     under this same lock) and target != self: send wake IPI so the
-///     parked `hlt`/`wfi` exits and `run` re-runs `dequeueOrIdle`.
-///   - target current EC outranks `ec`: nothing to do — `ec` waits its
-///     turn. Only sound because `idle_parked` was checked first: a
-///     target that has committed to parking still names its last EC in
-///     `current_ec`, and trusting that alone strands `ec` forever.
-///   - `ec` outranks target's current EC: send a scheduler IPI to the
-///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
-///     it's IF-gated and fires once the caller exits its current IRQ /
-///     spinlock-held window. We deliberately do NOT inline-yield: many
-///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
-///     and a context-switch via `loadEcContextAndReturn` would strand
-///     it.
-pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
-    execution_context.recordSpawnTrace(ec, null, .enqueue_attempt, core);
-    if (!lifecycle.tryPinLive(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_live, core);
-        return;
-    }
-    defer lifecycle.releasePin(ec);
+const EnqueuePinnedResult = enum {
+    published,
+    not_publishable,
+    not_claimed,
+    claimed_unpublishable,
+};
 
+fn finishEnqueuePublish(core: u8, ec: *ExecutionContext, irq: u64) void {
     const lock = &core_locks[core];
-    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
-        lock.unlockIrqRestore(irq);
-        return;
-    }
-    switch (lifecycle.load(ec)) {
-        .ready => {},
-        .claimed => {
-            if (!lifecycle.finishClaimedReady(ec, NOT_IN_RUN_QUEUE)) {
-                lock.unlockIrqRestore(irq);
-                return;
-            }
-        },
-        .pended => {
-            if (!lifecycle.finishPendedReady(ec, NOT_IN_RUN_QUEUE)) {
-                lock.unlockIrqRestore(irq);
-                return;
-            }
-        },
-        .parking => {
-            if (ec.wait.kind != .requeue or !lifecycle.cas(ec, .parking, .ready)) {
-                lock.unlockIrqRestore(irq);
-                return;
-            }
-            ec.owner_core = NOT_IN_RUN_QUEUE;
-            ec.wait.clear();
-        },
-        else => {
-            execution_context.recordSpawnTrace(ec, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(ec)));
-            lock.unlockIrqRestore(irq);
-            return;
-        },
-    }
-
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
-        lock.unlockIrqRestore(irq);
-        return;
-    }
-
     (&core_states[core]).run_queue.enqueue(ec);
     // Publish queue residency under the target core's lock so a
     // racing `removeFromQueue(ec)` from a third core can target the
@@ -1409,6 +1815,113 @@ pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
     arch.smp.triggerSchedulerInterrupt(core);
 }
 
+fn enqueueClaimedOnCorePinned(core: u8, ec: *ExecutionContext) EnqueuePinnedResult {
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+
+    if (!canPublishReady(ec)) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+        lock.unlockIrqRestore(irq);
+        return .not_publishable;
+    }
+    if (lifecycle.load(ec) != .claimed) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(ec)));
+        lock.unlockIrqRestore(irq);
+        return .not_claimed;
+    }
+    if (!lifecycle.finishClaimedReady(ec, NOT_IN_RUN_QUEUE)) {
+        lock.unlockIrqRestore(irq);
+        return .not_claimed;
+    }
+
+    if (!canPublishReady(ec)) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+        std.debug.assert(ec.current_queue_core.load(.acquire) == NOT_IN_RUN_QUEUE);
+        std.debug.assert(lifecycle.cas(ec, .ready, .claimed));
+        lock.unlockIrqRestore(irq);
+        return .claimed_unpublishable;
+    }
+
+    finishEnqueuePublish(core, ec, irq);
+    return .published;
+}
+
+fn enqueuePinnedClaimed(ec: *ExecutionContext) EnqueuePinnedResult {
+    return enqueueClaimedOnCorePinned(pickCoreForAffinity(ec.affinity), ec);
+}
+
+/// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
+/// futex wake, timer fires, and the boot path.
+///
+/// Wake / preempt policy after queueing:
+///   - target idle (no `current_ec`) or parking (`idle_parked`, set
+///     under this same lock) and target != self: send wake IPI so the
+///     parked `hlt`/`wfi` exits and `run` re-runs `dequeueOrIdle`.
+///   - target current EC outranks `ec`: nothing to do — `ec` waits its
+///     turn. Only sound because `idle_parked` was checked first: a
+///     target that has committed to parking still names its last EC in
+///     `current_ec`, and trusting that alone strands `ec` forever.
+///   - `ec` outranks target's current EC: send a scheduler IPI to the
+///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
+///     it's IF-gated and fires once the caller exits its current IRQ /
+///     spinlock-held window. We deliberately do NOT inline-yield: many
+///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
+///     and a context-switch via `loadEcContextAndReturn` would strand
+///     it.
+pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
+    execution_context.recordSpawnTrace(ec, null, .enqueue_attempt, core);
+    if (!lifecycle.tryPinLive(ec)) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_live, core);
+        return;
+    }
+    defer lifecycle.releasePin(ec);
+
+    const lock = &core_locks[core];
+    const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
+
+    if (!canPublishReady(ec)) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+        lock.unlockIrqRestore(irq);
+        return;
+    }
+    switch (lifecycle.load(ec)) {
+        .ready => {},
+        .claimed => {
+            if (!lifecycle.finishClaimedReady(ec, NOT_IN_RUN_QUEUE)) {
+                lock.unlockIrqRestore(irq);
+                return;
+            }
+        },
+        .pended => {
+            if (!lifecycle.finishPendedReady(ec, NOT_IN_RUN_QUEUE)) {
+                lock.unlockIrqRestore(irq);
+                return;
+            }
+        },
+        .parking => {
+            if (ec.wait.kind != .requeue or !lifecycle.cas(ec, .parking, .ready)) {
+                lock.unlockIrqRestore(irq);
+                return;
+            }
+            ec.owner_core = NOT_IN_RUN_QUEUE;
+            ec.wait.clear();
+        },
+        else => {
+            execution_context.recordSpawnTrace(ec, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(ec)));
+            lock.unlockIrqRestore(irq);
+            return;
+        },
+    }
+
+    if (!canPublishReady(ec)) {
+        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+        lock.unlockIrqRestore(irq);
+        return;
+    }
+
+    finishEnqueuePublish(core, ec, irq);
+}
+
 /// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
 pub fn enqueue(ec: *ExecutionContext) void {
     enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
@@ -1428,14 +1941,10 @@ pub fn enqueue(ec: *ExecutionContext) void {
 /// LAPIC-tick suppression under SMP=4 concurrent CD destroys.
 ///
 /// Fallback (`current_queue_core == NOT_IN_RUN_QUEUE`): sweep all 64
-/// per-core locks. Required because the IPC fast-path asm in
-/// `arch/x64/interrupts.zig` (R13 main + R13 fallback) enqueues a
-/// freshly-replied receiver onto the local run queue without writing
-/// `current_queue_core`. ECs in that window read the sentinel but
-/// genuinely live in some queue — the legacy sweep finds them. The
-/// bd-vzdh storm scenario does not enter this path: faulted ECs are
-/// dispatched via the slow path, never the IPC fast path, so the
-/// hint stays accurate for them.
+/// per-core locks. Required for stale-hint races and for any EC that
+/// was removed from one queue while the caller's hint snapshot was old;
+/// the x64 IPC fast path now publishes this field in its ready-enqueue
+/// branches, matching the Zig enqueue discipline.
 pub fn removeFromQueue(ec: *ExecutionContext) void {
     const hint = ec.current_queue_core.load(.acquire);
     if (hint < MAX_CORES) {
@@ -1663,18 +2172,6 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
     }
 }
 
-/// Racy identity read of `core_states[core].current_ec` for cross-core
-/// "has this EC left its core's dispatch slot" waits (terminate's
-/// stops-executing barrier). Single-writer-per-core plus a single
-/// naturally aligned pointer word makes this read tear-free on both
-/// arches; the gen is deliberately not read — pointer identity is all
-/// the caller compares. (The tear-freedom this doc always claimed only
-/// became true when `current_ec` stopped being a 24-byte `?SlabRef`;
-/// see that field's doc.)
-pub inline fn currentEcPtrOn(core: u8) ?*ExecutionContext {
-    return (&core_states[core]).current_ec;
-}
-
 pub inline fn clearCurrentEc(core: u8) void {
     if (comptime ec_log.enabled) {
         ec_log.mark(.clear_current_ec, (&core_states[core]).current_ec, null);
@@ -1701,11 +2198,6 @@ pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
     ec.owner_core = core;
 }
 
-/// True if this core's `current_ec` is null (idle).
-pub inline fn coreIsIdle(core: u8) bool {
-    return (&core_states[core]).current_ec == null;
-}
-
 // ── State transitions used by other subsystems ───────────────────────
 
 /// Transition `ec` to ready and enqueue. Used by event delivery
@@ -1729,6 +2221,22 @@ pub fn markReady(ec: *ExecutionContext) void {
         },
         .none => {},
     }
+}
+
+pub fn clearYieldHandoffGuard(core: u8) void {
+    if (core >= MAX_CORES) return;
+    yield_handoff_preempt_guard[core] = false;
+}
+
+pub fn yieldHandoffGuardPtr(core: u8) *bool {
+    return &yield_handoff_preempt_guard[core];
+}
+
+pub fn consumeYieldHandoffGuard(core: u8) bool {
+    if (core >= MAX_CORES) return false;
+    if (!yield_handoff_preempt_guard[core]) return false;
+    yield_handoff_preempt_guard[core] = false;
+    return true;
 }
 
 /// Pick the right core for `ec` based on its affinity mask.

@@ -384,6 +384,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "revoke_06", .path = "cases/revoke_06.zig" },
     .{ .name = "rng_01", .path = "cases/rng_01.zig" },
     .{ .name = "rng_02", .path = "cases/rng_02.zig" },
+    .{ .name = "scheduler_balance_01", .path = "cases/scheduler_balance_01.zig" },
     .{ .name = "self_01", .path = "cases/self_01.zig" },
     .{ .name = "self_02", .path = "cases/self_02.zig" },
     .{ .name = "self_handle_01", .path = "cases/self_handle_01.zig" },
@@ -827,13 +828,12 @@ pub fn build(b: *std.Build) void {
     // onto the runner's core.
     //
     // The runner used to pass `initial_ec_affinity = 0` ("kernel picks
-    // any core") for every test domain. The kernel resolves 0 to *the
-    // calling core*, and nothing ever moves an affinity-0 EC afterwards
-    // — no work stealing, no pull path, and the preemption re-enqueue
-    // re-picks the current core. The runner is a single EC, so "the
-    // calling core" was always the same core and the entire 485-test
-    // suite executed on one core while the rest idled
-    // (docs/kernel/open-design-questions.md §2, stygia-yxj).
+    // any core") for every test domain. Initial placement remains
+    // local-biased, and runner-created test domains should keep
+    // deterministic placement for stability triage even though x64 now
+    // has pull-side stealing for affinity-0 ready ECs. The old behavior
+    // was a single-core pile-up (docs/kernel/open-design-questions.md
+    // §2, stygia-yxj).
     //
     // With this on, test N is pinned to core `N % cores` via a
     // single-bit mask, which the kernel honours on every enqueue *and*
@@ -842,15 +842,14 @@ pub fn build(b: *std.Build) void {
     // load-dependent, which is what a stability rig wants: a failure
     // reproduces on the same core on the next boot.
     //
-    // This sidesteps rather than fixes stygia-yxj — the kernel's
-    // affinity-0 policy is unchanged, and picking among its three
-    // candidate shapes is still an open design decision. Set
-    // `-Dspread_cores=false` to A/B against the historical single-core
-    // behaviour without editing code.
+    // Set `-Dspread_cores=false` to keep runner-spawned test domains on
+    // the historical local-biased initial placement. That does not
+    // disable x64 pull-side stealing for affinity-0 ECs created inside
+    // a test; `scheduler_balance_01` covers that path explicitly.
     const spread_cores = b.option(
         bool,
         "spread_cores",
-        "Pin test domain N to core N % cores instead of spawning every test with affinity 0, which the kernel resolves to the runner's core (default true)",
+        "Pin test domain N to core N % cores instead of using affinity-0 local-biased initial placement (default true)",
     ) orelse true;
 
     // Build the filtered list of test entries up front. The same

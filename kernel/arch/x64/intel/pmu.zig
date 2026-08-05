@@ -339,8 +339,9 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
 
 /// PMU overflow handler. Registered on the LAPIC PerfMon vector via
 /// `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
-/// `dispatchInterrupt` issues `apic.endOfInterrupt()` after this returns
-/// — the handler MUST NOT EOI here.
+/// `dispatchInterrupt` issues `apic.endOfInterrupt()` after normal returns.
+/// If PMU delivery parks the interrupted EC, the non-returning scheduler
+/// escape path EOIs explicitly before tail-dispatching away.
 ///
 /// Behavior (mirrors aarch64 PMUv3 PMI in `arch/aarch64/pmu.zig`):
 ///   1. Read `IA32_PERF_GLOBAL_STATUS` (MSR 0x38E) to find the
@@ -475,10 +476,15 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     // If event delivery suspended the EC (route bound), drive the
     // scheduler so this core dispatches the next ready EC instead of
-    // ERET-ing back to the now-parked context.
+    // ERET-ing back to the now-parked context. This abandons
+    // dispatchInterrupt's post-handler epilogue, so EOI the PMI here.
+    // The PMI vector shares LAPIC priority class 0xF with the scheduler
+    // vector; leaving it in-service can make this core deaf to later
+    // scheduler IPIs.
     const core: u8 = @truncate(apic.coreID());
     if (!scheduler.coreCurrentIs(core, ec)) {
-        scheduler.preempt();
+        apic.endOfInterrupt();
+        scheduler.hopParkRun();
     }
 }
 
