@@ -6,24 +6,36 @@
 //  even when the vCPU's interrupt window opens or it becomes
 //  runnable with the line unmasked."
 //
-// Spec semantics
-//   The full faithful witness for this property requires a guest
-//   image whose IDT/GIC is configured to vector IRQ [2] into a
-//   handler whose entry is observable from outside the guest
-//   (via a vm_exit sub-code change, MMIO ack, or HLT-resume) —
-//   the spec property is stated in terms of "no interrupt
-//   vm_exit corresponding to line [2] is delivered". Booting a
-//   real guest from the in-kernel test runner is not feasible:
-//   the runner has no facility to stage guest code into VM
-//   memory, and §[vm_policy] alone — which is all userspace can
-//   configure here — does not seed an IDT/IOAPIC. We therefore
-//   exercise the smoke-degraded slice the runner can witness:
-//   that on a real VM with an in-range IRQ line and clean
-//   reserved bits, the deassert call after a prior assert call
-//   traverses its success path and returns OK rather than
-//   surfacing E_BADCAP / E_INVAL. The downstream "no vm_exit
-//   delivered" half of the spec assertion is unreachable from
-//   this harness and is not asserted here.
+// Current status: degraded smoke, not full closure for test 05.
+//
+//   The full faithful witness for this property requires a guest/vCPU
+//   that has entered guest mode with interrupts unmasked and an
+//   observable interrupt-window or interrupt-delivery path. A bounded
+//   negative check would be:
+//     assert IRQ line N, deassert line N, open the guest interrupt
+//     window, then recv(exit_port, finite_timeout) and require
+//     E_TIMEOUT or a non-interrupt vm_exit.
+//
+//   The suite has pieces of that flow today: map_guest can stage guest
+//   memory, create_vcpu delivers the synthetic initial vm_exit, and
+//   recv has finite timeouts. The missing piece is a small VMM/guest
+//   harness that can reply to the initial vm_exit with a complete,
+//   valid arch-specific guest state (RIP/PC, flags/PSTATE, control
+//   registers/sysregs, segments/tables on x86-64, etc.) and run a tiny
+//   guest to the interrupt-window point. The existing libz
+//   replyVmExit helper intentionally only zeroes the wide vm_exit
+//   window and writes the initial_state sub-code; that keeps the vCPU
+//   not-started and re-delivers synthetic initial_state exits. Adding
+//   a timeout recv to that state would only prove that a suspended or
+//   not-started vCPU did not deliver an interrupt, which a no-op or
+//   deliver-anyway implementation could still pass.
+//
+//   Until that harness exists, this file only checks the syscall
+//   prelude that is honestly observable here: on a real VM with an
+//   in-range IRQ line and clean reserved bits, the deassert call after
+//   a prior assert call returns OK rather than surfacing E_BADCAP /
+//   E_INVAL. It does not assert the promised guest/vCPU-visible "no
+//   interrupt vm_exit" behavior.
 //
 // Strategy
 //   Stage the same VM + vCPU + exit_port prelude as
@@ -38,8 +50,8 @@
 //     (b) vm_inject_irq(vm, irq_num=0, assert_word=0) — the
 //         immediately-following deassert under test.
 //
-//   irq_num = 0 is in range for both x86-64's IOAPIC (24 lines)
-//   and aarch64's GIC (1024 SPI/PPI/SGI ids), so §[vm_inject_irq]
+//   irq_num = 0 is in range for both x86-64's IOAPIC and aarch64's
+//   vGIC, so §[vm_inject_irq]
 //   [test 02]'s out-of-range E_INVAL gate cannot fire on either
 //   call. assert_word = 1 (assert) and assert_word = 0 (deassert)
 //   each have bits 1-63 clear, so [test 03]'s reserved-bits
@@ -57,7 +69,7 @@
 //     vm_ceiling = 0x01.
 //   - create_port: caps = {bind, recv}. `bind` is required so the
 //     port can be passed as create_vcpu's exit_port; `recv` lives
-//     within port_ceiling = 0x1C in case future test variants
+//     within port_ceiling = 0x5C in case future test variants
 //     pull from the port. Both bits are within the runner's
 //     port_ceiling.
 //   - create_vcpu: caps = {susp, read, write}. All three bits
@@ -104,6 +116,16 @@
 //   5: deassert vm_inject_irq returned non-OK on a valid VM
 //      handle with irq_num = 0 and assert_word = 0 immediately
 //      after the prior assert.
+//
+// Blocker for full §[vm_inject_irq] test 05 closure
+//   Add a shared suite helper that can:
+//     - stage a minimal per-arch guest page and map it executable with
+//       map_guest,
+//     - reply to the initial vm_exit with a complete valid guest-state
+//       window instead of only the initial_state sub-code,
+//     - drive the guest until interrupts are unmasked / the interrupt
+//       window opens, and
+//     - classify a finite-timeout recv as "no interrupt-class vm_exit".
 
 const lib = @import("lib");
 
@@ -188,7 +210,7 @@ pub fn main(cap_table_base: u64) void {
     // 5. Mint the exit port. `bind` is required for create_vcpu's
     //    [4] handle. `recv` is included to match the create_vcpu_09
     //    / vm_inject_irq_04 prelude shape; both bits live within
-    //    port_ceiling = 0x1C.
+    //    port_ceiling = 0x5C.
     const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cport = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cport.v1)) {
