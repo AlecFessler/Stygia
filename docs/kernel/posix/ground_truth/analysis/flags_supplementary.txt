@@ -1,0 +1,104 @@
+==============================================================================
+ARGUMENT-LEVEL DETAIL
+==============================================================================
+
+-- open() flags
+      2  O_RDONLY|O_LARGEFILE
+      2  O_RDONLY|O_LARGEFILE|O_CLOEXEC
+      1  O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_CLOEXEC
+
+-- openat() flags
+   (none)
+
+-- mmap() prot, flags
+     13  PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS
+      5  PROT_NONE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS
+      1  PROT_READ, MAP_SHARED
+
+-- mprotect() prot
+   (none)
+
+-- lseek() whence
+      2  SEEK_CUR
+
+-- wait4() options
+      5  0
+      5  WNOHANG
+
+-- rt_sigprocmask() how
+     20  SIG_SETMASK
+     10  SIG_BLOCK
+      2  SIG_UNBLOCK
+
+-- rt_sigaction() signals
+      9  SIGQUIT
+      4  SIGINT
+      2  SIGCHLD
+      2  SIGTERM
+
+-- ioctl() fd
+      4  1
+      2  0
+
+-- ioctl() request
+      6  TIOCGWINSZ
+
+-- fcntl() cmd
+      4  F_SETFD
+
+-- fcntl() full arg triple
+      4  3, F_SETFD, FD_CLOEXEC
+
+-- dup2() oldfd,newfd
+   (none)
+
+-- pipe variant
+   (none)
+
+-- process-creation variant
+      5  fork
+
+-- stat family variant
+     13  stat
+      1  lstat
+      1  fstat
+
+-- read/write family variant
+      7  read
+      3  writev
+      2  write
+
+-- getdents64() bufsize
+   (none)
+
+-- brk() arg
+      5  NULL
+      1  0xf0c2000
+      1  0x31a50000
+      1  0x1c93d000
+      1  0x268c7000
+      1  0x2b67f000
+
+-- exit_group() status
+      6  0
+      1  1
+
+-- set_tid_address() arg
+     14  0x1031748
+
+-- arch_prctl() code
+      9  ARCH_SET_FS
+
+-- uname
+      2  uname
+
+-- cred variant
+      2  geteuid
+
+==============================================================================
+SIGNAL DISPOSITIONS INSTALLED (sa_handler kind)
+==============================================================================
+      2  SIGCHLD    -> handler
+      2  SIGINT     -> handler
+      5  SIGQUIT    -> SIG_DFL
+      2  SIGQUIT    -> SIG_IGN

@@ -1,0 +1,16 @@
+echo hello
+ls
+pwd
+cd sub
+pwd
+cd ..
+exit
+
+
+BusyBox v1.37.0 (2026-08-07 10:07:27 CDT) built-in shell (ash)
+
+$ hello
+$ a.txt      b.txt      c.txt      d.dat      script.sh  sub
+$ /tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work
+$ $ /tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work/sub
+$ $ 

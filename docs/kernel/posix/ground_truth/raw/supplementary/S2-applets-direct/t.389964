@@ -1,0 +1,16 @@
+set_tid_address(0x1031748)              = 389964
+rt_sigprocmask(SIG_SETMASK, ~[KILL STOP RTMIN RT_1 RT_2], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
+rt_sigaction(SIGQUIT, {sa_handler=SIG_DFL, sa_mask=~[RTMIN RT_1 RT_2], sa_flags=SA_RESTORER, sa_restorer=0x1024f3d}, NULL, 8) = 0
+execve("/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/pwd", ["/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/pwd"], ["SHLVL=1", "HOME=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", "TERM=linux", "PATH=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin", "SHELL=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/sh", "PWD=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work"]) = 0
+arch_prctl(ARCH_SET_FS, 0x1031798)      = 0
+set_tid_address(0x1031748)              = 389964
+brk(NULL)                               = 0x31a4e000
+brk(0x31a50000)                         = 0x31a50000
+mmap(0x31a4e000, 4096, PROT_NONE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x31a4e000
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f271f106000
+getcwd("/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", 192) = 91
+ioctl(1, TIOCGWINSZ, {ws_row=0, ws_col=0, ws_xpixel=0, ws_ypixel=0}) = 0
+writev(1, [{iov_base="/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", iov_len=90}, {iov_base="\n", iov_len=1}], 2) = 91
+munmap(0x7f271f106000, 4096)            = 0
+exit_group(0)                           = ?

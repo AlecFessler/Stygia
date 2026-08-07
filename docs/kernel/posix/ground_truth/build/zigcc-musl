@@ -1,0 +1,16 @@
+#!/bin/sh
+# CC shim: zig cc as an x86_64-linux-musl cross compiler for busybox.
+#
+# busybox's scripts/trylink unconditionally appends three *diagnostic-only*
+# linker flags (INFO_OPTS(), trylink:99) that zig's linker does not implement:
+#   -Wl,--warn-common   -Wl,-Map,<exe>.map   -Wl,--verbose
+# None of them affect the produced binary and trylink never reads the .map it
+# asks for, so we drop them here rather than patching the busybox source.
+args=""
+for a in "$@"; do
+  case "$a" in
+    -Wl,--warn-common|-Wl,--verbose|-Wl,-Map,*) continue ;;
+  esac
+  args="$args '$a'"
+done
+eval exec zig cc -target x86_64-linux-musl "$args"

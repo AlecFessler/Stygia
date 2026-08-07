@@ -1,0 +1,34 @@
+set_tid_address(0x1031748)              = 389345
+rt_sigprocmask(SIG_SETMASK, ~[KILL STOP RTMIN RT_1 RT_2], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
+rt_sigaction(SIGQUIT, {sa_handler=SIG_DFL, sa_mask=~[RTMIN RT_1 RT_2], sa_flags=SA_RESTORER, sa_restorer=0x1024f3d}, NULL, 8) = 0
+close(3)                                = 0
+dup2(4, 1)                              = 1
+close(4)                                = 0
+execve("/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/ls", ["ls"], ["SHLVL=1", "HOME=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", "TERM=linux", "PATH=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin", "SHELL=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/sh", "PWD=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work"]) = 0
+arch_prctl(ARCH_SET_FS, 0x1031798)      = 0
+set_tid_address(0x1031748)              = 389345
+ioctl(0, TIOCGWINSZ, {ws_row=0, ws_col=0, ws_xpixel=0, ws_ypixel=0}) = 0
+ioctl(1, TIOCGWINSZ, 0x7ffd0ba00640)    = -1 ENOTTY (Inappropriate ioctl for device)
+brk(NULL)                               = 0x3c079000
+brk(0x3c07b000)                         = 0x3c07b000
+mmap(0x3c079000, 4096, PROT_NONE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x3c079000
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fdfffcd7000
+stat(".", {st_dev=makedev(0, 0x31), st_ino=43182, st_mode=S_IFDIR|0755, st_nlink=3, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=160, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.284889421-0500 */, st_mtime_nsec=284889421, st_ctime=1786115481 /* 2026-08-07T10:11:21.284889421-0500 */, st_ctime_nsec=284889421}) = 0
+open(".", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 3
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7fdfffcd5000
+getdents64(3, [{d_ino=43182, d_off=1, d_reclen=24, d_type=DT_DIR, d_name="."}, {d_ino=42848, d_off=8, d_reclen=24, d_type=DT_DIR, d_name=".."}, {d_ino=43189, d_off=7, d_reclen=32, d_type=DT_REG, d_name="script.sh"}, {d_ino=43187, d_off=6, d_reclen=32, d_type=DT_REG, d_name="d.dat"}, {d_ino=43186, d_off=5, d_reclen=32, d_type=DT_REG, d_name="c.txt"}, {d_ino=43185, d_off=4, d_reclen=32, d_type=DT_REG, d_name="b.txt"}, {d_ino=43184, d_off=3, d_reclen=32, d_type=DT_REG, d_name="a.txt"}, {d_ino=43183, d_off=2147483647, d_reclen=24, d_type=DT_DIR, d_name="sub"}], 2048) = 232
+lstat("./script.sh", {st_dev=makedev(0, 0x31), st_ino=43189, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=194, st_atime=1786115481 /* 2026-08-07T10:11:21.284889421-0500 */, st_atime_nsec=284889421, st_mtime=1786115481 /* 2026-08-07T10:11:21.286264082-0500 */, st_mtime_nsec=286264082, st_ctime=1786115481 /* 2026-08-07T10:11:21.286264082-0500 */, st_ctime_nsec=286264082}) = 0
+lstat("./d.dat", {st_dev=makedev(0, 0x31), st_ino=43187, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=6, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_mtime_nsec=283889423, st_ctime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_ctime_nsec=283889423}) = 0
+lstat("./c.txt", {st_dev=makedev(0, 0x31), st_ino=43186, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=6, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_mtime_nsec=283889423, st_ctime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_ctime_nsec=283889423}) = 0
+lstat("./b.txt", {st_dev=makedev(0, 0x31), st_ino=43185, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=5, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_mtime_nsec=283889423, st_ctime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_ctime_nsec=283889423}) = 0
+lstat("./a.txt", {st_dev=makedev(0, 0x31), st_ino=43184, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=6, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_mtime_nsec=283889423, st_ctime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_ctime_nsec=283889423}) = 0
+lstat("./sub", {st_dev=makedev(0, 0x31), st_ino=43183, st_mode=S_IFDIR|0755, st_nlink=2, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=60, st_atime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_atime_nsec=283889423, st_mtime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_mtime_nsec=283889423, st_ctime=1786115481 /* 2026-08-07T10:11:21.283889423-0500 */, st_ctime_nsec=283889423}) = 0
+getdents64(3, [], 2048)                 = 0
+close(3)                                = 0
+munmap(0x7fdfffcd5000, 8192)            = 0
+ioctl(1, TIOCGWINSZ, 0x7ffd0ba00570)    = -1 ENOTTY (Inappropriate ioctl for device)
+writev(1, [{iov_base="a.txt", iov_len=5}, {iov_base="\n", iov_len=1}], 2) = 6
+writev(1, [{iov_base="b.txt\nc.txt\nd.dat\nscript.sh\nsub\n", iov_len=32}, {iov_base=NULL, iov_len=0}], 2) = 32
+exit_group(0)                           = ?

@@ -1,0 +1,37 @@
+set_tid_address(0x1031748)              = 389967
+rt_sigprocmask(SIG_SETMASK, ~[KILL STOP RTMIN RT_1 RT_2], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
+rt_sigaction(SIGQUIT, {sa_handler=SIG_DFL, sa_mask=~[RTMIN RT_1 RT_2], sa_flags=SA_RESTORER, sa_restorer=0x1024f3d}, NULL, 8) = 0
+execve("/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/ls", ["/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/ls", "-l", "a.txt"], ["SHLVL=1", "HOME=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", "TERM=linux", "PATH=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin", "SHELL=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/sh", "PWD=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work"]) = 0
+arch_prctl(ARCH_SET_FS, 0x1031798)      = 0
+set_tid_address(0x1031748)              = 389967
+ioctl(0, TIOCGWINSZ, {ws_row=0, ws_col=0, ws_xpixel=0, ws_ypixel=0}) = 0
+brk(NULL)                               = 0x1c93b000
+brk(0x1c93d000)                         = 0x1c93d000
+mmap(0x1c93b000, 4096, PROT_NONE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x1c93b000
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f0f1bd41000
+lstat("a.txt", {st_dev=makedev(0, 0x31), st_ino=43517, st_mode=S_IFREG|0644, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=8, st_size=6, st_atime=1786115640 /* 2026-08-07T10:14:00.487507222-0500 */, st_atime_nsec=487507222, st_mtime=1786115640 /* 2026-08-07T10:14:00.487507222-0500 */, st_mtime_nsec=487507222, st_ctime=1786115640 /* 2026-08-07T10:14:00.487507222-0500 */, st_ctime_nsec=487507222}) = 0
+open("/etc/passwd", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 3
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f0f1bd40000
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+read(3, "root:x:0:0::/root:/usr/bin/bash\nbin:x:1:1::/:/usr/bin/nologin\ndaemon:x:2:2::/:/usr/bin/nologin\nmail:x:8:12::/var/spool/mail:/usr/bin/nologin\nftp:x:14:11::/srv/ftp:/usr/bin/nologin\nhttp:x:33:33::/srv/http:/usr/bin/nologin\nnobody:x:65534:65534:Kernel Overflo"..., 1024) = 1024
+read(3, " polkitd:/:/usr/bin/nologin\nalec:x:1000:1000::/home/alec:/bin/zsh\navahi:x:969:969:Avahi mDNS/DNS-SD daemon:/:/usr/bin/nologin\nrtkit:x:133:133:RealtimeKit:/proc:/usr/bin/nologin\nsddm:x:968:968:SDDM Greeter Account:/var/lib/sddm:/usr/bin/nologin\nnvidia-persi"..., 1024) = 1024
+lseek(3, -958, SEEK_CUR)                = 1090
+close(3)                                = 0
+munmap(0x7f0f1bd40000, 4096)            = 0
+open("/etc/group", O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 3
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f0f1bd40000
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+read(3, "root:x:0:brltty,root\nsys:x:3:bin\nmem:x:8:\nftp:x:11:\nmail:x:12:\nlog:x:19:\nsmmsp:x:25:\nproc:x:26:\ngames:x:50:\nlock:x:54:\nnetwork:x:90:\nfloppy:x:94:\nscanner:x:96:\npower:x:98:\nnobody:x:65534:\nadm:x:999:daemon\nwheel:x:998:alec\nutmp:x:997:\naudio:x:996:brltty\ndis"..., 1024) = 1024
+lseek(3, -245, SEEK_CUR)                = 779
+close(3)                                = 0
+munmap(0x7f0f1bd40000, 4096)            = 0
+open("/etc/localtime", O_RDONLY|O_NONBLOCK|O_LARGEFILE|O_CLOEXEC) = 3
+fstat(3, {st_dev=makedev(0x103, 0x9), st_ino=1049736, st_mode=S_IFREG|0644, st_nlink=3, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=8, st_size=3592, st_atime=1786055676 /* 2026-08-06T17:34:36.991706639-0500 */, st_atime_nsec=991706639, st_mtime=1783535910 /* 2026-07-08T13:38:30-0500 */, st_mtime_nsec=0, st_ctime=1786055676 /* 2026-08-06T17:34:36.966042137-0500 */, st_ctime_nsec=966042137}) = 0
+mmap(NULL, 3592, PROT_READ, MAP_SHARED, 3, 0) = 0x7f0f1bd40000
+close(3)                                = 0
+ioctl(1, TIOCGWINSZ, {ws_row=0, ws_col=0, ws_xpixel=0, ws_ypixel=0}) = 0
+writev(1, [{iov_base="-rw-r--r--    1 alec     alec             6 Aug  7 10:14 a.txt", iov_len=62}, {iov_base="\n", iov_len=1}], 2) = 63
+exit_group(0)                           = ?
