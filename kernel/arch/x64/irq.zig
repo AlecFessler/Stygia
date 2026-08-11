@@ -252,6 +252,11 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
 /// invocation just resets the next tick to `TIMESLICE_NS` from now.
 fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
+    // stygia-8xl breadcrumb: this vector is BOTH the preemption tick and
+    // the cross-core wake/scheduler IPI (`apic.sendSchedulerIpi`). A core
+    // whose counter is frozen in the hang dump is not taking the kick at
+    // all; one whose counter advances took it and still failed to act.
+    stygia.utils.spin_diag.noteEntry();
     kprof.enter(.sched_tick);
     defer kprof.exit(.sched_tick);
 

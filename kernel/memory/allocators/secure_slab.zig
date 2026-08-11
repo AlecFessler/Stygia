@@ -2,6 +2,7 @@ const std = @import("std");
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const bump = stygia.memory.allocators.bump;
 const debug = stygia.utils.sync.debug;
 
@@ -80,6 +81,7 @@ pub const GenLock = extern struct {
             // `waitForShootdownAcks` the machine wedges. Service
             // pending sync arms between attempts — near-free when
             // none are pending.
+            spin_diag.note(.slab_lock, @intFromPtr(self));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
             iters +%= 1;
@@ -214,6 +216,7 @@ pub const GenLock = extern struct {
             // fireMemoryFault (#PF context, IRQs off) spinning here on
             // a CD gen-lock whose holder was waiting for this core's
             // shootdown ack (stygia-rs6 mechanism 9).
+            spin_diag.note(.slab_lock, @intFromPtr(self));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             std.atomic.spinLoopHint();
             iters +%= 1;

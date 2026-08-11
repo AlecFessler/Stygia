@@ -25,6 +25,7 @@ const std = @import("std");
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const kprof = stygia.kprof.trace_id;
 const scheduler = stygia.sched.scheduler;
 
@@ -291,6 +292,125 @@ fn drainLocalFlush(local_core: u8) void {
     slot.done_seq.store(req, .release);
 }
 
+/// Service a cross-core FPU flush request targeting THIS core from
+/// inside an unbounded barrier spin (stygia-8xl).
+///
+/// ## Why every IRQ-masked barrier must call this
+///
+/// `migrateFlush` is a blocking cross-core protocol: the destination
+/// core publishes a request, IPIs the source core, and then SPINS —
+/// with interrupts masked, because it is reached through
+/// `interrupts.switchTo` — until the source core saves the FP regs.
+/// It is careful to service ITS OWN mailbox while spinning, precisely
+/// so two cores flushing each other cannot wedge.
+///
+/// Every other unbounded wait in the kernel got only half of that
+/// discipline. `serviceTlbMaintenanceWhileSpinning` was added so a
+/// spinner could not go deaf to shootdown IPIs; nothing was ever added
+/// for the FPU mailbox. And these waits are reached from the SYSCALL
+/// path, where `IA32_FMASK` clears IF on entry and no handler re-enables
+/// it — so a core spinning in one of them is deaf to the flush IPI for
+/// as long as it spins.
+///
+/// That closes a wait-for cycle with no participant able to yield:
+///
+///   core A: `terminate(X)` retired X, saw `X.owner_core == B`, and now
+///           spins in `routeRetiredFinalize` until B drops X from
+///           `current_ec`. IRQs masked (syscall).
+///   core B: dispatching X — `current_ec` is already published — is
+///           inside `interrupts.switchTo` → `migrateFlush(X)`, waiting
+///           for A to flush X's FP regs. IRQs masked.
+///
+/// B cannot reach `dispatchTailBody` (which would notice X is retired
+/// and discharge it), so A's condition never becomes false. The
+/// terminal photograph is a core holding a RETIRED, gen-dead EC in
+/// `current_ec` with ready ECs stranded behind a second wedged core.
+///
+/// ## Why doing the save HERE is sound
+///
+/// Note carefully what does NOT justify this: "the flush IPI could have
+/// fired at this instruction anyway." At these call sites it provably
+/// could not — that deafness is the whole bug — so that argument is
+/// circular and must not be used.
+///
+/// The actual argument is about WHEN, not whether. The request is
+/// sitting in this core's LAPIC IRR and will be delivered the instant IF
+/// is restored, which happens at the `sysretq`/`iretq` ending this
+/// syscall, before any user instruction runs. The handler would then
+/// perform exactly this mutation. So the drain cannot produce a state
+/// the machine was not already going to reach; it only reaches it
+/// EARLIER. What remains is to show that the reorder is harmless for
+/// every reader of the state `doFlushSave` touches.
+///
+/// `fpu_state` and CR0.TS are quick. The drained EC's `fpu_state` is
+/// read by the requesting core only after it observes `done_seq`, which
+/// we publish last. CR0.TS / `fpu_trap_armed` clear early, and the
+/// kernel is built without SSE/NEON, so no kernel instruction between
+/// here and the return can raise #NM: clearing TS early can only remove
+/// a trap, never introduce one.
+///
+/// `last_fpu_owner` needs the full list, because it has SIX readers and
+/// two of them are hand-rolled asm reading struct offsets:
+///
+///   1. `doFlushSave` (this file) — the drain itself. The mailbox claim
+///      is an atomic Xchg, so exactly one drainer wins.
+///   2. `handleTrap` (this file) — cannot run in between, per the #NM
+///      argument above. On the next USER FP instruction it sees null and
+///      re-establishes ownership, identically to the post-IPI timeline.
+///   3. `interrupts.switchTo` — CAN run in between (`syscallDispatch`
+///      tail-calls `hopParkRun`). Sees null, recomputes
+///      `desired_armed = true`, re-arms. That is precisely the recovery
+///      `doFlushSave`'s own comment specifies, and what it would do
+///      after an IPI-driven flush.
+///   4. the IPC SUSPEND fast path (`arch/x64/interrupts.zig`, which
+///      passes `@offsetOf(PerCore, "last_fpu_owner")` and
+///      `fpu_trap_armed` into a naked stub) — cannot run in between.
+///      The asm classifier runs at `syscallEntry`, strictly before
+///      `syscallDispatch`, and either completes to `sysretq` without
+///      ever reaching the slow path (so no barrier here runs at all) or
+///      bails to `.Lsyscall_slow_path` BEFORE dispatch. It cannot
+///      re-enter on this core until the next syscall entry — which is
+///      after IF is restored and therefore after the pending IPI has
+///      been taken, so it reads the same state on either timeline.
+///   5. the IPC REPLY fast path — identical argument, same two offsets.
+///   6. `clearFromLastFpuOwner` (this file) — CAN run in between, and
+///      does whenever pins are outstanding: `terminate` drains inside
+///      `waitForPinsDrained` (whose body runs only when
+///      `pin_depth != 0`) and only then calls it. Safe in both
+///      branches, but NOT for the same reason, and the second one is
+///      easy to get wrong:
+///        - If it names the EC we just drained, `doFlushSave` already
+///          nulled that EC's `last_fpu_core` — unconditionally, at its
+///          tail, outside both `if`s — so `storedCore` returns null and
+///          it exits before touching any slot.
+///        - If it names a DIFFERENT EC, our slot may still name it.
+///          `doFlushSave`'s inner `if (ref.ptr == ec)` can be false —
+///          the mailbox named Y while our slot named X — and then
+///          `clearFromLastFpuOwner(X)` does match and does null the
+///          slot. That is NOT a no-op. It is still correct, because in
+///          exactly that branch the drain touched NONE of
+///          `last_fpu_owner`, `fpu_trap_armed` or CR0.TS — only
+///          `Y.last_fpu_core` and `done_seq`, neither of which this
+///          reader consults for X. So nothing is reordered for this
+///          reader at all, and nulling the slot is what it would have
+///          done on either timeline. It is the function's whole job.
+///
+/// One precision on the reorder framing above: where the drained and
+/// undrained timelines DIFFER, they differ toward MORE trap-arming,
+/// never less. In the `switchTo`-in-between case, draining makes it see
+/// null and arm TS; not draining lets it see the stale owner, arm TS,
+/// `iretq` into the new EC, and only then take the IPI — which clears
+/// TS and nulls the slot, leaving that EC running with another EC's FP
+/// registers live and no trap armed. The reorder is not state-identical;
+/// it is safe in the direction that matters.
+///
+/// Supporting, not load-bearing: `migrateFlush` already calls
+/// `drainLocalFlush` with IRQs masked, so masked-context draining is an
+/// established mode for this code rather than a new one.
+pub fn serviceLocalFlushWhileSpinning() void {
+    drainLocalFlush(@truncate(arch.smp.coreID()));
+}
+
 /// IPI handler invoked on the source core when another core needs to
 /// take ownership of `ec`'s FPU state across a migration. Saves the
 /// regs (if this core still owns them) and clears `last_fpu_owner`
@@ -351,6 +471,7 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
         // with IRQs masked (reached through `switchTo`), so without it
         // a core parked here is deaf to the shootdown IPI another core
         // is inside `waitForShootdownAcks` waiting for.
+        spin_diag.note(.fpu_mailbox, 0);
         arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();
         drainLocalFlush(cur_core);
@@ -401,6 +522,7 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
             arch.cpu.sendFpuFlushIpi(src_core);
         }
         flush_spins +%= 1;
+        spin_diag.note(.fpu_mailbox, 1);
         // Ack-while-spinning — see the request_lock spin above.
         arch.paging.serviceTlbMaintenanceWhileSpinning();
         arch.cpu.cpuRelax();

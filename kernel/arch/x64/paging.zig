@@ -511,6 +511,7 @@ inline fn waitForShootdownAcks(expected_gen: u64, self_id: u64, core_count: u64)
     while (i < core_count) : (i += 1) {
         if (i == self_id) continue;
         while (@atomicLoad(u64, &core_acked_gen[i], .acquire) < expected_gen) {
+            stygia.utils.spin_diag.note(.shootdown_ack, i);
             asm volatile ("pause" ::: .{ .memory = true });
         }
     }

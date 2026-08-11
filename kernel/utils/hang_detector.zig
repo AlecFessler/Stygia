@@ -10,8 +10,28 @@
 //! wait queue if it can be inferred. Output is unlocked `printRaw` (same
 //! discipline as panic) so it can run mid-spinlock without deadlocking.
 //!
-//! Build-gated by `-Dkernel_hang_detector` (default true under -Dprofile=test).
-//! When off, every public symbol is a no-op and storage is zero-sized.
+//! NOT build-gated. This module is compiled into every profile, and the
+//! x86-only paths self-disable via `builtin.cpu.arch` (`tickCheck`,
+//! `arm` and `forceDump` all open with that guard).
+//!
+//! **The fast path is not as cheap as this comment used to claim.** It
+//! was described as "one atomic load plus a clock read"; it is actually
+//! a globally-shared `tick_counter.fetchAdd` — a contended cacheline,
+//! every tick on every core — plus FOUR `outb` to COM1 every 64th tick
+//! via `emitHeartbeatByte`, then `armed.load`, `dump_fired.load`, the
+//! clock read, and `last_progress_ns.load`. That is one atomic RMW,
+//! three atomic loads, a clock read, and periodic port I/O. The cost is
+//! still judged acceptable for an always-on hang detector, but it is
+//! stated honestly here because that cost is the entire justification
+//! for not gating this module, and an understated cost is how a gate
+//! decision gets made on bad information. An earlier version
+//! of this comment claimed a `-Dkernel_hang_detector` gate "default true
+//! under -Dprofile=test" — no such `b.option` has ever existed, and the
+//! string appeared nowhere in the tree except in that claim. The nearest
+//! real flag is `-Dkernel_hang_watchdog`, which arms the HPET-NMI
+//! watchdog as a second entry point into `dump` and is a different thing.
+//! The one real gate reachable from here is `-Dspin_entry_diag`, which
+//! controls only `spin_diag.entries` / the `sched_entries` column.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +43,7 @@ const execution_context = stygia.sched.execution_context;
 const capability_domain = stygia.caps.capability_domain;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
+const spin_diag = stygia.utils.spin_diag;
 const timer = stygia.sched.timer;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const EventType = stygia.sched.execution_context.EventType;
@@ -48,6 +69,11 @@ pub var last_progress_ns: std.atomic.Value(u64) =
 /// (potentially page-fault-prone) walk.
 pub var dump_fired: std.atomic.Value(bool) =
     std.atomic.Value(bool).init(false);
+
+/// stygia-8xl: how many hang photographs one boot may emit. See the
+/// re-arm in `tickCheck`.
+pub const DUMP_BUDGET: u32 = 6;
+pub var dumps_emitted: u32 = 0;
 
 /// True once `init()` has stamped the first `last_progress_ns` value. The
 /// detector is dormant until then so very-early boot before timers /
@@ -103,9 +129,12 @@ pub fn noteProgressOnNewline(b: u8) void {
 var tick_counter: std.atomic.Value(u64) =
     std.atomic.Value(u64).init(0);
 
-/// Called from the LAPIC scheduler tick after the periodic work. Cheap
-/// fast path when nothing is wrong: one atomic load + one TSC read +
-/// one subtraction.
+/// Called from the LAPIC scheduler tick after the periodic work. The
+/// fast path when nothing is wrong is one shared atomic RMW
+/// (`tick_counter`), three atomic loads, a clock read, and — every 64th
+/// tick — four `outb` to COM1. See the module header: this used to be
+/// documented as "one atomic load + one TSC read + one subtraction",
+/// which was never true of the code below it.
 pub fn tickCheck() void {
     if (builtin.cpu.arch != .x86_64) return;
     // Pre-armed-check counter so we can distinguish "tickCheck never
@@ -123,9 +152,20 @@ pub fn tickCheck() void {
     // emitted for HANG_THRESHOLD_NS — the canonical Type B / slow-tail
     // signature.
     if (delta >= HANG_THRESHOLD_NS) {
+        // stygia-8xl: the one-shot latch used to cost us every event
+        // after the first in a repeat-100 boot. The runner RECOVERS from
+        // one of these (it skips the batch and carries on), so a boot can
+        // produce several independent hangs and only the first was ever
+        // photographed. Allow a small budget instead, and re-arm the
+        // progress stamp after each dump so the next one needs a fresh
+        // HANG_THRESHOLD_NS of silence rather than tripping immediately
+        // on the dump's own elapsed time.
         if (dump_fired.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         emitHeartbeatByte('!');
         dump(delta);
+        const dumps = @atomicRmw(u32, &dumps_emitted, .Add, 1, .monotonic) + 1;
+        last_progress_ns.store(arch.time.currentMonotonicNs(), .release);
+        if (dumps < DUMP_BUDGET) dump_fired.store(false, .release);
         return;
     }
 
@@ -197,6 +237,7 @@ fn dump(elapsed_ns: u64) void {
         core_id += 1;
     }
 
+    dumpSpinLiveness(num_cores);
     dumpTimerWheels(num_cores);
     dumpLifecycleCounters();
     dumpSpawnTraceSamples();
@@ -209,6 +250,67 @@ fn dump(elapsed_ns: u64) void {
     execution_context.slab_instance.forEachAlive(@as(*u8, @ptrCast(&dump_visit_dummy)), dumpAliveEc);
 
     rawWrite("[HANG] (end)\n");
+}
+
+/// stygia-8xl liveness probe. Snapshot every core's spin/entry counters,
+/// busy-wait a bounded window, snapshot again, print the deltas.
+///
+/// This is the half that makes the breadcrumbs interpretable:
+///   spin+ > 0   → the core is spinning AT `site` right now.
+///   spin+ = 0, ent+ > 0 → not spinning anywhere instrumented, but still
+///                 taking the scheduler vector: it is in userspace or a
+///                 bounded kernel path, and `site` is a stale leftover.
+///   both 0      → the core is taking no interrupts at all: wedged with
+///                 IRQs masked, or halted without a wake source.
+fn dumpSpinLiveness(num_cores: u64) void {
+    var i: u64 = 0;
+    while (i < num_cores) : (i += 1) {
+        before_spin[i] = @atomicLoad(u64, &spin_diag.iters[i], .monotonic);
+        before_ent[i] = spin_diag.entryCount(i);
+    }
+
+    // Bounded busy-wait. Two constraints shape it:
+    //
+    //  * It must SERVICE TLB MAINTENANCE. This core is IRQ-masked for the
+    //    whole window, and a peer inside `waitForShootdownAcks` is waiting
+    //    on our ack — measured at 10.7M spin iterations against an earlier
+    //    version of this loop that only issued `pause`. Not a deadlock
+    //    (the window is bounded) but it perturbs the very state we are
+    //    here to photograph, and with a dump budget above 1 it does so
+    //    repeatedly.
+    //  * It is 60 ms, not 120. A core actually spinning racks up ~10^5
+    //    iterations in that time versus exactly 0 for a frozen one, which
+    //    is all the discrimination this probe needs; halving it halves the
+    //    perturbation.
+    const start = arch.time.currentMonotonicNs();
+    while (arch.time.currentMonotonicNs() -% start < 60_000_000) {
+        arch.paging.serviceTlbMaintenanceWhileSpinning();
+        asm volatile ("pause" ::: .{ .memory = true });
+    }
+
+    const this_core: u64 = @truncate(arch.smp.coreID());
+    rawWrite("[HANG] liveness over 60ms:\n");
+    i = 0;
+    while (i < num_cores) : (i += 1) {
+        rawWrite("[HANG]   core=");
+        printDecimal(i);
+        rawWrite(" spins+=");
+        printDecimal(@atomicLoad(u64, &spin_diag.iters[i], .monotonic) -% before_spin[i]);
+        rawWrite(" sched_entries+=");
+        printDecimal(spin_diag.entryCount(i) -% before_ent[i]);
+        rawWrite(" site=");
+        rawWrite(spin_diag.siteName(@atomicLoad(u16, &spin_diag.site[i], .monotonic)));
+        rawWrite(" arg=");
+        printHex(@atomicLoad(u64, &spin_diag.arg[i], .monotonic));
+        // The dumping core is frozen by this very loop for the whole
+        // window, so its deltas are 0 BY CONSTRUCTION. Unlabelled, that
+        // reads as "wedged with interrupts masked" under the rule below
+        // and turns the probe into exactly the false-signal trap it was
+        // built to remove.
+        if (i == this_core) rawWrite("   <-- DUMPING CORE: deltas frozen by this probe, NOT a signal");
+        rawWrite("\n");
+    }
+    rawWrite("[HANG]   (spins+>0 = spinning at site; spins+=0 with sched_entries+>0 = not spinning, site is stale; both 0 = taking no interrupts)\n");
 }
 
 fn dumpLifecycleCounters() void {
@@ -378,6 +480,14 @@ fn printTraceState(state: u8) void {
 
 var dump_visit_dummy: u8 = 0;
 
+/// Scratch for `dumpSpinLiveness`. Module-scope rather than stack locals:
+/// two `[MAX_CORES]u64` is 1 KiB, and this path is reachable from a timer
+/// IRQ whose kernel stack we do not want to spend that on. `dump_fired`
+/// serialises the dump, so a single shared pair is sufficient, and zero-
+/// init beats `undefined` on a diagnostic that prints what it reads.
+var before_spin: [scheduler.MAX_CORES]u64 = [_]u64{0} ** scheduler.MAX_CORES;
+var before_ent: [scheduler.MAX_CORES]u64 = [_]u64{0} ** scheduler.MAX_CORES;
+
 fn dumpAliveEc(_: *u8, ec: *ExecutionContext, gen: u63) bool {
     @setRuntimeSafety(false);
     rawWrite("[HANG]   ec=");
@@ -436,6 +546,19 @@ fn dumpCore(core_id: u8) void {
     if (pc.teardown_pending != null) rawWrite(" teardown_pending=1");
     if (pc.idle_parked) rawWrite(" idle_parked=1");
 
+    rawWrite("\n");
+
+    // stygia-8xl: WHERE is this core, not just what does it hold. See
+    // `utils/spin_diag.zig`; `dumpSpinLiveness` below re-samples the two
+    // counters so a stale breadcrumb can be told from a live spin.
+    rawWrite("[HANG]   wait: site=");
+    rawWrite(spin_diag.siteName(@atomicLoad(u16, &spin_diag.site[core_id], .monotonic)));
+    rawWrite(" arg=");
+    printHex(@atomicLoad(u64, &spin_diag.arg[core_id], .monotonic));
+    rawWrite(" spins=");
+    printDecimal(@atomicLoad(u64, &spin_diag.iters[core_id], .monotonic));
+    rawWrite(" sched_entries=");
+    printDecimal(spin_diag.entryCount(core_id));
     rawWrite("\n");
 
     // Dump run-queue heads plus a short bounded walk per level. This is

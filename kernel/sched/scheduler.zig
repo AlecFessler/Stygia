@@ -14,6 +14,7 @@ const std = @import("std");
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const ec_log = stygia.utils.ec_log;
 const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
@@ -534,7 +535,9 @@ pub fn claimPmuHardwareOwner(core: u8, ref: SlabRef(PerfmonState)) ?LockedPerfmo
             } else {
                 requestRemotePmuHandoffLocked(core, locked);
                 unlockPmuState(locked);
+                spin_diag.note(.pmu_handoff, 0);
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
+                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                 std.atomic.spinLoopHint();
             }
             return null;
@@ -547,7 +550,9 @@ pub fn claimPmuHardwareOwner(core: u8, ref: SlabRef(PerfmonState)) ?LockedPerfmo
             }
             requestRemotePmuHandoffLocked(core, locked);
             unlockPmuState(locked);
+            spin_diag.note(.pmu_handoff, 1);
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
             continue;
         }
@@ -577,7 +582,9 @@ pub fn retirePmuStateHardware(ref: SlabRef(PerfmonState)) bool {
             } else {
                 requestRemotePmuHandoffLocked(this_core, locked);
                 unlockPmuState(locked);
+                spin_diag.note(.pmu_handoff, 2);
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
+                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                 std.atomic.spinLoopHint();
             }
             return false;
@@ -592,7 +599,9 @@ pub fn retirePmuStateHardware(ref: SlabRef(PerfmonState)) bool {
             const done = locked.ptr.hw_core == null;
             unlockPmuState(locked);
             if (done) continue;
+            spin_diag.note(.pmu_handoff, 3);
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
             continue;
         }
@@ -621,7 +630,9 @@ pub fn releasePmuState(ref: SlabRef(PerfmonState)) void {
                         locked.ptr.handoff_pending = false;
                         unlockPmuState(locked);
                         arch.smp.triggerSchedulerInterrupt(owner_core);
+                        spin_diag.note(.pmu_handoff, 4);
                         arch.paging.serviceTlbMaintenanceWhileSpinning();
+                        stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                         std.atomic.spinLoopHint();
                         continue;
                     }
@@ -1042,7 +1053,9 @@ pub fn queueTeardown(core: u8, req: TeardownRequest) bool {
 pub fn queueCurrentTeardown(req: TeardownRequest) void {
     const core: u8 = @truncate(arch.smp.coreID());
     while (!queueTeardown(core, req)) {
+        spin_diag.note(.queue_teardown, @intFromPtr(req.cd.ptr));
         arch.paging.serviceTlbMaintenanceWhileSpinning();
+        stygia.sched.fpu.serviceLocalFlushWhileSpinning();
         std.atomic.spinLoopHint();
     }
 }
@@ -2151,7 +2164,12 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
             // is reachable with IRQs masked from the domain-destroy
             // path, and a core deaf to the shootdown IPI while another
             // core sits in `waitForShootdownAcks` wedges the machine.
+            spin_diag.note(.await_quiesced, core_idx);
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            // stygia-8xl: same class as `routeRetiredFinalize`'s wait —
+            // an IRQ-masked barrier whose target core may itself be
+            // blocked in `migrateFlush` waiting on this core's mailbox.
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             if (state.active_root.load(.acquire) == root_addr) {
                 std.atomic.spinLoopHint();
                 continue;

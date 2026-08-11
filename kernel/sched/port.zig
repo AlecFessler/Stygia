@@ -29,6 +29,7 @@ const stygia = @import("stygia");
 const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const arch_syscall = stygia.arch.dispatch.syscall;
 const capability = stygia.caps.capability;
 const capability_domain = stygia.caps.capability_domain;
@@ -607,6 +608,7 @@ fn waitForSuspendDirective(
                     arch.smp.triggerSchedulerInterrupt(owner_core);
                 }
             }
+            spin_diag.note(.directive_spin, @intFromPtr(target_ec));
             std.atomic.spinLoopHint();
         }
 
@@ -671,6 +673,7 @@ fn waitForSuspendDirective(
                 if (owner_core < scheduler.MAX_CORES) {
                     arch.smp.triggerSchedulerInterrupt(owner_core);
                 }
+                spin_diag.note(.directive_spin, @intFromPtr(target_ec));
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -817,7 +820,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
                 return errors.E_INVAL;
             }
             target_ref.unlockIrqRestore(target_irq_state);
+            spin_diag.note(.suspend_retry, @intFromPtr(target_ec));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
             tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
             target_ec = tlr.ptr;
@@ -867,7 +872,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
                 SuspendRetry.check(target_ec);
             lifecycle.releasePin(target_ec);
             if (should_retry) {
+                spin_diag.note(.suspend_retry, @intFromPtr(target_ec));
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
+                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -893,7 +900,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
         if (target_ec != caller and lifecycle.load(target_ec) == .running) {
             port_ref.unlockIrqRestore(plr.irq_state);
             if (target_pinned) lifecycle.releasePin(target_ec);
+            spin_diag.note(.suspend_retry, @intFromPtr(target_ec));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
             continue;
         }
@@ -902,7 +911,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
             const should_retry = SuspendRetry.check(target_ec);
             if (target_pinned) lifecycle.releasePin(target_ec);
             if (should_retry) {
+                spin_diag.note(.suspend_retry, @intFromPtr(target_ec));
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
+                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                 std.atomic.spinLoopHint();
                 continue;
             }
@@ -923,7 +934,9 @@ pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
             SuspendRetry.check(target_ec);
         if (target_pinned) lifecycle.releasePin(target_ec);
         if (should_retry) {
+            spin_diag.note(.suspend_retry, @intFromPtr(target_ec));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
+            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
             continue;
         }

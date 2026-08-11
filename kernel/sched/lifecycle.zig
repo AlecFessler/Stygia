@@ -9,6 +9,7 @@ const std = @import("std");
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 
 /// Authoritative EC lifecycle state.
 pub const State = enum(u8) {
@@ -122,6 +123,7 @@ pub fn tryPinLive(ec: anytype) bool {
         const old = ec.pin_depth.load(.seq_cst);
         std.debug.assert(old != std.math.maxInt(u8));
         if (ec.pin_depth.cmpxchgWeak(old, old + 1, .seq_cst, .seq_cst) != null) {
+            spin_diag.note(.claim_cas, @intFromPtr(ec));
             std.atomic.spinLoopHint();
             continue;
         }
@@ -142,7 +144,10 @@ pub fn releasePin(ec: anytype) void {
 
 pub fn waitForPinsDrained(ec: anytype) void {
     while (ec.pin_depth.load(.seq_cst) != 0) {
+        spin_diag.note(.pins_drained, @intFromPtr(ec));
         arch.paging.serviceTlbMaintenanceWhileSpinning();
+        // stygia-8xl: pin holders can be blocked in `migrateFlush`.
+        stygia.sched.fpu.serviceLocalFlushWhileSpinning();
         std.atomic.spinLoopHint();
     }
 }
@@ -203,6 +208,7 @@ pub fn beginWaitingClaim(ec: anytype) ClaimResult {
             },
             else => return .none,
         }
+        spin_diag.note(.claim_cas, @intFromPtr(ec));
         std.atomic.spinLoopHint();
     }
 }
@@ -227,6 +233,7 @@ pub fn beginWaitingClaimPinned(ec: anytype) ClaimResult {
         }
 
         releasePin(ec);
+        spin_diag.note(.claim_cas, @intFromPtr(ec));
         std.atomic.spinLoopHint();
     }
 }
@@ -259,6 +266,7 @@ pub fn publishPendedPayload(ec: anytype) void {
 
 pub fn waitForPendedPayload(ec: anytype) void {
     while (!ec.wait.payload_done.load(.acquire)) {
+        spin_diag.note(.pended_payload, @intFromPtr(ec));
         std.atomic.spinLoopHint();
     }
 }
@@ -295,6 +303,7 @@ pub fn retire(ec: anytype) State {
             ec.mark_state.store(@intFromEnum(MarkState.destroy), .release);
             return from;
         }
+        spin_diag.note(.retire_cas, @intFromPtr(ec));
         std.atomic.spinLoopHint();
     }
 }

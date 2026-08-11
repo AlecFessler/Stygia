@@ -2,6 +2,7 @@ const std = @import("std");
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const debug = stygia.utils.sync.debug;
 
 const SrcLoc = debug.SrcLoc;
@@ -29,6 +30,7 @@ fn spinAcquire(self: *SpinLock, src: SrcLoc) void {
     var iters: u64 = 0;
     while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
         // Ack-while-spinning (stygia-rs6 mechanism 9).
+        spin_diag.note(.spin_lock, @intFromPtr(self));
         arch.paging.serviceTlbMaintenanceWhileSpinning();
         std.atomic.spinLoopHint();
         iters +%= 1;

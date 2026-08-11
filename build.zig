@@ -129,6 +129,20 @@ pub fn build(b: *std.Build) void {
         "spawn_diag",
         "Enable test-child spawn/terminal attribution diagnostics (default: on under -Dprofile=test)",
     ) orelse (profile_name != null and std.mem.eql(u8, profile_name.?, "test"));
+    // Per-core kernel-entry counter feeding `spin_diag.entries` / the hang
+    // dump's liveness probe. Gated SEPARATELY from `spin_diag.note`, which
+    // is unconditional: `note` only ever runs inside an already-spinning
+    // wait loop, where one relaxed RMW is lost in the noise of the `pause`
+    // beside it, but `noteEntry` sits on the bare preemption tick and on
+    // every cross-core wake IPI with no surrounding spin to hide in. It is
+    // the one site where "free next to the pause" is not an argument, so
+    // production builds do not carry it. Default on under -Dprofile=test,
+    // which is where the hang detector that consumes it lives.
+    const kernel_spin_entry_diag = b.option(
+        bool,
+        "spin_entry_diag",
+        "Count kernel entries per core for the hang dump's liveness probe (default: on under -Dprofile=test)",
+    ) orelse (profile_name != null and std.mem.eql(u8, profile_name.?, "test"));
     // Test-only fixture devices (synthetic device_regions handed to the
     // root service so spec tests targeting `device_region` / IRQ / DMA
     // surfaces have something to scan for). Defaults on under
@@ -252,6 +266,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_pf_log", kernel_pf_log);
     build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
     build_opts.addOption(bool, "kernel_spawn_diag", kernel_spawn_diag);
+    build_opts.addOption(bool, "kernel_spin_entry_diag", kernel_spin_entry_diag);
     build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
     const build_opts_mod = build_opts.createModule();
     stygia_mod.addImport("build_options", build_opts_mod);

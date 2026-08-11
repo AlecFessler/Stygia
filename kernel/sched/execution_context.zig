@@ -6,6 +6,7 @@ const stygia = @import("stygia");
 const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
+const spin_diag = stygia.utils.spin_diag;
 const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
 const memory_init = stygia.memory.init;
@@ -921,7 +922,23 @@ fn routeRetiredFinalize(
     if (caller) |c| {
         if (c != ec) {
             while (scheduler.coreCurrentIs(retired_owner, ec)) {
+                spin_diag.note(.route_retired_wait, @intFromPtr(ec));
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
+                // stygia-8xl. This wait runs from the `terminate`
+                // syscall, i.e. with IF cleared by IA32_FMASK and never
+                // re-enabled, so it is deaf to every IPI. That is fine
+                // for the wake IPI we just sent (it only has to be
+                // delivered to the OTHER core) but fatal for the lazy-FPU
+                // flush protocol: `retired_owner` can be sitting in
+                // `interrupts.switchTo` → `migrateFlush`, IRQs masked,
+                // waiting for THIS core to save the very EC's FP regs —
+                // and it published `current_ec` before it got there, so
+                // our exit condition is exactly what it can no longer
+                // reach. Service the mailbox here; see
+                // `fpu.serviceLocalFlushWhileSpinning` for the full
+                // argument, including why "the IPI could have fired
+                // here anyway" is NOT the reason this is sound.
+                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
                 std.atomic.spinLoopHint();
             }
         }
