@@ -1,16 +1,30 @@
-# TLA+ model of the EC-lifecycle machine (model rev 16 / `systems.md` rev 16)
+# TLA+ model of the EC-lifecycle machine (model rev 17 / `systems.md` rev 17)
 
 TLC-checked model of the execution-context lifecycle state machine
-specified in `docs/kernel/systems.md`. **The transition relation is still
-the model revision-15 graph that the recorded exit-0 battery ran
-against.** Revision 16 adds artifact coverage (`t1d_min`/`pr4d_min`) and corrects
-the scope of `LiveSuspender` for a suspender that is itself externally
-parked or killed; it does not add a domain-pause model. The systems-doc
-half of revision 16 is doc-only for the model: it states a premise, fixes
-which leg of the user boundary one arm is checked on, and records a tree
-obligation, all invisible to a model that has no domains and no user
-memory. That parity gap is ledger entry **G12**, and G12 is the largest
-open one in the artifact.
+specified in `docs/kernel/systems.md`. Revision 17 adds the focused
+stygia-8xl vCPU cancellation surface without adding VM instruction
+semantics: `VCPU_ECS` marks ECs that enter guest mode after dispatch,
+remote retire of a guest-current vCPU must publish `VCPU_CANCEL`, and
+`VcpuCancelExit` is the owner-side VM-exit acknowledgement that returns
+the EC to the ordinary retired-current boundary/hop/finalize path. The
+default historical configs set `VCPU_ECS = {}` so their old scope remains
+unchanged; `vcpu_cancel` and `vcpu_nocancel` are the new load-bearing
+focused pair. Revision 16 was doc-only for the model: it stated a
+domain-pause premise, fixed which leg of the user boundary one arm is
+checked on, and recorded a tree obligation, all invisible to a model that
+has no domains and no user memory. That parity gap remains **G12**.
+
+**On `main`: this is the model only, and NOTHING RUNS IT.** Revisions 17
+and 18 landed here as a model-only port. Two classes of reference below
+point at artifacts that do not exist on this branch: the POSIX-campaign
+documents (`POSIX_AMENDMENTS.md`, `POSIX_TRANSITION_PLAN`) and the
+correspondence checker (`tools/check_model_correspondence` and its
+precommit stage `[0e]`) both live on `posix`. Consequently `main` has no
+`tla_battery` precommit stage and no correspondence gate: `run.sh` is
+never invoked automatically, and no gate notices if the model stops
+describing the code. The rows recorded here were reproduced by hand at
+the landing commit. Everything after that is unguarded, and a reader
+should assume drift rather than assume coverage.
 
 Revisions 6 through 10 were CO-EVOLVED with this model: model findings
 (N1–N6) were fed back into the doc, doc findings back into the model, and
@@ -333,7 +347,7 @@ gitignored; keep all generated output under them.
 
 | File | Purpose |
 |---|---|
-| `ECLifecycle.tla` | the model: rev 16 plus the dispatch-tail/PMU hardware-owner extension, with older/defective machines as switches |
+| `ECLifecycle.tla` | the model: rev 17 plus the dispatch-tail/PMU hardware-owner and vCPU-cancel extensions, with older/defective machines as switches |
 | `ECProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
 | `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
 | `ECLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
@@ -344,6 +358,8 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
 | `ECLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
 | `ECLifecycle_pmu_release.cfg` | focused PMU release/destruction lifetime check with per-core `phw` hardware refs and safe remote migration enabled; default battery |
+| `ECLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
+| `ECLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
 | `ECLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
 | `ECLifecycle_t1{min,s,r,d_min,d,full}.cfg` | **`LiveTerm` ladder under `SpecTrm`**, its minimal fairness set; `t1d_min` is the default directive-bearing replacement rung, while full `t1d` and `t1full` are extended/manual measured-unconverged rows |
 | `ECLifecycle_cr1minself.cfg` | focused `LiveSuspender` under `SpecSus` (neither N6 assumption), paired with `crfals` |
@@ -373,8 +389,8 @@ gitignored; keep all generated output under them.
 `ls ECLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
-	9–11 and the taxonomy kept describing them. There are **50 `.cfg` files**
-	and `run.sh` invokes **39**; the 11 it does not are `q1`–`q7`, `q7d`,
+9–11 and the taxonomy kept describing them. There are **52 `.cfg` files**
+and `run.sh` invokes **41**; the 11 it does not are `q1`–`q7`, `q7d`,
 `dirabafix`, full `medium`, and full `pr4d`, each with its reason
 recorded in `run.sh` itself.
 
@@ -399,11 +415,37 @@ form, which closes 2-cycles but not 3-cycles; `"none"` = the rev-7
 machine, a falsifier — round-7 C3), and **`TERM_ESCAPE`** (TRUE = the
 round-8 C-1 repair, a retired terminator abandons the W3/W4 wait; FALSE =
 revision 8, where mutual terminate deadlocks two cores — gated by
-`mterm`, which round-9 C-2 found was in NO runnable script).
-Feature gates: `SUSPEND_ON` (5c + recv-pop + edge 7), `RV_ON` (rendezvous
-window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
-(dead-domain filter route), `CR_BUDGET` (edge-1 creation), `TERM_BUDGET`
-(retires).
+`mterm`, which round-9 C-2 found was in NO runnable script),
+**`VCPU_ECS`** (the vCPU subset; empty in the historical aggregate
+configs), and **`VCPU_CANCEL`** (TRUE = remote retire publishes the arch
+cancel/kick and the owner acknowledges a VM exit; FALSE = the stygia-8xl
+falsifier).
+Feature gates: `SUSPEND_ON` (5c + edge 7 — cross-thread suspend of a
+RUNNABLE target), **`REQUEUE_ON`** (recv-pop + affinity claim-move),
+`RV_ON` (rendezvous window), `DIR_ON` (directive), `PINLOCK_ON`
+(pin-class locks), `S7_ON` (dead-domain filter route), `CR_BUDGET`
+(edge-1 creation), `TERM_BUDGET` (retires).
+
+**Revision 18 split `SUSPEND_ON`** (POSIX transition). Through revision 17
+one switch gated three mechanisms with three different fates: cross-thread
+suspend of a runnable target (no POSIX consumer — `POSIX_TRANSITION_PLAN`
+§3.3), `RecvPop` (which is **futex requeue**), and `AffMove` (which is
+**`sched_setaffinity`**). Dialing that one switch FALSE would have deleted
+futex requeue and `sched_setaffinity` from the model while every `.cfg`
+stayed green — the drift shape this file's parity discipline exists to
+catch, arriving via a switch rather than via a doc edit. The split lands at
+`REQUEUE_ON = SUSPEND_ON` in all 52 configs, so the transition relation is
+unchanged and **every recorded state count must reproduce exactly**; that
+reproduction is the evidence the split is a refactor. `SuspendPlace` /
+`SuspendTgtRetired` need no gate of their own — they are guarded by
+`pc = "suspC"`, which only `SuspendStart` and `RecvPop` can set.
+
+Note the asymmetry this exposes and does not fix: `SUSPEND_ON` and
+`REQUEUE_ON` are *feature* gates, and by this file's own taxonomy feature
+gates carry no falsifier (their evidence is the configs that enable them).
+That is a weaker standard than the machine switches are held to, and it is
+why a feature gate flipping FALSE is the cheapest way to lose a surface
+here.
 
 ## Parity table (spec section -> model construct)
 
@@ -436,16 +478,17 @@ window), `DIR_ON` (directive), `PINLOCK_ON` (pin-class locks), `S7_ON`
 | §9.4 both fused shapes | `FastPath` (suspend FP), `ReplyFP` (reply FP main) | asm conformance out of boundary (`stygia-qde`) |
 | §3.2 edge-4 claimability-at-the-hop | `E4_AT_HOP` switch + the e4 falsifier | the Phase-3b barrier-zero question, answered with teeth |
 | §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchEC` (selected/current commit) -> `DispatchPmu` (`pmuSwitch`) -> `DispatchLoad` (final context load); `DispatchAbort{Pre,After}Pmu` for lifecycle loss after commit; `PmuRelease` for perfmon-state release/destruction completion; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary. `InvPmuTailOwned` checks that at most one per-core PMU hardware ref names an EC; `InvPmuHwCoreRefCoherent` checks both `hw -> phw` and reverse `phw -> hw`; `InvPmuNoReleasedHw` checks release/destruction cannot complete while any PMU hardware token is live |
+| stygia-8xl vCPU guest-current retire/cancel | `VCPU_ECS`, `ecs[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitDomainQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
 | §3.2 wake body | `WakeStart` (5a/5b) + `WakePlace`/`WakePendDone`; `FireAt` + irq frame bodies | |
 | §3.3 IRQ discipline | masked sections = atomic actions; handler-active = masked (no nesting) | sync-exception rule outside boundary |
 | §3.5 R-claim | claims only inside container-atomic actions (pop+claim fused) or retire | gen-lock half abstracted (no gen) |
-| §3.6 T3 spins (**10 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W7 = `RetireEnabled` pd guard | W6, W8, W9 **not modelled** — and **W5-N (the domain-pause predicate wait) is not modelled either**, which revision 15's row omitted entirely: it accounted for 9 of 10 rows and read as complete. W5-N is the only PREDICATE-shaped wait in §3.6 and it belongs to G12 |
+| §3.6 T3 spins (**10 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W6's guest-current vCPU cancellation sub-obligation = `VcpuCancelExit`; W7 = `RetireEnabled` pd guard | Full W6 root teardown, W8, W9 **not modelled** — and **W5-N (the domain-pause predicate wait) is not modelled either**, which revision 15's row omitted entirely: it accounted for 9 of 10 rows and read as complete. W5-N is the only PREDICATE-shaped wait in §3.6 and it belongs to G12 |
 | §3.6 assumption (3), no interrupt storm | `SF_vars(BaseStep)` (STRONG, not weak) | rev 7 claimed the set was complete at two; this is the third, and it was always encoded — just not counted |
 | §4 hop | `HopRelease` (release first) -> `HopCommit{Wait,Requeue,Pended,Retired,Claimed}` | retired arm waits for NOTHING (F1); **rev 8: every commit arm that places picks its destination at placement time (M-2)** |
-| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the split dispatch tail; 3 = `UserPark`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
+| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the split dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
 | §5.1 T1 sources | one generic one-shot (`shot`) = deadline/wheel/device rows; rendezvous row = `RvStart` | periodic-scan loser protocol below granularity |
 | §5.2 T2 matrix | `RetireEcsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
-| §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin |
+| §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; running vCPU guest retire sets cancel state when `VCPU_CANCEL`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin and the stygia-8xl arch-cancel requirement |
 | §8.3 rendezvous | `RvStart` + `RvDeliver` | G-RV1 |
 | §8.5 creation | `CreateEC` (publish-last) | CD-lock liveness gate not modelled |
 | §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, `InvPmuTailOwned`, `InvPmuHwCoreRefCoherent`, `InvPmuNoReleasedHw`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC. The PMU invariants are hardware-owner/release ownership assertions, not a full PMU counter model |
@@ -1392,6 +1435,98 @@ which stays true and is the reason nobody should try the ghost-fairness
 route again.
 
 ## Results
+
+### Revision 18 — the `SUSPEND_ON` split, validated as state-preserving
+
+Revision 18 makes exactly one mechanism change: `SUSPEND_ON` splits into
+`SUSPEND_ON` (cross-thread suspend of a RUNNABLE target — `SuspendStart`)
+and `REQUEUE_ON` (`RecvPop`, which is futex requeue, and `AffMove`, which
+is `sched_setaffinity`). Rationale, and the POSIX-transition verdict table
+that rejects two of the four changes originally proposed, are in
+`POSIX_AMENDMENTS.md`.
+
+The claim is that this is a **refactor, not a semantic edit**, because
+`REQUEUE_ON = SUSPEND_ON` in all 52 configs leaves the transition relation
+unchanged. That claim is falsifiable and was **tested rather than
+asserted**: each config below was re-run under revision 18 and compared to
+a count measured under revision 17 **earlier the same day on the same
+machine** (`out/BASELINE_20260807.log`). The module was edited at
+13:53:42, so rows from `t1r` onward in that log are already revision 18
+and are NOT comparanda.
+
+| Config | `SUSPEND_ON` | rev 17 | rev 18 | |
+|---|---|---|---|---|
+| `vcpu_cancel` | FALSE | 39 | 39 | control |
+| `pmu_release` | FALSE | 31,970 | 31,970 | control |
+| `t1min` | FALSE | 77,498 | 77,498 | control |
+| `cr3self` | FALSE | 941,984 | 941,984 | control |
+| `t1s` | **TRUE** | 82,070 | 82,070 | **load-bearing** |
+| `large` | **TRUE** | 6,808,969 | 6,808,969 | **load-bearing** |
+| `medium_nodir` | **TRUE** | 6,828,440 | 6,828,440 | **load-bearing** |
+
+**Read the `SUSPEND_ON` column before reading the counts.** The four FALSE
+rows never enable `RecvPop` or `AffMove`, so their reproduction shows only
+that revision 18 broke nothing globally, and is close to VACUOUS as
+evidence about the split itself. The load-bearing evidence is the three
+TRUE rows — the ones that enable the family that moved.
+
+Reachability probes re-run under revision 18, all still firing (the
+violation is the pass, so a probe that goes quiet is a lost surface):
+`pr1` `ProbeNoRetiredRvSender`, `pr2` `ProbeNoRvPendedReceiver`, `pr3`
+`ProbeNoRetireFromPended`. `pr4d_min` `ProbeNoTermSuspendCycle` also fired
+under revision 18 in the shared battery.
+
+**Probe coverage is inverted relative to this transition, and nothing
+covers the split.** Of the five probes, `pr1`/`pr2` certify rendezvous
+(undecided post-POSIX), `pr4`/`pr5` certify the directive family (dark
+under `DIR_ON = FALSE`), and only `pr3` certifies a surface that plainly
+lives. **No probe covers `RecvPop` or `AffMove`** — so if a later revision
+sets `REQUEUE_ON = FALSE`, nothing fires. See `POSIX_AMENDMENTS.md` §6,
+including why the fix needs a ghost bit rather than five lines.
+
+**Scope correction.** The "31 configs + sany" figure below is STALE.
+`run.sh` now contains **41** `expect_*` invocations (20 `expect_pass`, 21
+`expect_violation`); **35** run by default and 6 sit behind
+`RUN_XLARGE=1` / `RUN_SLOW=1`. The per-config figures recorded under
+"Revision 15" are stale against the current model too — today's `t1r` is
+85,902 where this file records 11,969, because the revision-17 vCPU/PMU
+fields were never folded into these tables.
+
+**What this validation does NOT establish.** It shows the split preserved
+the model. It says nothing about whether the model still describes the
+code — that is `tools/check_model_correspondence` (precommit stage
+`[0e]`), whose manifest records **18 model variables with no Zig
+representation at all**. That checker is not on `main`.
+
+### Reproduced at the `main` landing commit
+
+Five rows re-run by hand on `main` when revisions 17/18 landed here. This
+is not the battery — `small` alone is ~49 minutes and `diraba` is an
+unconverged row — it is the vCPU pair plus three cheap controls chosen so
+that a pass row, a falsifier row, and the load-bearing `SUSPEND_ON = TRUE`
+side of the revision-18 split are each covered.
+
+| Config | Expected | Result | Distinct states |
+|---|---|---|---|
+| `vcpu_cancel` | clean, incl. `LiveVcpuCancel` | `No error has been found` | 39 (recorded 39) |
+| `vcpu_nocancel` | `InvRetiredVcpuCancelled` violated | **FIRED** | 29 before the violation, depth 8 |
+| `pmu_release` | clean | `No error has been found` | 31,970 (recorded 31,970) |
+| `pmu_remote` | `InvPmuHwCoreRefCoherent` violated | **FIRED** | 30 before the violation |
+| `t1s` | clean, `LiveTerm` under `SpecTrm` | `No error has been found` | 82,070 (recorded 82,070) |
+
+`sany` clean on both `ECLifecycle.tla` and `ECProbes.tla`. The three
+recorded counts reproduce **exactly**, which is the evidence that the
+port carried the model across without perturbing the transition relation.
+
+The `vcpu_nocancel` counterexample is the shape of the real defect: after
+`RetireEC` the state is `ecs[e1].st = "retired"` with `ecs[e1].vm =
+"guest"` and `cores[c1].cur = e1` — a retired vCPU still current on its
+owner core and still in guest mode, with no arch cancel published. That
+is the hang `a9885b326` fixed.
+
+**Not re-run on `main`:** the other 47 configs, including every row whose
+figure appears in the revision-15 and revision-18 tables above. Those
+figures remain upstream measurements.
 
 ### Revision 15 recorded battery, plus revision 16 recovery deltas
 

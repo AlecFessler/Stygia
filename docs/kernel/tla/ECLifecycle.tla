@@ -1,7 +1,7 @@
 ---------------------------- MODULE ECLifecycle ----------------------------
 (***************************************************************************)
 (* TLA+ model of the Stygia execution-context lifecycle machine,           *)
-(* docs/kernel/systems.md revision 16 (2026-08-02). Revision 8 carried     *)
+(* docs/kernel/systems.md revision 17 (2026-08-06). Revision 8 carried     *)
 (* three semantic deltas from rev 7, all encoded here: the staged          *)
 (* placement destination is no longer placement authority (placement       *)
 (* computes from the fresh descriptor under the destination lock -- the    *)
@@ -53,10 +53,40 @@ CONSTANTS
   Cores,        \* set of cores, e.g. {c1, c2}
   ECs,          \* set of (non-idle) execution contexts, e.g. {e1, e2}
   NULL,         \* model value: absent EC / core / holder / irq frame
+  VCPU_ECS,     \* subset of ECs that execute guest mode when dispatched
+  VCPU_CANCEL,  \* BOOLEAN: arch cancel request + forced VM-exit ack exists
   PENDED,       \* BOOLEAN: rev-5 pended hand-off + W7 (X2/X3/F1)
   PIN_GATE,     \* BOOLEAN: rev-5 pin_depth requeue-preemption gate (X1/F3)
-  SUSPEND_ON,   \* BOOLEAN: cross-EC suspend of a ready target (5c+7) and
-                \*          the recv-pop re-containment (5a+7)
+  SUSPEND_ON,   \* BOOLEAN: cross-EC suspend of a READY target (5c+7).
+                \* SPLIT IN REVISION 18 (POSIX transition). Through rev 17
+                \* this ALSO gated RecvPop and AffMove, which is a
+                \* conflation of three mechanisms with three different
+                \* fates:
+                \*   (a) SuspendStart/Place/TgtRetired -- one thread
+                \*       suspending another that is RUNNABLE. POSIX has no
+                \*       such operation (see POSIX_TRANSITION_PLAN 3.3),
+                \*       so this is the surface that goes dark.
+                \*   (b) RecvPop -- waiting -> claimed -> waiting
+                \*       re-containment. This is FUTEX REQUEUE. It lives.
+                \*   (c) AffMove -- the claim-move half of a cross-thread
+                \*       affinity edit. This is sched_setaffinity. It lives.
+                \* Setting one switch FALSE therefore used to delete
+                \* sched_setaffinity and futex requeue from the model
+                \* SILENTLY, while every .cfg stayed green -- the exact
+                \* drift shape README's parity discipline exists to catch.
+                \* (b) and (c) now ride REQUEUE_ON.
+  REQUEUE_ON,   \* BOOLEAN: the claim-move family that SURVIVES the POSIX
+                \* transition -- RecvPop (futex requeue) and AffMove
+                \* (sched_setaffinity). Both take a claim on a target the
+                \* caller does not own and discharge it through an
+                \* existing holder path (suspC and wakeC respectively), so
+                \* they exercise edge 5a/5c + edge 6/7 without the
+                \* blocking cross-thread semantics of SUSPEND_ON.
+                \* Revision 18 introduces this at REQUEUE_ON = SUSPEND_ON
+                \* in every existing config, so the transition relation is
+                \* UNCHANGED and every recorded state count must reproduce
+                \* exactly; that reproduction is the evidence the split is
+                \* a refactor and not a semantic edit.
   FASTPATH,     \* BOOLEAN: the fused IPC fast path (Sec 9.4)
   RV_ON,        \* BOOLEAN: the rendezvous window (Sec 8.3) -- a sender
                 \*          holding its receiver's claim while itself
@@ -186,6 +216,8 @@ CONSTANTS
                 \* same state.
 
 ASSUME TERM_BUDGET \in Nat /\ CR_BUDGET \in Nat /\ DROP_BUDGET \in Nat
+ASSUME VCPU_ECS \subseteq ECs
+ASSUME VCPU_CANCEL \in BOOLEAN
 ASSUME F1_MODE \in {"rev5","nowait","alwayswait"}
 ASSUME E4_AT_HOP \in BOOLEAN
 ASSUME PIN_BUMP_FIRST \in BOOLEAN
@@ -195,6 +227,8 @@ ASSUME TERM_ESCAPE \in BOOLEAN
 ASSUME DIR_DROP \in BOOLEAN
 ASSUME DIR_OWNED \in BOOLEAN
 ASSUME DIR_GENCHK \in BOOLEAN
+ASSUME SUSPEND_ON \in BOOLEAN
+ASSUME REQUEUE_ON \in BOOLEAN
 
 (***************************************************************************)
 (* State                                                                   *)
@@ -259,6 +293,12 @@ ASSUME DIR_GENCHK \in BOOLEAN
 (*               wait, EC context)                                        *)
 (*         tg  - wake/suspend body target                                 *)
 (*         ks  - core currently on this EC's kstack, or NULL (S3)         *)
+(*         vm  - arch execution submode for VCPU_ECS only: "host" means   *)
+(*               ordinary kernel/user-boundary execution; "guest" means   *)
+(*               the owner is in guest execution and a scheduler IPI is   *)
+(*               not, by itself, a lifecycle boundary; "cancel" means a   *)
+(*               remote retire requested an arch vCPU cancel/kick and     *)
+(*               teardown waits for the owner-side VM-exit acknowledgement*)
 (*                                                                        *)
 (* cores[c]: q    - run queue (set; FIFO order abstracted, see README)    *)
 (*           cur  - PerCore.current                                       *)
@@ -369,6 +409,7 @@ TypeOK ==
                       pc: EcPCs,
                       tg: ECs \cup {NULL},
                       ks: Cores \cup {NULL},
+                      vm: {"host","guest","cancel"},
                       lnk: BOOLEAN,
                       plk: {"none","held","preB","postD"},
                       dir: {"none","suspending","claiming","armed","failed","dead"},
@@ -435,21 +476,22 @@ EcCtx(c) == /\ cores[c].pc = "ecrun"
 (***************************************************************************)
 Init ==
   /\ \E f \in [ECs -> Cores]:
-       cores = [c \in Cores |->
-                 [q |-> {e \in ECs : f[e] = c},
-                  cur |-> NULL, pc |-> "idle", outg |-> NULL, irq |-> NULL]]
-  /\ ecs = [e \in ECs |->
-             [st |-> "ready", pk |-> "none",
-              shot |-> "none", own |-> NULL, pin |-> 0, pd |-> FALSE,
-              po |-> FALSE, hld |-> NULL, am |-> Cores, hw |-> NULL,
-              prel |-> FALSE,
-              mo |-> FALSE,
-              pc |-> "user", tg |-> NULL, ks |-> NULL,
-              lnk |-> FALSE, plk |-> "none", dir |-> "none",
-              dres |-> "none", dpin |-> FALSE,
-              dbad |-> FALSE, gen |-> 0, dgen |-> 0,
-              dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
-              dsrc |-> NULL, dd |-> FALSE]]
+       /\ cores = [c \in Cores |->
+                    [q |-> {e \in ECs : f[e] = c},
+                     cur |-> NULL, pc |-> "idle", outg |-> NULL, irq |-> NULL]]
+       /\ ecs = [e \in ECs |->
+                  [st |-> "ready", pk |-> "none",
+                   shot |-> "none", own |-> NULL, pin |-> 0, pd |-> FALSE,
+                   po |-> FALSE, hld |-> NULL, am |-> Cores, hw |-> NULL,
+                   prel |-> FALSE,
+                   mo |-> FALSE,
+                   pc |-> "user", tg |-> NULL, ks |-> NULL,
+                   vm |-> "host",
+                   lnk |-> FALSE, plk |-> "none", dir |-> "none",
+                   dres |-> "none", dpin |-> FALSE,
+                   dbad |-> FALSE, gen |-> 0, dgen |-> 0,
+                   dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
+                   dsrc |-> NULL, dd |-> FALSE]]
   /\ tb = TERM_BUDGET
   /\ cb = CR_BUDGET
   /\ db = IF S7_ON THEN 1 ELSE 0
@@ -542,7 +584,9 @@ DispatchLoad(c) ==
   /\ cores[c].pc = "dispatchLoad" /\ cores[c].irq = NULL /\ e # NULL
   /\ ecs[e].st = "running"
   /\ cores' = [cores EXCEPT ![c].pc = "ecrun"]
-  /\ UNCHANGED <<ecs, phw, tb, cb, db, pb>>
+  /\ ecs' = [ecs EXCEPT ![e].vm =
+                        IF e \in VCPU_ECS THEN "guest" ELSE "host"]
+  /\ UNCHANGED <<phw, tb, cb, db, pb>>
 
 (* PMU state release/destruction is modelled separately from dispatch-tail  *)
 (* hardware ownership. The fixed implementation may mark release pending    *)
@@ -707,6 +751,7 @@ DomDie ==
 UserPark(c) ==
   LET e == cores[c].cur IN
   /\ EcCtx(c) /\ ecs[e].pc = "user" /\ ecs[e].st = "running"
+  /\ ecs[e].vm = "host"
   /\ ecs[e].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ ecs[e].shot = "none"
   /\ ecs[e].pin = 0          \* Sec 2.4 assert: pin_depth = 0 at publish
@@ -719,7 +764,20 @@ UserPark(c) ==
                           \* ~E4_AT_HOP = the e4 falsifier: publish the
                           \* terminal wait state pre-hop, owner still on
                           \* the kstack -- todays tree shape; InvS3 fires
-                          ![e].pk = "wait", ![e].lnk = TRUE, ![e].shot = sh]
+                          ![e].pk = "wait", ![e].lnk = TRUE,
+                          ![e].shot = sh, ![e].vm = "host"]
+  /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
+  /\ UNCHANGED <<phw, tb, cb, db, pb>>
+
+VcpuGuestExit(c) ==
+  LET e == cores[c].cur IN
+  /\ EcCtx(c) /\ e \in VCPU_ECS
+  /\ ecs[e].pc = "user" /\ ecs[e].st = "running"
+  /\ ecs[e].vm = "guest"
+  /\ ecs[e].shot = "none"
+  /\ ecs[e].pin = 0
+  /\ ecs' = [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
+                        ![e].lnk = TRUE, ![e].vm = "host"]
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
   /\ UNCHANGED <<phw, tb, cb, db, pb>>
 
@@ -860,6 +918,7 @@ TickPreempt(c) ==
   LET e == cores[c].cur IN
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ e # NULL
   /\ ecs[e].st = "running"
+  /\ ecs[e].vm = "host"
   /\ PIN_GATE => ecs[e].pin = 0
   /\ PIN_GATE => ecs[e].pc \notin ClaimPCs
      \* Current claim continuations run in the IRQ-disabled reaching-lock
@@ -876,13 +935,16 @@ TickPreempt(c) ==
           (* requeue arm (entry from kernel: no directive arm, rule 3).   *)
           /\ ecs' = IF ecs[e].dsrc # NULL
                     THEN [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                                     ![e].lnk = TRUE, ![e].dir = "none", ![e].dres = "none",
+                                     ![e].lnk = TRUE, ![e].vm = "host",
+                                     ![e].dir = "none", ![e].dres = "none",
                                      ![ecs[e].dsrc].dlv = TRUE,  \* the ARMER
                                      ![e].dsrc = NULL]
                     ELSE [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                                     ![e].lnk = TRUE, ![e].dir = "none", ![e].dres = "none"]
+                                     ![e].lnk = TRUE, ![e].vm = "host",
+                                     ![e].dir = "none", ![e].dres = "none"]
           /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-     ELSE /\ ecs' = [ecs EXCEPT ![e].st = "parking", ![e].pk = "requeue"]
+     ELSE /\ ecs' = [ecs EXCEPT ![e].st = "parking", ![e].pk = "requeue",
+                                ![e].vm = "host"]
           /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
   /\ UNCHANGED <<phw, tb, cb, db, pb>>
 
@@ -891,9 +953,26 @@ TickPreempt(c) ==
 BoundaryRetired(c) ==
   LET e == cores[c].cur IN
   /\ EcCtx(c) /\ ecs[e].pc = "user" /\ ecs[e].st = "retired"
+  /\ ecs[e].vm = "host"
   /\ ecs[e].pin = 0    \* own pins/pin-class locks discharged pre-hop (2.4)
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
   /\ UNCHANGED <<ecs, phw, tb, cb, db, pb>>
+
+(* Arch vCPU cancellation acknowledgement (stygia-8xl). A remotely retired
+ * vCPU can be stuck below the generic scheduler boundary while the owner
+ * executes guest code. The lifecycle contract is not "scheduler IPI is
+ * enough"; retire must publish an arch cancel/kick, the architecture must
+ * force a VM exit, and only the owner-side acknowledgement converts the EC
+ * back to ordinary host execution where BoundaryRetired can run.          *)
+VcpuCancelExit(c) ==
+  LET e == cores[c].cur IN
+  /\ VCPU_CANCEL
+  /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ e # NULL
+  /\ e \in VCPU_ECS
+  /\ ecs[e].st = "retired"
+  /\ ecs[e].vm = "cancel"
+  /\ ecs' = [ecs EXCEPT ![e].vm = "host"]
+  /\ UNCHANGED <<cores, phw, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* The wake body, syscall context (futex wake / reply / recv-side): claim  *)
@@ -1074,7 +1153,8 @@ RvStart(c) ==
          /\ ecs[r].st = "waiting"
          /\ ecs' = [ecs EXCEPT
               ![s].st = "parking", ![s].pk = "wait",
-              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r,
+              ![s].lnk = TRUE, ![s].vm = "host",
+              ![s].pc = "rvC", ![s].tg = r,
               ![r].st = "claimed", ![r].hld = [ty |-> "ec", id |-> s],
               ![r].pin = @ + 1, ![r].shot = "none", ![r].lnk = FALSE]
       \/ (* receiver itself mid-park: 5b claim -> pended; the receiver's  *)
@@ -1083,7 +1163,8 @@ RvStart(c) ==
          /\ ecs[r].st = "parking" /\ ecs[r].pk = "wait"
          /\ ecs' = [ecs EXCEPT
               ![s].st = "parking", ![s].pk = "wait",
-              ![s].lnk = TRUE, ![s].pc = "rvC", ![s].tg = r,
+              ![s].lnk = TRUE, ![s].vm = "host",
+              ![s].pc = "rvC", ![s].tg = r,
               ![r].st = "pended", ![r].po = TRUE, ![r].pd = FALSE,
               ![r].hld = [ty |-> "ec", id |-> s],
               ![r].pin = @ + 1, ![r].shot = "none", ![r].lnk = FALSE]
@@ -1382,11 +1463,13 @@ DirConsume(c) ==
   /\ ecs[e].shot = "none" /\ ecs[e].pin = 0
   /\ ecs' = IF ecs[e].dsrc # NULL
             THEN [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                             ![e].lnk = TRUE, ![e].dir = "none",
+                             ![e].lnk = TRUE, ![e].vm = "host",
+                             ![e].dir = "none",
                              ![ecs[e].dsrc].dlv = TRUE,   \* credit the ARMER
                              ![e].dsrc = NULL]
             ELSE [ecs EXCEPT ![e].st = "parking", ![e].pk = "wait",
-                             ![e].lnk = TRUE, ![e].dir = "none"]
+                             ![e].lnk = TRUE, ![e].vm = "host",
+                             ![e].dir = "none"]
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
   /\ UNCHANGED <<phw, tb, cb, db, pb>>
 
@@ -1544,7 +1627,10 @@ RetireEcsAfter(e) ==
                      ![e].own = NULL, ![e].lnk = FALSE, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
                      ![e].pc = "user", ![e].tg = NULL]
     [] ecs[e].st = "running" ->                    \* boundary/hop discovery
-         [ecs EXCEPT ![e].st = "retired", ![e].mo = FALSE]
+         [ecs EXCEPT ![e].st = "retired", ![e].mo = FALSE,
+                     ![e].vm = IF e \in VCPU_ECS /\ ecs[e].vm = "guest"
+                                THEN IF VCPU_CANCEL THEN "cancel" ELSE "guest"
+                                ELSE "host"]
     [] ecs[e].st = "parking" ->                    \* hop discovery; marking
          \* deferred iff pin-writing (T2 marking column). The container
          \* unwind is retire STEP 3, after this CAS (Sec 8.2) -- it is the
@@ -1766,7 +1852,7 @@ CreateEC(c) ==
                      hld |-> NULL, am |-> Cores, hw |-> NULL,
                      prel |-> FALSE,
                      mo |-> FALSE,
-                     pc |-> "user", tg |-> NULL,
+                     pc |-> "user", tg |-> NULL, vm |-> "host",
                      ks |-> NULL, lnk |-> FALSE, plk |-> "none",
                      dir |-> "none", dres |-> "none", dpin |-> FALSE, dbad |-> FALSE,
                      gen |-> ecs[e].gen,   \* INHERIT, never reset (round-12)
@@ -1783,7 +1869,7 @@ CreateEC(c) ==
 (***************************************************************************)
 RecvPop(c) ==
   LET w == cores[c].cur IN
-  /\ SUSPEND_ON
+  /\ REQUEUE_ON      \* rev 18: futex requeue, not cross-thread suspend
   /\ EcCtx(c) /\ ecs[w].pc = "user" /\ ecs[w].st = "running"
   /\ ecs[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ ecs[w].shot = "none"
@@ -1814,7 +1900,8 @@ FastPath(c) ==
        /\ ecs[r].st = "waiting"                    \* 5b-shaped => bail
        /\ ecs' = [ecs EXCEPT
                     ![s].st = "waiting",
-                    ![s].own = NULL, ![s].ks = NULL, ![s].lnk = TRUE,
+                    ![s].own = NULL, ![s].ks = NULL,
+                    ![s].vm = "host", ![s].lnk = TRUE,
                     ![r].st = "running", ![r].own = c, ![r].ks = c,
                     ![r].shot = "none", ![r].lnk = FALSE]
        /\ cores' = [cores EXCEPT ![c].cur = r]
@@ -1839,7 +1926,7 @@ ReplyFP(c) ==
             ![r].st = "running", ![r].own = c, ![r].ks = c,
             ![r].shot = "none", ![r].lnk = FALSE,
             ![w].st = "ready", ![w].own = NULL, ![w].ks = NULL,
-            ![w].pk = "none"]
+            ![w].vm = "host", ![w].pk = "none"]
        /\ cores' = [cores EXCEPT ![c].cur = r, ![d].q = @ \cup {w}]
   /\ UNCHANGED <<phw, tb, cb, db, pb>>
 
@@ -1855,7 +1942,7 @@ ReplyFP(c) ==
 (* container => claim-move.                                                *)
 AffMove(c) ==
   LET w == cores[c].cur IN
-  /\ SUSPEND_ON
+  /\ REQUEUE_ON      \* rev 18: sched_setaffinity, not cross-thread suspend
   /\ EcCtx(c) /\ ecs[w].pc = "user" /\ ecs[w].st = "running"
   /\ ecs[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ ecs[w].shot = "none"
@@ -1890,7 +1977,7 @@ BaseStep(c) ==
   \/ HopRelease(c)
   \/ HopCommitWait(c) \/ HopCommitRequeue(c) \/ HopCommitPended(c)
   \/ HopCommitRetired(c) \/ HopCommitClaimed(c)
-  \/ BoundaryRetired(c)
+  \/ BoundaryRetired(c) \/ VcpuCancelExit(c)
   \/ WakePlace(c) \/ WakePendDone(c) \/ WakeTgtRetired(c)
   \/ RelwaitPlace(c)
   \/ SuspendPlace(c) \/ SuspendTgtRetired(c)
@@ -1956,7 +2043,7 @@ SpecDirNF == Init /\ [][DirectiveNext]_vars
 
 (* New requests (never fairness-forced).                                   *)
 Request(c) ==
-  \/ UserPark(c) \/ WakeStart(c) \/ SuspendStart(c) \/ RecvPop(c)
+  \/ UserPark(c) \/ VcpuGuestExit(c) \/ WakeStart(c) \/ SuspendStart(c) \/ RecvPop(c)
   \/ FastPath(c) \/ ReplyFP(c) \/ RvStart(c) \/ DirClaim(c)
   \/ DirSelfMark(c)
   \/ DirConsume(c) \/ DirFail(c) \/ DirDrop(c) \/ PinAcq(c) \/ CreateEC(c) \/ TermStart(c)
@@ -2373,6 +2460,26 @@ InvPmuNoReleasedHw ==
       /\ ecs[e].hw = NULL
       /\ \A c \in Cores: phw[c] # e
 
+(* stygia-8xl: a retired vCPU may be temporarily current only in the
+ * cancel-pending arch-owned state, never still executing raw guest code.
+ * The root teardown/quiescence side reads this as: current_ec = RETD is
+ * still non-quiescent until the owner acknowledges the cancel and clears
+ * current through the ordinary hop/finalize path.                         *)
+InvVcpuModeCoherent ==
+  \A e \in ECs:
+    ecs[e].vm # "host" =>
+      /\ e \in VCPU_ECS
+      /\ ecs[e].st \in {"running","retired"}
+      /\ \E c \in Cores:
+           /\ cores[c].cur = e
+           /\ cores[c].pc = "ecrun"
+
+InvRetiredVcpuCancelled ==
+  \A e \in ECs:
+    (e \in VCPU_ECS /\ ecs[e].st = "retired" /\ ecs[e].vm # "host") =>
+      /\ VCPU_CANCEL
+      /\ ecs[e].vm = "cancel"
+
 (* The UAF gate for rev 4's don't-wait F1 reading: a 5b claimant's         *)
 (* payload/payload_done writes land in the target's saved frame and        *)
 (* descriptor -- if the target can be FINALIZED (kstack unmapped, slot     *)
@@ -2402,6 +2509,9 @@ LiveParking ==   \* L1: parks complete (the sequence is never abandoned)
 
 LiveRetired ==   \* L2: retired => freed (the retire matrix is total)
   \A e \in ECs: ecs[e].st = "retired" ~> ecs[e].st = "freed"
+
+LiveVcpuCancel == \* stygia-8xl: arch cancel/kick eventually exits guest
+  \A e \in ECs: ecs[e].vm = "cancel" ~> ecs[e].vm = "host"
 
 LiveReady ==     \* L3: a ready EC is DISPATCHED (reaches `running`),
                  \* unless legitimately taken first by a 5c/S7 claim or a
