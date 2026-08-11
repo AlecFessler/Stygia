@@ -807,7 +807,16 @@ pub fn switchTo(ec: *ExecutionContext) void {
                 .payload = .{ 0, 0, 0 },
             };
         };
-        port_mod.fireVmExit(current, delivery.subcode, delivery.payload);
+        // stygia-8xl: a CANCELLED entry means another core retired this
+        // vCPU while it was executing guest code, and the run loop left
+        // guest mode to acknowledge that rather than exiting on a guest
+        // event. There is no event to report and no live EC to suspend —
+        // `fireVmExit` would publish a wait episode on a dead EC. Skip it
+        // and fall straight through to `dischargeOwnedParking`, which is
+        // the owner-side eviction the remote retire has been waiting for.
+        if (!delivery.cancelled) {
+            port_mod.fireVmExit(current, delivery.subcode, delivery.payload);
+        }
         arch.cpu.restoreInterrupts(irq);
 
         // `fireVmExit` suspends the vCPU through the normal running

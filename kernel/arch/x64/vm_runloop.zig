@@ -14,6 +14,7 @@ const cpu = stygia.arch.x64.cpu;
 const hv_vcpu = stygia.arch.x64.hv.vcpu;
 const hv_vm = stygia.arch.x64.hv.vm;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const mmio_decode = stygia.arch.x64.mmio_decode;
 const timers = stygia.arch.x64.timers;
 const vm_hw = stygia.arch.x64.vm;
@@ -31,6 +32,13 @@ const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
 pub const VmExitDelivery = struct {
     subcode: u8,
     payload: [3]u64,
+    /// The owner-side acknowledgement of an arch vCPU cancel (stygia-8xl).
+    /// True means this vCPU EC was retired by another core while we were
+    /// executing guest code, so we left the run loop rather than exiting
+    /// on a guest event. `subcode`/`payload` are meaningless in that case
+    /// and the caller must NOT deliver a vm_exit — the EC is dead. See
+    /// `enterGuest`'s cancel check for the full argument.
+    cancelled: bool = false,
 };
 
 // §[vm_exit_state] x86-64 sub-codes (mirror of the table in the spec).
@@ -87,6 +95,42 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     // vectors that should be injected on the next entry.
     var exit_info: vm_hw.VmExitInfo = undefined;
     while (true) {
+        // ── Arch vCPU cancellation acknowledgement (stygia-8xl) ──────────
+        //
+        // NEVER (RE-)ENTER THE GUEST ON A RETIRED EC. Another core can
+        // retire this vCPU at any point — domain teardown does exactly
+        // that — and it kicks us with a scheduler IPI. The kick works:
+        // `CTRL1_INTERCEPT_INTR` is set, so the IPI forces a VM exit and
+        // the `.interrupt_window` arm below opens the IRQ window for the
+        // host IDT to service it.
+        //
+        // What was missing is this check. Every arm of the switch below
+        // either breaks out or loops back to `vmResume`, and none of them
+        // consulted the EC's lifecycle — so after the IPI was serviced we
+        // went straight back into the guest. The owner core then sat in
+        // this loop forever holding a `retired` `current_ec`, while ready
+        // ECs queued behind it and the runner timed out waiting for
+        // results that no core was left to produce. That is the terminal
+        // signature in stygia-8xl: `current_ec ... state=RETD owner=N`
+        // with RDY ECs on the same core's run queue.
+        //
+        // Checking around `enterGuest` in the scheduler cannot fix this,
+        // because `enterGuest` never RETURNS — which is why the earlier
+        // attempts at that layer all still reproduced.
+        //
+        // This is `VcpuCancelExit` in the TLA lifecycle model: the arch
+        // forces the exit, and only the owner-side acknowledgement moves
+        // the EC out of guest submode so the ordinary retired-current
+        // boundary → hop → finalize path (`dischargeOwnedParking`, which
+        // the caller already invokes) can run. `BoundaryRetired` requires
+        // host submode for exactly this reason.
+        //
+        // Acquire load, and the EC is caller-pinned: it is this core's
+        // `current_ec` for the whole call, so the pointer stays live.
+        if (lifecycle.load(vcpu_ec) == .retired) {
+            return .{ .subcode = SUBCODE_UNKNOWN, .payload = .{ 0, 0, 0 }, .cancelled = true };
+        }
+
         // Advance the emulated LAPIC timer by the wall-clock time that
         // elapsed since the last pre-VMRUN tick. Linux's local timer is
         // the LAPIC timer; without this, programmed initial-counts

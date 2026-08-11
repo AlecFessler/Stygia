@@ -16,6 +16,7 @@ const hv_vcpu = stygia.arch.aarch64.hv.vcpu;
 const hv_vm = stygia.arch.aarch64.hv.vm;
 const hyp = stygia.arch.aarch64.hyp;
 const kprof = stygia.kprof.trace_id;
+const lifecycle = stygia.sched.lifecycle;
 const psci = stygia.arch.aarch64.hv.psci;
 const vgic = stygia.arch.aarch64.hv.vgic;
 const vm_hw = stygia.arch.aarch64.vm;
@@ -42,6 +43,13 @@ const VmExitInfo = vm_hw.VmExitInfo;
 pub const VmExitDelivery = struct {
     subcode: u8,
     payload: [3]u64,
+    /// The owner-side acknowledgement of an arch vCPU cancel (stygia-8xl).
+    /// True means this vCPU EC was retired by another core while we were
+    /// executing guest code, so we left the run loop rather than exiting
+    /// on a guest event. `subcode`/`payload` are meaningless in that case
+    /// and the caller must NOT deliver a vm_exit — the EC is dead. Twin of
+    /// the x86-64 field; see `x64/vm_runloop.zig` for the full argument.
+    cancelled: bool = false,
 };
 
 // §[vm_exit_state] aarch64 sub-codes (mirror of the table in the spec).
@@ -118,6 +126,24 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     // here without a vm_exit round-trip; every other exit reason
     // surfaces to the VMM. Mirrors x86's MMIO inline-handle path.
     while (true) {
+        // ── Arch vCPU cancellation acknowledgement (stygia-8xl) ──────────
+        //
+        // NEVER (RE-)ENTER THE GUEST ON A RETIRED EC. Twin of the x86-64
+        // check; the same reasoning applies, and this loop has the same
+        // shape — `IRQ_EXIT_SENTINEL` below re-enters after servicing a
+        // host IRQ, which is exactly how the scheduler's kick arrives.
+        // Without this, the owner core stays in the loop forever holding
+        // a `retired` `current_ec` while ready ECs queue behind it.
+        //
+        // This is `VcpuCancelExit` in the TLA lifecycle model: only the
+        // owner-side acknowledgement moves the EC out of guest submode so
+        // the ordinary retired-current boundary → hop → finalize path can
+        // run. Acquire load; the EC is caller-pinned as this core's
+        // `current_ec` for the whole call.
+        if (lifecycle.load(vcpu_ec) == .retired) {
+            return .{ .subcode = SUBCODE_UNKNOWN, .payload = .{ 0, 0, 0 }, .cancelled = true };
+        }
+
         // If the guest's virtual timer would have fired (ISTATUS=1
         // observed at last exit), inject PPI 27 into LR0 so Linux's
         // arch_timer driver runs its tick on the next entry. Mask
