@@ -2439,6 +2439,8 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 **E_INVAL** — reserved bits set; `[1]` references a vCPU; `[1]` is already suspended.
 
+**E_TERM** — `[1]` references a thread whose termination committed before this suspension; the stale handle is removed from the caller's table on the same call.
+
 #### Tests
 
 [test 01] returns E_BADCAP if [1] is not a valid thread handle.
@@ -2464,6 +2466,8 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 [test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's thread state on reply; otherwise modifications are discarded.
 
 [test 12] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
+
+[test 13] returns E_TERM and removes [1] from the caller's table when target termination commits before suspend can claim the target; a suspend that claims the target first follows the normal success path.
 
 
 ### recv
