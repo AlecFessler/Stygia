@@ -1,7 +1,7 @@
 ---------------------------- MODULE ThreadLifecycle ----------------------------
 (***************************************************************************)
 (* TLA+ model of the Stygia thread lifecycle machine,           *)
-(* docs/kernel/systems.md revision 17 (2026-08-06). Revision 8 carried     *)
+(* docs/kernel/systems.md revision 16 (2026-08-02). Revision 8 carried     *)
 (* three semantic deltas from rev 7, all encoded here: the staged          *)
 (* placement destination is no longer placement authority (placement       *)
 (* computes from the fresh descriptor under the destination lock -- the    *)
@@ -58,35 +58,13 @@ CONSTANTS
   PENDED,       \* BOOLEAN: rev-5 pended hand-off + W7 (X2/X3/F1)
   PIN_GATE,     \* BOOLEAN: rev-5 pin_depth requeue-preemption gate (X1/F3)
   SUSPEND_ON,   \* BOOLEAN: cross-thread suspend of a READY target (5c+7).
-                \* SPLIT IN REVISION 18 (POSIX transition). Through rev 17
-                \* this ALSO gated RecvPop and AffMove, which is a
-                \* conflation of three mechanisms with three different
-                \* fates:
-                \*   (a) SuspendStart/Place/TgtRetired -- one thread
-                \*       suspending another that is RUNNABLE. POSIX has no
-                \*       such operation (see POSIX_TRANSITION_PLAN 3.3),
-                \*       so this is the surface that goes dark.
-                \*   (b) RecvPop -- waiting -> claimed -> waiting
-                \*       re-containment. This is FUTEX REQUEUE. It lives.
-                \*   (c) AffMove -- the claim-move half of a cross-thread
-                \*       affinity edit. This is sched_setaffinity. It lives.
-                \* Setting one switch FALSE therefore used to delete
-                \* sched_setaffinity and futex requeue from the model
-                \* SILENTLY, while every .cfg stayed green -- the exact
-                \* drift shape README's parity discipline exists to catch.
-                \* (b) and (c) now ride REQUEUE_ON.
-  REQUEUE_ON,   \* BOOLEAN: the claim-move family that SURVIVES the POSIX
-                \* transition -- RecvPop (futex requeue) and AffMove
-                \* (sched_setaffinity). Both take a claim on a target the
-                \* caller does not own and discharge it through an
-                \* existing holder path (suspC and wakeC respectively), so
-                \* they exercise edge 5a/5c + edge 6/7 without the
-                \* blocking cross-thread semantics of SUSPEND_ON.
-                \* Revision 18 introduces this at REQUEUE_ON = SUSPEND_ON
-                \* in every existing config, so the transition relation is
-                \* UNCHANGED and every recorded state count must reproduce
-                \* exactly; that reproduction is the evidence the split is
-                \* a refactor and not a semantic edit.
+  REQUEUE_ON,   \* BOOLEAN: independent claim-move scope gate for RecvPop
+                \* (port receive re-containment) and AffMove (thread
+                \* affinity). Both claim a target the caller does not own
+                \* and discharge it through an existing holder path
+                \* (suspC and wakeC respectively). Every recorded config
+                \* sets this equal to SUSPEND_ON, preserving the original
+                \* transition relation and state counts.
   FASTPATH,     \* BOOLEAN: the fused IPC fast path (Sec 9.4)
   RV_ON,        \* BOOLEAN: the rendezvous window (Sec 8.3) -- a sender
                 \*          holding its receiver's claim while itself
@@ -1771,7 +1749,7 @@ CreateThread(c) ==
 (***************************************************************************)
 RecvPop(c) ==
   LET w == cores[c].cur IN
-  /\ REQUEUE_ON      \* rev 18: futex requeue, not cross-thread suspend
+  /\ REQUEUE_ON      \* port receive re-containment, not cross-thread suspend
   /\ ThreadCtx(c) /\ threads[w].pc = "user" /\ threads[w].st = "running"
   /\ threads[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ threads[w].shot = "none"
@@ -1844,7 +1822,7 @@ ReplyFP(c) ==
 (* container => claim-move.                                                *)
 AffMove(c) ==
   LET w == cores[c].cur IN
-  /\ REQUEUE_ON      \* rev 18: sched_setaffinity, not cross-thread suspend
+  /\ REQUEUE_ON      \* thread affinity claim-move, not cross-thread suspend
   /\ ThreadCtx(c) /\ threads[w].pc = "user" /\ threads[w].st = "running"
   /\ threads[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ threads[w].shot = "none"

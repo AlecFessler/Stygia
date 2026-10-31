@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduces every TLC check for the thread-lifecycle model (systems.md rev 17).
+# Reproduces every TLC check for the thread-lifecycle model (systems.md rev 16).
 #   ./run.sh                 gates + probes + safety + the cheap liveness set
 #   RUN_XLARGE=1 ./run.sh    also the 3-core/4-thread safety run
 #   RUN_SLOW=1   ./run.sh    also the extended/manual liveness rows

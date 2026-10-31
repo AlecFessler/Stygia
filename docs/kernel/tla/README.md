@@ -1,4 +1,4 @@
-# TLA+ model of the thread-lifecycle machine (model rev 17 / `systems.md` rev 17)
+# TLA+ model of the thread-lifecycle machine (model rev 17 / `systems.md` rev 16)
 
 TLC-checked model of the thread lifecycle state machine
 specified in `docs/kernel/systems.md`. Revision 17 adds the focused
@@ -11,17 +11,12 @@ default historical configs set `VCPU_THREADS = {}` so their old scope remains
 unchanged; `vcpu_cancel` and `vcpu_nocancel` are the new load-bearing
 focused pair.
 
-**On `main`: this is the model only, and NOTHING RUNS IT.** Revisions 17
-and 18 landed here as a model-only port. Two classes of reference below
-point at artifacts that do not exist on this branch: the POSIX-campaign
-documents (`POSIX_AMENDMENTS.md`, `POSIX_TRANSITION_PLAN`) and the
-correspondence checker (`tools/check_model_correspondence` and its
-precommit stage `[0e]`) both live on `posix`. Consequently `main` has no
-`tla_battery` precommit stage and no correspondence gate: `run.sh` is
-never invoked automatically, and no gate notices if the model stops
-describing the code. The rows recorded here were reproduced by hand at
-the landing commit. Everything after that is unguarded, and a reader
-should assume drift rather than assume coverage.
+**On `main`: the model battery is manual.** There is no active
+`tla_battery` precommit stage or model-to-code correspondence checker.
+Run `run.sh` explicitly and review the parity ledger before citing a
+model verdict as evidence about the implementation. The recorded rows
+were reproduced by hand at the landing commit; later code changes can
+introduce drift until correspondence checks are restored.
 
 Revisions 6 through 10 were CO-EVOLVED with this model: model findings
 (N1–N6) were fed back into the doc, doc findings back into the model, and
@@ -207,10 +202,10 @@ spec GAP goes to §11 as a maintainer call, never to a silent narrowing.
 
 ```sh
 cd docs/kernel/tla
-./run.sh                            # the DEFAULT battery: 31 configs + sany
+./run.sh                            # the DEFAULT battery: 33 configs + sany
 RUN_XLARGE=1 ./run.sh               # + xlarge (3c x 4e safety)
 RUN_SLOW=1   ./run.sh               # + measured t1full, full t1d, cr1fullself, liveness_a/b
-RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # all 37; hours, launch it detached
+RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # all 39; hours, launch it detached
 ```
 
 The former full `medium` aggregate (`ThreadLifecycle_medium.cfg`) is no
@@ -381,8 +376,8 @@ gitignored; keep all generated output under them.
 `ls ThreadLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
-9–11 and the taxonomy kept describing them. There are **52 `.cfg` files**
-and `run.sh` invokes **41**; the 11 it does not are `q1`–`q7`, `q7d`,
+9–11 and the taxonomy kept describing them. There are **50 `.cfg` files**
+and `run.sh` invokes **39**; the 11 it does not are `q1`–`q7`, `q7d`,
 `dirabafix`, full `medium`, and full `pr4d`, each with its reason
 recorded in `run.sh` itself.
 
@@ -418,19 +413,13 @@ RUNNABLE target), **`REQUEUE_ON`** (recv-pop + affinity claim-move),
 (pin-class locks), `S7_ON` (dead-process filter route), `CR_BUDGET`
 (edge-1 creation), `TERM_BUDGET` (retires).
 
-**Revision 18 split `SUSPEND_ON`** (POSIX transition). Through revision 17
-one switch gated three mechanisms with three different fates: cross-thread
-suspend of a runnable target (no POSIX consumer — `POSIX_TRANSITION_PLAN`
-§3.3), `RecvPop` (which is **futex requeue**), and `AffMove` (which is
-**`sched_setaffinity`**). Dialing that one switch FALSE would have deleted
-futex requeue and `sched_setaffinity` from the model while every `.cfg`
-stayed green — the drift shape this file's parity discipline exists to
-catch, arriving via a switch rather than via a doc edit. The split lands at
-`REQUEUE_ON = SUSPEND_ON` in all 52 configs, so the transition relation is
-unchanged and **every recorded state count must reproduce exactly**; that
-reproduction is the evidence the split is a refactor. `SuspendPlace` /
-`SuspendTgtRetired` need no gate of their own — they are guarded by
-`pc = "suspC"`, which only `SuspendStart` and `RecvPop` can set.
+`SUSPEND_ON` gates cross-thread suspend of a runnable target. `REQUEUE_ON`
+separately gates `RecvPop` (port receive re-containment) and `AffMove`
+(thread affinity claim-move). The two guards are equal in every recorded
+config, so their separation leaves the checked transition relation and
+state counts unchanged. `SuspendPlace` / `SuspendTgtRetired` need no gate
+of their own: `pc = "suspC"` is established only by `SuspendStart` and
+`RecvPop`.
 
 Note the asymmetry this exposes and does not fix: `SUSPEND_ON` and
 `REQUEUE_ON` are *feature* gates, and by this file's own taxonomy feature
@@ -1320,25 +1309,18 @@ route again.
 
 ## Results
 
-### Revision 18 — the `SUSPEND_ON` split, validated as state-preserving
+### Independent claim-move scope gate, validated as state-preserving
 
-Revision 18 makes exactly one mechanism change: `SUSPEND_ON` splits into
-`SUSPEND_ON` (cross-thread suspend of a RUNNABLE target — `SuspendStart`)
-and `REQUEUE_ON` (`RecvPop`, which is futex requeue, and `AffMove`, which
-is `sched_setaffinity`). Rationale, and the POSIX-transition verdict table
-that rejects two of the four changes originally proposed, are in
-`POSIX_AMENDMENTS.md`.
+`SUSPEND_ON` scopes cross-thread suspend of a runnable target, while
+`REQUEUE_ON` scopes port receive re-containment and thread affinity
+claim-move. Their guards remain independent for model coverage purposes.
 
 The claim is that this is a **refactor, not a semantic edit**, because
-`REQUEUE_ON = SUSPEND_ON` in all 52 configs leaves the transition relation
-unchanged. That claim is falsifiable and was **tested rather than
-asserted**: each config below was re-run under revision 18 and compared to
-a count measured under revision 17 **earlier the same day on the same
-machine** (`out/BASELINE_20260807.log`). The module was edited at
-13:53:42, so rows from `t1r` onward in that log are already revision 18
-and are NOT comparanda.
+`REQUEUE_ON = SUSPEND_ON` in all 50 configs leaves the transition relation
+unchanged. That claim was tested by comparing the listed state counts
+before and after separating the two guards on the same machine.
 
-| Config | `SUSPEND_ON` | rev 17 | rev 18 | |
+| Config | `SUSPEND_ON` | before split | after split | |
 |---|---|---|---|---|
 | `vcpu_cancel` | FALSE | 39 | 39 | control |
 | `t1min` | FALSE | 77,498 | 77,498 | control |
@@ -1349,41 +1331,43 @@ and are NOT comparanda.
 
 **Read the `SUSPEND_ON` column before reading the counts.** The four FALSE
 rows never enable `RecvPop` or `AffMove`, so their reproduction shows only
-that revision 18 broke nothing globally, and is close to VACUOUS as
+that the guard split changed nothing globally, and is close to VACUOUS as
 evidence about the split itself. The load-bearing evidence is the three
 TRUE rows — the ones that enable the family that moved.
 
-Reachability probes re-run under revision 18, all still firing (the
+Reachability probes re-run after the guard split, all still firing (the
 violation is the pass, so a probe that goes quiet is a lost surface):
 `pr1` `ProbeNoRetiredRvSender`, `pr2` `ProbeNoRvPendedReceiver`, `pr3`
 `ProbeNoRetireFromPended`. `pr4d_min` `ProbeNoTermSuspendCycle` also fired
-under revision 18 in the shared battery.
+after the split in the shared battery.
 
 **Probe coverage is inverted relative to this transition, and nothing
 covers the split.** Of the five probes, `pr1`/`pr2` certify rendezvous
-(undecided post-POSIX), `pr4`/`pr5` certify the directive family (dark
+and `pr4`/`pr5` certify the directive family (dark
 under `DIR_ON = FALSE`), and only `pr3` certifies a surface that plainly
 lives. **No probe covers `RecvPop` or `AffMove`** — so if a later revision
-sets `REQUEUE_ON = FALSE`, nothing fires. See `POSIX_AMENDMENTS.md` §6,
-including why the fix needs a ghost bit rather than five lines.
+sets `REQUEUE_ON = FALSE`, nothing fires. A dedicated reachability probe
+for `RecvPop` and `AffMove` remains absent.
 
 **Validation status.** The counts and verdicts in the historical tables below
-predate removal of obsolete model state. Run `run.sh` for the current battery;
-a full post-cleanup rerun is pending.
+predate removal of obsolete model state. On 2026-10-31, the current default
+`./run.sh` battery (33 configs plus SANY) exited 0 with `RESULT: OK`:
+all expected falsifiers fired, all expected-clean checks passed, and the
+paired `t1d_min`/`pr4d_min` liveness and reachability checks passed.
+`RUN_XLARGE=1` and `RUN_SLOW=1` were not run in that battery. This is a
+model verdict; the G11, G14, and G16 parity gaps above remain open.
 
 **What this validation does NOT establish.** It shows the split preserved
-the model. It says nothing about whether the model still describes the
-code — that is `tools/check_model_correspondence` (precommit stage
-`[0e]`), whose manifest records **18 model variables with no Zig
-representation at all**. That checker is not on `main`.
+the model, not that the model still describes the code. No active
+model-to-code correspondence checker exists on this branch.
 
 ### Reproduced at the `main` landing commit
 
-Five rows re-run by hand on `main` when revisions 17/18 landed here. This
+Five rows re-run by hand on `main` when the current model landed here. This
 is not the battery — `small` alone is ~49 minutes and `diraba` is an
 unconverged row — it is the vCPU pair plus three cheap controls chosen so
 that a pass row, a falsifier row, and the load-bearing `SUSPEND_ON = TRUE`
-side of the revision-18 split are each covered.
+side of the independent guard split are each covered.
 
 | Config | Expected | Result | Distinct states |
 |---|---|---|---|
@@ -1401,7 +1385,7 @@ The `vcpu_nocancel` counterexample is the shape of the real defect: after
 owner core and still in guest mode, with no arch cancel published. That
 is the hang `a9885b326` fixed.
 
-**Not re-run on `main`:** the other 47 configs, including every row whose
+**Not re-run on `main`:** the other configs, including every row whose
 figure appears in the revision-15 and revision-18 tables above. Those
 figures remain upstream measurements.
 
@@ -1418,13 +1402,14 @@ sany**: 14 falsification gates, 5 reachability probes, 6 safety configs,
 4 liveness configs. Revision 16's runner adds `t1d_min` and `pr4d_min`, and the
 dpin recovery reclassifies `dirf6` as expected-clean, and dpin+dres move
 the `LiveSuspender` calibration pair (`crfals`/`cr1minself`) to a focused
-no-drop `SpecSus` scope, making the current default **31 configs + sany**:
+no-drop `SpecSus` scope, making the revision-16 default **31 configs + sany**:
 12 falsification gates, 2 stale-gate closures (`f1a`, `dirf6`), 6
 reachability probes, 6 safety configs, and 5 liveness configs. Six
 further configs live in `run.sh` behind `RUN_XLARGE=1` / `RUN_SLOW=1` —
 `xlarge`, `t1full`, full `t1d`, `cr1fullself`, `liveness_a`,
 `liveness_b`. `t1full` and full `t1d` are measured-unconverged rows, not
-green liveness verdicts. The remaining revision-11 figures are **STALE**:
+green liveness verdicts. The revision-17 vCPU cancel pair brings the
+current default to **33 configs + sany**. The remaining revision-11 figures are **STALE**:
 they have not been re-run since the model gained six per-thread fields in
 revisions 11–13 (`gen`, `dgen`, `dlv`, `pok`, `dfs`, `dbad`). Treat each
 stale row as having NO verdict on the current machine until the extended
