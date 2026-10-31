@@ -39,7 +39,7 @@
 //   handles (one consumed, one not). We `delete` the second so
 //   the second sender's slab gets resolved with E_ABANDONED and
 //   doesn't sit blocked when the test thread exits. The senders stay
-//   at `dummyEntry` (hlt loop) post-resumption; their domain is
+//   at `dummyEntry` (hlt loop) post-resumption; their process is
 //   torn down at the test thread's release.
 //
 // Action
@@ -198,7 +198,7 @@ pub fn main(cap_table_base: u64) void {
     // suspended sender still waits resolves them with E_ABANDONED.
     // The matching `port.resumeWithAbandoned` path runs the wake
     // sequence cleanly and leaves the sender's slab on the
-    // domain's free path at teardown.
+    // process's free path at teardown.
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = reply_slot_1 });
 
     // Step 9: second recv. Drains the remaining queued sender
@@ -215,7 +215,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Drain the second sender symmetrically. Both sender Threads are
-    // now in the domain's at-rest set; teardown reaps them.
+    // now in the process's at-rest set; teardown reaps them.
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = reply_slot_2 });
 
     testing.pass();

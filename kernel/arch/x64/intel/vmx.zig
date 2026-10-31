@@ -945,23 +945,23 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         :
         : [gs] "r" (gs_ptr),
         : .{
-            // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
-            // pushes/pops them on entry/exit. Listing a manually-saved
-            // callee-saved register as a clobber forces LLVM to allocate a
-            // scratch register for it — and with `omit_frame_pointer = false`
-            // plus the guest-GPR constraints, register pressure aborts the
-            // compile. See the matching comment on the SVM VMRUN asm.
-            .rax = true,
-            .rcx = true,
-            .rdx = true,
-            .rsi = true,
-            .rdi = true,
-            .r8 = true,
-            .r9 = true,
-            .r10 = true,
-            .r11 = true,
-            .memory = true,
-            .cc = true,
+          // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
+          // pushes/pops them on entry/exit. Listing a manually-saved
+          // callee-saved register as a clobber forces LLVM to allocate a
+          // scratch register for it — and with `omit_frame_pointer = false`
+          // plus the guest-GPR constraints, register pressure aborts the
+          // compile. See the matching comment on the SVM VMRUN asm.
+          .rax = true,
+          .rcx = true,
+          .rdx = true,
+          .rsi = true,
+          .rdi = true,
+          .r8 = true,
+          .r9 = true,
+          .r10 = true,
+          .r11 = true,
+          .memory = true,
+          .cc = true,
         });
 
     // Read guest architectural state back from VMCS into GuestState
@@ -1231,7 +1231,7 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
 ///      remote EPT TLB entries are never consulted again. `freeVmStructures`
 ///      currently leaks the EPT page tables until process-exit address-space
 ///      teardown, so the backing physical pages are not handed to another
-///      security domain until after that process dies entirely (at which
+///      security process until after that process dies entirely (at which
 ///      point no core holds a cached EPTP matching this VM).
 ///
 ///   2. `rollbackGuestMap` partial-failure path — called synchronously
@@ -1243,11 +1243,11 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
 ///      freed — only their EPT leaf is cleared. A stale remote EPT TLB
 ///      entry therefore only lets a vCPU of the SAME process continue to
 ///      read/write a host page the same process already owns. This is not
-///      a cross-security-domain leak.
+///      a cross-security-process leak.
 ///
 /// If a future caller needs to unmap EPT pages while other vCPUs of the
 /// same VM are actively executing AND the host page must be reused across
-/// security domains (e.g., an eventual `vm_guest_unmap` syscall that
+/// security processes (e.g., an eventual `vm_guest_unmap` syscall that
 /// frees the host page back to PMM), this function is NOT sufficient:
 /// it must be paired with an IPI-driven INVEPT shootdown on every core
 /// that may hold stale entries for this EPTP (canonical TLB shootdown),
@@ -1296,4 +1296,3 @@ pub fn unmapEptPage(ept_root: PAddr, guest_phys: u64) void {
           [type] "r" (@as(u64, 1)),
         : .{ .memory = true, .cc = true });
 }
-

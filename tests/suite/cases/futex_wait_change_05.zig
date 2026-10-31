@@ -1,7 +1,7 @@
 // Spec §[futex_wait_change] — test 05.
 //
 // "[test 05] returns E_BADADDR if any addr is not a valid user address
-//  in the caller's domain."
+//  in the caller's process."
 //
 // Strategy
 //   Per kernel/syscall/futex.zig the order of checks for
@@ -12,7 +12,7 @@
 //     4. for each pair: addr is 8-byte aligned                  (E_INVAL)
 //     5. for each pair: resolveCallerVa(addr) succeeds          (E_BADADDR)
 //
-//   The runner mints each child capability domain with
+//   The runner mints each child process with
 //   `fut_wait_max = 63` and a non-zero `fut_wake` cap (see
 //   runner/primary.zig). To isolate the BADADDR rejection we must
 //   pass:
@@ -20,7 +20,7 @@
 //       would not hang waiting on a target value).
 //     - exactly N = 1 pair (well within [1, 63] and <= fut_wait_max).
 //     - addr that is 8-byte aligned (so the alignment gate clears).
-//     - addr that is not mapped in the caller's domain (so
+//     - addr that is not mapped in the caller's process (so
 //       resolveCallerVa returns null and the syscall returns
 //       E_BADADDR).
 //
@@ -56,7 +56,7 @@ pub fn main(cap_table_base: u64) void {
     // 0x4000_0000_0000 = 64 TiB. 8-byte aligned. Deep in the canonical
     // user half (below the 0xFFFF_8000_0000_0000 user/kernel split) but
     // well above any address the loader / stack / cap-table view of
-    // this child capability domain occupies. The PML4 entry covering
+    // this child process occupies. The PML4 entry covering
     // it is unset, so the kernel's page-table walk for resolveVaddr
     // returns null and the syscall must surface E_BADADDR.
     const unmapped_addr: u64 = 0x4000_0000_0000;

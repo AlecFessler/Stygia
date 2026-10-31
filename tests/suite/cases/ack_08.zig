@@ -12,7 +12,7 @@
 //   side effect fires for `ack` regardless of return code. For a
 //   device_region handle the kernel-mutable snapshot is
 //   field1.irq_count (§[device_region]) which the kernel propagates
-//   to every domain-local copy on each device IRQ; field0 is reserved
+//   to every process-local copy on each device IRQ; field0 is reserved
 //   today but the spec assertion still applies.
 //
 // Faithful path

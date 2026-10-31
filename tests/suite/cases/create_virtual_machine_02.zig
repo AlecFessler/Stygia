@@ -4,20 +4,20 @@
 //  `vm_ceiling`."
 //
 // Strategy
-//   `vm_ceiling` is an 8-bit subfield of the calling domain's
-//   self-handle field0. Per §[create_capability_domain]'s
+//   `vm_ceiling` is an 8-bit subfield of the calling process's
+//   self-handle field0. Per §[create_process]'s
 //   ceilings_inner layout (which "matches self-handle field0") the
 //   subfield occupies bits 40-47; only bit 0 (`policy`, at field0
 //   bit 40) is defined within vm_ceiling, bits 1-7 of the subfield
 //   are reserved. The runner (runner/primary.zig) installs the test
-//   domain with vm_ceiling = 0x01, so every defined vm_ceiling bit
+//   process with vm_ceiling = 0x01, so every defined vm_ceiling bit
 //   is already set in the caller.
 //
-//   (SPEC AMBIGUITY: §[capability_domain] field0 places vm_ceiling
-//   at bits 48-55, but §[create_capability_domain] explicitly
+//   (SPEC AMBIGUITY: §[process] field0 places vm_ceiling
+//   at bits 48-55, but §[create_process] explicitly
 //   declares its ceilings_inner argument layout — also at bits 40-47
 //   for vm_ceiling — "matches self-handle field0". The runner and
-//   create_capability_domain_11.zig both treat field0 as identical
+//   create_process_11.zig both treat field0 as identical
 //   to the ceilings_inner packing; this test follows that convention.)
 //
 //   `[1] caps` for create_virtual_machine carries a 16-bit VmCap word
@@ -57,7 +57,7 @@
 //   runner narrows its installed vm_ceiling so a defined vm_ceiling
 //   bit is clear in the caller), the test self-promotes to a faithful
 //   probe — see runFaithfulProbe below, which mirrors
-//   create_capability_domain_11.zig.
+//   create_process_11.zig.
 //
 // Action (smoke)
 //   1. createVirtualMachine(caps = 0x01, policy_pf = 0)
@@ -77,7 +77,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Bitmask of currently-defined bits inside the 8-bit vm_ceiling
-// subfield. Per §[capability_domain] only bit 0 (`policy`) is defined
+// subfield. Per §[process] only bit 0 (`policy`) is defined
 // in vm_ceiling; bits 1-7 are reserved.
 const VM_CEILING_DEFINED: u8 = 0x01;
 
@@ -121,7 +121,7 @@ pub fn main(cap_table_base: u64) void {
 // Future-spec faithful probe. Reachable only if a later spec defines
 // additional vm_ceiling bits (or the runner narrows its installed
 // vm_ceiling) so a defined vm_ceiling bit is clear in the caller.
-// Mirrors create_capability_domain_11.zig.
+// Mirrors create_process_11.zig.
 fn runFaithfulProbe(
     caller_vm_ceiling: u8,
     undefined_clear_in_caller: u8,

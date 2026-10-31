@@ -11,8 +11,8 @@
 //   fire before the per-entry page_frame validation is the test-02 BADCAP
 //   check on the supplied page_frame slot.
 //
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -127,7 +127,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
-    // 5. Slot 0xFFE is guaranteed empty by the create_capability_domain
+    // 5. Slot 0xFFE is guaranteed empty by the create_process
     //    table layout — only slots 0..3 plus the few minted above are
     //    populated. The BADCAP gate on the page_frame entry must fire
     //    once the kernel discovers the empty slot.

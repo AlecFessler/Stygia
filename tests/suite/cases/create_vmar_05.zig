@@ -6,11 +6,11 @@
 //   To isolate the pages == 0 check we must make every other
 //   create_vmar-prelude check pass:
 //     - caller self-handle has `crvr` (the root_service launches every
-//       test domain with the full self-cap set, so this is satisfied
+//       test process with the full self-cap set, so this is satisfied
 //       implicitly — see runner/serial.zig which calls create_vmar the
 //       same way).
 //     - caps.r/w/x ⊆ vmar_inner_ceiling.r/w/x (test 02): use only r,w
-//       which the root domain's ceiling permits (serial.zig uses the
+//       which the root process's ceiling permits (serial.zig uses the
 //       same combination plus mmio).
 //     - caps.max_sz ≤ ceiling.max_sz (test 03): leave max_sz = 0.
 //     - caps.mmio (test 04, 08, 11, 13): leave mmio = 0.

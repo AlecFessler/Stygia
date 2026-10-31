@@ -20,8 +20,8 @@
 //   ahead of the BADCAP check on the page_frame handle itself; they
 //   would surface only after that check passes.
 //
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0 → self
 //     slot 1 → initial thread
 //     slot 2 → self-IDC

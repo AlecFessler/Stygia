@@ -2,7 +2,7 @@
 //
 // "[test 19] on success when `pair_count > 0`, the resumed thread's syscall
 //  word carries `pair_count = N` and `tstart = S`; the next N slots
-//  `[S, S+N)` in the resumed thread's domain contain the inserted handles
+//  `[S, S+N)` in the resumed thread's process contain the inserted handles
 //  per §[handle_attachments] (caps intersected with `idc_rx` for IDC
 //  handles, verbatim otherwise)."
 //
@@ -10,7 +10,7 @@
 //   reply's success path with pair_count > 0 needs (a) a live reply
 //   handle to consume, (b) a suspended thread to resume, and (c) at least
 //   one source handle to attach. All three live in the same single-
-//   domain test:
+//   process test:
 //
 //     - The test thread mints a port with bind|recv|xfer (xfer is required
 //       to mint a reply handle whose `xfer` cap is set, which is in
@@ -29,7 +29,7 @@
 //       The pair entry is in vreg 127 per §[handle_attachments]; the
 //       libz `replyTransfer` wrapper owns that high-vreg layout.
 //
-//   The test thread's domain is the resumed thread's domain (we created the
+//   The test thread's process is the resumed thread's process (we created the
 //   sibling with target=self), so the inserted handle slot is visible
 //   to us through the read-only cap table mapping. The sibling, after
 //   resume, writes its observed post-resume syscall word back to a
@@ -86,7 +86,7 @@ const testing = lib.testing;
 const HandleId = caps.HandleId;
 
 // Cross-thread channel. Sibling and test thread share the same address space
-// (single domain, same ELF); these globals are an in-process mailbox.
+// (single process, same ELF); these globals are an in-process mailbox.
 var g_ready: u32 = 0;
 var g_port_handle_id: u64 = 0;
 var g_sibling_self_handle_id: u64 = 0;
@@ -169,7 +169,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 3. Mint the sibling thread bound to this domain with susp+term and
+    // 3. Mint the sibling thread bound to this process with susp+term and
     //    rp=0. susp is necessary because the sibling self-suspends; we
     //    don't actually use term but it keeps the cap profile minimal.
     //    rp=0 sidesteps any restart_policy ceiling interaction.
@@ -212,7 +212,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         @intFromPtr(&siblingEntry),
         1, // stack_pages
-        0, // target = self (this domain)
+        0, // target = self (this process)
         sibling_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
@@ -267,7 +267,7 @@ pub fn main(cap_table_base: u64) void {
     // 7. Wait for the sibling to resume and report what it observed.
     //    The sibling writes its post-resume syscall word to
     //    g_sibling_observed_word and sets g_sibling_done. Spinning is
-    //    safe — both Threads are bound to this domain on the same scheduler;
+    //    safe — both Threads are bound to this process on the same scheduler;
     //    the kernel will schedule the sibling.
     while (@atomicLoad(u32, &g_sibling_done, .acquire) == 0) {
         _ = syscall.yieldThread(@as(u64, sibling_thread));
@@ -291,7 +291,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 8. The next N=1 slots starting at S=tstart in the resumed thread's
-    //    domain (== ours) must hold the inserted handles. For our
+    //    process (== ours) must hold the inserted handles. For our
     //    page-frame entry, the install caps are the entry's caps
     //    verbatim (no idc_rx intersection because page_frame is not an
     //    IDC handle type).

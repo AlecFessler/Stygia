@@ -10,7 +10,7 @@
 //       absent => E_INVAL).
 //   With both satisfied, the contract is: `ack` returns the value of
 //   `field1.irq_count` immediately before the call, atomically zeroes
-//   it on every domain-local copy, and unmasks the line.
+//   it on every process-local copy, and unmasks the line.
 //
 //   The runner's dma+irq fixture (kernel/boot/userspace_init.zig
 //   grantTestFixtureDevices, phys_base = 0xCAFE_0000) carries

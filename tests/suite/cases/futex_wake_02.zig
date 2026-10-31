@@ -11,7 +11,7 @@
 //   Per the §[futex_wake] gate order in the spec:
 //     test 01 — E_PERM if self-handle lacks `fut_wake`
 //     test 02 — E_INVAL if [1] is not 8-byte aligned
-//     test 03 — E_BADADDR if [1] is not valid in the caller's domain
+//     test 03 — E_BADADDR if [1] is not valid in the caller's process
 //     test 04 — success
 //
 //   The runner's primary spawns the test with `fut_wake = true` on its
@@ -20,7 +20,7 @@
 //
 //   To keep the test 03 (E_BADADDR) gate from masking the alignment
 //   check, we feed a misaligned address that lies inside a valid
-//   user-mapped page in the caller's domain. We construct that by
+//   user-mapped page in the caller's process. We construct that by
 //   creating a VMAR backed by a fresh page frame, then offsetting the
 //   VMAR's base vaddr by 1 byte. The result is a real, mapped, R/W
 //   user address that is unambiguously not 8-byte aligned. Whatever
@@ -37,7 +37,7 @@
 //      — must succeed; gives a 1-page user VMAR with a base vaddr.
 //   3. mapPf(vmar_handle, .{ 0, pf_handle })
 //      — binds page 0 of the VMAR to the PF so the vaddr is actually
-//      mapped in the caller's domain.
+//      mapped in the caller's process.
 //   4. futexWake(var_base + 1, 0)
 //      — must return E_INVAL because var_base + 1 is not 8-byte
 //      aligned.

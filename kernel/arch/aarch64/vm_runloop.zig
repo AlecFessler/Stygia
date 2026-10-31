@@ -88,7 +88,7 @@ pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
     // Capture the cell pointer under the VM lock; the cell is freed
     // only by `freeVmArchState` in the VM teardown path, which cannot
     // run while a vCPU thread holds a SlabRef on the VM (that's the
-    // creator-domain lifetime contract). Safe to use post-unlock.
+    // creator-process lifetime contract). Safe to use post-unlock.
     const cell_opt: ?*hv_vm.CtrlStateCell = hv_vm.cellOf(vm_ptr);
     vm_ref.unlock();
 

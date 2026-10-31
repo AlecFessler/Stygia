@@ -10,7 +10,7 @@
 //
 //   To isolate the reserved-max_sz check we make every prior check
 //   pass:
-//     - the runner-spawned domain's self-handle holds `crpf` (test 01)
+//     - the runner-spawned process's self-handle holds `crpf` (test 01)
 //     - caps.r/w/x are within the runner-provided pf_ceiling.max_rwx
 //       (= 0b111); we leave them all clear here, which is trivially a
 //       subset (test 02)

@@ -3,8 +3,8 @@
 // "[test 02] returns E_BADCAP if [2] is not a valid port handle."
 //
 // Strategy
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -15,8 +15,8 @@
 //
 //   To exercise the [2] BADCAP gate we must pass a valid thread handle
 //   for [1]; otherwise the [1] BADCAP gate (test 01) would preempt
-//   it. Slot 1 is the initial thread for this domain and is guaranteed
-//   valid as an thread handle.
+//   it. Slot 1 is the initial thread for this process and is guaranteed
+//   valid as a thread handle.
 //
 // Action
 //   1. suspend(self_thread, invalid_port_slot) — must return E_BADCAP
@@ -36,7 +36,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Slot 1 is the initial thread — guaranteed a valid thread handle by the
-    // create_capability_domain table layout. Slot 4095 is guaranteed
+    // create_process table layout. Slot 4095 is guaranteed
     // empty, so referencing it as a port handle must trip E_BADCAP.
     const self_thread: u12 = 1;
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;

@@ -1,18 +1,18 @@
 // Spec §[snapshot] snapshot — test 10.
 //
-// "[test 10] on domain restart, when [2].map = 1 and any backing
+// "[test 10] on process restart, when [2].map = 1 and any backing
 //  page_frame has `mapcnt > 1` or the source's effective write
-//  permission is nonzero, the restart fails and the domain is
+//  permission is nonzero, the restart fails and the process is
 //  terminated."
 //
 // DEGRADED SMOKE VARIANT
-//   The faithful shape of test 10 requires the same domain-restart
+//   The faithful shape of test 10 requires the same process-restart
 //   observability that test 09 needs, with the additional twist that
 //   the source VMAR must be in a *deliberately unstable* state at the
-//   restart instant, and the post-restart observable is "the domain
+//   restart instant, and the post-restart observable is "the process
 //   was terminated rather than restarted":
 //
-//     pre-restart (live domain N):
+//     pre-restart (live process N):
 //       1. mint source VMAR S with restart_policy = 2 (preserve), in
 //          map=1 (page_frame-backed). S must be configured so its
 //          stability constraint per spec line 1116 is *violated* at
@@ -33,7 +33,7 @@
 //          populate however (its post-restart contents are irrelevant
 //          because the restart is supposed to fail).
 //       3. snapshot(T, S) — bind S as T's restart-time source.
-//       4. trigger a domain restart on the calling domain.
+//       4. trigger a process restart on the calling process.
 //
 //     restart boundary:
 //       5. kernel verifies S's stability constraints (line 1115-1119).
@@ -41,34 +41,34 @@
 //          a backing page_frame with mapcnt = 2 and rejects. For mode
 //          (b) — effective `w` nonzero — the verifier sees `cur_rwx.w
 //          ∩ page_frame.caps.w = 1` and rejects. Per spec line 1119,
-//          the restart fails and the domain is terminated.
+//          the restart fails and the process is terminated.
 //
-//     post-restart (would-be domain N+1, never reached):
-//       6. observable: the domain is gone. The parent harness that
+//     post-restart (would-be process N+1, never reached):
+//       6. observable: the process is gone. The parent harness that
 //          drove the restart sees "child terminated" rather than
-//          "child resumed". An acquired handle to the domain (or to S
-//          / T held by the parent) reports the domain as terminated.
+//          "child resumed". An acquired handle to the process (or to S
+//          / T held by the parent) reports the process as terminated.
 //
-//   None of this is reachable from a single child capability domain
+//   None of this is reachable from a single child process
 //   via the v0 test child surface (same gaps as snapshot_09 plus one
 //   more: the v0 child cannot observe its own termination — by
 //   definition a terminated thread cannot run a `pass()` afterward, so
 //   the assertion has to come from a parent driver).
 //
 //   (a) A child cannot trigger its own restart; the restart entry
-//       point per spec is for restarting *child* domains from a
+//       point per spec is for restarting *child* processes from a
 //       parent. To stage and observe this test we need a parent test
-//       driver that holds a handle to the test domain, restarts it,
-//       and then queries the domain's liveness.
+//       driver that holds a handle to the test process, restarts it,
+//       and then queries the process's liveness.
 //
 //   (b) The runner currently spawns each test as a one-shot child
-//       capability domain whose parent (the primary test runner) does
+//       process whose parent (the primary test runner) does
 //       not retain a snapshot/restart fixture for the child. There is
-//       no "restart this test domain and assert it terminated" hook
+//       no "restart this test process and assert it terminated" hook
 //       in runner/primary.zig.
 //
 //   (c) Termination is observed only from outside the terminated
-//       domain. The faithful test must report pass/fail from a parent
+//       process. The faithful test must report pass/fail from a parent
 //       that survived the restart, not from the test child itself.
 //       That requires a parent-side result-port handshake that exists
 //       independent of the test child's lifetime.
@@ -106,7 +106,7 @@
 //   error" — and we record even that as a smoke prelude rather than a
 //   spec assertion, because the *behavior* under test (restart-time
 //   termination on unstable source) is unreachable from inside the
-//   child domain.
+//   child process.
 //
 // Action
 //   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
@@ -137,9 +137,9 @@
 //       page_frame, OR effective write permission nonzero),
 //     - grants S, T to the test child,
 //     - waits for a "binding established" signal on the result port,
-//     - restarts the test child domain,
+//     - restarts the test child process,
 //     - asserts the child does NOT post a post-restart signal and the
-//       domain reports terminated.
+//       process reports terminated.
 //   Once that exists, the action becomes:
 //     <parent: mint S (preserve, map=1, writable page_frame)>
 //     <parent: stage violation — install pf into a second VMAR for
@@ -147,7 +147,7 @@
 //     <parent: mint T (snapshot, same size)>
 //     <parent: hand S, T to child, run child>
 //     <child: snapshot(T, S); signal ready; spin>
-//     <parent: restart child domain>
+//     <parent: restart child process>
 //     <parent: observe child terminated, no post-restart signal>
 //   That termination assertion (id 1) would replace this smoke's
 //   pass-with-id-0.

@@ -22,7 +22,7 @@ const lifecycle = stygia.sched.lifecycle;
 const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const Thread = stygia.sched.thread.Thread;
 const NOT_IN_RUN_QUEUE = stygia.sched.thread.NOT_IN_RUN_QUEUE;
 const Priority = stygia.sched.thread.Priority;
@@ -79,7 +79,7 @@ pub const TeardownKind = enum(u8) { self_delete, unhandled_fault };
 
 pub const TeardownRequest = struct {
     kind: TeardownKind,
-    cd: SlabRef(CapabilityDomain),
+    process: SlabRef(Process),
     caller_thread: ?SlabRef(Thread) = null,
 };
 
@@ -148,7 +148,7 @@ pub const PerCore = struct {
     /// requirement, not a micro-optimisation. This slot is written
     /// without any lock by its owning core (`setCurrentThread` /
     /// `clearCurrentThread`) and read WITHOUT A LOCK by other cores —
-    /// `awaitDomainQuiesced`'s teardown barrier, `markReady`'s
+    /// `awaitProcessQuiesced`'s teardown barrier, `markReady`'s
     /// wake/preempt decision, `currentThreadPtrOn`, the hang detector and
     /// the fatal-fault reporter all do it.
     ///
@@ -161,9 +161,9 @@ pub const PerCore = struct {
     /// that order. A remote reader loading the three words with no
     /// acquire barrier can therefore observe `is_non_null = 1`
     /// alongside `ptr = 0`, which is not a state any writer ever
-    /// intends. `awaitDomainQuiesced` then dereferenced it and took
+    /// intends. `awaitProcessQuiesced` then dereferenced it and took
     /// `KERNEL PAGE FAULT at 0x488` — exactly
-    /// `@offsetOf(Thread, "domain")` — killing core 1 at
+    /// `@offsetOf(Thread, "process")` — killing core 1 at
     /// pass 14 of a 100-pass bare-metal run.
     ///
     /// As a plain `?*Thread` the optional IS the pointer
@@ -176,7 +176,7 @@ pub const PerCore = struct {
     ///
     /// caller-pinned: bare `*T` is deliberate, matching `committed_thread`
     /// directly below. Cross-core readers perform identity-only
-    /// compares (`== thread`, `.domain.ptr == cd_key`) and never lock
+    /// compares (`== thread`, `.process.ptr == process_key`) and never lock
     /// through this pointer; a slab slot's bytes outlive its gen flip,
     /// so a stale-but-non-null value simply mismatches and the reader
     /// moves on.
@@ -205,7 +205,7 @@ pub const PerCore = struct {
     /// `.release` immediately AFTER each hardware root load. 0 = no
     /// user root (kernel root / parked / detached). This — not
     /// `on_cpu`, not `current_thread` — is the authoritative "may this
-    /// core still walk translations of root R" signal that domain
+    /// core still walk translations of root R" signal that process
     /// teardown must wait on before freeing R's tables (stygia-rs6):
     /// `on_cpu` stays stale-true across the migration boundary and
     /// its gated clears race, and `current_thread` flips BEFORE the
@@ -351,7 +351,7 @@ pub fn perCoreInit() void {
 // ── Dispatch ─────────────────────────────────────────────────────────
 
 /// Context switch to `thread` on the current core. Saves outgoing thread's
-/// state to its `ctx`, swaps address space (if domain changed),
+/// state to its `ctx`, swaps address space (if process changed),
 /// updates `current_thread`, applies lazy-FPU policy (arm/clear CR0.TS),
 /// loads `thread.ctx` and returns to userspace via iretq/sysretq.
 ///
@@ -476,7 +476,7 @@ pub fn switchTo(thread: *Thread) void {
             // a running core makes every `enqueueOnCore` targeting it
             // send a wake IPI, and on x86 that vector IS the scheduler
             // vector (`IntVecs.sched` — see `arch.smp.sendWakeIpi`), so
-            // the "wake" preempts an thread that was running fine. That
+            // the "wake" preempts a thread that was running fine. That
             // shows up as latency, e.g. a 5 ms deadline
             // arm-then-observe window closing late.
             (&core_states[core]).idle_parked = false;
@@ -627,7 +627,7 @@ pub fn queueTeardown(core: u8, req: TeardownRequest) bool {
     defer lock.unlockIrqRestore(irq);
     const slot = &(&core_states[core]).teardown_pending;
     if (slot.*) |existing| {
-        if (existing.cd.eql(req.cd)) return true;
+        if (existing.process.eql(req.process)) return true;
         return false;
     }
     slot.* = req;
@@ -637,7 +637,7 @@ pub fn queueTeardown(core: u8, req: TeardownRequest) bool {
 pub fn queueCurrentTeardown(req: TeardownRequest) void {
     const core: u8 = @truncate(arch.smp.coreID());
     while (!queueTeardown(core, req)) {
-        spin_diag.note(.queue_teardown, @intFromPtr(req.cd.ptr));
+        spin_diag.note(.queue_teardown, @intFromPtr(req.process.ptr));
         arch.paging.serviceTlbMaintenanceWhileSpinning();
         stygia.sched.fpu.serviceLocalFlushWhileSpinning();
         std.atomic.spinLoopHint();
@@ -655,27 +655,27 @@ pub fn claimOwnTeardownInline(thread: *Thread) bool {
     return true;
 }
 
-fn runDomainTeardown(req: TeardownRequest) void {
+fn runProcessTeardown(req: TeardownRequest) void {
     const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(
         @src(),
         stygia.caps.derivation.TREE_MUTEX_GROUP,
     );
-    const cd_lr = req.cd.lockOrderedIrqSave(
-        stygia.caps.derivation.TREE_DOMAIN_GROUP,
+    const process_lr = req.process.lockOrderedIrqSave(
+        stygia.caps.derivation.TREE_PROCESS_GROUP,
         @src(),
     ) catch {
         stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
         return;
     };
-    const deferred = stygia.caps.capability_domain.destroyPhase1(
-        cd_lr.ptr,
+    const deferred = stygia.caps.process.destroyPhase1(
+        process_lr.ptr,
         req.caller_thread,
     );
-    arch.cpu.restoreInterrupts(cd_lr.irq_state);
+    arch.cpu.restoreInterrupts(process_lr.irq_state);
     stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
 
     switch (req.kind) {
-        .self_delete, .unhandled_fault => stygia.caps.capability_domain.destroyPhase2(deferred),
+        .self_delete, .unhandled_fault => stygia.caps.process.destroyPhase2(deferred),
     }
 }
 
@@ -688,23 +688,23 @@ pub fn drainTeardown(core: u8, incoming: ?*Thread) void {
             const slot = &(&core_states[core]).teardown_pending;
             const req = slot.* orelse return;
             if (incoming) |thread| {
-                const dref = thread.domain;
+                const dref = thread.process;
                 // `dispatchTailBody` calls this after committing
                 // `current_thread` but before entering userspace. Phase-2
-                // domain teardown deliberately skips the executing
-                // core in `awaitDomainQuiesced`; if this core drained
-                // teardown for `incoming`'s own domain here, it could
+                // process teardown deliberately skips the executing
+                // core in `awaitProcessQuiesced`; if this core drained
+                // teardown for `incoming`'s own process here, it could
                 // retire the thread after scheduler selection and before
                 // the first user instruction. Leave it pending until
                 // the core reaches a null-incoming park/yield drain.
-                if (req.cd.ptr == dref.ptr and req.cd.gen == dref.gen) {
+                if (req.process.ptr == dref.ptr and req.process.gen == dref.gen) {
                     return;
                 }
             }
             slot.* = null;
             break :blk req;
         };
-        runDomainTeardown(req);
+        runProcessTeardown(req);
     }
 }
 
@@ -732,7 +732,7 @@ fn yieldToTarget(initial_target: YieldTarget) void {
     // this frame has no thread to be re-enqueued under, so if we go on to
     // `switchTo` some other thread the C stack we are standing on is
     // ABANDONED — nothing will ever resume it. That is the exact
-    // mechanism blamed for the leaked domain teardowns; count the events
+    // mechanism blamed for the leaked process teardowns; count the events
     // instead of inferring them from a counter gap.
     const disowned_at_entry = state.current_thread == null;
     if (state.current_thread) |cur| {
@@ -767,7 +767,7 @@ fn yieldToTarget(initial_target: YieldTarget) void {
         // via the hop before selecting `next`).
         if (disowned_at_entry) {
             // TEMP DIAGNOSTIC (stygia-afo, REMOVE).
-            stygia.caps.capability_domain.noteFrameAbandoned();
+            stygia.caps.process.noteFrameAbandoned();
         }
         switchTo(n);
         return;
@@ -940,7 +940,7 @@ fn parkAndAwaitIRQ() void {
     // arch trampoline below.
     //
     // The drain above runs OUTSIDE the lock (finalize takes its own
-    // CD/port locks; nesting them under core_locks would seed an
+    // process/port locks; nesting them under core_locks would seed an
     // out-of-class acquire). We re-drain post-wake in the asm landing
     // pad anyway, so any zombie posted between the pre-park drain and
     // the lock acquire below gets reaped on the next wake — what
@@ -951,13 +951,13 @@ fn parkAndAwaitIRQ() void {
     // Use `dequeueOrIdleLocked` rather than a raw `isEmpty` check: the
     // queue may contain `.exited` Threads that yieldTo's race-prone re-enqueue
     // window dropped in (a yieldTo that read `state == .running` from a
-    // racing terminate's pre-flip can re-enqueue an thread after the second
+    // racing terminate's pre-flip can re-enqueue a thread after the second
     // sweep, leaving it dangling). dequeue filters those — if we bailed on
     // a queue containing only stale entries, `run()` would loop right back
     // through dequeueOrIdle, see only filterable junk, and re-park,
     // burning CPU on a tight cycle until the queue is cleaned out.
     if (dequeueOrIdleLocked(core)) |raced_in| {
-        // Peer race: an thread landed in our queue between `run()`'s
+        // Peer race: a thread landed in our queue between `run()`'s
         // `dequeueOrIdle()` and now. Bail park, dispatch directly under
         lock.unlockIrqRestore(irq);
         switchTo(raced_in);
@@ -1002,8 +1002,8 @@ fn parkAndAwaitIRQ() void {
 
     // Detach from whatever user translation root the last dispatch
     // left loaded and publish "no user root" BEFORE halting. A parked
-    // core otherwise keeps the previous domain's root live in CR3 —
-    // if that domain is then destroyed, `freeUserAddrSpace` recycles
+    // core otherwise keeps the previous process's root live in CR3 —
+    // if that process is then destroyed, `freeUserAddrSpace` recycles
     // the tables this core's next IRQ entry walks through (stygia-rs6
     // family). The kernel half is shared across all roots, so the
     // swap is transparent to the park path itself; the publish order
@@ -1044,26 +1044,26 @@ export fn scheduler_run_after_park() callconv(.c) noreturn {
 /// Internal helper — dequeues the highest-priority thread, or returns the
 /// per-core idle thread if the queue is empty. Returns null when both are
 /// empty (caller drops to `sti+hlt` and waits for a wake IPI).
-/// True while `thread`'s domain SlabRef still names the CD slot's live
-/// gen. Turns false the instant `destroyPhase1` dead-marks the CD —
+/// True while `thread`'s process SlabRef still names the process slot's live
+/// gen. Turns false the instant `destroyPhase1` dead-marks the process —
 /// i.e. it covers the phase1→phase2 teardown gap in which the
-/// domain's Threads are themselves still gen-live and `.ready` but their
-/// domain (and imminently its translation root) is being destroyed.
+/// process's Threads are themselves still gen-live and `.ready` but their
+/// process (and imminently its translation root) is being destroyed.
 /// Every dispatch-commitment site must refuse such Threads BEFORE the
-/// `switchTo` domain deref; see the stygia-rs6 CR3=0 corpse notes at
+/// `switchTo` process deref; see the stygia-rs6 CR3=0 corpse notes at
 /// the dequeue filter.
-inline fn domainRefAlive(thread: *Thread) bool {
-    const dref = thread.domain;
+inline fn processRefAlive(thread: *Thread) bool {
+    const dref = thread.process;
     return dref.ptr._gen_lock.currentGen() == @as(u64, dref.gen);
 }
 
 inline fn canPublishReady(thread: *Thread) bool {
-    return thread._gen_lock.currentGen() % 2 == 1 and !lifecycle.isDestroyMarked(thread) and domainRefAlive(thread);
+    return thread._gen_lock.currentGen() % 2 == 1 and !lifecycle.isDestroyMarked(thread) and processRefAlive(thread);
 }
 
 fn diagTag(thread: *Thread) u64 {
     if (thread.diag_test_tag != 0) return thread.diag_test_tag;
-    return thread.domain.ptr.diag_test_tag;
+    return thread.process.ptr.diag_test_tag;
 }
 
 fn logYieldSelectDiag(core: u8, target: *Thread, reason: []const u8, publishable: bool) void {
@@ -1264,8 +1264,8 @@ fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*Thread {
     if (target.thread) |t| {
         defer target.release();
 
-        // `domainRefAlive`: same dying-domain dispatch gate as the
-        // dequeue filter — a yieldTo target whose CD was dead-marked
+        // `processRefAlive`: same dying-process dispatch gate as the
+        // dequeue filter — a yieldTo target whose process was dead-marked
         // by destroyPhase1 must not be committed (its queue entry, if
         // any, is drained and dropped by dequeueOrIdleLocked instead).
         if (!affinityAdmitsCore(t.affinity, core)) {
@@ -1502,7 +1502,7 @@ pub fn enqueue(thread: *Thread) void {
 /// case (terminate / paired post-`.exited` sweep / destroyPhase2 reap
 /// on faulted Threads, the bd-vzdh contention scenario), eliminating the
 /// O(MAX_CORES) cache-line bouncing that compounded into ~2.5 s of
-/// LAPIC-tick suppression under SMP=4 concurrent CD destroys.
+/// LAPIC-tick suppression under SMP=4 concurrent process destroys.
 ///
 /// Fallback (`current_queue_core == NOT_IN_RUN_QUEUE`): sweep all 64
 /// per-core locks. Required for stale-hint races and for any thread that
@@ -1560,7 +1560,7 @@ fn claimReadyFromLockedQueue(core: u8, thread: *Thread, expected_gen: ?u32) bool
     if (expected_gen) |gen| {
         if (thread_gen != @as(u63, gen)) return false;
     }
-    if (thread_gen % 2 == 0 or !domainRefAlive(thread)) return false;
+    if (thread_gen % 2 == 0 or !processRefAlive(thread)) return false;
     if (thread.owner_core != NOT_IN_RUN_QUEUE) return false;
     if (lifecycle.load(thread) != .ready) return false;
     if (!runQueueContains(&state.run_queue, thread)) return false;
@@ -1644,14 +1644,14 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
     (&core_states[core]).active_root.store(root_addr, .release);
 }
 
-/// Spin until no core can execute through the dying domain's
+/// Spin until no core can execute through the dying process's
 /// translation tables. Two per-core clauses, both required:
 ///
 ///   1. `active_root == root_addr` — the core has the dying root
 ///      LOADED (published with release-after-load; see
 ///      `PerCore.active_root`).
-///   2. `current_thread` names an thread whose `domain.ptr == cd_ptr` — the
-///      core has COMMITTED to dispatching a dying-domain thread but may
+///   2. `current_thread` names a thread whose `process.ptr == process_ptr` — the
+///      core has COMMITTED to dispatching a dying-process thread but may
 ///      not have loaded (or published) its root yet. `current_thread`
 ///      flips at `setCurrentThread`, well before the dispatch path's
 ///      root swap, so it is the conservative early signal for
@@ -1660,9 +1660,9 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
 ///      stalled in migrateFlush) when the teardown freed the root
 ///      it was about to load.
 ///
-/// Domain teardown calls this after the destroy walk (zombies + wake
+/// Process teardown calls this after the destroy walk (zombies + wake
 /// IPIs posted, gens bumped) and before freeing any table. Both
-/// clauses converge: dying-domain Threads are gen-dead so no NEW dequeue
+/// clauses converge: dying-process Threads are gen-dead so no NEW dequeue
 /// can dispatch them (dequeueOrIdleLocked filters even-gen), running
 /// victims get evicted within one IRQ delivery, and an in-flight
 /// dispatch either completes (publishing the root — clause 1 holds
@@ -1670,7 +1670,7 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
 /// carries a committed thread in neither signal; it contains no spins
 /// and its close (`setCurrentThread`'s SlabRef.init) asserts on the
 /// bumped gen, so it cannot silently dispatch. Cross-core reads of
-/// `thread.domain.ptr` are identity-only; slab memory persists after
+/// `thread.process.ptr` are identity-only; slab memory persists after
 /// reap (zeroed ⇒ ptr mismatch ⇒ clause exits).
 ///
 /// The EXECUTING core is skipped: a self-destroying caller thread still
@@ -1693,7 +1693,7 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
 /// after any in-progress locked commit, making `committed_thread` (and
 /// everything the committer wrote before its unlock) visible to the
 /// clause scan below.
-pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
+pub fn awaitProcessQuiesced(root_addr: u64, process_ptr: *const anyopaque) void {
     const self_core: u8 = @truncate(arch.smp.coreID());
     for (&core_locks) |*lock| {
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
@@ -1703,7 +1703,7 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
         if (core_idx == self_core) continue;
         while (true) {
             // Ack-while-spinning (stygia-rs6 mechanism 9): this barrier
-            // is reachable with IRQs masked from the domain-destroy
+            // is reachable with IRQs masked from the process-destroy
             // path, and a core deaf to the shootdown IPI while another
             // core sits in `waitForShootdownAcks` wedges the machine.
             spin_diag.note(.await_quiesced, core_idx);
@@ -1718,10 +1718,10 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
             }
             if (state.current_thread) |cur| {
                 // caller-pinned: identity-only compare of the raw
-                // domain pointer against the dying CD's address — no
-                // field of the CD is read through it. Slab bytes of a
+                // process pointer against the dying process's address — no
+                // field of the process is read through it. Slab bytes of a
                 // current thread persist past its gen flip (deferred
-                // finalize), and a zeroed domain field simply
+                // finalize), and a zeroed process field simply
                 // mismatches and exits the clause.
                 //
                 // The deref below is UNCONDITIONAL, so "non-null implies
@@ -1729,9 +1729,9 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
                 // cross-core read. It does now, and did not before:
                 // `current_thread` is a single pointer word (see its field
                 // doc), where the old `?SlabRef` aggregate let this
-                // exact load fault at 0x488 == @offsetOf(thread, "domain")
+                // exact load fault at 0x488 == @offsetOf(thread, "process")
                 // on a torn `{ is_non_null = 1, ptr = 0 }`.
-                if (@intFromPtr(cur.domain.ptr) == @intFromPtr(cd_ptr)) {
+                if (@intFromPtr(cur.process.ptr) == @intFromPtr(process_ptr)) {
                     std.atomic.spinLoopHint();
                     continue;
                 }

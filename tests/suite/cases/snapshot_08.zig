@@ -1,12 +1,12 @@
 // Spec §[snapshot] — test 08.
 //
 // "[test 08] if the source [2] is deleted before restart, the binding
-//  is cleared; on restart with no source bound, the domain is
+//  is cleared; on restart with no source bound, the process is
 //  terminated rather than restarted."
 //
 // DEGRADED SMOKE VARIANT
-//   The faithful observable is split across two domain-restart events
-//   that the test capability domain cannot trigger or witness from
+//   The faithful observable is split across two process-restart events
+//   that the test process cannot trigger or witness from
 //   inside itself:
 //
 //     1. Bind a source VMAR to a target VMAR via `snapshot`.
@@ -16,38 +16,38 @@
 //        target's source binding as a side effect of that source
 //        deletion (the binding is internal kernel state — there is no
 //        v3 syscall that reads "the source bound to this target").
-//     3. Cause the calling capability domain to restart (e.g., fault
+//     3. Cause the calling process to restart (e.g., fault
 //        every thread, or kill the self-handle with `restart` cap set).
 //        The kernel walks the target VMAR's `restart_policy = snapshot`,
 //        looks up its bound source, finds none, and per the spec line
-//        TERMINATES the domain rather than restarting it.
-//     4. From outside, observe that the domain did not restart.
+//        TERMINATES the process rather than restarting it.
+//     4. From outside, observe that the process did not restart.
 //
 //   None of these post-action observations is reachable from inside the
-//   test thread's own capability domain:
+//   test thread's own process:
 //
 //     - Step (2)'s side effect — "the binding is cleared" — is not
 //       directly observable: there is no `get_snapshot_source` syscall
 //       and `sync` on the target VMAR refreshes only `cur_rwx`, `map`,
 //       `device` (per §[var] field1), not the bound-source identity.
-//     - Step (3) requires triggering a restart of *this same domain*,
+//     - Step (3) requires triggering a restart of *this same process*,
 //       which destroys the thread running the test. Even if we could trip
 //       the restart, the spec-mandated outcome (TERMINATION instead of
 //       restart) means the test thread does not get a chance to call
 //       `pass`/`fail` — the result port reply path is gone with the
-//       domain. Confirming "domain was terminated, not restarted" is a
+//       process. Confirming "process was terminated, not restarted" is a
 //       parent-runner observation, and the runner currently spawns
-//       each test in a single child capability domain with no recipe
-//       for "restart this domain and report whether it came back".
+//       each test in a single child process with no recipe
+//       for "restart this process and report whether it came back".
 //
 //   Reaching the faithful observation would require either:
 //     - the runner gaining a per-test "restart-and-observe" harness:
-//       hold a self-IDC handle to the test domain plus a watch on its
-//       lifecycle, fault one of its Threads, and report whether the domain
+//       hold a self-IDC handle to the test process plus a watch on its
+//       lifecycle, fault one of its Threads, and report whether the process
 //       reappears; or
-//     - this test spawning a sub-sub-domain, embedding an inner ELF
+//     - this test spawning a sub-sub-process, embedding an inner ELF
 //       that performs the snapshot/delete/fault sequence, and reading
-//       termination back through the sub-sub-domain's IDC handle (a
+//       termination back through the sub-sub-process's IDC handle (a
 //       full nested test driver — the same infrastructure that
 //       restart_semantics_04's notes call out).
 //
@@ -89,16 +89,16 @@
 //
 // Assertion
 //   No assertion is checked — passes with assertion id 0 because the
-//   spec-mandated observable (domain terminates, not restarts, when
-//   the bound source is gone at restart time) sits behind a domain
+//   spec-mandated observable (process terminates, not restarts, when
+//   the bound source is gone at restart time) sits behind a process
 //   restart we cannot trigger or witness from inside the test thread.
 //
 // Faithful-test note
 //   Faithful test deferred pending a runner-side restart-observability
-//   harness: a parent that holds a self-IDC handle to the test domain,
-//   triggers the test domain's restart (e.g., by faulting one of its
+//   harness: a parent that holds a self-IDC handle to the test process,
+//   triggers the test process's restart (e.g., by faulting one of its
 //   Threads whose self-handle has the `restart` cap), and reports back
-//   whether the domain restarted or was terminated. With that, the
+//   whether the process restarted or was terminated. With that, the
 //   action becomes:
 //
 //     create_vmar(restart_policy=2, ...) -> source
@@ -106,7 +106,7 @@
 //     snapshot(target, source)
 //     delete(source)
 //     <signal parent: "now trip my restart">
-//     <parent observes: domain terminated, did not come back>
+//     <parent observes: process terminated, did not come back>
 //       -> *expected* observable per test 08 (id 1)
 //
 //   Two sibling cases worth covering once the harness exists:
@@ -176,7 +176,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Bind source -> target. Per §[snapshot], on success no error is
     // returned; we don't assert on the return because the spec
-    // observable under test sits behind a domain restart, and any
+    // observable under test sits behind a process restart, and any
     // bind-time anomaly would be caught by snapshot tests 01-07.
     _ = syscall.snapshot(target_handle, source_handle);
 
@@ -185,12 +185,12 @@ pub fn main(cap_table_base: u64) void {
     // the target is supposed to be cleared as a side effect. The
     // cleared-binding observable is invisible from inside the child
     // (no syscall reads "current bound source"), and the
-    // termination-on-restart observable requires the domain itself to
+    // termination-on-restart observable requires the process itself to
     // be restarted from outside.
     _ = syscall.delete(source_handle);
 
     // No spec assertion is being checked — the restart-observability
-    // half of test 08 is unreachable from inside the test domain.
+    // half of test 08 is unreachable from inside the test process.
     // Pass with assertion id 0 to mark this slot as smoke-only in
     // coverage.
     testing.pass();

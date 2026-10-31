@@ -833,7 +833,7 @@ pub fn initZeroPageFeatures() void {
 ///
 /// AMD APM Vol 3, "CLZERO" — "Zeroes the cache line specified by the
 /// logical address in rAX." CLZERO implicitly flushes the line from
-/// all caches in the coherence domain before zeroing, so the zeros
+/// all caches in the coherence process before zeroing, so the zeros
 /// reach main memory on the next writeback.
 pub fn zeroPage4K(ptr: *anyopaque) void {
     if (has_clzero) {
@@ -890,7 +890,7 @@ pub fn prepareThreadContext(
 /// shape. Mirrors the user-mode arm of `interrupts.prepareThreadContext`
 /// (sets USER_CODE/USER_DATA selectors, applies the SysV ABI
 /// `rsp%16==8` skew, writes RIP and the first-arg register). Used by
-/// callers that allocate an thread without an attached user stack and wire
+/// callers that allocate a thread without an attached user stack and wire
 /// the stack in afterward.
 pub fn patchUserModeIretFrame(
     ctx: *interrupts.ArchCpuContext,
@@ -927,7 +927,7 @@ pub fn idle() void {
 /// land on a stack dedicated to this core (rather than on a shared
 /// stale gs:0 pointing at a previously-suspended thread's kstack — see
 /// `sched.scheduler.parkAndAwaitIRQ`). Clears the thread-identity caches
-/// (gs:32 current_thread, gs:176 current_thread_gen, gs:40/48/56 domain ptrs)
+/// (gs:32 current_thread, gs:176 current_thread_gen, gs:40/48/56 process ptrs)
 /// to null so any FP path on this core would bail to slow path; in
 /// practice no FP entry fires while this core is parked because no
 /// userspace runs on it without a `switchTo` first.
@@ -936,7 +936,7 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     sc.kernel_rsp = park_top;
     sc.current_thread = 0;
     sc.current_thread_gen = 0;
-    sc.current_domain = 0;
+    sc.current_process = 0;
     sc.current_user_table = 0;
     sc.current_kernel_table = 0;
     gdt.coreTss(core_id).rsp0 = park_top;
@@ -961,7 +961,7 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
 /// `entry(arg)`. The store happens AFTER the rsp swap — from that
 /// instruction on, this core provably never reads or writes the old
 /// stack again, so a byte that gates "may another core reuse that
-/// kstack" (an thread's `on_cpu` flag) can be cleared here and nowhere
+/// kstack" (a thread's `on_cpu` flag) can be cleared here and nowhere
 /// earlier. x86-TSO gives the plain `movb` store release semantics
 /// against the `.acquire` loads in the wake-side spins.
 ///

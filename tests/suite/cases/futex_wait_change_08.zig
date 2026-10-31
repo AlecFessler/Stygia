@@ -13,11 +13,11 @@
 //   actually changed the underlying value (the spec note about
 //   spurious wakes).
 //
-//   The runner mints each test child capability domain with
+//   The runner mints each test child process with
 //   `fut_wake = true` on the self-handle (runner/primary.zig line
 //   184) and `fut_wait_max = 63` (line 167); the self-handle is
-//   shared across every thread in the domain, so any thread the test spawns
-//   inherits both rights for free. Same-domain spawn (target = 0 on
+//   shared across every thread in the process, so any thread the test spawns
+//   inherits both rights for free. Same-process spawn (target = 0 on
 //   create_thread) keeps the child in this address space
 //   so a process-global is shared memory between the two Threads — same
 //   shape `yield_03` uses to verify visibility of a child write.
@@ -44,8 +44,8 @@
 //   Watched address alignment: `watched` is a u64 in .bss; the
 //   linker aligns u64 to 8 bytes so test 04 (E_INVAL on misaligned
 //   addr) cannot fire. The address is in the test ELF's loaded
-//   image, mapped r/w into the child capability domain by
-//   `create_capability_domain`, so test 05 (E_BADADDR) cannot fire.
+//   image, mapped r/w into the child process by
+//   `create_process`, so test 05 (E_BADADDR) cannot fire.
 //   N = 1 stays inside [1, 63] and inside the caller's
 //   `fut_wait_max = 63`, so tests 02 / 03 cannot fire. The
 //   `fut_wait_max = 63` minted on the self-handle leaves test 01
@@ -95,7 +95,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global watched word, shared between the test thread and the
-// child thread because both run in the same capability domain. Stays at
+// child thread because both run in the same process. Stays at
 // 0 throughout the test — the child never writes it; only its
 // futex_wake call reaches the parent. .bss alignment for u64
 // guarantees 8-byte alignment per test 04.
@@ -106,7 +106,7 @@ fn childEntry() callconv(.c) noreturn {
     // futex_wait_val or futex_wait_change on the given address. The
     // self-handle carries `fut_wake` (runner/primary.zig line 184),
     // so test 01 cannot fire; `&watched` is 8-byte aligned (test
-    // 02) and mapped r/w in this domain (test 03). Hammer the wake
+    // 02) and mapped r/w in this process (test 03). Hammer the wake
     // continuously: if the child is scheduled before the parent
     // parks on the futex bucket, an early single-shot wake misses
     // and the parent times out. The continuous loop guarantees a
@@ -122,9 +122,9 @@ fn childEntry() callconv(.c) noreturn {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Same-domain spawn: caps = 0 (the child needs no per-handle
+    // Same-process spawn: caps = 0 (the child needs no per-handle
     // caps for `futex_wake` — that gate lives on the self-handle,
-    // shared across every thread in the domain). `restart_policy = 0`
+    // shared across every thread in the process). `restart_policy = 0`
     // dodges restart_semantics test 01.
     const thread_caps = caps.ThreadCap{ .restart_policy = 0 };
     const caps_word: u64 = @as(u64, thread_caps.toU16());

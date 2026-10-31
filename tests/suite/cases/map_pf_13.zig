@@ -11,7 +11,7 @@
 //   rejected by IOMMU" assertions both require a real bus initiator
 //   (the bound device) emitting transactions against the VMAR's IOVA.
 //   The v3 userspace surface has no primitive for synthesizing DMA
-//   cycles from a child capability domain — only an integration harness
+//   cycles from a child process — only an integration harness
 //   driving the kernel's IOMMU under hardware (or a QEMU-backed
 //   fixture) can observe those clauses faithfully. Both clauses stay
 //   out of reach of any test running entirely inside a userspace thread.

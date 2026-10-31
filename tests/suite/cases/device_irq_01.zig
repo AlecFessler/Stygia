@@ -1,7 +1,7 @@
 // Spec §[device_irq] device_irq — test 01.
 //
 // "[test 01] when the device fires an IRQ, within a bounded delay every
-//  domain-local copy of [1] returns `field1.irq_count = (prior + 1)`
+//  process-local copy of [1] returns `field1.irq_count = (prior + 1)`
 //  from a fresh `sync`."
 //
 // Faithful path (post-injection)
@@ -9,11 +9,11 @@
 //     1. Read [1].field1.irq_count via a fresh sync; record `prior`.
 //     2. Cause the device to fire an IRQ.
 //     3. Within a bounded delay, observe a fresh sync return
-//        `prior + 1` on every domain-local copy.
+//        `prior + 1` on every process-local copy.
 //
 //   Step 2 is unreachable on this branch. The runner-fix commit
 //   (kernel/boot/userspace_init.zig grantTestFixtureDevices) mints two
-//   synthetic device_regions onto root_cd with `irq_source =
+//   synthetic device_regions onto root_process with `irq_source =
 //   IRQ_SOURCE_NONE`. There is no IOAPIC/GIC line bound, so the kernel
 //   `onIrq` path never fires for these fixtures, and there is no
 //   test-only injection syscall. Furthermore
@@ -24,7 +24,7 @@
 //   message (commit 27efffc76).
 //
 //   What IS reachable: the prior=0 base case. A fresh-spawned spec-test
-//   capability domain inherits the dma+irq fixture handle with no IRQs
+//   process inherits the dma+irq fixture handle with no IRQs
 //   ever delivered (the kernel can't deliver to it), so a fresh sync
 //   must observe `field1.irq_count == 0`. This is the boundary case
 //   of the test 01 contract — `prior` is fixed at 0 — and lets us

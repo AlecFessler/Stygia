@@ -6,7 +6,7 @@ const device_region = stygia.devices.device_region;
 const errors = stygia.syscall.errors;
 const port = stygia.sched.port;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const DeviceRegion = device_region.DeviceRegion;
 const Thread = stygia.sched.thread.Thread;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;
@@ -79,17 +79,17 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 
     if (recv_port != 0) {
         const port_slot: u12 = @truncate(recv_port);
-        const cd_ref_p = thread.domain;
-        const lr_p = cd_ref_p.lockIrqSave(@src()) catch return errors.E_BADCAP;
-        const cd_p = lr_p.ptr;
-        const entry_p = capability.resolveHandleOnDomain(cd_p, port_slot, .port);
+        const process_ref_p = thread.process;
+        const lr_p = process_ref_p.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const process_p = lr_p.ptr;
+        const entry_p = capability.resolveHandleOnProcess(process_p, port_slot, .port);
         var has_recv = false;
         if (entry_p != null) {
-            const port_caps_word: u16 = @truncate(Word0.caps(cd_p.user_table[port_slot].word0));
+            const port_caps_word: u16 = @truncate(Word0.caps(process_p.user_table[port_slot].word0));
             const port_caps: port.PortCaps = @bitCast(port_caps_word);
             has_recv = port_caps.recv;
         }
-        cd_ref_p.unlockIrqRestore(lr_p.irq_state);
+        process_ref_p.unlockIrqRestore(lr_p.irq_state);
         if (entry_p == null) return errors.E_BADCAP;
         if (!has_recv) return errors.E_PERM;
     }
@@ -98,11 +98,11 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         replyTransferInternal(thread, syscall_word, pair_count, args)
     else blk: {
         const slot: u12 = @truncate(reply_handle);
-        const cd_ref = thread.domain;
-        const lr = cd_ref.lockIrqSave(@src()) catch break :blk errors.E_BADCAP;
-        const cd = lr.ptr;
-        const entry_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
-        cd_ref.unlockIrqRestore(lr.irq_state);
+        const process_ref = thread.process;
+        const lr = process_ref.lockIrqSave(@src()) catch break :blk errors.E_BADCAP;
+        const process = lr.ptr;
+        const entry_present = capability.resolveHandleOnProcess(process, slot, .reply) != null;
+        process_ref.unlockIrqRestore(lr.irq_state);
         if (!entry_present) break :blk errors.E_BADCAP;
         break :blk port.reply(thread, reply_handle);
     };
@@ -123,7 +123,7 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 /// Consumes a reply handle, resumes the suspended thread, and attaches N
 /// handles to the resumption. The resumed thread's syscall word carries
 /// `pair_count = N` and `tstart = S` (slot id of the first attached
-/// handle in the resumed thread's domain). State writes are applied per
+/// handle in the resumed thread's process). State writes are applied per
 /// `reply` semantics.
 ///
 /// ```
@@ -147,14 +147,14 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 /// [test 02] returns E_PERM if the reply handle does not have the `xfer` cap.
 /// [test 03] returns E_INVAL if N is 0 or N > 63.
 /// [test 04] returns E_INVAL if any reserved bits are set in the syscall word or any pair entry.
-/// [test 05] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
+/// [test 05] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's process.
 /// [test 06] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
 /// [test 07] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
 /// [test 08] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
 /// [test 09] returns E_INVAL if two pair entries reference the same source handle.
 /// [test 10] returns E_TERM if the suspended thread was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
-/// [test 11] returns E_FULL if the resumed thread's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
-/// [test 12] on success, the reply handle is consumed; the resumed thread's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed thread's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+/// [test 11] returns E_FULL if the resumed thread's process handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+/// [test 12] on success, the reply handle is consumed; the resumed thread's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating thread handle had the `write` cap, the resumed thread's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended thread is resumed.
@@ -175,20 +175,20 @@ fn replyTransferInternal(caller: *Thread, syscall_word: u64, n: u8, args: []cons
     // outright empty. Test 04b (per-entry reserved-bit) must fire
     // before test 01 *only when the slot is occupied as a non-reply
     // handle* (per tests/reply_transfer_04 case B which uses
-    // SLOT_SELF, an in-domain capability_domain entry).
-    const cd_ref = thread.domain;
-    const lr_pre = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd_pre = lr_pre.ptr;
-    const slot_occupied = capability.resolveHandleOnDomain(cd_pre, slot, null) != null;
+    // SLOT_SELF, an in-process process entry).
+    const process_ref = thread.process;
+    const lr_pre = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process_pre = lr_pre.ptr;
+    const slot_occupied = capability.resolveHandleOnProcess(process_pre, slot, null) != null;
     const reply_present = slot_occupied and
-        capability.resolveHandleOnDomain(cd_pre, slot, .reply) != null;
+        capability.resolveHandleOnProcess(process_pre, slot, .reply) != null;
     var has_xfer = false;
     if (reply_present) {
-        const caps_word = Word0.caps(cd_pre.user_table[slot].word0);
+        const caps_word = Word0.caps(process_pre.user_table[slot].word0);
         const reply_caps: ReplyCaps = @bitCast(caps_word);
         has_xfer = reply_caps.xfer;
     }
-    cd_ref.unlockIrqRestore(lr_pre.irq_state);
+    process_ref.unlockIrqRestore(lr_pre.irq_state);
 
     // Test 01 — fires here iff the slot is unoccupied. An occupied
     // non-reply slot keeps going so test 04b can trip first.
@@ -219,24 +219,24 @@ fn replyTransferInternal(caller: *Thread, syscall_word: u64, n: u8, args: []cons
     }
 
     // Test 01: reply handle resolves as a reply. Deferred to here so
-    // test 04b fires first against in-domain non-reply slots.
+    // test 04b fires first against in-process non-reply slots.
     if (!reply_present) return errors.E_BADCAP;
 
     // Spec §[reply].reply_transfer per-entry gates (tests 05/06/07/08).
-    // Resolved under the domain lock so the check is atomic against
+    // Resolved under the process lock so the check is atomic against
     // concurrent revoke/delete on the source handles. While the lock is
     // held we also stash decoded entries on the caller's thread for the
     // port-layer install pass — capturing each source's ErasedSlabRef
     // here pins the underlying object across the upcoming reply ops
     // even if the source slot is later cleared on a `move = 1` path.
-    const lr2 = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr2.ptr;
-    if (validatePairEntrySources(cd, thread, pair_entries)) |err| {
+    const lr2 = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr2.ptr;
+    if (validatePairEntrySources(process, thread, pair_entries)) |err| {
         port.releasePendingPairEntries(thread);
-        cd_ref.unlockIrqRestore(lr2.irq_state);
+        process_ref.unlockIrqRestore(lr2.irq_state);
         return err;
     }
-    cd_ref.unlockIrqRestore(lr2.irq_state);
+    process_ref.unlockIrqRestore(lr2.irq_state);
 
     return port.replyTransfer(thread, reply_handle, n);
 }
@@ -252,21 +252,21 @@ fn validatePairEntryBits(entries: []const u64) ?i64 {
 
 /// Per-entry source-id resolution + caps subset + move/copy authority
 /// for `reply_transfer`. Spec §[reply].reply_transfer tests 05/06/07/08.
-/// Caller holds `cd._gen_lock`. Returns `null` on full pass; otherwise
+/// Caller holds `process._gen_lock`. Returns `null` on full pass; otherwise
 /// the first failing test's error code. Stashes each decoded entry on
 /// `thread.pending_pair_entries` as a side effect — the kernel-side
 /// `port.replyTransfer` consumes the stash to install handles in the
-/// resumed sender's domain. `thread.pending_pair_count` is published only
+/// resumed sender's process. `thread.pending_pair_count` is published only
 /// on full pass to keep partial failure observably equivalent to "no
 /// entries stashed" for cleanup / re-entry.
 fn validatePairEntrySources(
-    cd: *CapabilityDomain,
+    process: *Process,
     thread: *Thread,
     entries: []const u64,
 ) ?i64 {
-    const source_domain: capability.ErasedSlabRef = .{
-        .ptr = cd,
-        .gen = @intCast(cd._gen_lock.currentGen()),
+    const source_process: capability.ErasedSlabRef = .{
+        .ptr = process,
+        .gen = @intCast(process._gen_lock.currentGen()),
     };
     var idx: usize = 0;
     while (idx < entries.len) : (idx += 1) {
@@ -275,14 +275,14 @@ fn validatePairEntrySources(
         const entry_caps: u16 = @truncate((entry >> 16) & 0xFFFF);
         const move_flag: bool = (entry & PAIR_MOVE_BIT) != 0;
 
-        // Test 05: source handle must resolve in the caller's domain.
-        const src = capability.resolveHandleOnDomain(cd, slot, null) orelse {
+        // Test 05: source handle must resolve in the caller's process.
+        const src = capability.resolveHandleOnProcess(process, slot, null) orelse {
             thread.pending_pair_count = @intCast(idx);
             port.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
 
-        const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
+        const src_caps: u16 = @truncate(Word0.caps(process.user_table[slot].word0));
 
         // Test 06: requested caps must be a subset of the source
         // handle's current caps. Bitwise subset is correct for every
@@ -313,12 +313,12 @@ fn validatePairEntrySources(
         }
 
         // Stash the decoded entry. Captures the source object's
-        // ErasedSlabRef under `cd._gen_lock` so the gen baked into the
+        // ErasedSlabRef under `process._gen_lock` so the gen baked into the
         // ref matches a live object until at least the install phase.
-        const obj_type = Word0.typeTag(cd.user_table[slot].word0);
+        const obj_type = Word0.typeTag(process.user_table[slot].word0);
         thread.pending_pair_entries[idx] = .{
             .obj_ref = src.ref,
-            .source_domain = source_domain,
+            .source_process = source_process,
             .source_instance = src.instance,
             .obj_type = obj_type,
             .source_caps = src_caps,
@@ -384,17 +384,17 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
     const thread: *Thread = @ptrCast(@alignCast(caller));
     const slot: u12 = @truncate(handle);
 
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
-    const entry = capability.resolveHandleOnDomain(cd, slot, .device_region) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const entry = capability.resolveHandleOnProcess(process, slot, .device_region) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
     const dr_ref = capability.typedRef(DeviceRegion, entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
@@ -402,22 +402,22 @@ pub fn ack(caller: *anyopaque, handle: u64) i64 {
     // cap. The cap word lives in user_table[slot].word0 bits 48-63 and
     // is sourced from the device_region cap layout in §[device_region]
     // (bit 3 = irq).
-    const dev_caps_word: u16 = Word0.caps(cd.user_table[slot].word0);
+    const dev_caps_word: u16 = Word0.caps(process.user_table[slot].word0);
     const dev_caps: device_region.DeviceRegionCaps = @bitCast(dev_caps_word);
     if (!dev_caps.irq) {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_PERM;
     }
 
     // Resolve the physical address of the caller's `field1` slot in its
-    // domain's user_table — the futex-watch address Spec §[device_irq]
+    // process's user_table — the futex-watch address Spec §[device_irq]
     // wakes on. The user_table page is identity-mapped via the kernel's
     // direct map, so taking `&` yields a valid kernel-VA the userio
     // helpers can translate.
-    const field1_kva: u64 = @intFromPtr(&cd.user_table[slot].field1);
+    const field1_kva: u64 = @intFromPtr(&process.user_table[slot].field1);
     const field1_paddr = PAddr.fromInt(field1_kva);
 
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
 
     const drlr = dr_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const dr = drlr.ptr;

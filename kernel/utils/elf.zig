@@ -26,7 +26,7 @@ pub const ParsedElf = struct {
     bytes: []u8,
     entry: VAddr,
     /// ELF `e_type` field (ET_DYN, ET_EXEC, etc.). Spec
-    /// §[create_capability_domain] requires PIE images (ET_DYN).
+    /// §[create_process] requires PIE images (ET_DYN).
     e_type: u16,
     sections: [@intFromEnum(ElfSection.num_sections)]Section,
     dwarf: Dwarf,
@@ -36,7 +36,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     result.bytes = bytes;
 
     const hdr_sz = @sizeOf(elf.Elf64_Ehdr);
-    // Spec §[create_capability_domain]: a malformed ELF (zero-sized
+    // Spec §[create_process]: a malformed ELF (zero-sized
     // page frame, truncated file, missing magic) must surface as
     // E_INVAL at the syscall boundary. parseElf is the entry point
     // most likely to be reached with attacker-controlled bytes —
@@ -53,7 +53,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     // through the child's read-only cap_table_base and dies as a
     // unhandled `memory_fault`. The thread is unrunnable by construction, so
     // reject at the syscall boundary (callers map parse errors to
-    // E_INVAL) rather than spawning a domain that can only fault.
+    // E_INVAL) rather than spawning a process that can only fault.
     const want_machine: elf.EM = switch (builtin.cpu.arch) {
         .x86_64 => .X86_64,
         .aarch64 => .AARCH64,
@@ -84,7 +84,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     while (try phdr_itr.next()) |phdr| {
         if (phdr.p_type != elf.PT_LOAD) continue;
         // Validate the segment file extent against `bytes.len`. The
-        // resulting Section is consumed by capability_domain's segment-
+        // resulting Section is consumed by process's segment-
         // copy loop and boot.userspace_init's ELF mapper, both of which
         // slice `bytes[offset .. offset + size]` directly; an unchecked
         // p_offset/p_filesz from a hostile phdr would slice past the

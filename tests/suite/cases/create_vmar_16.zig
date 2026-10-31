@@ -7,7 +7,7 @@
 //   other create_vmar-prelude check, mirroring create_var_05.zig:
 //     - caller self-handle has `crvr` (root_service grants this).
 //     - caps.r/w/x ⊆ vmar_inner_ceiling.r/w/x (test 02): use only r,w
-//       which the root domain's ceiling permits.
+//       which the root process's ceiling permits.
 //     - caps.max_sz ≤ ceiling.max_sz (test 03): leave max_sz = 0.
 //     - caps.mmio (tests 04, 08, 11, 13): leave mmio = 0.
 //     - caps.dma (tests 12, 13, 14, 15, 22): leave dma = 0; pass

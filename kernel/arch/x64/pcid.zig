@@ -21,7 +21,6 @@ const SpinLock = stygia.utils.sync.SpinLock;
 /// core before returning the slot to the bitmap. A future re-allocation
 /// of the same id therefore cannot inherit stale mappings from the
 /// previous owner.
-
 const pcid_bits: u16 = 12;
 const pcid_count: u16 = 1 << pcid_bits;
 const word_bits: u16 = 64;
@@ -66,10 +65,10 @@ pub fn free(id: u16) void {
     std.debug.assert(id < pcid_count);
 
     // Queue remote INVPCID broadcasts for this PCID before recycling.
-    // A core that previously ran the dying domain may still hold stale
-    // PCID-tagged entries; if the PCID is reused for a new domain
-    // before those clear naturally, the new domain's user-half VAs can
-    // resolve to the dying domain's freed physical pages — particularly
+    // A core that previously ran the dying process may still hold stale
+    // PCID-tagged entries; if the PCID is reused for a new process
+    // before those clear naturally, the new process's user-half VAs can
+    // resolve to the dying process's freed physical pages — particularly
     // dangerous now that the destroy path returns those pages to PMM
     // via `freeUserAddrSpace` (vs the prior leak-style teardown that
     // left them quiescent). See SDM Vol 2A INVPCID type 1 (single-PCID,

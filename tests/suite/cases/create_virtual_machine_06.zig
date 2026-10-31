@@ -50,7 +50,7 @@
 //        table, num_cr_policies, pads) is in-range, so the only
 //        invariant violated is the one under test.
 //     4. create_virtual_machine(caps={policy=true}, policy_pf). The
-//        runner provisions the test domain with `crvm` (per
+//        runner provisions the test process with `crvm` (per
 //        runner/primary.zig) and `vm_ceiling` covering the `policy`
 //        bit (bit 48 of ceilings_inner = 0x01), so the call cannot
 //        short-circuit on E_PERM ahead of the VmPolicy validation.

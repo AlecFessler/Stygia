@@ -7,7 +7,7 @@
 //   reply with pair_count > 0 takes a reply handle and N pair entries
 //   in the high vregs [128-N..127]. The duplicate-source check fires
 //   when two entries name the same source handle id in the caller's
-//   domain, regardless of caps/move flag.
+//   process, regardless of caps/move flag.
 //
 //   To reach the call we need a valid reply handle in our table. The
 //   only way to mint one is `recv` on a port that has had a sender
@@ -20,7 +20,7 @@
 //        Its entry point is `dummyEntry` (halt-forever); execution
 //        body is irrelevant — the thread only needs to exist and be
 //        suspendable. restart_policy=0 keeps the create call within
-//        the child domain's `restart_policy_ceiling.thread_restart_max`.
+//        the child process's `restart_policy_ceiling.thread_restart_max`.
 //     3. `suspend(sibling, port)` — sibling is dequeued onto the port's
 //        suspended-sender queue. We do not attach handles, so the port
 //        only needs `bind` for this step (§[suspend] test 04); xfer is
@@ -42,7 +42,7 @@
 //       default to zero.
 //     - test 12 (E_BADCAP if source invalid): we use SLOT_INITIAL_THREAD,
 //       which is always valid in a freshly-spawned child per
-//       §[create_capability_domain] test 21.
+//       §[create_process] test 21.
 //     - test 13 (E_PERM if entry caps not subset of source caps):
 //       entry caps = 0 (empty set), trivially a subset.
 //     - test 14 (E_PERM if move=1 source lacks move): move=false.
@@ -151,12 +151,7 @@ fn issueReplyDup(reply_id: u12, entry: u64) u64 {
                 : [v1] "={x0}" (x0_out),
                 : [word] "r" (word),
                   [entry] "r" (entry),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
             return x0_out;
         },
         else => @compileError("unsupported target architecture"),
@@ -188,7 +183,7 @@ pub fn main(cap_table_base: u64) void {
 
     // §[create_thread]: sibling thread with susp+term so we can
     // suspend it on the port. restart_policy=0 keeps the create within
-    // the child domain's restart_policy_ceiling.thread_restart_max=2.
+    // the child process's restart_policy_ceiling.thread_restart_max=2.
     // priority=0 keeps the thread within the child's pri ceiling of 3.
     const thread_caps = caps.ThreadCap{
         .susp = true,

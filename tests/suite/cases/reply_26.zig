@@ -8,7 +8,7 @@
 // Strategy
 //   The combo path stacks reply_transfer's pair-attachment effect on
 //   top of reply_24's recv-mode park. We need THREE actors in the same
-//   domain so that we can witness BOTH effects in one test:
+//   process so that we can witness BOTH effects in one test:
 //
 //     - Test thread mints port_A (caps={bind,recv,xfer}). xfer is the
 //       cap that makes the kernel mint the resulting reply handle
@@ -40,7 +40,7 @@
 //       non-IDC type, so the install caps land verbatim — no
 //       idc_rx intersection to disentangle (matches
 //       reply_transfer_12.zig's reasoning).
-//     - W and the test thread share a domain, so the kernel-chosen
+//     - W and the test thread share a process, so the kernel-chosen
 //       tstart slot is visible to us through the read-only cap
 //       table mapping. W stashes its captured post-resume syscall
 //       word into a shared global so the test thread can decode
@@ -125,7 +125,7 @@ const EVENT_TYPE_SUSPENSION: u8 = 4;
 const ATTACH_PF_CAPS: caps.PfCap = .{ .move = true, .r = true, .w = true };
 
 // Cross-thread mailbox. Test thread + siblings share the same address space
-// (single domain, single ELF). Same in-process pattern as
+// (single process, single ELF). Same in-process pattern as
 // reply_24.zig / reply_transfer_12.zig.
 var g_port_a_handle: u64 = 0;
 var g_port_b_handle: u64 = 0;
@@ -291,7 +291,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         @intFromPtr(&siblingW_entry),
         1, // stack_pages
-        0, // target = self (this domain)
+        0, // target = self (this process)
         sibling_affinity,
     );
     if (testing.isHandleError(created_thread_w.v1)) {
@@ -343,7 +343,7 @@ pub fn main(cap_table_base: u64) void {
     // 9. Combo unified reply: pair_count=1 (pf attached) AND
     //    recv_port_handle_id=port_b. Per spec test 26 the kernel
     //    atomically (a) resumes W with the page_frame installed in
-    //    its (= our) domain at a kernel-chosen tstart slot, and
+    //    its (= our) process at a kernel-chosen tstart slot, and
     //    (b) parks the test thread on port_B for the next event. X remains
     //    gated until W returns from this resume path, so X cannot
     //    prequeue the port_B event before the combo syscall.
@@ -387,7 +387,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // The next N=1 slot at S=tstart in the resumed thread's domain (== ours)
+    // The next N=1 slot at S=tstart in the resumed thread's process (== ours)
     // must hold the inserted page_frame handle with caps verbatim
     // (no idc_rx intersection — page_frame is non-IDC).
     const installed = caps.readCap(cap_table_base, @as(u32, w_tstart));

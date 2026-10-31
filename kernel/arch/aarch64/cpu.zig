@@ -431,23 +431,23 @@ pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
     const cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
     stygia.sched.scheduler.drainTeardown(cid, thread);
 
-    // Swap TTBR0_EL1 to the thread's domain root so the post-ERET user-half
+    // Swap TTBR0_EL1 to the thread's process root so the post-ERET user-half
     // translation walks the right tree. Kernel half lives in TTBR1 and
     // is shared, so no kernel-side TLBI is needed.
     //
     // caller-pinned: `thread` was selected by the scheduler for this core; its
-    // domain is held live by the thread through the dispatch window (the thread
-    // carries a SlabRef into the domain), so reading addr_space_root /
+    // process is held live by the thread through the dispatch window (the thread
+    // carries a SlabRef into the process), so reading addr_space_root /
     // addr_space_id directly off the deref'd pointer without re-locking
     // the SlabRef is sound here. Mirrors the matching exemption in
     // arch/x64/interrupts.zig switchTo.
-    const dom = thread.domain.ptr;
+    const dom = thread.process.ptr;
     const new_root = dom.addr_space_root;
     if (new_root.addr != stygia.arch.aarch64.paging.getAddrSpaceRoot().addr) {
         stygia.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
     }
-    // Publish AFTER the hardware TTBR0 load — domain teardown's
-    // quiesce barrier keys on this before freeing the dying domain's
+    // Publish AFTER the hardware TTBR0 load — process teardown's
+    // quiesce barrier keys on this before freeing the dying process's
     // tables — and retire the locked dispatch commitment. Mirrors
     // arch/x64/interrupts.zig switchTo.
     stygia.sched.scheduler.publishActiveRoot(cid, new_root.addr);
@@ -547,7 +547,7 @@ pub fn prepareThreadContext(
 }
 
 /// Re-patch a previously-built first-dispatch frame for user-mode entry.
-/// Used when an thread was allocated without a user stack (so
+/// Used when a thread was allocated without a user stack (so
 /// `prepareThreadContext` left the frame in EL1h kernel-mode shape) and the
 /// caller is wiring in the user stack and entry afterward.
 pub fn patchUserModeIretFrame(

@@ -18,7 +18,7 @@
 //   reserves 2 × 4 KiB pages. Same page size, different page_count =
 //   different byte size → E_INVAL.
 //
-//   The root domain's `vmar_inner_ceiling` permits {r, w, max_sz=0} and
+//   The root process's `vmar_inner_ceiling` permits {r, w, max_sz=0} and
 //   its `restart_policy_ceiling.vmar_restart_max` is 3 (see
 //   runner/primary.zig: ceilings_outer = 0x...01FE...), so both
 //   restart_policy values requested here are within bounds. mmio = 0

@@ -1,10 +1,10 @@
 // Spec §[handle_attachments] — test 02.
 //
 // "[test 02] returns E_BADCAP if any entry's source handle id is not
-// valid in the suspending thread's domain."
+// valid in the suspending thread's process."
 //
 // Strategy
-//   The child capability domain's table at spawn time contains:
+//   The child process's table at spawn time contains:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC

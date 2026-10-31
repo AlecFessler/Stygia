@@ -5,7 +5,7 @@
 //
 // Strategy
 //   The caller's priority ceiling lives in the self-handle's `pri`
-//   field (§[capability_domain] field bits 14-15 of the SelfCap word).
+//   field (§[process] field bits 14-15 of the SelfCap word).
 //   The runner mints each child with `pri = 3` (the maximum), so a
 //   create_thread call with priority in 0..3 cannot exceed
 //   the ceiling out of the box. We first lower our own ceiling via
@@ -28,7 +28,7 @@
 //
 //   target = 0 (self), so the test 02 / test 04 / test 05 / test 07
 //   target-side checks cannot fire. caps = {susp, term} is a subset of
-//   the new domain's `thread_inner_ceiling = 0xFF` (set by the runner), so
+//   the new process's `thread_inner_ceiling = 0xFF` (set by the runner), so
 //   test 03 cannot fire. stack_pages = 1, affinity = 0 (any core),
 //   reserved bits clean, so tests 08, 09, 10 cannot fire. The
 //   priority-ceiling check from test 06 is the only error path the
@@ -56,7 +56,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // §[capability_domain] SelfCap. Lower the priority ceiling from 3
+    // §[process] SelfCap. Lower the priority ceiling from 3
     // (runner default) to 1 while keeping `crec` so the subsequent
     // create_thread still passes the test 01 cap check.
     const restricted_self = caps.SelfCap{

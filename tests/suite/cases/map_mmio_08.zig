@@ -7,7 +7,7 @@
 //   The faithful test 08 observable is a CPU access pattern:
 //     - allowed accesses (those whose access type is in `cur_rwx`) round-
 //       trip without fault.
-//     - denied accesses fault and tear down the owning domain.
+//     - denied accesses fault and tear down the owning process.
 //   The denied-access leg requires a runner fixture that can observe
 //   teardown without losing its own result channel. The allowed-access leg runs on the bare
 //   fixture device_region (phys_base = 0xBABE_0000) which is a

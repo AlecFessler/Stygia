@@ -6,10 +6,10 @@
 //   To isolate the [2] VM-handle BADCAP check, every other rejection
 //   path the kernel could fire ahead of it must be inert:
 //     - test 01 (caller's self-handle lacks `crec`) — the runner grants
-//       `crec` on the test domain's self-handle (runner/primary.zig).
-//     - test 02 (caps not a subset of the VM's owning domain's
+//       `crec` on the test process's self-handle (runner/primary.zig).
+//     - test 02 (caps not a subset of the VM's owning process's
 //       `thread_inner_ceiling`) — caps = 0 is a subset of any ceiling,
-//       and resolving the owning domain's ceiling requires the [2]
+//       and resolving the owning process's ceiling requires the [2]
 //       handle to first resolve to a VM, so on an empty slot this
 //       check cannot fire ahead of the BADCAP probe in any case.
 //     - test 03 (priority exceeds caller's priority ceiling) — caps[1]
@@ -24,8 +24,8 @@
 //   syscall are [2] and [4] BADCAP, both of which collapse to the
 //   same error code that this test asserts.
 //
-//   The test capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The test process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0 → self
 //     slot 1 → initial thread
 //     slot 2 → self-IDC

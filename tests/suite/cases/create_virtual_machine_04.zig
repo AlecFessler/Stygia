@@ -7,7 +7,7 @@
 //   the kernel could fire ahead of the [2] handle-validity check must
 //   be inert:
 //     - test 01 (caller's self-handle lacks `crvm`) — the runner grants
-//       `crvm` on the test domain's self-handle (runner/primary.zig).
+//       `crvm` on the test process's self-handle (runner/primary.zig).
 //     - test 02 (caps not a subset of `vm_ceiling`) — caps = 0 is a
 //       subset of any ceiling.
 //     - test 08 (reserved bits in [1]) — caps = 0 leaves all reserved
@@ -16,8 +16,8 @@
 //   without first resolving slot [2] to a page_frame handle, so those
 //   checks cannot fire ahead of the BADCAP probe on an empty slot.
 //
-//   The test capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The test process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0 → self
 //     slot 1 → initial thread
 //     slot 2 → self-IDC

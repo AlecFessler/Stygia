@@ -3,8 +3,8 @@
 // "[test 01] returns E_PERM if the caller's self-handle lacks `crec`."
 //
 // Strategy
-//   The primary spawns each test as its own child capability domain,
-//   minting a self-handle with caps = {crcd, crec, crvr, crpf, crvm,
+//   The primary spawns each test as its own child process,
+//   minting a self-handle with caps = {crproc, crec, crvr, crpf, crvm,
 //   crpt, fut_wake, timer, pri=3} (see runner/primary.zig). To
 //   exercise the missing-`crec` path we first reduce the self-handle's
 //   caps via `restrict`, dropping just the `crec` bit while leaving
@@ -50,10 +50,10 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // §[capability_domain] self-handle caps minted by the runner
+    // §[process] self-handle caps minted by the runner
     // (see runner/primary.zig spawnOne), with `crec` cleared.
     const reduced_self = caps.SelfCap{
-        .crcd = true,
+        .crproc = true,
         .crec = false, // drop just this bit
         .crvr = true,
         .crpf = true,

@@ -27,7 +27,7 @@ var pf_diag_prints: u32 = 0;
 
 fn diagTag(thread: *const stygia.sched.thread.Thread) u64 {
     if (thread.diag_test_tag != 0) return thread.diag_test_tag;
-    return thread.domain.ptr.diag_test_tag;
+    return thread.process.ptr.diag_test_tag;
 }
 
 fn logPfDiag(
@@ -310,8 +310,8 @@ fn dumpCoreStatesRaw() void {
         if (cs.teardown_pending) |req| {
             arch.boot.printRaw(" td_kind=");
             panic_mod.printHex(@intFromEnum(req.kind));
-            arch.boot.printRaw(" td_cd=0x");
-            panic_mod.printHex(@intFromPtr(req.cd.ptr));
+            arch.boot.printRaw(" td_process=0x");
+            panic_mod.printHex(@intFromPtr(req.process.ptr));
         }
         arch.boot.printRaw("\n");
     }
@@ -407,7 +407,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         //     it, so every lock that frame holds stays locked in memory
         //     forever. `fireMemoryFault`'s unhandled-fault path then takes
         //     `caps.derivation.tree_mutex` and blocking-acquires the
-        //     thread's capability-domain gen-lock — which, on the demand-
+        //     thread's process gen-lock — which, on the demand-
         //     paging path, is exactly one of the locks just leaked
         //     (fault.zig's own user arm took it, and vmar.handlePageFault
         //     took the VMAR's). The result is an unkillable spin holding
@@ -479,7 +479,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // kernel-stack frame.
         // Identity, not just null: the wake/destroy machinery can leave
         // `current_thread` naming a DIFFERENT thread. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // the ORIGINAL faulter's frame on its kstack — a thread the
         // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentThread();
@@ -552,16 +552,16 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // hard enough to mask real errors. If userland PF tracing is
     // wanted, gate it on a runtime flag rather than a default-on log.
 
-    const dom_ref = thread.domain;
+    const dom_ref = thread.process;
     const dom_lr = dom_ref.lockIrqSave(@src()) catch {
-        // Domain torn down between exception entry and here — fire
+        // Process torn down between exception entry and here — fire
         // memory_fault so the unhandled-fault path retires the thread.
         if (comptime pf_log.enabled) {
-            pf_log.mark(thread, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
+            pf_log.mark(thread, .USER_PROCESS_GONE, faulting_virt.addr, 0);
         }
         dbgStashFault(fault, 2); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         const subcode: u8 = @intFromEnum(MemoryFaultSubcode.unmapped);
-        logPfDiag("user_domain_gone", thread, fault, errors.E_BADCAP, subcode);
+        logPfDiag("user_process_gone", thread, fault, errors.E_BADCAP, subcode);
         port.fireMemoryFault(thread, subcode, faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
         // fault event may have suspended the thread with its kstack
@@ -574,7 +574,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // back to the stale faulting frame.
         // Identity, not just null: the wake/destroy machinery can leave
         // `current_thread` naming a DIFFERENT thread. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // the ORIGINAL faulter's frame on its kstack — a thread the
         // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentThread();
@@ -589,7 +589,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // Spec v3 vmar.handlePageFault returns 0 on a resolved fault
     // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero
     // return — E_BADADDR (no covering VMAR), E_PERM (rights mismatch),
-    // E_NOMEM (demand alloc exhausted) — tears down the faulting domain.
+    // E_NOMEM (demand alloc exhausted) — tears down the faulting process.
     // Yield the CPU after firing because this thread is no longer runnable.
     if (comptime pf_log.enabled) {
         if (rc == 0) {
@@ -615,7 +615,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // Same rationale as the kernel-on-user-VA branch.
         // Identity, not just null: the wake/destroy machinery can leave
         // `current_thread` naming a DIFFERENT thread. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // the ORIGINAL faulter's frame on its kstack — a thread the
         // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
         const cur_after = scheduler.currentThread();

@@ -21,7 +21,7 @@
 //       refcounts must remain at 1; nothing in restrict's
 //       cap-bit-edge dispatch should fire for the suspend bit.
 //     - recv on the same handle with a finite, nonzero timeout. With
-//       no sender queued and no other thread in this domain to ever
+//       no sender queued and no other thread in this process to ever
 //       queue one, the kernel must arm the deadline rather than
 //       short-circuit through E_CLOSED. Result: E_TIMEOUT once the
 //       deadline elapses.

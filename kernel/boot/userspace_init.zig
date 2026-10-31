@@ -5,14 +5,14 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
-const capdom = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const elf_util = stygia.utils.elf;
 const thread_mod = stygia.sched.thread;
 const paging_consts = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 const sched = stygia.sched.scheduler;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const ThreadCaps = stygia.sched.thread.ThreadCaps;
 const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
 const Thread = stygia.sched.thread.Thread;
@@ -23,13 +23,13 @@ const VAddr = stygia.memory.address.VAddr;
 
 // Identity of the boot root, used only by the test-profile exit hook.
 // No dereference is made after teardown; production compiles the hook out.
-pub var boot_root_domain_addr: usize = 0;
+pub var boot_root_process_addr: usize = 0;
 
-/// Cap word minted on the root capability domain's slot-0 self-handle.
-/// Spec §[capability_domain] self-handle cap layout — every privilege the
+/// Cap word minted on the root process's slot-0 self-handle.
+/// Spec §[process] self-handle cap layout — every privilege the
 /// root service is permitted to delegate downward must be set here.
-const ROOT_SELF_CAPS = capdom.CapabilityDomainCaps{
-    .crcd = true,
+const ROOT_SELF_CAPS = process_mod.ProcessCaps{
+    .crproc = true,
     .crec = true,
     .crvr = true,
     .crpf = true,
@@ -57,11 +57,11 @@ const ROOT_THREAD_CAPS = ThreadCaps{
 };
 
 /// Pages reserved for the per-thread user stack created by
-/// create_capability_domain. 16 pages (64 KiB) is the spec default
+/// create_process. 16 pages (64 KiB) is the spec default
 /// and the right size for nearly every userspace task. The in-Stygia
 /// self-hosted Zig compiler's recursive AstGen / Sema descent for
 /// std-sized files needs more headroom — that's a per-process opt-in
-/// (TODO: surface via a `create_capability_domain` argument or via
+/// (TODO: surface via a `create_process` argument or via
 /// demand-paged stack growth) rather than a global bump that would
 /// 64× every spawn's PMM footprint and starve the test runner past
 /// ~rep 2 of an N=500 boot.
@@ -69,15 +69,15 @@ pub const USER_STACK_PAGES: u64 = 16;
 pub const USER_STACK_BYTES: u64 = USER_STACK_PAGES * paging_consts.PAGE4K;
 
 /// Bytes reserved for the read-only cap-table view mapped into a new
-/// domain. MAX_HANDLES_PER_DOMAIN * sizeof(Capability) = 4096 * 24 =
+/// process. MAX_HANDLES_PER_PROCESS * sizeof(Capability) = 4096 * 24 =
 /// 96 KiB, rounded up to the next page.
 pub const ROOT_USER_TABLE_BYTES: u64 = 96 * 1024;
 
-/// Resolved per-domain layout in the ASLR zone: where the ELF image
+/// Resolved per-process layout in the ASLR zone: where the ELF image
 /// loads, where its user stack tops out, and where the read-only
 /// cap-table view is mapped. All three live inside the ASLR zone (spec
 /// §[address_space]) and are picked so they cannot overlap each other.
-pub const DomainLayout = struct {
+pub const ProcessLayout = struct {
     elf_slide: u64,
     stack_top: u64,
     table_base: u64,
@@ -95,7 +95,7 @@ fn elfImageSpan(elf_bytes: []const u8) !u64 {
     var phdr_itr = hdr.iterateProgramHeadersBuffer(@constCast(elf_bytes));
     while (try phdr_itr.next()) |phdr| {
         if (phdr.p_type != std.elf.PT_LOAD) continue;
-        // Spec §[create_capability_domain] [test 16]: any PT_LOAD that
+        // Spec §[create_process] [test 16]: any PT_LOAD that
         // declares more file bytes than the staged page frame can
         // supply (`p_offset + p_filesz > elf_bytes.len`) is an INVAL —
         // userspace lied about the staged image. Surface this here so
@@ -140,7 +140,7 @@ fn pickAslrBase(lo: u64, hi: u64, bytes: u64) ?u64 {
 /// are retried up to RETRY_LIMIT times before falling back to a tiled
 /// layout that places the regions adjacent to one another in zone
 /// order. Spec §[address_space].
-pub fn resolveDomainLayout(elf_bytes: []const u8) !DomainLayout {
+pub fn resolveProcessLayout(elf_bytes: []const u8) !ProcessLayout {
     const aslr = arch.paging.user_aslr;
     const elf_span = try elfImageSpan(elf_bytes);
     if (elf_span == 0) return error.ElfHasNoLoadableSegments;
@@ -188,23 +188,23 @@ pub fn init(root_service_elf: []const u8) !void {
     var parsed: ParsedElf = undefined;
     try elf_util.parseElf(&parsed, @constCast(root_service_elf));
 
-    // Spec §[create_capability_domain] test 16a: the ELF must be PIE
+    // Spec §[create_process] test 16a: the ELF must be PIE
     // (e_type == ET_DYN). Even at boot we enforce this so the loader
     // path is the single source of truth for the rule.
     if (parsed.e_type != @intFromEnum(std.elf.ET.DYN)) {
         return error.NotPositionIndependent;
     }
 
-    const layout = try resolveDomainLayout(root_service_elf);
+    const layout = try resolveProcessLayout(root_service_elf);
     const slid_entry = VAddr.fromInt(parsed.entry.addr + layout.elf_slide);
 
-    // Spec §[capability_domain] root domain: ceilings_inner / ceilings_outer
+    // Spec §[process] root process: ceilings_inner / ceilings_outer
     // are absolute upper bounds — root must be allowed to mint handles
     // with full caps in every type, otherwise the runner's own
-    // createPageFrame / createVmar / createCapabilityDomain calls fail
+    // createPageFrame / createVmar / createProcess calls fail
     // E_PERM against zero ceilings before the first test ever runs.
     //
-    // Self-handle field0 layout per §[capability_domain] Self handle:
+    // Self-handle field0 layout per §[process] Self handle:
     //   bits  0-7   thread_inner_ceiling          = 0xFF
     //   bits  8-23  vmar_inner_ceiling         = 0xFFFF
     //   bits 24-31  cridc_ceiling             = 0x27
@@ -231,38 +231,38 @@ pub fn init(root_service_elf: []const u8) !void {
         (@as(u64, 0x01FF) << 16) |
         (@as(u64, 63) << 32);
 
-    const root_cd = try capdom.allocCapabilityDomain(
+    const root_process = try process_mod.allocProcess(
         @bitCast(ROOT_SELF_CAPS),
         root_field0_ceilings,
         root_field1_ceilings,
         slid_entry,
     );
     if (build_options.test_root_reboot_on_exit) {
-        boot_root_domain_addr = @intFromPtr(root_cd);
+        boot_root_process_addr = @intFromPtr(root_process);
     }
 
     // Re-mirror kernel-half PML4 entries from the kernel root into the
-    // new domain's PML4. Fresh L3/L2/L1 paging structures created
-    // between allocCapabilityDomain (which copies entries 256..511 once
+    // new process's PML4. Fresh L3/L2/L1 paging structures created
+    // between allocProcess (which copies entries 256..511 once
     // up front) and now — most notably the thread's kernel stack PTEs
     // installed in allocThread — only landed in the kernel
     // address space root. Without this re-copy, swapAddrSpace into the
-    // new domain leaves the kernel-stack VAs unmapped and the iret
+    // new process leaves the kernel-stack VAs unmapped and the iret
     // epilogue's stack pop / writethrough faults.
-    const root_virt = VAddr.fromPAddr(root_cd.addr_space_root, null);
+    const root_virt = VAddr.fromPAddr(root_process.addr_space_root, null);
     arch.paging.copyKernelMappings(root_virt);
 
-    try loadElfSegments(root_cd, root_service_elf, &parsed, layout.elf_slide);
-    try mapUserStack(root_cd, layout.stack_top);
-    try mapUserTableView(root_cd, layout.table_base);
+    try loadElfSegments(root_process, root_service_elf, &parsed, layout.elf_slide);
+    try mapUserStack(root_process, layout.stack_top);
+    try mapUserTableView(root_process, layout.table_base);
 
-    const root_thread = try resolveOrSpawnRootThread(root_cd, slid_entry, layout);
+    const root_thread = try resolveOrSpawnRootThread(root_process, slid_entry, layout);
 
-    grantDevices(root_cd);
+    grantDevices(root_process);
 
     // Re-mirror once more — the user mappings we just installed live in
     // user-half PML4 entries (0..255), which copyKernelMappings does
-    // not touch. They went into root_cd's PML4 directly via mapPage.
+    // not touch. They went into root_process's PML4 directly via mapPage.
     arch.paging.copyKernelMappings(root_virt);
 
     arch.boot.print("[boot] root thread ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
@@ -272,7 +272,7 @@ pub fn init(root_service_elf: []const u8) !void {
 
 /// Walk PT_LOAD headers in `elf_bytes`, allocate user pages from PMM,
 /// copy bytes from the bootloader-loaded ELF blob (in physmap), and
-/// map into the new domain's PML4 with per-segment R/W/X perms,
+/// map into the new process's PML4 with per-segment R/W/X perms,
 /// shifted by `slide` (spec §[address_space] — PIE images load at a
 /// kernel-chosen randomized base in the ASLR zone).
 ///
@@ -288,7 +288,7 @@ pub fn init(root_service_elf: []const u8) !void {
 ///      perms — text/exec — must not be stripped by a subsequent
 ///      rodata mapping).
 pub fn loadElfSegments(
-    root_cd: *CapabilityDomain,
+    root_process: *Process,
     elf_bytes: []const u8,
     parsed: *const ParsedElf,
     slide: u64,
@@ -313,7 +313,7 @@ pub fn loadElfSegments(
         var off: u64 = 0;
         while (seg_start + off < seg_end) {
             const target_vaddr = VAddr.fromInt(seg_start + off);
-            const existing_phys = arch.paging.resolveVaddr(root_cd.addr_space_root, target_vaddr);
+            const existing_phys = arch.paging.resolveVaddr(root_process.addr_space_root, target_vaddr);
 
             // Compute the union of perms across every PT_LOAD that
             // touches this 4 KiB page. Test ELFs commonly split a
@@ -339,7 +339,7 @@ pub fn loadElfSegments(
                 const dst: [*]u8 = @ptrCast(page);
                 @memset(dst[0..paging_consts.PAGE4K], 0);
                 try arch.paging.mapPage(
-                    root_cd.addr_space_root,
+                    root_process.addr_space_root,
                     phys,
                     target_vaddr,
                     page_perms,
@@ -374,13 +374,13 @@ pub fn loadElfSegments(
     // in `.rela.dyn` whose addend is the unslided VA. The patched value
     // is `addend + slide`; the relocation target's VA is also slid before
     // the kernel walks the page tables to find the backing physical page.
-    try applyRelativeRelocations(root_cd, elf_bytes, slide);
+    try applyRelativeRelocations(root_process, elf_bytes, slide);
 
     // aarch64 has non-coherent I/D caches: bytes copied through the
     // physmap above are data-cache writes, but the child fetches through
     // its user executable mapping. Publish every executable page after
     // all loader writes, including relocations. No-op on x86-64.
-    try syncExecutableElfPages(root_cd, elf_bytes, slide);
+    try syncExecutableElfPages(root_process, elf_bytes, slide);
 }
 
 /// Walk PT_LOADs and return the union of perms across every segment
@@ -417,11 +417,11 @@ fn unionPagePerms(
 /// to a PA via `resolveVaddr` and written through the kernel physmap
 /// rather than touching the file bytes — the file bytes live in
 /// either the bootloader's `loader_data` blob (root service path) or
-/// a page frame's physmap (createCapabilityDomain path), and patching
+/// a page frame's physmap (createProcess path), and patching
 /// them in place would corrupt the original ELF the caller still
 /// holds a reference to.
 fn applyRelativeRelocations(
-    root_cd: *CapabilityDomain,
+    root_process: *Process,
     elf_bytes: []const u8,
     slide: u64,
 ) !void {
@@ -462,7 +462,7 @@ fn applyRelativeRelocations(
             const slid_target = rela.r_offset + slide;
             const target_va = VAddr.fromInt(slid_target);
             const target_pa = arch.paging.resolveVaddr(
-                root_cd.addr_space_root,
+                root_process.addr_space_root,
                 target_va,
             ) orelse return error.RelocationTargetUnmapped;
 
@@ -477,7 +477,7 @@ fn applyRelativeRelocations(
 }
 
 fn syncExecutableElfPages(
-    root_cd: *CapabilityDomain,
+    root_process: *Process,
     elf_bytes: []const u8,
     slide: u64,
 ) !void {
@@ -497,7 +497,7 @@ fn syncExecutableElfPages(
         var off: u64 = 0;
         while (seg_start + off < seg_end) : (off += paging_consts.PAGE4K) {
             const target_vaddr = VAddr.fromInt(seg_start + off);
-            const phys = arch.paging.resolveVaddr(root_cd.addr_space_root, target_vaddr) orelse
+            const phys = arch.paging.resolveVaddr(root_process.addr_space_root, target_vaddr) orelse
                 return error.RelocationTargetUnmapped;
             const kva = VAddr.fromPAddr(phys, null);
             arch.cpu.syncInstructionCacheRange(kva.addr, paging_consts.PAGE4K);
@@ -507,9 +507,9 @@ fn syncExecutableElfPages(
 
 /// Allocate USER_STACK_BYTES of user pages and map them ending at
 /// `stack_top`. The thread's iret frame uses `stack_top` as the initial
-/// RSP. Spec §[create_thread] / §[create_capability_domain]
+/// RSP. Spec §[create_thread] / §[create_process]
 /// — stack lives at a kernel-chosen randomized base in the ASLR zone.
-pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
+pub fn mapUserStack(root_process: *Process, stack_top: u64) !void {
     const base: u64 = stack_top - USER_STACK_BYTES;
     var off: u64 = 0;
     while (off < USER_STACK_BYTES) {
@@ -517,7 +517,7 @@ pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
         const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         try arch.paging.mapPage(
-            root_cd.addr_space_root,
+            root_process.addr_space_root,
             phys,
             VAddr.fromInt(base + off),
             .{ .read = true, .write = true },
@@ -527,18 +527,18 @@ pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
     }
 }
 
-/// Map the user_table backing pages read-only into the new domain's
+/// Map the user_table backing pages read-only into the new process's
 /// user half at `table_base`. The kernel writes to the table via its
-/// own kernel-half pointer (root_cd.user_table); user code reads
+/// own kernel-half pointer (root_process.user_table); user code reads
 /// through this view.
-pub fn mapUserTableView(root_cd: *CapabilityDomain, table_base: u64) !void {
-    const ut_kernel_va: u64 = @intFromPtr(root_cd.user_table);
+pub fn mapUserTableView(root_process: *Process, table_base: u64) !void {
+    const ut_kernel_va: u64 = @intFromPtr(root_process.user_table);
     var off: u64 = 0;
     while (off < ROOT_USER_TABLE_BYTES) {
         const kernel_page_va = VAddr.fromInt(ut_kernel_va + off);
         const phys = PAddr.fromVAddr(kernel_page_va, null);
         try arch.paging.mapPage(
-            root_cd.addr_space_root,
+            root_process.addr_space_root,
             phys,
             VAddr.fromInt(table_base + off),
             .{ .read = true },
@@ -549,15 +549,15 @@ pub fn mapUserTableView(root_cd: *CapabilityDomain, table_base: u64) !void {
 }
 
 fn resolveOrSpawnRootThread(
-    root_cd: *CapabilityDomain,
+    root_process: *Process,
     entry: VAddr,
-    layout: DomainLayout,
+    layout: ProcessLayout,
 ) !*Thread {
-    const existing = capability.typedRef(Thread, root_cd.kernel_table[1]);
+    const existing = capability.typedRef(Thread, root_process.kernel_table[1]);
     if (existing) |ref| return ref.ptr;
 
     const thread = try thread_mod.allocThread(
-        root_cd,
+        root_process,
         entry,
         1,
         0,
@@ -579,16 +579,16 @@ fn resolveOrSpawnRootThread(
         .ptr = thread,
         .gen = @intCast(thread._gen_lock.currentGen()),
     };
-    // Pin the root thread to slot 1 (= caps.SLOT_INITIAL_THREAD). Child CDs
+    // Pin the root thread to slot 1 (= caps.SLOT_INITIAL_THREAD). Child processes
     // get their initial thread at slot 1 via the explicit `user_table[1] =
-    // ...` block in create_capability_domain; the root CD's existing
+    // ...` block in create_process; the root process's existing
     // path used `mintHandle` (which pops `free_head` starting at 3),
     // so the root thread silently landed at slot 3 and the root service's
     // `priority(SLOT_INITIAL_THREAD, ...)` syscall returned E_BADCAP. Slots
     // 0, 1, 2 are reserved (not on the free list), so `mintHandleAt`
     // can drop a handle there without unlinking.
-    capdom.mintHandleAt(
-        root_cd,
+    process_mod.mintHandleAt(
+        root_process,
         1,
         obj_ref,
         .thread,
@@ -599,7 +599,7 @@ fn resolveOrSpawnRootThread(
     return thread;
 }
 
-fn grantDevices(root_cd: *CapabilityDomain) void {
+fn grantDevices(root_process: *Process) void {
     switch (builtin.cpu.arch) {
         .x86_64 => {
             // x86 enumerators (`enumeratePci`, `probeSerialPorts`) stage
@@ -607,19 +607,19 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
             // grant list. Drain it here so the root service's cap table
             // is the single source of truth for platform hardware —
             // COM1 included.
-            grantBootDevices(root_cd);
+            grantBootDevices(root_process);
         },
         .aarch64 => {
             // aarch64 has no PCI enumerator yet. Mint the platform
             // devices the runner / linux_guest VMM expect: the MMIO
             // PL011 region (0x09000000) and the virtualized port_io
             // 0x3F8 the runner serial sink scans for.
-            grantPl011(root_cd);
-            grantCom1(root_cd);
+            grantPl011(root_process);
+            grantCom1(root_process);
             // Plus anything kMain staged on the boot grant list
             // (currently the framebuffer; future arch-portable
             // platform devices will land here too).
-            grantBootDevices(root_cd);
+            grantBootDevices(root_process);
         },
         else => {},
     }
@@ -635,7 +635,7 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
     // purposes — and userspace cannot tell a fixture from real
     // hardware (no introspection on `phys_base` validity).
     if (build_options.tests_fixture_devices) {
-        grantTestFixtureDevices(root_cd);
+        grantTestFixtureDevices(root_process);
     }
 }
 
@@ -670,14 +670,14 @@ fn grantDevices(root_cd: *CapabilityDomain) void {
 /// IRQ-injection infrastructure that this branch does not provide;
 /// see the spec test files (device_irq_*.zig, ack_07.zig) for the
 /// outstanding harness gap.
-fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
+fn grantTestFixtureDevices(root_process: *Process) void {
     const TEST_DMA_IRQ_BASE: u64 = 0xCAFE_0000;
     const TEST_DMA_IRQ_SIZE: u64 = 0x1000;
     const TEST_PLAIN_BASE: u64 = 0xBABE_0000;
     const TEST_PLAIN_SIZE: u64 = 0x1000;
 
     mintTestFixtureMmio(
-        root_cd,
+        root_process,
         PAddr.fromInt(TEST_DMA_IRQ_BASE),
         TEST_DMA_IRQ_SIZE,
         stygia.devices.device_region.DeviceRegionCaps{
@@ -689,7 +689,7 @@ fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
         stygia.devices.device_region.PciAddress.make(0xCA, 0x1F, 0x7),
     );
     mintTestFixtureMmio(
-        root_cd,
+        root_process,
         PAddr.fromInt(TEST_PLAIN_BASE),
         TEST_PLAIN_SIZE,
         stygia.devices.device_region.DeviceRegionCaps{
@@ -701,7 +701,7 @@ fn grantTestFixtureDevices(root_cd: *CapabilityDomain) void {
 }
 
 fn mintTestFixtureMmio(
-    root_cd: *CapabilityDomain,
+    root_process: *Process,
     phys_base: PAddr,
     size: u64,
     dr_caps: stygia.devices.device_region.DeviceRegionCaps,
@@ -723,8 +723,8 @@ fn mintTestFixtureMmio(
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
-    _ = capdom.mintHandle(
-        root_cd,
+    _ = process_mod.mintHandle(
+        root_process,
         erased,
         stygia.caps.capability.CapabilityType.device_region,
         @bitCast(dr_caps),
@@ -735,11 +735,11 @@ fn mintTestFixtureMmio(
     };
 }
 
-fn grantBootDevices(root_cd: *CapabilityDomain) void {
-    stygia.devices.device_region.forEachBootGrant(root_cd, mintBootDevice);
+fn grantBootDevices(root_process: *Process) void {
+    stygia.devices.device_region.forEachBootGrant(root_process, mintBootDevice);
 }
 
-fn mintBootDevice(root_cd: *CapabilityDomain, dr: *stygia.devices.device_region.DeviceRegion) void {
+fn mintBootDevice(root_process: *Process, dr: *stygia.devices.device_region.DeviceRegion) void {
     // field0 layout per spec §[device_region]:
     //   port_io:     bits 0-3 dev_type=1, bits 4-19 base_port, bits 20-35 port_count
     //   mmio:        bits 0-3 dev_type=0, bits 4-51 paddr>>12, bits 52-63 size_pages
@@ -781,8 +781,8 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *stygia.devices.device_region.
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
-    _ = capdom.mintHandle(
-        root_cd,
+    _ = process_mod.mintHandle(
+        root_process,
         erased,
         stygia.caps.capability.CapabilityType.device_region,
         @bitCast(dr_caps),
@@ -793,7 +793,7 @@ fn mintBootDevice(root_cd: *CapabilityDomain, dr: *stygia.devices.device_region.
     };
 }
 
-fn grantCom1(root_cd: *CapabilityDomain) void {
+fn grantCom1(root_process: *Process) void {
     // Surface a port_io device_region for COM1 (0x3F8/8) so the runner's
     // serial sink can find it via slot scan + `caps.deviceRegionFields`.
     // Without this the runner's `[runner] *` print stream is silent —
@@ -825,8 +825,8 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
-    _ = capdom.mintHandle(
-        root_cd,
+    _ = process_mod.mintHandle(
+        root_process,
         erased,
         stygia.caps.capability.CapabilityType.device_region,
         dr_caps,
@@ -837,7 +837,7 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
     };
 }
 
-fn grantPl011(root_cd: *CapabilityDomain) void {
+fn grantPl011(root_process: *Process) void {
     // QEMU virt PL011 UART0 sits at 0x09000000/4 KiB. The aarch64
     // root_service VMMs (linux_guest, suite runner) discover it by
     // scanning their cap table for a device_region whose mmio fields
@@ -861,8 +861,8 @@ fn grantPl011(root_cd: *CapabilityDomain) void {
         .ptr = @ptrCast(dr),
         .gen = @intCast(dr._gen_lock.currentGen()),
     };
-    _ = capdom.mintHandle(
-        root_cd,
+    _ = process_mod.mintHandle(
+        root_process,
         erased,
         stygia.caps.capability.CapabilityType.device_region,
         dr_caps,

@@ -13,7 +13,7 @@
 //   cleared would still succeed and the regression would slip past a
 //   pure happy-path probe. Catching that requires the test thread to
 //   attempt a now-disallowed access and observe a CPU page fault that
-//   is delivered back to the test domain through some exception-
+//   is delivered back to the test process through some exception-
 //   handler hook. The v0 runner has no such hook (see map_pf_12 for
 //   the same constraint): a #PF on the test thread is handled by the
 //   kernel default, which terminates or restarts the child rather

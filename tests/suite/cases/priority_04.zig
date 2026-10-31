@@ -15,14 +15,14 @@
 //                             self-handle `pri`.
 //     - test 05 (E_INVAL):    no reserved bits set in [1].
 //
-//   The runner-spawned domain receives its initial thread at
+//   The runner-spawned process receives its initial thread at
 //   SLOT_INITIAL_THREAD (slot 1) with caps = the runner's
 //   `thread_inner_ceiling` (low byte 0xFF, see `runner/primary.zig`'s
 //   `ceilings_inner`). 0xFF includes bit 3 = `spri`, so slot 1 is a
 //   valid thread handle that carries the `spri` cap.
 //
 //   The caller's self-handle `pri` is set to 3 (`runner/primary.zig`
-//   sets `child_self.pri = 3` when minting the test domain), which is
+//   sets `child_self.pri = 3` when minting the test process), which is
 //   the maximum priority the spec admits. That means any [2] in
 //   {0..3} satisfies the test 03 cap check, while any [2] > 3 must
 //   trip the E_INVAL bound from test 04.

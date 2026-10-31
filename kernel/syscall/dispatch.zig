@@ -13,7 +13,7 @@ const stygia = @import("stygia");
 const build_options = @import("build_options");
 
 const capability = stygia.syscall.capability;
-const capability_domain = stygia.syscall.capability_domain;
+const process = stygia.syscall.process;
 const errors = stygia.syscall.errors;
 const thread_mod = stygia.syscall.thread;
 const futex = stygia.syscall.futex;
@@ -30,7 +30,7 @@ pub const SyscallNum = enum(u64) {
     delete = 16,
     revoke = 17,
     sync = 18,
-    create_capability_domain = 19,
+    create_process = 19,
     create_thread = 22,
     self = 23,
     terminate = 24,
@@ -112,9 +112,9 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .time_monotonic,
         => 13,
 
-        // create_capability_domain: passed_handles list, no syscall-word
+        // create_process: passed_handles list, no syscall-word
         // count. Surface the full upper window.
-        .create_capability_domain => 127,
+        .create_process => 127,
 
         // map_pf, map_guest, futex_wait_val/change: pairs of 2 vregs
         // each. Vreg 1 = handle/timeout, vregs 2..1+2N = pair data.
@@ -159,7 +159,7 @@ var syscall_seq: u64 = 0;
 fn logSpawnError(num_raw: u64, res: i64) void {
     if (!build_options.kernel_spawn_diag) return;
     if (res >= 0) return;
-    if (num_raw != @intFromEnum(SyscallNum.create_capability_domain) and
+    if (num_raw != @intFromEnum(SyscallNum.create_process) and
         num_raw != @intFromEnum(SyscallNum.create_thread)) return;
     const n = @atomicRmw(u32, &spawn_err_prints, .Add, 1, .monotonic);
     if (n >= 24) return;
@@ -195,7 +195,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .revoke => capability.revoke(caller, arg(args, 0)),
         .sync => capability.sync(caller, arg(args, 0)),
 
-        .create_capability_domain => capability_domain.createCapabilityDomain(
+        .create_process => process.createProcess(
             caller,
             arg(args, 0),
             arg(args, 1),

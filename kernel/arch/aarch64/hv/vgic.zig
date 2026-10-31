@@ -127,10 +127,10 @@ pub inline fn lrState(lr: u64) u2 {
 /// ICH_LR<n>_EL2).
 ///
 /// The distributor is single-writer from the kernel's perspective —
-/// `vm_inject_irq` is gated by the syscall-level domain lock on the
-/// VM's owning capability domain. Concurrent vCPU run loops on other
+/// `vm_inject_irq` is gated by the syscall-level process lock on the
+/// VM's owning process. Concurrent vCPU run loops on other
 /// cores will eventually need a finer-grained guard; until then the
-/// per-VM domain lock suffices.
+/// per-VM process lock suffices.
 pub const Vgic = extern struct {
     /// One bit per INTID. Bit `(intid % 32)` of `pending[intid / 32]`
     /// mirrors the corresponding bit of GICD_ISPENDR<intid/32> per

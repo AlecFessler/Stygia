@@ -204,7 +204,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 8: the reply handle must NOT have been consumed. The
-    // capability table is mapped read-only in the holding domain, so
+    // capability table is mapped read-only in the holding process, so
     // re-reading the slot via readCap reflects the kernel's authoritative
     // view; a `reply` HandleType means the slot still holds the live
     // reply handle.

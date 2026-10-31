@@ -13,7 +13,7 @@
 //   To isolate the success-path affinity assertion every other gate must
 //   be defused so create_vcpu actually returns a handle:
 //     - test 01 (E_PERM no `crec`): runner grants `crec` on the test
-//       domain's self-handle (runner/primary.zig).
+//       process's self-handle (runner/primary.zig).
 //     - test 02 (E_PERM caps not subset of thread_inner_ceiling): caps = 0
 //       is a subset of any ceiling.
 //     - test 03 (E_PERM priority exceeds caller's ceiling): priority = 2

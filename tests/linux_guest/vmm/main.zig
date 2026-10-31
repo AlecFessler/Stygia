@@ -18,7 +18,7 @@
 //!   9. Loop on recvVmExit; dispatch to per-subcode handlers; reply
 //!      with mods.
 //!  10. On fatal exit (triple_fault / shutdown), report final stats and
-//!      return to root-service entry for domain teardown.
+//!      return to root-service entry for process teardown.
 
 const lib = @import("lib");
 
@@ -106,7 +106,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 2 — createVirtualMachine.
     //   caps.policy = bit 0 of cap word (we'd want this for vm_set_policy
-    //   later). Ceiling check is against the calling domain's vm_ceiling.
+    //   later). Ceiling check is against the calling process's vm_ceiling.
     const vm_caps_word: u64 = (1 << 0); // policy
     const vm_r = syscall.createVirtualMachine(vm_caps_word, policy_pf);
     if (vm_r.v1 < 16) {

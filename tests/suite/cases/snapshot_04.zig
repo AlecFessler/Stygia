@@ -17,7 +17,7 @@
 //       VMAR handle.
 //     - test 02 (source [2] not a valid VMAR) — same.
 //     - test 03 (target.caps.restart_policy != 3) — mint the target
-//       with `restart_policy = 3` (snapshot). Per §[create_capability_domain]
+//       with `restart_policy = 3` (snapshot). Per §[create_process]
 //       test 07's notes, the runner's `restart_policy_ceiling.vmar_restart_max`
 //       = 3, so this is permitted.
 //     - test 05 ([1] and [2] sizes differ) — both VARs are

@@ -117,9 +117,19 @@ fn replyWithOnePairAtV127(reply_handle: u12, entry: u64) syscall.Regs {
                   [entry] "r" (entry),
                 : .{ .rcx = true, .r11 = true, .memory = true });
             return .{
-                .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4, .v5 = ov5,
-                .v6 = ov6, .v7 = ov7, .v8 = ov8, .v9 = ov9, .v10 = ov10,
-                .v11 = ov11, .v12 = ov12, .v13 = ov13,
+                .v1 = ov1,
+                .v2 = ov2,
+                .v3 = ov3,
+                .v4 = ov4,
+                .v5 = ov5,
+                .v6 = ov6,
+                .v7 = ov7,
+                .v8 = ov8,
+                .v9 = ov9,
+                .v10 = ov10,
+                .v11 = ov11,
+                .v12 = ov12,
+                .v13 = ov13,
             };
         },
         .aarch64 => {
@@ -161,14 +171,21 @@ fn replyWithOnePairAtV127(reply_handle: u12, entry: u64) syscall.Regs {
                   [v13] "={x12}" (ov13),
                 : [word] "r" (word),
                   [entry] "r" (entry),
-                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-                     .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-                     .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-                     .x29 = true, .x30 = true, .memory = true });
+                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
             return .{
-                .v1 = ov1, .v2 = ov2, .v3 = ov3, .v4 = ov4, .v5 = ov5,
-                .v6 = ov6, .v7 = ov7, .v8 = ov8, .v9 = ov9, .v10 = ov10,
-                .v11 = ov11, .v12 = ov12, .v13 = ov13,
+                .v1 = ov1,
+                .v2 = ov2,
+                .v3 = ov3,
+                .v4 = ov4,
+                .v5 = ov5,
+                .v6 = ov6,
+                .v7 = ov7,
+                .v8 = ov8,
+                .v9 = ov9,
+                .v10 = ov10,
+                .v11 = ov11,
+                .v12 = ov12,
+                .v13 = ov13,
             };
         },
         else => @compileError("unsupported target architecture"),
@@ -179,7 +196,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Clean syscall word, dirty pair entry. Build a clean entry that
-    // would satisfy tests 12-16 (id is a valid in-domain handle,
+    // would satisfy tests 12-16 (id is a valid in-process handle,
     // caps = 0, move = false, no duplicates) and pollute a single
     // reserved bit in the `_reserved_lo` band so test 11's pair-entry
     // gate is the unique applicable check. reply_handle_id = 0

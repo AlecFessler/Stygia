@@ -3,8 +3,8 @@
 // "[test 01] returns E_BADCAP if [1] is not a valid VMAR handle."
 //
 // Strategy
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -35,7 +35,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout. The BADCAP gate on [1] must fire before [2] is
     // examined, so passing the same empty slot for [2] is harmless.
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;

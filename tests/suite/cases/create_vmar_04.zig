@@ -4,18 +4,18 @@
 //  `vmar_inner_ceiling` does not permit mmio."
 //
 // Strategy
-//   The runner mints every spawned test domain with `vmar_inner_ceiling
+//   The runner mints every spawned test process with `vmar_inner_ceiling
 //   = 0x01FF` (mmio bit set; see runner/primary.zig). A test running
 //   as a runner-spawned child therefore cannot construct the E_PERM
 //   condition directly — the only ceiling exceedance available to it
-//   is widening, not narrowing. Per §[create_capability_domain] [2]
+//   is widening, not narrowing. Per §[create_process] [2]
 //   the child's `vmar_inner_ceiling` must be a subset of the parent's,
-//   so a sub-domain can install a stricter ceiling.
+//   so a sub-process can install a stricter ceiling.
 //
-//   This test mirrors create_capability_domain_31's parent-spawn +
+//   This test mirrors create_process_31's parent-spawn +
 //   child-probe pattern. The runner-spawned parent re-enters this same
-//   ELF as a sub-domain whose `vmar_inner_ceiling` clears the mmio
-//   bit. The sub-domain takes the child branch below and calls
+//   ELF as a sub-process whose `vmar_inner_ceiling` clears the mmio
+//   bit. The sub-process takes the child branch below and calls
 //   `create_vmar` with `caps.mmio = 1`. Per §[create_vmar] [test 04]
 //   the kernel must return E_PERM.
 //
@@ -48,7 +48,7 @@
 //
 // Action
 //   parent path:
-//     1. createCapabilityDomain(... vmar_inner_ceiling stripped of
+//     1. createProcess(... vmar_inner_ceiling stripped of
 //        mmio, [5] = 0 any-core)                                — must succeed
 //     2. return — child reports
 //   child path:
@@ -58,7 +58,7 @@
 //
 // Assertions
 //   parent path:
-//     1: createCapabilityDomain returned an error word
+//     1: createProcess returned an error word
 //   child path:
 //     2: createVmar did not return E_PERM  ← THE SPEC ASSERTION
 
@@ -72,12 +72,12 @@ const testing = lib.testing;
 const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
 const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
 // Mirrors libz_loader.LIBZ_PF_SLOT — the runner places the staged libz
-// page frame here for every spawned test domain so its _start can
+// page frame here for every spawned test process so its _start can
 // mapPf libz at LIBZ_SLIDE.
 const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
 // VmarCap bit 5 (mmio) within the 16-bit `vmar_inner_ceiling` (which
-// in turn occupies ceilings_inner bits 8-23 per §[capability_domain]).
+// in turn occupies ceilings_inner bits 8-23 per §[process]).
 // The runner ceiling is 0x01FF (every defined VmarCap bit set);
 // stripping bit 5 yields 0x01DF, the child's restricted ceiling.
 const VMAR_INNER_CEILING_CHILD: u64 = 0x01DF; // 0x01FF & ~(1 << 5)
@@ -87,7 +87,7 @@ pub fn main(cap_table_base: u64) void {
     const vmar_inner_ceiling: u64 = (self_cap.field0 >> 8) & 0xFFFF;
 
     // VmarCap bit 5 = mmio. Cleared marks the child (parent-spawned
-    // sub-domain whose ceiling stripped mmio); set marks the parent
+    // sub-process whose ceiling stripped mmio); set marks the parent
     // (runner-spawned, ceiling = 0x01FF).
     if ((vmar_inner_ceiling & (1 << 5)) == 0) {
         // ── Child path ──────────────────────────────────────────────
@@ -129,13 +129,13 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // ── Parent path ─────────────────────────────────────────────────
-    // Spawn a sub-domain that re-enters this same ELF with
+    // Spawn a sub-process that re-enters this same ELF with
     // `vmar_inner_ceiling = 0x01DF` (mmio bit cleared). The sub-
-    // domain takes the child branch above and asserts that
+    // process takes the child branch above and asserts that
     // create_vmar with caps.mmio = 1 returns E_PERM.
     //
     // Mirror runner/primary.zig's child_self caps so the spawned
-    // sub-domain has the cap budget needed to walk through libz
+    // sub-process has the cap budget needed to walk through libz
     // bootstrap (crvr for createVmar at LIBZ_SLIDE).
     const child_self = caps.SelfCap{
         .crec = true,
@@ -143,7 +143,7 @@ pub fn main(cap_table_base: u64) void {
         .pri = 3,
     };
 
-    // §[create_capability_domain] [2] ceilings_inner sub-fields:
+    // §[create_process] [2] ceilings_inner sub-fields:
     //   bits  0-7   thread_inner_ceiling   = 0xFF   (matches runner)
     //   bits  8-23  vmar_inner_ceiling  = 0x01DF (mmio bit 5 cleared)
     //   bits 24-31  cridc_ceiling      = 0x27   (matches runner)
@@ -160,7 +160,7 @@ pub fn main(cap_table_base: u64) void {
 
     const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
-    // Pass through the runner-supplied handles so the sub-domain can
+    // Pass through the runner-supplied handles so the sub-process can
     // bootstrap libz and report on the shared port. The `suspend` cap
     // is required because `testing.report` (and all spec tests under
     // the in-kernel runner) deliver results via a fast-suspend on the
@@ -198,7 +198,7 @@ pub fn main(cap_table_base: u64) void {
         }).toU64(),
     };
 
-    const r = syscall.createCapabilityDomain(
+    const r = syscall.createProcess(
         @as(u64, child_self.toU16()),
         ceilings_inner,
         ceilings_outer,
@@ -214,10 +214,10 @@ pub fn main(cap_table_base: u64) void {
     // Parent returns. The child is the sole reporter; the runner
     // indexes results by build-time test tag so a single report from
     // the child satisfies this test's slot. Returning lets `_start`
-    // invoke `delete(SLOT_SELF)` and tear the parent CD down — without
-    // it the parent CD would stay alive indefinitely and reps of the
-    // test runner would exhaust the CD slab class. The child sub-
-    // domain is independent (top-level CDs are not parent-linked
+    // invoke `delete(SLOT_SELF)` and tear the parent process down — without
+    // it the parent process would stay alive indefinitely and reps of the
+    // test runner would exhaust the process slab class. The child sub-
+    // process is independent (top-level processes are not parent-linked
     // under v3), so destroying the parent here does not affect the
     // child's ability to report.
     return;

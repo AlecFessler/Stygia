@@ -5,7 +5,7 @@
 //
 // DEGRADED SMOKE VARIANT
 //   Both `map = 2` and `map = 3` states are unreachable from a v0
-//   test child capability domain:
+//   test child process:
 //
 //   map = 2 (mmio): per §[map_mmio] test 06, `map` becomes 2 only on
 //     a successful map_mmio call, which itself requires a *valid*
@@ -13,7 +13,7 @@
 //     device_region handles are kernel-issued at boot to the root
 //     service and otherwise propagate via xfer/IDC. The v0 runner
 //     (runner/primary.zig) spawns each test as a child capability
-//     domain whose `passed_handles` carry only the result port at
+//     process whose `passed_handles` carry only the result port at
 //     slot 3 — no device_region is forwarded. The same `findCom1`-
 //     style scan that runner/serial.zig uses to bootstrap the
 //     primary's serial VMAR cannot succeed inside a test child,
@@ -36,7 +36,7 @@
 //     test can call to trigger demand-paging on a VMAR whose base is
 //     not yet known to the test code generator.
 //
-//   With neither prerequisite reachable from the test domain, the
+//   With neither prerequisite reachable from the test process, the
 //   strict test 10 path — kernel rejects with E_INVAL when map ∈
 //   {2, 3} — cannot be exercised end-to-end here.
 //

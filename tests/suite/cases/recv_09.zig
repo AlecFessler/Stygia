@@ -10,7 +10,7 @@
 //   required because the suspend will attach a handle — §[suspend]:
 //   "Additionally `xfer` if any handles are attached in the syscall
 //   word's `pair_count`"). It mints a worker thread W with the `susp` cap
-//   (target = self-domain), and a source handle S that will be the
+//   (target = self-process), and a source handle S that will be the
 //   attachment target. Then the test calls `suspend(W, P)` with
 //   pair_count = 1 and a single pair entry encoding S in vreg 127.
 //
@@ -48,7 +48,7 @@
 //       limit).
 //     - §[handle_attachments] tests 01-07 (suspend-time gates): the
 //       port has `xfer`, the source handle id is valid in the
-//       suspending thread's domain (W's domain == this test's domain since
+//       suspending thread's process (W's process == this test's process since
 //       W was created with target = self), entry.caps ⊆ source caps,
 //       move=0 with source `copy` set, no reserved bits, only one
 //       entry so no duplicate-source case.
@@ -190,12 +190,7 @@ fn suspendWithOneAttachmentArm(target: u12, port: u12, entry: u64) u64 {
           [iv1] "{x0}" (@as(u64, target)),
           [iv2] "{x1}" (@as(u64, port)),
           [entry] "r" (entry),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return x0_out;
 }
 
@@ -249,7 +244,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         w_entry,
         1, // stack_pages
-        0, // target = self (W's domain == this test's domain)
+        0, // target = self (W's process == this test's process)
         0, // affinity = any core
     );
     if (testing.isHandleError(cec.v1)) {
@@ -299,7 +294,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 7: tstart should be a valid slot id. Slot 0 is the test
-    // domain's self-handle, which the kernel will not overwrite, so
+    // process's self-handle, which the kernel will not overwrite, so
     // tstart = 0 would indicate the kernel did not allocate a slot.
     if (tstart == 0) {
         testing.fail(7);

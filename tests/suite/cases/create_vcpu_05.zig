@@ -7,8 +7,8 @@
 //   the kernel could fire ahead of the [4] handle-validity check must
 //   be inert:
 //     - test 01 (caller's self-handle lacks `crec`) — the runner grants
-//       `crec` on the test domain's self-handle (runner/primary.zig).
-//     - test 02 (caps not subset of VM domain's `thread_inner_ceiling`) —
+//       `crec` on the test process's self-handle (runner/primary.zig).
+//     - test 02 (caps not subset of VM process's `thread_inner_ceiling`) —
 //       pass caps = 0, a subset of any ceiling.
 //     - test 03 (priority exceeds caller's priority ceiling) — pri = 0.
 //     - test 04 (vm_handle not a valid VM handle) — we mint a real VM.
@@ -23,8 +23,8 @@
 //   create_virtual_machine_06 — page frame for VmPolicy, VMAR + map_pf
 //   to plant zero bytes, then create_virtual_machine.
 //
-//   The test capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The test process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0 → self
 //     slot 1 → initial thread
 //     slot 2 → self-IDC

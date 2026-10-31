@@ -9,7 +9,7 @@
 //
 //   To witness "actually execute" we need an observable side effect
 //   the worker thread performs only after it is resumed. The yield_03 idiom
-//   applies: spawn the worker in the test thread's own capability domain
+//   applies: spawn the worker in the test thread's own process
 //   (target = 0) so a process-global is shared memory between the two
 //   Threads, and have the worker's entry point store a sentinel into that
 //   global with release ordering. The test thread then loads it with
@@ -92,7 +92,7 @@ const testing = lib.testing;
 const SENTINEL: u64 = 0xA110_C0DE_5EE5_BEEF;
 
 // Process-global shared between the test thread and the worker thread. Both
-// run in the same capability domain (target = self at create time), so
+// run in the same process (target = self at create time), so
 // this global is the shared-memory witness of W's resumption.
 var observed: u64 = 0;
 

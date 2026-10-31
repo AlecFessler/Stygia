@@ -8,28 +8,26 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 | Object | Role | Spec |
 |---|---|---|
-| **Capability Domain** | A set of capabilities usable by the threads bound to the domain. The process-equivalent boundary in Stygia. | [§[capability_domain]](docs/kernel/specv3.md#capability_domain-capability-domain) |
-| **Thread** | A schedulable unit of executable state bound to a capability domain. The thread-equivalent. | [§[thread]](docs/kernel/specv3.md#thread-thread) |
-| **VMAR** | A virtual memory address region: a contiguous span of virtual address space bound to a capability domain, available for demand-paged memory or for installing page frames and device regions. | [§[vmar]](docs/kernel/specv3.md#vmar-virtual-memory-address-region) |
-| **Page Frame** | A reference to physical memory. Installing the same page frame into multiple capability domains creates shared memory. | [§[page_frame]](docs/kernel/specv3.md#page_frame-page-frame) |
-| **Device Region** | A reference to a device's MMIO region or x86-64 I/O port range. Installing it into a VMAR makes the device directly accessible to threads in that capability domain. | [§[device_region]](docs/kernel/specv3.md#device_region-device-region) |
+| **Process** | A set of capabilities usable by the threads bound to the process. The process-equivalent boundary in Stygia. | [§[process]](docs/kernel/specv3.md#process-process) |
+| **Thread** | A schedulable unit of executable state bound to a process. The thread-equivalent. | [§[thread]](docs/kernel/specv3.md#thread-thread) |
+| **VMAR** | A virtual memory address region: a contiguous span of virtual address space bound to a process, available for demand-paged memory or for installing page frames and device regions. | [§[vmar]](docs/kernel/specv3.md#vmar-virtual-memory-address-region) |
+| **Page Frame** | A reference to physical memory. Installing the same page frame into multiple processes creates shared memory. | [§[page_frame]](docs/kernel/specv3.md#page_frame-page-frame) |
+| **Device Region** | A reference to a device's MMIO region or x86-64 I/O port range. Installing it into a VMAR makes the device directly accessible to threads in that process. | [§[device_region]](docs/kernel/specv3.md#device_region-device-region) |
 | **Virtual Machine** | A guest execution environment with its own guest physical address space. Threads enter guest mode within a VM to run. | [§[virtual_machine]](docs/kernel/specv3.md#virtual_machine-virtual-machine) |
-| **Port** | A rendezvous point between a calling thread and a receiving thread. Used for IDC, capability transfer, and event delivery. | [§[port]](docs/kernel/specv3.md#port-port) |
+| **Port** | A rendezvous point between a calling thread and a receiving thread. Used for IPC, capability transfer, suspension, and VM exits. | [§[port]](docs/kernel/specv3.md#port-port) |
 | **Reply** | A one-shot capability referencing a suspended thread dequeued from a port by a receive. Consuming the handle is the only way to resume or abandon the suspended sender. | [§[reply]](docs/kernel/specv3.md#reply-reply) |
 
 ## Scope
 
-**Memory.** Demand-paged virtual memory address regions (VMARs), page table management, shared mappings (the same page frame mapped into multiple capability domains), and direct MMIO BAR mapping for userspace device access. DMA always routes through the IOMMU, so a misbehaving or compromised device cannot escape the buffer it was given.
+**Memory.** Demand-paged virtual memory address regions (VMARs), page table management, shared mappings (the same page frame mapped into multiple processes), and direct MMIO BAR mapping for userspace device access. DMA always routes through the IOMMU, so a misbehaving or compromised device cannot escape the buffer it was given.
 
 **Scheduling.** Preemptive round-robin scheduler. Per-thread core affinities and priorities that propagate through ports and futex waitlists. Futex primitive that integrates with the scheduler so a waiter blocks rather than spins.
 
-**IPC.** Capability-gated ports for suspend / receive / reply between capability domains. When the payload fits in architectural general-purpose registers and carries data only (no capability transfer), the rendezvous runs through an L4-style zero-register-copy fast path that does a direct context switch and bypasses the Zig dispatch table. Current round-trip cost is around 1,600 cycles for suspend → receive → reply on a Ryzen 9 7950X3D.
-
-**Kernel-event routing.** Per-thread events (memory faults, thread faults, breakpoints) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
+**IPC.** Capability-gated ports for suspend / receive / reply between processes. When the payload fits in architectural general-purpose registers and carries data only (no capability transfer), the rendezvous runs through an L4-style zero-register-copy fast path that does a direct context switch and bypasses the Zig dispatch table. Current round-trip cost is around 1,600 cycles for suspend → receive → reply on a Ryzen 9 7950X3D.
 
 **Time.** A monotonic clock primitive. Internal scheduler ticks and deadline checks drive preemption and timed waits.
 
-**Virtual machines.** KVM-style guest containers. vCPUs are threads in a VM-flavored capability domain; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
+**Virtual machines.** KVM-style guest containers. vCPUs are threads in a VM-flavored process; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
 
 ## Status
 
@@ -80,7 +78,7 @@ zig build run -Dprofile=linux_guest
 kernel/                Kernel proper
   arch/                  Arch dispatch (dispatch/) + per-arch backends (x64, aarch64)
   boot/                  UEFI handoff and userspace bringup
-  caps/                  Capability and handle types, capability domain
+  caps/                  Capability and handle types, process
   devices/               Device region registry
   hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
   memory/                PMM, VMM, VMARs, page frames, paging, allocators/ (SecureSlab lives here)

@@ -1,11 +1,11 @@
 //! Virtual Address Range (VMAR) — contiguous span of virtual address
-//! space bound to a capability domain, available for demand-paged
+//! space bound to a process, available for demand-paged
 //! memory or installing page frames or device regions. See spec §[var].
 //!
-//! Capability-domain lifetime: dies when the owning CapabilityDomain
-//! is destroyed. Multiple capability domains may hold handles to a VMAR
+//! Process lifetime: dies when the owning Process
+//! is destroyed. Multiple processes may hold handles to a VMAR
 //! via `copy`/`move` — UAF
-//! protection across domains comes from `_gen_lock`.
+//! protection across processes comes from `_gen_lock`.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -16,7 +16,7 @@ const errors = stygia.syscall.errors;
 const scheduler = stygia.sched.scheduler;
 const secure_slab = stygia.memory.allocators.secure_slab;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const DeviceRegion = stygia.devices.device_region.DeviceRegion;
 const Thread = stygia.sched.thread.Thread;
@@ -116,11 +116,11 @@ pub const VMAR = struct {
     /// guards every mutable field below.
     _gen_lock: GenLock = .{},
 
-    /// Owning capability domain. VARs cannot outlive their owner —
-    /// `destroyVmar` runs ahead of any domain teardown — but the
+    /// Owning process. VARs cannot outlive their owner —
+    /// `destroyVmar` runs ahead of any process teardown — but the
     /// invariant lives in code, not the type, so the slot is carried
-    /// as a SlabRef for analyzer-level UAF safety on cross-domain
-    domain: SlabRef(CapabilityDomain),
+    /// as a SlabRef for analyzer-level UAF safety on cross-process
+    process: SlabRef(Process),
 
     /// Base virtual address (or base IOVA for DMA VARs). Mirrors the
     /// user-visible Capability.field0. Set at create; immutable.
@@ -148,14 +148,14 @@ pub const VMAR = struct {
     /// a DMA VMAR (caps.dma=1, IOMMU mappings install via this device's
     /// IOMMU domain). Set/cleared by map_mmio/unmap when this is an
     /// MMIO VMAR. Null otherwise. Mirrors field1 bits 41-52 (handle id
-    /// in the owning domain's table).
+    /// in the owning process's table).
     device: ?SlabRef(DeviceRegion) = null,
 
     /// Snapshot binding source. Set by `snapshot` when this VMAR has
     /// `restart_policy = snapshot` (3) and a source has been bound.
-    /// On the owning domain's restart, the source's contents are
+    /// On the owning process's restart, the source's contents are
     /// copied into this VMAR before resume. Source may live in another
-    /// domain — cross-domain UAF protection routes through
+    /// process — cross-process UAF protection routes through
     /// `source._gen_lock`. Null when no binding.
     snapshot_source: ?SlabRef(VMAR) = null,
 
@@ -258,36 +258,36 @@ pub fn createVmar(
         }
     }
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
 
     // DMA VARs require a valid device_region handle with the dma cap.
     var dev_ptr: ?*DeviceRegion = null;
     if (vmar_caps.dma) {
         const slot: u12 = @truncate(device_region & 0xFFF);
-        const kh = lookupHandle(domain, slot, .device_region) orelse
+        const kh = lookupHandle(process, slot, .device_region) orelse
             return errors.E_BADCAP;
-        const cap_bits: u16 = Word0.caps(domain.user_table[slot].word0);
+        const cap_bits: u16 = Word0.caps(process.user_table[slot].word0);
         const dr_caps: stygia.devices.device_region.DeviceRegionCaps = @bitCast(cap_bits);
         if (!dr_caps.dma) return errors.E_PERM;
         dev_ptr = @ptrCast(@alignCast(kh.ref.ptr.?));
     }
 
-    const base = vaRangeAllocate(domain, @intCast(pages), sz, base_in) orelse
+    const base = vaRangeAllocate(process, @intCast(pages), sz, base_in) orelse
         return errors.E_NOSPC;
 
-    const overlap = stygia.caps.capability_domain.checkVaRangeOverlap(domain, base, @as(u64, @intCast(pages)) * sz_bytes);
+    const overlap = stygia.caps.process.checkVaRangeOverlap(process, base, @as(u64, @intCast(pages)) * sz_bytes);
     if (overlap != 0) return overlap;
 
-    const v = allocVmar(domain, base, @intCast(pages), sz, cch, cur_rwx, dev_ptr) catch
+    const v = allocVmar(process, base, @intCast(pages), sz, cch, cur_rwx, dev_ptr) catch
         return errors.E_NOMEM;
 
-    const append_rc = stygia.caps.capability_domain.appendVar(domain, v);
+    const append_rc = stygia.caps.process.appendVar(process, v);
     if (append_rc != 0) {
         destroyVmar(v);
         return append_rc;
     }
 
-    // Mint a handle for the new VMAR in the caller's domain. field0 =
+    // Mint a handle for the new VMAR in the caller's process. field0 =
     // base vaddr; field1 = packed page_count|sz|cch|cur_rwx|map|device.
     //
     // Spec §[create_vmar] test 22: "on success, when caps.dma = 1,
@@ -299,8 +299,8 @@ pub fn createVmar(
     const field0: u64 = base.addr;
     const field1: u64 = packField1(@intCast(pages), sz, cch, cur_rwx, .unmapped, dev_id_at_create);
     const handle_caps: u16 = @truncate(caps);
-    const slot = stygia.caps.capability_domain.mintHandle(
-        domain,
+    const slot = stygia.caps.process.mintHandle(
+        process,
         .{ .ptr = v, .gen = @intCast(v._gen_lock.currentGen()) },
         .virtual_memory_address_region,
         handle_caps,
@@ -348,15 +348,15 @@ pub fn createVmar(
 pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
+    const v = resolveVmar(process, slot) orelse return errors.E_BADCAP;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     defer v._gen_lock.unlockIrqRestore(v_irq);
-    defer refreshVmarSnapshot(domain, slot, v);
+    defer refreshVmarSnapshot(process, slot, v);
 
-    const caps_word: u16 = Word0.caps(domain.user_table[slot].word0);
+    const caps_word: u16 = Word0.caps(process.user_table[slot].word0);
     const vmar_caps: VmarCaps = @bitCast(caps_word);
     if (vmar_caps.mmio) return errors.E_PERM;
     if (v.map == .mmio or v.map == .demand) return errors.E_INVAL;
@@ -378,7 +378,7 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
         if (!std.mem.isAligned(offset, sz_bytes)) return errors.E_INVAL;
 
         const pf_slot: u12 = @truncate(pf_handle & 0xFFF);
-        const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse
+        const pf_kh = lookupHandle(process, pf_slot, .page_frame) orelse
             return errors.E_BADCAP;
         const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
 
@@ -397,7 +397,7 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
         while (j < i) {
             const other_offset = pairs[j];
             const other_pf_slot: u12 = @truncate(pairs[j + 1] & 0xFFF);
-            const other_kh = lookupHandle(domain, other_pf_slot, .page_frame) orelse
+            const other_kh = lookupHandle(process, other_pf_slot, .page_frame) orelse
                 return errors.E_BADCAP;
             const other_pf: *PageFrame = @ptrCast(@alignCast(other_kh.ref.ptr.?));
             const other_pair_bytes = @as(u64, other_pf.page_count) * pageSizeBytes(other_pf.sz);
@@ -411,13 +411,13 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
 
         // Spec §[var].map_pf test 09: pair must not overlap any
         // mapping already installed in the VMAR. For non-DMA VARs the
-        // owning domain's page tables are the authoritative record;
+        // owning process's page tables are the authoritative record;
         // probe each page-sized slot in the pair's range.
         if (!vmar_caps.dma) {
             var off_in: u64 = 0;
             while (off_in < pair_bytes) {
                 const va = v.base_vaddr.addr + offset + off_in;
-                if (dispatch.paging.resolveVaddr(domain.addr_space_root, .fromInt(va)) != null) {
+                if (dispatch.paging.resolveVaddr(process.addr_space_root, .fromInt(va)) != null) {
                     return errors.E_INVAL;
                 }
                 off_in += sz_bytes;
@@ -439,7 +439,7 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
     while (i < pairs.len) {
         const offset = pairs[i];
         const pf_slot: u12 = @truncate(pairs[i + 1] & 0xFFF);
-        const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse {
+        const pf_kh = lookupHandle(process, pf_slot, .page_frame) orelse {
             // Roll back installs from [0..i) — a pf handle disappearing
             // between Pass 1 and Pass 2 is implausible under the gen-lock
             // bracket but the rollback path is symmetric with mappingInstall
@@ -455,9 +455,9 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
 
         // Spec §[var].map_pf test 12: effective PTE perms must equal
         // `VMAR.cur_rwx ∩ page_frame.r/w/x`. PageFrame caps live in the
-        // calling domain's user_table at the handle's slot — read them
+        // calling process's user_table at the handle's slot — read them
         // here so `mappingInstall` can intersect per page.
-        const pf_caps_word: u16 = Word0.caps(domain.user_table[pf_slot].word0);
+        const pf_caps_word: u16 = Word0.caps(process.user_table[pf_slot].word0);
         const pf_caps: PageFrameCaps = @bitCast(pf_caps_word);
         const pf_rwx: u3 = (@as(u3, @intFromBool(pf_caps.r))) |
             (@as(u3, @intFromBool(pf_caps.w)) << 1) |
@@ -482,21 +482,21 @@ pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
 
 /// `map_mmio` syscall handler. Spec §[var].map_mmio.
 pub fn mapMmio(caller: *Thread, vmar_handle: u64, device_region: u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
     const vmar_slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, vmar_slot) orelse return errors.E_BADCAP;
+    const v = resolveVmar(process, vmar_slot) orelse return errors.E_BADCAP;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     defer v._gen_lock.unlockIrqRestore(v_irq);
-    defer refreshVmarSnapshot(domain, vmar_slot, v);
+    defer refreshVmarSnapshot(process, vmar_slot, v);
 
-    const caps_word: u16 = Word0.caps(domain.user_table[vmar_slot].word0);
+    const caps_word: u16 = Word0.caps(process.user_table[vmar_slot].word0);
     const vmar_caps: VmarCaps = @bitCast(caps_word);
     if (!vmar_caps.mmio) return errors.E_PERM;
     if (v.map != .unmapped) return errors.E_INVAL;
 
     const dr_slot: u12 = @truncate(device_region & 0xFFF);
-    const dr_kh = lookupHandle(domain, dr_slot, .device_region) orelse
+    const dr_kh = lookupHandle(process, dr_slot, .device_region) orelse
         return errors.E_BADCAP;
     const dr: *DeviceRegion = @ptrCast(@alignCast(dr_kh.ref.ptr.?));
 
@@ -532,7 +532,7 @@ pub fn mapMmio(caller: *Thread, vmar_handle: u64, device_region: u64) i64 {
         var off: u64 = 0;
         while (off < var_size) {
             dispatch.paging.mapPageSized(
-                domain.addr_space_root,
+                process.addr_space_root,
                 .fromInt(phys_base.addr + off),
                 .fromInt(v.base_vaddr.addr + off),
                 v.sz,
@@ -549,7 +549,7 @@ pub fn mapMmio(caller: *Thread, vmar_handle: u64, device_region: u64) i64 {
                 var u: u64 = 0;
                 while (u < off) : (u += sz_bytes) {
                     _ = dispatch.paging.unmapPageSized(
-                        domain.addr_space_root,
+                        process.addr_space_root,
                         .fromInt(v.base_vaddr.addr + u),
                         v.sz,
                     );
@@ -567,13 +567,13 @@ pub fn mapMmio(caller: *Thread, vmar_handle: u64, device_region: u64) i64 {
 
 /// `unmap` syscall handler. Spec §[var].unmap.
 pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
+    const v = resolveVmar(process, slot) orelse return errors.E_BADCAP;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     defer v._gen_lock.unlockIrqRestore(v_irq);
-    defer refreshVmarSnapshot(domain, slot, v);
+    defer refreshVmarSnapshot(process, slot, v);
 
     if (v.map == .unmapped) return errors.E_INVAL;
     if (v.map == .mmio and selectors.len > 0) return errors.E_INVAL;
@@ -582,7 +582,7 @@ pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
     const var_size = @as(u64, v.page_count) * sz_bytes;
 
     if (selectors.len == 0) {
-        unmapAll(v, domain);
+        unmapAll(v, process);
         v.map = .unmapped;
         v.device = null;
         return 0;
@@ -592,7 +592,7 @@ pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
         .page_frame => {
             for (selectors) |sel| {
                 const pf_slot: u12 = @truncate(sel & 0xFFF);
-                const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse
+                const pf_kh = lookupHandle(process, pf_slot, .page_frame) orelse
                     return errors.E_BADCAP;
                 const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
                 const offset = findInstalledOffset(v, pf) orelse return errors.E_NOENT;
@@ -612,7 +612,7 @@ pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
     }
 
     dispatch.paging.shootdownTlbRange(
-        domain.addr_space_id,
+        process.addr_space_id,
         v.base_vaddr,
         v.sz,
         v.page_count,
@@ -624,18 +624,18 @@ pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
 pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
     if (new_cur_rwx >> 3 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
+    const v = resolveVmar(process, slot) orelse return errors.E_BADCAP;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     defer v._gen_lock.unlockIrqRestore(v_irq);
-    defer refreshVmarSnapshot(domain, slot, v);
+    defer refreshVmarSnapshot(process, slot, v);
 
     if (v.map == .unmapped or v.map == .mmio) return errors.E_INVAL;
 
     const new_rwx: u3 = @truncate(new_cur_rwx & 0b111);
-    const caps_word: u16 = Word0.caps(domain.user_table[slot].word0);
+    const caps_word: u16 = Word0.caps(process.user_table[slot].word0);
     const vmar_caps: VmarCaps = @bitCast(caps_word);
     const caps_rwx: u3 = (@as(u3, @intFromBool(vmar_caps.r))) |
         (@as(u3, @intFromBool(vmar_caps.w)) << 1) |
@@ -657,17 +657,17 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
             const pf = pf_ref.ptr;
             const pf_caps_word: u16 = blk: {
                 var i: usize = 0;
-                while (i < domain.user_table.len) : (i += 1) {
-                    if (Word0.typeTag(domain.user_table[i].word0) != .page_frame) continue;
-                    const kh = domain.kernel_table[i];
+                while (i < process.user_table.len) : (i += 1) {
+                    if (Word0.typeTag(process.user_table[i].word0) != .page_frame) continue;
+                    const kh = process.kernel_table[i];
                     if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
-                        break :blk Word0.caps(domain.user_table[i].word0);
+                        break :blk Word0.caps(process.user_table[i].word0);
                     }
                 }
-                // No handle to this pf in the calling domain: derive
+                // No handle to this pf in the calling process: derive
                 // r/w/x from the pf's effective state by treating it
                 // as fully permissive (all bits set). The owning
-                // domain's handle is what gates installation, and the
+                // process's handle is what gates installation, and the
                 // intersection is taken across installed frames; the
                 // remap caller already passed a caps-subset check via
                 // the VMAR's own caps.
@@ -705,11 +705,11 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
         const pf_rwx_for_remap: u3 = blk: {
             if (v.map == .demand) break :blk 0b111;
             var i: usize = 0;
-            while (i < domain.user_table.len) : (i += 1) {
-                if (Word0.typeTag(domain.user_table[i].word0) != .page_frame) continue;
-                const kh = domain.kernel_table[i];
+            while (i < process.user_table.len) : (i += 1) {
+                if (Word0.typeTag(process.user_table[i].word0) != .page_frame) continue;
+                const kh = process.kernel_table[i];
                 if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
-                    const pfc: PageFrameCaps = @bitCast(Word0.caps(domain.user_table[i].word0));
+                    const pfc: PageFrameCaps = @bitCast(Word0.caps(process.user_table[i].word0));
                     break :blk (@as(u3, @intFromBool(pfc.r))) |
                         (@as(u3, @intFromBool(pfc.w)) << 1) |
                         (@as(u3, @intFromBool(pfc.x)) << 2);
@@ -726,7 +726,7 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
             if (off_p + pf_sz_bytes > @as(u64, v.page_count) * sz_bytes) break;
             const phys_p = PAddr.fromInt(pf.phys_base.addr + @as(u64, p) * pf_sz_bytes);
             dispatch.paging.mapPageSized(
-                domain.addr_space_root,
+                process.addr_space_root,
                 phys_p,
                 .fromInt(v.base_vaddr.addr + off_p),
                 v.sz,
@@ -737,7 +737,7 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
         entry.effective_rwx = effective_rwx;
     }
     dispatch.paging.shootdownTlbRange(
-        domain.addr_space_id,
+        process.addr_space_id,
         v.base_vaddr,
         v.sz,
         v.page_count,
@@ -748,15 +748,15 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
 
 /// `snapshot` syscall handler. Spec §[var].snapshot.
 pub fn snapshot(caller: *Thread, target_vmar: u64, source_vmar: u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
+    const process = caller.process.ptr; // caller-pinned: caller is the running thread; its process stays alive across this syscall
     const t_slot: u12 = @truncate(target_vmar & 0xFFF);
     const s_slot: u12 = @truncate(source_vmar & 0xFFF);
 
-    const target = resolveVmar(domain, t_slot) orelse return errors.E_BADCAP;
-    const source = resolveVmar(domain, s_slot) orelse return errors.E_BADCAP;
+    const target = resolveVmar(process, t_slot) orelse return errors.E_BADCAP;
+    const source = resolveVmar(process, s_slot) orelse return errors.E_BADCAP;
 
-    const t_caps: VmarCaps = @bitCast(Word0.caps(domain.user_table[t_slot].word0));
-    const s_caps: VmarCaps = @bitCast(Word0.caps(domain.user_table[s_slot].word0));
+    const t_caps: VmarCaps = @bitCast(Word0.caps(process.user_table[t_slot].word0));
+    const s_caps: VmarCaps = @bitCast(Word0.caps(process.user_table[s_slot].word0));
     if (t_caps.restart_policy != @intFromEnum(RestartPolicy.snapshot)) return errors.E_INVAL;
     if (s_caps.restart_policy != @intFromEnum(RestartPolicy.preserve)) return errors.E_INVAL;
 
@@ -792,41 +792,41 @@ pub inline fn packField1(
 /// Look up a handle slot expecting the given type. Returns null on
 /// out-of-range, free slot, or type mismatch. Centralized here to keep
 /// every VMAR-handler's resolve path identical.
-fn lookupHandle(cd: *CapabilityDomain, slot: u12, expected: CapabilityType) ?*KernelHandle {
-    if (slot >= cd.user_table.len) return null;
-    const cap = cd.user_table[slot];
+fn lookupHandle(process: *Process, slot: u12, expected: CapabilityType) ?*KernelHandle {
+    if (slot >= process.user_table.len) return null;
+    const cap = process.user_table[slot];
     if (Word0.typeTag(cap.word0) != expected) return null;
-    const kh = &cd.kernel_table[slot];
+    const kh = &process.kernel_table[slot];
     if (kh.ref.ptr == null) return null;
     return kh;
 }
 
-fn resolveVmar(cd: *CapabilityDomain, slot: u12) ?*VMAR {
-    const kh = lookupHandle(cd, slot, .virtual_memory_address_region) orelse return null;
+fn resolveVmar(process: *Process, slot: u12) ?*VMAR {
+    const kh = lookupHandle(process, slot, .virtual_memory_address_region) orelse return null;
     return @ptrCast(@alignCast(kh.ref.ptr.?));
 }
 
 /// Refresh `slot`'s field0/field1 from authoritative VMAR state. Spec
 /// §[var] tests 14/09/12 (implicit-sync side effect on every syscall
 /// touching the handle).
-fn refreshVmarSnapshot(cd: *CapabilityDomain, slot: u12, v: *const VMAR) void {
-    if (slot >= cd.user_table.len) return;
+fn refreshVmarSnapshot(process: *Process, slot: u12, v: *const VMAR) void {
+    if (slot >= process.user_table.len) return;
     // caller-pinned: device ref is part of v's mutable state, accessed
     // under v's gen-lock by the caller.
-    const dev_id: u12 = if (v.device) |dr_ref| handleIdOf(cd, dr_ref.ptr) else 0;
-    cd.user_table[slot].field0 = v.base_vaddr.addr;
-    cd.user_table[slot].field1 = packField1(v.page_count, v.sz, v.cch, v.cur_rwx, v.map, dev_id);
+    const dev_id: u12 = if (v.device) |dr_ref| handleIdOf(process, dr_ref.ptr) else 0;
+    process.user_table[slot].field0 = v.base_vaddr.addr;
+    process.user_table[slot].field1 = packField1(v.page_count, v.sz, v.cch, v.cur_rwx, v.map, dev_id);
 }
 
-/// Linear scan of `cd`'s handle table for the slot id pointing at `dr`.
+/// Linear scan of `process`'s handle table for the slot id pointing at `dr`.
 /// Returns 0 when no handle is found — safe because slot 0 is reserved
 /// for the self-handle and so cannot hold a device_region.
-fn handleIdOf(cd: *const CapabilityDomain, dr: *const DeviceRegion) u12 {
+fn handleIdOf(process: *const Process, dr: *const DeviceRegion) u12 {
     var i: u16 = 0;
-    while (i < cd.user_table.len) {
-        const cap = cd.user_table[i];
+    while (i < process.user_table.len) {
+        const cap = process.user_table[i];
         if (Word0.typeTag(cap.word0) == .device_region) {
-            const kh = cd.kernel_table[i];
+            const kh = process.kernel_table[i];
             if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(dr))) return @intCast(i);
         }
         i += 1;
@@ -834,10 +834,10 @@ fn handleIdOf(cd: *const CapabilityDomain, dr: *const DeviceRegion) u12 {
     return 0;
 }
 
-/// Allocate a VMAR slab slot, claim a VA range in `domain`, append to
-/// `domain.vars[]`. Spec §[var].create_vmar.
+/// Allocate a VMAR slab slot, claim a VA range in `process`, append to
+/// `process.vars[]`. Spec §[var].create_vmar.
 fn allocVmar(
-    domain: *CapabilityDomain,
+    process: *Process,
     base: VAddr,
     pages: u32,
     sz: PageSize,
@@ -849,7 +849,7 @@ fn allocVmar(
     const v = pending.ptr;
     // Slab zero-on-free covers map=.unmapped, device=null,
     // snapshot_source=null, mapping_table=null, installed_pfs=all-empty.
-    v.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
+    v.process = SlabRef(Process).init(process, process._gen_lock.currentGen());
     v.base_vaddr = base;
     v.page_count = pages;
     v.sz = sz;
@@ -861,37 +861,37 @@ fn allocVmar(
 }
 
 /// Final teardown — unmaps all installations, releases device/snapshot
-/// refs, removes from `domain.vars[]`, frees VA range, frees slab slot.
+/// refs, removes from `process.vars[]`, frees VA range, frees slab slot.
 pub fn destroyVmar(v: *VMAR) void {
-    // caller-pinned: domain owns this VMAR and outlives it (destroyVmar
-    // runs ahead of any domain teardown).
-    const domain = v.domain.ptr;
+    // caller-pinned: process owns this VMAR and outlives it (destroyVmar
+    // runs ahead of any process teardown).
+    const process = v.process.ptr;
     const gen = v._gen_lock.currentGen();
     if (v.map == .page_frame or v.map == .demand) {
-        unmapAll(v, domain);
+        unmapAll(v, process);
     } else if (v.map == .mmio) {
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
             _ = dispatch.paging.unmapPageSized(
-                domain.addr_space_root,
+                process.addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
                 v.sz,
             );
             off += sz_bytes;
         }
         dispatch.paging.shootdownTlbRange(
-            domain.addr_space_id,
+            process.addr_space_id,
             v.base_vaddr,
             v.sz,
             v.page_count,
         );
     }
-    stygia.caps.capability_domain.removeVar(domain, v);
+    stygia.caps.process.removeVar(process, v);
     slab_instance.destroy(v, gen) catch {};
 }
 
-/// VMAR teardown variant for the capability-domain destroy path:
+/// VMAR teardown variant for the process destroy path:
 /// drops mapcnt for every installed page_frame, clears the leaf PTEs
 /// without issuing per-page TLB shootdowns, and frees the slab slot.
 /// Used by `destroyPhase2`'s pre-dead-mark VMAR snapshot where paying
@@ -899,17 +899,17 @@ pub fn destroyVmar(v: *VMAR) void {
 /// 4 MiB-stack-sized child with multiple VMARs would otherwise eat
 /// thousands of shootdown IPIs per spawn.
 ///
-/// Skipping the shootdown is only legal AFTER `awaitDomainQuiesced`
-/// has confirmed that no core has the dying CD's translation root
+/// Skipping the shootdown is only legal AFTER `awaitProcessQuiesced`
+/// has confirmed that no core has the dying process's translation root
 /// loaded and no core holds one of its Threads in its dispatch slot
 /// (stygia-1im). Do not call this from a context that cannot make that
 /// guarantee — use `destroyVmar` there instead.
-pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PAddr) void {
-    // caller-pinned: the only caller is `capability_domain.destroyPhase2`
-    // walking a `vars[]` snapshot captured before the owning CD was
-    // dead-marked. `addr_space_root` was captured from that same live CD;
-    // this helper deliberately does not touch `v.domain.ptr` or mutate
-    // `domain.vars[]`, because the CD is already in even-gen teardown.
+pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: PAddr) void {
+    // caller-pinned: the only caller is `process.destroyPhase2`
+    // walking a `vars[]` snapshot captured before the owning process was
+    // dead-marked. `addr_space_root` was captured from that same live process;
+    // this helper deliberately does not touch `v.process.ptr` or mutate
+    // `process.vars[]`, because the process is already in even-gen teardown.
     const v = v_ref.ptr;
     const gen: u63 = @intCast(v_ref.gen);
     if (v.map == .page_frame or v.map == .demand) {
@@ -944,7 +944,7 @@ pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PA
 
 /// Allocate a contiguous VA range of `pages * sz` bytes for a new VMAR.
 /// `preferred_base != 0` returns that base verbatim (the create_vmar
-/// caller is asking for a specific address; the per-domain overlap
+/// caller is asking for a specific address; the per-process overlap
 /// check still has the final say). Otherwise pick a randomized,
 /// `sz`-aligned base inside the ASLR zone (spec §[create_vmar] test 24
 /// + §[address_space]). On overlap with an existing VMAR, retry a
@@ -952,8 +952,8 @@ pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PA
 /// forward progress.
 ///
 /// Overlap detection covers two classes of mapping:
-///   1. `domainOverlaps` — VMAR-tracked ranges (every successful
-///      `create_vmar` registers in `domain.vars[]`).
+///   1. `processOverlaps` — VMAR-tracked ranges (every successful
+///      `create_vmar` registers in `process.vars[]`).
 ///   2. `pageTableOverlaps` — eager mappings the kernel installs at boot
 ///      that don't go through the VMAR layer: ELF segments
 ///      (`loadElfSegments`), the user stack (`mapUserStack`), and the
@@ -962,7 +962,7 @@ pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PA
 ///      overlaps either would let `map_pf`'s test 09 check fire on the
 ///      eager PTEs and reject the install with E_INVAL.
 fn vaRangeAllocate(
-    domain: *CapabilityDomain,
+    process: *Process,
     pages: u32,
     sz: PageSize,
     preferred_base: VAddr,
@@ -974,11 +974,11 @@ fn vaRangeAllocate(
     // Reject when the request would land on top of an eager kernel
     // mapping (ELF segments, user stack, cap-table view) — the
     // checkVaRangeOverlap probe in createVmar only covers
-    // `domain.vars[]`, so without this gate the static zone would let
+    // `process.vars[]`, so without this gate the static zone would let
     // userspace mint a VMAR aliasing kernel-installed PTEs and
     // map_pf's overlap probe (test 09) would later fire on the alias.
     if (preferred_base.addr != 0) {
-        if (pageTableOverlaps(domain, preferred_base.addr, range_bytes, sz_bytes)) return null;
+        if (pageTableOverlaps(process, preferred_base.addr, range_bytes, sz_bytes)) return null;
         return preferred_base;
     }
 
@@ -998,8 +998,8 @@ fn vaRangeAllocate(
         const off = r % span;
         const candidate = aslr.start + std.mem.alignBackward(u64, off, sz_bytes);
         if (candidate >= aslr.start and candidate <= max_base) {
-            if (!domainOverlaps(domain, candidate, range_bytes) and
-                !pageTableOverlaps(domain, candidate, range_bytes, sz_bytes))
+            if (!processOverlaps(process, candidate, range_bytes) and
+                !pageTableOverlaps(process, candidate, range_bytes, sz_bytes))
             {
                 return .fromInt(candidate);
             }
@@ -1008,18 +1008,18 @@ fn vaRangeAllocate(
     }
 
     // Fallback: bump-allocate from `next_var_base` so a VA-pressured
-    // domain still makes forward progress when randomized probing
+    // process still makes forward progress when randomized probing
     // keeps colliding. Walk the bump pointer forward past any eager
     // mappings (ELF/stack/cap-table view) that happen to sit at the
     // current bump position; without this the bump path inherits the
     // same eager-overlap blind spot the randomized path used to have.
-    var aligned = std.mem.alignForward(u64, domain.next_var_base, sz_bytes);
+    var aligned = std.mem.alignForward(u64, process.next_var_base, sz_bytes);
     while (aligned + range_bytes <= aslr.end) {
         const new_top = aligned + range_bytes;
-        if (!domainOverlaps(domain, aligned, range_bytes) and
-            !pageTableOverlaps(domain, aligned, range_bytes, sz_bytes))
+        if (!processOverlaps(process, aligned, range_bytes) and
+            !pageTableOverlaps(process, aligned, range_bytes, sz_bytes))
         {
-            domain.next_var_base = new_top;
+            process.next_var_base = new_top;
             return .fromInt(aligned);
         }
         aligned = std.mem.alignForward(u64, aligned + sz_bytes, sz_bytes);
@@ -1028,18 +1028,18 @@ fn vaRangeAllocate(
 }
 
 /// Return true when any page-sized slot in `[base, base + bytes)` already
-/// has a present leaf PTE in `domain`'s address space. Catches eager
+/// has a present leaf PTE in `process`'s address space. Catches eager
 /// mappings (ELF segments, user stack, cap-table view) that aren't
-/// registered in `domain.vars[]` and would otherwise fall through
-/// `domainOverlaps` to be picked as a fresh VMAR base. Walks at the
+/// registered in `process.vars[]` and would otherwise fall through
+/// `processOverlaps` to be picked as a fresh VMAR base. Walks at the
 /// requested page size so an overlap test against a 4 KiB candidate
 /// only checks 4 KiB-aligned slots; larger sz aligns up to the
 /// granule.
-fn pageTableOverlaps(domain: *CapabilityDomain, base: u64, bytes: u64, sz_bytes: u64) bool {
+fn pageTableOverlaps(process: *Process, base: u64, bytes: u64, sz_bytes: u64) bool {
     var off: u64 = 0;
     while (off < bytes) {
         const va = VAddr.fromInt(base + off);
-        if (dispatch.paging.resolveVaddr(domain.addr_space_root, va) != null) {
+        if (dispatch.paging.resolveVaddr(process.addr_space_root, va) != null) {
             return true;
         }
         off += sz_bytes;
@@ -1047,20 +1047,20 @@ fn pageTableOverlaps(domain: *CapabilityDomain, base: u64, bytes: u64, sz_bytes:
     return false;
 }
 
-/// Cheap overlap test against the domain's already-bound VARs. Used
+/// Cheap overlap test against the process's already-bound VARs. Used
 /// during randomized base selection — `checkVaRangeOverlap` has the
 /// same logic but returns an i64 status; here we want a bool to drive
 /// retry decisions.
-fn domainOverlaps(domain: *const CapabilityDomain, base: u64, bytes: u64) bool {
+fn processOverlaps(process: *const Process, base: u64, bytes: u64) bool {
     const new_end = base + bytes;
     var i: u16 = 0;
-    while (i < domain.var_count) {
-        const v_ref = domain.vars[i] orelse {
+    while (i < process.var_count) {
+        const v_ref = process.vars[i] orelse {
             i += 1;
             continue;
         };
-        // caller-pinned: VMAR's domain owns it; the walking caller holds
-        // the domain alive across this scan.
+        // caller-pinned: VMAR's process owns it; the walking caller holds
+        // the process alive across this scan.
         const v = v_ref.ptr;
         const v_sz_bytes = pageSizeBytes(v.sz);
         const v_start = v.base_vaddr.addr;
@@ -1087,15 +1087,15 @@ var aslr_fallback_counter: u64 = 0;
 /// Install a page_frame at offset, increments mapcnt, programs PTE or
 /// IOMMU PTE. Spec §[var].map_pf — installs every page in the page
 /// frame contiguously starting at `offset`. `pf_rwx` carries the
-/// page_frame handle's `r/w/x` caps from the calling domain; spec
+/// page_frame handle's `r/w/x` caps from the calling process; spec
 /// §[var].map_pf test 12 requires effective PTE perms =
 /// `VMAR.cur_rwx ∩ page_frame.r/w/x`.
 fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
-    // caller-pinned: VMAR's domain is its owner.
-    const domain = v.domain.ptr;
-    const slot_idx = handleSlotOf(v, domain);
-    const caps_word: u16 = if (slot_idx < domain.user_table.len)
-        Word0.caps(domain.user_table[slot_idx].word0)
+    // caller-pinned: VMAR's process is its owner.
+    const process = v.process.ptr;
+    const slot_idx = handleSlotOf(v, process);
+    const caps_word: u16 = if (slot_idx < process.user_table.len)
+        Word0.caps(process.user_table[slot_idx].word0)
     else
         0;
     const vmar_caps: VmarCaps = @bitCast(caps_word);
@@ -1138,7 +1138,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
             break :blk false;
         } else blk: {
             dispatch.paging.mapPageSized(
-                domain.addr_space_root,
+                process.addr_space_root,
                 phys_p,
                 .fromInt(v.base_vaddr.addr + off_p),
                 v.sz,
@@ -1175,7 +1175,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
                     );
                 } else {
                     _ = dispatch.paging.unmapPageSized(
-                        domain.addr_space_root,
+                        process.addr_space_root,
                         .fromInt(v.base_vaddr.addr + off_u),
                         v.sz,
                     );
@@ -1190,7 +1190,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
         // I-cache lines from a PREVIOUS owner, because page frames are
         // recycled and the PMM's zero-fill is a DATA-side write that
         // does not evict them. The new owner would then fetch the old
-        // domain's instructions — wrong execution and a cross-domain
+        // process's instructions — wrong execution and a cross-process
         // information leak (stygia-ojs).
         //
         // Done per page inside the loop rather than once for the whole
@@ -1232,11 +1232,11 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
 /// PageFrame is freed and its physical pages return to PMM (the leftover
 /// PTE still translates the user VA to the now-recycled phys).
 fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
-    // caller-pinned: VMAR's domain is its owner.
-    const domain = v.domain.ptr;
-    const slot_idx = handleSlotOf(v, domain);
-    const caps_word: u16 = if (slot_idx < domain.user_table.len)
-        Word0.caps(domain.user_table[slot_idx].word0)
+    // caller-pinned: VMAR's process is its owner.
+    const process = v.process.ptr;
+    const slot_idx = handleSlotOf(v, process);
+    const caps_word: u16 = if (slot_idx < process.user_table.len)
+        Word0.caps(process.user_table[slot_idx].word0)
     else
         0;
     const vmar_caps: VmarCaps = @bitCast(caps_word);
@@ -1271,7 +1271,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
             dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz, 1);
         } else {
             _ = dispatch.paging.unmapPageSized(
-                domain.addr_space_root,
+                process.addr_space_root,
                 .fromInt(v.base_vaddr.addr + off_p),
                 v.sz,
             );
@@ -1328,9 +1328,9 @@ fn demandAlloc(v: *VMAR, offset: u64) i64 {
 }
 
 /// Page-fault handler hook — looks up the VMAR covering `fault_vaddr`
-/// in `domain` and dispatches per `map`. Spec §[var] demand transition.
-pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx: u3) i64 {
-    const v = findVmarCovering(domain, fault_vaddr) orelse return errors.E_BADADDR;
+/// in `process` and dispatches per `map`. Spec §[var] demand transition.
+pub fn handlePageFault(process: *Process, fault_vaddr: VAddr, access_rwx: u3) i64 {
+    const v = findVmarCovering(process, fault_vaddr) orelse return errors.E_BADADDR;
     const v_irq = v._gen_lock.lockIrqSave(@src());
 
     if ((access_rwx & ~v.cur_rwx) != 0) {
@@ -1359,7 +1359,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // Port-IO virtualization — decode MOV, emit IN/OUT, advance
             // RIP. Spec §[port_io_virtualization]. Plain MMIO faults
             // here are spurious (real PTEs were installed at map time)
-            // and tear down the faulting domain.
+            // and tear down the faulting process.
             // caller-pinned: device ref under VMAR's gen-lock.
             const dev_ref = v.device orelse {
                 v._gen_lock.unlockIrqRestore(v_irq);
@@ -1376,19 +1376,19 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // emulator to fire `memory_fault` / `thread_fault` inline
             // and yield the thread; in those paths the emulator never
             // returns, so a still-held VMAR `_gen_lock` would strand
-            // forever and deadlock any future walk of the domain's
+            // forever and deadlock any future walk of the process's
             // `vars[]`. The DeviceRegion pointer is stable for the
             // kernel's lifetime once bound, so unlocking here is safe.
             const var_base = v.base_vaddr.addr;
             v._gen_lock.unlockIrqRestore(v_irq);
-            return decodePortIoFault(domain, fault_vaddr, var_base, dev);
+            return decodePortIoFault(process, fault_vaddr, var_base, dev);
         },
         .page_frame => {
             const fault_offset = fault_vaddr.addr - v.base_vaddr.addr;
             if (installedEffectiveRwxAt(v, fault_offset)) |effective_rwx| {
                 if ((access_rwx & ~effective_rwx) == 0) {
                     dispatch.paging.shootdownTlbRange(
-                        domain.addr_space_id,
+                        process.addr_space_id,
                         .fromInt(std.mem.alignBackward(u64, fault_vaddr.addr, pageSizeBytes(v.sz))),
                         v.sz,
                         1,
@@ -1404,16 +1404,16 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
 }
 
 /// Linear scan for any VMAR whose [base, base + page_count*sz) covers
-/// `fault_vaddr`. The flat per-domain `vars[]` makes this O(N) which
-/// is fine because a domain holds at most MAX_VARS_PER_DOMAIN (512).
-pub fn findVmarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VMAR {
+/// `fault_vaddr`. The flat per-process `vars[]` makes this O(N) which
+/// is fine because a process holds at most MAX_VARS_PER_PROCESS (512).
+pub fn findVmarCovering(process: *Process, fault_vaddr: VAddr) ?*VMAR {
     var i: u16 = 0;
-    while (i < cd.var_count) {
-        const v_ref = cd.vars[i] orelse {
+    while (i < process.var_count) {
+        const v_ref = process.vars[i] orelse {
             i += 1;
             continue;
         };
-        // caller-pinned: VMAR's domain (= cd) owns it.
+        // caller-pinned: VMAR's process (= process) owns it.
         const v = v_ref.ptr;
         const sz_bytes = pageSizeBytes(v.sz);
         const end = v.base_vaddr.addr + @as(u64, v.page_count) * sz_bytes;
@@ -1425,21 +1425,21 @@ pub fn findVmarCovering(cd: *CapabilityDomain, fault_vaddr: VAddr) ?*VMAR {
     return null;
 }
 
-/// Find which slot id in `domain.user_table` holds the handle for `v`.
+/// Find which slot id in `process.user_table` holds the handle for `v`.
 /// Linear scan; the 4096-entry table cap bounds the cost. Returns
-/// `MAX_HANDLES_PER_DOMAIN` (out-of-range) when no handle is found —
+/// `MAX_HANDLES_PER_PROCESS` (out-of-range) when no handle is found —
 /// callers truncate to u12 and read the resulting cap word.
-fn handleSlotOf(v: *const VMAR, cd: *const CapabilityDomain) u16 {
+fn handleSlotOf(v: *const VMAR, process: *const Process) u16 {
     var i: u16 = 0;
-    while (i < cd.user_table.len) {
-        const cap = cd.user_table[i];
+    while (i < process.user_table.len) {
+        const cap = process.user_table[i];
         if (Word0.typeTag(cap.word0) == .virtual_memory_address_region) {
-            const kh = cd.kernel_table[i];
+            const kh = process.kernel_table[i];
             if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(v))) return i;
         }
         i += 1;
     }
-    return @intCast(cd.user_table.len);
+    return @intCast(process.user_table.len);
 }
 
 /// Walk the per-page mapping table of `v` looking for an installed
@@ -1479,12 +1479,12 @@ fn installedEffectiveRwxAt(v: *VMAR, offset: u64) ?u3 {
 
 /// Tear down every installed PTE / demand page, decrement mapcnts, and
 /// invalidate. Called by `unmap` (N=0) and `destroyVmar`.
-fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
+fn unmapAll(v: *VMAR, process: *Process) void {
     const sz_bytes = pageSizeBytes(v.sz);
     var off: u64 = 0;
     while (off < @as(u64, v.page_count) * sz_bytes) {
         _ = dispatch.paging.unmapPageSized(
-            domain.addr_space_root,
+            process.addr_space_root,
             .fromInt(v.base_vaddr.addr + off),
             v.sz,
         );
@@ -1502,7 +1502,7 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
         entry.* = .{};
     }
     dispatch.paging.shootdownTlbRange(
-        domain.addr_space_id,
+        process.addr_space_id,
         v.base_vaddr,
         v.sz,
         v.page_count,
@@ -1531,15 +1531,15 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
 /// and never returns; the caller's iretq window resumes whatever thread
 /// the scheduler dispatches next.
 fn decodePortIoFault(
-    cd: *CapabilityDomain,
+    process: *Process,
     fault_vaddr: VAddr,
     var_base: u64,
     dev: *DeviceRegion,
 ) i64 {
-    _ = cd;
+    _ = process;
     // caller-pinned: currentThread() is the thread whose page-fault we're
     // servicing; its kernel stack is the running stack and its bound
-    // domain is alive across this handler.
+    // process is alive across this handler.
     const thread = scheduler.currentThread() orelse return errors.E_BADADDR;
     return stygia.arch.dispatch.port_io.emulatePortIoFault(thread, fault_vaddr, var_base, dev);
 }

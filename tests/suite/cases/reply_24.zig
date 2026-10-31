@@ -26,7 +26,7 @@
 //     - Cross-thread handle ids and start-gates ride in shared module-scope
 //       globals; the siblings spin on `g_ready_w` / `g_ready_x` until
 //       the test thread has installed the handles and given them the go
-//       signal. Same single-domain in-process mailbox pattern as
+//       signal. Same single-process in-process mailbox pattern as
 //       reply_transfer_12.zig.
 //     - Self-suspend uses the libz suspend wrapper so the test thread can
 //       sequence the start gates and observe a real cross-thread suspend
@@ -87,7 +87,7 @@ const HandleId = caps.HandleId;
 const EVENT_TYPE_SUSPENSION: u8 = 4;
 
 // Cross-thread channel. Test thread + siblings share the same address space
-// (single domain, single ELF). Same in-process mailbox pattern as
+// (single process, single ELF). Same in-process mailbox pattern as
 // reply_transfer_12.zig.
 var g_port_a_handle: u64 = 0;
 var g_port_b_handle: u64 = 0;

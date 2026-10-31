@@ -20,7 +20,7 @@
 //       distinguishing the two workers requires either two distinct
 //       entry symbols or a TLS-equivalent the harness does not
 //       expose.
-//     - The runner's child capability domain has no preconfigured
+//     - The runner's child process has no preconfigured
 //       page_frame for shared memory between the test thread and worker
 //       Threads; staging one in-test would compose `create_page_frame`,
 //       `create_vmar`, `map_pf`, and per-thread stack-relative addressing
@@ -34,7 +34,7 @@
 //   the `spri` cap, with the new priority within the caller's
 //   priority ceiling. A success return (vreg 1 == OK) demonstrates
 //   that:
-//     - the thread handle resolves and is recognized as an thread type
+//     - the thread handle resolves and is recognized as a thread type
 //     - the `spri` cap check passes
 //     - the `[2] new_priority <= caller's pri ceiling` check passes
 //     - the `[2] new_priority <= 3` check passes
@@ -58,7 +58,7 @@
 // Action
 //   1. create_thread(caps={spri, susp, term},
 //                               &dummyEntry, 1, 0, 0)
-//      — must succeed, yielding an thread handle that carries `spri`.
+//      — must succeed, yielding a thread handle that carries `spri`.
 //   2. priority(thread_handle, 1)
 //      — must succeed (vreg 1 == OK).
 //
@@ -77,7 +77,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Mint an thread that carries `spri` so the priority syscall's cap
+    // Mint a thread that carries `spri` so the priority syscall's cap
     // check passes. `susp` and `term` are added so the handle's caps
     // are well within the child's `thread_inner_ceiling` (low 8 bits per
     // runner/primary.zig's ceilings_inner = 0xFF in field 0-7) and

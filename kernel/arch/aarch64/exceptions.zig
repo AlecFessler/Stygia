@@ -109,7 +109,7 @@ fn isWriteFault(esr: u64) bool {
 
 fn diagTag(thr: *Thread) u64 {
     if (thr.diag_test_tag != 0) return thr.diag_test_tag;
-    return thr.domain.ptr.diag_test_tag;
+    return thr.process.ptr.diag_test_tag;
 }
 
 fn logLowerElAbort(
@@ -476,12 +476,12 @@ fn readFarEl1() u64 {
 fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
     const thread_ptr = scheduler.currentThread() orelse return false;
     // caller-pinned: `thread_ptr` is the running thread of this core (we are mid-
-    // synchronous-trap from it), so its domain SlabRef is live for the
+    // synchronous-trap from it), so its process SlabRef is live for the
     // duration of this handler. Mirrors arch/x64/interrupts.zig switchTo.
-    const domain = thread_ptr.domain.ptr;
+    const process = thread_ptr.process.ptr;
     const fault_va = VAddr.fromInt(readFarEl1());
 
-    const v = vmar.findVmarCovering(domain, fault_va) orelse return false;
+    const v = vmar.findVmarCovering(process, fault_va) orelse return false;
 
     const v_irq = v._gen_lock.lockIrqSave(@src());
     const is_port_io = v.map == .mmio and v.device != null and
@@ -672,7 +672,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // re-validates the caller before its sysret; this tail only
             // checked for idle, so a handler that left `current_thread`
             // naming a DIFFERENT thread fell through to the trampoline
-            // epilogue, which ERETs the CALLER's frame — resuming an thread
+            // epilogue, which ERETs the CALLER's frame — resuming a thread
             // the scheduler had handed elsewhere, with SP_EL1 left on
             // the caller's kstack. The next kernel entry from that user
             // context then runs on a kstack whose thread is concurrently
@@ -860,7 +860,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 );
                 // Report the LOGICAL core id in Aff0 rather than the raw
                 // hardware affinity. The whole point of emulating this
-                // read is to let an thread observe which core it is running
+                // read is to let a thread observe which core it is running
                 // on (see the affinity tests above), and the kernel's
                 // core numbering — affinity masks, run queues, per-core
                 // state — is `gic.coreID()`, an index into the
@@ -968,7 +968,7 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // scheduler work rewrote the slot and then RETURNED (switchTo's
     // non-dispatching exits), falling through would resume a frame the
     // scheduler handed elsewhere. Hop, don't run in place: this frame
-    // sits on the interrupted thread's kstack, and an thread no longer current
+    // sits on the interrupted thread's kstack, and a thread no longer current
     // is claimable by other cores.
     if (entry_cur) |thread_ptr| {
         if (!scheduler.coreCurrentIsRunning(@truncate(gic.coreID()), thread_ptr)) {
@@ -1326,7 +1326,7 @@ fn dispatchIrq(intid: u32) void {
             // the firing INTID to its bound region and delegate to
             // `device_region.onIrq`, which masks the line at the GIC
             // (so a level-sensitive line cannot re-pend before the
-            // handling thread `ack`s) and bumps every domain-local copy
+            // handling thread `ack`s) and bumps every process-local copy
             // of `field1.irq_count`, futex-waking blocked readers per
             // Spec §[device_irq].
             //
@@ -1370,7 +1370,7 @@ fn dispatchIrq(intid: u32) void {
 }
 
 /// Look up the running thread, fire a `thread_fault` event with `subcode`
-/// and `payload`, then yield after the faulting domain is torn down.
+/// and `payload`, then yield after the faulting process is torn down.
 fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     const thr = scheduler.currentThread() orelse
         @panic("user thread fault with no current thread");

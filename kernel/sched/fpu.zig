@@ -84,7 +84,7 @@ pub fn handleTrap(current: *Thread) void {
 /// on the named core (either `terminate` is from another core, or
 /// the thread is parked / .exited), and (b) FPU traps on the named core
 /// for a different thread would re-evict and clear the slot anyway.
-/// Validate a core id that was read back out of an thread field rather than
+/// Validate a core id that was read back out of a thread field rather than
 /// derived from `coreID()` on the core we are currently running on.
 ///
 /// `thread.last_fpu_core` is only ever written as `@truncate(coreID())` (see

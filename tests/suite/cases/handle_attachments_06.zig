@@ -22,12 +22,12 @@
 //     - test 01 (port lacks xfer): the runner mints the result port
 //       at SLOT_FIRST_PASSED with `{xfer, bind}`.            cleared
 //     - test 02 (BADCAP for invalid source): SLOT_INITIAL_THREAD is a
-//       live, valid handle in this domain.                    cleared
+//       live, valid handle in this process.                    cleared
 //     - test 03 (entry caps ⊄ source caps): entry.caps = 0,
 //       trivially a subset of any source caps.                cleared
 //     - test 04 (move=1 with no move cap): we use move=0; test 04
 //       only fires for move=1 entries.                        cleared
-//     - test 05 (move=0 lacking copy): per §[create_capability_domain]
+//     - test 05 (move=0 lacking copy): per §[create_process]
 //       test 21 the initial-thread handle's caps equal the runner's
 //       `thread_inner_ceiling` (0xFF), so bit 1 (`copy`) is set.   cleared
 //     - test 07 (duplicate sources): N=1.                     cleared
@@ -174,10 +174,7 @@ fn suspendWithOnePairAtV127Arm(word: u64, target: u64, port: u64, entry: u64) sy
           [entry] "r" (entry),
           [iv1] "{x0}" (target),
           [iv2] "{x1}" (port),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     return .{
         .v1 = ov1,

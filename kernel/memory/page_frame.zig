@@ -1,8 +1,8 @@
 //! Page Frame — reference to a contiguous physical memory region.
 //! Installing it into virtual address ranges bound to multiple
-//! capability domains creates shared memory. See spec §[page_frame].
+//! processes creates shared memory. See spec §[page_frame].
 //!
-//! Refcount lifetime — total handles across all capability domains
+//! Refcount lifetime — total handles across all processes
 //! plus VMAR installations keep the underlying physical pages alive.
 //! When the last handle drops the physical memory returns to the free
 //! pool.
@@ -12,12 +12,12 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
-const capability_domain = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const errors = stygia.syscall.errors;
 const pmm = stygia.memory.pmm;
 const vmar = stygia.memory.vmar;
 
-const CapabilityDomain = capability_domain.CapabilityDomain;
+const Process = process_mod.Process;
 const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
 const Thread = stygia.sched.thread.Thread;
@@ -48,7 +48,7 @@ pub const PageFrame = struct {
     /// Slab generation lock + per-instance mutex.
     _gen_lock: GenLock = .{},
 
-    /// Total user-visible handles across all capability domains.
+    /// Total user-visible handles across all processes.
     /// CAS-loop atomic with sticky observed-zero marker; the dec that
     /// transitions 1→Sticky AND mapcnt==0 owns teardown. Once Sticky
     /// is set, future alias-mint `inc` returns observed_zero so the
@@ -125,7 +125,7 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
     // Mint the user-visible handle into the caller's table. The kernel
     // table entry holds the `SlabRef(PageFrame)` (gen-validated); the
     // user table mirrors caps + field0/field1 snapshot.
-    const cd = callerDomain(thread);
+    const process = callerProcess(thread);
     const erased: ErasedSlabRef = .{
         .ptr = @ptrCast(pf),
         .gen = @intCast(pf._gen_lock.currentGen()),
@@ -133,8 +133,8 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
     const field0: u64 = packField0(page_count, sz);
     const field1: u64 = 0;
     const handle_caps: u16 = @bitCast(caps_bits);
-    const slot = capability_domain.mintHandle(
-        cd,
+    const slot = process_mod.mintHandle(
+        process,
         erased,
         CapabilityType.page_frame,
         handle_caps,
@@ -279,7 +279,7 @@ pub fn releaseHandleLocked(pf: *PageFrame, held_irq: u64) void {
 
 /// Bump the per-handle refcount when an alias of an existing PageFrame
 /// is minted into a fresh slot (e.g. `passed_handles` into a child
-/// domain, `mintHandleAlwaysNew` for §[handle_attachments] recv-time
+/// process, `mintHandleAlwaysNew` for §[handle_attachments] recv-time
 /// delivery). Mirrors the implicit `refcount = 1` that `createPageFrame`
 /// installs for its caller's handle. Without this, every such alias
 /// would share the original handle's refcount slot — `releaseHandle` on
@@ -339,32 +339,32 @@ inline fn packField0(page_count: u32, sz: PageSize) u64 {
     return @as(u64, page_count) | (@as(u64, @intFromEnum(sz)) << 32);
 }
 
-/// Resolve the caller's owning capability domain. The syscall ABI
+/// Resolve the caller's owning process. The syscall ABI
 /// dispatches via `*anyopaque`; the concrete type is `*Thread`
-/// whose `domain` SlabRef names the owner.
-fn callerDomain(thread: *Thread) *CapabilityDomain {
-    return thread.domain.ptr; // caller-pinned: thread is the running thread; its domain stays alive across this syscall
+/// whose `process` SlabRef names the owner.
+fn callerProcess(thread: *Thread) *Process {
+    return thread.process.ptr; // caller-pinned: thread is the running thread; its process stays alive across this syscall
 }
 
 /// Spec §[create_page_frame] test 01: returns E_PERM if the caller's
 /// self-handle lacks `crpf`. The self-handle's caps live in the
-/// capability domain's user_table[0].word0 caps field.
+/// process's user_table[0].word0 caps field.
 fn selfHandleLacksCrpf(thread: *Thread) bool {
-    const cd = callerDomain(thread);
-    const self_caps_word: u16 = capability.Word0.caps(cd.user_table[0].word0);
-    const self_caps: capability_domain.CapabilityDomainCaps = @bitCast(self_caps_word);
+    const process = callerProcess(thread);
+    const self_caps_word: u16 = capability.Word0.caps(process.user_table[0].word0);
+    const self_caps: process_mod.ProcessCaps = @bitCast(self_caps_word);
     return !self_caps.crpf;
 }
 
 /// Spec §[create_page_frame] test 02: returns E_PERM if caps' r/w/x
 /// bits are not a subset of the caller's `pf_ceiling.max_rwx`. Per
-/// §[capability_domain] Self handle — pf_ceiling lives at field0 bits
+/// §[process] Self handle — pf_ceiling lives at field0 bits
 /// 40..47 with `max_rwx` at bits 40..42 and `max_sz` at bits 43..44.
 /// (Self-handle field0 differs from [2] ceilings_inner: it inserts
 /// idc_rx at bits 32..39, shifting pf/vm/port ceilings up by 8.)
 fn rwxIsSubsetOfCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
-    const cd = callerDomain(thread);
-    const self_field0 = cd.user_table[0].field0;
+    const process = callerProcess(thread);
+    const self_field0 = process.user_table[0].field0;
     const max_rwx: u3 = @truncate((self_field0 >> 40) & 0b111);
     const requested_rwx: u3 = (@as(u3, @intFromBool(caps_bits.r))) |
         (@as(u3, @intFromBool(caps_bits.w)) << 1) |
@@ -374,11 +374,11 @@ fn rwxIsSubsetOfCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
 
 /// Spec §[create_page_frame] test 03: returns E_PERM if `caps.max_sz`
 /// exceeds the caller's `pf_ceiling.max_sz`. Stored in self-handle
-/// field0 bits 43..44 per §[capability_domain] layout (shifted by 8
+/// field0 bits 43..44 per §[process] layout (shifted by 8
 /// vs the [2] ceilings_inner layout to make room for idc_rx).
 fn maxSzWithinCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
-    const cd = callerDomain(thread);
-    const self_field0 = cd.user_table[0].field0;
+    const process = callerProcess(thread);
+    const self_field0 = process.user_table[0].field0;
     const ceiling_max_sz: u2 = @truncate((self_field0 >> 43) & 0b11);
     return caps_bits.max_sz <= ceiling_max_sz;
 }

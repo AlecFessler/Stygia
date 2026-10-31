@@ -253,7 +253,7 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
 // `stack_vreg_buf` is @export'd so the asm can `lea` it via a RIP-
 // relative reference; a `_saved_rsp` companion stores the user rsp
 // across the syscall. Both are PROCESS-LOCAL (single libz instance per
-// thread; no SMP within an thread). Concurrent issue from a different thread in
+// thread; no SMP within a thread). Concurrent issue from a different thread in
 // the same process is impossible because each thread has its own user
 // stack and runs its own copy of libz code, but only one is in the
 // asm body at a time per thread, and different Threads can't share rsp.

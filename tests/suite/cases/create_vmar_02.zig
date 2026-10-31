@@ -8,16 +8,16 @@
 //   `vmar_inner_ceiling` (self-handle field0 bits 8-23) to have at least
 //   one of r/w/x cleared so that we can pass a caps word with that bit
 //   set and trip the subset check. The runner primary spawns each test
-//   as a child capability domain with `vmar_inner_ceiling = 0x01FF`
+//   as a child process with `vmar_inner_ceiling = 0x01FF`
 //   (every defined bit set: move, copy, r, w, x, mmio, max_sz, dma —
 //   see runner/primary.zig's `ceilings_inner = 0x001C_011F_2701_FFFF`).
 //   With every r/w/x bit already permitted by the ceiling, the
-//   strict-superset case is unconstructible from inside this domain.
+//   strict-superset case is unconstructible from inside this process.
 //
 //   The faithful test would either (a) require a per-test override of
 //   the runner-supplied `vmar_inner_ceiling` (so the test child is born
 //   with one of r/w/x cleared), or (b) extend the test to spawn a
-//   nested sub-domain with reduced ceilings and observe its
+//   nested sub-process with reduced ceilings and observe its
 //   `create_vmar` attempt fail. Neither path exists in the v0 runner;
 //   `restrict` cannot lower ceilings (it only tightens caps).
 //
@@ -45,7 +45,7 @@
 // GAP
 //   The strict-superset side of the rule (a caps r/w/x bit set that the
 //   ceiling does NOT have) is left for the multi-level test infra
-//   extension. Until the runner mints test domains with reduced
+//   extension. Until the runner mints test processes with reduced
 //   `vmar_inner_ceiling`, this file lives in the manifest as a smoke
 //   test pinning only the subset-equal path.
 //
@@ -54,7 +54,7 @@
 //      observation: a same-as-ceiling r/w/x must not reject).
 //
 // Faithful-test note
-//   Faithful test deferred pending sub-domain plumbing in the runner
+//   Faithful test deferred pending sub-process plumbing in the runner
 //   (so the test child is born with at least one of r/w/x cleared in
 //   vmar_inner_ceiling). The current pass uses assertion id 0 — see the
 //   `testing.pass()` call at the end.
@@ -67,7 +67,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    // §[capability_domain] self-handle field0 layout: vmar_inner_ceiling
+    // §[process] self-handle field0 layout: vmar_inner_ceiling
     // at bits 8-23. Snapshot directly from slot 0 — `sync` is
     // unnecessary since ceilings are install-at-create and not
     // kernel-mutated thereafter.

@@ -52,7 +52,7 @@ bytes as `\XX`. Every monomorphized Zig generic is quoted, because its name
 embeds the instantiation argument list:
 
 ```
-@"memory.allocators.secure_slab.SecureSlab(caps.capability_domain.CapabilityDomain,256).forEachAlive__anon_94571"
+@"memory.allocators.secure_slab.SecureSlab(caps.process.Process,256).forEachAlive__anon_94571"
 ```
 
 Resolution walks three steps, most specific first, and records which one hit
@@ -75,7 +75,7 @@ is itself a known entity in that namespace, so std-library names such as
 
 Collapsing every instantiation onto one entity is a deliberate
 over-approximation: `SecureSlab(Thread,256).forEachAlive` and
-`SecureSlab(CapabilityDomain,256).forEachAlive` share the single AST entity
+`SecureSlab(Process,256).forEachAlive` share the single AST entity
 `memory.allocators.secure_slab.forEachAlive`, so that entity's callee set is
 the union over all instantiations. Reachability answers are therefore sound
 (no real path is missing) but not exact. Consumers that need per-

@@ -5,7 +5,7 @@
 //
 // Faithful test rationale (and why this is a degraded smoke variant)
 //   The runner (tests/suite/runner/primary.zig) mints every spec-test
-//   domain with `vmar_inner_ceiling = 0x01FF`. That word covers VmarCap
+//   process with `vmar_inner_ceiling = 0x01FF`. That word covers VmarCap
 //   bits 0-8 (move, copy, r, w, x, mmio, max_sz_lo, max_sz_hi, dma);
 //   in particular both max_sz bits are set, so the ceiling's max_sz
 //   field has the value 3.
@@ -21,10 +21,10 @@
 //
 //   The runner ceiling is shared across the entire test manifest and
 //   cannot be widened for one test, and there is currently no
-//   exposed syscall that lets a child domain narrow its own
+//   exposed syscall that lets a child process narrow its own
 //   vmar_inner_ceiling below 3 before invoking create_vmar. Until such
 //   a ceiling-restriction syscall lands, the faithful E_PERM path
-//   for test 03 is unreachable from a userspace test domain.
+//   for test 03 is unreachable from a userspace test process.
 //
 //   This file lands a degraded *smoke* variant in place of the
 //   faithful test: it issues a create_vmar with caps.max_sz = 2 and
@@ -35,7 +35,7 @@
 //   the kernel rejected a max_sz that the ceiling permits.
 //
 //   When a ceiling-restriction syscall is added, this test should
-//   be rewritten to: (a) narrow the calling domain's
+//   be rewritten to: (a) narrow the calling process's
 //   vmar_inner_ceiling so its max_sz is < 2, then (b) invoke
 //   create_vmar with caps.max_sz = 2 and assert E_PERM. See
 //   create_var_05 for the clean-success skeleton this test borrows
@@ -45,7 +45,7 @@
 //   To keep the call on the success path under the runner ceiling
 //   we make every prior check pass:
 //     - caller self-handle has `crvr` (test 01): the runner grants
-//       it on every spawned test domain.
+//       it on every spawned test process.
 //     - caps.r/w/x ⊆ vmar_inner_ceiling.r/w/x (test 02): caps =
 //       {r, w}, no x.
 //     - caps.max_sz = 2 (1 GiB), strictly below ceiling.max_sz = 3

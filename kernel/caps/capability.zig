@@ -2,10 +2,10 @@
 //!
 //! A capability is an unforgeable reference to a kernel object, paired
 //! with type-dependent caps and metadata. The system holds two parallel
-//! tables per capability domain, indexed by the same 12-bit handle id:
+//! tables per process, indexed by the same 12-bit handle id:
 //!
 //!   - User table — array of `Capability` (24 bytes each). Mapped
-//!     read-only into the holding domain so userspace can inspect cap
+//!     read-only into the holding process so userspace can inspect cap
 //!     bits, type, and the kernel-mutable field0/field1 snapshots
 //!     directly without a syscall.
 //!
@@ -24,7 +24,7 @@
 const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
-const capability_domain = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const derivation = stygia.caps.derivation;
 const device_region = stygia.devices.device_region;
 const errors = stygia.syscall.errors;
@@ -35,7 +35,7 @@ const secure_slab = stygia.memory.allocators.secure_slab;
 const vmar = stygia.memory.vmar;
 const virtual_machine = stygia.hv.virtual_machine;
 
-const CapabilityDomain = capability_domain.CapabilityDomain;
+const Process = process_mod.Process;
 const DeviceRegion = device_region.DeviceRegion;
 const Thread = thread_mod.Thread;
 const PageFrame = page_frame.PageFrame;
@@ -43,8 +43,8 @@ const Port = port.Port;
 const VMAR = vmar.VMAR;
 const VirtualMachine = virtual_machine.VirtualMachine;
 
-/// Maximum handles per capability domain. Spec: 12-bit handle id.
-pub const MAX_HANDLES_PER_DOMAIN: u16 = 4096;
+/// Maximum handles per process. Spec: 12-bit handle id.
+pub const MAX_HANDLES_PER_PROCESS: u16 = 4096;
 
 /// Sentinel marking the tail of the free-slot list.
 pub const FREE_LIST_TAIL: u16 = 0xFFFF;
@@ -53,11 +53,11 @@ pub const FREE_LIST_TAIL: u16 = 0xFFFF;
 /// of kernel object the corresponding `KernelHandle.obj` points at.
 /// 4-bit field allows up to 16 distinct types.
 pub const CapabilityType = enum(u4) {
-    /// Slot 0 in every domain. References the domain itself (its
+    /// Slot 0 in every process. References the process itself (its
     /// self-handle, with the full ceiling-bearing cap word).
-    capability_domain_self = 0,
-    /// IDC handle to another (or this) capability domain.
-    capability_domain = 1,
+    process_self = 0,
+    /// IDC handle to another (or this) process.
+    process = 1,
     thread = 2,
     page_frame = 3,
     virtual_memory_address_region = 4,
@@ -69,7 +69,7 @@ pub const CapabilityType = enum(u4) {
 };
 
 /// User-visible capability entry. 24 bytes, three little-endian u64s.
-/// One of these per slot in the domain's user-mapped table.
+/// One of these per slot in the process's user-mapped table.
 pub const Capability = extern struct {
     /// Word 0 — universal envelope:
     /// ```
@@ -146,8 +146,8 @@ pub const ErasedSlabRef = extern struct {
     /// detection (lockdep treats every instance in the same group as
     /// disjoint for the duration of the held window) so callers that
     /// legitimately hold multiple `SlabRef(T)` locks of the same T at
-    /// once — e.g. the cross-domain copy-derivation tree walk in
-    /// `caps/derivation.zig` holds two `*CapabilityDomain` gen-locks
+    /// once — e.g. the cross-process copy-derivation tree walk in
+    /// `caps/derivation.zig` holds two `*Process` gen-locks
     /// under `tree_mutex` — don't trip the lockdep guard. Caller is
     /// responsible for ensuring an outer serializer (here, `tree_mutex`)
     /// makes the same-class overlap structurally safe. Caller pairs
@@ -155,8 +155,8 @@ pub const ErasedSlabRef = extern struct {
     /// back.
     ///
     /// The plain (`ordered_group=0`) variant intentionally is not
-    /// exposed here — every CD-lock acquire on the tree-mutation paths
-    /// goes through `TREE_DOMAIN_GROUP`. Adding a non-ordered variant
+    /// exposed here — every process-lock acquire on the tree-mutation paths
+    /// goes through `TREE_PROCESS_GROUP`. Adding a non-ordered variant
     /// would risk callers mixing plain and ordered acquires on the
     /// same class, which lockdep rejects via `acquireOn`'s
     /// `held.ordered_group != ordered_group` clause.
@@ -210,35 +210,35 @@ comptime {
     }
 }
 
-/// Cross-domain link to a `KernelHandle` in another (or this) capability
-/// domain. Used for revoke-ancestry tree links — parent, first_child,
+/// Cross-process link to a `KernelHandle` in another (or this) capability
+/// process. Used for revoke-ancestry tree links — parent, first_child,
 /// next_sibling — embedded in `KernelHandle`.
 ///
-/// Carries the holder domain as an `ErasedSlabRef` so each traversal step
-/// goes through `SlabRef.lock` for gen validation: if the target domain
+/// Carries the holder process as an `ErasedSlabRef` so each traversal step
+/// goes through `SlabRef.lock` for gen validation: if the target process
 /// has been freed since the link was installed, the lock raises
 /// `StaleHandle` and the descendant is treated as already gone.
 ///
-/// `slot` is the 12-bit handle id within `domain`'s `kernel_table`. The
+/// `slot` is the 12-bit handle id within `process`'s `kernel_table`. The
 /// remaining bits in the trailing word are reserved.
 ///
 /// Two-state encoding mirrors `ErasedSlabRef` itself:
-///   - Linked  : `domain.ptr != null`. `slot` is the linked slot id.
-///   - Unlinked: `domain.ptr == null`. `slot` is meaningful only on the
+///   - Linked  : `process.ptr != null`. `slot` is the linked slot id.
+///   - Unlinked: `process.ptr == null`. `slot` is meaningful only on the
 ///               `parent` link of a free slot, where it carries the
 ///               next-free-slot index (see `KernelHandle` doc).
 pub const HandleLink = extern struct {
-    domain: ErasedSlabRef = .{},
+    process: ErasedSlabRef = .{},
     slot: u16 = 0,
     _reserved: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
 };
 
 comptime {
     if (@sizeOf(HandleLink) != 24) @compileError("HandleLink must be 24 bytes");
-    if (@offsetOf(HandleLink, "domain") != 0) @compileError("HandleLink.domain must be at offset 0");
+    if (@offsetOf(HandleLink, "process") != 0) @compileError("HandleLink.process must be at offset 0");
 }
 
-/// Kernel-side mirror entry. One per slot in the domain's handle table,
+/// Kernel-side mirror entry. One per slot in the process's handle table,
 /// indexed identically to the user-visible `Capability` table. Lives in
 /// kernel-only memory.
 ///
@@ -247,8 +247,8 @@ comptime {
 ///     the kernel object. Combine with the user table's type tag to
 ///     reconstruct a typed `SlabRef(T)` via `typedRef`. The three link
 ///     fields (`parent`, `first_child`, `next_sibling`) describe this
-///     handle's position in the cross-domain copy-derivation tree used
-///     by `revoke` (Spec §[capabilities].revoke). A null `parent.domain`
+///     handle's position in the cross-process copy-derivation tree used
+///     by `revoke` (Spec §[capabilities].revoke). A null `parent.process`
 ///     in the used state means the handle was minted as a tree root
 ///     (e.g. via `create_*`) and has no copy ancestor.
 ///   - **Free** (`ref.ptr == null`): the parent link doubles as the
@@ -323,10 +323,10 @@ fn SlabRefOf(comptime T: type) type {
 // ── Free-list helpers ─────────────────────────────────────────────────
 
 /// Compose the free-list cell stored in a free entry's `parent` link.
-/// In the free state `parent.domain` is null and `parent.slot` carries
+/// In the free state `parent.process` is null and `parent.slot` carries
 /// the next free slot index (`FREE_LIST_TAIL` for end of list).
 pub inline fn encodeFreeNext(next: u16) HandleLink {
-    return .{ .domain = .{}, .slot = next };
+    return .{ .process = .{}, .slot = next };
 }
 
 /// Read the next free slot index from a free entry's `parent` link.
@@ -342,14 +342,14 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
     if (caps_arg & ~RESTRICT_CAPS_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = cd_lr.ptr;
-    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
+    const process_ref = thread.process;
+    const process_lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = process_lr.ptr;
+    defer process_ref.unlockIrqRestore(process_lr.irq_state);
 
     const slot: u12 = @truncate(handle);
-    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
-    const user_entry = &cd.user_table[slot];
+    const entry = resolveHandleOnProcess(process, slot, null) orelse return errors.E_BADCAP;
+    const user_entry = &process.user_table[slot];
 
     const type_tag = Word0.typeTag(user_entry.word0);
     const current_caps = Word0.caps(user_entry.word0);
@@ -393,7 +393,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
         port.finalizeClosedSenders(&dec_result.pending_senders);
     }
 
-    refreshSnapshot(cd, slot, entry);
+    refreshSnapshot(process, slot, entry);
     return 0;
 }
 
@@ -404,13 +404,13 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
 /// an ancestor still reaches them — Spec §[capabilities].revoke
 /// test 04), then runs the per-type release and clears the slot.
 ///
-/// Lock order: `tree_mutex` → caller's domain gen-lock. Matches the
+/// Lock order: `tree_mutex` → caller's process gen-lock. Matches the
 /// order taken by `derivation.revoke`/`derivation.derive`.
 pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.domain);
+    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.process);
 
     const slot: u12 = @truncate(handle);
     return derivation.deleteAndDetach(caller_dom_ref, slot);
@@ -425,7 +425,7 @@ pub fn revoke(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.domain);
+    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.process);
     return derivation.revoke(caller_dom_ref, handle);
 }
 
@@ -434,15 +434,15 @@ pub fn sync(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = cd_lr.ptr;
-    defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
+    const process_ref = thread.process;
+    const process_lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = process_lr.ptr;
+    defer process_ref.unlockIrqRestore(process_lr.irq_state);
 
     const slot: u12 = @truncate(handle);
-    const entry = resolveHandleOnDomain(cd, slot, null) orelse return errors.E_BADCAP;
+    const entry = resolveHandleOnProcess(process, slot, null) orelse return errors.E_BADCAP;
 
-    refreshSnapshot(cd, slot, entry);
+    refreshSnapshot(process, slot, entry);
     return 0;
 }
 
@@ -454,14 +454,14 @@ pub fn sync(caller: *anyopaque, handle: u64) i64 {
 ///
 /// `expected == null` skips the type-tag check (used by
 /// `restrict`/`delete`/`revoke`/`sync` which all accept any type).
-pub fn resolveHandleOnDomain(
-    cd: *CapabilityDomain,
+pub fn resolveHandleOnProcess(
+    process: *Process,
     slot: u12,
     expected: ?CapabilityType,
 ) ?*KernelHandle {
-    if (@as(u16, slot) >= MAX_HANDLES_PER_DOMAIN) return null;
+    if (@as(u16, slot) >= MAX_HANDLES_PER_PROCESS) return null;
 
-    const entry = &cd.kernel_table[slot];
+    const entry = &process.kernel_table[slot];
     // Free slots are flagged by `ref.ptr == null`; reserved slots carry
     // a private non-null sentinel so allocators cannot reuse them before
     // publication, but they are not visible as valid handles.
@@ -469,7 +469,7 @@ pub fn resolveHandleOnDomain(
     if (isReservedHandleSlot(entry)) return null;
 
     if (expected) |t| {
-        const user_word0 = cd.user_table[slot].word0;
+        const user_word0 = process.user_table[slot].word0;
         if (Word0.typeTag(user_word0) != t) return null;
     }
     return entry;
@@ -479,31 +479,31 @@ pub fn resolveHandleOnDomain(
 /// the parallel user `Capability`) and apply the type-specific delete
 /// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion)
 /// call their `decHandleRef` to release their per-handle
-/// increment; capability-domain-lifetime types (thread, VMAR, VM) and
+/// increment; process-lifetime types (thread, VMAR, VM) and
 /// system-lifetime IDC handles do not — those die only with the
-/// owning domain. Spec §[capabilities].delete table.
-pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+/// owning process. Spec §[capabilities].delete table.
+pub fn releaseHandle(holder: *Process, slot: u12, entry: *KernelHandle) void {
     const user_entry = &holder.user_table[slot];
     const type_tag = Word0.typeTag(user_entry.word0);
     const caps_word = Word0.caps(user_entry.word0);
 
     switch (type_tag) {
-        .capability_domain_self => {
+        .process_self => {
             // SLOT_SELF tear-down is driven directly from
             // `caps.derivation.deleteAndDetach`'s slot==0 branch so it
-            // can release `tree_mutex` and the CD `_gen_lock` between
+            // can release `tree_mutex` and the process `_gen_lock` between
             // the destroy's phase 1 and phase 2. Reaching this arm
             // means a caller routed a self-handle through `releaseHandle`
             // bypassing that path — surface it loudly rather than
-            // silently leaking the domain.
-            @panic("releaseHandle on capability_domain_self: route via deleteAndDetach SLOT_SELF instead");
+            // silently leaking the process.
+            @panic("releaseHandle on process_self: route via deleteAndDetach SLOT_SELF instead");
         },
-        .capability_domain => {
+        .process => {
             // System-lifetime: dropping an IDC handle does not destroy
-            // the referenced domain. No per-handle refcount.
+            // the referenced process. No per-handle refcount.
         },
         .thread => {
-            // Capability-domain lifetime: Threads die with their domain,
+            // Process lifetime: Threads die with their process,
             // not with the last handle drop.
         },
         .page_frame => {
@@ -519,8 +519,8 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             // range, releases the handle." VMAR holds exactly one handle
             // by construction (non-transferable), so the per-handle
             // delete is the same teardown that fires when the owning
-            // capability domain dies — `destroyVmar` unmaps every
-            // installed page, removes the VMAR from `domain.vars[]` so
+            // process dies — `destroyVmar` unmaps every
+            // installed page, removes the VMAR from `process.vars[]` so
             // the address range is reusable, and frees the slab slot.
             const ref = typedRef(VMAR, entry.*) orelse return;
             vmar.destroyVmar(ref.ptr);
@@ -569,7 +569,7 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
 /// already applied any object-side release semantics via `releaseHandle`
 /// and unlinked the handle from any copy-derivation tree it participated
 /// in (see `caps.derivation`).
-pub fn clearAndFreeSlot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+pub fn clearAndFreeSlot(holder: *Process, slot: u12, entry: *KernelHandle) void {
     entry.instance +%= 1;
     holder.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     entry.ref = .{};
@@ -611,7 +611,7 @@ fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType)
 /// Bit mask of the `restart_policy` field within a handle's caps word
 /// for the given type, or 0 if the type carries no restart_policy.
 /// Tracks the per-type cap layouts in §[thread], §[var],
-/// §[port], §[page_frame], §[device_region], §[capability_domain].
+/// §[port], §[page_frame], §[device_region], §[process].
 fn restartPolicyMask(type_tag: CapabilityType) u16 {
     return switch (type_tag) {
         .thread => 0b11 << 8, // ThreadCaps bits 8-9
@@ -620,7 +620,7 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
         .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
         .virtual_machine => 0b1 << 1, // VmCaps bit 1
-        .capability_domain => 0b1 << 5, // IdcCaps bit 5
+        .process => 0b1 << 5, // IdcCaps bit 5
         else => 0,
     };
 }
@@ -629,10 +629,10 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
 /// authoritative kernel state (per-type snapshot). No-op for types
 /// whose snapshot doesn't drift. Spec §[capabilities].sync.
 ///
-/// The user table is mapped read-only into the holding domain but
+/// The user table is mapped read-only into the holding process but
 /// kernel writes go through the kernel-side R/W view of the same
-/// physical pages — see `CapabilityDomain.user_table` doc comment.
-pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
+/// physical pages — see `Process.user_table` doc comment.
+pub fn refreshSnapshot(holder: *Process, slot: u12, entry: *KernelHandle) void {
     const user_entry = &holder.user_table[slot];
     const type_tag = Word0.typeTag(user_entry.word0);
     switch (type_tag) {
@@ -745,8 +745,8 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
             user_entry.field1 = @as(u64, mapcnt);
         },
         // Types whose snapshots don't drift. For these, no-op.
-        .capability_domain_self,
-        .capability_domain,
+        .process_self,
+        .process,
         .port,
         .reply,
         .virtual_machine,

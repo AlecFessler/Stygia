@@ -9,15 +9,15 @@
 //   ASLR zone (`arch.dispatch.paging.user_aslr` =
 //   [0x0000_0000_0000_1000, 0x0000_1000_0000_0000) on x86-64). The
 //   kernel today uses a deterministic bump allocator
-//   (`domain.next_var_base`) for the stack reservation — see
-//   `kernel/sched/thread.zig::createThreadInDomain`. The
+//   (`process.next_var_base`) for the stack reservation — see
+//   `kernel/sched/thread.zig::createThreadInProcess`. The
 //   bump cursor lives inside the ASLR zone numerically (the
-//   per-domain VAR base starts there), so the spec invariant "base
+//   per-process VAR base starts there), so the spec invariant "base
 //   lies within the ASLR zone" is satisfied trivially without any
 //   actual randomization. The proper fix is to plumb the existing
 //   randomized placer (`memory/vmar.zig::vaRangeAllocate`) through
 //   to the thread stack reservation; that's a deferred change that
-//   touches both the thread create path and the per-domain VMM glue.
+//   touches both the thread create path and the per-process VMM glue.
 //   Tracked alongside the v3 spec-test tightening pass.
 //
 //   Until ASLR is wired in, asserting "base ∈ ASLR zone" would
@@ -68,7 +68,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Once an thread stack-base introspection primitive lands, swap this
+    // Once a thread stack-base introspection primitive lands, swap this
     // smoke pass for the real ASLR-zone bounds check.
     testing.pass();
 }

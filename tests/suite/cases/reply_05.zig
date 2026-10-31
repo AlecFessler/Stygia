@@ -143,7 +143,7 @@ pub fn main(cap_table_base: u64) void {
     // W on resume (the assertion under test). susp lets the test thread
     // suspend W; term lets a future revision tear W down explicitly
     // (currently W just spins after the store and is reaped when its
-    // domain — i.e. the test thread's domain — exits). restart_policy=0
+    // process — i.e. the test thread's process — exits). restart_policy=0
     // (kill) stays inside the runner's thread_restart_max ceiling.
     const w_caps = caps.ThreadCap{
         .term = true,

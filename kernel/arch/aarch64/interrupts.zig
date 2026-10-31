@@ -237,9 +237,9 @@ pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
 /// particular makes the resumed thread `RET` to the receiver's stack frame
 /// instead of returning from its own `svc`, which silently traps the
 /// post-resume control flow (including the `delete(SLOT_SELF)` tail in
-/// `libz/start.zig`) — domains never tear down, leaked timer/PMM state
+/// `libz/start.zig`) — processes never tear down, leaked timer/PMM state
 /// accumulates per test, and the in-kernel-parallel runner stalls in
-/// `createCapabilityDomain` once PMM blocks are exhausted.
+/// `createProcess` once PMM blocks are exhausted.
 pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
     dst.regs.x0 = src.regs.x0;
     dst.regs.x1 = src.regs.x1;

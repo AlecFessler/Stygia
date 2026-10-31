@@ -4,8 +4,8 @@
 //  handle."
 //
 // Strategy
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -19,7 +19,7 @@
 //   itself fails before the cap check, so the kernel must return
 //   E_BADCAP per test 07. The other early-error paths are kept clean
 //   so they cannot fire ahead of BADCAP:
-//     - caller's self-handle has `crec` (root domain holds all rights)
+//     - caller's self-handle has `crec` (root process holds all rights)
 //       → test 01 does not fire.
 //     - target = empty slot, so no caps comparison runs (tests 02,
 //       04, 05 inapplicable when handle resolution itself fails).
@@ -59,7 +59,7 @@ pub fn main(cap_table_base: u64) void {
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
 
     // Slot 4095 is the highest 12-bit handle id and is never populated
-    // by `create_capability_domain` (only slots 0..3 are filled here).
+    // by `create_process` (only slots 0..3 are filled here).
     const invalid_idc: u64 = caps.HANDLE_TABLE_MAX - 1;
 
     const result = syscall.createThread(

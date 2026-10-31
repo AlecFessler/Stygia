@@ -24,7 +24,7 @@
 //   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever (`hlt`). No synchronization is needed because the
 //   `spri` cap check happens against the handle's caps field in our
-//   domain's handle table; the running thread's state is irrelevant.
+//   process's handle table; the running thread's state is irrelevant.
 //
 // Action
 //   1. create_thread(target=self, caps={susp, spri=false})

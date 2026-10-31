@@ -3,7 +3,7 @@
 // "[test 01] returns E_PERM if the caller's self-handle lacks `crvr`."
 //
 // Strategy
-//   The runner's primary gives every test domain a self-handle with
+//   The runner's primary gives every test process a self-handle with
 //   `crvr = true`. To force the create_vmar E_PERM path we must drop
 //   the `crvr` bit on the self-handle before invoking the syscall.
 //

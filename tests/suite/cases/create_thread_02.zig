@@ -3,16 +3,16 @@
 // "[test 02] returns E_PERM if [4] is nonzero and [4] lacks `crec`."
 //
 // Strategy
-//   The kernel populates slot 2 of every fresh capability domain with
-//   an IDC handle to the domain itself (§[capability_domain] /
-//   §[create_capability_domain] test 22). The primary builds the test
+//   The kernel populates slot 2 of every fresh process with
+//   an IDC handle to the process itself (§[process] /
+//   §[create_process] test 22). The primary builds the test
 //   child with `cridc_ceiling = 0x27` (all six IDC cap bits set,
 //   including `crec` at bit 2), so slot 2 starts with `crec`.
 //
 //   To isolate the test 02 failure path we drop `crec` from the
 //   self-IDC via `restrict`, leaving every other IDC bit intact. After
 //   the restrict, slot 2 is a structurally valid IDC handle that
-//   resolves to a real domain (so test 07's E_BADCAP check cannot
+//   resolves to a real process (so test 07's E_BADCAP check cannot
 //   fire) but lacks the cap that test 02 requires.
 //
 //   With the IDC handle prepared, call create_thread with:

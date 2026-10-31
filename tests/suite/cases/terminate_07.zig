@@ -24,7 +24,7 @@
 //
 //   A `recv(port)` then returns immediately (no E_CLOSED, since the
 //   test thread still holds the port handle with its `bind` cap; no E_FULL,
-//   since the test's domain has plenty of free slots). The kernel hands
+//   since the test's process has plenty of free slots). The kernel hands
 //   back the reply handle id in the recv syscall word; that id is the
 //   handle the spec line under test refers to.
 //

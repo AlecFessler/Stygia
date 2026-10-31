@@ -12,10 +12,10 @@
 //     - N must be in [1, 63] and N must not exceed `fut_wait_max` so
 //       tests 02 and 03 cannot fire,
 //     - the addr we pass must resolve to a valid user mapping in the
-//       caller's domain so test 05 (E_BADADDR) cannot fire if a
+//       caller's process so test 05 (E_BADADDR) cannot fire if a
 //       future implementation evaluates that gate before alignment.
 //
-//   The test runs in the root capability domain, whose self-handle
+//   The test runs in the root process, whose self-handle
 //   carries the full ceiling — `fut_wait_max` is therefore non-zero,
 //   so tests 01/03 cannot trigger. We pass a single (addr, target)
 //   pair (N = 1), so test 02 cannot trigger either.

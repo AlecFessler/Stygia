@@ -52,7 +52,7 @@ pub const Site = enum(u16) {
     /// `thread.routeRetiredFinalize` — terminator waiting for
     /// the retired thread's owner core to drop it from `current_thread`.
     route_retired_wait = 1,
-    /// `scheduler.awaitDomainQuiesced` — phase-2 translation barrier.
+    /// `scheduler.awaitProcessQuiesced` — phase-2 translation barrier.
     await_quiesced = 2,
     /// `lifecycle.waitForPinsDrained`.
     pins_drained = 3,

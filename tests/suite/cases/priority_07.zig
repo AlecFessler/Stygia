@@ -37,7 +37,7 @@
 //       The success path is the only path the kernel can take.
 //     - verify the kernel reflects the new priority in the child's
 //       handle field0. The handle table maps read-only into this
-//       domain at `cap_table_base`; field0 bits 0-1 carry `pri`.
+//       process at `cap_table_base`; field0 bits 0-1 carry `pri`.
 //       Reading it back confirms the kernel accepted and recorded
 //       the priority change — a necessary precondition for any
 //       "takes effect on next wake" assertion at the scheduler

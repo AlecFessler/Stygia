@@ -1,38 +1,38 @@
 // Spec §[restart_semantics] — test 06.
 //
 // "[test 06] returns E_PERM if any IDC handle minted by
-//  `create_capability_domain` (the caller's own returned handle, the
-//  new domain's slot-2 self-IDC, or any `passed_handles` IDC entry)
-//  has `caps.restart_policy = 1` and the calling domain's
+//  `create_process` (the caller's own returned handle, the
+//  new process's slot-2 self-IDC, or any `passed_handles` IDC entry)
+//  has `caps.restart_policy = 1` and the calling process's
 //  `restart_policy_ceiling.idc_restart_max = 0`."
 //
 // Strategy (faithful)
-//   Stand up a fresh capability domain as a sub-child via
-//   `create_capability_domain`, where the calling domain (this test)
+//   Stand up a fresh process as a sub-child via
+//   `create_process`, where the calling process (this test)
 //   has `restart_policy_ceiling.idc_restart_max = 0`. Then:
 //     a) pass an IDC handle in `passed_handles` whose entry caps have
 //        `restart_policy = 1`; OR
 //     b) request that the caller's own returned IDC handle have
 //        `restart_policy = 1` via the IDC cap bits in [1].caps; OR
-//     c) request that the new domain's slot-2 self-IDC have
+//     c) request that the new process's slot-2 self-IDC have
 //        `restart_policy = 1` via the `cridc_ceiling` field in [2].
 //   Each of those mints triggers E_PERM under the test 06 check.
 //
 // Blocker
 //   The v0 runner (tests/suite/runner/primary.zig) hard-codes
 //   `restart_policy_ceiling.idc_restart_max = 1` in the
-//   `ceilings_outer` it passes to every spawned test domain
+//   `ceilings_outer` it passes to every spawned test process
 //   (encoded into the 0x01FE block at bits 16-31 of word 3, with
 //   bit 24 = idc_restart_max). The spawned test therefore runs as
-//   a calling domain with `idc_restart_max = 1`, not 0. Forcing
+//   a calling process with `idc_restart_max = 1`, not 0. Forcing
 //   `idc_restart_max = 0` on this test would require either
 //     - a per-test override path in the runner (not present in v0),
-//     - or chaining a second `create_capability_domain` call where
-//       the sub-sub-domain inherits `idc_restart_max = 0`. But the
+//     - or chaining a second `create_process` call where
+//       the sub-sub-process inherits `idc_restart_max = 0`. But the
 //       test 06 check fires on the *caller's* ceiling, not on the
-//       newly-created domain's ceiling, so a sub-sub-spawn does not
+//       newly-created process's ceiling, so a sub-sub-spawn does not
 //       move the gate into our reach: our ceiling stays 1 no matter
-//       how many domains we layer beneath us.
+//       how many processes we layer beneath us.
 //
 //   Until the runner exposes a per-test ceilings override (or the
 //   runner itself is split so this test can run under a tightened
@@ -43,7 +43,7 @@
 //   lands.
 //
 // Degraded smoke variant
-//   Issue a `create_capability_domain` call shaped like the test 06
+//   Issue a `create_process` call shaped like the test 06
 //   trigger pattern: pass a `restart_policy = 1` IDC entry in
 //   `passed_handles`, with everything else inside our ceiling. Under
 //   the v0 runner config (`idc_restart_max = 1`) this does *not* fire
@@ -58,13 +58,13 @@
 // Action
 //   1. Read our self-IDC at slot 2 (minted by the runner with the IDC
 //      caps the runner allowed). This is the source IDC handle for
-//      the passed_handles entry; we hand it to the new sub-domain.
+//      the passed_handles entry; we hand it to the new sub-process.
 //   2. Stage a tiny, kernel-rejected ELF page frame so the call
 //      reaches the ceilings/restart_policy check before any ELF
 //      validation. v0 has no kernel implementation, so a zero-length
 //      ELF buffer is fine: the call returns whatever the v0 mock
 //      returns, which we ignore.
-//   3. Issue create_capability_domain with:
+//   3. Issue create_process with:
 //        - ceilings_inner / outer reduced to safe subsets of ours
 //        - elf_page_frame = a small page frame we own
 //        - passed_handles[0] = self-IDC at slot 2 with caps including
@@ -89,7 +89,7 @@ pub fn main(cap_table_base: u64) void {
     // Build the trigger pattern: an IDC passed_handles entry whose
     // caps include `restart_policy = 1`. The source handle id is
     // slot 2 — the runner-minted self-IDC — which is the only IDC
-    // handle this test domain owns by construction.
+    // handle this test process owns by construction.
     const idc_caps = caps.IdcCap{
         .copy = true,
         .restart_policy = true,
@@ -123,11 +123,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // Sub-domain self_caps and ceilings: tightly subset of the
+    // Sub-process self_caps and ceilings: tightly subset of the
     // runner-provided ceilings. The runner gives us self caps that
-    // include crcd, crec, crvr, crpf, crvm, crpt, fut_wake,
+    // include crproc, crec, crvr, crpf, crvm, crpt, fut_wake,
     // timer, pri=3 (no `restart`). We ask for self_caps
-    // = {crpt} — enough that the sub-domain validates without
+    // = {crpt} — enough that the sub-process validates without
     // needing rights we don't hold.
     const sub_self = caps.SelfCap{ .crpt = true };
     const sub_self_caps_word: u64 = @as(u64, sub_self.toU16());
@@ -135,7 +135,7 @@ pub fn main(cap_table_base: u64) void {
     // ceilings_inner: zero everything we don't need. The runner's
     // outer view of our `idc_rx` is opaque to us; we mirror the
     // runner's encoded value at bits 24-31 (0x27: all IDC bits) so
-    // the new domain can mint its own IDCs. All other ceilings
+    // the new process can mint its own IDCs. All other ceilings
     // narrow to 0 (still a subset of our ceilings).
     const sub_ceilings_inner: u64 = 0x0000_0000_3F00_0000;
 
@@ -149,7 +149,7 @@ pub fn main(cap_table_base: u64) void {
     // succeeds (v3 not implemented yet) or surfaces a non-test-06
     // error code; under a future strict-ceiling runner it returns
     // E_PERM and the test would gate on that.
-    _ = syscall.createCapabilityDomain(sub_self_caps_word, sub_ceilings_inner, sub_ceilings_outer, pf_handle, 0, // initial_thread_affinity
+    _ = syscall.createProcess(sub_self_caps_word, sub_ceilings_inner, sub_ceilings_outer, pf_handle, 0, // initial_thread_affinity
         passed[0..]);
 
     testing.pass();

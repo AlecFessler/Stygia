@@ -10,7 +10,7 @@
 //       self-handle has `crec` set (see runner/primary.zig:`child_self`),
 //       so this cannot fire.
 //     - tests 02, 04, 05, 07 (target-side checks when [4] != 0): use
-//       `target = 0` (self) so none of the target-domain paths apply.
+//       `target = 0` (self) so none of the target-process paths apply.
 //     - test 03 (E_PERM, caps not subset of self's thread_inner_ceiling):
 //       set caps = 0. The empty cap set is a subset of any ceiling.
 //     - test 06 (E_PERM, priority exceeds ceiling): set priority = 0.

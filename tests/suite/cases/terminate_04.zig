@@ -3,10 +3,10 @@
 // "[test 04] on success, the target thread stops executing."
 //
 // Strategy
-//   Mint a worker thread inside this domain (target = self) that runs a
+//   Mint a worker thread inside this process (target = self) that runs a
 //   tight loop incrementing a shared u64 in this ELF's .bss. Because
 //   create_thread with target = 0 puts the new thread in the
-//   caller's own capability domain — and therefore in the same
+//   caller's own process — and therefore in the same
 //   address space — the parent test thread can observe the worker's
 //   progress by reading the same memory location.
 //

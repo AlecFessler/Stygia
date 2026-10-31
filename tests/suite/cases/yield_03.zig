@@ -6,8 +6,8 @@
 //  syscall returns."
 //
 // Strategy
-//   The test thread spawns a child thread in its own capability domain
-//   (target = 0). Same-domain spawn means the child runs in the same
+//   The test thread spawns a child thread in its own process
+//   (target = 0). Same-process spawn means the child runs in the same
 //   address space, so a process-global variable is shared memory
 //   between the test thread and the child thread. The child's entry point
 //   stores a sentinel value into that global with release ordering and
@@ -73,7 +73,7 @@ const testing = lib.testing;
 const SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
 // Process-global shared between the test thread and the child thread. Both Threads
-// run in the same capability domain (same address space), so this
+// run in the same process (same address space), so this
 // global is the "shared memory" the spec line under test references.
 var observed: u64 = 0;
 

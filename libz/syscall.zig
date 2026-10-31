@@ -51,7 +51,7 @@ pub const SyscallNum = enum(u12) {
     delete = 16,
     revoke = 17,
     sync = 18,
-    create_capability_domain = 19,
+    create_process = 19,
     create_thread = 22,
     self = 23,
     terminate = 24,
@@ -196,10 +196,10 @@ pub fn sync(handle: u12) Regs {
 }
 
 // ---------------------------------------------------------------
-// 4..6: capability-domain ops
+// 4..6: process ops
 // ---------------------------------------------------------------
 
-pub fn createCapabilityDomain(
+pub fn createProcess(
     caps: u64,
     ceilings_inner: u64,
     ceilings_outer: u64,
@@ -207,7 +207,7 @@ pub fn createCapabilityDomain(
     initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
-    // Spec §[create_capability_domain]: [5] is the initial thread affinity
+    // Spec §[create_process]: [5] is the initial thread affinity
     // mask, passed handles start at [6+]. Up to 8 passed handles fit
     // in register vregs 6..13; beyond that issueStack handles spill.
     var in = Regs{
@@ -226,9 +226,9 @@ pub fn createCapabilityDomain(
     if (passed_handles.len >= 7) in.v12 = passed_handles[6];
     if (passed_handles.len >= 8) in.v13 = passed_handles[7];
     if (passed_handles.len > 8) {
-        return issueStack(.create_capability_domain, 0, in, passed_handles[8..]);
+        return issueStack(.create_process, 0, in, passed_handles[8..]);
     }
-    return issueReg(.create_capability_domain, 0, in);
+    return issueReg(.create_process, 0, in);
 }
 
 // ---------------------------------------------------------------

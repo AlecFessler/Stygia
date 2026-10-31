@@ -3,7 +3,7 @@
 // Architecture:
 //   - The primary owns all rights and orchestrates tests.
 //   - It mints a single result port and spawns each test as its own
-//     child capability domain, passing the port handle with `bind |
+//     child process, passing the port handle with `bind |
 //     xfer` caps. The kernel scheduler/SMP gives parallelism for free.
 //   - Each child performs its assertion logic and calls the libz
 //     `testing.report` helper, which suspends the initial thread on the
@@ -17,7 +17,7 @@
 //     results without depending on completion order.
 //
 //   - Tests are pinned round-robin across cores via
-//     `create_capability_domain` `[5] initial_thread_affinity` (see
+//     `create_process` `[5] initial_thread_affinity` (see
 //     `-Dspread_cores`). Passing 0 there — "kernel picks any core" —
 //     uses local-biased initial placement; x64 can now pull-steal
 //     affinity-0 ready Threads, but deterministic runner placement is still
@@ -207,7 +207,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Phase 1+2 interleaved. Spawn `BATCH` tests, then drain `BATCH`
     // results before spawning the next batch. Bounded in-flight test
-    // count keeps simultaneous thread/CD/PageFrame slab usage well below
+    // count keeps simultaneous thread/process/PageFrame slab usage well below
     // the per-class capacities and avoids running every test child to
     // peak concurrency in a 4-core scheduler — the kernel's debug
     // accounting (lockdep stacks, IRQ-handler depth tables, slab
@@ -222,7 +222,7 @@ pub fn main(cap_table_base: u64) void {
     // `spawned 16/16` print after `[runner] batch 416..432` with the
     // kernel still ticking and the runner thread parked (stygia-utf). The
     // contention was never pinpointed, and it is independent of the
-    // per-domain resource leak fixed by `disarmTimerHandlesInDomain`.
+    // per-process resource leak fixed by `disarmTimerHandlesInProcess`.
     //
     // Now set by `-Dbatch=N` so the wall can be re-tested without
     // editing test code. Note "runner thread parked, kernel still ticking"
@@ -232,7 +232,7 @@ pub fn main(cap_table_base: u64) void {
     // what happens.
     const BATCH: usize = embedded_tests.batch;
 
-    // Cores to spread test domains over; see `-Dspread_cores`.
+    // Cores to spread test processes over; see `-Dspread_cores`.
     //
     // The suite's expected core count comes from its boot configuration.
     // `-Dspread_cores=false` retains single-core initial placement.
@@ -307,7 +307,7 @@ pub fn main(cap_table_base: u64) void {
 
                 // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
                 // Drop the batch on the floor (its survivors stay `.not_run` =
-                // MISS in summarize). Hung sender Threads are reaped at domain
+                // MISS in summarize). Hung sender Threads are reaped at process
                 // teardown when the runner returns and drops its self-handle.
                 if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
                     serial.print("[runner] recv timeout after ");
@@ -412,8 +412,8 @@ pub fn main(cap_table_base: u64) void {
                 // delivered event, E_TIMEOUT on the deadline path).
                 // Previous code read vreg 1 here, so `reply_handle_id`
                 // came back as 0 and every reply syscall hit
-                // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
-                // sender Threads stayed parked on the result port and their CDs
+                // `resolveHandleOnProcess(...) == null` → E_BADCAP. The
+                // sender Threads stayed parked on the result port and their processes
                 // lived indefinitely, preventing the runner from draining
                 // those test batches.
                 //
@@ -437,7 +437,7 @@ pub fn main(cap_table_base: u64) void {
                 // chain INCLUDING the inner `asm volatile`. The visible
                 // failure was the runner emitting ~10 of ~420 expected
                 // reply syscalls, every elided reply leaving a test thread
-                // parked on the result port and the test's CD live
+                // parked on the result port and the test's process live
                 // indefinitely. Accumulated parked children starved the
                 // runner and produced a cascade-MISS tail.
                 //
@@ -478,8 +478,8 @@ pub fn main(cap_table_base: u64) void {
     // exits, while Pi tryboot returns to Pi OS.
 }
 
-// Spawns a single test capability domain bound to the shared result
-// port. Returns true on success, false if create_capability_domain
+// Spawns a single test process bound to the shared result
+// port. Returns true on success, false if create_process
 // reported an error in vreg 1 — the caller skips queueing a recv for
 // failed spawns so the recv loop's iteration count stays accurate.
 fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleId, affinity: u64) bool {
@@ -490,7 +490,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     //   slot 4 (SLOT_FIRST_PASSED + 1) — its own ELF page_frame
     //                                    (R-only). Tests that re-
     //                                    spawn themselves into a
-    //                                    sub-domain (e.g.
+    //                                    sub-process (e.g.
     //                                    create_thread_03)
     //                                    reach for it via this slot.
     //   slot 5 (SLOT_FIRST_PASSED + 2 = LIBZ_PF_SLOT) — the staged
@@ -535,7 +535,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         .w = builtin.target.cpu.arch == .x86_64,
         .x = true,
     };
-    // Per §[create_capability_domain] passed-handle entry encoding
+    // Per §[create_process] passed-handle entry encoding
     // (libz/caps.zig:PassedHandle) the new caps word in the child
     // is `entry.caps`, NOT subset-checked against any ceiling — the
     // kernel forwards verbatim for passed handles. So the dma+irq
@@ -597,7 +597,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     }
     const passed: []const u64 = passed_buf[0..passed_len];
 
-    // Spec §[create_capability_domain] [2] ceilings_inner field layout:
+    // Spec §[create_process] [2] ceilings_inner field layout:
     //   bits  0-7   thread_inner_ceiling   = 0xFF
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF
     //   bits 24-31  cridc_ceiling      = 0x27
@@ -605,11 +605,11 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     //   bits 40-47  vm_ceiling         = 0x01   (policy bit)
     //   bits 48-55  port_ceiling       = 0x5C   (xfer | recv | bind | suspend)
     //   bits 56-63  _reserved          = 0
-    // Test cases (e.g. create_capability_domain_03/05/08/10/11/12) read
+    // Test cases (e.g. create_process_03/05/08/10/11/12) read
     // their caller's installed sub-fields and construct violators or
     // exact-match baselines; the values here must match the per-test
     // documented baseline (`0x005C_011F_2701_FFFF`) so subset checks in
-    // syscall/capability_domain.zig fire only on intentional violators.
+    // syscall/process.zig fire only on intentional violators.
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0x01FF) << 8) |
@@ -621,7 +621,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     const child_self = caps.SelfCap{
-        .crcd = true,
+        .crproc = true,
         .crec = true,
         .crvr = true,
         .crpf = true,
@@ -632,9 +632,9 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     };
     const self_caps: u64 = @as(u64, child_self.toU16());
 
-    // Spec §[create_capability_domain] [5] initial_thread_affinity — a
+    // Spec §[create_process] [5] initial_thread_affinity — a
     // single-core mask under `-Dspread_cores` (the default), else 1,
-    // which pins runner-created test domains to core 0. We keep this
+    // which pins runner-created test processes to core 0. We keep this
     // deterministic even though affinity-0 ready Threads can now be
     // pull-stolen on x64.
     //
@@ -642,7 +642,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     // affinity the test requests. Affinity 0 remains local-biased at
     // creation time but is steal-admissible on x64, so tests that need
     // simple local contender placement should pin explicitly.
-    const r = syscall.createCapabilityDomain(
+    const r = syscall.createProcess(
         self_caps,
         ceilings_inner,
         ceilings_outer,
@@ -669,10 +669,10 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
 
     // Drop the runner-side per-spawn handles that aren't needed anymore:
     //   - pf_handle: the staged ELF page_frame. The child got an alias
-    //     in its own table during create_capability_domain; with
+    //     in its own table during create_process; with
     //     `incHandleRef` on alias the PF refcount is 2 here, so dropping
     //     the runner side leaves the child's reference at 1 and the PF
-    //     stays alive until the child's domain destroys.
+    //     stays alive until the child's process destroys.
     //   - idc_handle (returned slot in r.v1 low 12 bits): the runner
     //     never sends IDCs to children, so it doesn't need this handle
     //     past spawn. Reclaiming the slot is required for N>>1 reps to

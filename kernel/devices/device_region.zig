@@ -53,7 +53,7 @@ pub const PixelFormat = enum(u8) {
 /// during PCI enumeration; left zero with `valid=false` for non-PCI
 /// device regions (platform UARTs, IOAPICs, etc.). The IOMMU drivers
 /// (`arch/x64/intel/vtd.zig`, `arch/x64/amd/vi.zig`) read this when
-/// lazily provisioning a per-device translation domain on first
+/// lazily provisioning a per-device translation process on first
 /// `iommuMapPage`.
 pub const PciAddress = extern struct {
     bus: u8 = 0,
@@ -162,7 +162,7 @@ pub const DeviceRegion = extern struct {
 
     /// Linker-language: head of the singly-linked list of every
     /// `KernelHandle` that names this region. Used by `onIrq` to bump
-    /// every domain-local copy of `field1.irq_count`. Stored
+    /// every process-local copy of `field1.irq_count`. Stored
     /// type-erased to avoid a caps-module dependency cycle.
     handle_list_head: ?*HandleListNode = null,
 
@@ -170,12 +170,12 @@ pub const DeviceRegion = extern struct {
     /// non-PCI regions. Populated by `registerMmioPci` /
     /// `registerPortIoPci` from the ACPI PCI enumerator. The IOMMU
     /// drivers consume `bdf()` / `bus`/`devfn` accessors when
-    /// provisioning a per-device translation domain.
+    /// provisioning a per-device translation process.
     pci: PciAddress = .{},
 
     /// IOMMU per-device side-state opaque slot. The active arch
     /// IOMMU driver allocates and stores its per-device translation
-    /// state (e.g. SL-PT root + domain id for VT-d, page-table root
+    /// state (e.g. SL-PT root + process id for VT-d, page-table root
     /// for AMD-Vi) here on first `iommuMapPage`, and reuses it on
     /// subsequent map/unmap/invalidate. Stored type-erased so the
     /// devices module doesn't pull in arch-specific IOMMU types.
@@ -189,13 +189,13 @@ pub const IRQ_SOURCE_NONE: u32 = std.math.maxInt(u32);
 
 /// Per-handle propagation entry. One node per `KernelHandle` to a
 /// device_region. `field1_paddr` is the physical address of the handle
-/// entry's `field1` slot in its owning capability domain's user_table —
+/// entry's `field1` slot in its owning process's user_table —
 /// i.e. the futex address Spec §[device_irq] step 3 wakes on. Embedded
 /// inside `KernelHandle` so storage is owned by the handle table itself;
 /// threaded through `next` into the parent region's `handle_list_head`.
 /// `appendHandleListNode` / `removeHandleListNode` mutate the list under
 /// `DeviceRegion._gen_lock`; `onIrq` / `ack` likewise take the lock when
-/// walking so a concurrent CD-destroy unlinking nodes can not yank
+/// walking so a concurrent process-destroy unlinking nodes can not yank
 /// `next` out from under the walker.
 pub const HandleListNode = extern struct {
     field1_paddr: PAddr = .{ .addr = 0 },
@@ -205,7 +205,7 @@ pub const HandleListNode = extern struct {
 /// Insert `node` at the head of `dr.handle_list_head` and stamp its
 /// `field1_paddr` field. Called from the cap-mint path (caps module's
 /// `writeHandleSlot`) once the handle slot has been written, so the
-/// next IRQ on `dr` propagates into the new domain-local copy. Caller
+/// next IRQ on `dr` propagates into the new process-local copy. Caller
 /// must NOT already hold `dr._gen_lock`.
 pub fn appendHandleListNode(
     dr: *DeviceRegion,
@@ -287,11 +287,11 @@ var irq_table_lock: SpinLock = .{ .class = "device_region.irq_table" };
 
 /// Boot-time list of DeviceRegions that platform enumerators (PCI scan,
 /// serial port probe, GIC/IOAPIC) wanted minted into the root capability
-/// domain's handle table. The enumerators run during ACPI parse —
-/// before the root domain exists — so they stage refs here and
+/// process's handle table. The enumerators run during ACPI parse —
+/// before the root process exists — so they stage refs here and
 /// `userspace_init.grantDevices` drains the list after allocating the
-/// root domain. Each entry transfers the registerXxx caller-ref onto
-/// the minted root_cd handle (no incRef needed; refcount stays 1 and
+/// root process. Each entry transfers the registerXxx caller-ref onto
+/// the minted root_process handle (no incRef needed; refcount stays 1 and
 /// is owned by the handle slot). Spec §[device_region].
 var boot_grant_list: [MAX_DEVICE_REGIONS]?*DeviceRegion = [_]?*DeviceRegion{null} ** MAX_DEVICE_REGIONS;
 var boot_grant_count: usize = 0;
@@ -370,7 +370,7 @@ pub fn registerPortIo(base_port: u16, port_count: u16) !*DeviceRegion {
 /// Allocate a framebuffer device_region. Returned with `refcount = 1`
 /// owned by the boot enumerator that called us; the typical pattern
 /// is to immediately `appendBootGrant(dr)` so userspace_init mints it
-/// into the root capability domain. The geometry fields ride the cap
+/// into the root process. The geometry fields ride the cap
 /// itself (encoded into `Capability.field1` by `mintBootDevice`) so
 /// userspace doesn't need a side-channel page_frame to discover the
 /// resolution.
@@ -436,7 +436,7 @@ pub fn releaseHandleLocked(dr: *DeviceRegion, held_irq: u64) void {
 
 /// Bump the per-handle refcount when an alias of an existing
 /// DeviceRegion is minted into a fresh slot (e.g. `passed_handles`
-/// into a child domain). Returns `error.BadCap` if a concurrent
+/// into a child process). Returns `error.BadCap` if a concurrent
 /// destroy already Sticky'd the refcount.
 pub fn incHandleRef(dr: *DeviceRegion) error{BadCap}!void {
     const irq_state = dr._gen_lock.lockIrqSave(@src());
@@ -495,7 +495,7 @@ pub fn findDeviceByIrqSource(irq_source: u32) ?IrqSnapshot {
 }
 
 /// Acknowledge accumulated IRQs from `dr`: atomically reads the IRQ
-/// counter on every domain-local copy back to zero, signals EOI to the
+/// counter on every process-local copy back to zero, signals EOI to the
 /// interrupt controller, and unmasks the line. Spec §[device_region].ack.
 ///
 /// Returns the prior counter value observed on the caller's own handle
@@ -526,7 +526,7 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
 
 /// Hardware IRQ entry. Per Spec §[device_irq]:
 ///   1. Mask the line (kept masked until `ack` to coalesce duplicates).
-///   2. Bump every domain-local copy's `irq_count` (saturating u64).
+///   2. Bump every process-local copy's `irq_count` (saturating u64).
 ///   3. Wake recv-blocked Threads that may be sitting in `futex_wait_val`
 ///      against any of those counters.
 ///
@@ -539,7 +539,7 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
 ///     `decHandleRef` that destroys + recycles the slot. The slab's
 ///     `lockWithGen` rejects the stale gen and we drop the IRQ
 ///     silently — same shape as a spurious delivery.
-///   * Closes the CD-destroy `removeHandleListNodeLocked` race; the
+///   * Closes the process-destroy `removeHandleListNodeLocked` race; the
 ///     mutual exclusion under `dr._gen_lock` keeps `node.next` stable
 ///     across the walk.
 ///
@@ -562,7 +562,7 @@ pub fn onIrq(snapshot: IrqSnapshot) void {
         irq.maskIrq(dr.irq_source);
     }
 
-    // Steps 2+3: walk the per-region handle list; for each domain-local
+    // Steps 2+3: walk the per-region handle list; for each process-local
     // copy bump `field1.irq_count` saturating at u64::MAX via
     // `userio.atomicAddU64Saturating` and futex-wake every waiter parked
     // in `futex_wait_val` on that paddr. Idle remote cores hosting a

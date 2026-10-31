@@ -6,7 +6,7 @@
 // Strategy
 //   §[reply] resumes the suspended sender referenced by the reply
 //   handle. Per §[terminate]: "Termination atomically destroys the
-//   thread. Handles referencing it in any capability domain become stale;
+//   thread. Handles referencing it in any process become stale;
 //   a syscall invoked with a stale handle returns `E_TERM` and the
 //   stale handle is removed from the caller's table on the same
 //   call." A reply handle whose suspended sender has been terminated
@@ -20,7 +20,7 @@
 //
 //     1. minting a port with bind+recv caps so the test thread owns both
 //        ends of the suspension/recv handshake;
-//     2. spawning a child thread in the same capability domain (target=0)
+//     2. spawning a child thread in the same process (target=0)
 //        with caps={susp, term, read} so the child can suspend itself
 //        on the port and we can later terminate it;
 //     3. having the child entry call `self()` to obtain its own thread
@@ -55,7 +55,7 @@
 //   any other code (OK / E_BADCAP / etc) — the assertion that reply
 //   does not silently succeed on a terminated sender is preserved.
 //
-//   Same-domain child: the child runs in our address space so a
+//   Same-process child: the child runs in our address space so a
 //   plain global (`port_slot_for_child`) is the simplest channel for
 //   the port slot id. The child uses `self()` (§[self]) to recover
 //   its own thread handle id rather than relying on a side-channel for
@@ -119,7 +119,7 @@ fn haltForever() noreturn {
 }
 
 // Communicated to the child thread across the create_thread
-// boundary. The child runs in the same capability domain so it
+// boundary. The child runs in the same process so it
 // shares this ELF's address space.
 var port_slot_for_child: u12 = 0;
 
@@ -189,7 +189,7 @@ pub fn main(cap_table_base: u64) void {
         caps_word,
         entry,
         1, // stack_pages: nonzero so test 08 cannot fire
-        0, // target = self domain
+        0, // target = self process
         0, // affinity = any core
     );
     if (testing.isHandleError(cec.v1)) {

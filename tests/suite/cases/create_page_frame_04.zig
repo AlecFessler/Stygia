@@ -6,7 +6,7 @@
 //   To isolate the pages == 0 check we must make every other
 //   create_page_frame-prelude check pass:
 //     - caller self-handle has `crpf` (test 01): the runner grants
-//       it on every spawned test domain (see runner/primary.zig).
+//       it on every spawned test process (see runner/primary.zig).
 //     - caps.r/w/x ⊆ pf_ceiling.max_rwx (test 02): use only r,w which
 //       the runner ceiling permits (max_rwx = 0b111).
 //     - caps.max_sz ≤ pf_ceiling.max_sz (test 03): leave max_sz = 0,

@@ -11,11 +11,11 @@
 //
 //   Test 01 (E_PERM if `fut_wait_max = 0` on the self-handle) is
 //   neutralized because the runner-supplied self-handle for every
-//   spawned test domain has `fut_wait_max = 63` (see
+//   spawned test process has `fut_wait_max = 63` (see
 //   `runner/primary.zig` ceilings_outer construction). Test 03 (N
 //   exceeds `fut_wait_max`) is structurally entangled with the upper
 //   bound of test 02 — `fut_wait_max` is a 6-bit field capped at 63 by
-//   §[capability_domain], so any N > 63 also exceeds `fut_wait_max`.
+//   §[process], so any N > 63 also exceeds `fut_wait_max`.
 //   Both checks would fire for the N > 63 case; both return E_INVAL,
 //   so the observable test-02 invariant still holds. The N = 0 case is
 //   pure test 02: it cannot trip test 03 (zero never exceeds anything)

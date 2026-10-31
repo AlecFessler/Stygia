@@ -5,7 +5,7 @@
 // affinity = 0 from one test thread, then prove the workers execute on more
 // than one core. It remains meaningful when the suite runner is invoked
 // with -Dspread_cores=false because the workers are created inside this
-// test domain and explicitly use the affinity-0 sentinel.
+// test process and explicitly use the affinity-0 sentinel.
 
 const builtin = @import("builtin");
 const lib = @import("lib");

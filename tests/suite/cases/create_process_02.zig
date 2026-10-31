@@ -1,0 +1,102 @@
+// Spec §[create_process] create_process — test 02.
+//
+// "[test 02] returns E_PERM if `self_caps` is not a subset of the
+//  caller's self-handle caps."
+//
+// Strategy
+//   `self_caps` (bits 0-15 of [1]) is the caps word installed on the
+//   new process's slot-0 self-handle. It must be a bitwise subset of
+//   the calling process's own self-handle caps; otherwise the call
+//   would let a process mint a child with rights it doesn't itself
+//   hold, which would break the v3 monotonic-rights invariant.
+//
+//   The runner spawns each test with a child self-handle that has
+//   `fut_wake = true` (see runner/primary.zig spawnOne). We first
+//   restrict slot 0 to drop the `fut_wake` bit, then call
+//   create_process with `self_caps` that re-asserts
+//   `fut_wake`. The new caps word now contains a bit (fut_wake) that is
+//   not set in the caller's current self-handle caps, so the
+//   kernel must reject with E_PERM.
+//
+//   The remaining arguments are kept syntactically clean to make
+//   the failure mode unambiguous: ceilings are zero (trivially a
+//   subset of any caller ceiling), elf_page_frame is left as 0
+//   (the kernel is permitted to fault with E_BADCAP on that, but
+//   the self_caps subset check is documented before the ELF
+//   handle resolution path in this section), and no passed
+//   handles are supplied. The test runner only requires that the
+//   ELF compile and link; the kernel-side check order will be
+//   exercised once the v3 kernel implementation lands.
+//
+// Action
+//   1. restrict(slot 0, current self caps without `fut_wake`) — must succeed.
+//   2. create_process(self_caps with `fut_wake` set, …)
+//      — must return E_PERM.
+//
+// Assertions
+//   1: the setup restrict returned a non-zero error word
+//   2: create_process returned something other than E_PERM
+
+const lib = @import("lib");
+
+const caps = lib.caps;
+const errors = lib.errors;
+const syscall = lib.syscall;
+const testing = lib.testing;
+
+pub fn main(cap_table_base: u64) void {
+    _ = cap_table_base;
+
+    // Match the cap shape the runner installs on every test's self
+    // handle (see runner/primary.zig `child_self`) but with `fut_wake`
+    // dropped. restrict only narrows caps, so this is a valid subset
+    // of the current caps.
+    const reduced = caps.SelfCap{
+        .crproc = true,
+        .crec = true,
+        .crvr = true,
+        .crpf = true,
+        .crvm = true,
+        .crpt = true,
+        .fut_wake = false,
+        .pri = 3,
+    };
+    const restrict_word: u64 = @as(u64, reduced.toU16());
+    const restrict_result = syscall.restrict(caps.SLOT_SELF, restrict_word);
+    if (restrict_result.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(1);
+        return;
+    }
+
+    // self_caps re-asserts `fut_wake`, which is no longer in the
+    // caller's self-handle caps after the restrict above. The
+    // kernel must reject the call with E_PERM.
+    const requested = caps.SelfCap{
+        .crproc = true,
+        .crec = true,
+        .crvr = true,
+        .crpf = true,
+        .crvm = true,
+        .crpt = true,
+        .fut_wake = true,
+        .pri = 3,
+    };
+    const self_caps_word: u64 = @as(u64, requested.toU16());
+
+    const result = syscall.createProcess(
+        self_caps_word,
+        0, // ceilings_inner — trivially a subset of caller's ceilings
+        0, // ceilings_outer — same
+        0, // elf_page_frame — handle id 0 (self); kernel will reject
+        // on the type tag, but only after the self_caps subset check
+        0, // initial_thread_affinity
+        &.{}, // passed_handles — empty
+    );
+
+    if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
+        testing.fail(2);
+        return;
+    }
+
+    testing.pass();
+}

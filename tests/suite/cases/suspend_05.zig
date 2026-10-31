@@ -88,7 +88,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: caps.HandleId = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2: a fresh self-domain thread carrying `susp` so suspend's [1]
+    // Step 2: a fresh self-process thread carrying `susp` so suspend's [1]
     // cap check stays inert. `term` is included for shape parity with
     // other thread-targeted tests; `restart_policy = 0` keeps the call
     // within the runner's restart_policy_ceiling. The new thread begins

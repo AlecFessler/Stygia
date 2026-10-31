@@ -15,7 +15,7 @@
 //   error codes: E_TERM for "thread terminated", E_BADCAP for "no
 //   handle in this slot").
 //
-//   Mint a target thread inside the calling domain (target = self, so
+//   Mint a target thread inside the calling process (target = self, so
 //   no IDC is needed) with caps {term, spri, restart_policy = 0}:
 //     - `term` lets the test thread actually terminate the target,
 //     - `spri` lets the test invoke `priority` on the thread handle,

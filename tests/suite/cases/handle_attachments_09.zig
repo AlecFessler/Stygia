@@ -7,8 +7,8 @@
 //   Mirrors test 08's single-thread suspend-self-with-recv harness, but
 //   with TWO attachment entries: one with `move = 1` and one with
 //   `move = 0`. Both source handles are minted in the test thread's own
-//   table (single-CD case), so the recv-time source-slot clear runs
-//   inline in `port.deliverEvent` against the receiver's CD lock and
+//   table (single-process case), so the recv-time source-slot clear runs
+//   inline in `port.deliverEvent` against the receiver's process lock and
 //   the assertion is observable directly via `readCap` on the test
 //   thread's slot ids.
 //
@@ -189,12 +189,7 @@ fn suspendWithTwoAttachmentsArm(
           [v2in] "{x1}" (port_handle),
           [v126] "r" (pair_v126),
           [v127] "r" (pair_v127),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return ret_v1;
 }
 
@@ -328,7 +323,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 8: the move=1 source slot must now be empty in the
-    // sender's (= test thread's, single-CD) table. `clearAndFreeSlot`
+    // sender's (= test thread's, single-process) table. `clearAndFreeSlot`
     // zeros the entire user_table entry, so word0 == 0 is the
     // post-clear signature. (The HandleType enum has no `none`
     // tag — empty slots decode to type=0/id=0/caps=0, indistinguishable

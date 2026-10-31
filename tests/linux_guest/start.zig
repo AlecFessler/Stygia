@@ -1,7 +1,7 @@
 const app = @import("app");
 const lib = @import("lib");
 
-// Per spec §[create_capability_domain]: "The pointer to the new domain's
+// Per spec §[create_process]: "The pointer to the new process's
 // read-only view of its capability table is passed as the first argument
 // to the initial thread's entry point." On x86-64 SysV that's rdi at entry;
 // the linker puts _start in .text._start so the kernel jumps to it as an
@@ -9,9 +9,9 @@ const lib = @import("lib");
 export fn _start(cap_table_base: u64) noreturn {
     app.main(cap_table_base);
     // Fall-through: drop the self-handle. Per spec §[delete] the
-    // calling capability domain is cleaned up — every handle in its
+    // calling process is cleaned up — every handle in its
     // table is released with its type-specific delete behavior, the
-    // domain's address space is freed, and any vCPUs / VARs / page
+    // process's address space is freed, and any vCPUs / VARs / page
     // frames are torn down.
     //
     // Use `issueRegDiscard` directly. ReleaseSmall LLVM otherwise

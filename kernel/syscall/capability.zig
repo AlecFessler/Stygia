@@ -30,7 +30,7 @@ const CAPS_MASK: u64 = 0xFFFF;
 ///
 /// [test 01] returns E_BADCAP if [1] is not a valid handle.
 /// [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
-/// [test 03] returns E_PERM if the handle is an thread handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
+/// [test 03] returns E_PERM if the handle is a thread handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
 /// [test 04] returns E_PERM if the handle is a VMAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 /// [test 05] returns E_INVAL if any reserved bits are set in [1] or [2].
 /// [test 06] on success, the handle's caps field equals [2].caps.
@@ -41,7 +41,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
     return capability.restrict(caller, handle, caps);
 }
 
-/// Releases a handle from the calling domain's handle table. Type-specific
+/// Releases a handle from the calling process's handle table. Type-specific
 /// side effects apply.
 ///
 /// ```
@@ -55,9 +55,9 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
 ///
 /// | Handle type | Observable delete behavior |
 /// |---|---|
-/// | `capability_domain_self` | The calling domain is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
-/// | `capability_domain` (IDC) | Release handle. Domain has system lifetime; it does not terminate when IDC handles drop |
-/// | `thread` | Release handle. Threads have capability-domain lifetime; they are not destroyed by handle drops |
+/// | `process_self` | The calling process is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
+/// | `process` (IDC) | Release handle. Process has system lifetime; it does not terminate when IDC handles drop |
+/// | `thread` | Release handle. Threads have process lifetime; they are not destroyed by handle drops |
 /// | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 /// | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 /// | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
@@ -78,7 +78,7 @@ pub fn delete(caller: *anyopaque, handle: u64) i64 {
     // all other handles retain the normal delete path.
     if (build_options.test_root_reboot_on_exit and handle == 0) {
         const thread: *stygia.sched.thread.Thread = @ptrCast(@alignCast(caller));
-        if (@intFromPtr(thread.domain.ptr) == stygia.boot.userspace_init.boot_root_domain_addr) {
+        if (@intFromPtr(thread.process.ptr) == stygia.boot.userspace_init.boot_root_process_addr) {
             return stygia.arch.dispatch.cpu.powerAction(.reboot);
         }
     }
@@ -86,7 +86,7 @@ pub fn delete(caller: *anyopaque, handle: u64) i64 {
 }
 
 /// Releases every handle transitively derived from the target via `copy`,
-/// across all capability domains. The target handle itself is not
+/// across all processes. The target handle itself is not
 /// released — use `delete` for that.
 ///
 /// ```
@@ -100,7 +100,7 @@ pub fn delete(caller: *anyopaque, handle: u64) i64 {
 ///
 /// A handle that was copied from the target and then subsequently moved is
 /// still a derivation of the target — moving a handle keeps it on the copy
-/// ancestry chain rather than orphaning it. A domain that has moved a
+/// ancestry chain rather than orphaning it. A process that has moved a
 /// handle elsewhere no longer holds it and cannot revoke it; whoever holds
 /// the copy ancestor still can, and the revoke will reach the moved
 /// descendant through the preserved chain.

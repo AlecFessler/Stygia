@@ -22,7 +22,7 @@
 //   target thread without the `term` cap so terminate must reject under
 //   test 02.
 //
-//   The runner spawns the test domain with `crec` and pri=3 in the
+//   The runner spawns the test process with `crec` and pri=3 in the
 //   self-handle, plus thread_inner_ceiling = 0xFF (every thread cap bit
 //   below restart_policy permitted). We mint the target thread with
 //   priority = 2 (non-zero, within ceiling) and affinity = 1 (core 0
@@ -60,7 +60,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    // Mint an thread without the `term` cap so terminate hits E_PERM.
+    // Mint a thread without the `term` cap so terminate hits E_PERM.
     // restart_policy = 0 keeps the create within the inner ceiling.
     const initial = caps.ThreadCap{
         .susp = true,

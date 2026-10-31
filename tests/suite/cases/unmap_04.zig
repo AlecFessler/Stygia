@@ -19,7 +19,7 @@
 //
 //   To trigger test 04 we then call unmap with N = 1 and a selector
 //   that points to an empty handle slot. Slot 4095 (HANDLE_TABLE_MAX
-//   - 1) is guaranteed empty by the create_capability_domain table
+//   - 1) is guaranteed empty by the create_process table
 //   layout (slot 0 = self, 1 = initial thread, 2 = self-IDC, 3 = result
 //   port; nothing else has been installed at slot 4095). Passing it
 //   as the unmap selector forces the kernel to look up an empty slot
@@ -99,7 +99,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: unmap with a single selector pointing at an empty handle
     // slot. Slot 4095 is guaranteed empty by the
-    // create_capability_domain table layout, so it is not a valid
+    // create_process table layout, so it is not a valid
     // page_frame handle. The kernel must return E_BADCAP per
     // §[unmap] test 04.
     const empty_slot: u64 = @as(u64, caps.HANDLE_TABLE_MAX - 1);

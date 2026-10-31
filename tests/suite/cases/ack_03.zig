@@ -10,12 +10,12 @@
 //
 // Strategy
 //   The runner's child cap_table is populated by
-//   create_capability_domain: slot 0 self, slot 1 thread, slot 2 self-IDC,
+//   create_process: slot 0 self, slot 1 thread, slot 2 self-IDC,
 //   slot 3 the result port (the only `passed_handle` the runner
 //   forwards). No device_regions are forwarded today (see runner/
 //   primary.zig spawnOne — `passed[]` carries only the result port).
 //   That makes the E_INVAL assertion structurally unreachable from
-//   inside a child domain on this branch — we have no device_region
+//   inside a child process on this branch — we have no device_region
 //   handle to pass to `ack`, let alone one with no IRQ configured.
 //
 // Degraded smoke
@@ -75,7 +75,7 @@ pub fn main(cap_table_base: u64) void {
     if (r.v1 == @intFromEnum(errors.Error.E_INVAL)) {
         // Real test 03 assertion: device_region has no IRQ delivery
         // configured, kernel returned E_INVAL. The first day a child
-        // domain sees a device_region without an IRQ line, this is
+        // process sees a device_region without an IRQ line, this is
         // the path we hit.
         testing.pass();
         return;
@@ -93,7 +93,7 @@ pub fn main(cap_table_base: u64) void {
 
 fn findDeviceRegion(cap_table_base: u64) ?caps.HandleId {
     // Scan the full handle table. Slots 0/1/2 are self / initial thread /
-    // self-IDC for a child capability domain (§[capability_domain]),
+    // self-IDC for a child process (§[process]),
     // and passed_handles start at slot 3. Today the runner forwards
     // only the result port at slot 3; no device_regions reach a child.
     // Scan everything to remain robust if that changes.

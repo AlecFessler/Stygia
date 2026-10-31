@@ -17,7 +17,7 @@
 //        wakes, and
 //     3. zero free slots in the receiver's handle table at that moment.
 //
-//   The simplest faithful construction in a child capability domain
+//   The simplest faithful construction in a child process
 //   (per runner/primary.zig spawnOne):
 //     - The test holds the result port at SLOT_FIRST_PASSED with
 //       bind+xfer; the runner holds bind on its own copy too. We mint
@@ -25,12 +25,12 @@
 //       ourselves the `recv` cap (the result port's caps as forwarded
 //       by the runner do not include `recv` by spec — the runner is
 //       the receiver of result events, not the test).
-//     - We spawn a helper thread inside this same capability domain. The
+//     - We spawn a helper thread inside this same process. The
 //       helper, on entry, calls `self()` to obtain its own thread handle
 //       id, then `suspend(self_handle, port, &.{})` so it queues as
 //       a sender on `port` with pair_count = 0. The handle table is
 //       shared between the test and helper Threads because they share a
-//       capability domain; `port` and the helper's thread handle live in
+//       process; `port` and the helper's thread handle live in
 //       the same table.
 //     - The test thread, after spawning the helper, saturates its handle
 //       table by repeated `create_port` until E_FULL is returned.
@@ -55,7 +55,7 @@
 //       port between spawn and recv.
 //
 //   Helper entry uses the shared address space — both Threads run in the
-//   same capability domain, so a top-level `var` storing the port
+//   same process, so a top-level `var` storing the port
 //   handle is visible to the helper. Stack pages are kernel-allocated
 //   per `create_thread` so the helper's stack does not
 //   collide with the test's.
@@ -66,7 +66,7 @@
 //      it.
 //   2. create_thread(caps={susp}, entry=&helperEntry,
 //      stack_pages=1, target=0, affinity=0) — spawn the helper thread in
-//      this same domain.
+//      this same process.
 //   3. Saturate the handle table: loop create_port(0) until E_FULL.
 //   4. recv(port) — must return E_FULL in regs.v1.
 //
@@ -86,7 +86,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Visible to both the test thread and the helper thread: they share a
-// capability domain (and thus an address space) per
+// process (and thus an address space) per
 // `create_thread([4] target = 0)`.
 var helper_port: u12 = 0;
 
@@ -137,7 +137,7 @@ pub fn main(cap_table_base: u64) void {
     }
     helper_port = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2: spawn a helper thread in this same capability domain. The
+    // Step 2: spawn a helper thread in this same process. The
     // thread handle is minted into our table at some slot. Caps include
     // `susp` so the helper's `suspend(self_handle, port)` passes the
     // thread-cap check. Stack pages = 1 satisfies test 08; affinity = 0

@@ -2,21 +2,21 @@
 //
 // "[test 07] returns E_PERM if any device_region handle minted by
 //  transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1`
-//  and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`."
+//  and the calling process's `restart_policy_ceiling.dr_restart_max = 0`."
 //
 // DEGRADED SMOKE VARIANT
 //
 //   A faithful test for this rule needs three things the v0 runner +
 //   libz cannot deliver yet:
 //
-//     1. A device_region handle in the calling domain. Per
+//     1. A device_region handle in the calling process. Per
 //        §[capabilities] line 115, device_region handles are
 //        "kernel-issued at boot to root service; received via
-//        suspend/reply transfer". A test child domain spawned by the
+//        suspend/reply transfer". A test child process spawned by the
 //        runner has none unless the runner explicitly transfers one;
 //        the runner currently transfers only the result port.
 //
-//     2. A calling domain with `dr_restart_max = 0` in its
+//     2. A calling process with `dr_restart_max = 0` in its
 //        `restart_policy_ceiling`. The runner's child template sets
 //        `ceilings_outer = 0x0000_003F_01FE_FFFF`, which puts
 //        dr_restart_max = 1 — explicitly the wrong polarity for this
@@ -41,7 +41,7 @@
 //   When the upstream pieces land, replace the smoke body with the
 //   faithful sequence:
 //
-//     1. Spawn a child domain with restart_policy_ceiling such that
+//     1. Spawn a child process with restart_policy_ceiling such that
 //        dr_restart_max = 0 (and high enough other fields that the
 //        E_PERM source is unambiguously dr_restart_max).
 //     2. xfer-attach a device_region handle (kernel-issued to the
@@ -61,7 +61,7 @@
 //   1: failed to obtain a transferable device_region handle in setup
 //   2: reply_transfer/suspend returned something other than E_PERM
 //      when carrying a device_region attachment with restart_policy=1
-//      against a domain whose dr_restart_max = 0
+//      against a process whose dr_restart_max = 0
 
 const lib = @import("lib");
 

@@ -5,7 +5,7 @@
 //
 // Strategy
 //   Drive create_vmar down its success path with the same prelude as
-//   create_var_05/runner/serial.zig — the root domain's self-handle
+//   create_var_05/runner/serial.zig — the root process's self-handle
 //   carries `crvr`, the vmar_inner_ceiling permits {r, w}, max_sz = 0
 //   keeps every max_sz check satisfied, mmio = 0 and dma = 0 close
 //   off all device-binding error paths, props.sz = 0 / cur_rwx = 0b011

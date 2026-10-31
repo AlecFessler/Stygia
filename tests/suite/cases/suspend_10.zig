@@ -9,7 +9,7 @@
 //
 //   Phase A — read=true → state per §[event_state]:
 //     The test thread mints a port with `bind | recv` and a child thread W_R
-//     in its own domain with caps `{susp, term, read, restart_policy=0}`
+//     in its own process with caps `{susp, term, read, restart_policy=0}`
 //     and entry pointing at a small assembly trampoline that:
 //       (1) writes a sentinel value to a process-global with release
 //           ordering so the test thread has a synchronization witness that
@@ -68,7 +68,7 @@
 //       fresh thread exactly once.
 //     - recv test 04 (E_CLOSED): the test thread keeps its bind-cap port
 //       handle live across both phases.
-//     - recv test 06 (E_FULL): the test thread's domain has plenty of
+//     - recv test 06 (E_FULL): the test thread's process has plenty of
 //       slack — only a handful of slots are consumed.
 //
 //   Neutralize create_thread error paths the same way
@@ -142,7 +142,7 @@ fn entryR() callconv(.c) noreturn {
             \\ 1: pause
             \\    jmp 1b
             :
-            : [observed] "r" (&observed_r)
+            : [observed] "r" (&observed_r),
             : .{ .r15 = true, .memory = true }),
         .aarch64 => asm volatile (
             \\ movz x12, #0xF00D
@@ -153,7 +153,7 @@ fn entryR() callconv(.c) noreturn {
             \\ 1: yield
             \\    b 1b
             :
-            : [observed] "r" (&observed_r)
+            : [observed] "r" (&observed_r),
             : .{ .x12 = true, .memory = true }),
         else => @compileError("unsupported arch"),
     }
@@ -168,7 +168,7 @@ fn entryZ() callconv(.c) noreturn {
             \\ 1: pause
             \\    jmp 1b
             :
-            : [observed] "r" (&observed_z)
+            : [observed] "r" (&observed_z),
             : .{ .r15 = true, .memory = true }),
         .aarch64 => asm volatile (
             \\ movz x12, #0xF00D
@@ -179,7 +179,7 @@ fn entryZ() callconv(.c) noreturn {
             \\ 1: yield
             \\    b 1b
             :
-            : [observed] "r" (&observed_z)
+            : [observed] "r" (&observed_z),
             : .{ .x12 = true, .memory = true }),
         else => @compileError("unsupported arch"),
     }
@@ -292,7 +292,7 @@ pub fn main(cap_table_base: u64) void {
     // Phase B — read=false: payload state must be zeroed
     // ---------------------------------------------------------------
 
-    // Step 6: mint W_Z with susp+term but NOT read. Same domain, same
+    // Step 6: mint W_Z with susp+term but NOT read. Same process, same
     // address space, so entryZ is reachable.
     const wz_caps = caps.ThreadCap{
         .term = true,

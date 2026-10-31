@@ -47,7 +47,7 @@ const is_runner = @hasDecl(app, "RUNNER_STATIC");
 // to see this decl when test ELFs build with os_tag = .linux. Without
 // pub, std would emit its own _start and collide.
 //
-// Per §[create_capability_domain]: "The pointer to the new domain's
+// Per §[create_process]: "The pointer to the new process's
 // read-only view of its capability table is passed as the first
 // argument to the initial thread's entry point." On x86-64 SysV that's
 // rdi at entry; on AAPCS64 that's x0 at entry. The kernel ELF loader
@@ -61,7 +61,7 @@ pub export fn _start(cap_table_base: u64) noreturn {
     }
     app.main(cap_table_base);
     // Fall-through: drop the self-handle, which per spec §[delete]
-    // cleans up the calling capability domain.
+    // cleans up the calling process.
     //
     // Must use `issueRegDiscard` directly. ReleaseSmall LLVM otherwise
     // strips the entire `issueReg → issueRawNoStack` chain when the
@@ -103,7 +103,7 @@ fn bootstrapLibz(cap_table_base: u64) void {
     // helper uses shared .bss scratch. aarch64 uses caller-stack
     // storage, so the runner passes the libz pf without `w` and this
     // same request intersects down to R+X, avoiding writable aliases
-    // between concurrently running child domains.
+    // between concurrently running child processes.
     //
     // Pinning preferred_base = LIBZ_SLIDE is what makes the runner's
     // pre-applied RELATIVE relocs land correctly.

@@ -11,7 +11,7 @@
 //   spec-mandated error path that applies:
 //     - test 01 (E_BADCAP, invalid handle): the thread handle is freshly
 //       inserted by the kernel via create_thread, so it is
-//       valid in our domain.
+//       valid in our process.
 //     - test 03 (E_INVAL, [2] has out-of-range core bits): pass
 //       new_affinity = 0, the "any core" sentinel, which by
 //       construction has no bits set above the system's core count.
@@ -33,7 +33,7 @@
 //   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever; the test thread continues independently. No
 //   synchronization is required: the affinity call only consults the
-//   handle's caps slot in our domain's handle table — not the
+//   handle's caps slot in our process's handle table — not the
 //   running thread's state.
 //
 // Action

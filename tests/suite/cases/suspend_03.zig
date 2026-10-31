@@ -24,7 +24,7 @@
 //
 //   The new thread begins executing at `dummyEntry`, which halts forever
 //   (§[testing] dummyEntry: `hlt` loop). The suspend cap check fires
-//   against the thread handle's caps field in the caller's domain table
+//   against the thread handle's caps field in the caller's process table
 //   before any state change to the running thread; the running state is
 //   irrelevant.
 //

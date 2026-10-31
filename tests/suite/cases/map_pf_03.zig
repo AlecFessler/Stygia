@@ -14,7 +14,7 @@
 //   §[var]:
 //     - caps.mmio = 1 requires props.sz = 0 (create_vmar test 08),
 //       caps.x = 0 (test 11), caps.dma = 0 (test 13).
-//     - The root domain's vmar_inner_ceiling permits mmio (the same
+//     - The root process's vmar_inner_ceiling permits mmio (the same
 //       construction is used by runner/serial.zig).
 //   With caps = {r, w, mmio} and props = {sz=0, cch=1 (uc),
 //   cur_rwx=0b011} the create_vmar prelude succeeds and we get a VMAR

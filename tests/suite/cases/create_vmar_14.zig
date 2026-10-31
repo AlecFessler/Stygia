@@ -7,7 +7,7 @@
 //   To isolate the BADCAP-on-[5] check we must make every
 //   create_vmar-prelude check that runs ahead of it pass:
 //     - caller self-handle has `crvr` (root_service launches every test
-//       domain with the full self-cap set — see runner/primary.zig).
+//       process with the full self-cap set — see runner/primary.zig).
 //     - caps.r/w/x ⊆ vmar_inner_ceiling.r/w/x (test 02): the runner's
 //       ceilings_inner = 0x001C_011F_2701_FFFF places vmar_inner_ceiling
 //       at field0 bits 8-23 = 0x01FF, which permits r, w, and dma. We
@@ -26,8 +26,8 @@
 //     - reserved bits clean (test 17): all unused fields zero.
 //     - pages != 0 (test 05): use pages = 1.
 //   With caps.dma = 1 set, the kernel must validate [5]. The child
-//   capability domain's table is populated by the kernel at
-//   create_capability_domain time — slot 0 self, slot 1 initial thread,
+//   process's table is populated by the kernel at
+//   create_process time — slot 0 self, slot 1 initial thread,
 //   slot 2 self-IDC, slot 3+ passed_handles (only the result port at
 //   slot 3 here). Slot 4095 (the maximum 12-bit handle id) is
 //   guaranteed unminted, so it cannot be a valid device_region handle.

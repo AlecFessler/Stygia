@@ -1,26 +1,26 @@
 // Spec §[restart_semantics] restart_semantics — test 02.
 //
 // "[test 02] returns E_PERM if `create_vmar` is called with
-//  caps.restart_policy exceeding the calling domain's
+//  caps.restart_policy exceeding the calling process's
 //  restart_policy_ceiling.vmar_restart_max."
 //
 // DEGRADED SMOKE VARIANT
-//   The strict E_PERM path here requires the calling domain's
+//   The strict E_PERM path here requires the calling process's
 //   `restart_policy_ceiling.vmar_restart_max` to be strictly less than
 //   some value of `caps.restart_policy` we can pass to `create_vmar`.
 //   `restart_policy` on a VMAR cap is a 2-bit numeric enum (0..3); the
-//   primary runner spawns each test as a child capability domain with
+//   primary runner spawns each test as a child process with
 //   `restart_policy_ceiling.vmar_restart_max = 3` (snapshot, the
 //   maximum-privilege value — see runner/primary.zig's
 //   `ceilings_outer = 0x...01FE...`). With the ceiling at the field's
 //   maximum representable value, no `caps.restart_policy` value can
 //   exceed it, so the E_PERM branch is structurally unreachable from
-//   inside the child without first spawning a *nested* sub-domain
+//   inside the child without first spawning a *nested* sub-process
 //   with a reduced ceiling — which would require either embedding a
 //   second ELF or extending the runner to host nested sub-tests.
 //
 //   The faithful version is therefore deferred until the runner gains
-//   nested-domain support. This smoke variant instead asserts the
+//   nested-process support. This smoke variant instead asserts the
 //   complementary positive observation: a `create_vmar` with
 //   `caps.restart_policy = 3` (snapshot — the ceiling value, not
 //   exceeding it) does NOT return E_PERM. That confirms the kernel's

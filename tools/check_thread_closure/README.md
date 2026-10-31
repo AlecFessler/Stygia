@@ -23,7 +23,7 @@ the enumeration. This makes that tool-closure permanent.
 ## Rule A — interrupt-context wake-source closure
 
 Every function reachable from an interrupt/exception entry point that can
-wake or claim an thread.
+wake or claim a thread.
 
 **Seeds** (interrupt entry points) come from the union of three mechanical
 sources, so that no single one silently going stale shrinks the answer:
@@ -62,7 +62,7 @@ A primitive name that fails to resolve to a function entity is an
 **Wake sources** are the arch → generic frontier of `fwd(seeds) ∩
 bwd(primitives)`: functions in the closure that live outside `kernel/arch/`
 and are called directly by arch code that is also in the closure. That is
-"the first thing the ISR plumbing hands control to that can wake an thread" —
+"the first thing the ISR plumbing hands control to that can wake a thread" —
 the granularity a hand-written table uses.
 
 Deliberately *not* "the first non-arch node on a shortest witness path": a
@@ -124,7 +124,7 @@ userspace trees with their own unrelated `SpinLock` types —
 `ir_call` alone is **not** a sound base for a closure claim. The indexer maps
 LLVM IR callee names back to entities by exact name, and Zig's monomorphized
 generics carry decorated IR names —
-`…SecureSlab(caps.capability_domain.CapabilityDomain,256).forEachAlive__anon_94571`
+`…SecureSlab(caps.process.Process,256).forEachAlive__anon_94571`
 — that never match an entity row. Every call *through* a generic is silently
 absent. The indexer generic-call fixture demonstrates the missing edge
 through `SecureSlab(...).forEachAlive`; a tool built on raw `ir_call`

@@ -15,7 +15,7 @@
 //
 //   The simplest single-thread witness uses the same shape as
 //   `terminate_07`: the test thread is both sender and receiver. It mints
-//   a port P with bind+recv+xfer, an thread W as the suspend target (so
+//   a port P with bind+recv+xfer, a thread W as the suspend target (so
 //   the suspending thread = the test thread itself, the syscall caller, per
 //   §[handle_attachments] entry-id-validation wording), and a
 //   "carry" thread C used solely as the attachment source. It then issues
@@ -30,7 +30,7 @@
 //   has time to insert the attachment into the receiver's table at a
 //   contiguous slot range.
 //
-//   Choice of attachment type: an thread handle, not an IDC handle. The
+//   Choice of attachment type: a thread handle, not an IDC handle. The
 //   spec line under test gives two formulations — IDC handles install
 //   with caps intersected with idc_rx, "or entry.caps verbatim for
 //   other handle types." The verbatim arm is the tighter assertion
@@ -63,7 +63,7 @@
 //   20-31, reply_handle_id in bits 32-43, event_type in bits 44-48.
 //   The test reads those fields off the recv's returned word, then
 //   reads the cap table at slot tstart and verifies (a) the slot
-//   carries an thread handle and (b) its caps field equals the
+//   carries a thread handle and (b) its caps field equals the
 //   verbatim entry caps.
 //
 // Pre-call gates the test must clear so no other error can mask the

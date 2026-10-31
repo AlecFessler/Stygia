@@ -1,17 +1,17 @@
 // Spec §[restart_semantics] Restart Semantics — test 01.
 //
 // "[test 01] returns E_PERM if `create_thread` is called
-//  with `caps.restart_policy` exceeding the calling domain's
+//  with `caps.restart_policy` exceeding the calling process's
 //  `restart_policy_ceiling.thread_restart_max`."
 //
 // Strategy
-//   `restart_policy` on an thread handle is a 2-bit numeric field
+//   `restart_policy` on a thread handle is a 2-bit numeric field
 //   (0=kill / 1=restart_at_entry / 2=persist / 3=_reserved) bounded
-//   at create time by the calling domain's `thread_restart_max` field
+//   at create time by the calling process's `thread_restart_max` field
 //   in `restart_policy_ceiling`. Test 01 specifically exercises the
 //   create-time bound on `create_thread`.
 //
-//   The runner spawns each test in a child capability domain whose
+//   The runner spawns each test in a child process whose
 //   `ceilings_outer` encodes `thread_restart_max = 2` (see
 //   runner/primary.zig — restart_policy_ceiling = 0x01FE puts
 //   thread_restart_max in bits 0-1 of the field = 0b10). Asking for
@@ -56,7 +56,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // restart_policy = 3 exceeds the child domain's thread_restart_max
+    // restart_policy = 3 exceeds the child process's thread_restart_max
     // (= 2) supplied by the runner. Other cap bits are kept inside
     // the child's thread_inner_ceiling so they cannot trip a separate
     // E_PERM via test 03.

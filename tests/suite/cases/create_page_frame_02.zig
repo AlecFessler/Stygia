@@ -5,10 +5,10 @@
 //
 // Faithful test rationale (and why this is a degraded smoke variant)
 //   The runner (tests/suite/runner/primary.zig) mints every spec-test
-//   domain with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 32-39
+//   process with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 32-39
 //   of that word are the `pf_ceiling` byte, which carries the value
 //   0x1F: bits 0-2 = max_rwx (r|w|x all permitted), bits 3-4 = max_sz
-//   (= 3). See §[capability_domain] field0 and §[create_capability_domain]
+//   (= 3). See §[process] field0 and §[create_process]
 //   [2] bits 32-34/35-36 for the ceiling layout.
 //
 //   A faithful "caps' r/w/x not a subset of pf_ceiling.max_rwx" test
@@ -20,11 +20,11 @@
 //
 //   The runner ceiling is shared across the entire test manifest and
 //   cannot be narrowed for one test, and there is currently no
-//   exposed syscall that lets a child domain restrict its own
+//   exposed syscall that lets a child process restrict its own
 //   pf_ceiling.max_rwx below 0b111 before invoking create_page_frame.
 //   Until such a ceiling-restriction syscall lands, the faithful
 //   E_PERM path for test 02 is unreachable from a userspace test
-//   domain. This mirrors create_var_03's degraded-smoke rationale
+//   process. This mirrors create_var_03's degraded-smoke rationale
 //   for the vmar_inner_ceiling.max_sz analogue.
 //
 //   This file lands a degraded *smoke* variant in place of the
@@ -36,7 +36,7 @@
 //   runner ceiling permits.
 //
 //   When a ceiling-restriction syscall is added, this test should be
-//   rewritten to: (a) narrow the calling domain's pf_ceiling.max_rwx
+//   rewritten to: (a) narrow the calling process's pf_ceiling.max_rwx
 //   so at least one of r/w/x is clear, then (b) invoke
 //   create_page_frame with that bit set and assert E_PERM.
 //
@@ -44,7 +44,7 @@
 //   To keep the call on the success path under the runner ceiling we
 //   make every prior check pass:
 //     - caller self-handle has `crpf` (test 01): the runner grants
-//       it on every spawned test domain.
+//       it on every spawned test process.
 //     - caps.r/w/x = 0b111, which is ⊆ pf_ceiling.max_rwx = 0b111
 //       (this test's gate).
 //     - caps.max_sz = 0 (4 KiB), within pf_ceiling.max_sz = 3 and

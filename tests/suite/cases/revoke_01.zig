@@ -3,8 +3,8 @@
 // "[test 01] returns E_BADCAP if [1] is not a valid handle."
 //
 // Strategy
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC

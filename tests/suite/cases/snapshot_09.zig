@@ -1,14 +1,14 @@
 // Spec §[snapshot] snapshot — test 09.
 //
-// "[test 09] on domain restart, when the source's stability constraints
+// "[test 09] on process restart, when the source's stability constraints
 //  hold, [1]'s contents are replaced by a copy of [2]'s contents before
-//  the domain resumes."
+//  the process resumes."
 //
 // DEGRADED SMOKE VARIANT
 //   The faithful shape of test 09 requires three phases of observation
-//   that span a domain-restart boundary:
+//   that span a process-restart boundary:
 //
-//     pre-restart (live domain N):
+//     pre-restart (live process N):
 //       1. mint source VMAR S with restart_policy = 2 (preserve), populate
 //          S with a known sentinel pattern (e.g. fill with 0xA5A5A5A5...).
 //          Stability constraints (per spec line 1116-1117): S.cur_rwx.w
@@ -18,40 +18,40 @@
 //          T with a *different* sentinel pattern (e.g. fill with
 //          0x5A5A5A5A...).
 //       3. snapshot(T, S) — bind S as T's restart-time source.
-//       4. trigger a domain restart on the calling domain.
+//       4. trigger a process restart on the calling process.
 //
 //     restart boundary:
 //       5. kernel verifies S's stability constraints (line 1115-1119),
-//          performs the source-to-target copy, then resumes the domain.
+//          performs the source-to-target copy, then resumes the process.
 //
-//     post-restart (live domain N+1):
+//     post-restart (live process N+1):
 //       6. read T's contents — must observe the 0xA5A5A5A5... pattern,
 //          i.e. S's pre-restart contents.
 //
 //   No piece of this sequence is reachable from a single child capability
-//   domain via the v0 test child surface as currently provisioned:
+//   process via the v0 test child surface as currently provisioned:
 //
-//   (a) A domain cannot trigger its own restart and then continue
+//   (a) A process cannot trigger its own restart and then continue
 //       executing as the same thread instance with its register/stack state
-//       intact. `restart` (syscall 14) restarts a *child* domain, not
-//       the calling domain; calling it on the test thread's own enclosing
-//       domain is not how the spec frames the restart entry point. To
+//       intact. `restart` (syscall 14) restarts a *child* process, not
+//       the calling process; calling it on the test thread's own enclosing
+//       process is not how the spec frames the restart entry point. To
 //       observe the post-restart side effect from a single test thread we
 //       would need either: (i) a parent harness that holds a handle to
-//       this test domain, restarts it, and inspects T after resume; or
+//       this test process, restarts it, and inspects T after resume; or
 //       (ii) a re-entry hook so the test thread's `main` is invoked again
 //       on restart with enough fixture state preserved across the
 //       boundary to compare against the pre-restart sentinel.
 //
 //   (b) The runner currently spawns each test as a one-shot child
-//       capability domain whose parent (the primary test runner) does
+//       process whose parent (the primary test runner) does
 //       not retain a snapshot/restart fixture for the child. There is
-//       no "restart this test domain and read back T" hook in
+//       no "restart this test process and read back T" hook in
 //       runner/primary.zig; adding one would introduce a parent-side
 //       result-port handshake to observe the copied pages after restart).
 //
 //   (c) Even with a parent-side restart driver, observing T's contents
-//       post-copy requires a mapped reader in a suitable domain. The
+//       post-copy requires a mapped reader in a suitable process. The
 //       current runner has no fixture for that observation.
 //
 //   Reaching the faithful path needs a *runner-side* restart harness
@@ -77,7 +77,7 @@
 //   No spec assertion is checked beyond "the binding call did not
 //   error" — and we record even that as a smoke prelude rather than a
 //   spec assertion, because the *behavior* under test (post-restart
-//   content replacement) is unreachable from inside the child domain.
+//   content replacement) is unreachable from inside the child process.
 //
 // Action
 //   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
@@ -101,8 +101,8 @@
 //     - mints source/target VARs in a parent test driver,
 //     - grants them to the test child,
 //     - waits for a "binding established" signal on the result port,
-//     - restarts the test child domain,
-//     - post-restart, maps and reads T in the owning domain and
+//     - restarts the test child process,
+//     - post-restart, maps and reads T in the owning process and
 //       compares against the sentinel pattern
 //       pre-loaded into S.
 //   Once that exists, the action becomes:
@@ -110,7 +110,7 @@
 //     <parent: mint T (snapshot), fill T with 0x5A...>
 //     <parent: hand S, T to child, run child>
 //     <child: snapshot(T, S); signal ready>
-//     <parent: restart child domain>
+//     <parent: restart child process>
 //     <parent: observe T -> *expected* 0xA5... pattern>
 //   That equality assertion (id 1) would replace this smoke's
 //   pass-with-id-0.

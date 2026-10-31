@@ -1,14 +1,14 @@
 // Spec §[snapshot] snapshot — test 11.
 //
-// "[test 11] on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`,
-//  the restart fails and the domain is terminated."
+// "[test 11] on process restart, when [2].map = 3 and `[2].cur_rwx.w = 1`,
+//  the restart fails and the process is terminated."
 //
 // DEGRADED SMOKE VARIANT
 //   The faithful shape of test 11 requires observing kernel behavior at
-//   the domain-restart boundary when the source VMAR violates the
+//   the process-restart boundary when the source VMAR violates the
 //   demand-paged stability constraint:
 //
-//     pre-restart (live domain N):
+//     pre-restart (live process N):
 //       1. mint source VMAR S with restart_policy = 2 (preserve), `map = 3`
 //          (demand-paged), and `cur_rwx.w = 1` so the demand-paging
 //          stability constraint (per spec line 1117) is intentionally
@@ -18,22 +18,22 @@
 //       3. snapshot(T, S) — bind S as T's restart-time source; this call
 //          itself is expected to succeed, the violation is only checked
 //          at restart time per spec line 1115-1119.
-//       4. trigger a domain restart on the calling domain.
+//       4. trigger a process restart on the calling process.
 //
 //     restart boundary:
 //       5. kernel checks S.cur_rwx.w on the demand-paged source (line
 //          1117), observes write = 1, fails the source-to-target copy,
-//          terminates the domain rather than resuming it.
+//          terminates the process rather than resuming it.
 //
 //     post-restart (no live successor):
-//       6. parent harness observes "domain terminated, not restarted"
+//       6. parent harness observes "process terminated, not restarted"
 //          and reports pass.
 //
 //   Two pieces of this sequence are unreachable from a single child
-//   capability domain via the v0 test child surface as currently
+//   process via the v0 test child surface as currently
 //   provisioned:
 //
-//   (a) Same restart-boundary problem as snapshot_09: a domain cannot
+//   (a) Same restart-boundary problem as snapshot_09: a process cannot
 //       trigger its own restart and continue executing as the same thread,
 //       and the runner does not retain a snapshot/restart fixture for
 //       the child. Observing the *terminated* outcome additionally
@@ -68,7 +68,7 @@
 //   We exercise the *pre-restart* portion of the faithful sequence in a
 //   single test thread: mint S as a preserve-policy VMAR with `cur_rwx.w = 1`,
 //   mint T as a snapshot-policy VMAR, call `snapshot(T, S)`. The actual
-//   stability check (line 1117) and the resulting domain termination are
+//   stability check (line 1117) and the resulting process termination are
 //   not observable here because we cannot cross the restart boundary
 //   from inside the child, and we additionally cannot drive S into
 //   `map = 3` without a fault path the runner does not expose.
@@ -76,8 +76,8 @@
 //   No spec assertion is checked beyond "the binding call did not
 //   error" — and we record even that as a smoke prelude rather than a
 //   spec assertion, because the *behavior* under test (restart-time
-//   stability failure causing domain termination) is unreachable from
-//   inside the child domain.
+//   stability failure causing process termination) is unreachable from
+//   inside the child process.
 //
 // Action
 //   1. createVmar(caps={r, w, restart_policy=2}, props={cur_rwx=0b011},
@@ -107,7 +107,7 @@
 //     - a runner-side restart driver (shared prerequisite with
 //       snapshot_09, snapshot_10) that mints S/T in a parent, grants
 //       to the child, restarts the child after the binding signal, and
-//       observes "domain terminated rather than restarted" via the
+//       observes "process terminated rather than restarted" via the
 //       result port;
 //     - a way for either the parent or the child to drive S into
 //       `map = 3` (demand-paged) before restart — either a syscall
@@ -120,7 +120,7 @@
 //     <parent: hand S, T to child, run child>
 //     <child: fault on S to land it in map=3; signal demand-paged>
 //     <child: snapshot(T, S); signal ready>
-//     <parent: restart child domain>
+//     <parent: restart child process>
 //     <parent: observe "no resume / terminated" on result port>
 //   That termination-observed assertion (id 1) would replace this
 //   smoke's pass-with-id-0.

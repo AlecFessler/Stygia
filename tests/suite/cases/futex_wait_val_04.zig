@@ -14,13 +14,13 @@
 //   sit in [1, 63] and not exceed `fut_wait_max`, and at least one
 //   addr must not be 8-byte aligned. To prevent the E_BADADDR gate
 //   (test 05) from preempting, the unaligned addr must lie inside a
-//   region that is a valid user address in the caller's domain.
+//   region that is a valid user address in the caller's process.
 //
-//   The simplest in-domain valid user address available to a fresh
+//   The simplest in-process valid user address available to a fresh
 //   test is `cap_table_base` — the read-only handle-table mapping
-//   passed to `_start` per §[create_capability_domain]. It is page-
+//   passed to `_start` per §[create_process]. It is page-
 //   aligned by construction; `cap_table_base + 1` is therefore both
-//   in-domain valid (same page) and not 8-byte aligned (offset 1).
+//   in-process valid (same page) and not 8-byte aligned (offset 1).
 //
 //   Two scenarios cover the "any" wording:
 //     A. N = 1, single pair whose only addr is unaligned. Direct hit

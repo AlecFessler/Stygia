@@ -1,35 +1,35 @@
 // Spec §[restart_semantics] — test 05.
 //
 // "[test 05] returns E_PERM if `create_port` is called with
-//  `caps.restart_policy = 1` and the calling domain's
+//  `caps.restart_policy = 1` and the calling process's
 //  `restart_policy_ceiling.port_restart_max = 0`."
 //
 // Variant chosen: degraded positive-path smoke.
 //
 //   The faithful negative variant requires running `create_port` from a
-//   domain whose `restart_policy_ceiling.port_restart_max = 0`. The
-//   ceiling is fixed on the calling domain's self-handle field1 at
-//   `create_capability_domain` time and cannot be lowered post-hoc on
-//   the test thread's own self-handle. Reaching a domain with that ceiling
-//   from inside this test would mean calling `create_capability_domain`
+//   process whose `restart_policy_ceiling.port_restart_max = 0`. The
+//   ceiling is fixed on the calling process's self-handle field1 at
+//   `create_process` time and cannot be lowered post-hoc on
+//   the test thread's own self-handle. Reaching a process with that ceiling
+//   from inside this test would mean calling `create_process`
 //   with a reduced `ceilings_outer`, staging a separate ELF (or this
 //   ELF re-entered in a different mode) into a fresh page frame, and
 //   plumbing the grandchild's result back through a port — essentially
-//   recreating the runner. The runner provisions the test thread's domain
+//   recreating the runner. The runner provisions the test thread's process
 //   with `port_restart_max = 1` (see `runner/primary.zig` ceilings_outer
 //   = 0x...01FE_FFFF), so `create_port(restart_policy=1)` from this
-//   domain is expected to succeed, not fail.
+//   process is expected to succeed, not fail.
 //
 //   This test exercises the symmetric positive-path: when the calling
-//   domain's `port_restart_max = 1`, `create_port` with
+//   process's `port_restart_max = 1`, `create_port` with
 //   `caps.restart_policy = 1` must succeed and the returned handle's
 //   caps must include the requested `restart_policy` bit. That confirms
 //   the ceiling check accepts the in-bounds case; the E_PERM negative
-//   case for `port_restart_max = 0` is left for the cross-domain
+//   case for `port_restart_max = 0` is left for the cross-process
 //   construction to land (same blocker as revoke_03/04/06).
 //
 // Strategy
-//   The test thread's domain has `port_restart_max = 1` per the runner. Mint
+//   The test thread's process has `port_restart_max = 1` per the runner. Mint
 //   a port with `caps.restart_policy = 1` plus `bind` so the handle is
 //   well-formed (port caps use bitwise subset against `port_ceiling`,
 //   which the runner sets to xfer|recv|bind = 0x1C; restart_policy lives

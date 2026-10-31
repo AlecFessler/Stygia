@@ -9,7 +9,7 @@
 //   A single VMAR cannot serve both roles, so the kernel must reject
 //   any `create_vmar` whose [1] caps word has both bits set.
 //
-//   The runner (runner/primary.zig) installs the test domain with a
+//   The runner (runner/primary.zig) installs the test process with a
 //   permissive `vmar_inner_ceiling`, so r/w and mmio are permitted by
 //   the caller's ceiling — tests 02 (rwx subset) and 04 (mmio not
 //   permitted) cannot intercept.

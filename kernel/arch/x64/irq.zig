@@ -117,7 +117,7 @@ pub fn init() void {
     );
 
     // Lazy-FPU cross-core flush IPI vector. Sent by `cpu.fpuFlushIpi`
-    // when the scheduler migrates an thread whose FP regs still live on
+    // when the scheduler migrates a thread whose FP regs still live on
     // a remote core's hardware. Receiver runs `fpuFlushIpiHandler` to
     // FXSAVE the requested thread's state from this core's regs into
     // the thread's `fpu_state` buffer, then acks the mailbox.
@@ -168,7 +168,7 @@ pub fn init() void {
 /// Device IRQ handler — called for vectors 32-47 (ISA IRQ lines 0-15).
 /// Resolves the firing vector to its bound device_region and delegates
 /// to the generic `device_region.onIrq` path which masks the line, bumps
-/// every domain-local copy of `field1.irq_count`, and futex-wakes
+/// every process-local copy of `field1.irq_count`, and futex-wakes
 /// waiters per Spec §[device_irq].
 ///
 /// The device_region IRQ-source table is keyed on the IOAPIC pin (GSI),

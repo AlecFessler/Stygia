@@ -23,7 +23,7 @@
 //   the port's bind cap (no E_CLOSED) and W is the queued sender.
 //
 //   For (a) we read the reply_handle_id slot out of the cap table
-//   (mapped read-only into the holding domain per §[capabilities])
+//   (mapped read-only into the holding process per §[capabilities])
 //   and check `handleType() == reply`.
 //
 //   For (b) we invoke `reply(reply_handle_id)`. A healthy reply
@@ -131,7 +131,7 @@ pub fn main(cap_table_base: u64) void {
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
     // Step 5: read the slot the kernel named. The cap table is
-    // mapped read-only into the holding domain per §[capabilities];
+    // mapped read-only into the holding process per §[capabilities];
     // word 0 carries the handle-type tag in bits 12-15. The
     // assertion under test demands the inserted handle be a reply
     // handle.

@@ -19,7 +19,7 @@
 //
 //   The blocker is the same one documented in create_var_22.zig: the
 //   v0 runner (runner/primary.zig spawnOne) populates a child
-//   capability domain's table via `create_capability_domain`'s
+//   process's table via `create_process`'s
 //   passed_handles, which on this branch carry only the result port
 //   at slot 3. Slots 0/1/2 are kernel-installed as self / initial thread
 //   / self-IDC. No device_region reaches a test child today.
@@ -41,7 +41,7 @@
 //       forwarded, the faithful test would either grow this to a
 //       deliberately mismatched page count or shrink the device_region
 //       to a different size and assert E_INVAL.
-//   Pass slot 4095 for [2]: per the create_capability_domain table
+//   Pass slot 4095 for [2]: per the create_process table
 //   layout that slot is guaranteed empty, so the kernel rejects with
 //   E_BADCAP via test 02 instead of reaching test 05.
 //

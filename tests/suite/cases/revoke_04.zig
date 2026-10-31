@@ -3,7 +3,7 @@
 // "[test 04] a handle that was copied from [1] and then subsequently
 //  moved is released by revoke([1])."
 //
-// The faithful test requires three capability domains so the chain
+// The faithful test requires three processes so the chain
 // {original in X, copy in Y, moved-from-Y-into-Z} can exist
 // simultaneously, plus a way for X to observe that Z's handle is
 // released after revoke. Building that out of a single test ELF
@@ -14,20 +14,20 @@
 //     Z holds a moved-after-copy descendant of X's original.
 //   - Z observes its own handle's status after X calls revoke.
 //   - Z reports back to X over a separate result port.
-// None of that infrastructure (multi-ELF nesting, cross-domain result
+// None of that infrastructure (multi-ELF nesting, cross-process result
 // reporting beyond the primary↔test result port) exists in the v0
 // runner. Spawning a separate sub-ELF from inside a test, and the
-// "Z reports to X" channel for cross-domain observation, are
+// "Z reports to X" channel for cross-process observation, are
 // prerequisites the runner does not yet provide.
 //
 // Degraded smoke variant
 //   The kernel-side mechanism revoke 04 exercises is the same code
 //   path revoke 03 walks (`copy ancestor → derived holders are
 //   released`). The 04-specific bit is that the chain must survive a
-//   `move` that re-parents the descendant from one domain to another
+//   `move` that re-parents the descendant from one process to another
 //   without orphaning it.
 //
-//   Without nested-spawn + cross-domain reporting we cannot construct
+//   Without nested-spawn + cross-process reporting we cannot construct
 //   that ancestry chain in user space. Instead this test exercises
 //   the success-path shape: revoke on a freshly minted port (no
 //   descendants) returns OK, and the target itself remains usable per

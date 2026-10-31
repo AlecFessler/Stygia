@@ -229,7 +229,7 @@ var core_acked_gen: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 // `flushRemotePcid` cannot use the descriptor-and-wait pattern of the
 // other sync paths above. It is reachable from `pcid.free` →
 // `freeAddrSpaceId` → `caps.destroyPhase2`, which masks IRQs across the
-// entire phase-2 body so the dying domain's frame cannot be preempted
+// entire phase-2 body so the dying process's frame cannot be preempted
 // and abandoned. With smp ≥ 2 and a destroy storm, two cores can be
 // inside `destroyPhase2` simultaneously; each spinning in
 // `waitForShootdownAcks` cannot deliver the other's INVPCID IPI — hard
@@ -288,7 +288,7 @@ var pcid_acks_remaining: [4096]u64 = [_]u64{0} ** 4096;
 /// Bitmap of pcids that are pending-free (awaiting drain). Set by
 /// `flushRemotePcid`, cleared by the allocator's drain pass once
 /// `pcid_acks_remaining[id]` has dropped to zero. Distinguishes
-/// "currently allocated by a live domain" from "pending-free, drainable"
+/// "currently allocated by a live process" from "pending-free, drainable"
 /// — the allocator's bitmap bit alone cannot tell them apart.
 var pcid_pending_free_mask: [PCID_PENDING_WORDS]u64 =
     [_]u64{0} ** PCID_PENDING_WORDS;
@@ -465,7 +465,7 @@ fn ackPendingSyncArmConservative(my_core: u64) void {
 /// `shootdown_lock` contention: ANY IRQs-masked spin on ANY lock
 /// whose holder is (transitively) inside `waitForShootdownAcks`
 /// wedges the machine — captured live (stygia-rs6 mechanism 9) as a
-/// #PF handler spinning IRQs-off on a CapabilityDomain gen-lock
+/// #PF handler spinning IRQs-off on a Process gen-lock
 /// while the lock's holder ran `capability.delete` → `destroyVmar`
 /// → `unmapAll` → sync shootdown, waiting for the spinner's ack.
 /// Cheap when idle: one shared-cacheline load and compare.
@@ -541,7 +541,7 @@ inline fn fanoutShootdownIpis(self_id: u64) void {
 /// both reaching `unmapPage` with IRQs off would each spin on
 /// `shootdown_lock` waiting for the other's ack while neither can
 /// process the other's IPI. The original UAF window described below
-/// remains for this single-page kernel-side unmap; cross-domain user
+/// remains for this single-page kernel-side unmap; cross-process user
 /// mappings shoot down through `shootdownTlbRange`, which IS waited
 /// (see that function for why the IRQ-context concern doesn't
 /// apply).
@@ -574,8 +574,8 @@ fn flushRemoteTlb(virt_addr: u64) void {
 
 /// Queue a per-PCID TLB invalidation for every remote core. Used by
 /// `pcid.free` so a recycled PCID does not inherit stale TLB entries on
-/// cores that previously ran the dying domain. Without this, a CD whose
-/// PCID gets reused by a new domain may resolve user-half VAs to the
+/// cores that previously ran the dying process. Without this, a process whose
+/// PCID gets reused by a new process may resolve user-half VAs to the
 /// freed (and possibly already-reallocated) physical pages of the prior
 /// owner — visible as random user faults / corruption mid-rep on
 /// SMP > 1 once the test runner starts recycling PCIDs.
@@ -1117,9 +1117,9 @@ pub fn unmapPage(
     return phys;
 }
 
-/// Variant of `unmapPage` for the capability-domain destroy path: clears
+/// Variant of `unmapPage` for the process destroy path: clears
 /// the leaf PTE but skips the local INVLPG and the remote-core
-/// shootdown IPI. Safe because no core has the dying CD's CR3 active —
+/// shootdown IPI. Safe because no core has the dying process's CR3 active —
 /// the calling core's own switchAddrSpace runs on its way out of
 /// `scheduler.run`'s next dispatch, and other cores never used it. The
 /// leaf clear lets the subsequent `freeUserAddrSpace` walk distinguish
@@ -1348,7 +1348,7 @@ pub fn unmapPageSized(
     return unmapPage(addr_space_root, virt);
 }
 
-/// Allocate a fresh PML4 table for a new capability domain. Kernel
+/// Allocate a fresh PML4 table for a new process. Kernel
 /// mappings (entries 256..511) are copied from the current address
 /// space so kernel addresses translate identically; user-half entries
 /// (0..255) come up empty for the caller to populate.
@@ -1373,7 +1373,7 @@ pub fn allocAddrSpaceRoot() !PAddr {
 ///   - leaf 4 KiB pages whose physical address is NOT in the
 ///     [skip_phys_start, skip_phys_start + skip_phys_bytes) skip range
 ///     (used by the caller to keep page-aliased buddy blocks alive — the
-///     `mapUserTableView` path aliases the cap-domain's `user_buf` block
+///     `mapUserTableView` path aliases the cap-process's `user_buf` block
 ///     into user space, and that block is freed wholesale via
 ///     `pmm.freeBlock` rather than per-page)
 ///   - the PML4 itself
@@ -1595,7 +1595,7 @@ pub fn shootdownTlbRange(
 /// Publish-and-poll rather than publish-and-wait, deliberately. This is
 /// reachable from `stack.destroyKernel` on paths that hold object
 /// gen-locks (`destroyThreadLocked` runs under the dying
-/// domain's lock) and run with IRQs masked. Blocking for acks there
+/// process's lock) and run with IRQs masked. Blocking for acks there
 /// closes a cycle against the IPC fast path, whose gen-lock CAS spins
 /// are hand-written assembly that runs IRQs-off and services no arms:
 /// the waiter cannot progress until a core acks, and that core cannot
@@ -1642,4 +1642,3 @@ pub fn kernelUnmapEpochRetired(epoch: u64) bool {
     }
     return true;
 }
-

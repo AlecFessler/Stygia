@@ -5,7 +5,7 @@
 //
 // Spec semantics
 //   revoke walks DOWN the copy chain (descendants) but never UP it
-//   (ancestors). Concretely: if domain X has a port and domain Y
+//   (ancestors). Concretely: if process X has a port and process Y
 //   receives a copy of that port from X, then Y holds the descendant
 //   and X holds the ancestor. If Y issues revoke on its own copy, the
 //   spec requires that X's original handle be untouched — the chain
@@ -13,31 +13,31 @@
 //
 // Strategy (degraded variant)
 //   The faithful test would look like:
-//     1. domain X creates port P (ancestor)
+//     1. process X creates port P (ancestor)
 //     2. X spawns child Y with P passed via move=0 (copy)
 //     3. Y revokes its received copy of P
 //     4. X observes that its slot for P is still alive
 //
 //   The current test infrastructure embeds each test ELF directly in
 //   the primary's manifest and spawns each as a single capability
-//   domain. There is no path for a test ELF to embed a second ELF and
+//   process. There is no path for a test ELF to embed a second ELF and
 //   spawn it as a grandchild of the primary, so step 2 above is not
 //   reachable from a single-file test today. Faithfully exercising
 //   this assertion needs a "two-level test" infra extension: a test
 //   that ships its own child ELF, stages it into a page frame at
-//   runtime, and calls create_capability_domain on that page frame.
-//   revoke 03 and revoke 04 face the same gap (multi-domain copy
+//   runtime, and calls create_process on that page frame.
+//   revoke 03 and revoke 04 face the same gap (multi-process copy
 //   chains) and have been deferred for the same reason.
 //
-//   In the meantime we land the trivially-decidable single-domain
+//   In the meantime we land the trivially-decidable single-process
 //   case: a freshly-minted port has no copy ancestors anywhere in the
 //   system, so the "no ancestor handle is released" requirement is
 //   vacuously satisfied. We assert that the call succeeds and the
 //   target's own slot survives (which is also the explicit subject of
 //   revoke 05). This narrows the spec rule to "revoke does not
 //   release the target itself" — a strict subset of test 06's claim
-//   — and leaves the cross-domain ancestor preservation case for the
-//   multi-domain test infra.
+//   — and leaves the cross-process ancestor preservation case for the
+//   multi-process test infra.
 //
 // Action
 //   1. create_port(caps = {bind, recv})             — must succeed

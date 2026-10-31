@@ -60,7 +60,7 @@ pub const SyscallNum = enum(u12) {
     delete = 16,
     revoke = 17,
     sync = 18,
-    create_capability_domain = 19,
+    create_process = 19,
     create_thread = 22,
     self = 23,
     terminate = 24,
@@ -246,7 +246,7 @@ const ext = struct {
     extern fn delete(handle: u16) callconv(.c) c.Regs;
     extern fn revoke(handle: u16) callconv(.c) c.Regs;
     extern fn sync(handle: u16) callconv(.c) c.Regs;
-    extern fn createCapabilityDomain(
+    extern fn createProcess(
         caps: u64,
         ceilings_inner: u64,
         ceilings_outer: u64,
@@ -374,9 +374,9 @@ pub fn sync(handle: u12) Regs {
     return fromCRegs(ext.sync(@as(u16, handle)));
 }
 
-// 4..6: capability-domain ops
+// 4..6: process ops
 
-pub fn createCapabilityDomain(
+pub fn createProcess(
     caps: u64,
     ceilings_inner: u64,
     ceilings_outer: u64,
@@ -384,7 +384,7 @@ pub fn createCapabilityDomain(
     initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
-    return fromCRegs(ext.createCapabilityDomain(
+    return fromCRegs(ext.createProcess(
         caps,
         ceilings_inner,
         ceilings_outer,
@@ -610,7 +610,7 @@ pub fn timeMonotonic() Regs {
 comptime {
     std.debug.assert(@intFromEnum(SyscallNum.@"suspend") == 14);
     std.debug.assert(@intFromEnum(SyscallNum.restrict) == 15);
-    std.debug.assert(@intFromEnum(SyscallNum.create_capability_domain) == 19);
+    std.debug.assert(@intFromEnum(SyscallNum.create_process) == 19);
     std.debug.assert(@intFromEnum(SyscallNum.recv) == 49);
     std.debug.assert(@intFromEnum(SyscallNum.reply) == 52);
 }

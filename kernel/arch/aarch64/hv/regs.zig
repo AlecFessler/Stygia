@@ -58,7 +58,7 @@ pub const HCR_EL2_VSE: u64 = 1 << 8;
 
 /// FB -- Force Broadcast. When 1, certain TLB and cache maintenance
 /// instructions executed at EL1 are broadcast within the inner shareable
-/// domain regardless of the guest's choice.
+/// process regardless of the guest's choice.
 pub const HCR_EL2_FB: u64 = 1 << 9;
 
 /// DC -- Default Cacheability. When 1, stage-1 attributes are forced to
@@ -134,8 +134,8 @@ pub const HCR_EL2_RW: u64 = 1 << 31;
 
 // Upper-half bits we touch:
 
-/// CD -- Stage-1 Cacheability Disable override. (102142 §4.4.)
-pub const HCR_EL2_CD: u64 = 1 << 32;
+/// process -- Stage-1 Cacheability Disable override. (102142 §4.4.)
+pub const HCR_EL2_PROCESS: u64 = 1 << 32;
 
 /// ID -- Stage-1 Instruction Cacheability Disable override.
 pub const HCR_EL2_ID: u64 = 1 << 33;

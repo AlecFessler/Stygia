@@ -5,21 +5,21 @@
 //
 // Strategy
 //   The caller's self-handle carries `fut_wait_max` in field1 bits
-//   32-37 (§[capability_domain]). A faithful test reduces the caller's
+//   32-37 (§[process]). A faithful test reduces the caller's
 //   own `fut_wait_max` to 0, then issues `futex_wait_change` and
 //   expects E_PERM.
 //
 //   Per §[restrict], `restrict` only mutates the caps field (word0
 //   bits 48-63). `fut_wait_max` lives in field1, not in caps, so there
-//   is no syscall in v3 by which a domain can shrink its own
-//   `fut_wait_max` after creation. A domain's `fut_wait_max` is
+//   is no syscall in v3 by which a process can shrink its own
+//   `fut_wait_max` after creation. A process's `fut_wait_max` is
 //   therefore fixed at create time as an inner subset of its
 //   creator's outer ceiling.
 //
 //   The runner (runner/primary.zig) installs ceilings_outer with
-//   bits 32-37 = 63 for every test domain. So inside this test the
+//   bits 32-37 = 63 for every test process. So inside this test the
 //   self-handle's `fut_wait_max` is always 63, and the E_PERM branch
-//   under test is structurally unreachable from a child domain on the
+//   under test is structurally unreachable from a child process on the
 //   v0 runner.
 //
 // Degraded smoke
@@ -35,7 +35,7 @@
 //   interaction is required for the E_PERM check to fire), N = 1
 //   (within `1..63`, isolating from test 02), addr = a stack-local
 //   8-byte-aligned u64 (avoids E_INVAL test 04 on misaligned addr and
-//   E_BADADDR test 05 on a non-domain address), target = 0. With every
+//   E_BADADDR test 05 on a non-process address), target = 0. With every
 //   other reject path closed, only the §[futex_wait_change] test 01
 //   self-cap check can fire — the kernel must return E_PERM.
 //
@@ -63,10 +63,10 @@ pub fn main(cap_table_base: u64) void {
 
     if (fut_wait_max != 0) {
         // Degraded smoke: runner installs `fut_wait_max = 63` and
-        // there is no syscall in v3 that lets a domain shrink its own
+        // there is no syscall in v3 that lets a process shrink its own
         // `fut_wait_max` (restrict only touches caps, not field1).
         // The E_PERM branch under test is therefore structurally
-        // unreachable from a child domain on the v0 runner. Smoke-pass
+        // unreachable from a child process on the v0 runner. Smoke-pass
         // and document; if a future runner mode mints a child with
         // `fut_wait_max = 0`, this branch retires automatically.
         testing.pass();
@@ -74,7 +74,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Stack-local 8-byte aligned u64. Its address sits in this
-    // domain's caller-mapped stack range, so it is a valid user
+    // process's caller-mapped stack range, so it is a valid user
     // address (closes test 05) and naturally 8-byte aligned (closes
     // test 04). target = 0 is irrelevant: the spec test 01 self-cap
     // check fires before any value compare.

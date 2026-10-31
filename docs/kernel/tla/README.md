@@ -173,12 +173,12 @@ derived, and refuted. **Read every RECALLED marker as a defect that has
 not been found yet** — that has been the outcome four rounds running.
 
 **SCOPE (revision 13, normative — `systems.md` §0).** This model checks
-the **thread lifecycle and every state change that moves an thread on, off, or
+the **thread lifecycle and every state change that moves a thread on, off, or
 between CPU cores**, and nothing else. Out of scope, with reasons in
 §0.2: kernel-wide lock ordering (the kernel uses address-ordered
 same-class nesting plus lockdep's dynamic cycle detection; the chain
 project revisions 10–12 built is retracted), analyzer capability,
-migration sequencing, and anything that does not move an thread between
+migration sequencing, and anything that does not move a thread between
 cores — VMAR work, handle-table rewriting, capability cascades. **Do
 not read a green battery here as a statement about any of those.**
 Several rounds' findings were about them; they are recorded
@@ -415,7 +415,7 @@ falsifier).
 Feature gates: `SUSPEND_ON` (5c + edge 7 — cross-thread suspend of a
 RUNNABLE target), **`REQUEUE_ON`** (recv-pop + affinity claim-move),
 `RV_ON` (rendezvous window), `DIR_ON` (directive), `PINLOCK_ON`
-(pin-class locks), `S7_ON` (dead-domain filter route), `CR_BUDGET`
+(pin-class locks), `S7_ON` (dead-process filter route), `CR_BUDGET`
 (edge-1 creation), `TERM_BUDGET` (retires).
 
 **Revision 18 split `SUSPEND_ON`** (POSIX transition). Through revision 17
@@ -470,19 +470,19 @@ here.
 | §9.4 both fused shapes | `FastPath` (suspend FP), `ReplyFP` (reply FP main) | asm conformance out of boundary (`stygia-qde`) |
 | §3.2 edge-4 claimability-at-the-hop | `E4_AT_HOP` switch + the e4 falsifier | the Phase-3b barrier-zero question, answered with teeth |
 | §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchThread` (selected/current commit) -> `DispatchLoad` (final context load), with `DispatchAbort` for lifecycle loss after commit; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary |
-| stygia-8xl vCPU guest-current retire/cancel | `VCPU_THREADS`, `threads[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitDomainQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
+| stygia-8xl vCPU guest-current retire/cancel | `VCPU_THREADS`, `threads[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitProcessQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
 | §3.2 wake body | `WakeStart` (5a/5b) + `WakePlace`/`WakePendDone`; `FireAt` + irq frame bodies | |
 | §3.3 IRQ discipline | masked sections = atomic actions; handler-active = masked (no nesting) | sync-exception rule outside boundary |
 | §3.5 R-claim | claims only inside container-atomic actions (pop+claim fused) or retire | gen-lock half abstracted (no gen) |
 | §3.6 T3 spins (**9 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W6's guest-current vCPU cancellation sub-obligation = `VcpuCancelExit`; W7 = `RetireEnabled` pd guard | Full W6 root teardown, W8 and W9 are not modelled |
 | §3.6 assumption (3), no interrupt storm | `SF_vars(BaseStep)` (STRONG, not weak) | rev 7 claimed the set was complete at two; this is the third, and it was always encoded — just not counted |
 | §4 hop | `HopRelease` (release first) -> `HopCommit{Wait,Requeue,Pended,Retired,Claimed}` | retired arm waits for NOTHING (F1); **rev 8: every commit arm that places picks its destination at placement time (M-2)** |
-| §5 edges 1..10 | 1 = Init + `CreateThread`; 2 = `DispatchThread` + `StealDispatch`, followed by the dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireThread`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
+| §5 edges 1..10 | 1 = Init + `CreateThread`; 2 = `DispatchThread` + `StealDispatch`, followed by the dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-process `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireThread`/`Terminate` + `StealDropDead` for ProcessDie-after-steal-claim | every edge has >= 1 action |
 | §5.1 T1 sources | one generic one-shot (`shot`) = deadline/device rows; rendezvous row = `RvStart` | periodic-scan loser protocol below granularity |
 | §5.2 T2 matrix | `RetireThreadsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
 | §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; running vCPU guest retire sets cancel state when `VCPU_CANCEL`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin and the stygia-8xl arch-cancel requirement |
 | §8.3 rendezvous | `RvStart` + `RvDeliver` | G-RV1 |
-| §8.5 creation | `CreateThread` (publish-last) | CD-lock liveness gate not modelled |
+| §8.5 creation | `CreateThread` (publish-last) | process-lock liveness gate not modelled |
 | §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another thread. |
 | S1/S3/S4/S8 | `InvS1`, `InvS3`, `InvS4Holder`+`InvS4Pended`; S8 by construction | S2/S5/S6 and S7's lock half outside boundary |
 | L1-L6, W3/W4/W5 | `LiveParking/Retired/Ready/Wake/Mark/Claim/Term/Suspender` | L3 states DISPATCH, not merely "leaves ready" |
@@ -552,7 +552,7 @@ incomparable/reconstruction.
   priority ordering.
 - **G11 (NEW, rev 14, LP — round-12 M-2; LEDGERED, not modelled, per
   round-12's blocking bar).** The model **never writes `dir = "dead"`**.
-  The value occurs only in `TypeOK`'s domain; every finalize site writes
+  The value occurs only in `TypeOK`'s process; every finalize site writes
   `"none"`, because revision 12 modelled §8.2's `slot zero` (round-11
   C-1) and collapsed the release body's two writes into one. So §2.5's
   *"`dead` is still mapped to E_TERM"* and §3.4's *"terminal `dead`
@@ -585,7 +585,7 @@ incomparable/reconstruction.
   that hold, `removeNodesExcept` → a further bucket acquire at
   `futex.zig:219`), made safe by an ascending-index discipline and a
   `FUTEX_BUCKET_GROUP` opt-out rather than by any chain. A fourth class
-  (CD gen locks) was missing from the chain entirely. **Lock order is
+  (process gen locks) was missing from the chain entirely. **Lock order is
   outside this model's boundary — TLC contributed nothing to finding
   this and would not have caught it.**
   **XREF CORRECTED (revision 15/16): this entry used to say "recorded as
@@ -696,7 +696,7 @@ incomparable/reconstruction.
 
   **Note the shape, because it is the same one that killed the idle thread
   (G7): a fact that cannot be stated because the state space has one slot
-  where the design has two.** There the missing second slot was an thread per
+  where the design has two.** There the missing second slot was a thread per
   core; here it is a core per kstack. Any invariant whose prose quantifies
   over a PAIR should be checked against the model's arity before it is
   believed to be encoded.
@@ -704,19 +704,19 @@ incomparable/reconstruction.
   LEDGERED, not modelled).** **`PerCore.teardown_pending` and
   `TeardownRequest` are normative in §2.3/§8.2 but have no TLA+ field.**
   The model represents the lifecycle consequence of teardown with
-  `DomDie` (dead-domain marking) plus `RetireThread`; it does not represent
-  the per-core park-stack handoff that carries the CD ref across the
+  `ProcessDie` (dead-process marking) plus `RetireThread`; it does not represent
+  the per-core park-stack handoff that carries the process ref across the
   self-delete hop.
 
   **What is lost:** the model cannot check that the request is produced
   before self-retire, consumed exactly once on the park stack, or that the
-  same CD ref is held across dead-mark and phase 2. Those are
+  same process ref is held across dead-mark and phase 2. Those are
   implementation-ordering facts below the current per-thread lifecycle graph.
   The marked spec now defines the payload shape directly:
-  `{ kind: self_delete | unhandled_fault, cd: SlabRef(CapabilityDomain) }`.
+  `{ kind: self_delete | unhandled_fault, process: SlabRef(Process) }`.
 
-  **Why not model it here:** doing so properly needs the same domain
-  structure needed (`Domain`, CD refs, and scheduler-context phase-1/
+  **Why not model it here:** doing so properly needs the same process
+  structure needed (`Process`, process refs, and scheduler-context phase-1/
   phase-2 ownership). A standalone Boolean would be a ledger-silencing
   token: it would not prove ref identity, exactly-once consumption, or
   dead-mark ordering. This gap needs a dedicated model revision, not
@@ -863,7 +863,7 @@ what its tooling actually RAN.
 
 - **C-1 — `dropped` had no clearing rule.** Round-8's M-3 added a fourth
   directive terminal and modelled it on `dead` — but `dead` is written by
-  finalize on an thread being freed, so "never cleared" is correct THERE and
+  finalize on a thread being freed, so "never cleared" is correct THERE and
   was inherited without its justification. On a live thread it meant one
   stale-port drop left every future suspender's `none → claiming` CAS
   failing forever: the thread becomes **permanently unsuspendable**, i.e.
@@ -909,13 +909,13 @@ what its tooling actually RAN.
   atomicity grants for free. Fixed with a normative §3.3 rule, a §9.2
   spin-entry assert (IRQs enabled, not just `pin_depth == 0`), and a §12
   step-4 that ADDS the entry-path enable alongside the pin gate.
-- **C-5 — domain restart is absent from the machine, and the DERIVATION
+- **C-5 — process restart is absent from the machine, and the DERIVATION
   METHOD is why.** `grep -ni restart systems.md` → zero, while
   `specv3.md` §[restart_semantics] is normative and per-thread
   (`0=kill / 1=restart_at_entry / 2=persist`). `restart_at_entry` has no
-  edge — an thread in any state must be forced runnable with its frame reset
+  edge — a thread in any state must be forced runnable with its frame reset
   to the entry point, which is not edge 6, not 7, not a claim-move — and
-  `persist` keeps an thread running while its domain's VMARs are freed. **The
+  `persist` keeps a thread running while its process's VMARs are freed. **The
   instructive part is the method**: this README's sufficiency table was
   derived by walking the spec's SYSCALL list, and `§[restart_semantics]`
   is not a syscall section. **STATUS as of rev 16: `restart_at_entry` is
@@ -941,7 +941,7 @@ whose guard required the caller to be `running`, which made the caller's
 own retirement *mid-syscall* inexpressible — and with it the entire
 mutual shape. Revision 8 also excluded self-terminate outright, citing
 §8.2. That citation was **wrong**: §8.2 is `delete(SLOT_SELF)` on a
-capability *domain*, a different syscall, and `specv3.md` §[terminate]
+capability *process*, a different syscall, and `specv3.md` §[terminate]
 licenses no error at all for a self target, so `terminate(self())` must
 succeed and belongs in the model.
 
@@ -1236,7 +1236,7 @@ adds the named `AlignmentAssumption`.
   continuation (rev-5-literal machine only).
 - **No fairness** on `UserPark`, `WakeStart`, `SuspendStart`, `RecvPop`,
   `FastPath`, `ReplyFP`, `RvStart`, `DirClaim`, `DirConsume`, `PinAcq`,
-  `CreateThread`, `Terminate`, `RetireThread`, `AffMove`, `DomDie`: new requests,
+  `CreateThread`, `Terminate`, `RetireThread`, `AffMove`, `ProcessDie`: new requests,
   and forcing them could mask liveness bugs. N5's lesson lives elsewhere:
   directive consumption's EVENTUALITY is carried by `TickPreempt`'s rule-3
   arm under the existing `SF(TickPreempt)`, never by forcing
@@ -1523,7 +1523,7 @@ is no longer executing and no modelled rule promises a future user resume
 request. The revised property treats `waiting`/`claimed`/`pended` and
 `retired`/`freed` as legitimate external exits, matching the scoping
 style of `LiveReady`'s claim/retire exits rather than assuming progress
-for an thread another lifecycle operation has parked or killed. This is a
+for a thread another lifecycle operation has parked or killed. This is a
 model/spec correction, not a lifecycle bug mask; a fresh full
 `cr1fullself` verdict for the widened property is still an extended-run
 claim and must be recorded separately when run.
@@ -1809,8 +1809,8 @@ in the section that actually carries the walk — which is the one place
 it could still stop a reader looking. It was false: an independent walk
 found further gaps, including `restrict`'s port-refcount cascade waking suspended senders with E_CLOSED, `revoke`
 (zero mentions in `systems.md`), unhandled faults'
-kernel-initiated domain teardown from EXCEPTION context (a different actor
-than T2's terminator), `delete` of an thread handle mapped to edge 9 against
+kernel-initiated process teardown from EXCEPTION context (a different actor
+than T2's terminator), `delete` of a thread handle mapped to edge 9 against
 a spec that says Threads are not destroyed by handle drops.
 Treat this table as incomplete until it is tool-derived. The sections
 below are confirmed only in the sense that the walk reached them:
@@ -1839,14 +1839,14 @@ distinction a closure table exists to make.
 | **`priority`, waiting target (C2 — rev 7 had this WRONG)** | §8.1: re-bucket every linked wait node under its container lock (port lock; sorted all-buckets for futex) | **no action — the identity transition here** (no state change, no containment change; queues are sets, so intra-container position does not exist). Ledger G9 | the editing thread, under the reaching container lock |
 | **`priority`, ready target** | §8.1: in-lock relink within the SAME run queue — no claim, no state change | as above, no action | the editing thread, under that queue's lock |
 | `priority`, other states | §8.1: the word alone; the next link reads it fresh | as above | the next linker |
-| unhandled memory/thread fault, including invalid port-I/O access | edge 9 through domain teardown | `DomDie` + `RetireThread` | faulting core / teardown worker |
-| `terminate`; `delete`/`revoke` of an thread handle; cascade destroys | edge 9 + W3/W4 + L5 | `Terminate`/`TermWait` (+ env `RetireThread` for teardown walks) | terminator; §5.2 names the finalizer |
+| unhandled memory/thread fault, including invalid port-I/O access | edge 9 through process teardown | `ProcessDie` + `RetireThread` | faulting core / teardown worker |
+| `terminate`; `delete`/`revoke` of a thread handle; cascade destroys | edge 9 + W3/W4 + L5 | `Terminate`/`TermWait` (+ env `RetireThread` for teardown walks) | terminator; §5.2 names the finalizer |
 | `create_thread`, `create_vcpu` | edge 1 | Init + `CreateThread` (`ready`; vCPU initial `vm_exit` is synthesized by first dispatch and normal wait publication) | creator |
-| `delete(SLOT_SELF)` domain teardown; vCPU pre-loop | §8.2 / §8.1 | OUT OF SCOPE, stated: scheduler-context teardown phases and the degenerate-hop loop | park-stack code |
+| `delete(SLOT_SELF)` process teardown; vCPU pre-loop | §8.2 / §8.1 | OUT OF SCOPE, stated: scheduler-context teardown phases and the degenerate-hop loop | park-stack code |
 | IPC fast paths | §9.4 fused compositions | `FastPath`, `ReplyFP` as ideal atomic compositions | pinned asm sites |
-| **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireThread` / `Terminate` | the exiting domain's teardown |
-| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an thread in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
-| **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an thread *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live thread, and it collides directly with `active_root` / translation quiescence (W6): a running thread on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireThread` / `Terminate` | the exiting process's teardown |
+| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no process-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — a thread in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps a thread *running* while its process's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live thread, and it collides directly with `active_root` / translation quiescence (W6): a running thread on a root being rewritten is what `awaitProcessQuiesced` exists to prevent | **not modelled** | — |
 | `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any thread's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
 Two rows in that table are the round-7 additions that closed acceptance
@@ -1862,10 +1862,10 @@ memory-model subtleties — a model at this level would have blessed the
 real 24-byte torn read this project hit on aarch64. Specifically outside
 the boundary: W1 lock internals and **lock ordering** — the one verified
 edge (ThreadGen → CoreLock), the chain round 8 REFUTED and retracted (C-3),
-and F2's lock-order half: all lockdep's domain, none of it checkable
+and F2's lock-order half: all lockdep's process, none of it checkable
 here, and round 8 is the demonstration that a wrong claim in this area
 survives a fully green battery; slab gen / S5 fusion
-and every stale-handle race; S2/S6 writer- and width-discipline; domains
+and every stale-handle race; S2/S6 writer- and width-discipline; processes
 beyond a per-thread dead flag; W6/W8/W9; the §9.4 fast path's asm conformance;
 §3.3's sync-exception rule; **descriptor-write windows and
 instruction orders below action granularity — including C1's claim-side

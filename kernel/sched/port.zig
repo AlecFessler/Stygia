@@ -29,13 +29,13 @@ const arch = stygia.arch.dispatch;
 const spin_diag = stygia.utils.spin_diag;
 const arch_syscall = stygia.arch.dispatch.syscall;
 const capability = stygia.caps.capability;
-const capability_domain = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const errors = stygia.syscall.errors;
 const thread_mod = stygia.sched.thread;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 
-const CapabilityDomain = capability_domain.CapabilityDomain;
+const Process = process_mod.Process;
 const ThreadCaps = thread_mod.ThreadCaps;
 const ThreadQueue = scheduler.ThreadQueue;
 const ErasedSlabRef = capability.ErasedSlabRef;
@@ -354,13 +354,13 @@ var unhandled_prints: u32 = 0;
 
 // ── External API ─────────────────────────────────────────────────────
 
-fn hasContiguousFreeSlots(cd: *CapabilityDomain, n: u8) bool {
+fn hasContiguousFreeSlots(process: *Process, n: u8) bool {
     if (n == 0) return true;
-    if (cd.free_count < n) return false;
+    if (process.free_count < n) return false;
     var run_len: u16 = 0;
     var i: u16 = 3;
-    while (i < capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
-        if (cd.kernel_table[i].ref.ptr == null) {
+    while (i < capability.MAX_HANDLES_PER_PROCESS) : (i += 1) {
+        if (process.kernel_table[i].ref.ptr == null) {
             run_len += 1;
             if (run_len >= n) return true;
         } else {
@@ -370,9 +370,9 @@ fn hasContiguousFreeSlots(cd: *CapabilityDomain, n: u8) bool {
     return false;
 }
 
-fn canFitReplyAndAttachments(cd: *CapabilityDomain, pair_count: u8) bool {
-    return cd.free_count >= 1 + @as(u32, pair_count) and
-        hasContiguousFreeSlots(cd, pair_count);
+fn canFitReplyAndAttachments(process: *Process, pair_count: u8) bool {
+    return process.free_count >= 1 + @as(u32, pair_count) and
+        hasContiguousFreeSlots(process, pair_count);
 }
 
 fn pinReceiver(receiver: *Thread) bool {
@@ -641,12 +641,12 @@ fn waitForSuspendDirective(
 pub fn createPort(caller: *Thread, caps: u64) i64 {
     const port_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
 
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    defer process_ref.unlockIrqRestore(lr.irq_state);
 
-    if (cd.free_count == 0) return errors.E_FULL;
+    if (process.free_count == 0) return errors.E_FULL;
 
     const port = allocPort() catch return errors.E_NOMEM;
 
@@ -661,8 +661,8 @@ pub fn createPort(caller: *Thread, caps: u64) i64 {
         .gen = @intCast(port._gen_lock.currentGen()),
     };
     const port_caps_word: u16 = @bitCast(port_caps);
-    const slot = capability_domain.mintHandle(
-        cd,
+    const slot = process_mod.mintHandle(
+        process,
         obj_ref,
         .port,
         port_caps_word,
@@ -671,7 +671,7 @@ pub fn createPort(caller: *Thread, caps: u64) i64 {
     ) catch {
         // mintHandle failed after onHandleAcquire bumped the refcounts.
         // Roll back via onHandleRelease + finalize the cascade snapshot.
-        // The caller (createPort) holds the CD lock but no port lock;
+        // The caller (createPort) holds the process lock but no port lock;
         // releaseHandle takes the port lock internally.
         releaseHandle(port, port_caps_word);
         return errors.E_FULL;
@@ -690,38 +690,38 @@ pub fn createPort(caller: *Thread, caps: u64) i64 {
 /// delivered. State produced here MUST match what the fast path produces
 /// so the two are interchangeable.
 pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
     const target_slot: u12 = @truncate(target);
     const port_slot: u12 = @truncate(port);
 
-    const target_entry = capability.resolveHandleOnDomain(cd, target_slot, .thread) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const target_entry = capability.resolveHandleOnProcess(process, target_slot, .thread) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
-    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const port_entry = capability.resolveHandleOnProcess(process, port_slot, .port) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
-    const thread_caps: ThreadCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
+    const thread_caps: ThreadCaps = @bitCast(Word0.caps(process.user_table[target_slot].word0));
     if (!thread_caps.susp) {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_PERM;
     }
 
     const target_ref = capability.typedRef(Thread, target_entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
     const port_ref = capability.typedRef(Port, port_entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
 
     if (!lifecycle.selfMarkSuspending(caller)) return errors.E_BUSY;
     defer lifecycle.clearSelfDirective(caller);
@@ -773,7 +773,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
         }
         // Spec §[handle_attachments]: when the caller is suspending a
         // different thread, the pair entries were validated against the
-        // caller's domain in `validatePairEntries` and stashed on the
+        // caller's process in `validatePairEntries` and stashed on the
         // caller's thread. The actual move/copy at recv time runs against
         // the suspended thread (which is what `deliverEvent` sees), so we
         // hand the stash off only after the target commits the remote
@@ -869,7 +869,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
         // reply-time can decide whether receiver mutations apply (Spec
         // §[reply] tests 05/06) and so recv-time gates the suspended thread's
         // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
-        // The caps were captured into `thread_caps` above under the domain lock.
+        // The caps were captured into `thread_caps` above under the process lock.
         const ret = thread_mod.suspendOnPortWithPairHandoffGen(target_thread, caller, p, .suspension, 0, 0, thread_caps.write, thread_caps.read, plr.irq_state, target_ref.gen);
         const should_retry = target_pinned and
             (ret == errors.E_BUSY or ret == errors.E_INVAL) and
@@ -889,21 +889,21 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
 /// `recv` syscall handler. Spec §[port].recv.
 ///
 /// Slow path: if a sender is queued, pair off, mint a reply handle in
-/// the caller's domain, deliver event state via vregs, and return. If no
+/// the caller's process, deliver event state via vregs, and return. If no
 /// sender is queued and the port has bind holders or routes, the caller
 /// suspends as a receiver; otherwise returns E_CLOSED.
 ///
-/// Lock order: caller's CD `_gen_lock` is acquired first, held for the
+/// Lock order: caller's process `_gen_lock` is acquired first, held for the
 /// duration of the Port lock acquisition + port-side work, and only
-/// dropped after `deliverEvent` finishes (which needs CD held to mint
+/// dropped after `deliverEvent` finishes (which needs process held to mint
 /// the reply slot). The Port lock is released before `deliverEvent` runs
-/// so the canonical CD → Port order is never inverted — see the lock-
+/// so the canonical process → Port order is never inverted — see the lock-
 /// order note on `deliverEvent`.
 pub fn recv(caller: *Thread, port: u64, timeout_ns: u64) i64 {
-    // Wrapper: run the recv body (which holds the caller's CD gen-lock
+    // Wrapper: run the recv body (which holds the caller's process gen-lock
     // throughout, including across `deliverEvent`), then execute the
-    // recorded derivation-tree links AFTER the CD lock has dropped —
-    // `derive` takes `tree_mutex` and must never run under a CD
+    // recorded derivation-tree links AFTER the process lock has dropped —
+    // `derive` takes `tree_mutex` and must never run under a process
     // gen-lock (see `caps.derivation.tree_mutex`). Safe to defer: the
     // freshly-minted slots belong to `caller`, who is right here in
     // this syscall and cannot race its own handles.
@@ -922,13 +922,13 @@ fn recvInner(
     deferred: *DeferredDerives,
     moves: *DeferredMoveClears,
 ) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    defer process_ref.unlockIrqRestore(lr.irq_state);
 
     const port_slot: u12 = @truncate(port);
-    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port) orelse
+    const port_entry = capability.resolveHandleOnProcess(process, port_slot, .port) orelse
         return errors.E_BADCAP;
     const port_ref = capability.typedRef(Port, port_entry.*) orelse
         return errors.E_BADCAP;
@@ -948,7 +948,7 @@ fn recvInner(
         // the sender's resume state. (The check moved past the pop
         // because the slot count depends on the sender's stash, but
         // we reset and re-enqueue if we bail.)
-        if (!canFitReplyAndAttachments(cd, sender.pending_pair_count)) {
+        if (!canFitReplyAndAttachments(process, sender.pending_pair_count)) {
             // Re-enqueue: the sender was popped from the head; push
             // it back so a future recv can match it.
             p.waiters.enqueueFront(sender);
@@ -956,9 +956,9 @@ fn recvInner(
             port_ref.unlockIrqRestore(port_irq_state);
             return errors.E_FULL;
         }
-        // Drop the Port lock before deliverEvent — it needs receiver-CD
-        // (the caller's CD, already held by us). Holding both would
-        // re-introduce the Port → CD inversion.
+        // Drop the Port lock before deliverEvent — it needs receiver-process
+        // (the caller's process, already held by us). Holding both would
+        // re-introduce the Port → process inversion.
         const evt_type = sender.event_type;
         const evt_sub = sender.event_subcode;
         const evt_addr = sender.event_addr;
@@ -966,13 +966,13 @@ fn recvInner(
         // Spec §[reply]: the minted reply handle inherits `xfer = 1`
         // iff the recv'ing port carried the `xfer` cap. Snapshot the
         // recv'ing port's xfer cap from the caller's table while the
-        // CD lock is still held; deliverEvent uses it to set the
+        // process lock is still held; deliverEvent uses it to set the
         // minted reply handle's caps below.
-        const port_caps_word: u16 = @truncate(Word0.caps(cd.user_table[port_slot].word0));
+        const port_caps_word: u16 = @truncate(Word0.caps(process.user_table[port_slot].word0));
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         const port_xfer = port_caps_typed.xfer;
         port_ref.unlockIrqRestore(port_irq_state);
-        return deliverEvent(sender, caller, cd, evt_type, evt_sub, evt_addr, pair_count, port_xfer, deferred, moves);
+        return deliverEvent(sender, caller, process, evt_type, evt_sub, evt_addr, pair_count, port_xfer, deferred, moves);
     }
 
     // No sender ready. Spec §[recv] test 04: if the port has no
@@ -992,7 +992,7 @@ fn recvInner(
     // so block-then-fail is observably equivalent to fail-now. Surface
     // E_FULL up front rather than parking and discovering the failure
     // at rendezvous time (which would silently lose the wakeup).
-    if (cd.free_count == 0) {
+    if (process.free_count == 0) {
         port_ref.unlockIrqRestore(port_irq_state);
         return errors.E_FULL;
     }
@@ -1020,12 +1020,12 @@ fn recvInner(
     // with `xfer` derived from the recv'ing handle, not from
     // pair_count.
     {
-        const port_caps_word: u16 = @truncate(Word0.caps(cd.user_table[port_slot].word0));
+        const port_caps_word: u16 = @truncate(Word0.caps(process.user_table[port_slot].word0));
         const port_caps_typed: PortCaps = @bitCast(port_caps_word);
         caller.recv_port_xfer = port_caps_typed.xfer;
     }
     caller.pending_reply_holder = null;
-    caller.pending_reply_domain = null;
+    caller.pending_reply_process = null;
     caller.pending_reply_slot = 0;
     // Deliberately NO `on_cpu` clear here. The caller keeps executing
     // on this very kstack all the way through the syscall epilogue and
@@ -1076,7 +1076,7 @@ pub export fn replyAtomicRecvSendersFallback(
     caller: *Thread,
     recv_port_handle: u64,
 ) callconv(.c) void {
-    // Slow-path recv. Re-acquires the receiver CD lock and the port
+    // Slow-path recv. Re-acquires the receiver process lock and the port
     // gen-lock, observes `.senders` under lock, runs the rendezvous
     // path. Return value is the §[event_state] word for the rendezvous
     // case or `0` for the (race-window: senders drained between asm
@@ -1101,29 +1101,29 @@ pub export fn replyAtomicRecvSendersFallback(
 
 /// `reply` syscall handler. Spec §[reply].reply.
 pub fn reply(caller: *Thread, reply_handle: u64) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(reply_handle);
-    const entry = capability.resolveHandleOnDomain(cd, slot, .reply) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const entry = capability.resolveHandleOnProcess(process, slot, .reply) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const sender_ref = capability.typedRef(Thread, entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     // Snapshot the caps on the reply handle and clear the slot under
-    // the domain lock so a concurrent delete cannot race the resume.
-    const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
+    // the process lock so a concurrent delete cannot race the resume.
+    const reply_caps: ReplyCaps = @bitCast(Word0.caps(process.user_table[slot].word0));
 
-    capability.clearAndFreeSlot(cd, slot, entry);
+    capability.clearAndFreeSlot(process, slot, entry);
 
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
 
     // Spec §[terminate] test 07: when terminate destroys the suspended
     // sender, it marks the reply handle's `abandoned` bit. Subsequent
@@ -1154,8 +1154,8 @@ pub fn reply(caller: *Thread, reply_handle: u64) i64 {
 
     // IRQ-saving acquire: `consumeReply` runs with the sender's
     // thread._gen_lock held; masking IRQs across the held window prevents
-    // the timer ISR's scheduler dispatch from registering an thread→CD
-    // edge that would invert the destroy-side CD→thread ordering. Spec
+    // the timer ISR's scheduler dispatch from registering a thread→process
+    // edge that would invert the destroy-side process→thread ordering. Spec
     // §[reply] writeback discipline; see also the IRQ-acquired class
     // enforcement in `tools/check_gen_lock`.
     const sender_lr = sender_ref.lockIrqSave(@src()) catch return errors.E_TERM;
@@ -1173,22 +1173,22 @@ pub fn reply(caller: *Thread, reply_handle: u64) i64 {
 /// `caller.pending_pair_entries[0..n]` by the syscall layer
 /// (kernel/syscall/reply.zig::replyTransfer); each stashed entry
 /// carries the source's `ErasedSlabRef`, type tag, install caps, the
-/// `move` flag, and the source slot id in the caller's domain.
+/// `move` flag, and the source slot id in the caller's process.
 ///
 /// Order:
-///   1. Resolve the reply handle in caller's domain (no clear yet —
+///   1. Resolve the reply handle in caller's process (no clear yet —
 ///      test 11 demands the caller's table is unchanged on E_FULL).
 ///      Pull the suspended sender out of the entry's typed ref and
 ///      surface E_TERM if the sender slab generation moved (test 10).
-///   2. Lock the resumed sender's domain (== `sender.domain`) and
+///   2. Lock the resumed sender's process (== `sender.process`) and
 ///      reserve N contiguous slots via `allocContiguousFreeSlots`. On
 ///      failure, drop locks and return E_FULL with the reply handle
 ///      still in the caller's table (test 11), releasing the
 ///      validation-time pending object refs.
 ///   3. With contiguous slots reserved, install each pair entry via
-///      `mintHandleAt` at `[tstart, tstart+N)` in the sender's domain.
-///   4. Drop the sender's CD lock; run derivation links and moved-source
-///      deletes through the original source domains with no CD lock
+///      `mintHandleAt` at `[tstart, tstart+N)` in the sender's process.
+///   4. Drop the sender's process lock; run derivation links and moved-source
+///      deletes through the original source processes with no process lock
 ///      held, then consume the reply slot. The reply handle is consumed
 ///      last so test 11's "[1] is NOT consumed on E_FULL" stays
 ///      observably true above.
@@ -1199,19 +1199,19 @@ pub fn reply(caller: *Thread, reply_handle: u64) i64 {
 ///      `originating_write_cap`, mirroring `consumeReply`) and resume
 ///      the sender via `resumeFromReply`.
 pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
-    const caller_cd_ref = caller.domain;
+    const caller_cd_ref = caller.process;
     const slot: u12 = @truncate(reply_handle);
 
-    // Phase 1 — caller's CD: resolve the reply handle, capture the
-    // sender's typed ref, snapshot reply caps. Drop the CD lock before
-    // taking the sender's thread lock to honor the canonical CD-at-a-time
-    // discipline observed by `terminate` (which holds CD across an thread
-    // lock and so registers the order CD → thread with lockdep). Holding
-    // CD across an thread acquire here would otherwise invert that.
+    // Phase 1 — caller's process: resolve the reply handle, capture the
+    // sender's typed ref, snapshot reply caps. Drop the process lock before
+    // taking the sender's thread lock to honor the canonical process-at-a-time
+    // discipline observed by `terminate` (which holds process across a thread
+    // lock and so registers the order process → thread with lockdep). Holding
+    // process across a thread acquire here would otherwise invert that.
     const lr_phase1 = caller_cd_ref.lockIrqSave(@src()) catch
         return clearReplyTransferPendingAndReturn(caller, errors.E_BADCAP);
-    const cd_phase1 = lr_phase1.ptr;
-    const entry = capability.resolveHandleOnDomain(cd_phase1, slot, .reply) orelse {
+    const process_phase1 = lr_phase1.ptr;
+    const entry = capability.resolveHandleOnProcess(process_phase1, slot, .reply) orelse {
         caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
         return clearReplyTransferPendingAndReturn(caller, errors.E_BADCAP);
     };
@@ -1221,7 +1221,7 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
     };
     // Spec §[terminate] test 07: a reply handle whose suspended sender
     // was destroyed via terminate carries the `abandoned` bit.
-    const reply_caps: ReplyCaps = @bitCast(Word0.caps(cd_phase1.user_table[slot].word0));
+    const reply_caps: ReplyCaps = @bitCast(Word0.caps(process_phase1.user_table[slot].word0));
     caller_cd_ref.unlockIrqRestore(lr_phase1.irq_state);
 
     if (reply_caps.abandoned) {
@@ -1233,52 +1233,52 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
         // sender was destroyed via `terminate`, and reply_transfer
         // surfaces that as E_TERM. The reply slot is consumed in
         // either case so subsequent ops don't loop on the same id.
-        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
+        const process_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
             return clearReplyTransferPendingAndReturn(caller, errors.E_TERM);
-        const cd_clear = cd_clear_lr.ptr;
-        if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
-            capability.clearAndFreeSlot(cd_clear, slot, e);
+        const process_clear = process_clear_lr.ptr;
+        if (capability.resolveHandleOnProcess(process_clear, slot, .reply)) |e| {
+            capability.clearAndFreeSlot(process_clear, slot, e);
         }
-        caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
+        caller_cd_ref.unlockIrqRestore(process_clear_lr.irq_state);
         releasePendingPairEntries(caller);
         return errors.E_TERM;
     }
 
     // Phase 2 — sender liveness probe. Take the sender's thread lock just
     // long enough to validate the slab gen and capture the sender's
-    // domain ref. The lock is dropped before the sender's CD is
+    // process ref. The lock is dropped before the sender's process is
     // acquired — sender_cd_ref.lock validates that ref's own gen so
-    // the sender domain pointer doesn't dangle even with the thread lock
-    // released. Holding the thread lock here while taking the CD lock
-    // would invert the kernel-wide CD → thread order.
+    // the sender process pointer doesn't dangle even with the thread lock
+    // released. Holding the thread lock here while taking the process lock
+    // would invert the kernel-wide process → thread order.
     const sender_lr = sender_ref.lockIrqSave(@src()) catch {
-        const cd_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
+        const process_clear_lr = caller_cd_ref.lockIrqSave(@src()) catch
             return clearReplyTransferPendingAndReturn(caller, errors.E_TERM);
-        const cd_clear = cd_clear_lr.ptr;
-        if (capability.resolveHandleOnDomain(cd_clear, slot, .reply)) |e| {
-            capability.clearAndFreeSlot(cd_clear, slot, e);
+        const process_clear = process_clear_lr.ptr;
+        if (capability.resolveHandleOnProcess(process_clear, slot, .reply)) |e| {
+            capability.clearAndFreeSlot(process_clear, slot, e);
         }
-        caller_cd_ref.unlockIrqRestore(cd_clear_lr.irq_state);
+        caller_cd_ref.unlockIrqRestore(process_clear_lr.irq_state);
         releasePendingPairEntries(caller);
         return errors.E_TERM;
     };
     const sender = sender_lr.ptr;
-    const sender_cd_ref = sender.domain;
+    const sender_cd_ref = sender.process;
     // Spec §[reply] typed routing — pick up the originating event_type
     // while we hold the sender lock so reply-side state writeback below
     // can branch on it without re-locking.
     const sender_event_type = sender.event_type;
     sender_ref.unlockIrqRestore(sender_lr.irq_state);
 
-    // Phase 3 — sender's CD: reserve N contiguous slots and install
-    // each pair entry. CD-at-a-time: caller's CD is unlocked here, no
+    // Phase 3 — sender's process: reserve N contiguous slots and install
+    // each pair entry. process-at-a-time: caller's process is unlocked here, no
     // other lock is held.
     const sender_cd_lr = sender_cd_ref.lockIrqSave(@src()) catch {
         releasePendingPairEntries(caller);
         return errors.E_BADCAP;
     };
-    const sender_cd = sender_cd_lr.ptr;
-    const tstart = capability_domain.allocContiguousFreeSlots(sender_cd, n) catch {
+    const sender_process = sender_cd_lr.ptr;
+    const tstart = process_mod.allocContiguousFreeSlots(sender_process, n) catch {
         // Test 11: [1] is NOT consumed and the caller's table is
         // unchanged on E_FULL.
         sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
@@ -1287,19 +1287,19 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
     };
 
     // Spec §[idc_rx] test 01: IDC handles delivered to the sender's
-    // domain get caps ∩ sender_cd.idc_rx (self-handle field0 bits 32-39).
-    const sender_idc_rx: u16 = @truncate((sender_cd.user_table[0].field0 >> 32) & 0xFF);
+    // process get caps ∩ sender_process.idc_rx (self-handle field0 bits 32-39).
+    const sender_idc_rx: u16 = @truncate((sender_process.user_table[0].field0 >> 32) & 0xFF);
     var k: u8 = 0;
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
         const target_slot: u12 = @intCast(@as(u16, tstart) + k);
-        const installed_caps: u16 = if (stash.obj_type == .capability_domain)
+        const installed_caps: u16 = if (stash.obj_type == .process)
             stash.caps & sender_idc_rx
         else
             stash.caps;
         acquireTransferredHandleRef(stash, installed_caps);
-        capability_domain.mintHandleAt(
-            sender_cd,
+        process_mod.mintHandleAt(
+            sender_process,
             target_slot,
             stash.obj_ref,
             stash.obj_type,
@@ -1308,22 +1308,22 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
             0,
         );
     }
-    // Snapshot the sender-CD ref while its gen is provably live (lock
+    // Snapshot the sender-process ref while its gen is provably live (lock
     // still held) for the post-unlock derive loop below.
     const sender_dom_ref_for_derive: capability.ErasedSlabRef = .{
-        .ptr = sender_cd,
-        .gen = @intCast(sender_cd._gen_lock.currentGen()),
+        .ptr = sender_process,
+        .gen = @intCast(sender_process._gen_lock.currentGen()),
     };
     sender_cd_ref.unlockIrqRestore(sender_cd_lr.irq_state);
 
     // Spec §[capabilities].revoke: hang each new alias in the sender's
-    // domain under the source handle in its original holder domain.
-    // Runs AFTER the sender-CD gen-lock dropped: `derive`
-    // takes `tree_mutex`, and the old in-loop call (with the CD held
+    // process under the source handle in its original holder process.
+    // Runs AFTER the sender-process gen-lock dropped: `derive`
+    // takes `tree_mutex`, and the old in-loop call (with the process held
     // via `held_dom`) was one half of a live AB-BA against the
-    // domain-teardown tree walk — this core spinning on `tree_mutex`
-    // holding sender_cd, the teardown core holding `tree_mutex`
-    // spinning on sender_cd (see `caps.derivation.tree_mutex`).
+    // process-teardown tree walk — this core spinning on `tree_mutex`
+    // holding sender_process, the teardown core holding `tree_mutex`
+    // spinning on sender_process (see `caps.derivation.tree_mutex`).
     // Ordering is safe: the suspended sender cannot use (or delete)
     // the minted handles until `deliverReplyTransferResume` marks it
     // ready in phase 5, and `derive` re-validates gens / bails on
@@ -1332,7 +1332,7 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
         _ = stygia.caps.derivation.deriveExpected(
-            stash.source_domain,
+            stash.source_process,
             stash.src_slot,
             stash.obj_ref,
             stash.obj_type,
@@ -1356,7 +1356,7 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
         const stash = caller.pending_pair_entries[k];
         if (!stash.move) continue;
         _ = stygia.caps.derivation.deleteAndDetachExpected(
-            stash.source_domain,
+            stash.source_process,
             stash.src_slot,
             stash.obj_ref,
             stash.obj_type,
@@ -1365,12 +1365,12 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
         );
     }
 
-    // Phase 4 — caller's CD: consume the reply slot. Same
-    // single-CD-at-a-time pattern; moved source slots were consumed
+    // Phase 4 — caller's process: consume the reply slot. Same
+    // single-process-at-a-time pattern; moved source slots were consumed
     // above through derivation.deleteAndDetachExpected so their
     // children are reparented before the source is cleared.
-    const cd_phase4_lr = caller_cd_ref.lockIrqSave(@src()) catch {
-        // Caller's CD is gone mid-transfer. The sender-side install
+    const process_phase4_lr = caller_cd_ref.lockIrqSave(@src()) catch {
+        // Caller's process is gone mid-transfer. The sender-side install
         // already committed; resume the sender so the test thread's death
         // doesn't strand a parked sender forever.
         releasePendingPairEntries(caller);
@@ -1380,19 +1380,19 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
         deliverReplyTransferResume(caller, sender2, n, tstart, new_rip, sender_event_type);
         return errors.OK;
     };
-    const cd_phase4 = cd_phase4_lr.ptr;
-    if (capability.resolveHandleOnDomain(cd_phase4, slot, .reply)) |reply_entry| {
-        capability.clearAndFreeSlot(cd_phase4, slot, reply_entry);
+    const process_phase4 = process_phase4_lr.ptr;
+    if (capability.resolveHandleOnProcess(process_phase4, slot, .reply)) |reply_entry| {
+        capability.clearAndFreeSlot(process_phase4, slot, reply_entry);
     }
-    caller_cd_ref.unlockIrqRestore(cd_phase4_lr.irq_state);
+    caller_cd_ref.unlockIrqRestore(process_phase4_lr.irq_state);
 
     releasePendingPairEntries(caller);
 
     // Phase 5 — sender's thread: stage the §[event_state] return word and
     // resume. Re-lock the sender; if the slab gen has moved between
     // phases the sender was reaped concurrently, in which case the
-    // installed handles in the sender's CD become orphans (they share
-    // the domain's lifetime, so they'll be reclaimed when the domain
+    // installed handles in the sender's process become orphans (they share
+    // the process's lifetime, so they'll be reclaimed when the process
     // dies). The reply handle is already consumed; surface OK so the
     // caller observes a clean transfer.
     const sender2_lr = sender_ref.lockIrqSave(@src()) catch return errors.OK;
@@ -1449,7 +1449,7 @@ fn deliverReplyTransferResume(
     thread_mod.resumeFromReply(sender, sender.originating_write_cap);
 }
 
-/// Report an unhandled user fault before tearing down its domain.
+/// Report an unhandled user fault before tearing down its process.
 /// The fault path may hold locks, so use the raw printer.
 fn reportUnhandledFault(
     thread: *Thread,
@@ -1508,8 +1508,8 @@ fn maybePrintReportDelivered(sender: *Thread, receiver: *Thread, reply_slot: u12
     );
 }
 
-fn queueFaultDomainTeardown(thread: *Thread, kind: scheduler.TeardownKind) void {
-    scheduler.queueCurrentTeardown(.{ .kind = kind, .cd = thread.domain });
+fn queueFaultProcessTeardown(thread: *Thread, kind: scheduler.TeardownKind) void {
+    scheduler.queueCurrentTeardown(.{ .kind = kind, .process = thread.process });
     thread_mod.parkSelfFaulted(thread);
     if (scheduler.currentThread() == thread) scheduler.hopParkRun();
 }
@@ -1517,13 +1517,13 @@ fn queueFaultDomainTeardown(thread: *Thread, kind: scheduler.TeardownKind) void 
 pub fn fireMemoryFault(thread: *Thread, subcode: u8, fault_addr: u64) void {
     reportUnhandledFault(thread, "memory_fault", "unhandled_memory_fault", subcode, fault_addr);
 
-    queueFaultDomainTeardown(thread, .unhandled_fault);
+    queueFaultProcessTeardown(thread, .unhandled_fault);
 }
 
-/// An unhandled thread fault tears down the thread's domain.
+/// An unhandled thread fault tears down the thread's process.
 pub fn fireThreadFault(thread: *Thread, subcode: u8, payload: u64) void {
     reportUnhandledFault(thread, "thread_fault", "unhandled_thread_fault", subcode, payload);
-    queueFaultDomainTeardown(thread, .unhandled_fault);
+    queueFaultProcessTeardown(thread, .unhandled_fault);
 }
 
 /// A breakpoint trap has no userspace route. The architecture owns trap advancement.
@@ -1619,9 +1619,9 @@ pub fn finalizePendingVcpus(head: ?SlabRef(Thread)) void {
         // through the captured SlabRef so a stale/recycled thread slot is
         // rejected by the gen-lock.
         lifecycle.releasePin(thread);
-        // Port-cascade teardown is not domain teardown: the vCPU's domain is
+        // Port-cascade teardown is not process teardown: the vCPU's process is
         // still live, so pending replies must be abandoned through the normal
-        // live-domain path instead of the same-CD teardown shortcut.
+        // live-process path instead of the same-process teardown shortcut.
         thread_mod.destroyThreadRefLocked(thread_ref, null);
         cur = next;
     }
@@ -1822,26 +1822,26 @@ fn popHighestPriorityReceiver(p: *Port) ?*Thread {
 }
 
 /// Rendezvous + delivery — called once a (sender, receiver) pair is
-/// identified. Mints a reply handle in receiver's domain, processes
+/// identified. Mints a reply handle in receiver's process, processes
 /// attachments, writes event-state vregs, transitions states.
 ///
 /// Slow-path mirror of arch/x64/interrupts.zig Phase 4: the syscall
 /// return word and event-state vregs written here MUST match what the
 /// fast path produces so the two are interchangeable.
 ///
-/// LOCK ORDER: Caller MUST already hold `dom` (receiver's CD `_gen_lock`)
+/// LOCK ORDER: Caller MUST already hold `dom` (receiver's process `_gen_lock`)
 /// AND MUST NOT hold any Port `_gen_lock`. Canonical order across the
-/// kernel is `CapabilityDomain` → `Port`; the matching `delete` path
-/// takes CD then dispatches to `port.releaseHandle` which takes Port,
+/// kernel is `Process` → `Port`; the matching `delete` path
+/// takes process then dispatches to `port.releaseHandle` which takes Port,
 /// so this side must finish all Port-held work and drop Port BEFORE
-/// reaching here. Holding Port across the CD acquisition done by the
+/// reaching here. Holding Port across the process acquisition done by the
 /// previous version of this function created an AB-BA cycle observed
 /// by lockdep at port.zig:613 vs port.zig:552.
 /// Derivation-tree link work recorded by `deliverEvent` for execution
-/// AFTER the receiver-CD gen-lock drops. `derive` takes `tree_mutex`
-/// and must never run with a CD gen-lock held (see the tree_mutex
+/// AFTER the receiver-process gen-lock drops. `derive` takes `tree_mutex`
+/// and must never run with a process gen-lock held (see the tree_mutex
 /// order contract in `caps.derivation`) — the old inline derive inside
-/// `deliverEvent`'s mint loop deadlocked against the domain-teardown
+/// `deliverEvent`'s mint loop deadlocked against the process-teardown
 /// tree walk. `src_slots` is bounded by the pair-transfer stash size.
 pub const DeferredDerives = struct {
     child_dom: capability.ErasedSlabRef = .{ .ptr = null, .gen = 0 },
@@ -1854,8 +1854,8 @@ pub const DeferredDerives = struct {
     parent_instances: [thread_mod.MAX_PAIR_ENTRIES_PER_THREAD]u64 = undefined,
     src_slots: [thread_mod.MAX_PAIR_ENTRIES_PER_THREAD]u12 = undefined,
 
-    /// Run the recorded links. Caller must hold NO CD gen-lock. Every
-    /// `derive` re-validates both domains' gens and bails on slots a
+    /// Run the recorded links. Caller must hold NO process gen-lock. Every
+    /// `derive` re-validates both processes' gens and bails on slots a
     /// racer touched in the deferral window, so a stale record is a
     /// silent no-op.
     pub fn run(self: *const DeferredDerives) void {
@@ -1889,7 +1889,7 @@ pub const DeferredMoveClears = struct {
         while (k < self.count) : (k += 1) {
             const entry = self.entries[k];
             _ = stygia.caps.derivation.deleteAndDetachExpected(
-                entry.source_domain,
+                entry.source_process,
                 entry.src_slot,
                 entry.obj_ref,
                 entry.obj_type,
@@ -1909,7 +1909,7 @@ pub const RendezvousResult = union(enum) {
 fn deliverEvent(
     sender: *Thread,
     receiver: *Thread,
-    dom: *CapabilityDomain,
+    dom: *Process,
     event_type: EventType,
     subcode: u8,
     event_addr: u64,
@@ -1938,17 +1938,17 @@ fn deliverEvent(
 
     // Spec §[handle_attachments]: when the sender stashed pair entries
     // at suspend time, install them now in `[tstart, tstart+N)` of the
-    // receiver's domain. The sender stash captured the source object's
-    // ErasedSlabRef under the sender's domain lock, so the gen baked
+    // receiver's process. The sender stash captured the source object's
+    // ErasedSlabRef under the sender's process lock, so the gen baked
     // into each entry matches a live object as long as the object
     // hasn't been destroyed in the interim. We install via
-    // `mintHandleAt` to bypass the at-most-one-per-(domain, object)
+    // `mintHandleAt` to bypass the at-most-one-per-(process, object)
     // coalescing (spec test 08 requires N fresh slots even when the
     // receiver already holds a handle to the same object).
     var tstart: u12 = 0;
     var reply_slot: u12 = 0;
     if (pair_count > 0) {
-        tstart = capability_domain.allocContiguousFreeSlots(dom, pair_count) catch {
+        tstart = process_mod.allocContiguousFreeSlots(dom, pair_count) catch {
             // Couldn't reserve a contiguous run — should have been
             // caught by the free_count pre-check, but the contiguous
             // requirement can fail even when there are enough total
@@ -1957,7 +1957,7 @@ fn deliverEvent(
             arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
             return errors.E_FULL;
         };
-        // Spec §[idc_rx] test 01: when a domain receives an IDC handle
+        // Spec §[idc_rx] test 01: when a process receives an IDC handle
         // over IDC, the installed caps = granted ∩ receiver's idc_rx.
         // idc_rx lives in receiver self-handle field0 bits 32-39.
         const dom_idc_rx: u16 = @truncate((dom.user_table[0].field0 >> 32) & 0xFF);
@@ -1967,7 +1967,7 @@ fn deliverEvent(
             const target_slot: u12 = @intCast(@as(u16, tstart) + k);
             // Spec §[idc_rx] test 01: when receiving an IDC handle over
             // IDC, installed caps = granted ∩ receiver's idc_rx.
-            const installed_caps: u16 = if (entry.obj_type == .capability_domain)
+            const installed_caps: u16 = if (entry.obj_type == .process)
                 entry.caps & dom_idc_rx
             else
                 entry.caps;
@@ -1977,7 +1977,7 @@ fn deliverEvent(
             // the source slot cannot destroy the object out from under
             // the receiver's freshly minted handle.
             acquireTransferredHandleRef(entry, installed_caps);
-            capability_domain.mintHandleAt(
+            process_mod.mintHandleAt(
                 dom,
                 target_slot,
                 entry.obj_ref,
@@ -1988,14 +1988,14 @@ fn deliverEvent(
             );
 
             // Spec §[capabilities].revoke: hang the new alias in the
-            // receiver's domain under the source handle in its original
-            // holder domain so a future revoke on any ancestor of that
+            // receiver's process under the source handle in its original
+            // holder process so a future revoke on any ancestor of that
             // source reaches the alias.
             // RECORDED, not executed: `derive` takes `tree_mutex`, and
-            // the receiver's CD gen-lock is held here — running it
-            // inline is the `CD → tree_mutex` inversion that
+            // the receiver's process gen-lock is held here — running it
+            // inline is the `process → tree_mutex` inversion that
             // deadlocked against the teardown tree walk. The caller
-            // runs `deferred.run()` after this CD lock drops (and, on
+            // runs `deferred.run()` after this process lock drops (and, on
             // the rendezvous path, before the receiver is marked
             // ready, so the fresh slots cannot be raced by their
             // owner).
@@ -2004,7 +2004,7 @@ fn deliverEvent(
                 .gen = @intCast(dom._gen_lock.currentGen()),
             };
             deferred.tstart = tstart;
-            deferred.parent_doms[deferred.count] = entry.source_domain;
+            deferred.parent_doms[deferred.count] = entry.source_process;
             deferred.parent_refs[deferred.count] = entry.obj_ref;
             deferred.parent_types[deferred.count] = entry.obj_type;
             deferred.parent_caps[deferred.count] = entry.source_caps;
@@ -2016,7 +2016,7 @@ fn deliverEvent(
         }
 
         // Mint the reply handle before recording moved-source deletes.
-        // In a same-domain recv, deleting first returns the moved source
+        // In a same-process recv, deleting first returns the moved source
         // slot to the receiver's free list, letting the reply handle
         // reuse it and making the source look occupied immediately
         // after recv.
@@ -2137,13 +2137,13 @@ fn deliverEvent(
 /// Sender-side rendezvous with a waiting receiver. Caller is the
 /// suspended sender thread (state already set to `.suspended_on_port` by
 /// the suspendOnPort path); we dequeue the highest-priority waiting
-/// receiver, mint a reply handle in the receiver's domain, write the
+/// receiver, mint a reply handle in the receiver's process, write the
 /// event-state syscall return into the receiver's iret frame, and
 /// enqueue the receiver as ready.
 ///
 /// Caller MUST hold `p._gen_lock`. On a successful match (`.delivered`
 /// returned) the function RELEASES that Port lock before acquiring the
-/// receiver's CD lock — canonical kernel order is CD → Port and Port
+/// receiver's process lock — canonical kernel order is process → Port and Port
 /// must be dropped before deliverEvent reaches mintReply. Callers must
 /// therefore not also unlock `p` themselves on the success path.
 /// Returns `.no_receiver` (with `p._gen_lock` still held) if no receiver was
@@ -2190,14 +2190,14 @@ pub fn rendezvousWithReceiver(
             removeTimedRecvWaiter(receiver);
         }
 
-        // Snapshot receiver's CD ref under the port lock, then drop the
-        // port lock before acquiring the CD lock. The receiver is no
+        // Snapshot receiver's process ref under the port lock, then drop the
+        // port lock before acquiring the process lock. The receiver is no
         // longer queued on the port; the short lifecycle pin above keeps
         // its slab slot live until delivery/failure publication finishes.
-        // Holding port across the CD acquisition would re-introduce the
+        // Holding port across the process acquisition would re-introduce the
         // AB-BA cycle that lockdep catches against the
         // `delete → releaseHandle` path.
-        const receiver_dom_ref = receiver.domain;
+        const receiver_dom_ref = receiver.process;
         if (!temp_recv_ref) {
             incRecvRef(p) catch unreachable;
             temp_recv_ref = true;
@@ -2233,8 +2233,8 @@ pub fn rendezvousWithReceiver(
             &deferred,
             &moves,
         );
-        // Drop the receiver-CD lock BEFORE running the recorded derivation
-        // links: `derive` takes `tree_mutex`, and holding a CD gen-lock
+        // Drop the receiver-process lock BEFORE running the recorded derivation
+        // links: `derive` takes `tree_mutex`, and holding a process gen-lock
         // across that acquire is the AB-BA against the teardown tree walk
         // (see `caps.derivation.tree_mutex`). Running the links BEFORE
         // `markReady` keeps the fresh slots unracable: the receiver — the
@@ -2265,9 +2265,9 @@ pub fn rendezvousWithReceiver(
     }
 }
 
-/// Mint a reply handle in `receiver_domain`'s table pointing at the
+/// Mint a reply handle in `receiver_process`'s table pointing at the
 /// suspended `sender` thread. Sets `sender.pending_reply_holder` back-pointer.
-fn mintReply(receiver_domain: *CapabilityDomain, sender: *Thread, xfer: bool) !u12 {
+fn mintReply(receiver_process: *Process, sender: *Thread, xfer: bool) !u12 {
     const reply_caps: ReplyCaps = .{
         .move = true,
         .copy = false,
@@ -2278,8 +2278,8 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *Thread, xfer: bool) !u
         .ptr = sender,
         .gen = @intCast(sender._gen_lock.currentGen()),
     };
-    const slot = try capability_domain.mintHandle(
-        receiver_domain,
+    const slot = try process_mod.mintHandle(
+        receiver_process,
         obj_ref,
         .reply,
         @bitCast(reply_caps),
@@ -2287,10 +2287,10 @@ fn mintReply(receiver_domain: *CapabilityDomain, sender: *Thread, xfer: bool) !u
         0,
     );
 
-    sender.pending_reply_holder = &receiver_domain.kernel_table[slot];
-    sender.pending_reply_domain = SlabRef(CapabilityDomain).init(
-        receiver_domain,
-        receiver_domain._gen_lock.currentGen(),
+    sender.pending_reply_holder = &receiver_process.kernel_table[slot];
+    sender.pending_reply_process = SlabRef(Process).init(
+        receiver_process,
+        receiver_process._gen_lock.currentGen(),
     );
     sender.pending_reply_slot = slot;
     sender.wait.kind = .reply;

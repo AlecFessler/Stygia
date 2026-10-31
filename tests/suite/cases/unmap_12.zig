@@ -9,7 +9,7 @@
 //   `unmap` mutates the kernel-side VMAR state (`map` and, for mmio,
 //   `device`); for handle-table consumers to observe that mutation
 //   without an explicit `sync`, the syscall must refresh [1]'s field0
-//   and field1 in the holding domain's (read-only) cap table on every
+//   and field1 in the holding process's (read-only) cap table on every
 //   call where [1] resolves to a valid handle — both the success path
 //   and the post-resolution error paths. We exercise both legs:
 //
@@ -80,7 +80,7 @@
 //   3: post-success cap-table snapshot of field1's `map` is not 0 —
 //      the success-path refresh did not propagate the kernel's
 //      authoritative `map = 0` (set by §[unmap] test 08) into the
-//      holding domain's cap table.
+//      holding process's cap table.
 
 const lib = @import("lib");
 

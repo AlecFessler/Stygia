@@ -1,14 +1,14 @@
 // Spec §[reply] reply — test 22.
 //
 // "[test 22] returns E_BADCAP when `recv_port_handle_id != 0` and that
-//  slot does not name a valid port handle in the caller's domain; the
+//  slot does not name a valid port handle in the caller's process; the
 //  reply handle is NOT consumed and the caller does not park."
 //
 // Strategy
 //   To exercise the recv-port gate we must arrive at the reply syscall
 //   with a real reply handle in the caller's table — otherwise the
 //   reply-handle gate (test 01) would fire first. Pipeline (single
-//   domain, test thread owns both ends):
+//   process, test thread owns both ends):
 //
 //     1. mint port with caps = {bind, recv}     — xfer not needed since
 //        pair_count = 0, but bind is required for suspend (§[suspend]
@@ -21,7 +21,7 @@
 //        with the reply handle id encoded in syscall word bits 32-43.
 //     5. unified reply syscall with pair_count = 0 and
 //        recv_port_handle_id = 4095. Slot 4095 is guaranteed empty by
-//        the create_capability_domain table layout (slot 0 = self,
+//        the create_process table layout (slot 0 = self,
 //        1 = initial thread, 2 = self-IDC, 3+ = passed_handles), so it
 //        cannot name a valid port handle. The kernel must return
 //        E_BADCAP and must NOT consume the reply handle.
@@ -123,7 +123,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 5: probe the recv-port gate. Slot 4095 is guaranteed empty
-    // (create_capability_domain table layout — see reply_01.zig). The
+    // (create_process table layout — see reply_01.zig). The
     // unified reply syscall word per §[reply]:
     //   bits  0-11: syscall_num (52 = reply)
     //   bits 12-19: pair_count (0)
@@ -150,21 +150,21 @@ pub fn main(cap_table_base: u64) void {
                 : [v1] "={rax}" (rax_out),
                 : [w] "{rcx}" (word),
                 : .{
-                    .rcx = true,
-                    .rdx = true,
-                    .rbx = true,
-                    .rbp = true,
-                    .rsi = true,
-                    .rdi = true,
-                    .r8 = true,
-                    .r9 = true,
-                    .r10 = true,
-                    .r11 = true,
-                    .r12 = true,
-                    .r13 = true,
-                    .r14 = true,
-                    .r15 = true,
-                    .memory = true,
+                  .rcx = true,
+                  .rdx = true,
+                  .rbx = true,
+                  .rbp = true,
+                  .rsi = true,
+                  .rdi = true,
+                  .r8 = true,
+                  .r9 = true,
+                  .r10 = true,
+                  .r11 = true,
+                  .r12 = true,
+                  .r13 = true,
+                  .r14 = true,
+                  .r15 = true,
+                  .memory = true,
                 });
         },
         .aarch64 => {
@@ -175,12 +175,7 @@ pub fn main(cap_table_base: u64) void {
                 \\ add sp, sp, #16
                 : [v1] "={x0}" (rax_out),
                 : [w] "r" (word),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
         },
         else => @compileError("unsupported target architecture"),
     }

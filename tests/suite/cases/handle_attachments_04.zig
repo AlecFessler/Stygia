@@ -14,7 +14,7 @@
 //   handle_attachments_02 and 03).
 //
 //   For the source handle we use the test child's initial thread at
-//   slot 1. Per §[create_capability_domain] test 21 the initial thread's
+//   slot 1. Per §[create_process] test 21 the initial thread's
 //   caps equal the runner's `thread_inner_ceiling`, which the runner sets
 //   to 0xFF — bits 0-7 of `ThreadCap`: {move, copy, saff, spri, term,
 //   susp, read, write}. To set up the precondition for test 04 we
@@ -158,10 +158,7 @@ fn suspendWithOnePairAtV127Arm(word: u64, target: u64, port: u64, entry: u64) sy
           [entry] "r" (entry),
           [iv1] "{x0}" (target),
           [iv2] "{x1}" (port),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     return .{
         .v1 = ov1,

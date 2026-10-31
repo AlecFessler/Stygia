@@ -1,27 +1,27 @@
 // Spec §[restart_semantics] restart_semantics — test 04.
 //
 // "[test 04] returns E_PERM if `create_virtual_machine` is called with
-//  `caps.restart_policy = 1` and the calling domain's
+//  `caps.restart_policy = 1` and the calling process's
 //  `restart_policy_ceiling.vm_restart_max = 0`."
 //
 // Strategy (DEGRADED SMOKE VARIANT)
-//   The faithful shape requires the calling domain to have
+//   The faithful shape requires the calling process to have
 //   `vm_restart_max = 0` so create_virtual_machine with
 //   `caps.restart_policy = 1` triggers the spec-mandated E_PERM. The
 //   primary runner (runner/primary.zig) currently spawns each test in a
-//   child capability domain whose `restart_policy_ceiling` field has
+//   child process whose `restart_policy_ceiling` field has
 //   `vm_restart_max = 1` (bit 7 of the ceiling = 1, encoded in
 //   ceilings_outer = 0x0000_003F_01FE_FFFF). With vm_restart_max = 1,
 //   `caps.restart_policy = 1` is *within* the ceiling and the kernel
 //   must NOT return E_PERM on that field — the spec violation can't
-//   fire from inside the runner's child domain as currently provisioned.
+//   fire from inside the runner's child process as currently provisioned.
 //
 //   Reaching the violation faithfully would require either:
-//     - the runner spawning this test in a sibling domain whose
+//     - the runner spawning this test in a sibling process whose
 //       ceilings_outer carves vm_restart_max back out (orthogonal to
 //       this test, and would weaken the rest of the runner's test
 //       fixture); or
-//     - this test creating a sub-sub-domain with vm_restart_max = 0
+//     - this test creating a sub-sub-process with vm_restart_max = 0
 //       and shipping an embedded ELF inside it that performs the
 //       create_virtual_machine call (significant infrastructure: a
 //       second ELF image embedded into this test, plus a result-port
@@ -95,7 +95,7 @@ pub fn main(cap_table_base: u64) void {
 
     // SPEC TEST INVERSION: under the runner's vm_restart_max = 1, the
     // spec line forbids E_PERM on this exact call. The faithful E_PERM
-    // path needs vm_restart_max = 0 in the calling domain — see the
+    // path needs vm_restart_max = 0 in the calling process — see the
     // strategy comment for why that's not yet wired.
     if (result.v1 == @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(2);

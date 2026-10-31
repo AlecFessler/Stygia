@@ -25,7 +25,7 @@
 //   Second, the same blocker documented in port_io_virtualization_01
 //   /02.zig and map_mmio_05.zig applies: the v0 runner
 //   (runner/primary.zig spawnOne) populates a child capability
-//   domain's table via `create_capability_domain`'s passed_handles,
+//   process's table via `create_process`'s passed_handles,
 //   which on this branch carry only the result port at slot 3.
 //   Slots 0/1/2 are kernel-installed as self / initial thread /
 //   self-IDC. No device_region of any `dev_type` reaches a test
@@ -51,7 +51,7 @@
 //         08), cch = 1 (uc) is the legal cache type for an MMIO
 //         VMAR per §[var], cur_rwx ⊆ caps.{r, w}.
 //     - pages = 1 — minimum-size MMIO VMAR.
-//   Pass slot 4095 for [2]: per the create_capability_domain table
+//   Pass slot 4095 for [2]: per the create_process table
 //   layout that slot is guaranteed empty, so the kernel rejects
 //   with E_BADCAP via §[map_mmio] test 02 instead of reaching the
 //   port_io / caps.x arm.
@@ -83,12 +83,12 @@
 //   Faithful test deferred pending two independent runner extensions
 //   that must both land before the assertion can be observed:
 //
-//   1. The runner (or a peer in the test child's domain) must be
+//   1. The runner (or a peer in the test child's process) must be
 //      able to deliver an MMIO-flagged VMAR handle whose caps.x bit
 //      is set. Today the only minting path is `create_vmar`, which
 //      §[create_vmar] test 11 closes; a faithful test needs either a
 //      relaxation of that gate (e.g., for downgraded handles) or a
-//      forwarded handle minted in another domain that legitimately
+//      forwarded handle minted in another process that legitimately
 //      pairs caps.mmio with caps.x. The test child cannot construct
 //      such a VMAR locally.
 //
@@ -141,7 +141,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const mmio_var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout (slots 0/1/2 are self / initial_thread / self_idc;
     // passed_handles begin at slot 3 and only the result port lands
     // there for tests). The §[map_mmio] gate order rejects an

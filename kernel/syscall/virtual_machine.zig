@@ -4,7 +4,7 @@ const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
 const vm_obj = stygia.hv.virtual_machine;
 
-const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
+const ProcessCaps = stygia.caps.process.ProcessCaps;
 const Thread = stygia.sched.thread.Thread;
 const PortCaps = stygia.sched.port.PortCaps;
 const VmCaps = vm_obj.VmCaps;
@@ -25,15 +25,15 @@ const CREATE_VCPU_CAPS_MASK: u64 = 0x0000_0003_0000_FFFF;
 const INJECT_IRQ_ASSERT_MASK: u64 = 0x1;
 
 /// Bit position of `vm_ceiling` within self-handle `field0`.
-/// Per §[capability_domain] Self handle layout — field0 has idc_rx at
+/// Per §[process] Self handle layout — field0 has idc_rx at
 /// bits 32-39, so vm_ceiling occupies bits 48-55 with `policy` at bit
 /// 48 (shifted up by 8 from the [2] ceilings_inner layout).
 const VM_CEILING_FIELD0_SHIFT: u6 = 48;
 const VM_CEILING_MASK: u64 = 0xFF;
 
 /// Bit position of `restart_policy_ceiling.vm_restart_max` within
-/// self-handle `field1`. Per §[capability_domain] Self handle layout
-/// (matches §[create_capability_domain] `[3] ceilings_outer`):
+/// self-handle `field1`. Per §[process] Self handle layout
+/// (matches §[create_process] `[3] ceilings_outer`):
 /// `restart_policy_ceiling` occupies field1 bits 16-31, with
 /// `vm_restart_max` at bit 23 of field1 (= bit 7 of the 16-bit
 /// restart_policy_ceiling sub-word).
@@ -80,27 +80,27 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     if (policy_page_frame & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
-    const self_word0 = cd.user_table[0].word0;
-    const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(self_word0));
-    const vm_ceiling: u16 = @truncate((cd.user_table[0].field0 >> VM_CEILING_FIELD0_SHIFT) & VM_CEILING_MASK);
+    const self_word0 = process.user_table[0].word0;
+    const self_caps: ProcessCaps = @bitCast(Word0.caps(self_word0));
+    const vm_ceiling: u16 = @truncate((process.user_table[0].field0 >> VM_CEILING_FIELD0_SHIFT) & VM_CEILING_MASK);
     // `vm_restart_max` is a single bit; read as u1 for the > comparison
     // against the requested `restart_policy` (also 1 bit).
-    const vm_restart_max: u1 = @truncate((cd.user_table[0].field1 >> VM_RESTART_MAX_FIELD1_SHIFT) & 0x1);
+    const vm_restart_max: u1 = @truncate((process.user_table[0].field1 >> VM_RESTART_MAX_FIELD1_SHIFT) & 0x1);
 
     const pf_slot: u12 = @truncate(policy_page_frame);
-    const pf_resolved = capability.resolveHandleOnDomain(cd, pf_slot, .page_frame) != null;
+    const pf_resolved = capability.resolveHandleOnProcess(process, pf_slot, .page_frame) != null;
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (!self_caps.crvm) return errors.E_PERM;
 
     // The requested caps word is the 16-bit cap layout from
     // §[virtual_machine]: bit 0 = `policy`, bit 1 = `restart_policy`.
-    // `vm_ceiling` (self-handle field0 bits 48-55 per §[capability_domain]
+    // `vm_ceiling` (self-handle field0 bits 48-55 per §[process]
     // Self handle layout) gates only `policy`; `restart_policy` is gated
     // separately by `restart_policy_ceiling.vm_restart_max` per
     // §[restart_semantics] test 04 — enforced just below in the same
@@ -111,12 +111,12 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     if (requested_policy & ~ceiling_policy != 0) return errors.E_PERM;
 
     // Spec §[restart_semantics] test 04: returns E_PERM if
-    // `caps.restart_policy = 1` and the calling domain's
+    // `caps.restart_policy = 1` and the calling process's
     // `restart_policy_ceiling.vm_restart_max = 0`. Mirrors the
     // `thread_restart_max` enforcement at `thread.zig` (caller's
     // `restart_policy_ceiling` is the authoritative gate regardless of
     // whether the new handle is minted in the caller's own table — VM
-    // handles are non-transferable so there is no second domain).
+    // handles are non-transferable so there is no second process).
     const requested_restart_policy: u1 = @truncate((requested >> 1) & 0x1);
     if (requested_restart_policy > vm_restart_max) return errors.E_PERM;
 
@@ -149,7 +149,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 /// Caps required: caller's self-handle must have `crec`. Holding the VM
 /// handle implies the authority to spawn vCPUs in it.
 ///
-/// The vCPU thread is bound to the capability domain that holds the VM
+/// The vCPU thread is bound to the process that holds the VM
 /// handle. `create_vcpu` binds `exit_port` as the destination for its
 /// vm_exit events and publishes the new vCPU as runnable. On the vCPU's
 /// first dispatch, the kernel delivers a vm_exit-style event on
@@ -164,13 +164,13 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 /// caller's handle table has no free slot.
 ///
 /// [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
-/// [test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `thread_inner_ceiling`.
+/// [test 02] returns E_PERM if caps is not a subset of the VM's owning process's `thread_inner_ceiling`.
 /// [test 03] returns E_PERM if priority exceeds the caller's priority ceiling.
 /// [test 04] returns E_BADCAP if [2] is not a valid VM handle.
 /// [test 05] returns E_BADCAP if [4] is not a valid port handle.
 /// [test 06] returns E_INVAL if [3] affinity has bits set outside the system's core count.
 /// [test 07] returns E_INVAL if any reserved bits are set in [1].
-/// [test 08] on success, the caller receives an thread handle with caps = `[1].caps`.
+/// [test 08] on success, the caller receives a thread handle with caps = `[1].caps`.
 /// [test 09] on success, `suspend` on the returned thread handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 /// [test 10] on success, the thread's priority is set to `[1].priority`.
 /// [test 11] on success, the thread's affinity is set to `[3]`.
@@ -187,29 +187,29 @@ pub fn createVcpu(
     if (exit_port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
-    const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[0].word0));
+    const self_caps: ProcessCaps = @bitCast(Word0.caps(process.user_table[0].word0));
     // pri ceiling lives in the self-handle's caps word, bits 14-15
-    // (§[capability_domain]). Compare to the requested priority in
+    // (§[process]). Compare to the requested priority in
     // bits 32-33 of `caps`.
     const pri_ceiling: u2 = self_caps.pri;
     const requested_pri: u2 = @truncate((caps >> 32) & 0x3);
 
     const vm_slot: u12 = @truncate(vm_handle);
-    const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
+    const vm_resolved = capability.resolveHandleOnProcess(process, vm_slot, .virtual_machine) != null;
 
     const port_slot: u12 = @truncate(exit_port);
-    const port_entry = capability.resolveHandleOnDomain(cd, port_slot, .port);
+    const port_entry = capability.resolveHandleOnProcess(process, port_slot, .port);
     const port_caps_word = if (port_entry != null)
-        Word0.caps(cd.user_table[port_slot].word0)
+        Word0.caps(process.user_table[port_slot].word0)
     else
         @as(u16, 0);
     const port_caps: PortCaps = @bitCast(port_caps_word);
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (!self_caps.crec) return errors.E_PERM;
     if (@as(u8, requested_pri) > @as(u8, pri_ceiling)) return errors.E_PERM;
@@ -249,14 +249,14 @@ pub fn mapGuest(caller: *anyopaque, vm: u64, pairs: []const u64) i64 {
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
-    const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
+    const vm_resolved = capability.resolveHandleOnProcess(process, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 
@@ -285,14 +285,14 @@ pub fn unmapGuest(caller: *anyopaque, vm: u64, page_frames: []const u64) i64 {
     if (page_frames.len == 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
-    const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
+    const vm_resolved = capability.resolveHandleOnProcess(process, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 
@@ -330,19 +330,19 @@ pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []co
     const count: u8 = @truncate((syscall_word >> 13) & 0xFF);
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
-    const vm_entry = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine);
+    const vm_entry = capability.resolveHandleOnProcess(process, vm_slot, .virtual_machine);
     const vm_caps_word = if (vm_entry != null)
-        Word0.caps(cd.user_table[vm_slot].word0)
+        Word0.caps(process.user_table[vm_slot].word0)
     else
         @as(u16, 0);
     const vm_caps: VmCaps = @bitCast(vm_caps_word);
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (vm_entry == null) return errors.E_BADCAP;
     if (!vm_caps.policy) return errors.E_PERM;
@@ -377,14 +377,14 @@ pub fn vmInjectIrq(caller: *anyopaque, vm: u64, irq_num: u64, assert: u64) i64 {
     if (assert & ~INJECT_IRQ_ASSERT_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
 
     const vm_slot: u12 = @truncate(vm);
-    const vm_resolved = capability.resolveHandleOnDomain(cd, vm_slot, .virtual_machine) != null;
+    const vm_resolved = capability.resolveHandleOnProcess(process, vm_slot, .virtual_machine) != null;
 
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     if (!vm_resolved) return errors.E_BADCAP;
 

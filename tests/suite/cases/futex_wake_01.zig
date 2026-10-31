@@ -8,18 +8,18 @@
 //   §[restrict]: "Reduces the caps on a handle in place. The new caps
 //   must be a subset of the current caps. No self-handle cap is
 //   required — reducing authority never requires authority." Restrict
-//   on the self-handle is a legal way for a domain to drop bits from
+//   on the self-handle is a legal way for a process to drop bits from
 //   its own SelfCap.
 //
 // Strategy
-//   The runner mints each test's child capability domain with a
+//   The runner mints each test's child process with a
 //   SelfCap that includes `fut_wake` (see runner/primary.zig — the
 //   child needs `fut_wake` to construct futex wake calls tested
 //   elsewhere in the suite). To exercise the missing-`fut_wake`
 //   failure path, the test itself must drop `fut_wake` from its
 //   self-handle before calling futex_wake.
 //
-//   `restrict` lets a domain reduce its own SelfCap caps in place.
+//   `restrict` lets a process reduce its own SelfCap caps in place.
 //   The new caps must be a bitwise subset of the current caps, so we
 //   compute the reduced SelfCap by copying the runner's grant and
 //   clearing only the `fut_wake` bit. All other bits remain set, so
@@ -53,7 +53,7 @@ pub fn main(cap_table_base: u64) void {
     // SelfCap; restrict's bitwise subset rule applies to it as well,
     // so we keep pri = 3 (matching the runner).
     const reduced = caps.SelfCap{
-        .crcd = true,
+        .crproc = true,
         .crec = true,
         .crvr = true,
         .crpf = true,
@@ -73,11 +73,11 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // §[futex_wake]: addr must be 8-byte aligned and a valid user
-    // address in the caller's domain. The cap check on `fut_wake` is
+    // address in the caller's process. The cap check on `fut_wake` is
     // gated on the self-handle's `fut_wake` bit and runs before any
     // other validation (alignment, address validity), so neither
     // E_INVAL on alignment nor E_BADADDR on the address can preempt
-    // it. We point at a local u64 (8-byte aligned, in our domain) and
+    // it. We point at a local u64 (8-byte aligned, in our process) and
     // pass count = 1 to keep all other inputs valid; with `fut_wake`
     // cleared the kernel must short-circuit to E_PERM.
     var local: u64 align(8) = 0;

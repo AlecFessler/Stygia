@@ -63,7 +63,7 @@ NON_SPEC_TEST_FILES = {
 # test-review issue Stygia-o4a.6.4. Keep the spec assertion; reject any
 # unlisted gap or stale entry here.
 KNOWN_MISSING_TESTS = {
-    # Lower target-domain thread ceiling is unavailable in the current fixture.
+    # Lower target-process thread ceiling is unavailable in the current fixture.
     "create_thread_04.zig": "lower thread_outer_ceiling fixture",
     "create_thread_05.zig": "lower thread_inner_ceiling fixture",
     "create_vcpu_02.zig": "lower VM-owner thread_inner_ceiling fixture",
@@ -71,7 +71,7 @@ KNOWN_MISSING_TESTS = {
     "map_pf_12.zig": "permission-fault teardown observation fixture",
     "self_01.zig": "self-handle result reporting fixture",
     # Port-I/O fault assertions need an issued device_region and a runner
-    # that can observe the child domain's unhandled-fault teardown.
+    # that can observe the child process's unhandled-fault teardown.
     **{f"port_io_virtualization_{num:02}.zig": "port-I/O fault fixture"
        for num in range(6, 12)},
 }
@@ -186,8 +186,8 @@ def longest_section_match(filename_section: str, spec_sections: set[str]) -> str
     is a prefix of it.
 
     Necessary because the file naming `<section>_<NN>.zig` is greedy: a file
-    named `create_capability_domain_16.zig` parses (per the regex) as section
-    `create_capability_domain` + num `16`. But for a hypothetical file named
+    named `create_process_16.zig` parses (per the regex) as section
+    `create_process` + num `16`. But for a hypothetical file named
     `foo_bar_baz_01.zig` where the spec section is `foo_bar`, we'd want to
     re-attribute the trailing `_baz` as part of the test number stem... no:
     the spec test ids never contain underscores, so `<section>_<NN>` is

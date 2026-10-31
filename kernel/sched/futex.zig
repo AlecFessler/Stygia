@@ -289,14 +289,14 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         const node = peekMatchingWaiter(bucket, paddr, &requeue) orelse break;
 
         // stygia-qbx: the thread behind this node can be destroyed by a
-        // DOMAIN teardown running on another core at any point in this
+        // PROCESS teardown running on another core at any point in this
         // iteration. The old comment here claimed the node's residence
         // in our bucket pinned the thread ("cannot have been freed"); that
         // is not true. `cancelWait` unlinks a victim's nodes under this
         // same bucket lock, so while we hold it a concurrent teardown
         // simply BLOCKS — the node stays visible to us — and the gen
         // has typically already been bumped dead by then. The first
-        // acquire below catches an thread that is already dead; the danger
+        // acquire below catches a thread that is already dead; the danger
         // was everything after the old unconditional unlock.
         //
         // Phase 1 — validate under the thread's gen lock and claim the wait
@@ -381,14 +381,14 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 /// `futex_wait_val` — block while every `(addrs[i], expected[i])`
 /// satisfies `*addr == expected`. Spec §[futex].futex_wait_val.
 ///
-/// `vaddrs[i]` is the caller-domain virtual address corresponding to
+/// `vaddrs[i]` is the caller-process virtual address corresponding to
 /// `addrs[i]`. The success path returns the user vaddr that satisfied
 /// the wait per spec §[futex_wait_val] vreg-1 contract; this avoids any
 /// collision between an index (0..n-1) and a positive spec error code
 /// (1..15) that the syscall layer would otherwise have to disambiguate.
 ///
 /// Returns:
-///   vaddrs[i]  = caller-domain vaddr of the first mismatched address
+///   vaddrs[i]  = caller-process vaddr of the first mismatched address
 ///                (immediate, no block) or the woken address (after
 ///                blocking).
 ///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
@@ -495,11 +495,11 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 /// `futex_wait_change` — block while every `(addrs[i], targets[i])`
 /// satisfies `*addr != target`. Spec §[futex].futex_wait_change.
 ///
-/// `vaddrs[i]` parallels `addrs[i]` and is the caller-domain user vaddr;
+/// `vaddrs[i]` parallels `addrs[i]` and is the caller-process user vaddr;
 /// the success path returns one of these per spec §[futex_wait_change].
 ///
 /// Returns:
-///   vaddrs[i]  = caller-domain vaddr of the first matched address
+///   vaddrs[i]  = caller-process vaddr of the first matched address
 ///                (immediate, no block) or the woken address (after
 ///                blocking).
 ///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
@@ -648,7 +648,7 @@ pub fn expireTimedWaiters() void {
     const now_ns = arch.time.getMonotonicClock().now();
 
     // Phase 1: snapshot expired Threads + clear their slots, all under
-    // timed_lock. Capturing the deadline lets phase 2 detect an thread
+    // timed_lock. Capturing the deadline lets phase 2 detect a thread
     // that was woken and re-registered as a fresh waiter between phases.
     //
     // The split is required by lock-order: wait() and wake() acquire

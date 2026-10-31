@@ -214,7 +214,7 @@ pub const GenLock = extern struct {
             }
             // Ack-while-spinning — see `lockOrdered`. Captured live:
             // fireMemoryFault (#PF context, IRQs off) spinning here on
-            // a CD gen-lock whose holder was waiting for this core's
+            // a process gen-lock whose holder was waiting for this core's
             // shootdown ack (stygia-rs6 mechanism 9).
             spin_diag.note(.slab_lock, @intFromPtr(self));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
@@ -658,7 +658,7 @@ pub fn SecureSlab(
             // IRQ-masked: mixed-mode class — see the `lock` field doc.
             // Reached from process context by
             // `destroyThreadLocked`'s self-help drain (in
-            // `terminate` / domain-destroy, IRQs enabled) and from IRQ
+            // `terminate` / process-destroy, IRQs enabled) and from IRQ
             // context by the preempt → `yieldTo` → `switchTo` →
             // `finalizeDestroyMarkedDead` reaper. This is the site whose
             // `IRQ-mode mix` lockdep panic under N>>1 reps first proved
@@ -686,7 +686,7 @@ pub fn SecureSlab(
         /// alongside the pointer is the snapshot the visitor would use
         /// to construct a `SlabRef(T)` for verify-and-acquire.
         ///
-        /// Used by cross-domain object-holder lookups where no inverse
+        /// Used by cross-process object-holder lookups where no inverse
         /// index exists.
         pub fn forEachAlive(self: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *T, u63) bool) void {
             // Snapshot count_total once. New slots minted concurrently

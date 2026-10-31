@@ -228,8 +228,8 @@ pub fn dropIdentityMapping() void {
 }
 
 /// Detach this core from a dying user address space before its
-/// translation tables are freed. An thread destroying its OWN domain
-/// executes destroyPhase2 while the dying domain's root is still the
+/// translation tables are freed. A thread destroying its OWN process
+/// executes destroyPhase2 while the dying process's root is still the
 /// active translation base on x86-64 (CR3 covers both halves), so
 /// `freeUserAddrSpace` would recycle the very tables the executing
 /// core walks through — the first cold TLB miss afterwards makes even
@@ -240,7 +240,7 @@ pub fn dropIdentityMapping() void {
 /// existing flushRemotePcid machinery on addr-space-id release.
 ///
 /// Returns true when a swap was performed, so the caller can publish
-/// `active_root = 0` truthfully (a cross-domain destroyer keeps its
+/// `active_root = 0` truthfully (a cross-process destroyer keeps its
 /// own root loaded and must keep publishing it).
 ///
 /// aarch64: kernel translation lives in TTBR1_EL1 and the dying root
@@ -372,7 +372,7 @@ pub fn unmapPageSized(
 /// Allocate a fresh empty top-level address space (PML4 root on x86-64,
 /// stage-1 TTBR0 root on aarch64). Bumps the per-arch ASID/PCID
 /// allocator implicitly is the caller's responsibility — this only
-/// hands back the page-table root. Spec §[capability_domain].
+/// hands back the page-table root. Spec §[process].
 /// Mirror the kernel half (upper) of the current address-space root into
 /// a freshly-allocated child root. On x86_64 this copies PML4 entries
 /// 256..511; on aarch64 the kernel half lives in TTBR1 and is shared by
@@ -398,10 +398,10 @@ pub fn allocAddrSpaceRoot() !PAddr {
 /// strategy. Two `(skip_phys_start, skip_phys_bytes)` ranges define
 /// physical extents whose leaves are NOT freed individually — the
 /// caller is freeing them via a wholesale `pmm.freeBlock`. Pass
-/// `skipN_bytes = 0` to disable a range. Used by capability-domain
+/// `skipN_bytes = 0` to disable a range. Used by process
 /// teardown to reclaim the eagerly-mapped user stack, ELF segments,
 /// and page-table pages that accumulate per-spawn under the test
-/// runner; the user_table view aliases the cap-domain's user_buf
+/// runner; the user_table view aliases the cap-process's user_buf
 /// block (skip range 1) and the user stack lives in a contiguous
 /// buddy block freed wholesale (skip range 2).
 pub fn freeUserAddrSpace(
@@ -420,7 +420,7 @@ pub fn freeUserAddrSpace(
 
 /// Clear a leaf PTE in `addr_space_root` for `virt` without issuing
 /// local INVLPG or remote TLB shootdown. Used by VMAR destroy in the
-/// capability-domain teardown path — no core has the dying CD's CR3
+/// process teardown path — no core has the dying process's CR3
 /// active by the time `freeUserAddrSpace` returns, so the shootdown is
 /// unnecessary. Returns the leaf physical address that was cleared
 /// (caller may freePage it) or null if no leaf was installed.

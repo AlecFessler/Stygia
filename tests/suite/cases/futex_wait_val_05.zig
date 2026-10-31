@@ -1,10 +1,10 @@
 // Spec §[futex_wait_val] futex_wait_val — test 05.
 //
 // "[test 05] returns E_BADADDR if any addr is not a valid user
-//  address in the caller's domain."
+//  address in the caller's process."
 //
 // Strategy
-//   The runner gives every test domain a self-handle with
+//   The runner gives every test process a self-handle with
 //   `fut_wait_max = 63` (see runner/primary.zig ceilings_outer), so
 //   test 01's E_PERM (fut_wait_max = 0) and test 03's E_INVAL
 //   (N > fut_wait_max) cannot fire. Picking N = 1 keeps us inside
@@ -12,12 +12,12 @@
 //   us out of test 04's E_INVAL.
 //
 //   The remaining filter to satisfy is the "valid user address in
-//   the caller's domain" requirement. Per arch/dispatch/paging.zig
+//   the caller's process" requirement. Per arch/dispatch/paging.zig
 //   the x86_64 user partition is `[0, 0xFFFF_8000_0000_0000)`; any
 //   address with bit 63 set is in the kernel half and cannot be a
-//   valid user mapping in any capability domain. `0xFFFF_8000_0000_0000`
+//   valid user mapping in any process. `0xFFFF_8000_0000_0000`
 //   is the first kernel-half address, is 8-byte aligned, and is
-//   guaranteed unmapped from the test domain's user-side page
+//   guaranteed unmapped from the test process's user-side page
 //   tables — `resolveVaddr` returns null and the syscall must
 //   produce E_BADADDR.
 //

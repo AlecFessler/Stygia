@@ -48,7 +48,7 @@ const Resolved = struct {
 ///  1. LLVM *quotes* any global whose name contains a character outside
 ///     `[A-Za-z0-9._$-]`, escaping inner bytes as `\XX`. Every monomorphized
 ///     Zig generic is quoted, because its name embeds the instantiation
-///     argument list: `@"a.b.SecureSlab(caps.CapabilityDomain,256).create"`.
+///     argument list: `@"a.b.SecureSlab(caps.Process,256).create"`.
 ///  2. Zig appends a `__anon_NNNNN` discriminator to functions that take an
 ///     anonymous comptime parameter (callbacks, tuples).
 ///  3. The instantiation argument list itself has no counterpart in the AST:
@@ -444,7 +444,7 @@ fn headIsKnown(
 }
 
 /// Split a decorated name on `.` at nesting depth zero, so the dots inside
-/// an instantiation argument list (`SecureSlab(caps.domain.CapabilityDomain,
+/// an instantiation argument list (`SecureSlab(caps.process.Process,
 /// 256)`) do not split the segment.
 const SegmentIter = struct {
     s: []const u8,

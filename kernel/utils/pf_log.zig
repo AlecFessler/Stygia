@@ -1,7 +1,7 @@
 //! Global page-fault outcome ring with dump-on-panic.
 //!
 //! Build-gated debug instrumentation for the smp=4 page-fault loop:
-//! an thread traps, the PF handler claims to resolve it, but the user
+//! a thread traps, the PF handler claims to resolve it, but the user
 //! resumes at the same RIP and faults again. The handler MUST be
 //! returning success on each fire, otherwise the kernel would panic
 //! immediately on an unrecoverable fault. This tool records what each
@@ -66,9 +66,9 @@ pub const Outcome = enum(u8) {
     KERNEL_NO_THREAD = 9,
     /// `current_thread` was null on a user fault → panic.
     USER_NO_THREAD = 10,
-    /// Domain gen-lock failed (domain torn down between trap entry
+    /// Process gen-lock failed (process torn down between trap entry
     /// and dispatch); fired memory_fault.
-    USER_DOMAIN_GONE = 11,
+    USER_PROCESS_GONE = 11,
     /// vmar.handlePageFault returned 0 — fault resolved (demand alloc
     /// or other in-VMAR resolution).
     USER_RESOLVED = 12,
@@ -102,7 +102,6 @@ else
 /// `mark` reads the program counter and user stack pointer from
 /// `thread.ctx + ctx_pc_offset / + ctx_sp_offset`. Offsets resolve at
 /// comptime through `arch.dispatch.cpu` so this file stays arch-agnostic.
-
 inline fn rdtsc() u64 {
     if (builtin.cpu.arch == .x86_64) {
         var a: u32 = 0;
@@ -213,7 +212,7 @@ fn outcomeName(o: u8) []const u8 {
         @intFromEnum(Outcome.KERNEL_VA_INVALID) => "KERNEL_VA_INVALID",
         @intFromEnum(Outcome.KERNEL_NO_THREAD) => "KERNEL_NO_THREAD",
         @intFromEnum(Outcome.USER_NO_THREAD) => "USER_NO_THREAD",
-        @intFromEnum(Outcome.USER_DOMAIN_GONE) => "USER_DOMAIN_GONE",
+        @intFromEnum(Outcome.USER_PROCESS_GONE) => "USER_PROCESS_GONE",
         @intFromEnum(Outcome.USER_RESOLVED) => "USER_RESOLVED",
         @intFromEnum(Outcome.USER_INVALID) => "USER_INVALID",
         else => "?",

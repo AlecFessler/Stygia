@@ -346,7 +346,7 @@ pub fn syncInstructionCache() void {
 ///   1. The kernel zero-fills a recycled page frame through the physmap
 ///      (a DATA-side write). That does not evict I-cache lines left over
 ///      from the frame's PREVIOUS owner, so the new owner can
-///      instruction-fetch the previous domain's bytes — a correctness
+///      instruction-fetch the previous process's bytes — a correctness
 ///      bug and an information-disclosure bug.
 ///   2. Anything the kernel writes into a page that is about to be
 ///      executable sits dirty in L1D and has not reached the PoU, so
@@ -357,7 +357,7 @@ pub fn syncInstructionCache() void {
 /// Sequence per ARM ARM B2.4.6 / D5.10.2: clean the data lines to the
 /// PoU, barrier, invalidate the instruction lines, barrier, then `isb`
 /// so this core refetches. `ic ivau` is broadcast to the inner
-/// shareable domain, so peer cores are covered without an IPI.
+/// shareable process, so peer cores are covered without an IPI.
 ///
 /// NOTE this does NOT make code that USERSPACE writes visible — those
 /// stores land after this runs. Userspace must do its own maintenance
@@ -587,12 +587,12 @@ pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
     }
 }
 
-/// Build the first-dispatch iret frame at the top of an thread's kernel
+/// Build the first-dispatch iret frame at the top of a thread's kernel
 /// stack. Returns the *ArchCpuContext pointer that scheduler.switchTo
 /// will pass to loadThreadContextAndReturn. `entry` is the user-mode RIP;
 /// `ustack_top` is the user RSP (or null for kernel-mode init Threads);
 /// `arg` is loaded into the first argument register (vreg 1 / rdi on
-/// x86-64) so create_capability_domain can pass `cap_table_base`.
+/// x86-64) so create_process can pass `cap_table_base`.
 pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
@@ -607,10 +607,10 @@ pub fn prepareThreadContext(
 }
 
 /// Re-patch a previously-built iret frame from kernel-mode shape to
-/// user-mode shape. Used when an thread was allocated without a user stack
+/// user-mode shape. Used when a thread was allocated without a user stack
 /// (so `prepareThreadContext` left the frame in kernel mode) and the
 /// caller is wiring in the user stack and entry afterward — the root
-/// service's primordial thread and freshly-spawned domain Threads both follow
+/// service's primordial thread and freshly-spawned process Threads both follow
 /// this pattern. Writes user code/data selectors, the user stack
 /// pointer (with the SysV `rsp%16==8` skew baked in), the entry RIP,
 /// and the first-arg register.

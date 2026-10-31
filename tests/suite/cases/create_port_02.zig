@@ -5,9 +5,9 @@
 //
 // Faithful test rationale (and why this is a degraded smoke variant)
 //   The runner (tests/suite/runner/primary.zig) mints every spec-test
-//   domain with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 56-63
+//   process with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 56-63
 //   of that word are the `port_ceiling` byte, which carries the value
-//   0x1C: bits 2-4 = `xfer | recv | bind` per §[capability_domain]
+//   0x1C: bits 2-4 = `xfer | recv | bind` per §[process]
 //   field0 (port_ceiling at bits 56-63 with `xfer` at field-bit 2,
 //   `recv` at field-bit 3, `bind` at field-bit 4 — equivalently bits
 //   58/59/60 of field0 as the spec describes).
@@ -22,10 +22,10 @@
 //
 //   The runner ceiling is shared across the entire test manifest and
 //   cannot be narrowed for one test, and there is currently no
-//   exposed syscall that lets a child domain restrict its own
+//   exposed syscall that lets a child process restrict its own
 //   port_ceiling below 0x1C before invoking create_port. Until such
 //   a ceiling-restriction syscall lands, the faithful E_PERM path
-//   for test 02 is unreachable from a userspace test domain. This
+//   for test 02 is unreachable from a userspace test process. This
 //   mirrors create_page_frame_02's degraded-smoke rationale for the
 //   pf_ceiling.max_rwx analogue.
 //
@@ -38,7 +38,7 @@
 //   the runner ceiling permits.
 //
 //   When a ceiling-restriction syscall is added, this test should be
-//   rewritten to: (a) narrow the calling domain's port_ceiling so at
+//   rewritten to: (a) narrow the calling process's port_ceiling so at
 //   least one of xfer/recv/bind is clear, then (b) invoke create_port
 //   with that bit set and assert E_PERM.
 //
@@ -46,7 +46,7 @@
 //   To keep the call on the success path under the runner ceiling we
 //   make every prior check pass:
 //     - caller self-handle has `crpt` (test 01): the runner grants
-//       it on every spawned test domain.
+//       it on every spawned test process.
 //     - caps.{xfer, recv, bind} = 1, which is ⊆ port_ceiling = 0x1C
 //       (this test's gate).
 //     - all reserved bits zero (test 03): bits 16-63 of [1] are 0

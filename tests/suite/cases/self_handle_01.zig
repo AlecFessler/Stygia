@@ -1,21 +1,21 @@
-// Spec §[capability_domain] self_handle — test 01.
+// Spec §[process] self_handle — test 01.
 //
-// "[test 01] when a domain receives an IDC handle over IDC, the
+// "[test 01] when a process receives an IDC handle over IDC, the
 //  installed handle's caps = intersection of the granted caps and the
 //  receiver's `idc_rx`."
 //
 // Spec semantics
-//   §[idc_rx]: each capability domain carries an `idc_rx` mask in its
-//   self-handle field0 (bits 32-39). When that domain receives an IDC
+//   §[idc_rx]: each process carries an `idc_rx` mask in its
+//   self-handle field0 (bits 32-39). When that process receives an IDC
 //   handle as a handle attachment over IDC (via suspend/recv or
 //   reply_transfer per §[handle_attachments]), the kernel installs the
 //   handle with caps = the entry's granted caps ANDed with the
-//   receiver's `idc_rx`. This is how a domain bounds the privileges of
+//   receiver's `idc_rx`. This is how a process bounds the privileges of
 //   any IDC handle reaching it from outside, regardless of what the
 //   sender attempted to grant.
 //
-// Faithful variant (deferred — needs cross-domain IDC plumbing)
-//   The spec-faithful test requires two distinct capability domains
+// Faithful variant (deferred — needs cross-process IDC plumbing)
+//   The spec-faithful test requires two distinct processes
 //   communicating over IDC:
 //     1. Receiver R is created with a known `idc_rx` mask M (e.g.,
 //        IdcCap{ .copy = true } — `move` cleared).
@@ -28,20 +28,20 @@
 //     5. R reads the installed slot and asserts caps == granted ∩ M
 //        — specifically, that `move` is cleared because M cleared it.
 //
-//   This needs (a) a way to spawn a child capability domain from a
+//   This needs (a) a way to spawn a child process from a
 //   test ELF (currently each test is itself a single capability
-//   domain, with no path to embed and stage a second ELF as a child),
-//   and (b) the cross-domain suspend/recv handle-attachment path
+//   process, with no path to embed and stage a second ELF as a child),
+//   and (b) the cross-process suspend/recv handle-attachment path
 //   wired through libz (the IDC pair-entry layout lives at high vregs
 //   per §[handle_attachments] and the libz `suspendThread` wrapper still
 //   panics on attachments != 0). Both are tracked elsewhere; the same
-//   gap blocks several create_capability_domain and handle_attachments
+//   gap blocks several create_process and handle_attachments
 //   tests.
 //
 // Degraded variant (this file)
-//   The closest single-domain code path is `restrict` on the slot-2
+//   The closest single-process code path is `restrict` on the slot-2
 //   self-IDC handle. The kernel pre-populates slot 2 of every fresh
-//   capability domain with an IDC handle to itself (§[create_capability_domain],
+//   process with an IDC handle to itself (§[create_process],
 //   §[cridc_ceiling]); that handle has cap-restrict semantics
 //   identical to any IDC handle the receiver would later install via
 //   IDC. Restricting it to a subset of the original caps is the same
@@ -79,7 +79,7 @@ const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
     const before = caps.readCap(cap_table_base, caps.SLOT_SELF_IDC);
-    if (before.handleType() != .capability_domain) {
+    if (before.handleType() != .process) {
         testing.fail(1);
         return;
     }

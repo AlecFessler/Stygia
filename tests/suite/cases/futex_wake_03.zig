@@ -1,13 +1,13 @@
 // Spec §[futex_wake] — test 03.
 //
 // "[test 03] returns E_BADADDR if [1] addr is not a valid user
-// address in the caller's domain."
+// address in the caller's process."
 //
 // Spec semantics
 //   §[error_codes] (table row for E_BADADDR): "a user address
-//   argument is not a valid mapped address in the caller's domain".
+//   argument is not a valid mapped address in the caller's process".
 //   §[futex_wake]: "[1] addr: 8-byte-aligned user address in the
-//   caller's domain". The address-validity gate is observably
+//   caller's process". The address-validity gate is observably
 //   distinct from:
 //     - test 01 (E_PERM)  — runner mints the child with `fut_wake`
 //                            true, so this test does not touch its
@@ -18,16 +18,16 @@
 //
 // Strategy
 //   To exercise the address-validity gate we need an 8-byte-aligned
-//   address that is not part of any mapping in the caller's domain.
+//   address that is not part of any mapping in the caller's process.
 //   Two distinct witnesses pin the kernel to a real validity check
 //   rather than e.g. only filtering one canonical-half:
 //
 //     1. Low witness: 0x10. The first page (the NULL page) is never
-//        mapped in a user domain. 0x10 is 8-byte aligned, well below
+//        mapped in a user process. 0x10 is 8-byte aligned, well below
 //        any code/data/stack mapping the runner installs.
 //     2. High witness: 0xFFFF_FFFF_FFFF_FF00. This sits in the
 //        x86-64 high-half (kernel range) and is never part of a
-//        user-domain mapping. It is 16-byte (and thus 8-byte)
+//        user-process mapping. It is 16-byte (and thus 8-byte)
 //        aligned.
 //
 //   `syscall.futexWake` takes `addr: u64`, so both values flow
@@ -59,7 +59,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // High witness: 8-byte aligned, kernel-half address that is
-    // never part of a user-domain mapping.
+    // never part of a user-process mapping.
     const r2 = syscall.futexWake(0xFFFF_FFFF_FFFF_FF00, 1);
     if (r2.v1 != @intFromEnum(errors.Error.E_BADADDR)) {
         testing.fail(2);

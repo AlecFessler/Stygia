@@ -13,7 +13,7 @@
 //   lands the entry at the right offset.
 //
 //   For the source handle we use the test child's initial thread at
-//   slot 1. Per §[create_capability_domain] test 21 the initial thread's
+//   slot 1. Per §[create_process] test 21 the initial thread's
 //   caps equal the runner's `thread_inner_ceiling`, which the runner sets
 //   to 0xFF — bits 0-7 of `ThreadCap`: {move, copy, saff, spri, term,
 //   susp, read, write}. Since `copy` is set, an entry with `move = 0`
@@ -30,7 +30,7 @@
 //   the `xfer` cap (the runner grants `bind | xfer` to the child),
 //   so test 01 ("returns E_PERM if N>0 and the port lacks xfer") is
 //   not the failure source. The entry's id (slot 1) is valid in this
-//   domain, so test 02 (E_BADCAP) does not fire either. Reserved
+//   process, so test 02 (E_BADCAP) does not fire either. Reserved
 //   entry bits are zero (test 06 inactive), and there is only one
 //   entry so test 07 (duplicate ids) is moot.
 //

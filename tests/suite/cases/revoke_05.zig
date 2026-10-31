@@ -17,7 +17,7 @@
 //   Confirm survival by reading the slot back out of the read-only
 //   cap-table mapping. Per §[capabilities], an empty slot has word0 =
 //   0; its handle-type tag (bits 12-15) therefore decodes to
-//   `capability_domain_self` (the 0-valued tag in HandleType). A slot
+//   `process_self` (the 0-valued tag in HandleType). A slot
 //   that still references the port keeps the port type tag (= 6).
 //   Asserting `handleType() == .port` is the cleanest survivability
 //   probe and matches the readCap pattern used by restrict_06.

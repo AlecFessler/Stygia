@@ -58,7 +58,7 @@
 //
 // Why target=self for W
 //   `create_thread` with [4] = 0 places W in the test's own
-//   capability domain. That keeps W's entry inside the test ELF's
+//   process. That keeps W's entry inside the test ELF's
 //   text (no need to set up a separate page frame / loader) and lets
 //   W and the test thread share globals via .data. Both required caps
 //   (`susp` and `write`) are within the runner's `thread_inner_ceiling`
@@ -186,7 +186,7 @@ pub fn main(cap_table_base: u64) void {
     //   write — gates whether modifications written to the event
     //           payload land back on W's state at reply time
     //   restart_policy = 0 (kill) — keeps W from being silently
-    //           resurrected by a domain restart fallback if W's
+    //           resurrected by a process restart fallback if W's
     //           hlt ever traps
     const w_caps = caps.ThreadCap{
         .susp = true,

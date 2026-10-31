@@ -1,5 +1,5 @@
 pub const capability = @import("capability.zig");
-pub const capability_domain = @import("capability_domain.zig");
+pub const process = @import("process.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const errors = @import("errors.zig");
 pub const thread = @import("thread.zig");

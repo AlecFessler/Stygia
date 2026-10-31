@@ -57,7 +57,7 @@
 //      VMAR ready to be paired with a hypothetical port_io
 //      device_region.
 //   2. mapMmio(mmio_var, HANDLE_TABLE_MAX - 1) — slot 4095 is
-//      guaranteed empty by the create_capability_domain table layout
+//      guaranteed empty by the create_process table layout
 //      (slots 0/1/2 are self / initial_thread / self_idc; passed_handles
 //      begin at slot 3 and the runner forwards at most the result
 //      port + ELF pf + libz pf + two mmio fixtures, so the upper
@@ -137,7 +137,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const mmio_var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout. The map_mmio call returns E_BADCAP via §[map_mmio]
     // test 02 without ever reaching the dev_type/arch check this test
     // targets. The arch-conditional E_INVAL leg (port_io device_region

@@ -139,10 +139,7 @@ fn recvCaptureRipX64(port: u12) RecvRip {
           [rip] "={rbx}" (rip_out),
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (@as(u64, port)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true,
-             .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true,
-             .r12 = true, .r13 = true, .r14 = true, .r15 = true,
-             .memory = true });
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
 
     return .{ .v1 = v1_out, .rip = rip_out };
 }
@@ -168,12 +165,7 @@ fn recvCaptureRipArm(port: u12) RecvRip {
           [rip] "={x13}" (rip_out),
         : [word] "r" (word),
           [iv1] "{x0}" (@as(u64, port)),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     return .{ .v1 = v1_out, .rip = rip_out };
 }
@@ -276,7 +268,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 4: recv with stack-slot capture for vreg 14. The port has
     // the test thread as a live bind-cap holder and W queued as a
     // suspension event, so recv returns immediately (no E_CLOSED, no
-    // E_FULL — the test domain has plenty of free slots for the reply
+    // E_FULL — the test process has plenty of free slots for the reply
     // handle). With `read` set on the thread handle used at suspend, the
     // kernel writes W's saved register state into the vreg layout in
     // §[event_state]; vreg 14 = `[rsp + 8]` is W's RIP.

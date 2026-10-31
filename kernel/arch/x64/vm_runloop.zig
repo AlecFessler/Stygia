@@ -59,7 +59,6 @@ const SUBCODE_UNKNOWN: u8 = 12;
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support hardware virt).
 pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
-
     if (!vm_hw.vmSupported()) return null;
 
     // Resolve the VM's per-vCPU state and the VM's control-state PAddr.
@@ -95,7 +94,7 @@ pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
         // ── Arch vCPU cancellation acknowledgement (stygia-8xl) ──────────
         //
         // NEVER (RE-)ENTER THE GUEST ON A RETIRED thread. Another core can
-        // retire this vCPU at any point — domain teardown does exactly
+        // retire this vCPU at any point — process teardown does exactly
         // that — and it kicks us with a scheduler IPI. The kick works:
         // `CTRL1_INTERCEPT_INTR` is set, so the IPI forces a VM exit and
         // the `.interrupt_window` arm below opens the IRQ window for the
@@ -567,7 +566,7 @@ fn storeSegment(rsp: u64, off: u64, seg: *const GuestState.SegmentReg) void {
 /// brackets the user-stack stores).
 ///
 /// Companion to `applyReplyStateToVcpu`. Together they implement the
-/// spec-v3 cross-domain guest-state-via-vregs contract.
+/// spec-v3 cross-process guest-state-via-vregs contract.
 pub fn populateVmExitVregs(
     receiver: *Thread,
     vcpu_thread: *Thread,

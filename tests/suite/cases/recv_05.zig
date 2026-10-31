@@ -7,7 +7,7 @@
 //   The assertion needs a witness chain:
 //     (a) A port with at least one bind-cap holder so the steady state
 //         passes the "no bind-cap holders" gate of test 04.
-//     (b) An thread suspended inside `recv` on that port (i.e., a "blocked
+//     (b) A thread suspended inside `recv` on that port (i.e., a "blocked
 //         recv"). recv blocks the calling thread, so to keep the test thread
 //         runnable and able to drive the rest of the scenario, the
 //         blocked recv must be issued from a separate worker thread.
@@ -18,7 +18,7 @@
 //         zero, receivers suspended
 //         on the port resume with E_CLOSED."
 //
-//   Both Threads are minted in the test's own capability domain so they
+//   Both Threads are minted in the test's own process so they
 //   share the address space and the handle table. Sharing the table
 //   means the worker can `recv` on the same slot id the test thread sees;
 //   sharing the address space means a process-global variable is the
@@ -26,7 +26,7 @@
 //   test thread.
 //
 //   With caps={bind,recv} on a single port handle the only bind-cap
-//   holder is the test domain's slot. The worker calling recv does not
+//   holder is the test process's slot. The worker calling recv does not
 //   itself add to the bind refcount — recv is gated by the `recv` cap,
 //   not `bind`. Deleting the slot therefore drops the bind refcount
 //   from 1 to 0 in one step, and with no queued events, the spec mandates the worker's blocked recv resume
@@ -75,7 +75,7 @@
 //     - test 02 (E_PERM): the port handle carries the `recv` cap.
 //     - test 03 (E_INVAL on reserved bits): the libz wrapper takes
 //       u12 and zero-extends, so reserved bits in [1] are clean.
-//     - test 06 (E_FULL): the test domain's table has plenty of free
+//     - test 06 (E_FULL): the test process's table has plenty of free
 //       slots when the kernel needs to mint a reply handle. Not
 //       relevant on the E_CLOSED path anyway.
 //
@@ -121,7 +121,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global side channel. Both Threads run in the same capability
-// domain, so they share the address space; the worker writes its recv
+// process, so they share the address space; the worker writes its recv
 // result here with release ordering and the test thread reads with acquire
 // ordering, mirroring the side-channel idiom in yield_03.
 var worker_port_slot: u12 = 0;
@@ -180,7 +180,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         entry,
         1, // stack_pages
-        0, // target = self (this domain)
+        0, // target = self (this process)
         0, // affinity = any core
     );
     if (testing.isHandleError(cec.v1)) {

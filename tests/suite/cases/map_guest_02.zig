@@ -11,8 +11,8 @@
 //   With those gates inert, supplying a pair whose page_frame slot is
 //   empty must surface E_BADCAP from the page_frame validation step.
 //
-//   The child domain's handle table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's handle table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -131,7 +131,7 @@ pub fn main(cap_table_base: u64) void {
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
     // 5. Single pair with an invalid page_frame slot. 0xFFE is unused
-    //    in this domain's handle table and is not the reserved
+    //    in this process's handle table and is not the reserved
     //    invalid-handle sentinel (0xFFF), so the kernel must reject
     //    the pair through the page_frame validity gate.
     const invalid_pf: u64 = 0xFFE;

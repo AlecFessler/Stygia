@@ -4,7 +4,7 @@
 //  authoritative kernel state at the moment of the call."
 //
 // Strategy
-//   sync's job is to refresh the holder-domain's snapshot of a
+//   sync's job is to refresh the holder-process's snapshot of a
 //   handle's field0/field1 from the authoritative kernel state.
 //   §[capabilities]: "No-op for handles whose state does not drift."
 //   A port (§[port]) is the simplest such handle: both field0 and

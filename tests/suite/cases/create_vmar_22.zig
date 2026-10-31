@@ -8,7 +8,7 @@
 // The second clause (DMA traffic routing through the IOMMU) requires
 // emitting bus transactions from a real device and observing the IOVA
 // translation. That is out of scope for a userspace spec test in v0
-// — no DMA initiator is reachable from a child capability domain. This
+// — no DMA initiator is reachable from a child process. This
 // test exercises the first clause: on a successful dma create_vmar,
 // the resulting VMAR's field1 `device` subfield equals the bound
 // device_region's handle id (per §[var] field1 layout, bits 41-52).

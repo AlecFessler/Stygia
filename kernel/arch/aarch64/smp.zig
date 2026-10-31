@@ -338,7 +338,7 @@ fn smpInitFull() !void {
     // `secondaryEntry`. Without this, any hypcall issued from an AP
     // (`map_guest` -> `stage2InvalidateIpa` -> `hvc`) vectors into
     // firmware's stale table and never returns, wedging that core with
-    // IRQs masked while it holds its capability-domain gen-lock.
+    // IRQs masked while it holds its process gen-lock.
     //
     // 0 when EL2 / the hyp stub is unavailable (e.g. running as a KVM
     // guest at EL1), in which case the trampoline leaves VBAR_EL2 alone.
@@ -454,7 +454,7 @@ fn smpInitFull() !void {
             // Worth a line rather than a silent skip: `gic.coreCount()` is
             // NOT reduced when a core fails to start, so userspace can still
             // set an affinity mask naming it (the syscall gate is
-            // `core_id < coreCount()`). An thread pinned to a core that never
+            // `core_id < coreCount()`). A thread pinned to a core that never
             // came up is simply never dispatched, which surfaces as a test
             // MISS with no other evidence anywhere. DEN0022D Table 10:
             // -1 NOT_SUPPORTED, -2 INVALID_PARAMETERS, -4 ALREADY_ON,
@@ -648,7 +648,7 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
         // stale table and never came back: `map_guest` scheduled onto a
         // secondary core reached `stage2InvalidateIpa` -> `hvc` and
         // wedged that core with IRQs masked, still holding its
-        // capability-domain gen-lock, which then stalled every other
+        // process gen-lock, which then stalled every other
         // core behind it. Silent (no vector = no panic output) and only
         // reproducible on hardware with tests spread across cores.
         //

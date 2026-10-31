@@ -18,15 +18,15 @@
 //
 //   The calling thread's own self handle (`SLOT_INITIAL_THREAD`) is a valid
 //   thread handle by construction (the runner installs it at slot 1 with
-//   caps = the child domain's `thread_inner_ceiling` per
-//   §[capability_domain] / §[create_capability_domain] test 21). The
+//   caps = the child process's `thread_inner_ceiling` per
+//   §[process] / §[create_process] test 21). The
 //   runner sets `thread_inner_ceiling = 0xFF` (primary.zig), so the slot-1
 //   handle carries the `susp` cap (ThreadCap bit 5) — that means the [1]
 //   gates (test 01 BADCAP and test 03 PERM `susp`) cannot fire.
 //
 //   To trigger an error after [1] passes, we pass an empty cap-table
 //   slot as [2]. Slot 4095 is guaranteed empty by the
-//   create_capability_domain table layout (slots 0/1/2 = self /
+//   create_process table layout (slots 0/1/2 = self /
 //   initial thread / self-IDC; passed_handles begin at slot 3, and the
 //   primary passes only one — the result port — at slot 3). The
 //   suspend syscall then returns E_BADCAP on the [2] gate (test 02).
@@ -78,7 +78,7 @@
 //      field1 == pre-call field1.
 //
 // Assertions
-//   1: precondition broken — slot 1 was not an thread
+//   1: precondition broken — slot 1 was not a thread
 //      handle. The runner contract is violated; cannot evaluate the
 //      spec assertion.
 //   2: the failing `suspend` did not return E_BADCAP — either the
@@ -99,9 +99,9 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    // Precondition: SLOT_INITIAL_THREAD must be an thread handle. The runner
+    // Precondition: SLOT_INITIAL_THREAD must be a thread handle. The runner
     // installs the child's initial thread at slot 1 with the
-    // `thread_inner_ceiling` caps (§[create_capability_domain] test 21);
+    // `thread_inner_ceiling` caps (§[create_process] test 21);
     // the child's `thread_inner_ceiling` is 0xFF in primary.zig so the
     // slot carries `susp` (ThreadCap bit 5). If this read disagrees, the
     // runner contract has shifted out from under the test.
@@ -113,7 +113,7 @@ pub fn main(cap_table_base: u64) void {
     const field0_pre = cap_pre.field0;
     const field1_pre = cap_pre.field1;
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout, so the [2] BADCAP gate must fire. The [1] gate
     // has already passed (slot 1 is a valid thread), which is the
     // precondition for the spec's test 12 refresh requirement.

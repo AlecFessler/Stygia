@@ -13,7 +13,7 @@
 //   To exercise the fast path the test needs writable user memory
 //   whose qword content the kernel will read. The test child cannot
 //   touch arbitrary VAs — only ranges installed by the kernel into
-//   the test domain's page tables are valid u-mode addresses
+//   the test process's page tables are valid u-mode addresses
 //   (E_BADADDR otherwise per test 05). The minimal construction is:
 //
 //     create_page_frame(caps={r,w}, sz=0, pages=1)   — backing 4 KiB

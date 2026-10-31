@@ -15,7 +15,7 @@
 //   The blocker is identical to the one documented in
 //   create_var_22.zig and map_mmio_05.zig: the v0 runner
 //   (runner/primary.zig spawnOne) populates a child capability
-//   domain's table via `create_capability_domain`'s passed_handles,
+//   process's table via `create_process`'s passed_handles,
 //   which on this branch carry only the result port at slot 3.
 //   Slots 0/1/2 are kernel-installed as self / initial thread /
 //   self-IDC. No device_region of any `dev_type` reaches a test
@@ -42,7 +42,7 @@
 //       device_region is forwarded, the faithful test would size
 //       the VMAR to match that device_region's port_count (rounded
 //       up to a page) and assert E_INVAL on the cch mismatch.
-//   Pass slot 4095 for [2]: per the create_capability_domain table
+//   Pass slot 4095 for [2]: per the create_process table
 //   layout that slot is guaranteed empty, so the kernel rejects
 //   with E_BADCAP via §[map_mmio] test 02 instead of reaching the
 //   port_io / cch arm.

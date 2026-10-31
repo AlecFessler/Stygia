@@ -242,8 +242,8 @@ fn emitVarConst(
     var is_slab_struct: bool = false;
     if (vd.ast.init_node.unwrap()) |init_node| {
         var buf: [2]Node.Index = undefined;
-        if (w.tree.fullContainerDecl(&buf, init_node)) |cd| {
-            for (cd.ast.members) |member| {
+        if (w.tree.fullContainerDecl(&buf, init_node)) |process| {
+            for (process.ast.members) |member| {
                 if (containerFieldNameIs(w.tree, member, "_gen_lock")) {
                     is_slab_struct = true;
                     break;
@@ -281,16 +281,16 @@ fn emitVarConst(
     // with the new container_path so nested fns get correctly qualified.
     if (vd.ast.init_node.unwrap()) |init_node| {
         var buf: [2]Node.Index = undefined;
-        if (w.tree.fullContainerDecl(&buf, init_node)) |cd| {
+        if (w.tree.fullContainerDecl(&buf, init_node)) |process| {
             const new_path = if (container_path.len == 0)
                 try w.palloc.dupe(u8, name)
             else
                 try std.fmt.allocPrint(w.palloc, "{s}.{s}", .{ container_path, name });
 
-            const cd_node_id = try emitNode(w, KIND_CONTAINER_DECL, init_node, node_id);
+            const process_node_id = try emitNode(w, KIND_CONTAINER_DECL, init_node, node_id);
             const sub_kind = containerDeclKind(w, init_node);
-            for (cd.ast.members) |member| {
-                try walkContainerMember(w, member, cd_node_id, new_path, sub_kind);
+            for (process.ast.members) |member| {
+                try walkContainerMember(w, member, process_node_id, new_path, sub_kind);
             }
         } else {
             // Non-container init: walk it as expression to catch calls.
@@ -513,15 +513,56 @@ fn walkExpr(w: *Walker, idx: Node.Index, parent_id: ?u64) anyerror!void {
         },
 
         // Binary expressions where data is `node_and_node`: descend both sides.
-        .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal,
-        .add, .add_wrap, .add_sat, .sub, .sub_wrap, .sub_sat, .mul, .mul_wrap, .mul_sat,
-        .div, .mod, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .shl, .shl_sat, .shr,
-        .array_access, .array_cat, .array_mult, .@"catch", .@"orelse",
-        .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod,
-        .assign_bit_and, .assign_bit_or, .assign_bit_xor, .assign_shl, .assign_shr,
-        .assign_add_wrap, .assign_sub_wrap, .assign_mul_wrap,
-        .assign_add_sat, .assign_sub_sat, .assign_mul_sat, .assign_shl_sat,
-        .merge_error_sets, .error_union,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        .add,
+        .add_wrap,
+        .add_sat,
+        .sub,
+        .sub_wrap,
+        .sub_sat,
+        .mul,
+        .mul_wrap,
+        .mul_sat,
+        .div,
+        .mod,
+        .bool_and,
+        .bool_or,
+        .bit_and,
+        .bit_or,
+        .bit_xor,
+        .shl,
+        .shl_sat,
+        .shr,
+        .array_access,
+        .array_cat,
+        .array_mult,
+        .@"catch",
+        .@"orelse",
+        .assign,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .assign_bit_and,
+        .assign_bit_or,
+        .assign_bit_xor,
+        .assign_shl,
+        .assign_shr,
+        .assign_add_wrap,
+        .assign_sub_wrap,
+        .assign_mul_wrap,
+        .assign_add_sat,
+        .assign_sub_sat,
+        .assign_mul_sat,
+        .assign_shl_sat,
+        .merge_error_sets,
+        .error_union,
         => {
             const data = w.tree.nodeData(idx);
             try walkExpr(w, data.node_and_node[0], parent_id);
@@ -529,7 +570,12 @@ fn walkExpr(w: *Walker, idx: Node.Index, parent_id: ?u64) anyerror!void {
         },
 
         // Unary tagged with `node`: descend the operand.
-        .negation, .negation_wrap, .bit_not, .bool_not, .address_of, .deref,
+        .negation,
+        .negation_wrap,
+        .bit_not,
+        .bool_not,
+        .address_of,
+        .deref,
         .optional_type,
         => {
             try walkExpr(w, w.tree.nodeData(idx).node, parent_id);
@@ -545,25 +591,45 @@ fn walkExpr(w: *Walker, idx: Node.Index, parent_id: ?u64) anyerror!void {
         },
 
         // Container init (struct{}, [_]T{}, etc.) — descend into init values for calls.
-        .struct_init_one, .struct_init_one_comma, .struct_init, .struct_init_comma,
-        .struct_init_dot_two, .struct_init_dot_two_comma, .struct_init_dot, .struct_init_dot_comma,
-        .array_init_one, .array_init_one_comma, .array_init, .array_init_comma,
-        .array_init_dot_two, .array_init_dot_two_comma, .array_init_dot, .array_init_dot_comma,
+        .struct_init_one,
+        .struct_init_one_comma,
+        .struct_init,
+        .struct_init_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init,
+        .array_init_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
         => {
             // Skip for slice B; nested calls in initializer expressions can wait.
         },
 
         // Anonymous container_decls in expression position (e.g. return struct {...})
-        .container_decl, .container_decl_trailing, .container_decl_arg, .container_decl_arg_trailing,
-        .container_decl_two, .container_decl_two_trailing,
-        .tagged_union, .tagged_union_trailing, .tagged_union_two, .tagged_union_two_trailing,
-        .tagged_union_enum_tag, .tagged_union_enum_tag_trailing,
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
         => {
             const node_id = try emitNode(w, KIND_CONTAINER_DECL, idx, parent_id);
             var buf: [2]Node.Index = undefined;
-            if (w.tree.fullContainerDecl(&buf, idx)) |cd| {
+            if (w.tree.fullContainerDecl(&buf, idx)) |process| {
                 const sub_kind = containerDeclKind(w, idx);
-                for (cd.ast.members) |member| {
+                for (process.ast.members) |member| {
                     try walkContainerMember(w, member, node_id, "", sub_kind);
                 }
             }

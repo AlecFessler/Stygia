@@ -1,8 +1,8 @@
 // Spec §[ack] — test 06.
 //
-// "[test 06] on success, the calling domain's copy of [1] has
+// "[test 06] on success, the calling process's copy of [1] has
 //  `field1.irq_count = 0` immediately on return; every other
-//  domain-local copy returns 0 from a fresh `sync` within a bounded
+//  process-local copy returns 0 from a fresh `sync` within a bounded
 //  delay."
 //
 // Strategy
@@ -18,24 +18,24 @@
 //   is on word 0 bits 48-63 per §[device_region], readable through
 //   readCap → cap field).
 //
-//   Calling-domain assertion. Spec test 06 splits into two halves:
+//   Calling-process assertion. Spec test 06 splits into two halves:
 //
-//   (a) calling-domain copy: after a successful `ack`, the test
+//   (a) calling-process copy: after a successful `ack`, the test
 //       child's own copy of the device_region handle must have
 //       `field1.irq_count = 0`. We refresh the slot via `sync` (which
 //       writes the kernel's authoritative state back into the
 //       caller's copy of field0/field1), read field1, and assert
 //       it is 0. This is observable from a single child capability
-//       domain and is the focus of this test.
+//       process and is the focus of this test.
 //
-//   (b) cross-domain bounded-delay: every OTHER domain-local copy
+//   (b) cross-process bounded-delay: every OTHER process-local copy
 //       returns 0 from a fresh `sync` within a bounded delay. There
-//       is no cross-domain peer in this child's reach — the child
-//       cannot mint a sibling capability domain that holds its own
-//       copy of the same device_region (no `crcd` on a runner-minted
-//       child self-handle today, and even with crcd, no syscall
+//       is no cross-process peer in this child's reach — the child
+//       cannot mint a sibling process that holds its own
+//       copy of the same device_region (no `crproc` on a runner-minted
+//       child self-handle today, and even with crproc, no syscall
 //       reaches into the sibling's cap_table to drive a `sync`
-//       there). That arm is therefore deferred behind a multi-domain
+//       there). That arm is therefore deferred behind a multi-process
 //       harness that does not exist on this branch and is documented
 //       here rather than tested.
 //
@@ -43,7 +43,7 @@
 //   0xCAFE_0000 is a synthetic mmio region; no real IRQ source is
 //   wired to it on the test profile, and there is no userspace-
 //   reachable mechanism in this child to inject an IRQ on a
-//   device_region from inside its own capability domain. The
+//   device_region from inside its own process. The
 //   pre-call counter is therefore guaranteed to be 0 (the kernel
 //   only increments `field1.irq_count` on a real device IRQ per
 //   §[device_region]). The test still tightens the spec's SHAPE
@@ -53,9 +53,9 @@
 //       E_BADCAP). With irq=1 and the kernel's IRQ delivery wired
 //       up at boot for this fixture, only success satisfies the
 //       spec.
-//     - the post-call calling-domain `field1.irq_count` MUST be 0,
+//     - the post-call calling-process `field1.irq_count` MUST be 0,
 //       which is the load-bearing test 06 invariant for the
-//       calling domain — the kernel must zero the counter on a
+//       calling process — the kernel must zero the counter on a
 //       successful ack regardless of the prior value (0 → 0 is the
 //       boundary case explicitly preserved by the spec wording
 //       "field1.irq_count = 0 immediately on return").
@@ -74,17 +74,17 @@
 //      fixture lost its kernel-side IRQ wiring or the cap was
 //      mis-forwarded; assertion structurally unreachable through
 //      this handle). Otherwise fail.
-//   4. sync(found) — refresh the calling-domain copy of field1.
-//   5. assert field1.irq_count == 0 in the calling-domain copy.
+//   4. sync(found) — refresh the calling-process copy of field1.
+//   5. assert field1.irq_count == 0 in the calling-process copy.
 //
 // Assertions
 //   1: ack returned a non-OK, non-degraded outcome (an error other
 //      than E_PERM/E_INVAL — for example E_BADCAP, indicating the
 //      forwarded handle is invalid).
 //   2: sync after ack failed (cap-table refresh mechanism broke).
-//   3: field1.irq_count was nonzero in the calling-domain copy
+//   3: field1.irq_count was nonzero in the calling-process copy
 //      immediately after a successful ack — the test 06 calling-
-//      domain invariant under test failed.
+//      process invariant under test failed.
 
 const lib = @import("lib");
 
@@ -97,7 +97,7 @@ pub fn main(cap_table_base: u64) void {
     const dev_handle = findIrqDeviceRegion(cap_table_base) orelse {
         // Degraded smoke: no irq-bearing device_region forwarded into
         // this child (e.g. kernel built without
-        // -Dtests_fixture_devices=true). The calling-domain assertion
+        // -Dtests_fixture_devices=true). The calling-process assertion
         // is structurally unreachable; smoke-pass.
         testing.pass();
         return;
@@ -109,7 +109,7 @@ pub fn main(cap_table_base: u64) void {
         // E_PERM (irq cap missing despite the scan — possible if the
         // fixture's cap word changes) or E_INVAL (no IRQ delivery
         // configured in this build) leaves the success-path
-        // calling-domain assertion unreachable. Both are spec-legal
+        // calling-process assertion unreachable. Both are spec-legal
         // outcomes for a different test (§[ack] tests 02 / 03), so
         // smoke-pass rather than treat them as failures of test 06.
         if (r.v1 == @intFromEnum(errors.Error.E_PERM)) {
@@ -124,9 +124,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Success: refresh the calling-domain handle copy via `sync`
+    // Success: refresh the calling-process handle copy via `sync`
     // and observe field1. §[ack] test 06 wording: "the calling
-    // domain's copy of [1] has field1.irq_count = 0 immediately on
+    // process's copy of [1] has field1.irq_count = 0 immediately on
     // return". `sync` is the user-visible mechanism for pulling the
     // kernel's authoritative field1 back into the cap_table — the
     // wording "immediately on return" is satisfied by any sync

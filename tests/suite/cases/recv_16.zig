@@ -18,7 +18,7 @@
 //   [1] != self) queues W as a suspended sender but W never made a
 //   syscall — there is no syscall return for the kernel to resolve, so
 //   E_ABANDONED is not directly observable. recv_16 instead spawns a
-//   worker thread W in the same capability domain, hands W the slot id of
+//   worker thread W in the same process, hands W the slot id of
 //   its own thread handle through a shared global, and has W issue
 //   `suspend(self_slot, port)` from `workerEntry`. That is the syscall
 //   the kernel resumes with E_ABANDONED on delete; W stores the result
@@ -41,7 +41,7 @@
 //   halts. The test thread bounded-yield-polls `worker_done`; on
 //   observation the recorded result must equal E_ABANDONED.
 //
-//   Both Threads run in the same capability domain (target=0 on the
+//   Both Threads run in the same process (target=0 on the
 //   create_thread call), so they share the address space —
 //   `worker_self_slot`, `worker_port_slot`, `worker_ready`,
 //   `worker_result`, and `worker_done` are process-global side
@@ -78,7 +78,7 @@
 //           event before the test thread recvs.
 //         05 (E_CLOSED on blocked recv when bind drops): the test thread
 //           never deletes the port handle.
-//         06 (E_FULL): the test domain has plenty of free slots for
+//         06 (E_FULL): the test process has plenty of free slots for
 //           the reply handle and the zero attached handles.
 //
 // Action
@@ -123,7 +123,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global side channels. Both Threads run in the same capability
-// domain, so they share the address space and the handle table.
+// process, so they share the address space and the handle table.
 //   - worker_self_slot: the slot id of W's own thread handle, published by
 //     the test thread after createThread returns. W reads it
 //     after observing worker_ready to issue suspend(self, port).
@@ -202,7 +202,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         entry,
         1, // stack_pages
-        0, // target = self (this domain)
+        0, // target = self (this process)
         0, // affinity = any core
     );
     if (testing.isHandleError(cec.v1)) {

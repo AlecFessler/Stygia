@@ -1,6 +1,6 @@
 // Test reporting helpers for spec v3 model tests.
 //
-// Each test ELF is spawned by the primary as its own capability domain
+// Each test ELF is spawned by the primary as its own process
 // with the result port at `SLOT_FIRST_PASSED`. A test reports its
 // outcome by calling `pass()` or `fail(id)`, which suspends the
 // initial thread on the port with the result encoding loaded into vregs
@@ -63,7 +63,7 @@ pub fn isHandleError(v: u64) bool {
     return v > 0 and v < 16;
 }
 
-// A no-op thread entry. Tests that need an thread handle but don't care about
+// A no-op thread entry. Tests that need a thread handle but don't care about
 // what the thread executes pass `&dummyEntry` as the entry argument to
 // `create_thread`. The thread will halt forever; the test thread
 // reads/restricts/etc. the handle without interference.

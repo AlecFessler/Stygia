@@ -19,7 +19,7 @@
 //   practice that requires two cap-table slots aliasing the same thread
 //   (so an operation on slot A leaves slot B stale until something
 //   touches B), which requires a second alias handle. The current test infrastructure
-//   spawns each test as a single-domain child with no sibling, so the
+//   spawns each test as a single-process child with no sibling, so the
 //   alias-slot path is not yet wired.
 //
 // Degraded variant (this file)

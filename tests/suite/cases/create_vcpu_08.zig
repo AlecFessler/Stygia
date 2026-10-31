@@ -1,6 +1,6 @@
 // Spec §[create_vcpu] — test 08.
 //
-// "[test 08] on success, the caller receives an thread handle with caps =
+// "[test 08] on success, the caller receives a thread handle with caps =
 //  `[1].caps`."
 //
 // Strategy

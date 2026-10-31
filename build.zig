@@ -200,7 +200,7 @@ pub fn build(b: *std.Build) void {
             // ReleaseSafe boot: growOne's zeroing memset wrote
             // v0={0xffffff80bd238280,0xffff000000008e9c} (a physmap ptr
             // + its own return address) instead of zeros into the first
-            // CD slab slot, and the next create() read the garbage as a
+            // process slab slot, and the next create() read the garbage as a
             // gen word.
             //
             // The old TODO here feared the EFI bootloader (it imports
@@ -554,7 +554,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (emit_index) {
-        // Run the indexer (must already be built — `cd tools/indexer && zig
+        // Run the indexer (must already be built — `process tools/indexer && zig
         // build` once before invoking this) against the just-installed
         // kernel ELF + IR. Output `.db` lands in tools/callgraph_http/test/dbs/
         // where the callgraph daemons auto-discover it.
@@ -593,7 +593,7 @@ pub fn build(b: *std.Build) void {
         });
         run_indexer.step.dependOn(&install_kernel.step);
         if (maybe_install_ir) |ir| run_indexer.step.dependOn(&ir.step);
-        const index_step = b.step("index", "Run the callgraph DB indexer after the kernel build (requires `cd tools/indexer && zig build` and -Demit_index=true)");
+        const index_step = b.step("index", "Run the callgraph DB indexer after the kernel build (requires `process tools/indexer && zig build` and -Demit_index=true)");
         index_step.dependOn(&run_indexer.step);
     }
 
@@ -601,7 +601,7 @@ pub fn build(b: *std.Build) void {
     //
     // The root service is a PREBUILT input: this build copies it verbatim
     // and never re-derives it. `tests/suite/bin/root_service.elf` is
-    // arch-specific and is produced by a separate `cd tests/suite &&
+    // arch-specific and is produced by a separate `process tests/suite &&
     // zig build [-Darch=arm]`, so building the kernel for one arch after
     // building the suite for the other silently pairs an x86-64
     // kernel.elf with an aarch64 root_service.elf (or vice versa).
@@ -820,8 +820,8 @@ fn verifyRootServiceArch(path: []const u8, arch: std.Target.Cpu.Arch) void {
         \\This file is a prebuilt input; the kernel build copies it verbatim and
         \\never re-derives it. Rebuild it for this arch, then rebuild the kernel:
         \\
-        \\  cd tests/suite && rm -rf bin/ .zig-cache && zig build{s}
-        \\  cd - && rm -rf zig-out && zig build -Dprofile=test{s}
+        \\  process tests/suite && rm -rf bin/ .zig-cache && zig build{s}
+        \\  process - && rm -rf zig-out && zig build -Dprofile=test{s}
         \\
         \\Booting the mismatched pair would jump into a zeroed page and produce a
         \\boot-time USR-PF write to address 0 plus a single-live-thread [HANG], which

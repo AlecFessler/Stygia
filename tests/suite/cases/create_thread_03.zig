@@ -5,24 +5,24 @@
 //
 // Strategy
 //   thread_inner_ceiling lives in self-handle field0 bits 0-7 (an 8-bit
-//   field — see §[capability_domain]). The kernel's create_thread inner
+//   field — see §[process]). The kernel's create_thread inner
 //   subset check reads those 8 bits and compares against caps[0..7];
 //   ThreadCap bits 8-9 (`restart_policy`) are governed by
 //   restart_policy_ceiling, while bits 10-15 are reserved. Exercising
-//   the test 03 reject path therefore requires a domain whose
+//   the test 03 reject path therefore requires a process whose
 //   thread_inner_ceiling drops at least one of bits 0-7.
 //
-//   The runner spawns every test capability domain with
+//   The runner spawns every test process with
 //   `thread_inner_ceiling = 0xFF`, so a child running directly under the
 //   runner can never trigger the bits-0..7 reject. We work around
-//   that by spawning a sub-domain inheriting the same test ELF with
+//   that by spawning a sub-process inheriting the same test ELF with
 //   `thread_inner_ceiling = 0x7F` (bit 7 = `write` cleared) and let the
-//   sub-domain's initial thread perform the actual create_thread call. The
-//   parent and the sub-domain share this ELF; the entry distinguishes
+//   sub-process's initial thread perform the actual create_thread call. The
+//   parent and the sub-process share this ELF; the entry distinguishes
 //   the two by reading the caller's own `thread_inner_ceiling` out of
 //   `cap_table_base[SLOT_SELF].field0`:
 //
-//     - field0 bit 7 set  → parent  → spawn the sub-domain
+//     - field0 bit 7 set  → parent  → spawn the sub-process
 //     - field0 bit 7 clear → child  → call create_thread
 //                                     with caps.write = true and assert
 //                                     the return is E_PERM
@@ -32,17 +32,17 @@
 //   per spawned manifest entry (the spec test tag is per-build, so
 //   parent and child carry the same tag).
 //
-//   To spawn the sub-domain the parent needs a page_frame containing
+//   To spawn the sub-process the parent needs a page_frame containing
 //   the test ELF. The runner already passed that handle to the test
-//   domain via `passed_handles[1]` (slot 4) for exactly this case;
+//   process via `passed_handles[1]` (slot 4) for exactly this case;
 //   passed_handles[0] (slot 3) remains the shared result port. The
-//   sub-domain receives both as passed handles in the same slot
-//   layout so its child path can `report` and (if the sub-domain
+//   sub-process receives both as passed handles in the same slot
+//   layout so its child path can `report` and (if the sub-process
 //   itself needs to spawn further tests) propagate the ELF handle.
 //
 // Assertions
 //   parent path:
-//     1: createCapabilityDomain returned an error word (failed to
+//     1: createProcess returned an error word (failed to
 //        spawn the restricted child)
 //   child path:
 //     2: create_thread returned something other than E_PERM
@@ -58,7 +58,7 @@ const testing = lib.testing;
 const SLOT_RESULT_PORT: caps.HandleId = caps.SLOT_FIRST_PASSED; // 3
 const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
 // Mirrors libz_loader.LIBZ_PF_SLOT — the runner places the
-// staged libz page frame here for every spawned test domain so its
+// staged libz page frame here for every spawned test process so its
 // _start can mapPf libz at LIBZ_SLIDE.
 const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
@@ -112,7 +112,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // ── Parent path ───────────────────────────────────────────────
-    // Spawn a child domain that re-enters this same ELF with
+    // Spawn a child process that re-enters this same ELF with
     // thread_inner_ceiling = 0x7F. The child then takes the branch above.
     // `crvr` is required so the child's _start can call createVmar to
     // map libz at LIBZ_SLIDE; without it the libz bootstrap halts.
@@ -126,7 +126,7 @@ pub fn main(cap_table_base: u64) void {
     // sub-fields mirror the runner's installed ceilings exactly so the
     // syscall's subset checks (test 12 port_ceiling in particular)
     // accept the spawn — only the thread_inner_ceiling restriction is
-    // load-bearing for this test. Layout matches §[create_capability_domain]
+    // load-bearing for this test. Layout matches §[create_process]
     // [2] ceilings_inner:
     //   bits  0-7   thread_inner_ceiling   = 0x7F (bit 7 cleared)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
@@ -147,7 +147,7 @@ pub fn main(cap_table_base: u64) void {
     // Pass the runner-supplied handles through to the child so the
     // child can report on the shared port and bootstrap libz. The ELF
     // pf is forwarded to keep symmetry with the parent layout (the
-    // child does not need to spawn further sub-domains, but uniform
+    // child does not need to spawn further sub-processes, but uniform
     // slot layout simplifies cap_table_base offsets). The libz pf is
     // mandatory: the spawned grandchild's _start (tests/suite/libz/
     // start.zig) reads slot SLOT_LIBZ_PF and mapPfs the libz image at
@@ -193,7 +193,7 @@ pub fn main(cap_table_base: u64) void {
         }).toU64(),
     };
 
-    const r = syscall.createCapabilityDomain(
+    const r = syscall.createProcess(
         @as(u64, child_self.toU16()),
         ceilings_inner,
         ceilings_outer,
@@ -209,10 +209,10 @@ pub fn main(cap_table_base: u64) void {
     // Parent returns. The child is the sole reporter; the runner
     // indexes results by build-time test tag so a single report from
     // the child satisfies this test's slot. Returning lets `_start`
-    // invoke `delete(SLOT_SELF)` and tear the parent CD down — without
-    // it the parent CD stayed alive indefinitely and ~10 reps of the
-    // test runner exhausted the CD slab class. The child sub-domain
-    // is independent (top-level CDs are not parent-linked under v3),
+    // invoke `delete(SLOT_SELF)` and tear the parent process down — without
+    // it the parent process stayed alive indefinitely and ~10 reps of the
+    // test runner exhausted the process slab class. The child sub-process
+    // is independent (top-level processes are not parent-linked under v3),
     // so destroying the parent here does not affect the child's
     // ability to report.
     return;

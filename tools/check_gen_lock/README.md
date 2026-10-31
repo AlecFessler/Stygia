@@ -178,7 +178,7 @@ provenance along the path is recorded and printed
   `secure_slab.forEachAlive` is one entity carrying the union of every
   visitor's callees, so a path can enter through one instantiation and
   leave through another (`hang_detector.dump → forEachAlive →
-  destroyThreadsInDomain` is such a phantom).
+  destroyThreadsInProcess` is such a phantom).
 
 Both are over-approximations: they cost false positives, not false
 negatives. The next one does not.
@@ -262,7 +262,7 @@ when there's a documented reason the per-register lock-bracket model
 is genuinely too coarse for this fn — NOT as a way to silence findings
 that look inconvenient. A flagged unlocked field access on a slab
 pointer is almost always a real race against syscalls that other
-handles to the same object can make through their own holding domains.
+handles to the same object can make through their own holding processes.
 
 Out of scope (deliberately): aarch64 (different mnemonics), functions
 with mixed Zig and asm, composite-offset field-pinning.

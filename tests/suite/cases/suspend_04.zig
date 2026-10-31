@@ -34,7 +34,7 @@
 //   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever (`hlt`). No synchronization is needed because the
 //   suspend-cap check happens against the port handle's caps field in
-//   our domain's handle table; the running thread's state is irrelevant.
+//   our process's handle table; the running thread's state is irrelevant.
 //
 // Action
 //   1. create_port(caps={recv, bind})                             — must succeed

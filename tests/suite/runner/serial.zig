@@ -112,7 +112,7 @@ pub fn init(cap_table_base: u64) Serial {
 fn findCom1(cap_table_base: u64) ?HandleId {
     // SPEC AMBIGUITY: boot-time root-service handle layout undefined.
     // Slots 0/1/2 are self / initial thread / self-IDC; passed_handles
-    // start at 3 for create_capability_domain callers, but the spec
+    // start at 3 for create_process callers, but the spec
     // does not pin where the kernel populates root-service-only
     // handles like device_regions. Scan the full table.
     var slot: u32 = caps.SLOT_FIRST_PASSED;

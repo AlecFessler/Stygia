@@ -221,7 +221,7 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
 // for 32 <= N <= 127, with vreg 0 (the syscall word) at `[sp + 0]`.
 // Reserve the kernel-visible vreg window on the caller stack for the
 // svc instant. That keeps libz's shared image read-only in test
-// domains; a process-global .bss scratch page would alias across every
+// processes; a process-global .bss scratch page would alias across every
 // concurrently running child.
 pub fn issueRawWithSlots(word: u64, in: Regs, slots: *const [16]u64, n: usize) Regs {
     var window: [97]u64 align(16) = .{0} ** 97;

@@ -1,8 +1,8 @@
 // Spec §[ack] — test 07.
 //
 // "[test 07] on success, after a subsequent IRQ from the device, every
-//  domain-local copy's `field1.irq_count` reaches the new value within
-//  a bounded delay and an thread blocked in `futex_wait_val` on each copy's
+//  process-local copy's `field1.irq_count` reaches the new value within
+//  a bounded delay and a thread blocked in `futex_wait_val` on each copy's
 //  `field1` paddr is woken."
 //
 // Faithful path
@@ -11,7 +11,7 @@
 //        (so kernel/devices/device_region.zig onIrq actually reaches
 //        propagateIrqAndWake on injection).
 //     2. handle_list_head wired by the caps mint/alias path so
-//        propagateIrqAndWake walks every domain-local copy and bumps
+//        propagateIrqAndWake walks every process-local copy and bumps
 //        field1.irq_count saturating + futex.wake on its paddr.
 //     3. A worker thread parked in `futex_wait_val(addr=&copy.field1,
 //        expected=copy.field1.irq_count)` ahead of the second IRQ so

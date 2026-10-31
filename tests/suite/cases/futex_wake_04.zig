@@ -39,10 +39,10 @@
 //   sibling at all.
 //
 //   Choice of addr_a: `cap_table_base` — page-aligned, valid in the
-//   caller's domain, so test 02 / 03 cannot fire on Leg A.
+//   caller's process, so test 02 / 03 cannot fire on Leg A.
 //   Choice of addr_b: `&shared` — process-global u64 in .bss; the
 //   sibling is spawned with `target = 0` so the same vaddr is valid
-//   in both Threads' (shared) domain, satisfying test 02 / 03 for Leg B.
+//   in both Threads' (shared) process, satisfying test 02 / 03 for Leg B.
 //
 //   Self-handle: the runner mints children with `fut_wake = true`
 //   and `fut_wait_max = 63` (runner/primary.zig), so test 01
@@ -86,7 +86,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global shared between primary and sibling — both run in the
-// same capability domain (target = 0), so &shared has the same vaddr
+// same process (target = 0), so &shared has the same vaddr
 // in both. .bss u64 alignment satisfies the 8-byte requirement.
 var shared: u64 = 0;
 var sibling_alive: u64 = 0;

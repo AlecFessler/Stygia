@@ -11,7 +11,7 @@
 //   table.
 //
 //   To witness that path we need:
-//     (a) A live reply handle in this domain. The reply handle must
+//     (a) A live reply handle in this process. The reply handle must
 //         carry `xfer` so test 09 (E_PERM, xfer missing) cannot fire
 //         instead of test 15. Per spec the kernel mints the reply at
 //         recv time with xfer = 1 iff the recv'ing port had `xfer`, so

@@ -3,7 +3,7 @@
 /// Spec v3 has no debug-write syscall. Output goes to COM1 (0x3F8/8) via
 /// the port-IO virtualization path: the bootloader hands the kernel a
 /// `device_region` for COM1 with `dev_type = port_io`; the kernel
-/// passes it into the root-service domain at create-time as a passed
+/// passes it into the root-service process at create-time as a passed
 /// handle. We discover it by scanning the cap table, build an MMIO VMAR
 /// over it via `map_mmio`, and 1-byte stores to the VMAR's base address
 /// trap and emulate as `out (base_port + offset), al` per

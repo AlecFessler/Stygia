@@ -5,7 +5,7 @@ const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
 const port_obj = stygia.sched.port;
 
-const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
+const ProcessCaps = stygia.caps.process.ProcessCaps;
 const ThreadCaps = stygia.sched.thread.ThreadCaps;
 const Thread = stygia.sched.thread.Thread;
 const PortCaps = port_obj.PortCaps;
@@ -56,13 +56,13 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     if (caps & ~CREATE_PORT_CAPS_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const self_caps_word = Word0.caps(cd.user_table[0].word0);
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const self_caps_word = Word0.caps(process.user_table[0].word0);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
-    const self_caps: CapabilityDomainCaps = @bitCast(self_caps_word);
+    const self_caps: ProcessCaps = @bitCast(self_caps_word);
     if (!self_caps.crpt) return errors.E_PERM;
 
     // Port lifetime is governed by `recv_refcount` (Spec §[recv] tests
@@ -125,9 +125,9 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     if (pair_count > MAX_PAIR_COUNT) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
     const irq_state = lr.irq_state;
 
     // Spec §[suspend] gate order: [1] target validity (test 01) before
@@ -136,20 +136,20 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // invalid target with a valid port returned E_PERM (port lacks
     // bind) instead of E_BADCAP.
     const target_slot: u12 = @truncate(target);
-    if (capability.resolveHandleOnDomain(cd, target_slot, .thread) == null) {
-        cd_ref.unlockIrqRestore(irq_state);
+    if (capability.resolveHandleOnProcess(process, target_slot, .thread) == null) {
+        process_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
 
     const port_slot: u12 = @truncate(port);
-    if (capability.resolveHandleOnDomain(cd, port_slot, .port) == null) {
-        cd_ref.unlockIrqRestore(irq_state);
+    if (capability.resolveHandleOnProcess(process, port_slot, .port) == null) {
+        process_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
-    const thread_caps: ThreadCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
-    const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
+    const thread_caps: ThreadCaps = @bitCast(Word0.caps(process.user_table[target_slot].word0));
+    const port_caps: PortCaps = @bitCast(Word0.caps(process.user_table[port_slot].word0));
 
-    cd_ref.unlockIrqRestore(irq_state);
+    process_ref.unlockIrqRestore(irq_state);
 
     if (!thread_caps.susp) return errors.E_PERM;
     if (!port_caps.@"suspend") return errors.E_PERM;
@@ -226,17 +226,17 @@ fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
     }
 
     // Tests 02, 03, 04, 05: per-entry source-handle resolution under
-    // the suspending thread's domain lock. Each entry is checked in turn
+    // the suspending thread's process lock. Each entry is checked in turn
     // and the first failure short-circuits — spec does not pin
     // intra-list ordering, only that 02 fires on any invalid id, 03
     // on any cap-subset violation, etc.
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
-    const source_domain: capability.ErasedSlabRef = .{
-        .ptr = cd,
-        .gen = @intCast(cd._gen_lock.currentGen()),
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    defer process_ref.unlockIrqRestore(lr.irq_state);
+    const source_process: capability.ErasedSlabRef = .{
+        .ptr = process,
+        .gen = @intCast(process._gen_lock.currentGen()),
     };
 
     i = 0;
@@ -245,19 +245,19 @@ fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
         const entry_caps: u16 = @truncate((entries[i] >> 16) & 0xFFFF);
         const move_flag: bool = (entries[i] & PAIR_MOVE_BIT) != 0;
 
-        const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse {
+        const handle = capability.resolveHandleOnProcess(process, slot, null) orelse {
             thread.pending_pair_count = @intCast(i);
             port_obj.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
 
-        const src_caps: u16 = @truncate(Word0.caps(cd.user_table[slot].word0));
+        const src_caps: u16 = @truncate(Word0.caps(process.user_table[slot].word0));
 
         // Test 03: requested caps must be a subset of the source
         // handle's current caps. Bitwise subset suffices for every
         // cap type that ships through pair entries today (port,
         // thread, page_frame, var, device_region, timer,
-        // capability_domain IDC) — none of them carry the 2-bit
+        // process IDC) — none of them carry the 2-bit
         // restart_policy enum that `restrict` special-cases.
         if (entry_caps & ~src_caps != 0) {
             thread.pending_pair_count = @intCast(i);
@@ -292,12 +292,12 @@ fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
         // sender's source handle keeps the underlying object alive
         // across the suspend → recv rendezvous; the at-recv
         // mintHandleAlwaysNew installs a fresh slot in the receiver
-        // domain with the entry's caps verbatim (or intersected with
+        // process with the entry's caps verbatim (or intersected with
         // idc_rx for IDC handles, when that path is wired).
-        const obj_type = Word0.typeTag(cd.user_table[slot].word0);
+        const obj_type = Word0.typeTag(process.user_table[slot].word0);
         thread.pending_pair_entries[i] = .{
             .obj_ref = handle.ref,
-            .source_domain = source_domain,
+            .source_process = source_process,
             .source_instance = handle.instance,
             .obj_type = obj_type,
             .source_caps = src_caps,
@@ -379,19 +379,19 @@ pub fn recv(caller: *anyopaque, port: u64, timeout_ns: u64) i64 {
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
     const irq_state = lr.irq_state;
 
     const port_slot: u12 = @truncate(port);
-    if (capability.resolveHandleOnDomain(cd, port_slot, .port) == null) {
-        cd_ref.unlockIrqRestore(irq_state);
+    if (capability.resolveHandleOnProcess(process, port_slot, .port) == null) {
+        process_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
-    const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
+    const port_caps: PortCaps = @bitCast(Word0.caps(process.user_table[port_slot].word0));
 
-    cd_ref.unlockIrqRestore(irq_state);
+    process_ref.unlockIrqRestore(irq_state);
 
     if (!port_caps.recv) return errors.E_PERM;
 

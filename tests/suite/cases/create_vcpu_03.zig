@@ -4,7 +4,7 @@
 //  ceiling."
 //
 // Spec semantics
-//   §[capability_domain] places the priority ceiling in the SelfCap
+//   §[process] places the priority ceiling in the SelfCap
 //   `pri` field (bits 14-15 of the SelfCap word). §[create_vcpu] caps
 //   word bits 32-33 carry the requested priority for the new vCPU thread,
 //   "0-3, bounded by caller's priority ceiling". The kernel must
@@ -12,7 +12,7 @@
 //   caller's ceiling.
 //
 // Strategy
-//   The runner mints each child capability domain with `pri = 3` (max),
+//   The runner mints each child process with `pri = 3` (max),
 //   so an in-bounds 0..3 priority on its own cannot exceed the ceiling.
 //   We first lower our self-handle's ceiling via `restrict`; bitwise
 //   subset semantics (§[capabilities] restrict, "Most cap fields use
@@ -153,7 +153,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 3. Create the VM. caps = 0 keeps the VM handle's caps within
-    //    `vm_ceiling` regardless of the domain's vm_ceiling field, so
+    //    `vm_ceiling` regardless of the process's vm_ceiling field, so
     //    test 02 (E_PERM caps not subset) cannot fire. On UEFI-booted
     //    aarch64 EL2 is unreachable so create_virtual_machine returns
     //    E_NODEV — degrade with a smoke-pass since the priority gate

@@ -1,18 +1,18 @@
 // Spec §[device_irq] device_irq — test 03.
 //
 // "[test 03] when the device fires an IRQ, every thread blocked in
-//  futex_wait_val keyed on the paddr of any domain-local copy of
+//  futex_wait_val keyed on the paddr of any process-local copy of
 //  [1].field1 returns from the call with [1] = the corresponding
-//  domain-local vaddr of field1."
+//  process-local vaddr of field1."
 //
 // Faithful path
 //   The faithful sequence parks a worker thread in
 //   `futex_wait_val(addr=&handle.field1, expected=last_seen)`, then
 //   triggers an IRQ from the bound device. The kernel's onIrq path
-//   bumps every domain-local copy's `field1.irq_count` and issues a
+//   bumps every process-local copy's `field1.irq_count` and issues a
 //   futex wake on its paddr (kernel/devices/device_region.zig
 //   propagateIrqAndWake), so the parked thread returns with [1] equal to
-//   the worker's domain-local vaddr of field1.
+//   the worker's process-local vaddr of field1.
 //
 // What's reachable on this branch
 //   Two harness gaps block the wake-on-IRQ shape:
@@ -29,8 +29,8 @@
 //   returns immediately with `[1]` set to that addr") gives us a
 //   syscall-level oracle for the address arithmetic that test 03's
 //   wake side actually rides. The test 03 contract names the *exact
-//   address* the kernel will deliver: the domain-local vaddr of
-//   field1 on the calling domain's copy of [1]. A futex_wait_val call
+//   address* the kernel will deliver: the process-local vaddr of
+//   field1 on the calling process's copy of [1]. A futex_wait_val call
 //   with `expected = field1_irq_count + 1` (i.e. mismatched by
 //   construction, since no IRQ has fired) returns immediately with
 //   `[1]` equal to the field1 vaddr — exactly the same address the
@@ -48,7 +48,7 @@
 //   3. sync(found); record field1_pre (must be 0 since no IRQ has
 //      ever been delivered; documents the kernel-authoritative
 //      starting state).
-//   4. Compute the field1 vaddr in this domain:
+//   4. Compute the field1 vaddr in this process:
 //        cap_table_base + handle_id * sizeof(Cap) + offsetof(Cap, field1).
 //   5. futex_wait_val(timeout=any, addr=field1_vaddr,
 //                     expected=field1_pre + 1).
@@ -68,13 +68,13 @@
 // Faithful-test note (deferred half)
 //   Replace the entry-fast-path oracle with a parked-thread + injection
 //   sequence:
-//     - spawn a worker thread inside the test child capability domain
-//       (or a sibling domain holding a copied alias of [1]);
+//     - spawn a worker thread inside the test child process
+//       (or a sibling process holding a copied alias of [1]);
 //     - worker parks in futex_wait_val(addr=&copy.field1,
 //       expected=copy.field1.irq_count) and side-channels its
 //       observed return [1] back to the test thread;
 //     - test thread injects an IRQ on the dma+irq fixture; asserts
-//       worker's [1] == worker's domain-local vaddr of field1
+//       worker's [1] == worker's process-local vaddr of field1
 //       (id 4).
 //   Needs both a kernel-side test injection hook and
 //   handle_list_head propagation.
@@ -113,7 +113,7 @@ pub fn main(cap_table_base: u64) void {
     // §[capabilities] handle layout: Cap = { word0, field0, field1 },
     // each u64; field1 sits at offset 16 within the 24-byte slot. The
     // cap_table is read-only-mapped at cap_table_base, so the vaddr
-    // the kernel keys this domain's futex address resolution on is the
+    // the kernel keys this process's futex address resolution on is the
     // byte offset arithmetic below.
     const slot_offset: u64 = @as(u64, dev_handle) * @as(u64, caps.HANDLE_BYTES);
     const field1_vaddr: u64 = cap_table_base + slot_offset + @offsetOf(caps.Cap, "field1");

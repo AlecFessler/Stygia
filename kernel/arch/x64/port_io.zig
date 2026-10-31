@@ -13,7 +13,7 @@
 //!   3. Compute the target port: `dev.access.port_io.base_port +
 //!      (fault_vaddr - var_base)`.
 //!   4. Bounds-check `port_offset + width <= port_count`. Out of range
-//!      tears down the owning domain with an unhandled memory fault.
+//!      tears down the owning process with an unhandled memory fault.
 //!   5. Emit IN/OUT of the matching width (`cpu.inb/inw/ind` /
 //!      `cpu.outb/outw/outd`).
 //!   6. Deposit the read-back into the destination GPR (loads;
@@ -83,15 +83,15 @@ pub fn emulatePortIoFault(
     // page tables. x86-64 instructions are at most 15 bytes
     // (Intel SDM Vol 2A §2.3.11) and may straddle a 4 KiB page
     // boundary. caller-pinned: thread is the running thread so its bound
-    // domain is alive across this PF service path; `addr_space_root`
-    // is immutable for the domain's lifetime.
-    const domain = thread.domain.ptr;
+    // process is alive across this PF service path; `addr_space_root`
+    // is immutable for the process's lifetime.
+    const process = thread.process.ptr;
     const page_off = rip & 0xFFF;
     const first_page_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     var buf: [15]u8 = undefined;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
+    const phys = paging_mod.resolveVaddr(process.addr_space_root, rip_page) orelse {
         return failProtection(thread, rip);
     };
     const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
@@ -104,7 +104,7 @@ pub fn emulatePortIoFault(
     var fetched: u8 = first_page_bytes;
     if (first_page_bytes < 15) {
         const next_page = VAddr.fromInt((rip & ~@as(u64, 0xFFF)) + 0x1000);
-        if (paging_mod.resolveVaddr(domain.addr_space_root, next_page)) |next_phys| {
+        if (paging_mod.resolveVaddr(process.addr_space_root, next_page)) |next_phys| {
             const next_base = VAddr.fromPAddr(next_phys, null).addr;
             const next_ptr: [*]const u8 = @ptrFromInt(next_base);
             const need: u8 = 15 - first_page_bytes;

@@ -13,7 +13,7 @@
 //   binding pointer. The only spec-observable signal that the binding
 //   was actually rewired is downstream restart behavior — §[snapshot]
 //   tests 09/10/11 exercise that path — and the v0 testing harness has
-//   no facility to drive a domain restart from inside a single test
+//   no facility to drive a process restart from inside a single test
 //   ELF and re-observe the post-restart state.
 //
 //   This smoke variant therefore asserts only the call-shape claim:
@@ -27,7 +27,7 @@
 //   deferred to the restart-driven tests that need a richer harness.
 //
 // Strategy
-//   The runner spawns each test as a child capability domain with
+//   The runner spawns each test as a child process with
 //   vmar_inner_ceiling permitting r/w and vmar_restart_max = 3
 //   (snapshot) — see restart_semantics_02.zig for the precedent. So
 //   we can mint:

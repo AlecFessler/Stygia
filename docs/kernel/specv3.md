@@ -53,7 +53,7 @@ Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success
 | Value | Name | Meaning |
 |---|---|---|
 | 1 | E_ABANDONED | the peer that would resolve a pending suspension was destroyed before it could do so |
-| 2 | E_BADADDR | a user address argument is not a valid mapped address in the caller's domain |
+| 2 | E_BADADDR | a user address argument is not a valid mapped address in the caller's process |
 | 3 | E_BADCAP | handle id is not a valid handle of the expected type in the caller's table |
 | 4 | E_BUSY | target object is in a state that disallows the operation (e.g., target thread is running and not suspended) |
 | 5 | E_CLOSED | port has no remaining endpoints to make progress against the call |
@@ -65,7 +65,7 @@ Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success
 | 11 | E_NOSPC | insufficient address space for the requested range |
 | 12 | E_PERM | required cap is missing on the handle (or self-handle), or argument exceeds a ceiling |
 | 13 | E_REFUSED | a pending IDC call was rejected by policy before a reply could be produced |
-| 14 | E_TERM | handle references an thread that was terminated; the stale handle is removed from the caller's table on the same call |
+| 14 | E_TERM | handle references a thread that was terminated; the stale handle is removed from the caller's table on the same call |
 | 15 | E_TIMEOUT | a wait expired before its wakeup condition was met |
 
 ## §[capabilities] Capabilities
@@ -105,16 +105,16 @@ word 2 (field1):
 
 Syscall arguments that take a handle carry only the 12-bit handle id — the caller's handle-table index. Such arguments may be named `handle` directly or after the role they play (e.g. `target`, `exit_port`). The kernel resolves the id against the caller's table and reads the full capability for cap checks and dispatch.
 
-A capability domain's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
+A process's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
 
-Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an thread handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
+Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., a thread handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
 
-Handle types a capability domain can hold:
+Handle types a process can hold:
 
 | Type | How obtained |
 |---|---|
-| capability_domain_self | inherent (slot 0 at capability domain creation) |
-| capability_domain (IDC handle) | `create_capability_domain`; received via suspend/reply transfer |
+| process_self | inherent (slot 0 at process creation) |
+| process (IDC handle) | `create_process`; received via suspend/reply transfer |
 | thread | `create_thread`; received via suspend/reply transfer |
 | page_frame | `create_page_frame`; received via suspend/reply transfer |
 | virtual_memory_address_region | `create_vmar`; received via suspend/reply transfer |
@@ -127,9 +127,9 @@ Handle types a capability domain can hold:
 
 Kernel objects are grouped by the **ceiling** of their lifetime — the longest they could possibly persist. An object may die sooner (via delete, revoke, kill, etc.) but cannot outlive its ceiling.
 
-- **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
+- **System lifetime** — Device Region, Process. Could persist as long as the kernel runs.
 - **Refcount lifetime** — Port, Page Frame. Bounded by the distributed set of handles referencing them.
-- **Capability domain lifetime** — Thread, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
+- **Process lifetime** — Thread, Virtual Memory Address Region, Virtual Machine. Cannot outlive the process they are bound to.
 - **Thread lifetime** — Reply. Replies cannot outlive the thread they are bound to.
 
 ### restrict
@@ -172,7 +172,7 @@ None — reducing authority never requires authority.
 
 [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
 
-[test 03] returns E_PERM if the handle is an thread handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
+[test 03] returns E_PERM if the handle is a thread handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
 
 [test 04] returns E_PERM if the handle is a VMAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 
@@ -189,7 +189,7 @@ None — reducing authority never requires authority.
 
 #### Summary
 
-Releases a handle from the calling domain's handle table. Type-specific side effects apply.
+Releases a handle from the calling process's handle table. Type-specific side effects apply.
 
 #### Declaration
 
@@ -206,9 +206,9 @@ Per-type observable behavior:
 
 | Handle type | Observable delete behavior |
 |---|---|
-| `capability_domain_self` | The calling domain is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
-| `capability_domain` (IDC) | Release handle. Domain has system lifetime; it does not terminate when IDC handles drop |
-| `thread` | Release handle. Threads have capability-domain lifetime; they are not destroyed by handle drops |
+| `process_self` | The calling process is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
+| `process` (IDC) | Release handle. Process has system lifetime; it does not terminate when IDC handles drop |
+| `thread` | Release handle. Threads have process lifetime; they are not destroyed by handle drops |
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
@@ -239,7 +239,7 @@ None.
 
 #### Summary
 
-Releases every handle transitively derived from the target via `copy`, across all capability domains. The target handle itself is not released — use `delete` for that.
+Releases every handle transitively derived from the target via `copy`, across all processes. The target handle itself is not released — use `delete` for that.
 
 #### Declaration
 
@@ -252,7 +252,7 @@ revoke([1] handle) -> void
 
 #### Description
 
-A handle that was copied from the target and then subsequently moved is still a derivation of the target — moving a handle keeps it on the copy ancestry chain rather than orphaning it. A domain that has moved a handle elsewhere no longer holds it and cannot revoke it; whoever holds the copy ancestor still can, and the revoke will reach the moved descendant through the preserved chain.
+A handle that was copied from the target and then subsequently moved is still a derivation of the target — moving a handle keeps it on the copy ancestry chain rather than orphaning it. A process that has moved a handle elsewhere no longer holds it and cannot revoke it; whoever holds the copy ancestor still can, and the revoke will reach the moved descendant through the preserved chain.
 
 Each released descendant is processed with the type-specific behavior defined for `delete`.
 
@@ -315,9 +315,9 @@ None.
 [test 03] on success, [1]'s field0 and field1 reflect the authoritative kernel state at the moment of the call.
 
 
-## §[capability_domain] Capability Domain
+## §[process] Process
 
-A capability domain is a set of capabilities usable by threads bound to the domain.
+A process is a set of capabilities usable by threads bound to the process.
 
 ### Self handle
 
@@ -350,14 +350,14 @@ cap (word 0, bits 48-63):
 ```
  15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
 ┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│pri(2)│_rsv│_rsvd│fut_wk│reply │restrt│_rsv  │_rsv  │_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│pri(2)│_rsv│_rsvd│fut_wk│reply │restrt│_rsv  │_rsv  │_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crproc │
 │      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
 └──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
 
 | Bit(s) | Name | Gates |
 |---|---|---|
-| 0 | `crcd` — create capability domain | `create_capability_domain` syscall |
+| 0 | `crproc` — create process | `create_process` syscall |
 | 1 | `crec` — create thread | `create_thread` syscall (target = self) |
 | 2 | `crvr` — create virtual memory address region | `create_vmar` syscall |
 | 3 | `crpf` — create page frame | `create_page_frame` syscall |
@@ -366,49 +366,49 @@ cap (word 0, bits 48-63):
 | 6 | _reserved | — |
 | 7 | _reserved | — |
 | 8 | _reserved | — |
-| 9 | `restart` — domain restart on thread exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
-| 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
+| 9 | `restart` — process restart on thread exit/fault | the kernel restarts the process rather than tearing it down (see §[restart_semantics]) |
+| 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the process are kept (1) rather than dropped (0) |
 | 11 | `fut_wake` — futex wake | `futex_wake` syscall |
 | 12-13 | _reserved | — |
-| 14-15 | `pri` — priority ceiling (0-3) | max priority any thread in this domain may be created with or raised to |
+| 14-15 | `pri` — priority ceiling (0-3) | max priority any thread in this process may be created with or raised to |
 
 field0:
 
 | field | bits | meaning |
 |---|---|---|
-| thread_inner_ceiling | 0-7 | max caps on thread handles held by this domain itself referencing its own Threads |
-| vmar_inner_ceiling | 8-23 | max caps on VMAR handles held by this domain itself referencing its own VMARs (16 bits to fit all VMAR caps) |
+| thread_inner_ceiling | 0-7 | max caps on thread handles held by this process itself referencing its own Threads |
+| vmar_inner_ceiling | 8-23 | max caps on VMAR handles held by this process itself referencing its own VMARs (16 bits to fit all VMAR caps) |
 | cridc_ceiling | 24-31 | see §[cridc_ceiling] |
-| idc_rx | 32-39 | mask intersected with sent caps when this domain receives an IDC handle |
-| pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this domain (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
-| vm_ceiling | 48-55 | max caps `create_virtual_machine` may mint when called from this domain (`policy` bit 48) |
-| port_ceiling | 56-63 | max caps `create_port` may mint when called from this domain (`xfer` bit 58, `recv` bit 59, `bind` bit 60, `suspend` bit 62) |
+| idc_rx | 32-39 | mask intersected with sent caps when this process receives an IDC handle |
+| pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this process (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
+| vm_ceiling | 48-55 | max caps `create_virtual_machine` may mint when called from this process (`policy` bit 48) |
+| port_ceiling | 56-63 | max caps `create_port` may mint when called from this process (`xfer` bit 58, `recv` bit 59, `bind` bit 60, `suspend` bit 62) |
 
 field1:
 
 | field | bits | meaning |
 |---|---|---|
-| thread_outer_ceiling | 0-7 | max caps on thread handles held by other domains referencing Threads in this domain |
-| vmar_outer_ceiling | 8-15 | max caps on VMAR handles held by other domains referencing VMARs in this domain |
-| restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this domain (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
-| fut_wait_max | 32-37 | max number of addresses the domain may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
+| thread_outer_ceiling | 0-7 | max caps on thread handles held by other processes referencing Threads in this process |
+| vmar_outer_ceiling | 8-15 | max caps on VMAR handles held by other processes referencing VMARs in this process |
+| restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this process (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
+| fut_wait_max | 32-37 | max number of addresses the process may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
 
 #### §[cridc_ceiling] cridc_ceiling
 
-At `create_capability_domain`:
+At `create_process`:
 
-- The IDC handle the caller receives to the new domain has caps = the caller's `cridc_ceiling`.
-- The IDC handle placed in the new domain's slot 2 has caps = the `cridc_ceiling` passed in the ceilings word.
+- The IDC handle the caller receives to the new process has caps = the caller's `cridc_ceiling`.
+- The IDC handle placed in the new process's slot 2 has caps = the `cridc_ceiling` passed in the ceilings word.
 
-All subsequent IDC handles to the new domain derive from these two originals by copy or move, subject to cap-subset rules.
+All subsequent IDC handles to the new process derive from these two originals by copy or move, subject to cap-subset rules.
 
 #### §[idc_rx] idc_rx
 
-When a domain receives an IDC handle over IDC:
+When a process receives an IDC handle over IDC:
 
-- The installed handle has caps = the intersection of the caps attempted to be granted and the receiving domain's `idc_rx`.
+- The installed handle has caps = the intersection of the caps attempted to be granted and the receiving process's `idc_rx`.
 
-[test 01] when a domain receives an IDC handle over IDC, the installed handle's caps = intersection of the granted caps and the receiver's `idc_rx`.
+[test 01] when a process receives an IDC handle over IDC, the installed handle's caps = intersection of the granted caps and the receiver's `idc_rx`.
 
 
 ### IDC handle
@@ -447,27 +447,27 @@ cap (word 0, bits 48-63):
 
 | Bit | Name | Gates |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `crec` — create thread in referenced domain | `create_thread` with this handle as `target` |
-| 5 | `restart_policy` | IDC handle behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
+| 2 | `crec` — create thread in referenced process | `create_thread` with this handle as `target` |
+| 5 | `restart_policy` | IDC handle behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
-### create_capability_domain
+### create_process
 
 #### Summary
 
-Creates a new capability domain from an ELF image carried in a page frame. The caller receives back an IDC handle to the new domain.
+Creates a new process from an ELF image carried in a page frame. The caller receives back an IDC handle to the new process.
 
 #### Declaration
 
 ```
-create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
+create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
   -> [1] idc_handle
   syscall_num = 19
 
   [1] caps: u64 packed as
-    bits  0-15: self_caps          — caps on the new domain's slot-0 self-handle
-    bits 16-23: idc_rx             — new domain's idc_rx (see §[capability_domain] Self handle)
+    bits  0-15: self_caps          — caps on the new process's slot-0 self-handle
+    bits 16-23: idc_rx             — new process's idc_rx (see §[process] Self handle)
     bits 24-63: _reserved
 
   [2] ceilings_inner: u64 packed as (matches self-handle field0)
@@ -480,7 +480,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
                    bits 14-15: max_sz (enum)
                    bit 16:     dma
                    bits 17-23: _reserved
-    bits 24-31: cridc_ceiling      — new domain's cridc_ceiling (see §[capability_domain] Self handle)
+    bits 24-31: cridc_ceiling      — new process's cridc_ceiling (see §[process] Self handle)
     bits 32-39: pf_ceiling:
                    bits 32-34: max_rwx (r/w/x)
                    bits 35-36: max_sz (enum)
@@ -512,7 +512,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
   [4] elf_page_frame: page frame handle containing the ELF image from offset 0
 
-  [5] initial_thread_affinity: u64 core mask applied to the new domain's
+  [5] initial_thread_affinity: u64 core mask applied to the new process's
       initial thread. Bit N = 1 allows the thread to run on core N. 0 = any
       core (kernel chooses). Same encoding as `create_thread`'s
       `[6] affinity`.
@@ -520,20 +520,20 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
   [6+] passed_handles: each entry is a u64 packed as
     bits  0-11: handle id (12-bit handle in the caller's table)
     bits 12-15: _reserved
-    bits 16-31: caps to install on the handle inserted into the new domain
+    bits 16-31: caps to install on the handle inserted into the new process
     bit     32: move (1 = remove from caller; 0 = copy, both retain)
     bits 33-63: _reserved
 ```
 
 #### Description
 
-The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial thread's entry point.
+The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new process's read-only view of its capability table is passed as the first argument to the initial thread's entry point.
 
-The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-thread handle is minted with caps = the new domain's `thread_inner_ceiling` from [2].
+The caller receives an IDC handle to the new process with caps = the caller's own `cridc_ceiling`. The new process's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new process's slot-1 initial-thread handle is minted with caps = the new process's `thread_inner_ceiling` from [2].
 
 #### Capabilities
 
-- Self-handle: `crcd`
+- Self-handle: `crproc`
 - `[1].self_caps` ⊆ caller's self-handle caps
 - `[2].thread_inner_ceiling` ⊆ caller's `thread_inner_ceiling`
 - `[2].vmar_inner_ceiling` ⊆ caller's `vmar_inner_ceiling`
@@ -548,11 +548,11 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 #### Return value
 
-`[1]`: IDC handle to the new domain with caps = caller's `cridc_ceiling`.
+`[1]`: IDC handle to the new process with caps = caller's `cridc_ceiling`.
 
 #### Errors
 
-**E_PERM** — caller's self-handle lacks `crcd`, or any cap/ceiling argument exceeds the corresponding ceiling on the caller.
+**E_PERM** — caller's self-handle lacks `crproc`, or any cap/ceiling argument exceeds the corresponding ceiling on the caller.
 
 **E_BADCAP** — `[4]` is not a valid page frame handle, or any passed handle id in `[6+]` is not a valid handle in the caller's table.
 
@@ -564,7 +564,7 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 #### Tests
 
-[test 01] returns E_PERM if the caller's self-handle lacks `crcd`.
+[test 01] returns E_PERM if the caller's self-handle lacks `crproc`.
 
 [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
 
@@ -602,74 +602,74 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 
-[test 19] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
+[test 19] on success, the caller receives an IDC handle to the new process with caps = the caller's `cridc_ceiling`.
 
-[test 20] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
+[test 20] on success, the new process's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 
-[test 21] on success, the new domain's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
+[test 21] on success, the new process's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
 
-[test 22] on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
+[test 22] on success, the new process's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
 
-[test 23] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
+[test 23] on success, passed handles occupy slots 3+ of the new process's handle table in the order supplied, each with the caps specified in its entry.
 
 [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 
 [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
 
-[test 26] on success, the new domain's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+[test 26] on success, the new process's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
 
-[test 27] on success, the new domain's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
+[test 27] on success, the new process's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 
-[test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
+[test 28] on success, the new process's `idc_rx` in field0 is set to the value supplied in [1].
 
 [test 29] the initial thread begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
 
-[test 30] on success, two successive `create_capability_domain` calls with the same ELF image place the image at different randomized base addresses with high probability (ASLR jitter test — see §[address_space]).
+[test 30] on success, two successive `create_process` calls with the same ELF image place the image at different randomized base addresses with high probability (ASLR jitter test — see §[address_space]).
 
-[test 31] on success, the new domain's initial thread has affinity equal to `[5]` (any-core when 0).
+[test 31] on success, the new process's initial thread has affinity equal to `[5]` (any-core when 0).
 
 [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
 
 
 ### §[restart_semantics] Restart Semantics
 
-When a capability domain holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the domain rather than tearing it down. Threads re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting domain are governed by the domain-wide `reply_policy` bit on the self-handle.
+When a process holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the process rather than tearing it down. Threads re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting process are governed by the process-wide `reply_policy` bit on the self-handle.
 
 Per-handle policies are ordered least-to-most privileged. The `restart_policy` cap field is monotonic-reducing along this ordering: a holder may reduce its handle's policy to any value at or below the current setting. (For 2-bit policies, "reducing" is numeric reduction along the privilege ordering, not bitwise subset.)
 
 | Handle type | Policies (low → high privilege) | Notes |
 |---|---|---|
-| `capability_domain_self` | always preserved | the restart target itself |
+| `process_self` | always preserved | the restart target itself |
 | `thread` | 0=kill / 1=restart_at_entry / 2=persist | `persist` keeps the thread running through the restart, including its stack pages; otherwise the thread re-enters at its original entry point (1) or is killed (0) |
-| `virtual_memory_address_region` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VMAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VMAR lives in exactly one domain's address space; the owning domain's handle's `restart_policy` determines what happens to the VMAR. Cross-domain handles to the same VMAR carry their own `restart_policy` for whether the foreign handle survives the foreign domain's restart |
+| `virtual_memory_address_region` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VMAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VMAR lives in exactly one process's address space; the owning process's handle's `restart_policy` determines what happens to the VMAR. Cross-process handles to the same VMAR carry their own `restart_policy` for whether the foreign handle survives the foreign process's restart |
 | `page_frame` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `device_region` | 0=drop / 1=keep | |
 | `port` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `virtual_machine` | 0=drop / 1=keep | |
-| `capability_domain` (IDC) | 0=drop / 1=keep | |
-| `reply` | governed by domain `reply_policy` | drop: pending callers resume with `E_REFUSED`; keep: reply remains valid, caller stays suspended |
+| `process` (IDC) | 0=drop / 1=keep | |
+| `reply` | governed by process `reply_policy` | drop: pending callers resume with `E_REFUSED`; keep: reply remains valid, caller stays suspended |
 
-Each handle's `restart_policy` value is bounded at create time (and at copy time) by the domain's `restart_policy_ceiling` corresponding field on its self-handle.
+Each handle's `restart_policy` value is bounded at create time (and at copy time) by the process's `restart_policy_ceiling` corresponding field on its self-handle.
 
-[test 01] returns E_PERM if `create_thread` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.thread_restart_max`.
+[test 01] returns E_PERM if `create_thread` is called with `caps.restart_policy` exceeding the calling process's `restart_policy_ceiling.thread_restart_max`.
 
-[test 02] returns E_PERM if `create_vmar` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.vmar_restart_max`.
+[test 02] returns E_PERM if `create_vmar` is called with `caps.restart_policy` exceeding the calling process's `restart_policy_ceiling.vmar_restart_max`.
 
-[test 03] returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.pf_restart_max = 0`.
+[test 03] returns E_PERM if `create_page_frame` is called with `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.pf_restart_max = 0`.
 
-[test 04] returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.vm_restart_max = 0`.
+[test 04] returns E_PERM if `create_virtual_machine` is called with `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.vm_restart_max = 0`.
 
-[test 05] returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.port_restart_max = 0`.
+[test 05] returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.port_restart_max = 0`.
 
-[test 06] returns E_PERM if any IDC handle minted by `create_capability_domain` (the caller's own returned handle, the new domain's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.idc_restart_max = 0`.
+[test 06] returns E_PERM if any IDC handle minted by `create_process` (the caller's own returned handle, the new process's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.idc_restart_max = 0`.
 
-[test 07] returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`.
+[test 07] returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.dr_restart_max = 0`.
 
 
 
 ## §[thread] Thread
 
-An thread is a schedulable unit of executable state bound to a capability domain.
+A thread is a schedulable unit of executable state bound to a process.
 
 Handle ABI:
 
@@ -715,21 +715,21 @@ cap (word 0, bits 48-63):
 
 | Bit | Name | Gates |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `saff` — set affinity | `affinity` syscall on this thread |
 | 3 | `spri` — set priority | `priority` syscall on this thread |
 | 4 | `term` — terminate | `terminate` syscall on this thread |
 | 5 | `susp` — suspend | `suspend` syscall on this thread |
 | 6 | `read` | exposing this thread's state in event payloads during event delivery (§[event_state]); when absent, state in the payload is zeroed |
 | 7 | `write` | applying modifications written to the event payload back to this thread's state on reply; when absent, modifications are discarded |
-| 8-9 | `restart_policy` | thread behavior on domain restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
+| 8-9 | `restart_policy` | thread behavior on process restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
 
 ### create_thread
 
 #### Summary
 
-Creates a new thread either in the caller's own domain or in a target domain referenced by an IDC handle.
+Creates a new thread either in the caller's own process or in a target process referenced by an IDC handle.
 
 #### Declaration
 
@@ -748,7 +748,7 @@ create_thread([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [
   [2] entry:        instruction pointer where the thread begins execution
   [3] stack_pages:  number of stack pages the kernel allocates in the target's address space;
                     kernel installs unmapped guard pages above and below the stack
-  [4] target:       0 = self, else IDC handle with crec cap to the target domain
+  [4] target:       0 = self, else IDC handle with crec cap to the target process
   [5] affinity:     64-bit core mask; bit N = 1 allows the thread to run on core N.
                     0 = any core (kernel chooses)
 ```
@@ -761,8 +761,8 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 - Self-handle: `crec`
 - IDC handle `[4]` (when nonzero): `crec`
-- `[1].caps` ⊆ self's `thread_inner_ceiling` (when `[4] = 0`) or target domain's `thread_outer_ceiling` (when `[4] != 0`)
-- `[1].target_caps` ⊆ target domain's `thread_inner_ceiling` (when `[4] != 0`)
+- `[1].caps` ⊆ self's `thread_inner_ceiling` (when `[4] = 0`) or target process's `thread_outer_ceiling` (when `[4] != 0`)
+- `[1].target_caps` ⊆ target process's `thread_inner_ceiling` (when `[4] != 0`)
 - `[1].priority` ≤ caller's priority ceiling
 
 #### Return value
@@ -781,7 +781,7 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 **E_NOSPC** — target's address space has insufficient contiguous space for the stack.
 
-**E_FULL** — caller's handle table has no free slot, or the target domain's handle table is full when `[4]` is nonzero.
+**E_FULL** — caller's handle table has no free slot, or the target process's handle table is full when `[4]` is nonzero.
 
 #### Tests
 
@@ -791,9 +791,9 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 [test 03] returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `thread_inner_ceiling`.
 
-[test 04] returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `thread_outer_ceiling`.
+[test 04] returns E_PERM if [4] is nonzero and caps is not a subset of the target process's `thread_outer_ceiling`.
 
-[test 05] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `thread_inner_ceiling`.
+[test 05] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target process's `thread_inner_ceiling`.
 
 [test 06] returns E_PERM if priority exceeds the caller's priority ceiling.
 
@@ -805,9 +805,9 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 [test 10] returns E_INVAL if any reserved bits are set in [1].
 
-[test 11] on success, the caller receives an thread handle with caps = `[1].caps`.
+[test 11] on success, the caller receives a thread handle with caps = `[1].caps`.
 
-[test 12] on success, when [4] is nonzero, the target domain also receives a handle with caps = `[1].target_caps`.
+[test 12] on success, when [4] is nonzero, the target process also receives a handle with caps = `[1].target_caps`.
 
 [test 13] on success, the thread's priority is set to `[1].priority`.
 
@@ -865,7 +865,7 @@ terminate([1] target) -> void
 
 #### Description
 
-Termination atomically destroys the thread. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
+Termination atomically destroys the thread. Handles referencing it in any process become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
 
 Termination marks any reply handles whose suspended sender was the terminated thread such that subsequent operations on those reply handles return `E_ABANDONED`.
 
@@ -911,7 +911,7 @@ Yields the calling thread's timeslice. With `[1] = 0`, the scheduler selects the
 yield([1] target) -> void
   syscall_num = 25
 
-  [1] target: 0 = yield to scheduler; else an thread handle to yield to
+  [1] target: 0 = yield to scheduler; else a thread handle to yield to
 ```
 
 #### Capabilities
@@ -1034,7 +1034,7 @@ affinity([1] target, [2] new_affinity) -> void
 
 ## §[address_space] Address Space Layout
 
-Each capability domain owns a per-domain virtual address space. The user half is split into three zones with distinct placement semantics:
+Each process owns a per-process virtual address space. The user half is split into three zones with distinct placement semantics:
 
 | Zone | Placement |
 |---|---|
@@ -1042,7 +1042,7 @@ Each capability domain owns a per-domain virtual address space. The user half is
 | ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, thread stacks, and `create_vmar` with `preferred_base = 0` |
 | Static zone | userspace-chosen base via `create_vmar` with `preferred_base != 0`. Placement is deterministic |
 
-ELF images loaded by `create_capability_domain` must be position-independent; the kernel relocates them to a randomized base in the ASLR zone. The first faulted page in the NULL guard always faults regardless of any other mapping.
+ELF images loaded by `create_process` must be position-independent; the kernel relocates them to a randomized base in the ASLR zone. The first faulted page in the NULL guard always faults regardless of any other mapping.
 
 Concrete numeric boundaries are architecture-specific.
 
@@ -1064,7 +1064,7 @@ aarch64 (4-level paging, 48-bit TTBR0 user VA):
 
 ## §[vmar] Virtual Memory Address Region
 
-A virtual memory address region is a contiguous span of the virtual address space bound to a capability domain. It is available for demand-paged memory, or for installing page frames or device regions. See §[address_space] for the zone layout governing where VMARs are placed.
+A virtual memory address region is a contiguous span of the virtual address space bound to a process. It is available for demand-paged memory, or for installing page frames or device regions. See §[address_space] for the zone layout governing where VMARs are placed.
 
 A regular VMAR (`caps.mmio = 0, caps.dma = 0`) created without explicit mapping starts at `map = 0`. The first faulted access transitions it to `map = 3` (demand): the kernel allocates a fresh zero-filled page_frame and installs it at the faulting offset, with effective permissions = `VMAR.cur_rwx`. Once `map = 3`, the VMAR cannot be `map_pf`'d until it is `unmap`'d back to `map = 0`.
 
@@ -1114,24 +1114,24 @@ cap (word 0, bits 48-63):
 
 | Bit(s) | Name | Meaning |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `r` | max read |
 | 3 | `w` | max write |
 | 4 | `x` | max execute |
 | 5 | `mmio` | mmio mode |
 | 6-7 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
 | 8 | `dma` | dma mode (VMAR represents a device-IOVA range) |
-| 9-10 | `restart_policy` | VMAR behavior on domain restart: 0=free, 1=decommit, 2=preserve, 3=snapshot (see §[restart_semantics]) |
+| 9-10 | `restart_policy` | VMAR behavior on process restart: 0=free, 1=decommit, 2=preserve, 3=snapshot (see §[restart_semantics]) |
 | 11-15 | `_reserved` | |
 
-`r`/`w`/`x` and `max_sz` are ceiling-checked against the domain's `vmar_inner_ceiling`. `mmio`, `dma`, and `max_sz` describe the VMAR object and are immutable after creation. `mmio` and `dma` are mutually exclusive. `dma` VMARs cannot have `x` set. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VMAR. Move/copy semantics on VMARs are bounded by `vmar_outer_ceiling` for the receiving handle.
+`r`/`w`/`x` and `max_sz` are ceiling-checked against the process's `vmar_inner_ceiling`. `mmio`, `dma`, and `max_sz` describe the VMAR object and are immutable after creation. `mmio` and `dma` are mutually exclusive. `dma` VMARs cannot have `x` set. `sz`, `cch`, and `cur_rwx` in field1 are observable state on the VMAR. Move/copy semantics on VMARs are bounded by `vmar_outer_ceiling` for the receiving handle.
 
 ### create_vmar
 
 #### Summary
 
-Reserves a range of virtual address space bound to the caller's domain.
+Reserves a range of virtual address space bound to the caller's process.
 
 #### Declaration
 
@@ -1469,7 +1469,7 @@ None beyond holding the VMAR handle.
 
 #### Summary
 
-Binds a source VMAR to a target VMAR. On the owning domain's restart, the kernel copies the source's contents into the target before the domain resumes. Used together with `restart_policy = snapshot` on the target VMAR — see §[restart_semantics].
+Binds a source VMAR to a target VMAR. On the owning process's restart, the kernel copies the source's contents into the target before the process resumes. Used together with `restart_policy = snapshot` on the target VMAR — see §[restart_semantics].
 
 #### Declaration
 
@@ -1489,7 +1489,7 @@ At restart time, the source-to-target copy succeeds only if the source is stable
 - For `[2].field1.map = 1` (page_frame-backed): every backing page_frame has `field1.mapcnt = 1` AND the source's effective write permission is 0 (`[2].field1.cur_rwx` write bit ∩ each page_frame's `caps.w` is 0).
 - For `[2].field1.map = 3` (demand-paged): the source's `cur_rwx.w = 0`. Demand-paged pages are kernel-allocated and not exposed elsewhere, so `mapcnt = 1` is implicit.
 
-If the source's stability cannot be verified at restart, the restart fails and the domain is terminated.
+If the source's stability cannot be verified at restart, the restart fails and the process is terminated.
 
 #### Capabilities
 
@@ -1518,18 +1518,18 @@ If the source's stability cannot be verified at restart, the restart fails and t
 
 [test 07] calling `snapshot` a second time on the same target replaces the prior source binding.
 
-[test 08] if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the domain is terminated rather than restarted.
+[test 08] if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the process is terminated rather than restarted.
 
-[test 09] on domain restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the domain resumes.
+[test 09] on process restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the process resumes.
 
-[test 10] on domain restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the domain is terminated.
+[test 10] on process restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the process is terminated.
 
-[test 11] on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the domain is terminated.
+[test 11] on process restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the process is terminated.
 
 
 ## §[page_frame] Page Frame
 
-A page frame is a reference to physical memory. Installing it into virtual memory address regions bound to multiple capability domains creates shared memory.
+A page frame is a reference to physical memory. Installing it into virtual memory address regions bound to multiple processes creates shared memory.
 
 Handle ABI:
 
@@ -1573,13 +1573,13 @@ cap (word 0, bits 48-63):
 
 | Bit(s) | Name | Meaning |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `r` | read; applied only if the installing VMAR's `cur_rwx.r` is set |
 | 3 | `w` | write; applied only if the installing VMAR's `cur_rwx.w` is set |
 | 4 | `x` | execute; applied only if the installing VMAR's `cur_rwx.x` is set |
 | 5-6 | `max_sz` | max page size: 0=4 KiB, 1=2 MiB, 2=1 GiB, 3=reserved |
-| 7 | `restart_policy` | page_frame behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 7 | `restart_policy` | page_frame behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 | 8-15 | `_reserved` | |
 
 ### create_page_frame
@@ -1650,7 +1650,7 @@ create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
 
 ## §[device_region] Device Region
 
-A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual memory address region makes the device directly accessible to threads in that capability domain.
+A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual memory address region makes the device directly accessible to threads in that process.
 
 Handle ABI:
 
@@ -1682,7 +1682,7 @@ Field layout:
 | dev_type | field0 bits 0-3 | device region kind (immutable): 0=mmio, 1=port_io (x86-64 only); other values _reserved |
 | base_port | field0 bits 4-19 | x86-64 I/O port base (u16) for `dev_type = port_io`; _reserved otherwise |
 | port_count | field0 bits 20-35 | number of consecutive x86-64 I/O ports (u16) for `dev_type = port_io`; _reserved otherwise |
-| irq_count | field1 bits 0-63 | u64 IRQ counter, kernel-incremented (saturating at u64::MAX) on each device IRQ; cleared by `ack`. The kernel propagates each increment to every domain-local copy of the handle, but propagation is not atomic across copies — different copies may transiently observe different counts (see §[device_irq]). 0 stays 0 for device regions that do not deliver IRQs |
+| irq_count | field1 bits 0-63 | u64 IRQ counter, kernel-incremented (saturating at u64::MAX) on each device IRQ; cleared by `ack`. The kernel propagates each increment to every process-local copy of the handle, but propagation is not atomic across copies — different copies may transiently observe different counts (see §[device_irq]). 0 stays 0 for device regions that do not deliver IRQs |
 
 cap (word 0, bits 48-63):
 
@@ -1696,11 +1696,11 @@ cap (word 0, bits 48-63):
 
 | Bit | Name | Gates |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `dma` | binding this device_region to a DMA-flagged VMAR via `create_vmar`, authorizing IOMMU mappings for the device |
 | 3 | `irq` | acknowledging IRQs from this device via `ack` |
-| 4 | `restart_policy` | device_region behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 4 | `restart_policy` | device_region behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### §[port_io_virtualization] x86-64 Port I/O Virtualization
 
@@ -1708,9 +1708,9 @@ A device_region with `dev_type = port_io` carries a 16-bit `base_port` and `port
 
 The kernel handles such faults by decoding the faulting MOV instruction, computing the target port as `base_port + (fault_vaddr - VMAR.base)`, executing the corresponding x86-64 `in`/`out` of the operand width, writing the result into the destination GPR (loads) or committing the source value (stores), and advancing RIP past the instruction.
 
-Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — cause an unhandled thread fault and teardown of the owning capability domain.
+Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — cause an unhandled thread fault and teardown of the owning process.
 
-Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, causes an unhandled memory fault and teardown of the owning capability domain. Accesses with computed offset `>= port_count` cause the same unhandled memory fault teardown.
+Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, causes an unhandled memory fault and teardown of the owning process. Accesses with computed offset `>= port_count` cause the same unhandled memory fault teardown.
 
 [test 01] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
 
@@ -1722,35 +1722,35 @@ Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or
 
 [test 05] a 1-, 2-, or 4-byte MOV store to `VMAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
 
-[test 06] a MOV access to `VMAR.base + offset` with `offset >= port_count` causes an unhandled memory fault and teardown of the owning capability domain.
+[test 06] a MOV access to `VMAR.base + offset` with `offset >= port_count` causes an unhandled memory fault and teardown of the owning process.
 
-[test 07] a MOV load when `VMAR.cur_rwx.r = 0` causes an unhandled memory fault and teardown of the owning capability domain.
+[test 07] a MOV load when `VMAR.cur_rwx.r = 0` causes an unhandled memory fault and teardown of the owning process.
 
-[test 08] a MOV store when `VMAR.cur_rwx.w = 0` causes an unhandled memory fault and teardown of the owning capability domain.
+[test 08] a MOV store when `VMAR.cur_rwx.w = 0` causes an unhandled memory fault and teardown of the owning process.
 
-[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
+[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VMAR causes an unhandled thread fault and teardown of the owning process.
 
-[test 10] a `LOCK`-prefixed MOV targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
+[test 10] a `LOCK`-prefixed MOV targeting the VMAR causes an unhandled thread fault and teardown of the owning process.
 
-[test 11] an 8-byte MOV access targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
+[test 11] an 8-byte MOV access targeting the VMAR causes an unhandled thread fault and teardown of the owning process.
 
 
 ### §[device_irq] Device IRQ Delivery
 
-A device_region configured for IRQ delivery exposes its IRQ counter directly as `field1.irq_count` of every handle to it. The handle table is mapped read-only into the holding domain, so the field's vaddr (computable as `cap_table_base + handle_id * sizeof(handle) + offsetof(field1)`) is a valid futex address.
+A device_region configured for IRQ delivery exposes its IRQ counter directly as `field1.irq_count` of every handle to it. The handle table is mapped read-only into the holding process, so the field's vaddr (computable as `cap_table_base + handle_id * sizeof(handle) + offsetof(field1)`) is a valid futex address.
 
 On each IRQ from the bound device, the kernel:
-1. Atomically increments `field1.irq_count` by 1 (saturating at `u64::MAX`) in every domain-local copy of the handle. Increments are propagated to all copies but not atomically across copies — different copies may transiently observe different counts.
+1. Atomically increments `field1.irq_count` by 1 (saturating at `u64::MAX`) in every process-local copy of the handle. Increments are propagated to all copies but not atomically across copies — different copies may transiently observe different counts.
 2. Masks the IRQ line at the interrupt controller.
 3. Issues a futex wake on the physical address of `field1` for each copy.
 
 Userspace pairs the counter with `futex_wait_val(addr=&handle.field1, expected=last_seen)` to sleep until the next IRQ. After observing one or more IRQs, userspace calls `ack` to clear the counter and unmask the line.
 
-[test 01] when the device fires an IRQ, within a bounded delay every domain-local copy of [1] returns `field1.irq_count = (prior + 1)` from a fresh `sync`.
+[test 01] when the device fires an IRQ, within a bounded delay every process-local copy of [1] returns `field1.irq_count = (prior + 1)` from a fresh `sync`.
 
 [test 02] when the device fires a second IRQ before `ack` is called, [1].field1.irq_count is not incremented a second time; only after `ack` does a subsequent IRQ from the device increment it again.
 
-[test 03] when the device fires an IRQ, every thread blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
+[test 03] when the device fires an IRQ, every thread blocked in futex_wait_val keyed on the paddr of any process-local copy of [1].field1 returns from the call with [1] = the corresponding process-local vaddr of field1.
 
 [test 04] when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
 
@@ -1798,9 +1798,9 @@ ack([1] device_region) -> [1] prior_count
 
 [test 05] on success, the returned `prior_count` equals [1].field1.irq_count immediately before the call.
 
-[test 06] on success, the calling domain's copy of [1] has `field1.irq_count = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
+[test 06] on success, the calling process's copy of [1] has `field1.irq_count = 0` immediately on return; every other process-local copy returns 0 from a fresh `sync` within a bounded delay.
 
-[test 07] on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an thread blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
+[test 07] on success, after a subsequent IRQ from the device, every process-local copy's `field1.irq_count` reaches the new value within a bounded delay and a thread blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
 
 [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -1844,7 +1844,7 @@ cap (word 0, bits 48-63):
 | Bit | Name | Gates |
 |---|---|---|
 | 0 | `policy` | mutating this VM's policy tables (§[vm_policy]) via runtime syscalls |
-| 1 | `restart_policy` | VM behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 1 | `restart_policy` | VM behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_virtual_machine
 
@@ -2025,12 +2025,12 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
 
 #### Description
 
-The vCPU thread is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events and publishes the new vCPU as runnable. On the vCPU's first dispatch, the kernel delivers a vm_exit-style event on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
+The vCPU thread is bound to the process that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events and publishes the new vCPU as runnable. On the vCPU's first dispatch, the kernel delivers a vm_exit-style event on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
 
 #### Capabilities
 
 - Self-handle: `crec`. Holding the VM handle implies the authority to spawn vCPUs in it.
-- `[1].caps` ⊆ VM's owning domain's `thread_inner_ceiling`
+- `[1].caps` ⊆ VM's owning process's `thread_inner_ceiling`
 - `[1].priority` ≤ caller's priority ceiling
 
 #### Return value
@@ -2039,7 +2039,7 @@ The vCPU thread is bound to the capability domain that holds the VM handle. `cre
 
 #### Errors
 
-**E_PERM** — self-handle lacks `crec`; `caps` not a subset of the VM's owning domain's `thread_inner_ceiling`; `priority` exceeds the caller's priority ceiling.
+**E_PERM** — self-handle lacks `crec`; `caps` not a subset of the VM's owning process's `thread_inner_ceiling`; `priority` exceeds the caller's priority ceiling.
 
 **E_BADCAP** — `[2]` is not a valid VM handle; `[4]` is not a valid port handle.
 
@@ -2053,7 +2053,7 @@ The vCPU thread is bound to the capability domain that holds the VM handle. `cre
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
 
-[test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `thread_inner_ceiling`.
+[test 02] returns E_PERM if caps is not a subset of the VM's owning process's `thread_inner_ceiling`.
 
 [test 03] returns E_PERM if priority exceeds the caller's priority ceiling.
 
@@ -2065,7 +2065,7 @@ The vCPU thread is bound to the capability domain that holds the VM handle. `cre
 
 [test 07] returns E_INVAL if any reserved bits are set in [1].
 
-[test 08] on success, the caller receives an thread handle with caps = `[1].caps`.
+[test 08] on success, the caller receives a thread handle with caps = `[1].caps`.
 
 [test 09] on success, `suspend` on the returned thread handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 
@@ -2320,12 +2320,12 @@ cap (word 0, bits 48-63):
 
 | Bit | Name | Meaning |
 |---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
+| 0 | `move` | transferring this handle via move to another process |
+| 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `xfer` | transferring capabilities on this port (attaching handles to a suspension event payload, or to a reply payload) |
 | 3 | `recv` | reading events off this port and receiving the associated reply capability |
 | 4 | `bind` | using this port as the `exit_port` of a `create_vcpu`; pins the port's bind-side lifetime |
-| 5 | `restart_policy` | port behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 5 | `restart_policy` | port behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 | 6 | `suspend` | using this port as the destination of a `suspend` syscall |
 
 ### create_port
@@ -2624,9 +2624,9 @@ A suspending thread may attach handles to the event by encoding them as pair ent
 The syscall word at suspend time carries `pair_count` `N` in bits 12-19 (0..255). When `N > 0`, the entries occupy vregs `[128-N..127]`. Each entry is a u64 packed as:
 
 ```
-bits  0-11: source handle id (in the suspending thread's domain)
+bits  0-11: source handle id (in the suspending thread's process)
 bits 12-15: _reserved
-bits 16-31: caps to install on the handle in the receiver's domain
+bits 16-31: caps to install on the handle in the receiver's process
 bit     32: move (1 = remove from sender's table; 0 = copy)
 bits 33-63: _reserved
 ```
@@ -2637,7 +2637,7 @@ At recv time the kernel inserts the `N` handles into the receiving thread's tabl
 
 [test 01] returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
 
-[test 02] returns E_BADCAP if any entry's source handle id is not valid in the suspending thread's domain.
+[test 02] returns E_BADCAP if any entry's source handle id is not valid in the suspending thread's process.
 
 [test 03] returns E_PERM if any entry's caps are not a subset of the source handle's current caps.
 
@@ -2814,12 +2814,12 @@ cap (word 0, bits 48-63):
 
 | Bit | Name | Meaning |
 |---|---|---|
-| 0 | `move` | transferring this reply handle via move to another capability domain |
+| 0 | `move` | transferring this reply handle via move to another process |
 | 1 | `copy` | always 0 — reply handles are one-shot and cannot be duplicated |
 | 2 | `xfer` | attaching handles to the resumption via `reply` (when `pair_count > 0`) |
 | 3-15 | `_reserved` | |
 
-The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and `xfer = 1` if and only if the recv'ing port had the `xfer` cap; otherwise `xfer = 0`. A holder may `restrict` away `move` or `xfer` to hand a more limited reply handle to another domain. `copy` cannot be set, so `restrict` cannot grant it.
+The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and `xfer = 1` if and only if the recv'ing port had the `xfer` cap; otherwise `xfer = 0`. A holder may `restrict` away `move` or `xfer` to hand a more limited reply handle to another process. `copy` cannot be set, so `restrict` cannot grant it.
 
 ### reply
 
@@ -2855,7 +2855,7 @@ The reply handle is typed by the originating event_type at recv time. The kernel
 
 The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
 
-When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed thread's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed thread's domain).
+When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed thread's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed thread's process).
 
 When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another thread to interleave a syscall on the caller in between. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended thread was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
 
@@ -2876,7 +2876,7 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 **E_TERM** — suspended thread was terminated before reply could deliver; the reply handle is consumed; on `pair_count > 0` no handle transfer occurs; on `recv_port_handle_id != 0` the caller does NOT park.
 
-**E_FULL** — `pair_count > 0` and the resumed thread's domain handle table cannot accommodate N contiguous slots (reply handle NOT consumed; caller's table unchanged).
+**E_FULL** — `pair_count > 0` and the resumed thread's process handle table cannot accommodate N contiguous slots (reply handle NOT consumed; caller's table unchanged).
 
 #### Tests
 
@@ -2902,7 +2902,7 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 11] returns E_INVAL if any reserved bits are set in any pair entry.
 
-[test 12] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's domain.
+[test 12] returns E_BADCAP if any pair entry's source handle id is not valid in the caller's process.
 
 [test 13] returns E_PERM if any pair entry's caps are not a subset of the source handle's current caps.
 
@@ -2914,15 +2914,15 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 17] returns E_TERM if the suspended thread was terminated before reply could deliver and `pair_count > 0`; the reply handle is consumed and no handle transfer occurs.
 
-[test 18] returns E_FULL if `pair_count > 0` and the resumed thread's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+[test 18] returns E_FULL if `pair_count > 0` and the resumed thread's process handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
 
-[test 19] on success when `pair_count > 0`, the resumed thread's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed thread's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+[test 19] on success when `pair_count > 0`, the resumed thread's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
 
 [test 20] on success when `pair_count > 0`, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 
-[test 21] on success when `pair_count > 0` and the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; the N attached handles are still installed in the vCPU's domain at slots `[tstart, tstart+N)` per the standard pair-attachment rules.
+[test 21] on success when `pair_count > 0` and the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; the N attached handles are still installed in the vCPU's process at slots `[tstart, tstart+N)` per the standard pair-attachment rules.
 
-[test 22] returns E_BADCAP when `recv_port_handle_id != 0` and that slot does not name a valid port handle in the caller's domain; the reply handle is NOT consumed and the caller does not park.
+[test 22] returns E_BADCAP when `recv_port_handle_id != 0` and that slot does not name a valid port handle in the caller's process; the reply handle is NOT consumed and the caller does not park.
 
 [test 23] returns E_PERM when `recv_port_handle_id != 0` and the named port handle does not have the `recv` cap; the reply handle is NOT consumed and the caller does not park.
 
@@ -2935,7 +2935,7 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 ## §[futex] Futex
 
-A futex is a user-side synchronization primitive: a thread atomically checks one or more user memory locations against a comparison and sleeps until the condition is met or another thread wakes it. The kernel keys waits by physical address, so two capability domains sharing a page_frame can synchronize through their respective virtual addresses to the same word.
+A futex is a user-side synchronization primitive: a thread atomically checks one or more user memory locations against a comparison and sleeps until the condition is met or another thread wakes it. The kernel keys waits by physical address, so two processes sharing a page_frame can synchronize through their respective virtual addresses to the same word.
 
 Two wait primitives with opposite comparison directions:
 - `futex_wait_val` — "I think these addresses currently hold these expected values; wake me when any of them differs."
@@ -2958,7 +2958,7 @@ futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
   syscall word bits 12-19: N (1..63)
 
   [1] timeout_ns: 0 = non-blocking, u64::MAX = indefinite, otherwise nanoseconds
-  [2 + 2i] addr: 8-byte-aligned user address in the caller's domain
+  [2 + 2i] addr: 8-byte-aligned user address in the caller's process
   [2 + 2i + 1] expected: u64 expected value at addr
 
   for i in 0..N-1.
@@ -2978,7 +2978,7 @@ futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
 
 **E_INVAL** — N is 0 or > 63; N exceeds caller's self-handle `fut_wait_max`; any addr not 8-byte aligned.
 
-**E_BADADDR** — any addr is not a valid user address in the caller's domain.
+**E_BADADDR** — any addr is not a valid user address in the caller's process.
 
 **E_TIMEOUT** — timeout expired before any pair's `addr != expected` condition was met and before any watched address was woken.
 
@@ -2992,7 +2992,7 @@ futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
 
 [test 04] returns E_INVAL if any addr is not 8-byte aligned.
 
-[test 05] returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+[test 05] returns E_BADADDR if any addr is not a valid user address in the caller's process.
 
 [test 06] returns E_TIMEOUT if the timeout expires before any pair's `addr != expected` condition is met and before any watched address is woken.
 
@@ -3016,7 +3016,7 @@ futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] add
   syscall word bits 12-19: N (1..63)
 
   [1] timeout_ns: 0 = non-blocking, u64::MAX = indefinite, otherwise nanoseconds
-  [2 + 2i] addr: 8-byte-aligned user address in the caller's domain
+  [2 + 2i] addr: 8-byte-aligned user address in the caller's process
   [2 + 2i + 1] target: u64 target value at addr
 
   for i in 0..N-1.
@@ -3036,7 +3036,7 @@ futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] add
 
 **E_INVAL** — N is 0 or > 63; N exceeds caller's self-handle `fut_wait_max`; any addr not 8-byte aligned.
 
-**E_BADADDR** — any addr is not a valid user address in the caller's domain.
+**E_BADADDR** — any addr is not a valid user address in the caller's process.
 
 **E_TIMEOUT** — timeout expired before any pair's `addr == target` condition was met and before any watched address was woken.
 
@@ -3050,7 +3050,7 @@ futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] add
 
 [test 04] returns E_INVAL if any addr is not 8-byte aligned.
 
-[test 05] returns E_BADADDR if any addr is not a valid user address in the caller's domain.
+[test 05] returns E_BADADDR if any addr is not a valid user address in the caller's process.
 
 [test 06] returns E_TIMEOUT if the timeout expires before any pair's `addr == target` condition is met and before any watched address is woken.
 
@@ -3071,7 +3071,7 @@ Wakes up to `count` Threads blocked in `futex_wait_val` or `futex_wait_change` o
 futex_wake([1] addr, [2] count) -> [1] woken
   syscall_num = 59
 
-  [1] addr: 8-byte-aligned user address in the caller's domain
+  [1] addr: 8-byte-aligned user address in the caller's process
   [2] count: maximum number of Threads to wake
 ```
 
@@ -3089,7 +3089,7 @@ futex_wake([1] addr, [2] count) -> [1] woken
 
 **E_INVAL** — `[1]` addr is not 8-byte aligned.
 
-**E_BADADDR** — `[1]` addr is not a valid user address in the caller's domain.
+**E_BADADDR** — `[1]` addr is not a valid user address in the caller's process.
 
 #### Tests
 
@@ -3097,7 +3097,7 @@ futex_wake([1] addr, [2] count) -> [1] woken
 
 [test 02] returns E_INVAL if [1] addr is not 8-byte aligned.
 
-[test 03] returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
+[test 03] returns E_BADADDR if [1] addr is not a valid user address in the caller's process.
 
 [test 04] on success, [1] is the number of Threads actually woken (0..count).
 

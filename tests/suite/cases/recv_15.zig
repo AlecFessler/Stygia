@@ -7,7 +7,7 @@
 // Strategy
 //   The assertion has two halves and both can be witnessed from a
 //   single test thread paired with a worker thread in the same capability
-//   domain:
+//   process:
 //     (a) recv with a finite, nonzero timeout returns success — not
 //         E_TIMEOUT — when a sender is queued before the deadline.
 //     (b) After the original deadline elapses, no spurious E_TIMEOUT
@@ -22,7 +22,7 @@
 //         syscall's result rather than a stale E_TIMEOUT.
 //
 //   Setup mirrors recv_05 / recv_16: the test thread mints a port with
-//   caps={bind, recv}, spawns a worker thread in the same domain, and
+//   caps={bind, recv}, spawns a worker thread in the same process, and
 //   yields to it so the worker reaches its blocking suspend before
 //   the test thread calls recv. The worker calls suspend(self, port) so
 //   the queued event is a suspended-thread sender the test thread can recv.
@@ -56,7 +56,7 @@
 //       suspension event before the test thread recvs.
 //     - test 05 (E_CLOSED on blocked recv when bind drops): the
 //       test thread never deletes the port handle.
-//     - test 06 (E_FULL): the test domain has plenty of free slots
+//     - test 06 (E_FULL): the test process has plenty of free slots
 //       for the reply handle plus zero attached handles.
 //
 //   create_thread error paths neutralized for the worker
@@ -100,7 +100,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global side channels shared across the test thread and the
-// worker thread — both run in the same capability domain so they share
+// worker thread — both run in the same process so they share
 // the address space and the handle table.
 //   - worker_self_slot: slot id of the worker's own thread handle, used
 //     by suspend(self, port).
@@ -121,7 +121,7 @@ fn workerEntry() callconv(.c) noreturn {
     _ = syscall.suspendThread(self_slot, port_slot, &.{});
     // The worker is left waiting indefinitely after suspend resolves.
     // The test thread never replies on the minted reply handle and the
-    // capability domain is torn down at test exit, so the worker is
+    // process is torn down at test exit, so the worker is
     // not expected to observe a particular resolution — it just must
     // not race the test thread into surfacing an unrelated event.
     while (true) {
@@ -164,7 +164,7 @@ pub fn main(cap_table_base: u64) void {
         thread_caps_word,
         entry,
         1, // stack_pages
-        0, // target = self (this domain)
+        0, // target = self (this process)
         0, // affinity = any core
     );
     if (testing.isHandleError(cec.v1)) {

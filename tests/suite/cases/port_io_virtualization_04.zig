@@ -17,7 +17,7 @@
 //   the root service, but test children today have no port_io
 //   device_region in their handle table — the v0 runner
 //   (runner/primary.zig spawnOne) populates a child capability
-//   domain's table via `create_capability_domain`'s passed_handles,
+//   process's table via `create_process`'s passed_handles,
 //   which on this branch carry only the result port at slot 3.
 //   Slots 0/1/2 are kernel-installed as self / initial thread /
 //   self-IDC. No port_io device_region is forwarded; the only such
@@ -44,7 +44,7 @@
 //       device_region is forwarded, the faithful test would size
 //       the VMAR to match that region's port_count (rounded up to a
 //       page).
-//   Pass slot 4095 for [2]: per the create_capability_domain table
+//   Pass slot 4095 for [2]: per the create_process table
 //   layout that slot is guaranteed empty, so the kernel rejects
 //   with E_BADCAP via §[map_mmio] test 02 instead of installing
 //   the VMAR for trap-on-access. The MOV-load against VMAR.base the
@@ -140,7 +140,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const mmio_var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout (slots 0/1/2 are self / initial_thread / self_idc;
     // passed_handles begin at slot 3 and only the result port lands
     // there for tests). The §[map_mmio] gate order rejects an invalid

@@ -5,7 +5,7 @@
 //
 // Strategy
 //   The runner gives every test thread a self-handle with `crec` set and
-//   `pri = 3` (see runner/primary.zig). The child domain's
+//   `pri = 3` (see runner/primary.zig). The child process's
 //   `thread_inner_ceiling` is also wide open (0xFF in primary.zig), so a
 //   minimal ThreadCap with `restart_policy = 0` is a subset and won't trip
 //   test 03. Likewise `priority = 0` stays under the pri ceiling and

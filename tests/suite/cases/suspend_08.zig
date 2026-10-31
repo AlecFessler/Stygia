@@ -3,10 +3,10 @@
 // "[test 08] on success, the target thread stops executing."
 //
 // Strategy
-//   Mint a worker thread inside this domain (target = self) that runs a
+//   Mint a worker thread inside this process (target = self) that runs a
 //   tight loop incrementing a shared u64 in this ELF's .bss. Because
 //   create_thread with target = 0 puts the new thread in the
-//   caller's own capability domain — and therefore in the same address
+//   caller's own process — and therefore in the same address
 //   space — the parent test thread can observe the worker's progress by
 //   reading the same memory location.
 //
@@ -21,7 +21,7 @@
 //   the assertion only requires that the worker stops executing, which
 //   the kernel must enforce synchronously regardless of whether anyone
 //   ever recv's the event. The port is left with the suspension event
-//   queued; teardown happens when the test thread's domain self-handle is
+//   queued; teardown happens when the test thread's process self-handle is
 //   deleted on return from `main`.
 //
 //   The verification has two phases:

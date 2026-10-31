@@ -21,7 +21,7 @@
 //        pair_count > 0 at all.
 //     2. Mint a sibling thread W with `susp | term`, restart_policy = 0.
 //        susp lets us queue W on the port; term + rp=0 keeps W's
-//        cleanup contained inside this test domain (no restart
+//        cleanup contained inside this test process (no restart
 //        fallback can re-resurrect W and surprise the recv path).
 //     3. suspend(W, port) — non-blocking on the test thread because [1] !=
 //        self per §[suspend]; queues W as a suspended sender on the
@@ -31,7 +31,7 @@
 //        (bits 32-43) is the handle we feed to reply.
 //
 //   For the source pair entries we use freshly-minted ports as donors.
-//   Ports are the cheapest non-thread handle the test domain has rights
+//   Ports are the cheapest non-thread handle the test process has rights
 //   to mint (the runner grants `crpt`), and they let us craft the
 //   exact source-cap shape each `move` polarity needs:
 //
@@ -177,7 +177,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: recv. Returns immediately because W is already queued
     // and the test thread holds the port's bind cap (no E_CLOSED) and the
-    // domain has plenty of free slots (no E_FULL).
+    // process has plenty of free slots (no E_FULL).
     const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);

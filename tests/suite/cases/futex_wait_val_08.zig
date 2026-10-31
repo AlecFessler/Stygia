@@ -7,7 +7,7 @@
 //
 // Strategy
 //   The assertion needs three pieces of state that only fit together
-//   when the test thread and a peer thread live in the same capability domain:
+//   when the test thread and a peer thread live in the same process:
 //     - a shared 8-byte-aligned address whose paddr both Threads key on
 //       (a process-global u64 in this ELF's .bss; same address space
 //       because the worker is spawned with `target = 0`),
@@ -16,7 +16,7 @@
 //     - a coordination shape that doesn't deadlock if the wake races
 //       ahead of the wait or vice versa.
 //
-//   We spawn a worker thread inside this domain with a custom entry
+//   We spawn a worker thread inside this process with a custom entry
 //   (`workerLoop`) that calls `futex_wake(&shared, 1)` in a tight
 //   loop. The worker's wakes against an empty wait-queue are spec'd
 //   to return 0 woken (§[futex_wake] test 04) and have no other
@@ -64,7 +64,7 @@
 //       .bss, naturally 8-byte aligned by Zig's u64 layout rules.
 //     - test 05 (E_BADADDR via invalid addr): &shared is in this
 //       ELF's data segment, mapped readable in the test child's
-//       domain.
+//       process.
 //     - test 06 (E_TIMEOUT): tolerated — the smoke degrades to id 0
 //       when every attempt times out (see below).
 //     - test 07 (entry-time *addr != expected): we pass `expected =
@@ -109,7 +109,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global shared between the test thread and the worker thread. Both
-// run in the same capability domain (target = 0 → same address
+// run in the same process (target = 0 → same address
 // space), so this u64's vaddr is identical in both Threads. u64 globals
 // in Zig's .bss are 8-byte aligned, so &shared satisfies the
 // futex_wait_val alignment requirement (§[futex_wait_val] test 04).

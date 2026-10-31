@@ -23,7 +23,7 @@
 //!   • Direct chain references in any context (file-level decls, function
 //!     bodies, struct-field initializers, anywhere else).
 //!     e.g. `const t = stygia.arch.dispatch.time;` from arch/x64/.
-//!     e.g. `lapic: stygia.arch.x64.kvm.lapic.Lapic = .{},` from kernel/capdom/.
+//!     e.g. `lapic: stygia.arch.x64.kvm.lapic.Lapic = .{},` from kernel/process_mod/.
 //!
 //!   • Single-step alias expansion. Given a file-local
 //!     `const NAME = stygia.arch[.<seg>...]` decl, any later chain rooted at

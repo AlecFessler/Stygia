@@ -5,10 +5,10 @@
 //
 // Strategy
 //   The runner mints the result port with caps `{xfer, bind}` only —
-//   no `move`, no `copy` — and passes it to each test domain at slot
+//   no `move`, no `copy` — and passes it to each test process at slot
 //   `SLOT_FIRST_PASSED` (= 3). That single handle is exactly what test
 //   05 needs as the source of an attachment with `move = 0`: it is a
-//   live, valid handle in this domain whose caps deliberately lack
+//   live, valid handle in this process whose caps deliberately lack
 //   `copy`.
 //
 //   We also use the same slot-3 port as the suspend port [2]. It has
@@ -18,7 +18,7 @@
 //   on the source handle of an attachment.
 //
 //   We use the initial thread at slot 1 as [1] (target = self). The runner
-//   grants the test domain's `thread_inner_ceiling` 0xFF, so slot 1 carries
+//   grants the test process's `thread_inner_ceiling` 0xFF, so slot 1 carries
 //   `susp` along with all other thread caps, neutralizing §[suspend] test 03
 //   (lacks `susp`).
 //
@@ -94,12 +94,7 @@ fn issueSuspendOneAttachmentArm(word: u64, thread_handle: u64, port_handle: u64,
           [iv1] "{x0}" (thread_handle),
           [iv2] "{x1}" (port_handle),
           [entry] "r" (entry_word),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return x0_out;
 }
 

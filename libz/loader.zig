@@ -36,7 +36,7 @@ const elf = std.elf;
 //
 // The runner stages libz_c.elf into a single page_frame at startup,
 // applies its R_*_RELATIVE relocations against `LIBZ_SLIDE`, then hands
-// that pf out to every spawned test domain. Each child mapPfs the pf
+// that pf out to every spawned test process. Each child mapPfs the pf
 // at exactly `LIBZ_SLIDE` so the prelinked addresses inside the libz
 // image (its own GOT, its data.rel.ro pointers, etc.) are valid at
 // runtime without re-relocating per-child.
@@ -312,7 +312,7 @@ fn cstrEql(p: [*]const u8, max: usize, name: []const u8) bool {
 /// lookups, so the linear scan is fine in practice. Adding a hash
 /// lookup would buy us ~10× on the constant factor but doesn't change
 /// the order of the runner's per-spawn cost (kernel-side
-/// createCapabilityDomain dwarfs it).
+/// createProcess dwarfs it).
 fn lookupSymbol(lib: Dynamic, image_runtime_base: u64, name: []const u8) ?u64 {
     var i: usize = 1; // index 0 is the reserved STN_UNDEF entry
     while (i < lib.sym_count) : (i += 1) {

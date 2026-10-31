@@ -13,7 +13,7 @@ const scheduler = stygia.sched.scheduler;
 const thread_mod = stygia.sched.thread;
 const sync_debug = stygia.utils.sync.debug;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const ThreadQueue = stygia.sched.scheduler.ThreadQueue;
 const ThreadQueueLevel = @typeInfo(@FieldType(ThreadQueue, "levels")).array.child;
@@ -164,15 +164,15 @@ pub const SyscallScratch = extern struct {
     /// Pointer to the thread currently dispatched on this core. Updated
     /// by `switchTo`. Read in fast-path entry without further lookup.
     current_thread: u64,
-    /// Pointer to that thread's bound CapabilityDomain. Updated alongside
+    /// Pointer to that thread's bound Process. Updated alongside
     /// `current_thread` so handle-table walks skip a dereference.
-    current_domain: u64,
-    /// Cached pointer to `current_domain.user_table` (the
+    current_process: u64,
+    /// Cached pointer to `current_process.user_table` (the
     /// [4096]Capability array base). Populated by `switchTo` alongside
-    /// `current_domain` so the fast-path's user-table indexing skips
-    /// the CD->user_table chained deref — one direct gs-relative load.
+    /// `current_process` so the fast-path's user-table indexing skips
+    /// the process->user_table chained deref — one direct gs-relative load.
     current_user_table: u64,
-    /// Cached pointer to `current_domain.kernel_table`
+    /// Cached pointer to `current_process.kernel_table`
     /// ([4096]KernelHandle array base). Same rationale as
     /// `current_user_table`.
     current_kernel_table: u64,
@@ -245,7 +245,7 @@ comptime {
 /// a naked stub, so layout drift on `SyscallScratch` must trip a
 /// compile error here rather than silently corrupting the path. The
 /// future L4 IPC fast path will share the same scratch layout, hence
-/// the slot bookkeeping for `current_thread`, `current_domain`,
+/// the slot bookkeeping for `current_thread`, `current_process`,
 /// `per_core_ptr`, and the `fast_temp` band stays parked here for
 /// when those slots become live again.
 const Offsets = struct {
@@ -254,7 +254,7 @@ const Offsets = struct {
     const sc_user_rip: usize = 16;
     const sc_user_rflags: usize = 24;
     const sc_current_thread: usize = 32;
-    const sc_current_domain: usize = 40;
+    const sc_current_process: usize = 40;
     const sc_current_user_table: usize = 48;
     const sc_current_kernel_table: usize = 56;
     const sc_fast_temp_0: usize = 64;
@@ -284,7 +284,7 @@ comptime {
     if (@offsetOf(SyscallScratch, "user_rip") != Offsets.sc_user_rip) @compileError("scratch.user_rip drift");
     if (@offsetOf(SyscallScratch, "user_rflags") != Offsets.sc_user_rflags) @compileError("scratch.user_rflags drift");
     if (@offsetOf(SyscallScratch, "current_thread") != Offsets.sc_current_thread) @compileError("scratch.current_thread drift");
-    if (@offsetOf(SyscallScratch, "current_domain") != Offsets.sc_current_domain) @compileError("scratch.current_domain drift");
+    if (@offsetOf(SyscallScratch, "current_process") != Offsets.sc_current_process) @compileError("scratch.current_process drift");
     if (@offsetOf(SyscallScratch, "current_user_table") != Offsets.sc_current_user_table) @compileError("scratch.current_user_table drift");
     if (@offsetOf(SyscallScratch, "current_kernel_table") != Offsets.sc_current_kernel_table) @compileError("scratch.current_kernel_table drift");
     if (@offsetOf(SyscallScratch, "fast_temp") != Offsets.sc_fast_temp_0) @compileError("scratch.fast_temp drift");
@@ -313,13 +313,13 @@ comptime {
 }
 
 // Optional-SlabRef layout assertion. The fast-path mint-reply chunk
-// writes `sender.pending_reply_domain` (a `?SlabRef(CapabilityDomain)`)
+// writes `sender.pending_reply_process` (a `?SlabRef(Process)`)
 // and `sender.suspend_port` (a `?SlabRef(Port)`) by hand: 16-byte
 // SlabRef payload at offset 0, 1-byte discriminator at offset 16,
 // padded to 24 total. If Zig's optional layout changes, this trips.
 comptime {
-    if (@sizeOf(?SlabRef(CapabilityDomain)) != 24) {
-        @compileError("?SlabRef(CapabilityDomain) layout drift — fast-path mint-reply assumes 16-byte payload + disc at +16");
+    if (@sizeOf(?SlabRef(Process)) != 24) {
+        @compileError("?SlabRef(Process) layout drift — fast-path mint-reply assumes 16-byte payload + disc at +16");
     }
     if (@sizeOf(?SlabRef(Port)) != 24) {
         @compileError("?SlabRef(Port) layout drift — fast-path sender.suspend_port write assumes 16-byte payload + disc at +16");
@@ -644,7 +644,7 @@ export fn syscallDispatch(ctx: *cpu.Context) void {
 /// payload_count). Predicate: self-suspend + receiver queued on the
 /// destination port + caps OK (susp/read/write on target, bind on
 /// port). On match the rendezvous mints a reply handle in the
-/// receiver's CD, parks the sender, transfers vregs zero-copy
+/// receiver's process, parks the sender, transfers vregs zero-copy
 /// through the GPRs, swaps CR3, and sysretq's directly to the
 /// receiver in user mode — never reaches `syscallDispatch`.
 /// Predicate misses funnel into `.Lsyscall_lock_fail` →
@@ -664,7 +664,7 @@ pub export fn syscallEntry() callconv(.naked) void {
     //
     // The check_gen_lock asm pass tracks lock state per-register at a
     // single-function granularity. This fast-path stub multiplexes
-    // seven distinct lock windows (recv_cd, receiver_thread, sender_thread,
+    // seven distinct lock windows (recv_process, receiver_thread, sender_thread,
     // port, caller_thread) across hundreds of asm lines, hands ownership
     // of `gs:` scratch slots between phases, and bridges between the
     // suspend FP and reply FP through asm labels whose per-jump
@@ -827,7 +827,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         //   gs:72  fast_temp[1]  target_id (rax) spill, restored on bail
         //   gs:80  fast_temp[2]  Port* spill during dequeue pop +
         //                        recv_cd_ptr spill during mint
-        //   gs:88  fast_temp[3]  receiver thread* spill (persists through CD
+        //   gs:88  fast_temp[3]  receiver thread* spill (persists through process
         //                        acquire + mint + state mutations)
         //   gs:96  fast_temp[4]  reply slot id (u16 in low bits)
         //   gs:104 fast_temp[5]  recv_cd_gen
@@ -1018,18 +1018,18 @@ pub export fn syscallEntry() callconv(.naked) void {
         ) ++
 
         // ─── Step 6.5: snapshot receiver state under port lock for the
-        // recv_cd + receiver_thread acquire chain that follows port release.
+        // recv_process + receiver_thread acquire chain that follows port release.
         // Port lock pins the receiver while held, so reads here are
         // gen-coherent. Stash:
         //   gs:104 = receiver_thread_gen   (snapshot for Step 9.5 lockWithGen)
-        //   gs:80  = recv_cd_ptr        (overwritten by recv_cd value at
+        //   gs:80  = recv_cd_ptr        (overwritten by recv_process value at
         //                                Step 10; we re-stash there)
         //   gs:96  = recv_cd_gen        (overwritten at Step 10 line ~800
         //                                with reply_slot id; we use it
         //                                in Step 9 acquire then it's free)
         //
-        // Capturing receiver.domain.ptr/.gen here moves the analyzer-
-        // flagged "receiver.domain via %r11: lock not held" read at
+        // Capturing receiver.process.ptr/.gen here moves the analyzer-
+        // flagged "receiver.process via %r11: lock not held" read at
         // (former) Step 9 line 752 into the port-locked window where the
         // receiver is provably alive. Step 9 then uses cached values.
         // ────────────────────────────────────────────────────────────────
@@ -1046,8 +1046,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .thread_lock_off = @offsetOf(Thread, "_gen_lock"),
-                .dom_ptr_off = @offsetOf(Thread, "domain"),
-                .dom_gen_off = @offsetOf(Thread, "domain") + 8,
+                .dom_ptr_off = @offsetOf(Thread, "process"),
+                .dom_gen_off = @offsetOf(Thread, "process") + 8,
             },
         ) ++
 
@@ -1092,11 +1092,11 @@ pub export fn syscallEntry() callconv(.naked) void {
         .{ .port_lock_off = @offsetOf(Port, "_gen_lock") },
     ) ++
 
-        // ─── Step 9: acquire receiver's CD gen-lock from cached snapshot
+        // ─── Step 9: acquire receiver's process gen-lock from cached snapshot
         // (Step 6.5: gs:80 = recv_cd_ptr, gs:96 = recv_cd_gen). Spill
         // receiver thread* to gs:88 (persists through everything that follows).
-        // Lock order: recv_cd here is the ONLY lock held; we acquire
-        // receiver_thread at Step 9.5 — canonical CD → thread.
+        // Lock order: recv_process here is the ONLY lock held; we acquire
+        // receiver_thread at Step 9.5 — canonical process → thread.
         // ────────────────────────────────────────────────────────────────
         \\movq %%r11, %%gs:88
         \\movq %%gs:80, %%rcx
@@ -1106,8 +1106,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\shlq $1, %%r11
         \\movq %%r11, %%rax
         \\incq %%r11
-        \\.Lacquire_recv_cd:
-        \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
+        \\.Lacquire_recv_process:
+        \\lock cmpxchgq %%r11, {[process_lock_off]d}(%%rcx)
         \\je .Lrecv_cd_acquired
         \\xorq %%r11, %%rax
         \\testq $-2, %%rax
@@ -1115,19 +1115,19 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\pause
         \\movq %%r11, %%rax
         \\andq $-2, %%rax
-        \\jmp .Lacquire_recv_cd
+        \\jmp .Lacquire_recv_process
         \\.Lrecv_cd_acquired:
         \\
     ,
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
 
         // ─── Step 9.5: acquire receiver_thread gen-lock with snapshotted gen
-        // from Step 6.5. Holds recv_cd lock — canonical CD → thread order.
-        // Bail to .Lrecv_thread_destroyed (release recv_cd, jmp slow path) if
+        // from Step 6.5. Holds recv_process lock — canonical process → thread order.
+        // Bail to .Lrecv_thread_destroyed (release recv_process, jmp slow path) if
         // gen rotated under us between Step 6.5 and now (concurrent
         // destroy walked the receiver while we were between port release
-        // and recv_cd acquire). Receiver_thread held through Step 15 — covers
+        // and recv_process acquire). Receiver_thread held through Step 15 — covers
         // every receiver field write (state, event_*, ctx) plus the
         // kernel_stack.top read in Step 14.
         //
@@ -1167,7 +1167,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // current-thread swap (Step 14 / R14). Per the lock discipline, every
         // slab-field access uses lockWithGen against a snap — even when
         // "we are this thread" — because terminate-from-another-core (some
-        // other thread holds a handle to us in its own CD) can fire between
+        // other thread holds a handle to us in its own process) can fire between
         // syscall entry and here, rotating the gen and possibly
         // reallocating the slot to a different thread. Held through Step 12
         // (last sender field write); released at Step 12.5.
@@ -1179,7 +1179,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // will flag the nesting; the documented invariant is that this
         // is the only path that holds both Threads at once.
         //
-        // Bail to .Lsender_thread_destroyed: hard panic. By this point recv_cd
+        // Bail to .Lsender_thread_destroyed: hard panic. By this point recv_process
         // and recv_thread are both held — there's no clean unwind that doesn't
         // race the destroyer, and "I shouldn't exist" is a hard invariant
         // break. Mirrors `.Lreply_caller_destroyed` / `.Lreply_sender_destroyed`.
@@ -1212,19 +1212,19 @@ pub export fn syscallEntry() callconv(.naked) void {
         },
     ) ++
 
-        // ─── Step 10: mint reply handle. recv_cd held by lock; receiver_thread
+        // ─── Step 10: mint reply handle. recv_process held by lock; receiver_thread
         // also held (Step 9.5). Reload rcx = recv_cd_ptr and r11 =
         // recv_cd_gen from the Step 6.5 stash since Step 9.5 left rcx =
         // receiver_thread_ptr. gs:104 still holds receiver_thread_gen from Step
         // 6.5; we overwrite it here with recv_cd_gen — receiver_thread_gen
         // is no longer needed (the lockWithGen acquire at Step 9.5
         // committed the gen check).
-        // Pop free slot via cd.free_head + free-list link (kernel_table[slot]
+        // Pop free slot via process.free_head + free-list link (kernel_table[slot]
         // .parent.slot at offset 32 within KernelHandle). Write
         // user_table[slot] (word0=caps|type|slot, field0/field1=0) and
         // kernel_table[slot] (ref={sender,sender_gen}, parent/first_child/
         // next_sibling=0). Set sender backpointers pending_reply_holder/
-        // domain/slot. word0 caps for fast path:
+        // process/slot. word0 caps for fast path:
         // ReplyCaps{move=1,xfer=1}=0b101=5; tag=.reply=7.
         // ────────────────────────────────────────────────────────────────
         \\movq %%gs:80, %%rcx
@@ -1244,9 +1244,9 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\
     ,
         .{
-            .fh_off = @offsetOf(CapabilityDomain, "free_head"),
-            .fc_off = @offsetOf(CapabilityDomain, "free_count"),
-            .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+            .fh_off = @offsetOf(Process, "free_head"),
+            .fc_off = @offsetOf(Process, "free_count"),
+            .kt_off = @offsetOf(Process, "kernel_table"),
             .kh_size = @sizeOf(KernelHandle),
         },
     ) ++
@@ -1272,7 +1272,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .kt_off = @offsetOf(Process, "kernel_table"),
                 .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
                 .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
                 // thread._gen_lock is NOT at offset 0: Thread is a
@@ -1309,7 +1309,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
+                .ut_off = @offsetOf(Process, "user_table"),
                 .w0_const = (@as(u64, @as(u16, @bitCast(ReplyCaps{ .move = true, .xfer = true }))) << 48) | (@as(u64, @intFromEnum(CapabilityType.reply)) << 12),
                 .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
                 .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
@@ -1332,18 +1332,18 @@ pub export fn syscallEntry() callconv(.naked) void {
         ,
             .{
                 .prh_off = @offsetOf(Thread, "pending_reply_holder"),
-                .prd_off = @offsetOf(Thread, "pending_reply_domain"),
-                .prd_gen_off = @offsetOf(Thread, "pending_reply_domain") + 8,
-                .prd_disc_off = @offsetOf(Thread, "pending_reply_domain") + 16,
+                .prd_off = @offsetOf(Thread, "pending_reply_process"),
+                .prd_gen_off = @offsetOf(Thread, "pending_reply_process") + 8,
+                .prd_disc_off = @offsetOf(Thread, "pending_reply_process") + 16,
                 .prs_off = @offsetOf(Thread, "pending_reply_slot"),
             },
         ) ++
 
-        // ─── Step 11: release recv_cd lock. ────────────────────────────
+        // ─── Step 11: release recv_process lock. ────────────────────────────
         \\movq %%gs:80, %%rcx
     ++ std.fmt.comptimePrint(
-        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
 
         // ─── Step 12: park sender state (sender = current_thread = gs:32).
@@ -1511,9 +1511,9 @@ pub export fn syscallEntry() callconv(.naked) void {
         // pageFaultHandler / syscall dispatch / etc. all read thread identity
         // through `scheduler.currentThread()` which loads from `PerCore`, not
         // from `gs:32`. If the fast path leaves them divergent, the next
-        // user fault on this core resolves the wrong domain (e.g. primary
+        // user fault on this core resolves the wrong process (e.g. primary
         // serial.print MMIO traps look up COM1 in the previously-scheduled
-        // child's CD → null → spurious memory_fault that retires the wrong
+        // child's process → null → spurious memory_fault that retires the wrong
         // thread). Mirrors `switchTo` (this file, end of module). FPU: arm
         // CR0.TS iff receiver != per_core->last_fpu_owner.ptr; skip CR-write
         // if already in desired state (each MOV-CR0 is a vmexit under KVM).
@@ -1576,8 +1576,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .ut_off = @offsetOf(Process, "user_table"),
+                .kt_off = @offsetOf(Process, "kernel_table"),
                 .kstack_top_off = @offsetOf(Thread, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
@@ -1666,8 +1666,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\
     ,
         .{
-            .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
-            .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
+            .asr_off = @offsetOf(Process, "addr_space_root"),
+            .asid_off = @offsetOf(Process, "addr_space_id"),
         },
     ) ++
         \\movq %%r11, %%cr3
@@ -1676,7 +1676,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // sysretq state, return to user mode.
         //
         // Stack writes use rax = recv_user_rsp (loaded pre-CR3-swap).
-        // After CR3 = recv_cd's PML4, recv's user pages are mapped.
+        // After CR3 = recv_process's PML4, recv's user pages are mapped.
         //
         // vreg 0 staged in gs:104 (we spilled it pre-CR3 to free rcx).
         // vreg 14 (sender RIP) comes from gs:16.
@@ -1800,8 +1800,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\.Lcd_full:
         \\movq %%gs:80, %%rcx
     ++ std.fmt.comptimePrint(
-        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
         \\ud2
         \\.Lrecv_cd_fail:
@@ -1809,19 +1809,19 @@ pub export fn syscallEntry() callconv(.naked) void {
         // .Lrecv_thread_destroyed: Step 9.5 lockWithGen detected receiver
         // gen rotated under us (concurrent destroy walked receiver
         // between Step 8 port release and Step 9.5 acquire). Release
-        // recv_cd and bail to slow path.
+        // recv_process and bail to slow path.
         \\.Lrecv_thread_destroyed:
         \\movq %%gs:80, %%rcx
     ++ std.fmt.comptimePrint(
-        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
         \\jmp .Lsyscall_lock_fail
 
         // .Lsender_thread_destroyed: Step 9.7 lockWithGen detected sender
         // (= current_thread) gen rotated between syscall entry's snap
         // (gs:176) and the acquire here — terminate-from-another-core
-        // fired against us. Hard panic: recv_cd / recv_thread are still
+        // fired against us. Hard panic: recv_process / recv_thread are still
         // held but the system invariant ("the thread running this syscall
         // exists") is broken; any clean unwind would still race the
         // destroyer. Mirror of `.Lreply_caller_destroyed`.
@@ -1860,7 +1860,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         //        scratch: rcx, r11; rax is freed after the gs:64 spill
         //        and reloaded just before sysretq.
         //
-        // Predicates (all under receiver CD lock so we can bail to slow
+        // Predicates (all under receiver process lock so we can bail to slow
         // path BEFORE touching the slot):
         //   1. kernel_table[slot].ref.ptr != null
         //   2. user_table[slot].word0 type tag == .reply (= 7)
@@ -1938,17 +1938,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%rax, %%gs:112
         \\movq $0, %%gs:120
 
-        // ─── Step R3: acquire receiver's CD gen-lock. CD ptr at gs:40.
+        // ─── Step R3: acquire receiver's process gen-lock. process ptr at gs:40.
         // CAS pattern matches suspend fast path Step 9.
         // ────────────────────────────────────────────────────────────────
     ++ std.fmt.comptimePrint(
         \\
         \\movq %%gs:40, %%rcx
-        \\movq {[cd_lock_off]d}(%%rcx), %%rax
+        \\movq {[process_lock_off]d}(%%rcx), %%rax
         \\andq $-2, %%rax
         \\lea 1(%%rax), %%r11
-        \\.Lreply_acquire_cd:
-        \\lock cmpxchgq %%r11, {[cd_lock_off]d}(%%rcx)
+        \\.Lreply_acquire_process:
+        \\lock cmpxchgq %%r11, {[process_lock_off]d}(%%rcx)
         \\je .Lreply_cd_acquired
         \\xorq %%r11, %%rax
         \\testq $-2, %%rax
@@ -1956,11 +1956,11 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\pause
         \\movq %%r11, %%rax
         \\andq $-2, %%rax
-        \\jmp .Lreply_acquire_cd
+        \\jmp .Lreply_acquire_process
         \\.Lreply_cd_acquired:
         \\
     ,
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
 
         // ─── Step R4: validate handle. Compute &kernel_table[slot] and
@@ -1994,8 +1994,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
+                .kt_off = @offsetOf(Process, "kernel_table"),
+                .ut_off = @offsetOf(Process, "user_table"),
                 .kh_size = @sizeOf(KernelHandle),
                 .ref_ptr_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "ptr"),
                 .ref_gen_off = @offsetOf(KernelHandle, "ref") + @offsetOf(stygia.caps.capability.ErasedSlabRef, "gen"),
@@ -2010,8 +2010,8 @@ pub export fn syscallEntry() callconv(.naked) void {
 
         // ─── Step R4b: atomic-recv-mode validation. Only fires when
         // gs:112 (recv_port_handle_id) is non-zero. Validates the named
-        // port handle while the CD lock is still held (user_table /
-        // kernel_table mutations are CD-protected). On any failure
+        // port handle while the process lock is still held (user_table /
+        // kernel_table mutations are process-protected). On any failure
         // (E_BADCAP for bad slot/type, E_PERM for missing recv cap),
         // bail to .Lreply_handle_invalid → slow path re-resolves and
         // returns the right error code with the reply handle intact
@@ -2021,7 +2021,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         //   gs:120 = port_thread_ptr
         //   gs:112 = recv_port (bits 0-11) | xfer (bit 12) | port_gen (bits 32-63)
         //
-        // After this block, rcx == receiver_cd (preserved for R6).
+        // After this block, rcx == receiver_process (preserved for R6).
         // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
@@ -2066,7 +2066,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\# park branch at R13 cannot rendezvous with them — the
             \\# park asm only knows how to enqueue the caller as a
             \\# receiver and clobbers waiter_kind. Bail to slow path
-            \\# (`.Lreply_handle_invalid` releases CD and jumps to
+            \\# (`.Lreply_handle_invalid` releases process and jumps to
             \\# `.Lsyscall_slow_path`); slow-path `port.recv` correctly
             \\# pops the sender and delivers its event. The read here
             \\# is unsynchronized so the bail doesn't catch every race
@@ -2080,8 +2080,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .ut_off = @offsetOf(Process, "user_table"),
+                .kt_off = @offsetOf(Process, "kernel_table"),
                 .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
                 .type_port = @intFromEnum(CapabilityType.port),
                 .recv_bit = 48 + 3,
@@ -2100,16 +2100,16 @@ pub export fn syscallEntry() callconv(.naked) void {
         // sender's gen-lock so a concurrent destroy/realloc of the slab
         // slot can't tear our predicate snapshot.
         //
-        // Stash sender_cd_ptr (sender.domain.ptr) to gs:104 along the
+        // Stash sender_cd_ptr (sender.process.ptr) to gs:104 along the
         // way — needed for the per-core switch + CR3 swap below.
         //
-        // Lock order: CD (R3) → sender_thread (here). Released sender_thread
-        // (R10) → CD (R7). Acquire CD-then-thread matches port.recv ordering.
+        // Lock order: process (R3) → sender_thread (here). Released sender_thread
+        // (R10) → process (R7). Acquire process-then-thread matches port.recv ordering.
         //
         // Bails:
-        //   .Lreply_eterm_under_cd : sender gen mismatch (slot recycled
-        //                            since R4 snapshot). CD lock held,
-        //                            handle NOT yet cleared. Release CD,
+        //   .Lreply_eterm_under_process : sender gen mismatch (slot recycled
+        //                            since R4 snapshot). process lock held,
+        //                            handle NOT yet cleared. Release process,
         //                            sysretq E_TERM to receiver.
         // ────────────────────────────────────────────────────────────────
         \\movq %%gs:72, %%rcx
@@ -2124,7 +2124,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\je .Lreply_sender_acquired
         \\xorq %%r11, %%rax
         \\testq $-2, %%rax
-        \\jnz .Lreply_eterm_under_cd
+        \\jnz .Lreply_eterm_under_process
         \\pause
         \\movq %%r11, %%rax
         \\andq $-2, %%rax
@@ -2135,7 +2135,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\
     ,
         .{
-            .dom_off = @offsetOf(Thread, "domain"),
+            .dom_off = @offsetOf(Thread, "process"),
             .thread_lock_off = @offsetOf(Thread, "_gen_lock"),
         },
     ) ++
@@ -2146,7 +2146,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // pointer and the field-access pointer are the same register.
         // Bail to .Lreply_sender_field_fail: releases sender lock first
         // (LIFO with R5a acquire), then falls into .Lreply_handle_invalid
-        // which releases CD lock and jumps slow path.
+        // which releases process lock and jumps slow path.
         // ────────────────────────────────────────────────────────────────
         std.fmt.comptimePrint(
             \\
@@ -2168,17 +2168,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         ) ++
 
         // ─── Step R6: clearAndFreeSlot inline. R5a left rcx = sender_thread_ptr,
-        // so reload rcx = receiver_cd from gs:40 first.
+        // so reload rcx = receiver_process from gs:40 first.
         //   kernel_table[slot].instance += 1
         //   user_table[slot] = {0, 0, 0}
         //   kernel_table[slot].ref = .{}                    (16 bytes)
-        //   kernel_table[slot].parent = encodeFreeNext(cd.free_head)
-        //     (16 bytes domain ErasedSlabRef = 0, then u16 slot =
-        //      cd.free_head, then 6 bytes _reserved = 0)
+        //   kernel_table[slot].parent = encodeFreeNext(process.free_head)
+        //     (16 bytes process ErasedSlabRef = 0, then u16 slot =
+        //      process.free_head, then 6 bytes _reserved = 0)
         //   kernel_table[slot].first_child = .{}            (24 bytes 0)
         //   kernel_table[slot].next_sibling = .{}           (24 bytes 0)
-        //   cd.free_head = slot
-        //   cd.free_count += 1
+        //   process.free_head = slot
+        //   process.free_count += 1
         // ────────────────────────────────────────────────────────────────
         \\movq %%gs:40, %%rcx
     ++ std.fmt.comptimePrint(
@@ -2210,7 +2210,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\
     ,
         .{
-            .ut_off = @offsetOf(CapabilityDomain, "user_table"),
+            .ut_off = @offsetOf(Process, "user_table"),
             .w0_off = @offsetOf(stygia.caps.capability.Capability, "word0"),
             .f0_off = @offsetOf(stygia.caps.capability.Capability, "field0"),
             .f1_off = @offsetOf(stygia.caps.capability.Capability, "field1"),
@@ -2226,15 +2226,15 @@ pub export fn syscallEntry() callconv(.naked) void {
             .ns0 = @offsetOf(KernelHandle, "next_sibling") + 0,
             .ns1 = @offsetOf(KernelHandle, "next_sibling") + 8,
             .ns2 = @offsetOf(KernelHandle, "next_sibling") + 16,
-            .fh_off = @offsetOf(CapabilityDomain, "free_head"),
-            .fc_off = @offsetOf(CapabilityDomain, "free_count"),
+            .fh_off = @offsetOf(Process, "free_head"),
+            .fc_off = @offsetOf(Process, "free_count"),
         },
     ) ++
 
-        // ─── Step R7: release CD lock. ─────────────────────────────────
+        // ─── Step R7: release process lock. ─────────────────────────────────
         std.fmt.comptimePrint(
-            "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-            .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+            "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+            .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
         ) ++
 
         // ─── Step R8: (folded into R5a — sender's gen-lock is already
@@ -2298,7 +2298,7 @@ pub export fn syscallEntry() callconv(.naked) void {
                 .event_addr_off = @offsetOf(Thread, "event_addr"),
                 .susp_disc_off = @offsetOf(Thread, "suspend_port") + 16,
                 .prh_off = @offsetOf(Thread, "pending_reply_holder"),
-                .prd_disc_off = @offsetOf(Thread, "pending_reply_domain") + 16,
+                .prd_disc_off = @offsetOf(Thread, "pending_reply_process") + 16,
                 .prs_off = @offsetOf(Thread, "pending_reply_slot"),
                 .orig_write_off = @offsetOf(Thread, "originating_write_cap"),
                 .orig_read_off = @offsetOf(Thread, "originating_read_cap"),
@@ -2325,7 +2325,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // _gen_lock against a snapshotted gen.
         //
         // Snap is `scratch.current_thread_gen` (gs:176), captured by `switchTo`
-        // alongside `current_thread`. Between R7 (CD release) and here the
+        // alongside `current_thread`. Between R7 (process release) and here the
         // caller_thread carries no held lock, so a concurrent terminate from
         // another core that holds a handle to *us* could fire (locks
         // caller_thread briefly, releases, then `destroyThread`
@@ -2334,7 +2334,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // wrong slab generation; lockWithGen catches the mismatch and
         // bails to `.Lreply_caller_destroyed`.
         //
-        // Lock order: nothing else held at this point (R7 dropped CD, R10
+        // Lock order: nothing else held at this point (R7 dropped process, R10
         // dropped sender_thread). For the atomic-recv-park R13 branch the port
         // lock will nest under this lock (receiver_thread → port). Tag the
         // acquisition with ordered_group=2 (THREAD_NESTED_GROUP) so future asm
@@ -2435,13 +2435,13 @@ pub export fn syscallEntry() callconv(.naked) void {
         //   recv_port != 0 (atomic-recv-mode): caller parks on the named
         //   port's wait queue with state .suspended_on_port, mirroring
         //   what slow-path port.recv would do. Lock order: port lock only
-        //   (CD released at R7, sender released at R10). Acquires port's
+        //   (process released at R7, sender released at R10). Acquires port's
         //   gen-lock with snapshot port_gen (gs:112 bits 32-63); if gen
         //   mismatch (port destroyed between R4b validation and now),
         //   fall back to run-queue enqueue — caller's syscall returns OK
         //   without parking. (Spec leaves this exact race undefined; the
         //   port-recv-cap holder is the caller itself, so port destruction
-        //   from outside our domain is impossible here in practice.)
+        //   from outside our process is impossible here in practice.)
         // ────────────────────────────────────────────────────────────────
         \\movq %%gs:112, %%rax
         \\testq %%rax, %%rax
@@ -2519,7 +2519,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         // recv_port wait queue. Acquires port's gen-lock with snapshot
         // port_gen (gs:112 bits 32-63). port_thread_ptr in gs:120. Lock
         // order: port lock only — no other locks held at this point
-        // (CD released R7, sender released R10). Mirrors slow-path
+        // (process released R7, sender released R10). Mirrors slow-path
         // port.recv's enqueueReceiver path.
         //
         // Receiver fields written (matches slow-path port.recv):
@@ -2697,7 +2697,7 @@ pub export fn syscallEntry() callconv(.naked) void {
             .event_subcode_off = @offsetOf(Thread, "event_subcode"),
             .event_addr_off = @offsetOf(Thread, "event_addr"),
             .prh_off = @offsetOf(Thread, "pending_reply_holder"),
-            .prd_disc_off = @offsetOf(Thread, "pending_reply_domain") + 16,
+            .prd_disc_off = @offsetOf(Thread, "pending_reply_process") + 16,
             .prs_off = @offsetOf(Thread, "pending_reply_slot"),
             .susp_value_ptr_off = @offsetOf(Thread, "suspend_port") + 0,
             .susp_value_gen_off = @offsetOf(Thread, "suspend_port") + 8,
@@ -2789,7 +2789,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\# alternative.
         \\#
         \\# Lock order: only sender_thread held at this point. caller_thread
-        \\# was just released (R13.5); CD released at R7. No nesting.
+        \\# was just released (R13.5); process released at R7. No nesting.
         \\movq %%gs:72, %%rcx
         \\movq %%gs:96, %%rax
         \\shlq $1, %%rax
@@ -2883,8 +2883,8 @@ pub export fn syscallEntry() callconv(.naked) void {
             \\
         ,
             .{
-                .ut_off = @offsetOf(CapabilityDomain, "user_table"),
-                .kt_off = @offsetOf(CapabilityDomain, "kernel_table"),
+                .ut_off = @offsetOf(Process, "user_table"),
+                .kt_off = @offsetOf(Process, "kernel_table"),
                 .kstack_top_off = @offsetOf(Thread, "kernel_stack") + @offsetOf(stygia.memory.stack.Stack, "top"),
                 .fpu_owner_off = @offsetOf(stygia.sched.scheduler.PerCore, "last_fpu_owner"),
                 .fpu_armed_off = @offsetOf(stygia.sched.scheduler.PerCore, "fpu_trap_armed"),
@@ -2923,8 +2923,8 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\
     ,
         .{
-            .asr_off = @offsetOf(CapabilityDomain, "addr_space_root"),
-            .asid_off = @offsetOf(CapabilityDomain, "addr_space_id"),
+            .asr_off = @offsetOf(Process, "addr_space_root"),
+            .asid_off = @offsetOf(Process, "addr_space_id"),
         },
     ) ++
         \\movq %%r11, %%cr3
@@ -3055,17 +3055,17 @@ pub export fn syscallEntry() callconv(.naked) void {
 
         // ─── Reply-fast bail handlers ──────────────────────────────────
         //
-        // .Lreply_eterm_under_cd: sender gen-lock acquire (R5a) saw a
+        // .Lreply_eterm_under_process: sender gen-lock acquire (R5a) saw a
         // stale gen — sender slot recycled between our R4 snapshot and
-        // our CAS. Handle is NOT yet cleared (R6 not run); CD lock IS
-        // still held. Slow path's CD-locked re-resolve would also see
+        // our CAS. Handle is NOT yet cleared (R6 not run); process lock IS
+        // still held. Slow path's process-locked re-resolve would also see
         // the stale gen via SlabRef and return E_TERM — short-circuit
-        // it here: release CD, sysretq E_TERM.
-        \\.Lreply_eterm_under_cd:
+        // it here: release process, sysretq E_TERM.
+        \\.Lreply_eterm_under_process:
         \\movq %%gs:40, %%rcx
     ++ std.fmt.comptimePrint(
-        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
         std.fmt.comptimePrint(
             "\nmovq ${d}, %%rax\n",
@@ -3078,9 +3078,9 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\sysretq
 
         // .Lreply_sender_field_fail: sender field predicate (R5b) failed
-        // while we hold both sender's gen-lock and CD lock. Release sender
+        // while we hold both sender's gen-lock and process lock. Release sender
         // lock first (LIFO with R5a acquire), then fall through to
-        // .Lreply_handle_invalid which releases CD and jumps slow path.
+        // .Lreply_handle_invalid which releases process and jumps slow path.
         \\.Lreply_sender_field_fail:
         \\movq %%gs:72, %%rcx
     ++ std.fmt.comptimePrint(
@@ -3088,18 +3088,18 @@ pub export fn syscallEntry() callconv(.naked) void {
         .{ .thread_lock_off = @offsetOf(Thread, "_gen_lock") },
     ) ++
 
-        // .Lreply_handle_invalid: bail with CD lock held. Release lock,
+        // .Lreply_handle_invalid: bail with process lock held. Release lock,
         // restore receiver's rax from gs:64, jmp slow path.
         \\.Lreply_handle_invalid:
         \\movq %%gs:40, %%rcx
     ++ std.fmt.comptimePrint(
-        "\nandq $-2, {[cd_lock_off]d}(%%rcx)\n",
-        .{ .cd_lock_off = @offsetOf(CapabilityDomain, "_gen_lock") },
+        "\nandq $-2, {[process_lock_off]d}(%%rcx)\n",
+        .{ .process_lock_off = @offsetOf(Process, "_gen_lock") },
     ) ++
         \\movq %%gs:64, %%rax
         \\jmp .Lsyscall_slow_path
 
-        // .Lreply_lock_fail: CD acquire saw stale gen (no locks held).
+        // .Lreply_lock_fail: process acquire saw stale gen (no locks held).
         // Restore rax, jmp slow path.
         \\.Lreply_lock_fail:
         \\movq %%gs:64, %%rax
@@ -3174,8 +3174,8 @@ pub fn prepareThreadContext(
         // against `rsp+offset` (e.g. movaps/movdqa for XMM spills,
         // 16-byte struct copies) traps with #GP at the first
         // instruction. Mirrors the same fix applied to the initial
-        // thread of a freshly-spawned capability domain in
-        // `caps.capability_domain.patchInitialIretFrame`.
+        // thread of a freshly-spawned process in
+        // `caps.process.patchInitialIretFrame`.
         ctx.rsp = ustack_top.?.addr - 8;
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
@@ -3201,11 +3201,11 @@ pub fn switchTo(thread: *Thread) void {
     updateScratchKernelRsp(core_id, kstack);
 
     // caller-pinned: `thread` was selected by the scheduler for this core; its
-    // domain is held live by the thread through the dispatch window (the
-    // thread carries a SlabRef into the domain), so reading
+    // process is held live by the thread through the dispatch window (the
+    // thread carries a SlabRef into the process), so reading
     // `addr_space_root` / `addr_space_id` directly off the deref'd
     // pointer without re-locking the SlabRef is sound here.
-    const dom = thread.domain.ptr;
+    const dom = thread.process.ptr;
     const new_root = dom.addr_space_root;
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
         paging.swapAddrSpace(new_root, dom.addr_space_id);
@@ -3219,7 +3219,7 @@ pub fn switchTo(thread: *Thread) void {
     const scratch = &per_cpu_scratch[cid];
     scratch.current_thread = @intFromPtr(thread);
     scratch.current_thread_gen = thread._gen_lock.currentGen();
-    scratch.current_domain = @intFromPtr(dom);
+    scratch.current_process = @intFromPtr(dom);
     scratch.current_user_table = @intFromPtr(dom.user_table);
     scratch.current_kernel_table = @intFromPtr(dom.kernel_table);
 
@@ -3252,7 +3252,7 @@ pub fn switchTo(thread: *Thread) void {
     // running in the sender's CR3, so the write must be deferred to
     // the resume path. Flush after the CR3 swap above and before the
     // iretq trampoline; the thread's user stack page is mapped in the
-    // domain we just switched into.
+    // process we just switched into.
     if (thread.pending_event_word_valid) {
         writeUserSyscallWord(thread.ctx, thread.pending_event_word);
         thread.pending_event_word = 0;

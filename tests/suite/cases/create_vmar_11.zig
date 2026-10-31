@@ -8,7 +8,7 @@
 //   must reject any `create_vmar` whose [1] caps word has both bits set,
 //   regardless of which other bits are populated.
 //
-//   The runner (runner/primary.zig) installs the test domain with
+//   The runner (runner/primary.zig) installs the test process with
 //   `vmar_inner_ceiling = 0x01FF` covering bits 0-8 of the VmarCap layout,
 //   so r/w/x and mmio are all permitted by the caller's ceiling. That
 //   keeps tests 02 (rwx-subset) and 04 (mmio-not-permitted) from

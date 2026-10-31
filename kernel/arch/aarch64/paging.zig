@@ -596,13 +596,12 @@ pub fn mapPageBoot(
 ///
 /// ARM ARM D5.9 -- after clearing a PTE, a break-before-make sequence is
 /// required: DSB ISHST ensures the invalid write is visible, TLBI VAE1IS
-/// invalidates the VA across all cores in the inner shareable domain,
+/// invalidates the VA across all cores in the inner shareable process,
 /// DSB ISH waits for completion, and ISB synchronizes the pipeline.
 pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
 ) ?PAddr {
-
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
@@ -622,7 +621,7 @@ pub fn unmapPage(
 
     // ARM ARM D5.9: TLB maintenance after PTE invalidation.
     // TLBI VAE1IS broadcasts the invalidation to all cores in the inner
-    // shareable domain, eliminating the need for explicit IPI-based shootdown.
+    // shareable process, eliminating the need for explicit IPI-based shootdown.
     tlbiVae1is(virt.addr);
 
     return phys;
@@ -870,21 +869,21 @@ fn isb() void {
 
 /// DSB ISHST -- Data Synchronization Barrier, Inner Shareable, Store.
 /// ARM ARM C6.2.3 -- ensures all prior stores are visible to other cores
-/// in the inner shareable domain before the barrier completes.
+/// in the inner shareable process before the barrier completes.
 fn dsbIshst() void {
     asm volatile ("dsb ishst" ::: .{ .memory = true });
 }
 
 /// DSB ISH -- Data Synchronization Barrier, Inner Shareable.
 /// ARM ARM C6.2.3 -- ensures all prior loads and stores are complete
-/// before the barrier completes, visible to the inner shareable domain.
+/// before the barrier completes, visible to the inner shareable process.
 fn dsbIsh() void {
     asm volatile ("dsb ish" ::: .{ .memory = true });
 }
 
 /// TLBI VAE1IS -- TLB Invalidate by VA, EL1, Inner Shareable.
 /// ARM ARM D5.9 -- invalidates all TLB entries matching the VA (page-aligned,
-/// shifted right by 12) across all cores in the inner shareable domain.
+/// shifted right by 12) across all cores in the inner shareable process.
 ///
 /// The full sequence for a PTE change is:
 ///   DSB ISHST -> TLBI VAE1IS -> DSB ISH -> ISB
@@ -935,7 +934,6 @@ pub fn mapPageSized(
         // caller cannot silently install a leaf into the first page.
         @panic("paging.mapPageSized: NULL guard");
     }
-
 
     const ap = permsToAp(perms, true);
     const xn = !perms.exec;
@@ -1044,7 +1042,7 @@ pub fn allocAddrSpaceRoot() !PAddr {
 ///     PMM allocations made by `mapPage`'s on-demand walk
 ///   - leaf 4 KiB pages whose physical address is NOT in either skip
 ///     range (used to keep page-aliased buddy blocks alive — the
-///     cap-domain's `user_buf` block is aliased into user space via
+///     cap-process's `user_buf` block is aliased into user space via
 ///     `mapUserTableView` and freed wholesale via `pmm.freeBlock`,
 ///     and the user stack lives in a contiguous buddy block)
 ///
@@ -1253,7 +1251,7 @@ pub fn shootdownTlbRange(
     _ = addr_space_id;
     std.debug.assert(sz == .sz_4k);
     // ARM ARM D5.9: TLBI VAE1IS broadcasts across the inner-shareable
-    // domain; no IPI fan-out required (unlike x86's per-core invlpg).
+    // process; no IPI fan-out required (unlike x86's per-core invlpg).
     var i: u32 = 0;
     while (i < page_count) {
         tlbiVae1is(virt.addr + @as(u64, i) * paging.PAGE4K);

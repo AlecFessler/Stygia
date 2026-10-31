@@ -20,7 +20,7 @@
 //     (b) A suspended state in which the port becomes terminally closed
 //         before any recv consumes the event.
 //     (c) A side observation, after the suspend returns, that every
-//         source handle is still resident in the sender's domain table
+//         source handle is still resident in the sender's process table
 //         with its caps intact.
 //
 //   §[capabilities] (port row) defines the closing transition that
@@ -30,17 +30,17 @@
 //      the recv refcount hits zero, suspended senders resume with
 //      E_CLOSED."
 //
-//   So we mint a port whose only handle in the test domain carries
+//   So we mint a port whose only handle in the test process carries
 //   bind + recv + xfer caps, queue up two pair entries, suspend the
 //   test thread itself onto that port, and arrange for a sibling thread in
-//   the same capability domain to release the port handle while the
+//   the same process to release the port handle while the
 //   test thread is suspended. The port's recv refcount drops from 1 to 0
 //   with no recv ever queued, the kernel resumes the test thread with
 //   E_CLOSED, and the sender-table-unchanged invariant is what we
 //   probe afterwards.
 //
 //   Sibling-thread mechanic: Threads created with target = self (the test thread's
-//   own capability domain) share the same handle table per
+//   own process) share the same handle table per
 //   §[create_thread]. The test thread pins itself to its current
 //   core, creates the sibling on that same core at idle priority, and
 //   stores the port handle id into a process-global with release
@@ -59,7 +59,7 @@
 //   ([rsp + 904]) and entry[1] at vreg 127 ([rsp + 912]) for N = 2.
 //
 //   Source-handle mechanic: each pair entry needs a source handle in
-//   the test domain that satisfies the entry's `move` field per
+//   the test process that satisfies the entry's `move` field per
 //   §[handle_attachments] tests 04/05 — `move = 1` requires the
 //   source to have `move`, `move = 0` requires it to have `copy`.
 //   Two page frames satisfy this cleanly: PF_A with caps `move + r`
@@ -69,7 +69,7 @@
 //   `pf_ceiling` already permits `move + copy + rwx, max_sz = 0`.
 //
 //   Observation mechanic: after the suspend resumes we read the test
-//   domain's read-only-mapped cap table at the PF slots. Per
+//   process's read-only-mapped cap table at the PF slots. Per
 //   §[capabilities], a handle's `word0` carries a non-zero type tag in
 //   bits 12-15 while it is live; if the kernel had moved either source
 //   the slot would have been released and the type tag would now read
@@ -155,7 +155,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Process-global the test thread writes (release) and the deleter sibling
-// reads (acquire). Both Threads run in the same capability domain so this
+// reads (acquire). Both Threads run in the same process so this
 // is shared memory in the strict sense.
 var deleter_port_id: u32 = 0;
 
@@ -367,7 +367,7 @@ pub fn main(cap_table_base: u64) void {
         deleter_caps_word,
         deleter_entry_addr,
         1, // stack_pages
-        0, // target = self (same domain → shared handle table)
+        0, // target = self (same process → shared handle table)
         deleter_affinity,
     );
     if (testing.isHandleError(cec.v1)) {
@@ -394,7 +394,7 @@ pub fn main(cap_table_base: u64) void {
     };
 
     // SLOT_INITIAL_THREAD = 1 is the test thread itself per
-    // §[create_capability_domain]'s slot-1 invariant.
+    // §[create_process]'s slot-1 invariant.
     const status = suspendWithTwoAttachments(
         @as(u64, caps.SLOT_INITIAL_THREAD),
         port_handle,

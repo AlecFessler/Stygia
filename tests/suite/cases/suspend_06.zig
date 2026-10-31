@@ -19,7 +19,7 @@
 //       destination port via create_port.
 //     - test 03 (E_PERM [1] lacks `susp`): the vCPU thread is minted with
 //       `susp` set in its caps word. The vCPU's `susp` bit must lie
-//       within the VM's owning domain `thread_inner_ceiling` (the runner
+//       within the VM's owning process `thread_inner_ceiling` (the runner
 //       grants thread_inner_ceiling = 0xFF, which covers `susp` = bit 5).
 //     - test 04 (E_PERM [2] lacks `bind`): the destination port is
 //       minted with `bind` set.
@@ -56,7 +56,7 @@
 //      E_NODEV (degraded smoke pass).
 //   5. createPort(caps={bind}) — exit_port for the vCPU.
 //   6. createVcpu(caps_word with susp=1, vm_handle, affinity=0,
-//      exit_port) — vCPU thread handle held by this domain.
+//      exit_port) — vCPU thread handle held by this process.
 //   7. createPort(caps={bind}) — destination port for the suspend call.
 //   8. suspendThread(vcpu_handle, dest_port, &.{}) — must return E_INVAL.
 //

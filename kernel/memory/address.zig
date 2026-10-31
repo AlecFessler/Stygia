@@ -128,21 +128,21 @@ pub const KernelVA = struct {
         // Spec-v3 SecureSlab regions for the new typed kernel objects.
         // Each typed slab needs a parallel data + ptrs + links region
         // (see SecureSlab init).
-        pub const capability_domain_slab: Range = .{
+        pub const process_slab: Range = .{
             .start = dev_region_slab_links.end,
             .end = dev_region_slab_links.end + SLAB_RESERVATION,
         };
-        pub const capability_domain_slab_ptrs: Range = .{
-            .start = capability_domain_slab.end,
-            .end = capability_domain_slab.end + SLAB_RESERVATION,
+        pub const process_slab_ptrs: Range = .{
+            .start = process_slab.end,
+            .end = process_slab.end + SLAB_RESERVATION,
         };
-        pub const capability_domain_slab_links: Range = .{
-            .start = capability_domain_slab_ptrs.end,
-            .end = capability_domain_slab_ptrs.end + SLAB_RESERVATION,
+        pub const process_slab_links: Range = .{
+            .start = process_slab_ptrs.end,
+            .end = process_slab_ptrs.end + SLAB_RESERVATION,
         };
         pub const managed_thread_slab: Range = .{
-            .start = capability_domain_slab_links.end,
-            .end = capability_domain_slab_links.end + SLAB_RESERVATION,
+            .start = process_slab_links.end,
+            .end = process_slab_links.end + SLAB_RESERVATION,
         };
         pub const managed_thread_slab_ptrs: Range = .{
             .start = managed_thread_slab.end,

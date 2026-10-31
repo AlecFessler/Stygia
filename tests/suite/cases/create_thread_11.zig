@@ -1,12 +1,12 @@
 // Spec §[create_thread] — test 11.
 //
-// "[test 11] on success, the caller receives an thread handle with caps =
+// "[test 11] on success, the caller receives a thread handle with caps =
 //  `[1].caps`."
 //
 // Strategy
 //   Build an in-bounds create_thread call with target = self
 //   so the spec ceiling check that applies is `caps ⊆ self's
-//   thread_inner_ceiling`. The runner primary configures the child domain's
+//   thread_inner_ceiling`. The runner primary configures the child process's
 //   `thread_inner_ceiling` to 0xFF (all 8 low bits) — see runner/primary.zig
 //   `ceilings_inner`. The low 8 bits of the thread cap word cover the
 //   bitwise-only fields {move, copy, saff, spri, term, susp, read,
@@ -36,7 +36,7 @@
 //
 //   The new thread starts at `dummyEntry`, which halts forever. The test
 //   thread continues independently; no synchronization is required because
-//   the cap-field read targets our domain's handle table, not the
+//   the cap-field read targets our process's handle table, not the
 //   running thread's state.
 //
 // Action

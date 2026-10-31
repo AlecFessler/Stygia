@@ -87,7 +87,7 @@ pub fn sync(handle: u16) callconv(.c) c.Regs {
     return toCRegs(syscall.sync(@truncate(handle)));
 }
 
-pub fn createCapabilityDomain(
+pub fn createProcess(
     caps: u64,
     ceilings_inner: u64,
     ceilings_outer: u64,
@@ -96,7 +96,7 @@ pub fn createCapabilityDomain(
     passed_handles_ptr: [*]const u64,
     passed_handles_len: usize,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.createCapabilityDomain(
+    return toCRegs(syscall.createProcess(
         caps,
         ceilings_inner,
         ceilings_outer,
@@ -316,7 +316,7 @@ comptime {
     @export(&delete, .{ .name = "delete" });
     @export(&revoke, .{ .name = "revoke" });
     @export(&sync, .{ .name = "sync" });
-    @export(&createCapabilityDomain, .{ .name = "createCapabilityDomain" });
+    @export(&createProcess, .{ .name = "createProcess" });
     @export(&createThread, .{ .name = "createThread" });
     @export(&self, .{ .name = "self" });
     @export(&terminate, .{ .name = "terminate" });

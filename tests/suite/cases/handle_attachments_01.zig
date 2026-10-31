@@ -31,7 +31,7 @@
 //
 //   The mint uses `caps = bind` only — no `xfer`. The runner's
 //   `port_ceiling = 0x1C` covers bind/recv/xfer (bit positions 4/3/2
-//   on the field-internal layout in §[capability_domain]), so a
+//   on the field-internal layout in §[process]), so a
 //   bind-only mint is strictly within the ceiling and trivially
 //   passes §[create_port] tests 02-03. The runner grants the test's
 //   self-handle the `crpt` cap (§[create_port] test 01).

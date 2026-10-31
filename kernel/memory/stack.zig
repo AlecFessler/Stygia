@@ -184,7 +184,7 @@ fn quarantineSlot(slot: u64, epoch: u64) void {
     // finalizeDestroyMarkedDead → destroyKernel`. See `freelist_lock`.
     const irq = freelist_lock.lockIrqSave(@src());
     defer freelist_lock.unlockIrqRestore(irq);
-    // Drain BEFORE testing capacity. Teardown is bursty — a domain
+    // Drain BEFORE testing capacity. Teardown is bursty — a process
     // death destroys hundreds of stacks with nothing allocating in
     // between — so a quarantine that only drained from `allocSlot`
     // would fill during the burst and leak every slot past the cap,
@@ -293,7 +293,7 @@ pub fn createKernel() !Stack {
 /// The reclaim is DEFERRED, not waited on. This function is reachable
 /// with object gen-locks held and IRQs masked (`terminate` and
 /// `destroyThreadLocked` both call it under the dying
-/// domain's lock), and blocking for shootdown acks there deadlocks
+/// process's lock), and blocking for shootdown acks there deadlocks
 /// against the IPC fast path: its gen-lock CAS spins are hand-written
 /// assembly that runs IRQs-off and services no TLB arms, so a core
 /// spinning on the lock this path holds can never ack, and this path
@@ -307,13 +307,13 @@ pub fn createKernel() !Stack {
 /// into `memory_init.kernel_addr_space_root` and nowhere else, so that
 /// is the only root it can ever be correct to unmap them from. The
 /// previous signature let callers pass a root, and the thread teardown path
-/// passed the owning domain's — correct on x86-64, where the kernel
-/// half is mirrored into every domain PML4, but wrong on aarch64, where
-/// the domain root is the TTBR0 (user-only) tree: `unmapPage` walked
+/// passed the owning process's — correct on x86-64, where the kernel
+/// half is mirrored into every process PML4, but wrong on aarch64, where
+/// the process root is the TTBR0 (user-only) tree: `unmapPage` walked
 /// USER tables with indices derived from the kernel VA, so every thread
 /// destroy either silently leaked the kstack (walk found nothing) or
 /// unmapped and freed an unrelated LIVE USER PAGE at the aliased low VA
-/// — a page whose physical frame the domain's wholesale teardown then
+/// — a page whose physical frame the process's wholesale teardown then
 /// freed a second time, handing it to two owners at once. Measured on
 /// the bare-metal Pi 5 as cross-core trampling of an active kernel
 /// stack (stygia-723).

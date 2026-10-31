@@ -111,7 +111,7 @@ pub fn main(cap_table_base: u64) void {
     // then verify dispatch satisfied the mask. Without this step the
     // test only proves the field1 mirror reflects the mask we
     // requested at create time — saying nothing about whether the
-    // scheduler honors affinity for an thread's first dispatch. Using
+    // scheduler honors affinity for a thread's first dispatch. Using
     // SLOT_INITIAL_THREAD keeps the test self-contained (saff cap is
     // included in the runner's thread_inner_ceiling = 0xFF).
     const self_pin: u64 = 0b0010;

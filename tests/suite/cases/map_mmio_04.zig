@@ -7,7 +7,7 @@
 //   The strict test 04 path requires landing a non-zero `map` on a
 //   VMAR whose `caps.mmio` bit is set, then issuing map_mmio so the
 //   kernel rejects with E_INVAL on the `map != 0` check. From a v0
-//   test child capability domain, no construction reaches that
+//   test child process, no construction reaches that
 //   pre-state:
 //
 //   map = 1 (pf): per §[map_pf] test 03, the kernel rejects map_pf

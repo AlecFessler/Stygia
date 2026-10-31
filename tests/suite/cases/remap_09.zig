@@ -9,7 +9,7 @@
 //   `remap` mutates the kernel-side VMAR state (`cur_rwx` on the
 //   success path); for handle-table consumers to observe that mutation
 //   without an explicit `sync`, the syscall must refresh [1]'s field0
-//   and field1 in the holding domain's (read-only) cap table on every
+//   and field1 in the holding process's (read-only) cap table on every
 //   call where [1] resolves to a valid handle — both the success path
 //   and the post-resolution error paths. We exercise both legs:
 //
@@ -90,7 +90,7 @@
 //   3: post-success cap-table snapshot of field1's `cur_rwx` is not
 //      0b001 — the success-path refresh did not propagate the
 //      kernel's authoritative `cur_rwx = 0b001` (set by §[remap] test
-//      07) into the holding domain's cap table.
+//      07) into the holding process's cap table.
 
 const lib = @import("lib");
 

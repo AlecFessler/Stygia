@@ -1,5 +1,5 @@
 //! Thread — schedulable unit of executable state bound to a
-//! capability domain. See docs/kernel/specv3.md §[thread].
+//! process. See docs/kernel/specv3.md §[thread].
 
 const std = @import("std");
 const stygia = @import("stygia");
@@ -17,7 +17,7 @@ const lifecycle = stygia.sched.lifecycle;
 const stack = stygia.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
 const GenLock = stygia.memory.allocators.secure_slab.GenLock;
@@ -62,7 +62,7 @@ pub var slow_post_done: u64 = 0;
 /// impossible (the self-drain immediately above empties that very slot).
 pub var slow_post_self: u64 = 0;
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Bracket around the per-victim
-/// `destroyThreadLocked` inside `destroyThreadsInDomain`'s visitor.
+/// `destroyThreadLocked` inside `destroyThreadsInProcess`'s visitor.
 /// `walk_visit_enter - walk_visit_done` is the number of abandonments that
 /// happened anywhere inside the walk's per-victim destroy. If that equals
 /// `p2_after_reap - p2_walk_done` the abandonment is in the victim destroy;
@@ -110,7 +110,7 @@ pub const PreReportTerminalSample = struct {
     publish_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     seq: u64 = 0,
     tag: u64 = 0,
-    cd: usize = 0,
+    process: usize = 0,
     thread: usize = 0,
     reason: []const u8 = "",
 };
@@ -121,7 +121,7 @@ pub const SpawnTraceSample = struct {
     event: SpawnTraceEvent = .spawn_child,
     tag: u64 = 0,
     thread: usize = 0,
-    cd: usize = 0,
+    process: usize = 0,
     core: u8 = 0,
     state: u8 = 0,
     owner: u8 = NOT_IN_RUN_QUEUE,
@@ -152,10 +152,10 @@ fn maybePrintReportEntered(thread: *Thread) void {
     const n = @atomicRmw(u32, &report_enter_prints, .Add, 1, .monotonic);
     if (n >= REPORT_PRINT_BUDGET) return;
     arch.boot.print(
-        "[rpt-enter] thread=0x{x} cd=0x{x} tag=0x{x} code={x} aid={x}\n",
+        "[rpt-enter] thread=0x{x} process=0x{x} tag=0x{x} code={x} aid={x}\n",
         .{
             @intFromPtr(thread),
-            @intFromPtr(thread.domain.ptr),
+            @intFromPtr(thread.process.ptr),
             tag,
             thread.event_state_gprs[2],
             thread.event_state_gprs[3],
@@ -165,7 +165,7 @@ fn maybePrintReportEntered(thread: *Thread) void {
 
 pub fn printPreReportTerminal(
     thread: ?*Thread,
-    cd: ?*CapabilityDomain,
+    process: ?*Process,
     reason: []const u8,
 ) void {
     if (!build_options.kernel_spawn_diag) return;
@@ -174,12 +174,12 @@ pub fn printPreReportTerminal(
     }
     const tag: u64 = blk: {
         if (thread) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
-        if (cd) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
+        if (process) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
         break :blk 0;
     };
     if ((tag & REPORT_TAG_MAGIC) == 0) return;
 
-    recordSpawnTrace(thread, cd, .terminal, 0);
+    recordSpawnTrace(thread, process, .terminal, 0);
 
     const n = @atomicRmw(u32, &pre_report_terminal_prints, .Add, 1, .monotonic);
     const seq = @atomicRmw(u64, &pre_report_terminal_seq, .Add, 1, .monotonic) + 1;
@@ -187,18 +187,18 @@ pub fn printPreReportTerminal(
     slot.publish_seq.store(0, .release);
     slot.seq = seq;
     slot.tag = tag;
-    slot.cd = if (cd) |d| @intFromPtr(d) else @as(usize, 0);
+    slot.process = if (process) |d| @intFromPtr(d) else @as(usize, 0);
     slot.thread = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
     slot.reason = reason;
     slot.publish_seq.store(seq, .release);
     if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return;
 
     arch.boot.print(
-        "[pre-report-terminal] tag=0x{x} index={x} cd=0x{x} thread=0x{x} reason={s}\n",
+        "[pre-report-terminal] tag=0x{x} index={x} process=0x{x} thread=0x{x} reason={s}\n",
         .{
             tag,
             tag - REPORT_TAG_MAGIC,
-            if (cd) |d| @intFromPtr(d) else @as(usize, 0),
+            if (process) |d| @intFromPtr(d) else @as(usize, 0),
             if (thread) |e| @intFromPtr(e) else @as(usize, 0),
             reason,
         },
@@ -207,14 +207,14 @@ pub fn printPreReportTerminal(
 
 pub fn recordSpawnTrace(
     thread: ?*Thread,
-    cd: ?*CapabilityDomain,
+    process: ?*Process,
     event: SpawnTraceEvent,
     aux: u64,
 ) void {
     if (!build_options.kernel_spawn_diag) return;
     const tag: u64 = blk: {
         if (thread) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
-        if (cd) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
+        if (process) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
         break :blk 0;
     };
     if ((tag & REPORT_TAG_MAGIC) == 0) return;
@@ -231,7 +231,7 @@ pub fn recordSpawnTrace(
     slot.event = event;
     slot.tag = tag;
     slot.thread = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
-    slot.cd = if (cd) |d| @intFromPtr(d) else if (thread) |e| @intFromPtr(e.domain.ptr) else @as(usize, 0);
+    slot.process = if (process) |d| @intFromPtr(d) else if (thread) |e| @intFromPtr(e.process.ptr) else @as(usize, 0);
     slot.core = @truncate(arch.smp.coreID());
     slot.state = state;
     slot.owner = owner;
@@ -245,14 +245,14 @@ pub fn recordSpawnTrace(
 /// time and consumed at recv time in `port.deliverEvent`. Captures the
 /// kernel-side `ErasedSlabRef` to the source object (lock-validated at
 /// stash time so the gen baked here matches the live object), the
-/// original holder domain and slot, the source caps captured for
+/// original holder process and slot, the source caps captured for
 /// expected-source revalidation, the internal caps used for the
 /// pending lifetime ref, the type tag to install on the receiver, the
 /// caps to install verbatim, and the move flag (drives the sender-side
 /// slot clear at recv).
 pub const PairEntryStashed = struct {
     obj_ref: ErasedSlabRef,
-    source_domain: ErasedSlabRef,
+    source_process: ErasedSlabRef,
     source_instance: u64,
     obj_type: CapabilityType,
     source_caps: u16,
@@ -346,15 +346,15 @@ pub const Thread = struct {
     kernel_stack: Stack,
 
     /// User stack reserved by `create_thread` in the bound
-    /// domain's address space, with unmapped guard pages above and below.
+    /// process's address space, with unmapped guard pages above and below.
     /// Optional to allow Threads without a user stack (e.g. per-core idle).
     user_stack: ?Stack,
 
-    /// Bound capability domain. Set at create time; immutable.
-    domain: SlabRef(CapabilityDomain),
+    /// Bound process. Set at create time; immutable.
+    process: SlabRef(Process),
 
     /// TEMP DIAGNOSTIC (Rawls x86 MISS attribution, REMOVE). Test-child
-    /// identity copied from the owning CD at spawn time. Kernel-private:
+    /// identity copied from the owning process at spawn time. Kernel-private:
     /// this does not affect any capability word or public ABI field.
     diag_test_tag: u64 = 0,
     diag_report_entered: bool = false,
@@ -370,11 +370,11 @@ pub const Thread = struct {
     /// must dequeue before freeing, and dequeue requires that same
     /// lock — so any pointer reachable from a held queue cannot be
     /// torn down. Slab type stability backs this up: the slot can
-    /// only ever hold an thread. Mirror of futex's `WaitNode.next: ?*WaitNode`.
+    /// only ever hold a thread. Mirror of futex's `WaitNode.next: ?*WaitNode`.
     next: ?*Thread = null,
 
     /// Backward link companion to `next`. Required by spec ops that
-    /// arbitrarily remove or reposition an thread: `priority` (re-bucket on
+    /// arbitrarily remove or reposition a thread: `priority` (re-bucket on
     /// change), `affinity` (migration), `terminate` (drop from queue on
     /// destroy), `delete` on a reply (resolve sender with E_ABANDONED),
     /// and cross-thread `suspend`. O(1) instead of O(N) walk.
@@ -397,7 +397,7 @@ pub const Thread = struct {
     /// means the thread is not currently owned by a CPU core.
     owner_core: u8 = NOT_IN_RUN_QUEUE,
 
-    /// Short pin count for lifecycle operations that have claimed an thread
+    /// Short pin count for lifecycle operations that have claimed a thread
     /// but have not yet finished moving it between containers.
     pin_depth: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
@@ -483,7 +483,7 @@ pub const Thread = struct {
     /// single-addr waits, up to MAX_FUTEX_ADDRS (63) for multi-addr.
     futex_bucket_count: u8 = 0,
 
-    /// Pointer to an array of N caller-domain user vaddrs paired with
+    /// Pointer to an array of N caller-process user vaddrs paired with
     /// `futex_wait_nodes` (entry i corresponds to wait-node i). The wake
     /// path reads `futex_wait_vaddrs[futex_wake_index]` to surface the
     /// matched user vaddr per spec §[futex_wait_val]/[futex_wait_change]
@@ -514,7 +514,7 @@ pub const Thread = struct {
     /// loads.
     futex_syscall_addrs_storage: [MAX_FUTEX_ADDRS_PER_THREAD]PAddr = undefined,
 
-    /// User-domain vaddrs from the call's pairs[] list, paired with
+    /// User-process vaddrs from the call's pairs[] list, paired with
     /// `futex_syscall_addrs_storage`. Passed through to the futex impl
     /// which copies into `futex_wait_vaddrs_storage` for the wait.
     futex_syscall_vaddrs_storage: [MAX_FUTEX_ADDRS_PER_THREAD]u64 = undefined,
@@ -562,7 +562,7 @@ pub const Thread = struct {
     /// suspend-side syscall layer from the syscall word's `pair_count`
     /// field after `validatePairEntries` has decoded each entry. Read
     /// at recv time in `port.deliverEvent` to drive contiguous handle
-    /// installation in the receiver's domain. Spec §[handle_attachments].
+    /// installation in the receiver's process. Spec §[handle_attachments].
     pending_pair_count: u8 = 0,
 
     /// Decoded pair entries stashed by the suspending thread's syscall
@@ -570,7 +570,7 @@ pub const Thread = struct {
     /// move/copy happens at recv time, so the entries ride the thread
     /// across the suspend → recv rendezvous. Each entry carries the
     /// captured `ErasedSlabRef` (gen-validated and object-ref pinned
-    /// at stash time), original source domain/slot, source caps, the
+    /// at stash time), original source process/slot, source caps, the
     /// type tag and caps to install verbatim on the receiver, and the
     /// move flag (drives the source-slot clear at recv). Sized to
     /// `MAX_PAIR_ENTRIES_PER_THREAD` to match the spec ceiling.
@@ -581,10 +581,10 @@ pub const Thread = struct {
     suspend_port: ?SlabRef(Port) = null,
 
     /// Snapshot of the recv'ing port handle's `xfer` cap, taken under
-    /// the receiver's CD lock when `recv` blocks. Spec §[reply]: the
+    /// the receiver's process lock when `recv` blocks. Spec §[reply]: the
     /// reply handle minted at recv resume inherits `xfer = 1` iff the
     /// recv'ing port carried `xfer`. The rendezvous-with-receiver path
-    /// no longer has the receiver's CD locked when minting the reply,
+    /// no longer has the receiver's process locked when minting the reply,
     /// so we cache the bit here on the suspend side. Zero outside a
     /// suspended recv.
     recv_port_xfer: bool = false,
@@ -634,12 +634,12 @@ pub const Thread = struct {
     /// reply ops comes from this thread's own `_gen_lock`.
     pending_reply_holder: ?*KernelHandle = null,
 
-    /// Receiver-side domain + slot for the outstanding reply handle —
+    /// Receiver-side process + slot for the outstanding reply handle —
     /// paired with `pending_reply_holder`. Stored separately so the
     /// `terminate` path can mark the user_table caps with the
     /// `abandoned` bit (the kernel_table entry alone has no caps
     /// field). Both are set/cleared together with `pending_reply_holder`.
-    pending_reply_domain: ?SlabRef(CapabilityDomain) = null,
+    pending_reply_process: ?SlabRef(Process) = null,
     pending_reply_slot: u12 = 0,
 
     /// Write-cap snapshot from the originating thread handle taken at the
@@ -730,8 +730,8 @@ pub fn initSlab(
 
 // ── External API (syscall handlers) ──────────────────────────────────
 
-/// `self` syscall handler — returns the packed handle word for an thread
-/// handle in the caller's domain that references the calling thread. Spec
+/// `self` syscall handler — returns the packed handle word for a thread
+/// handle in the caller's process that references the calling thread. Spec
 /// §[thread].self.
 ///
 /// Linear walk of the caller's kernel_table: an in-use slot
@@ -742,16 +742,16 @@ pub fn initSlab(
 /// type tag in bits 12..15 disambiguates the success word from the
 /// `1..15` error range.
 pub fn self(caller: *Thread) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    defer process_ref.unlockIrqRestore(lr.irq_state);
 
     var slot: u16 = 0;
-    while (slot < capability.MAX_HANDLES_PER_DOMAIN) {
-        const entry = &cd.kernel_table[slot];
+    while (slot < capability.MAX_HANDLES_PER_PROCESS) {
+        const entry = &process.kernel_table[slot];
         if (entry.ref.ptr == @as(*anyopaque, @ptrCast(caller))) {
-            const user_word0 = cd.user_table[slot].word0;
+            const user_word0 = process.user_table[slot].word0;
             if (capability.Word0.typeTag(user_word0) == .thread) {
                 const caps_word = capability.Word0.caps(user_word0);
                 return @intCast(capability.Word0.pack(
@@ -770,15 +770,15 @@ pub fn self(caller: *Thread) i64 {
 ///
 /// Reserved-bit validation, handle resolution, and `term` cap check are
 /// performed by the syscall-layer wrapper. By the time we get here the
-/// target has been verified as an thread handle in `caller.domain` carrying
+/// target has been verified as a thread handle in `caller.process` carrying
 /// `term`. This stage performs the actual teardown:
 ///
-///   1. Re-resolve the slot under the cd lock to recover the worker
+///   1. Re-resolve the slot under the process lock to recover the worker
 ///      thread's typed slab ref (pointer + gen).
-///   2. Drop the cd lock, then fire `destroyThread`. The
-///      destroy path locks the worker's domain itself to read the
-///      addr-space root for kstack unmap, so it must run with the cd
-///      lock released (worker.domain == caller.domain in the
+///   2. Drop the process lock, then fire `destroyThread`. The
+///      destroy path locks the worker's process itself to read the
+///      addr-space root for kstack unmap, so it must run with the process
+///      lock released (worker.process == caller.process in the
 ///      target=self construction the spec tests use).
 ///
 /// The caller's slot is intentionally NOT cleared here. Per spec
@@ -790,28 +790,28 @@ pub fn self(caller: *Thread) i64 {
 /// syscall using this handle catches the gen mismatch via
 /// `SlabRef.lock`, surfaces `E_TERM`, and lazily evicts the slot. The
 /// same lazy eviction applies to stale handles in other capability
-/// domains.
+/// processes.
 /// Park the calling thread out of every run queue with no possibility of
 /// resuming. Used by unhandled fault teardown: the kernel must keep
 /// the faulting thread from being re-dispatched. Otherwise
 /// the thread re-iretq's onto the same instruction, faults again, and
 /// (especially at higher-than-default priority) starves every other thread
-/// in its domain. A full `destroyThread` from this path would
+/// in its process. A full `destroyThread` from this path would
 /// unmap the kernel stack the exception handler is currently running
 /// on, so we instead clear the local core's `current_thread` slot and mark
 /// the thread `.exited`. The thread's slab + stacks stay pinned until its
-/// owning domain is torn down. After this returns the caller
+/// owning process is torn down. After this returns the caller
 /// (`exceptionHandler`) calls `scheduler.yieldTo(null)` — with
 /// `current_thread` cleared, `yieldTo` skips the re-enqueue path and
 /// dispatches the next runnable thread.
 /// TEMP DIAGNOSTIC (stygia-2u0, REMOVE). Plain call counter only.
 ///
 /// An earlier version of this probe also tried to classify each park by
-/// whether the thread's domain was still alive, via `thread.domain.lockIrqSave`.
+/// whether the thread's process was still alive, via `thread.process.lockIrqSave`.
 /// That DEADLOCKED the boot: SLOT_SELF teardown can call
-/// `parkSelfFaulted` while already holding `cd._gen_lock` (the
+/// `parkSelfFaulted` while already holding `process._gen_lock` (the
 /// `destroyPhase1` invariant), so the probe was a recursive gen-lock
-/// acquire. Nothing in this function may take the domain lock.
+/// acquire. Nothing in this function may take the process lock.
 pub var park_calls: u64 = 0;
 
 pub fn parkSelfFaulted(thread: *Thread) void {
@@ -942,19 +942,19 @@ fn retireAndBumpCurrentGen(thread: *Thread) ?RetiredDeadGen {
 }
 
 pub fn terminate(caller: *Thread, target: u64) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
-    const entry = capability.resolveHandleOnDomain(cd, slot, .thread) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const entry = capability.resolveHandleOnProcess(process, slot, .thread) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const worker_ref = capability.typedRef(Thread, entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
@@ -962,12 +962,12 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
     // refuses (slot's referenced thread was already destroyed), evict
     // the stale entry and surface E_TERM (spec test 05/06).
     const wlr = worker_ref.lockIrqSave(@src()) catch {
-        capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        capability.clearAndFreeSlot(process, slot, entry);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_TERM;
     };
     worker_ref.unlockIrqRestore(wlr.irq_state);
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
 
     const thread = worker_ref.ptr;
     const retired = retireAndBumpDeadGen(worker_ref, thread) orelse return errors.OK;
@@ -975,9 +975,9 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
     // Prepare phase — runs after the retire/dead-gen transition to keep
     // `.retired` fused with the slab generation flip. It still runs
     // WITHOUT the thread's gen lock held to avoid
-    // thread→CD lock-order inversion (abandonPendingReply takes the
-    // pending-reply holder's CD; CD→thread is the canonical order, so
-    // holding thread across CD acquire would seed an AB-BA cycle in
+    // thread→process lock-order inversion (abandonPendingReply takes the
+    // pending-reply holder's process; process→thread is the canonical order, so
+    // holding thread across process acquire would seed an AB-BA cycle in
     // lockdep). The fields touched here are stable for `.running`
     // Threads (queue/port linkage is empty while running) and for parked
     // Threads no other core is mutating them. Mirrors the pre-deferred-
@@ -1026,7 +1026,7 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
     return errors.OK;
 }
 
-/// Final teardown of an thread whose gen has already been rotated to its
+/// Final teardown of a thread whose gen has already been rotated to its
 /// freed parity via `slab_instance.bumpDeadGenLocked` and whose
 /// prepare-phase cleanup was already done by `terminate`. Frees the
 /// kernel stack and pushes the slab slot back onto the freelist.
@@ -1057,10 +1057,10 @@ pub fn finalizeDestroyMarkedDead(thread: *Thread) void {
         _ = us;
     }
     // Free the kstack unconditionally. This used to be gated on "the
-    // owning domain is still alive" (inherited from when the old code
-    // fetched the domain root under its lock), which leaked a
+    // owning process is still alive" (inherited from when the old code
+    // fetched the process root under its lock), which leaked a
     // KERNEL_STACK_PAGES-page stack for every thread finalized after its
-    // domain had been dead-marked. Since domain teardown dead-marks in
+    // process had been dead-marked. Since process teardown dead-marks in
     // phase 1 and then destroys its Threads, that was very nearly every thread:
     // ~30 MB per full suite pass, exhausting the PMM around pass 11-16
     // of a repeat run on both bare metal and KVM (stygia-2u0).
@@ -1069,7 +1069,7 @@ pub fn finalizeDestroyMarkedDead(thread: *Thread) void {
     // kstack" — a real hazard (freeing a stack that is some core's
     // SP_EL1 / TSS.RSP0 target turns its next exception into a push onto
     // unmapped memory) but one this function is already protected from
-    // by its callers, not by the domain's liveness. `on_cpu` is the
+    // by its callers, not by the process's liveness. `on_cpu` is the
     // precise signal, and every path here honours it: the three
     // scheduler drains and both arch dispatch reap loops filter on
     // `on_cpu` and `standing_on_zombie` (see `takeOwnPendingZombie`),
@@ -1104,7 +1104,7 @@ pub fn finalizeDestroyMarkedDead(thread: *Thread) void {
 /// `priority` syscall handler. Spec §[thread].priority.
 ///
 /// The syscall layer has already validated reserved bits, resolved the
-/// handle as an thread, and verified `spri` + `new_priority <= caller's
+/// handle as a thread, and verified `spri` + `new_priority <= caller's
 /// pri ceiling`. This handler updates the target thread's authoritative
 /// priority and refreshes the handle's field0 snapshot (spec
 /// §[thread] field0 bits 0-1 = pri).
@@ -1167,27 +1167,27 @@ fn repairAffinityPlacement(thread: *Thread, expected_gen: u32) void {
 pub fn setPriority(caller: *Thread, target: u64, new_priority: u64) i64 {
     if (new_priority > 3) return errors.E_INVAL;
 
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
-    const entry = capability.resolveHandleOnDomain(cd, slot, .thread) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const entry = capability.resolveHandleOnProcess(process, slot, .thread) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const target_ref = capability.typedRef(Thread, entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target thread was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
-        capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        capability.clearAndFreeSlot(process, slot, entry);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_TERM;
     };
     const target_thread = tlr.ptr;
@@ -1199,16 +1199,16 @@ pub fn setPriority(caller: *Thread, target: u64, new_priority: u64) i64 {
     repairPriorityPlacement(target_thread, target_gen);
 
     // Refresh the handle's field0 snapshot (priority is bits 0-1).
-    cd.user_table[slot].field0 = (cd.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
+    process.user_table[slot].field0 = (process.user_table[slot].field0 & ~@as(u64, 0x3)) | @intFromEnum(new_pri);
 
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
     return errors.OK;
 }
 
 /// `affinity` syscall handler. Spec §[thread].affinity.
 ///
 /// The syscall layer has already validated reserved bits, the
-/// new_affinity range, resolved the handle as an thread, and verified
+/// new_affinity range, resolved the handle as a thread, and verified
 /// `saff`. This handler updates the target thread's authoritative
 /// affinity mask and refreshes the handle's field1 snapshot (spec
 /// §[thread] field1 bits 0-63 = affinity mask).
@@ -1229,27 +1229,27 @@ pub fn setPriority(caller: *Thread, target: u64, new_priority: u64) i64 {
 /// replacement so the local frame is not iretq'd through `cur`'s
 /// saved frame while the remote core dispatches it).
 pub fn setAffinity(caller: *Thread, target: u64, new_affinity: u64) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const cd_irq_state = lr.irq_state;
+    const process_ref = caller.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const process_irq_state = lr.irq_state;
 
     const slot: u12 = @truncate(target);
-    const entry = capability.resolveHandleOnDomain(cd, slot, .thread) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+    const entry = capability.resolveHandleOnProcess(process, slot, .thread) orelse {
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const target_ref = capability.typedRef(Thread, entry.*) orelse {
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_BADCAP;
     };
 
     const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target thread was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
-        capability.clearAndFreeSlot(cd, slot, entry);
-        cd_ref.unlockIrqRestore(cd_irq_state);
+        capability.clearAndFreeSlot(process, slot, entry);
+        process_ref.unlockIrqRestore(process_irq_state);
         return errors.E_TERM;
     };
     const target_thread = tlr.ptr;
@@ -1261,9 +1261,9 @@ pub fn setAffinity(caller: *Thread, target: u64, new_affinity: u64) i64 {
 
     // Refresh the handle's field1 snapshot (affinity occupies bits
     // 0-63 of field1).
-    cd.user_table[slot].field1 = new_affinity;
+    process.user_table[slot].field1 = new_affinity;
 
-    cd_ref.unlockIrqRestore(cd_irq_state);
+    process_ref.unlockIrqRestore(process_irq_state);
     return errors.OK;
 }
 
@@ -1281,7 +1281,7 @@ pub fn setAffinity(caller: *Thread, target: u64, new_affinity: u64) i64 {
 /// `irq_state`. `suspendOnPort` ALWAYS releases that lock before
 /// returning — either directly (no-receiver path) or transitively via
 /// `rendezvousWithReceiver` (which drops Port before locking the
-/// receiver's CD to honor the canonical CD → Port order). Both release
+/// receiver's process to honor the canonical process → Port order). Both release
 /// paths use `unlockIrqRestore(irq_state)`. Callers must NOT keep
 /// their own `defer port_ref.unlockIrqRestore(...)`.
 pub fn suspendOnPort(
@@ -1467,7 +1467,7 @@ fn suspendOnPortInner(
     thread.suspend_port = SlabRef(Port).init(port, port._gen_lock.currentGen());
     thread.wait.port = thread.suspend_port;
     thread.pending_reply_holder = null;
-    thread.pending_reply_domain = null;
+    thread.pending_reply_process = null;
     thread.pending_reply_slot = 0;
     thread.originating_write_cap = originating_write_cap;
     thread.originating_read_cap = originating_read_cap;
@@ -1493,7 +1493,7 @@ fn suspendOnPortInner(
     // here would let a resume enqueue+dispatch `thread` on another core
     // that then reuses this very kstack under our feet. When `thread` is
     // remote or queued, its previous core owns the release: touching
-    // the flag from here would fake "kstack free" for an thread that may
+    // the flag from here would fake "kstack free" for a thread that may
     // still be running user code on its core (the remote-suspend
     // two-cores-one-frame hole).
 
@@ -1505,8 +1505,8 @@ fn suspendOnPortInner(
     // queue without consulting `waiter_kind == .receivers`.
     //
     // `rendezvousWithReceiver` releases Port internally on the success
-    // path so it can take the receiver's CD lock without inverting the
-    // canonical CD → Port order. On `.no_receiver` it leaves Port held.
+    // path so it can take the receiver's process lock without inverting the
+    // canonical process → Port order. On `.no_receiver` it leaves Port held.
     if (port.waiter_kind == .receivers) {
         switch (stygia.sched.port.rendezvousWithReceiver(thread, port, event, subcode, addr, irq_state)) {
             .delivered => {
@@ -1614,7 +1614,7 @@ pub fn resumeFromReply(thread: *Thread, apply_writes: bool) void {
     thread.iret_frame = null;
     thread.suspend_port = null;
     thread.pending_reply_holder = null;
-    thread.pending_reply_domain = null;
+    thread.pending_reply_process = null;
     thread.pending_reply_slot = 0;
     thread.originating_write_cap = false;
     thread.pending_pair_count = 0;
@@ -1640,10 +1640,10 @@ pub fn resumeFromReply(thread: *Thread, apply_writes: bool) void {
 /// died for other reasons".
 pub fn abandonPendingReply(thread: *Thread) void {
     _ = thread.pending_reply_holder orelse return;
-    if (thread.pending_reply_domain) |dom_ref| {
-        // Re-validate the domain through the SlabRef before mutating
+    if (thread.pending_reply_process) |dom_ref| {
+        // Re-validate the process through the SlabRef before mutating
         // its user_table — terminate may race against destroy of the
-        // receiver's domain.
+        // receiver's process.
         if (dom_ref.lockIrqSave(@src())) |domlr| {
             const dom = domlr.ptr;
             defer dom_ref.unlockIrqRestore(domlr.irq_state);
@@ -1660,19 +1660,19 @@ pub fn abandonPendingReply(thread: *Thread) void {
         } else |_| {}
     }
     thread.pending_reply_holder = null;
-    thread.pending_reply_domain = null;
+    thread.pending_reply_process = null;
     thread.pending_reply_slot = 0;
 }
 
 /// Re-launch `thread` at its `entry_point` with a fresh user stack —
 // ── Internal API ─────────────────────────────────────────────────────
 
-/// Allocate an thread bound to `domain`: slab slot, kernel stack, user
+/// Allocate a thread bound to `process`: slab slot, kernel stack, user
 /// stack with guard pages, sets `entry_point` and `affinity`. All
 /// fields receive their spec defaults; the gen-lock has already been
 /// initialized by the slab allocator.
 pub fn allocThread(
-    domain: *CapabilityDomain,
+    process: *Process,
     entry: VAddr,
     stack_pages: u32,
     affinity: u64,
@@ -1688,7 +1688,7 @@ pub fn allocThread(
 
     // Back the kernel stack VA range with physical pages mapped into
     // the *kernel* address space root (the kernel half is shared
-    // across all domain PML4s via copyKernelMappings). Without this
+    // across all process PML4s via copyKernelMappings). Without this
     // step the iret epilogue's stack pop and any subsequent kernel
     // execution on this stack page-fault into the void.
     var page_addr: u64 = kstack.base.addr;
@@ -1708,8 +1708,8 @@ pub fn allocThread(
 
     const ustack: ?Stack = if (vm != null) null else blk: {
         // VM vCPUs run guest code; no host user stack needed.
-        // Otherwise reserve `stack_pages` pages in `domain`'s address
-        // space using the domain's bump pointer. The full per-domain
+        // Otherwise reserve `stack_pages` pages in `process`'s address
+        // space using the process's bump pointer. The full per-process
         // VMM is still pending; this minimal allocator advances
         // `next_var_base` page-by-page so each new thread gets a fresh
         // non-overlapping stack range. Map the pages as user data so
@@ -1721,8 +1721,8 @@ pub fn allocThread(
         const guard_below: u64 = paging_consts.PAGE4K;
         const guard_above: u64 = paging_consts.PAGE4K;
         const total: u64 = guard_below + stack_bytes + guard_above;
-        const region_base: u64 = std.mem.alignForward(u64, domain.next_var_base, paging_consts.PAGE4K);
-        domain.next_var_base = region_base + total;
+        const region_base: u64 = std.mem.alignForward(u64, process.next_var_base, paging_consts.PAGE4K);
+        process.next_var_base = region_base + total;
 
         const stack_base: u64 = region_base + guard_below;
         const stack_top: u64 = stack_base + stack_bytes;
@@ -1733,7 +1733,7 @@ pub fn allocThread(
             const page = try pmm_mgr.create(paging_consts.PageMem(.page4k));
             const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
             try arch.paging.mapPage(
-                domain.addr_space_root,
+                process.addr_space_root,
                 phys,
                 VAddr.fromInt(stack_base + off),
                 .{ .read = true, .write = true },
@@ -1754,7 +1754,7 @@ pub fn allocThread(
     // stack. The arch helper writes RIP=entry, RFLAGS=0x202 (IF set),
     // CS/SS=user-mode selectors, RSP=user stack top (or null when no
     // user stack — currently the case for v0 Threads that have not had
-    // their domain VMM allocate a stack VMAR yet). When ustack is null
+    // their process VMM allocate a stack VMAR yet). When ustack is null
     // the resulting frame still iret's, but to user RSP=0 — fine for
     // first-dispatch debugging since the panic shows up sooner than
     // an infinite hang.
@@ -1769,8 +1769,8 @@ pub fn allocThread(
     thread.ctx = ctx_ptr;
     thread.kernel_stack = kstack;
     thread.user_stack = ustack;
-    thread.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
-    thread.diag_test_tag = domain.diag_test_tag;
+    thread.process = SlabRef(Process).init(process, process._gen_lock.currentGen());
+    thread.diag_test_tag = process.diag_test_tag;
     thread.diag_report_entered = false;
     thread.priority = priority;
     thread.affinity = affinity;
@@ -1784,52 +1784,52 @@ pub fn allocThread(
     // previous occupant's `last_fpu_core` if any prior teardown
     // skipped `clearFromLastFpuOwner` (e.g. via a non-graceful exit
     // path). `migrateFlush` reads this field and IPIs the named
-    // core; a stale non-null value would send a flush IPI for an thread
+    // core; a stale non-null value would send a flush IPI for a thread
     // that never actually used the FPU on that core.
     thread.last_fpu_core = null;
     _ = slab_instance.publish(pending);
     return thread;
 }
 
-/// Walk the thread slab and destroy every alive thread whose `domain` SlabRef
-/// matches `(cd, cd_gen)`, skipping any thread named in `keep`. Used by
-/// `destroyPhase2` to reap vCPU Threads and sub-domain helper Threads that
+/// Walk the thread slab and destroy every alive thread whose `process` SlabRef
+/// matches `(process, process_gen)`, skipping any thread named in `keep`. Used by
+/// `destroyPhase2` to reap vCPU Threads and sub-process helper Threads that
 /// have no other release path. The caller-running thread (the one that
 /// invoked `delete(SLOT_SELF)`) must be passed in `keep` — its kernel
 /// stack is in active use and cannot be unmapped here.
 ///
-/// We match BOTH `domain.ptr` and `domain.gen` to avoid grabbing leaked
-/// Threads whose owning CD slot has since been recycled into a different
-/// (currently-alive) CD: a bare-ptr aliasing match would let the new
-/// CD's destroy walk free unrelated leaked Threads from earlier tests, and
+/// We match BOTH `process.ptr` and `process.gen` to avoid grabbing leaked
+/// Threads whose owning process slot has since been recycled into a different
+/// (currently-alive) process: a bare-ptr aliasing match would let the new
+/// process's destroy walk free unrelated leaked Threads from earlier tests, and
 /// while their slab slots can in principle be reclaimed that way, the
-/// kstack unmap uses `cd_addr_space_root` and is only valid for Threads
-/// genuinely bound to *this* CD.
+/// kstack unmap uses `process_addr_space_root` and is only valid for Threads
+/// genuinely bound to *this* process.
 ///
-/// `cd_addr_space_root` is read from the CD by `destroyPhase1` while it
-/// holds `cd._gen_lock`; phase 2 runs after the lock has been released
+/// `process_addr_space_root` is read from the process by `destroyPhase1` while it
+/// holds `process._gen_lock`; phase 2 runs after the lock has been released
 /// (the slab slot is already destroyed-marked) so there is no recursive-
 /// acquire risk here.
-pub fn destroyThreadsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_root: PAddr, keep_ref: ?SlabRef(Thread)) void {
-    // Visitor packs the loop-invariant args. The CD ref carries a
-    // verified gen so the visitor can reject Threads whose `domain` ptr
+pub fn destroyThreadsInProcess(process_ref: SlabRef(Process), process_addr_space_root: PAddr, keep_ref: ?SlabRef(Thread)) void {
+    // Visitor packs the loop-invariant args. The process ref carries a
+    // verified gen so the visitor can reject Threads whose `process` ptr
     // happens to alias a stale (since-recycled) slot. The keep ref
     // names the caller-running thread; its slot is `parkSelfFaulted`'d
     // (state .exited) and will be reaped lazily, and we identify it by
     // pointer identity to skip it during the walk. Both refs use
     // `SlabRef` to satisfy the fat-pointer invariant, but the visitor
-    // never `.lock()`s them (we already hold cd._gen_lock and the keep
+    // never `.lock()`s them (we already hold process._gen_lock and the keep
     // thread is the very thread executing this path) — the `.ptr` accesses on
     // the chains below are bracketed by that outer lock and are
     // explicitly caller-pinned.
     const Visitor = struct {
-        cd_ref: SlabRef(CapabilityDomain),
-        cd_addr_space_root: PAddr,
+        process_ref: SlabRef(Process),
+        process_addr_space_root: PAddr,
         keep_ref: ?SlabRef(Thread),
     };
     var ctx = Visitor{
-        .cd_ref = cd_ref,
-        .cd_addr_space_root = cd_addr_space_root,
+        .process_ref = process_ref,
+        .process_addr_space_root = process_addr_space_root,
         .keep_ref = keep_ref,
     };
     slab_instance.forEachAlive(
@@ -1841,16 +1841,16 @@ pub fn destroyThreadsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_r
                     // path; pointer identity check, no deref.
                     if (thread == kr.ptr) return true;
                 }
-                // caller-pinned: cd_ref names the CD whose _gen_lock the
-                // outer caller holds; checking thread.domain alignment
+                // caller-pinned: process_ref names the process whose _gen_lock the
+                // outer caller holds; checking thread.process alignment
                 // against it is pointer arithmetic only, no deref.
-                if (thread.domain.ptr != c.cd_ref.ptr) return true;
-                if (thread.domain.gen != c.cd_ref.gen) return true;
-                // caller-pinned: same outer-locked CD, passed through to
+                if (thread.process.ptr != c.process_ref.ptr) return true;
+                if (thread.process.gen != c.process_ref.gen) return true;
+                // caller-pinned: same outer-locked process, passed through to
                 // the per-thread destroy helper which only uses the bare
-                // pointer for caller_cd identity comparison.
+                // pointer for caller_process identity comparison.
                 dbump(&walk_visit_enter); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-                destroyThreadRefLocked(SlabRef(Thread).init(thread, gen), c.cd_ref.ptr); // caller-pinned: identity-only key, never dereferenced
+                destroyThreadRefLocked(SlabRef(Thread).init(thread, gen), c.process_ref.ptr); // caller-pinned: identity-only key, never dereferenced
                 dbump(&walk_visit_done); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
                 return true;
             }
@@ -1867,17 +1867,17 @@ pub fn destroyThreadsInDomain(cd_ref: SlabRef(CapabilityDomain), cd_addr_space_r
 }
 
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Count alive Threads still matching
-/// `cd_ref` — i.e. survivors of a `destroyThreadsInDomain` walk that RAN TO
+/// `process_ref` — i.e. survivors of a `destroyThreadsInProcess` walk that RAN TO
 /// COMPLETION. Non-zero here means the walk itself misses Threads; zero with
 /// a climbing orphan census means the walk never ran (abandoned frame)
 /// or the Threads were created after it.
-pub fn countThreadsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
-    var ctx = struct { cd_ref: SlabRef(CapabilityDomain), n: u64 }{ .cd_ref = cd_ref, .n = 0 };
+pub fn countThreadsInProcess(process_ref: SlabRef(Process)) u64 {
+    var ctx = struct { process_ref: SlabRef(Process), n: u64 }{ .process_ref = process_ref, .n = 0 };
     slab_instance.forEachAlive(&ctx, struct {
         fn visit(c: *@TypeOf(ctx), thread: *Thread, _: u63) bool {
             // caller-pinned: identity-only comparison, no deref of the
-            // dead-marked CD slot.
-            if (thread.domain.ptr == c.cd_ref.ptr and thread.domain.gen == c.cd_ref.gen) c.n += 1;
+            // dead-marked process slot.
+            if (thread.process.ptr == c.process_ref.ptr and thread.process.gen == c.process_ref.gen) c.n += 1;
             return true;
         }
     }.visit);
@@ -1886,7 +1886,7 @@ pub fn countThreadsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
 
 /// Same as `destroyThread`, but tailored for the
 /// `destroyPhase2` walk: avoids the same-class recursive acquire on
-/// `thread.domain._gen_lock` (the CD slab slot is already destroyed-marked
+/// `thread.process._gen_lock` (the process slab slot is already destroyed-marked
 /// by phase 1, so locking would fail), and deliberately skips kstack
 /// reclaim (see comment near the slab destroy at the bottom of this
 /// fn for the rationale).
@@ -1895,24 +1895,24 @@ pub fn countThreadsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
 /// kstack is left mapped because tearing it down inline races against
 /// the dying thread's last cross-core dispatch.
 ///
-/// Caller passes its own CD pointer in `caller_cd` — any pending-reply
-/// holder ref pointing at that CD is cleared without re-locking it.
-/// For pending replies pointing at OTHER domains (cross-domain reply
+/// Caller passes its own process pointer in `caller_process` — any pending-reply
+/// holder ref pointing at that process is cleared without re-locking it.
+/// For pending replies pointing at OTHER processes (cross-process reply
 /// pin), we run the normal `abandonPendingReply` path.
-/// `caller_cd` is the domain whose teardown is driving this destroy, or
-/// `null` when no domain is being torn down. It exists solely for the same-CD pending-reply shortcut below,
+/// `caller_process` is the process whose teardown is driving this destroy, or
+/// `null` when no process is being torn down. It exists solely for the same-process pending-reply shortcut below,
 /// so `null` correctly forces the `abandonPendingReply` branch: nothing
 /// is freeing the holder's `user_table`, and silently dropping the
 /// back-pointer there would leak the holder slot.
 ///
 /// The former `dom_root: PAddr` parameter was removed — it was never
 /// read (`_ = dom_root`), and computing it at the new call sites would
-/// mean dereferencing `thread.domain.ptr` for a domain that may already be
+/// mean dereferencing `thread.process.ptr` for a process that may already be
 /// dead, which is exactly the case those call sites exist to handle.
-pub fn destroyThreadLocked(thread: *Thread, caller_cd: ?*CapabilityDomain) void {
+pub fn destroyThreadLocked(thread: *Thread, caller_process: ?*Process) void {
     const gen = thread._gen_lock.currentGen();
     if (gen % 2 == 0) return;
-    destroyThreadRefLocked(SlabRef(Thread).init(thread, @intCast(gen)), caller_cd);
+    destroyThreadRefLocked(SlabRef(Thread).init(thread, @intCast(gen)), caller_process);
 }
 
 /// Discharge a run-queue steal claim whose thread became unpublishable while the
@@ -1929,7 +1929,7 @@ pub fn dischargeClaimedHolderDead(thread: *Thread) void {
     destroyThreadRefLocked(thread_ref, null);
 }
 
-pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_cd: ?*CapabilityDomain) void {
+pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Process) void {
     const thread = thread_ref.ptr;
 
     // Route the slab destroy through the deferred-finalize path
@@ -1948,14 +1948,14 @@ pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_cd: ?*Capabili
     const retired = retireAndBumpDeadGen(thread_ref, thread) orelse return;
 
     if (thread.pending_reply_holder != null) {
-        if (thread.pending_reply_domain) |dom_ref| {
-            if (caller_cd != null and dom_ref.ptr == caller_cd.?) {
-                // Same-CD reply pin — the user_table has already been
+        if (thread.pending_reply_process) |dom_ref| {
+            if (caller_process != null and dom_ref.ptr == caller_process.?) {
+                // Same-process reply pin — the user_table has already been
                 // disarmed by the time we get here (the holder slot
-                // referenced this caller_cd's table). Just drop the
+                // referenced this caller_process's table). Just drop the
                 // back-pointer; user_table is about to be freed.
                 thread.pending_reply_holder = null;
-                thread.pending_reply_domain = null;
+                thread.pending_reply_process = null;
                 thread.pending_reply_slot = 0;
             } else {
                 abandonPendingReply(thread);

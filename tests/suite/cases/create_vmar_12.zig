@@ -8,10 +8,10 @@
 //   rule for the create path: requesting a DMA-flagged VMAR whose
 //   handle caps include `x` must be rejected with E_INVAL.
 //
-//   The runner-supplied child domain has self-handle caps including
+//   The runner-supplied child process has self-handle caps including
 //   `crvr` (see runner/primary.zig spawnOne) and a `vmar_inner_ceiling`
 //   = 0x01FF (bits 0..8 set: move, copy, r, w, x, mmio, max_sz[0..1],
-//   dma — see §[create_capability_domain] field0 layout). So r/w/x
+//   dma — see §[create_process] field0 layout). So r/w/x
 //   plus dma are individually permitted by the ceiling, isolating the
 //   E_INVAL path on the dma+x combination rather than on a missing
 //   ceiling permission.

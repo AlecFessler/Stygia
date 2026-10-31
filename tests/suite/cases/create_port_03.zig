@@ -13,7 +13,7 @@
 //   prelude check pass and then dial in a single reserved bit on top
 //   of an otherwise-valid word:
 //     - caller self-handle has `crpt` (test 01): the runner grants it
-//       on every spawned test domain.
+//       on every spawned test process.
 //     - caps' live bits are a subset of the runner's port_ceiling
 //       (test 02): port_ceiling = 0x1C carries xfer/recv/bind, so we
 //       set bind only — strictly within the ceiling.

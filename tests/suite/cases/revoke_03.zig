@@ -7,15 +7,15 @@
 // Variant chosen: zero-descendant (vacuous) success.
 //
 //   The full positive variant requires constructing a copy-derivation
-//   ancestry chain spanning two capability domains: the test domain
+//   ancestry chain spanning two processes: the test process
 //   passes a port to a grandchild via `copy`, then asserts that
 //   revoke([port]) releases the grandchild's copy. Verifying state
-//   inside a separate domain from the test thread requires an end-to-end
+//   inside a separate process from the test thread requires an end-to-end
 //   IDC round-trip (handle attachment encoding §[handle_attachments]
 //   on suspend, then recv decoding on the test side, plus a follow-up
 //   probe of the grandchild's table). The libz suspend wrapper does not
 //   yet implement the high-vreg pair layout — `suspendThread` panics when
-//   attachments are non-empty — so the cross-domain construction is
+//   attachments are non-empty — so the cross-process construction is
 //   currently unreachable from a single test ELF.
 //
 //   This test exercises the degenerate case of the same rule: when the
@@ -26,11 +26,11 @@
 //   a smoke check on the syscall's success path — confirms the syscall
 //   accepts a clean handle, returns OK, and does not crash. The full
 //   ancestry-walk semantics are exercised by tests 04 and 06, which
-//   need the same cross-domain plumbing once libz lands it.
+//   need the same cross-process plumbing once libz lands it.
 //
 // Strategy
-//   Create a fresh port in the test domain. Nothing has copied this
-//   handle out (the test domain is the only holder), so its copy
+//   Create a fresh port in the test process. Nothing has copied this
+//   handle out (the test process is the only holder), so its copy
 //   descendant set is empty. Call revoke(port). The kernel must return
 //   OK in vreg 1.
 //

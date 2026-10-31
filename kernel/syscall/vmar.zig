@@ -4,13 +4,13 @@ const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
 const vmar = stygia.memory.vmar;
 
-const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
+const ProcessCaps = stygia.caps.process.ProcessCaps;
 const Thread = stygia.sched.thread.Thread;
 const VmarCaps = stygia.memory.vmar.VmarCaps;
 const Word0 = capability.Word0;
 
-/// Self-handle slot. Spec §[capability_domain]: slot 0 is reserved for
-/// the domain's self-handle and carries the per-domain caps the kernel
+/// Self-handle slot. Spec §[process]: slot 0 is reserved for
+/// the process's self-handle and carries the per-process caps the kernel
 /// gates the create_* syscalls on.
 const SELF_HANDLE_SLOT: u12 = 0;
 
@@ -26,7 +26,7 @@ const HANDLE_ARG_MASK: u64 = 0xFFF;
 const REMAP_RWX_MASK: u64 = 0x7;
 
 /// Reserves a range of virtual address space bound to the caller's
-/// domain.
+/// process.
 ///
 /// ```
 /// create_vmar([1] caps, [2] props, [3] pages, [4] preferred_base, [5] device_region) -> [1] handle
@@ -91,16 +91,16 @@ pub fn createVmar(
     // on the decoded caps word.
 
     const thread: *Thread = @ptrCast(@alignCast(caller));
-    const cd_ref = thread.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
-    // Spec §[capability_domain] self-handle field0 bits 8-23 carry
-    // `vmar_inner_ceiling` — the per-domain ceiling on every VmarCaps
+    const process_ref = thread.process;
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = lr.ptr;
+    const self_caps: ProcessCaps = @bitCast(Word0.caps(process.user_table[SELF_HANDLE_SLOT].word0));
+    // Spec §[process] self-handle field0 bits 8-23 carry
+    // `vmar_inner_ceiling` — the per-process ceiling on every VmarCaps
     // bit `create_vmar` may mint. Snapshot under the same lock so the
     // tests-02/03/04 subset gates use a consistent view.
-    const vmar_inner_ceiling_word: u16 = @truncate((cd.user_table[SELF_HANDLE_SLOT].field0 >> 8) & 0xFFFF);
-    cd_ref.unlockIrqRestore(lr.irq_state);
+    const vmar_inner_ceiling_word: u16 = @truncate((process.user_table[SELF_HANDLE_SLOT].field0 >> 8) & 0xFFFF);
+    process_ref.unlockIrqRestore(lr.irq_state);
 
     // Spec §[create_vmar] test 01: caller's self-handle must carry `crvr`.
     if (!self_caps.crvr) return errors.E_PERM;
@@ -270,9 +270,9 @@ pub fn remap(caller: *anyopaque, vmar_handle: u64, new_cur_rwx: u64) i64 {
     return vmar.remap(thread, vmar_handle, new_cur_rwx);
 }
 
-/// Binds a source VMAR to a target VMAR. On the owning domain's restart,
+/// Binds a source VMAR to a target VMAR. On the owning process's restart,
 /// the kernel copies the source's contents into the target before the
-/// domain resumes. Used together with `restart_policy = snapshot` on the
+/// process resumes. Used together with `restart_policy = snapshot` on the
 /// target VMAR — see §[restart_semantics].
 ///
 /// ```
@@ -296,7 +296,7 @@ pub fn remap(caller: *anyopaque, vmar_handle: u64, new_cur_rwx: u64) i64 {
 ///   elsewhere, so `mapcnt = 1` is implicit.
 ///
 /// If the source's stability cannot be verified at restart, the restart
-/// fails and the domain is terminated.
+/// fails and the process is terminated.
 ///
 /// [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
 /// [test 02] returns E_BADCAP if [2] is not a valid VMAR handle.
@@ -305,10 +305,10 @@ pub fn remap(caller: *anyopaque, vmar_handle: u64, new_cur_rwx: u64) i64 {
 /// [test 05] returns E_INVAL if [1] and [2] have different sizes (`page_count` × `sz`).
 /// [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
 /// [test 07] calling `snapshot` a second time on the same target replaces the prior source binding.
-/// [test 08] if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the domain is terminated rather than restarted.
-/// [test 09] on domain restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the domain resumes.
-/// [test 10] on domain restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the domain is terminated.
-/// [test 11] on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the domain is terminated.
+/// [test 08] if the source [2] is deleted before restart, the binding is cleared; on restart with no source bound, the process is terminated rather than restarted.
+/// [test 09] on process restart, when the source's stability constraints hold, [1]'s contents are replaced by a copy of [2]'s contents before the process resumes.
+/// [test 10] on process restart, when [2].map = 1 and any backing page_frame has `mapcnt > 1` or the source's effective write permission is nonzero, the restart fails and the process is terminated.
+/// [test 11] on process restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the process is terminated.
 pub fn snapshot(caller: *anyopaque, target_vmar: u64, source_vmar: u64) i64 {
     if (target_vmar & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (source_vmar & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;

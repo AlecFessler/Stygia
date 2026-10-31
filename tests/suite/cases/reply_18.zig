@@ -1,7 +1,7 @@
 // Spec §[reply] reply — test 18.
 //
 // "[test 18] returns E_FULL if `pair_count > 0` and the resumed thread's
-//  domain handle table cannot accommodate N contiguous slots; the
+//  process handle table cannot accommodate N contiguous slots; the
 //  reply handle is NOT consumed and the caller's table is unchanged."
 //
 // Strategy
@@ -14,8 +14,8 @@
 //        the reply handle's own xfer cap, which reply with
 //        pair_count > 0 requires.
 //     2. Mint a sibling thread W with `term | susp` and restart_policy = 0
-//        (kill). The test thread is in the same capability domain as W, so
-//        "the resumed thread's domain handle table" in the spec line under
+//        (kill). The test thread is in the same process as W, so
+//        "the resumed thread's process handle table" in the spec line under
 //        test is the same physical table the test thread writes to.
 //     3. suspend(W, port) — non-blocking on the test thread since [1] != self.
 //        Queues W as a suspended sender on the port.

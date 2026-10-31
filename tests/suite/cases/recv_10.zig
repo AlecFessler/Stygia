@@ -6,7 +6,7 @@
 //   Stage a recv whose dequeued sender attached zero handles, then
 //   inspect the receiver's syscall word to confirm pair_count = 0.
 //   The sender side and the receiver side both run inside the test's
-//   own capability domain so no IDC dance is required.
+//   own process so no IDC dance is required.
 //
 //   Setup:
 //     1. create_port(caps={bind, recv}) — the test holds the bind cap
@@ -19,8 +19,8 @@
 //        zero-attachment branch by the cap shape alone.
 //     2. create_thread(target = self, caps = {susp},
 //        entry = &senderEntry, stack_pages = 1, affinity = 0) — mints a
-//        sibling thread inside this same domain. Since both Threads share the
-//        domain's address space and handle table, the test thread can
+//        sibling thread inside this same process. Since both Threads share the
+//        process's address space and handle table, the test thread can
 //        publish the port's slot id and the sibling's own slot id into
 //        process globals before the sibling's first syscall, and the
 //        sibling can reach those values through ordinary memory loads.
@@ -67,7 +67,7 @@
 //     - test 05 (E_CLOSED while blocked): no other holder of the bind
 //       cap exists, and the test does not release its bind copy.
 //     - test 06 (E_FULL, table can't fit reply + N pair handles): the
-//       child domain's table has slot 4 onward free; reply takes one
+//       child process's table has slot 4 onward free; reply takes one
 //       slot, N = 0 pair handles, plenty of headroom.
 //
 // Action
@@ -106,7 +106,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Shared globals between the test thread and the sibling sender thread. Both
-// run in the same capability domain (same address space and handle
+// run in the same process (same address space and handle
 // table), so plain process-global storage is the simplest channel.
 // The test thread writes with release ordering before entering recv; the
 // sibling's first action is an acquire load, so the dependency edge
@@ -136,7 +136,7 @@ fn senderEntry() callconv(.c) noreturn {
     // and no §[handle_attachments] entries are encoded. The kernel
     // queues a suspension event on the port; the test thread's recv
     // dequeues it and unblocks. After reply, the sibling resumes
-    // here and halts; the test domain exits when the test thread returns.
+    // here and halts; the test process exits when the test thread returns.
     _ = syscall.suspendThread(thread, port, &.{});
 
     while (true) {

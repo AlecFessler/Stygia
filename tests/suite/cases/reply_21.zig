@@ -4,7 +4,7 @@
 //  `vm_exit` and the receiver wrote the `initial_state` sub-code (vreg
 //  70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an
 //  initial vm_exit on the vCPU's exit_port without entering guest mode;
-//  the N attached handles are still installed in the vCPU's domain at
+//  the N attached handles are still installed in the vCPU's process at
 //  slots [tstart, tstart+N)."
 //
 // Spec semantics
@@ -20,7 +20,7 @@
 //   The "stay not-started" handshake suppresses guest entry, but the
 //   standard pair-attachment rules still execute: the N pair entries
 //   at vregs [128-N..127] are validated and installed into the vCPU's
-//   owning domain at slots [tstart, tstart+N) per
+//   owning process at slots [tstart, tstart+N) per
 //   §[handle_attachments]. Test 21 exercises that joint contract:
 //   the not-started re-delivery AND the handle install both fire.
 //
@@ -28,7 +28,7 @@
 //   The setup mirrors create_vcpu_09's success path (mint a VmPolicy
 //   page frame, map+zero, mint a VM, mint an exit port, mint a vCPU
 //   that defuses every other §[create_vcpu] gate). The vCPU is minted
-//   in the test thread's own capability domain (target=self semantics of
+//   in the test thread's own process (target=self semantics of
 //   create_vcpu), so the install lands in the test's own table — the
 //   spec property "installed at [tstart, tstart+N)" is still observable
 //   indirectly: with `move = 1` on each pair entry, the SOURCE slot
@@ -40,7 +40,7 @@
 //   per §[handle_attachments] [test 07] (E_PERM otherwise). With the
 //   handles being page_frames (not the source thread, the VM, the port,
 //   the vCPU thread, or the policy VMAR), the kernel installs them in the
-//   vCPU's domain (= the test's domain) at some [tstart, tstart+2)
+//   vCPU's process (= the test's process) at some [tstart, tstart+2)
 //   slots without coalescing against any pre-existing handle.
 //
 //   The exit_port carries `xfer` so the recv-minted reply handle is
@@ -217,7 +217,7 @@ pub fn main(cap_table_base: u64) void {
     //    the pair-entry move = 1 gate (§[handle_attachments] [test 07])
     //    finds `move` on the source. r + w round out a non-degenerate
     //    page_frame cap word — the kernel installs the target with the
-    //    same caps in the vCPU's domain.
+    //    same caps in the vCPU's process.
     const pf_attach_caps = caps.PfCap{
         .move = true,
         .r = true,
@@ -296,7 +296,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 7. Source slot for pf_a was vacated by the move = 1 pair entry;
-    //    the kernel installed pf_a in the vCPU's domain at [tstart,
+    //    the kernel installed pf_a in the vCPU's process at [tstart,
     //    tstart+2). A delete on the source id now hits an empty slot
     //    and must return E_BADCAP per §[delete].
     const del_a = syscall.delete(pf_a_id);

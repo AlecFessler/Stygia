@@ -10,7 +10,7 @@
 //       violation under test.
 //   Test 02 (E_BADCAP for an invalid device_region) is the only
 //   earlier check that could pre-empt this assertion. The test
-//   domain has no device_region handles, so [2] is forced to an
+//   process has no device_region handles, so [2] is forced to an
 //   unused slot id (4095). Per the spec's own per-syscall test
 //   list, E_PERM (test 03) follows the handle-validity gates
 //   (tests 01, 02). The kernel's gate order is therefore expected
@@ -63,7 +63,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
 
-    // [2] = 4095: the test domain holds no device_region handles,
+    // [2] = 4095: the test process holds no device_region handles,
     // so this slot is unallocated. The spec's test ordering puts
     // E_BADCAP for an invalid [2] (test 02) ahead of E_PERM (test
     // 03); a passing assertion here means the kernel checks

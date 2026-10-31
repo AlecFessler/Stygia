@@ -6,13 +6,13 @@
 // Strategy
 //   The success-on-entry contract is fully exercisable from a single
 //   test thread: the test owns its own user-mode stack (mapped r/w into
-//   its capability domain by the runner via §[create_capability_domain]
+//   its process by the runner via §[create_process]
 //   stack provisioning), so a stack-local `u64` is a valid 8-byte-
 //   aligned user address whose initial value the test controls
 //   absolutely. The runner mints the child with `fut_wait_max = 63`
 //   and `pri = 3` (see runner/primary.zig); the call's N = 2 stays
 //   well within both the spec range (1..63 per §[futex_wait_val]
-//   test 02) and the per-domain ceiling (test 03), so neither cap
+//   test 02) and the per-process ceiling (test 03), so neither cap
 //   check can fire.
 //
 //   Use two pairs and arrange the *second* pair to be the one whose
@@ -39,9 +39,9 @@
 //     - test 04 (E_INVAL: addr not 8-byte aligned): both addrs are
 //       `&u64` stack locals which are naturally 8-byte aligned on
 //       x86-64.
-//     - test 05 (E_BADADDR: addr not in caller's domain): both addrs
+//     - test 05 (E_BADADDR: addr not in caller's process): both addrs
 //       point into the thread's own stack — definitionally valid user
-//       addresses in the calling domain.
+//       addresses in the calling process.
 //     - test 06 (E_TIMEOUT): even though we pass a finite small
 //       timeout (100ms) as a deadlock guard, test 07's on-entry
 //       short-circuit fires before the kernel arms a timer at all,
@@ -81,7 +81,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Stack-local watched words. Declared `var` so their addresses
-    // are concrete user-domain addresses for futex_wait_val to inspect.
+    // are concrete user-process addresses for futex_wait_val to inspect.
     // u64 alignment on x86-64 SysV is 8, satisfying §[futex_wait_val]
     // test 04. Volatile-ish guard via @as conversions through u64
     // pointers keeps the optimizer from constant-folding the

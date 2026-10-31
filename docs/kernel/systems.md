@@ -22,7 +22,7 @@ apparatus: `dropped` had no clearing rule and made a target permanently
 unsuspendable; `run.sh` could not exit 0 and gated none of the new
 falsifiers; two concurrent `priority` calls desync the word from the
 bucket key; the IRQ state of thread context was never stated while twelve
-arguments depend on it; and domain restart was absent from the machine
+arguments depend on it; and process restart was absent from the machine
 entirely. Closed here), round 8 (adversarial review of rev 8: THREE CRITICALS — **C-1** mutual
 terminate, a hard two-core deadlock that is LIVE IN THE TREE and that
 rev 8 made worse by having no self-terminate carve-out at all; **C-2**
@@ -108,7 +108,7 @@ This is NOT a description of the current tree; it is the machine the code
 should converge on. Where today's code is referenced
 (`kernel/sched/scheduler.zig`, `kernel/sched/thread.zig`,
 `kernel/sched/port.zig`, `kernel/sched/futex.zig`,
-`kernel/caps/capability_domain.zig`, `kernel/devices/device_region.zig`,
+`kernel/caps/process.zig`, `kernel/devices/device_region.zig`,
 `kernel/arch/{x64,aarch64}/`), it is as evidence of a constraint or as the
 mechanism a design step deletes. Normative words (MUST/NEVER/only) describe
 the target design.
@@ -118,17 +118,17 @@ the target design.
 ## 0. Scope — normative, and read this before anything else
 
 This document exists to solve **one** problem, stated in §1: the kernel
-carries eight overlapping signals for where an thread is, and
+carries eight overlapping signals for where a thread is, and
 roughly 90% of recent bug fixes were thread teardown or lost wakes. The
 machine's job is therefore the **thread lifecycle and every state change that
-moves an thread on, off, or between CPU cores.** Nothing else.
+moves a thread on, off, or between CPU cores.** Nothing else.
 
 Six review rounds have confirmed the mechanism and churned the boundary.
 This section is normative so the boundary stops moving.
 
 ### 0.1 The test
 
-**Does this affect thread lifecycle or scheduler state — where an thread is,
+**Does this affect thread lifecycle or scheduler state — where a thread is,
 what core it is on, whether it is runnable?** In scope if yes,
 **regardless of which subsystem it lives in**.
 
@@ -146,7 +146,7 @@ thread-lifecycle or lost-wake bug, include it.
 **IN, by the test:**
 
 - The **lifecycle word** and its seven states (§2.1).
-- **Every transition that moves an thread on, off, or between cores** —
+- **Every transition that moves a thread on, off, or between cores** —
   dispatch, park, wake, claim, requeue, migration, retire, finalize
   (§5's edge table).
 - The **wait/wake sources that cause those transitions**: timer, futex,
@@ -154,13 +154,13 @@ thread-lifecycle or lost-wake bug, include it.
   device IRQ (§5.1's T1).
 - **Teardown and reclamation ordering**, including the kstack hop
   (§4, §8.2).
-- **The claim protocol** — who owns an thread in transit (§3.5, §5.2's T2).
+- **The claim protocol** — who owns a thread in transit (§3.5, §5.2's T2).
 - **The wakes caused by `revoke`/`restrict`** — a port-refcount cascade
   waking suspended senders with `E_CLOSED` is a wake, so it is in, via
   edge 5a's existing close-propagation trigger. No new edge.
-- ~~**`restart_at_entry`** — it makes an thread runnable.~~ **NO LONGER AN
+- ~~**`restart_at_entry`** — it makes a thread runnable.~~ **NO LONGER AN
   OBLIGATION as of revision 16** (maintainer decision, §[restart_semantics]). It WOULD
-  make an thread runnable, and the machine will route it when restart
+  make a thread runnable, and the machine will route it when restart
   semantics are built — but the tree implements only the policy plumbing,
   so this listed a scope commitment against a feature that does not
   exist. The test is unchanged; what changed is that there is nothing yet
@@ -227,12 +227,12 @@ extra complexity this machine must not carry.
   `tests/suite/cases/restart_semantics_*.zig` cases test `E_PERM`
   ceiling bounding, not restart behaviour. `grep -rn restart_at_entry
   kernel` returns only the enum-value name inside comments. **There is
-  no domain-restart implementation anywhere in the tree**, so there is
+  no process-restart implementation anywhere in the tree**, so there is
   nothing for this machine to be consistent with yet.
 
   **The analysis of what the edge would look like is kept, because it is
   the right answer when the feature arrives** — only its status is
-  demoted. It moves an thread to runnable, in **one edge**: claim by the
+  demoted. It moves a thread to runnable, in **one edge**: claim by the
   state's normal route (5a from `waiting`, 5c from `ready`, the directive
   from `running`), **reset the saved frame to the entry point under the
   won claim**, then place via edge 6. The frame reset under a won claim
@@ -247,7 +247,7 @@ extra complexity this machine must not carry.
   reason B for the rewriting itself, with one obligation retained
   in-scope** — a `persist`ing thread is a running thread whose root is being
   republished, which is precisely the configuration
-  `awaitDomainQuiesced` (W6) exists to serialize against. So `persist`
+  `awaitProcessQuiesced` (W6) exists to serialize against. So `persist`
   must either take that barrier or state why it is exempt, and **that
   obligation is in scope even though the rewriting is not.** Recorded in
   §11 rather than designed here.
@@ -266,7 +266,7 @@ the machine is shaped this way, and **not** something to code against.
 
 ## 1. The problem being designed away
 
-Today "the state of an thread" is the product of at least eight overlapping
+Today "the state of a thread" is the product of at least eight overlapping
 signals, each answering some version of *is this thread still in use*:
 
 ```
@@ -291,7 +291,7 @@ The design is organized around four principles:
 - **State implies containment.** The lifecycle state *is* the answer to
   "which container holds this thread".
 - **Every hand-off is a claim, and every obligation has one named
-  discharger.** Any party that takes an thread out of a claimable state wins a
+  discharger.** Any party that takes a thread out of a claimable state wins a
   CAS first, owns the thread exclusively while it works, and re-validates with
   a second CAS at placement. A won claim is never orphaned: claim-holding
   frames are pinned against requeue preemption (§3.1 rule 1) and never
@@ -457,7 +457,7 @@ to this machine, and §12 deliberately does not claim it.
 are what a *user* thread parks in when it executes `wfi`/`hlt` and traps — the
 aarch64 EL0 `wfi` trap at `arch/aarch64/exceptions.zig:737` and the x86-64
 `#GP`-on-`hlt` path at `arch/x64/exceptions.zig:260` — and `suspend`
-accepts such a target (`exceptions.zig:741`, `:759`). That is an thread
+accepts such a target (`exceptions.zig:741`, `:759`). That is a thread
 choosing to idle, which is nothing like a core having no thread to run.
 
 ### 2.2 The wait descriptor
@@ -469,7 +469,7 @@ A single struct, `thread.wait`, valid only in `parking`/`waiting`/`claimed`/
 pub const Wait = struct {
     kind: enum(u8) { none, port_queue, reply_pin, futex, idle, requeue }
     port: ?SlabRef(Port),                  // port_queue / reply_pin
-    reply_holder: ?*KernelHandle,          // reply_pin (+ domain, slot)
+    reply_holder: ?*KernelHandle,          // reply_pin (+ process, slot)
     futex_nodes: ?[*]WaitNode, futex_count: u8,
     deadline_node: DeadlineNode,           // intrusive; §8.4
     deadline_ns: u64,                      // 0 = untimed
@@ -492,7 +492,7 @@ pub const Wait = struct {
 };
 ```
 
-Today's `suspend_port`, `pending_reply_holder/domain/slot`, futex node
+Today's `suspend_port`, `pending_reply_holder/process/slot`, futex node
 fields, and both deadline fields fold in. `kind == .requeue` covers
 preemption and affinity migration; deletes `pending_cross_enqueue`.
 
@@ -548,7 +548,7 @@ it is listed.
 - **Descriptor post-publish rule (scoped).** The parking core may access
   its descriptor after the publish, until its hop, **iff** the access
   completes inside the lock section that gates the new reachability route
-  it is creating (the receiver-CD hold for the rendezvous pin). This rule
+  it is creating (the receiver-process hold for the rendezvous pin). This rule
   carries an assumption that must stay explicit (round-3 repair): during
   the pin-write window the sender has **no pre-existing reachability
   route** — in particular no deadline registration. That holds because
@@ -575,7 +575,7 @@ pub const PerCore = struct {
                                    // thread (§2.1.1, revision 16)
     park_stack: Stack,             // the idle core parks HERE, via
                                    // parkAndAwaitIRQ — core-owned storage,
-                                   // NOT an thread container (§2.1.1)
+                                   // NOT a thread container (§2.1.1)
     // idle_thread: REMOVED in revision 16 with §2.1.1. There is no per-core idle
     // thread: the field is never assigned at HEAD and its one read is
     // unreachable, and re-introducing one would regress the cross-core
@@ -585,19 +585,19 @@ pub const PerCore = struct {
 
 pub const TeardownRequest = struct {
     kind: enum(u8) { self_delete, unhandled_fault },
-    cd: SlabRef(CapabilityDomain), // held from validation through phase 2
+    process: SlabRef(Process), // held from validation through phase 2
 };
 ```
 
 - `current`: written at exactly two sites (dispatch commit under
   `core_locks[core]`; the hop, §4 step 1). Single-pointer-word layout
   retained; the Pi-5 tearing autopsy is the permanent justification.
-- `active_root` + `awaitDomainQuiesced`: retained unchanged.
+- `active_root` + `awaitProcessQuiesced`: retained unchanged.
 - `committed_thread`: deleted (slow path: one critical section; fast path
   brought under the core lock, §9.4).
 - `teardown_pending`: carries the self-delete teardown request across the
   hop (the payload cannot ride the hop's single `u64`). Revised per M-A:
-  it now carries the **CD ref for the whole teardown** — dead-mark
+  it now carries the **process ref for the whole teardown** — dead-mark
   included — not a post-dead-mark snapshot (§8.2). The producing thread stores
   exactly one `TeardownRequest` before self-retire; the park-stack consumer
   clears it before phase 1 and owns both teardown phases from there.
@@ -977,7 +977,7 @@ directive_port: SlabRef(Port),     // written only between claiming and
   `none` — which §2.5 defines as *consumed* — reports SUCCESS for a
   suspension that was never delivered. Rev 9 added a `dropped` terminal
   and **inherited `dead`'s "never cleared" property without `dead`'s
-  justification**: `dead` is written by finalize on an thread being freed, so
+  justification**: `dead` is written by finalize on a thread being freed, so
   never clearing it is correct there; `dropped` sits on a LIVE thread, so a
   single stale-port drop would leave every future suspender's
   `none → claiming` CAS failing forever and the thread **permanently
@@ -1191,7 +1191,7 @@ everywhere else.
 
 **Cost, stated rather than implied, because it is real work**: this
 needs (1) `trap_sync` promoted, or masking at fault entry, so the
-analyzer can tell an thread-context acquire from an exception-context one;
+analyzer can tell a thread-context acquire from an exception-context one;
 and (2) an **IF-state model in `asm_analyzer.zig`** — the two hazard
 sites above are raw asm, so a Zig-level acquire-site scan cannot see
 them at all. Neither exists. Until both do, §2.4's third clause is
@@ -1335,7 +1335,7 @@ gate — never by an ambient IRQ mask. (Forecloses class 2.)
 
 3. Post-publish, pre-hop: bounded work only — lock-bounded local
    operations allowed (the rendezvous delivery lives here, under §2.2's
-   descriptor rule, and it acquires the receiver-CD and destination
+   descriptor rule, and it acquires the receiver-process and destination
    run-queue locks — this is expected and legal), no unbounded spins, no
    waits on remote progress. (Rev 3's "no-cycle certificate" for this
    window claimed the owner's path acquires no locks, which its own §8.3
@@ -1345,14 +1345,14 @@ gate — never by an ambient IRQ mask. (Forecloses class 2.)
 4. The hop (§4).
 
 **The dispatch sequence** (`ready → running → SP on new kstack`): dequeue
-(or `yieldTo`-target pick), the S7 domain filter with its failure routing,
+(or `yieldTo`-target pick), the S7 process filter with its failure routing,
 the `ready → running` CAS, and `current`/`owner_core`/queue-field writes
 occur in one `core_locks[core]` critical section. The park-stack tail
 drains teardown requests, rechecks the lifecycle state, and loads the
 selected context. If retire or park wins after the commit, dispatch is
 abandoned and the core returns to `run()`. S7-failure routing
 (round-3 M-A repair; lock order
-corrected round 4 F2): a popped `ready` thread whose domain ref is gen-dead
+corrected round 4 F2): a popped `ready` thread whose process ref is gen-dead
 is **claimed, not retired in place** — the dispatcher CASes
 `ready → claimed` under the queue lock it already holds (legal per
 R-claim: the queue is the reaching container), releases the queue lock,
@@ -1409,7 +1409,7 @@ with both sides IRQ-masked. Never a silent drop, either way.
 | `thread.priority` | 1 byte | the `priority` syscall, under the target's `_gen_lock` | every link site (`ThreadQueue.enqueue`, futex `WaitNode` key), under the destination container lock | single-word store, **published before any subsequent link**; links that already exist are repaired by the same syscall's re-bucket (§8.1). A `WaitNode`'s copy of the key has ONE writer context — whoever holds that bucket's lock (the parking core at link time, the syscall thereafter) |
 | `thread.affinity` | 8 bytes | the `affinity` syscall, under the target's `_gen_lock` | every placement's destination computation, under the destination queue lock | as `thread.priority`; a `ready` target whose new mask excludes its current queue core is MOVED by the 5c claim-move, not by a bare store (§8.1) |
 | `thread.directive_port` | 1 word (SlabRef) | the suspender, **written only between its `none → claiming` and `claiming → armed` CASes** — i.e. under the exclusivity the `claiming` state grants | **the owner core only**, at its user-boundary check, to gen-validate and park into | round-10 C-D: rev 10 gave this field no row at all. The suspender never reads it back, so there is no cross-core read discipline to specify — it re-validates the port reference IT holds. That asymmetry is the whole reason the ownership test needs no second word |
-| `thread.directive_state` | **4 bytes: `{ state: u8, owner_slot: u24 }`**, one word, single-word CAS (round-10 C-D) | **writer contexts, enumerated in full (round-9 C-1; rev 9's row named two of them and S2/analyzer 9.3(1) pin writers from THIS row)**: (1) a **suspender** CASing `none → suspending` on its OWN word (§2.5.1 CAS 1 — the only case where an thread writes its own directive word); (2) a **suspender** CASing another thread's `none → claiming` and `claiming → armed`, and `(armed, me) → none` on disarm; (3) the **owner core** CASing `(armed, owner) → none` on successful user-boundary consumption; (4) the **owner core** publishing `directive_result` and CASing `(armed, owner) → (failed, owner)` on stale/bad-port or other consume failure; (5) the **matching waiter** CASing `(failed, me) → none` as the failure ack; (6) **finalize** writing the terminal `dead`; and **(7) the slot zero itself** — finalize's `slot zero + freelist` (§8.2, edge 10) writes the all-zeroes `none` over `dead` a few steps after (6), and creation's publish (edge 1) writes `none` into a recycled slot. **Round-11 C-1: this row claimed "four writer contexts, enumerated in full" and was short by exactly this one — the same failure as round-9 C-1, which was also this row being short.** The zero is not a bookkeeping detail: it is what destroys F6's marker, which is why the break disambiguator cannot rest on `dead` | owner entry check; suspender re-check loop; a suspender's own-word check at CAS 1 | payload under claiming→armed exclusivity; terminal `dead` distinguishes retired from consumed (§2.5, F6) only when observed before slot zero. `armed → none` means delivered consume or waiter disarm; owner-side failures instead publish `directive_result` and go `armed → failed`, then the matching waiter acks `failed → none`. The word carries the **identity of the suspender that placed the current arm**, and the suspender's break test and disarm CAS are both on `(armed, me)`, never on the state value — without that the word is an ABA and a suspender can both report success for an undelivered suspension and disarm a third party's directive. An epoch was tried first and TLC refuted it: a bounded counter is itself an ABA (§2.5). Full state set: `none | suspending | claiming | armed | failed | dead` |
+| `thread.directive_state` | **4 bytes: `{ state: u8, owner_slot: u24 }`**, one word, single-word CAS (round-10 C-D) | **writer contexts, enumerated in full (round-9 C-1; rev 9's row named two of them and S2/analyzer 9.3(1) pin writers from THIS row)**: (1) a **suspender** CASing `none → suspending` on its OWN word (§2.5.1 CAS 1 — the only case where a thread writes its own directive word); (2) a **suspender** CASing another thread's `none → claiming` and `claiming → armed`, and `(armed, me) → none` on disarm; (3) the **owner core** CASing `(armed, owner) → none` on successful user-boundary consumption; (4) the **owner core** publishing `directive_result` and CASing `(armed, owner) → (failed, owner)` on stale/bad-port or other consume failure; (5) the **matching waiter** CASing `(failed, me) → none` as the failure ack; (6) **finalize** writing the terminal `dead`; and **(7) the slot zero itself** — finalize's `slot zero + freelist` (§8.2, edge 10) writes the all-zeroes `none` over `dead` a few steps after (6), and creation's publish (edge 1) writes `none` into a recycled slot. **Round-11 C-1: this row claimed "four writer contexts, enumerated in full" and was short by exactly this one — the same failure as round-9 C-1, which was also this row being short.** The zero is not a bookkeeping detail: it is what destroys F6's marker, which is why the break disambiguator cannot rest on `dead` | owner entry check; suspender re-check loop; a suspender's own-word check at CAS 1 | payload under claiming→armed exclusivity; terminal `dead` distinguishes retired from consumed (§2.5, F6) only when observed before slot zero. `armed → none` means delivered consume or waiter disarm; owner-side failures instead publish `directive_result` and go `armed → failed`, then the matching waiter acks `failed → none`. The word carries the **identity of the suspender that placed the current arm**, and the suspender's break test and disarm CAS are both on `(armed, me)`, never on the state value — without that the word is an ABA and a suspender can both report success for an undelivered suspension and disarm a third party's directive. An epoch was tried first and TLC refuted it: a bounded counter is itself an ABA (§2.5). Full state set: `none | suspending | claiming | armed | failed | dead` |
 | `thread.directive_result` | 8 bytes (`i64`) | owner core, release-store before `(armed, owner) → (failed, owner)` | matching suspender after acquire-observing `(failed, me)` | carries the owner-side consume-failure code only while `directive_state` is `failed`. The matching waiter reads it before CASing `failed → none` and returns the error; the ack does not clear the result because that would be a second, non-atomic word update. Outside `failed`, the value may be stale and no success path reads it |
 | `thread.wait.*` | multi-word | per §2.2 | claim/retire winner; owner's hop after `payload_done` | ownership transfers with CAS; reachability-gating sections; `payload_done` release/acquire |
 | `thread.ctx` saved-frame payload | multi-word | claim winner only | the thread after re-dispatch | claim CAS + saved-frame ban + discharge ordering |
@@ -1435,7 +1435,7 @@ only:
 **Lock-order pin** (round-3 repair): retire of a `ready` target holds
 both the thread `_gen_lock` and the run-queue lock; the canonical order is
 **ThreadGen → CoreLock**. Nothing in the machine takes a core lock and then
-an thread gen lock (dispatch, enqueue, and placement never acquire thread gen
+a thread gen lock (dispatch, enqueue, and placement never acquire thread gen
 locks), so the pair-order is registrable with lockdep as a fixed edge.
 
 **Cross-class lock ordering is OUT OF SCOPE (§0.2), and revisions 10–12
@@ -1494,7 +1494,7 @@ callgraph (§9.3(6)).
 | W3 | terminate eviction spin | thread context, `pin_depth == 0`, no locks held | target leaving its core's `current` slot | target's kernel sequence completion + one user-boundary event (tick/IPI-bounded) | none — waiter is preemptible; target needs no interrupt of the waiter to return | target's progress is tick-driven, independent of the waiter — **CONDITIONAL on the two exit conditions below (round-8 C-1); without them this column is FALSE and mutual terminate is a hard two-core deadlock, reached by the model in 7 states**. **(i) Self carve-out**: if the target IS the caller, the wait is skipped entirely — a caller cannot wait for its own eviction. The tree already does this (`thread.zig:1028`, `if (thread != caller and ...)`); revision 8 had no such carve-out anywhere, so the tree was SAFER than the design. **(ii) Retired-waiter escape**: the spin also exits if the WAITING thread has itself become `retired`. The tree's `thread != caller` does NOT cover mutual terminate — A terminates B and B terminates A, and both cores pass `thread != caller`. Both callers end `retired` in kernel frames, and a `retired` thread in a kernel frame is moved by NOTHING: the requeue CAS fails on `retired` (§3.1 rule 1) and rule 3's entry checks are user-boundary-gated. Sound because a retired terminator never returns to user mode, so L5 has no observer to disappoint; safe because the frame holds no claim (`pin_depth == 0` at spin entry, rule (b)) |
 | W4 | L5 deferred-marking wait (terminate, prior `claimed`/`pended`): **acquire-load of `mark_state` until the owed bit is CLEAR** (§2.4, M-3) | thread context, `pin_depth == 0`, **no locks held**, preemptible | the discharger's bounded body (holder's L6 body, or owner's hop after `payload_done`) — its clearing release-store is the paired write | W1, W2 | none | discharger never waits on the terminator; bound = discharger instructions + scheduling latency, and the acquire/release pairing that bound presumes is now an explicit §3.4 discipline rather than an implicit one |
 | W5 | directive-suspender wait | thread context, `pin_depth == 0`, preemptible | target leaving `running`, OR consuming at a boundary | tick (requeue), its own park, or the **arming wake IPI forcing a user-boundary event → entry-check consumption** | none | round-2 verified for the requeue break; round-6 model addendum (N5): the requeue break ALONE is not total — a target duty-cycling pin-class holds can phase-align so the suspender never observes it off-CPU — and W5's termination then rests on rule 3's MANDATORY boundary consumption: every kernel entry from user mode (each periodic tick included) runs the directive arm, so an armed running target consumes within one unpinned tick; §2.5's wake IPI adds promptness for a target that never faults or syscalls. This is a distinct starvation class from N3 (N3: the SPINNER's recheck; N5: the spun-on EVENT), closed by rule 3, not by a fairness assumption — and rule 3's precedence over the requeue arm is what makes it work, which rev 7 left as a consequence and rev 8 states as a rule (round 7 M-5, §3.1). **This column is NOT a bound**: it is termination under assumptions (1)+(2) below, and the round-7 measurements show assumption (2) is the one the model can barely check (§11.7) |
-| W6 | `awaitDomainQuiesced` | scheduler context, no locks held | cores republishing roots / evicting dying-domain Threads | W3-like per-core progress | none (ack-while-spinning services shootdowns) | per-core progress is tick-driven; barrier holds nothing they need |
+| W6 | `awaitProcessQuiesced` | scheduler context, no locks held | cores republishing roots / evicting dying-process Threads | W3-like per-core progress | none (ack-while-spinning services shootdowns) | per-core progress is tick-driven; barrier holds nothing they need |
 | W7 | retire-from-`pended` `payload_done` pre-wait (edge 9, §8.2) | retire caller: thread-syscall or scheduler context — never interrupt context (asserted) | the pended claimant's straight-line body | W1 only | none | same bounded provider as W2; the wait precedes the retire CAS, so no later observer of `retired` ever waits (F1) |
 | W8 | FPU migrate-flush ack (`fpu.zig:337-414`) | thread/scheduler context, IRQ-masked, **holding `request_lock`** | remote core's flush-IPI handler, or inline service at the remote's spin sites | none unbounded: the handler is lock-free and bounded; a remote spinning IRQ-masked services the flush inline (ack-while-spinning) | provider needs an IRQ delivery OR an inline service — never this core's held lock | rule (b) exception; sound per the ack-while-spinning closure below (F4) |
 | W9 | TLB shootdown ack wait (`paging.zig:509`) | any, **holding `shootdown_lock`** | every remote core's shootdown ack (IRQ or inline service) | as W8 | as W8 | as W8 (F4) |
@@ -1700,13 +1700,13 @@ failure arm — never a plain store (the resurrection shape S8 prevents).
 
 | # | Edge | Actor | Trigger | Precondition | Postcondition |
 |---|---|---|---|---|---|
-| 1 | *(slab-private)* → `ready` | creator | `publish`, the last step of creation | all fallible work done; nothing externally visible yet; **domain liveness validated under the CD `_gen_lock` inside the publish section** (§8.5). `create_vcpu` follows the same runnable-first shape: the vCPU is published ready and its first dispatch synthesizes the initial `vm_exit` through the normal running→parking path | gen live + linked, one lock section; domain-dead ⇒ private-unwind arm. |
+| 1 | *(slab-private)* → `ready` | creator | `publish`, the last step of creation | all fallible work done; nothing externally visible yet; **process liveness validated under the process `_gen_lock` inside the publish section** (§8.5). `create_vcpu` follows the same runnable-first shape: the vCPU is published ready and its first dispatch synthesizes the initial `vm_exit` through the normal running→parking path | gen live + linked, one lock section; process-dead ⇒ private-unwind arm. |
 | 2 | `ready` → `running` | dispatching core | dequeue / **`yieldTo` target — qualified in §8.1 (round 7 M-4): `ready` ON THIS CORE'S QUEUE, S7-live, and affinity-mask-admitted; anything else degenerates to a plain `yield`** | inside `core_locks[core]` — a single core lock, which is exactly why the `yieldTo` arm is local-only; S7 filter (failure ⇒ dispatcher retires inline, §3.2); CAS wins | `current`, `owner_core`, queue field — same section; then park-stack tail lifecycle recheck and SP/root load. If lifecycle is no longer `running`, abandon to `run()` |
 | 3 | `running` → `parking` | owner core | blocking syscall, wfi/hlt trap, directive consumption (user boundary), preempt tick (requeue; `pin_depth == 0`), **plain `yield` and the `yieldTo` caller's own requeue park (requeue — round 6 M4; this list is the closure and had omitted both)**, affinity migration (requeue). **PRECEDENCE (round 7 M-5): where directive consumption and the preempt tick are both enabled — i.e. the tick lands on an unpinned user-mode frame with `directive_state == armed` — CONSUMPTION WINS; the tick is an entry from user mode and §3.1 rule 3 runs its checks before the requeue arm.** | park sequence §3.2 (staging pre-publish; links+CAS under final container lock; requeue = bare CAS) | straight line (bounded work) to the hop |
 | 4 | `parking` → `waiting` | owner core | the hop (or degenerate) | SP off kstack / never on it; `current` released (hop step 1) | claimable; `owner_core` poisoned (debug) |
 | 5a | `waiting` → `claimed` | any waker/mover (any context) | see T1 (§5.1) + syscall-context sources: the `futex_wake` syscall, recv pop, close propagation, reply via pin, rendezvous pop, suspend of idle-waiter, **`vm_inject_irq` waking a wfi-parked vCPU (round 6 M4; 5b if it races the vCPU's park; no T1 row unless an IRQ-context injection path is ever added, which would require one)** | CAS under R-claim; one winner per episode | holder owns descriptor+frame; unlinks containers incl. deadline node; **holder discharges** (edges 6/7) |
 | 5b | `parking` → `pended` | any waker (any context) | same wake sources racing a not-yet-committed park | CAS under R-claim | claimant: unlink + payload + `payload_done` release-store, then DONE. **Owner core discharges at its hop** (§4): placement, finalize-on-retired, deferred marking |
-| 5c | `ready` → `claimed` | cross-thread suspender; the dispatcher on S7-filter failure (§3.2, F2); the `affinity` claim-move (§8.1) | `suspend` of a `.ready` target; a popped gen-dead-domain thread; **a cross-thread `affinity` edit whose new mask excludes the target's current queue core (round 7 M-6 — rev 7 applied the closure standard to edge 3 and not to this row, so the rev-7 claim-move it had just introduced was missing from its own trigger list)**. NOT a trigger: a `priority` edit — the new bucket is in the SAME container, so it is an in-lock relink with no state change (§8.1) | inside the target's run-queue lock: unlink + CAS | holder discharges (edge 7; or edge 6 for the claim-move; or retire-as-holder for the S7 route) |
+| 5c | `ready` → `claimed` | cross-thread suspender; the dispatcher on S7-filter failure (§3.2, F2); the `affinity` claim-move (§8.1) | `suspend` of a `.ready` target; a popped gen-dead-process thread; **a cross-thread `affinity` edit whose new mask excludes the target's current queue core (round 7 M-6 — rev 7 applied the closure standard to edge 3 and not to this row, so the rev-7 claim-move it had just introduced was missing from its own trigger list)**. NOT a trigger: a `priority` edit — the new bucket is in the SAME container, so it is an in-lock relink with no state change (§8.1) | inside the target's run-queue lock: unlink + CAS | holder discharges (edge 7; or edge 6 for the claim-move; or retire-as-holder for the S7 route) |
 | 6 | `claimed` → `ready` | the holder | wake placement | payload complete; CAS-then-link inside destination queue-lock section, **destination computed there from the fresh descriptor** (M-2) | failure ⇒ `retired` ⇒ holder performs deferred marking + finalize |
 | 6p | `pended` → `ready` | **owner core, at its hop** | hop `pended` arm | `payload_done` observed; CAS-then-link inside destination queue-lock section, destination from the fresh descriptor (M-2) | failure ⇒ `retired` ⇒ owner performs deferred marking + finalize |
 | 7 | `claimed` → `waiting` | the holder | re-containment: recv pop → reply pin; suspend of ready/idle → port; delivery-failure relink. | descriptor re-targeted; CAS-then-link inside destination wait-container lock section (the link's bucket key reads the fresh `thread.priority`, §3.4) | failure ⇒ `retired` ⇒ holder: deferred marking + finalize + undo partial placement |
@@ -1759,7 +1759,7 @@ two empty cells in this matrix.
 | State \ cont. | U | K | K+C |
 |---|---|---|---|
 | `ready` | retirer, inline (ThreadGen → CoreLock, §3.5) | retirer, inline — safe because the lock dichotomy (§2.4, computed membership) guarantees a requeue-preempted frame holds no lock at all: IRQ-masked sections cannot span a tick, and pin-class holders are never preempted. (Rev 4's "holds nothing whose orphaning matters" rested on a recalled, wrong pin class — F3.) **CONDITIONAL on §2.4's ORDERING rule** (round 7 C1): "pin-class holders are never preempted" is true only if the bump precedes the acquire. Under `lock(); pin_depth += 1;` this cell's justification is FALSE and this row inline-finalizes a frame holding the slab lock — the model reproduces it in four states (`pinord` falsifier, `InvNoPreemptedLockHolder`) | **unreachable**: the pin gate forbids requeue-preempting a pinned frame (X1 cell 1; sound as of F3's computed membership AND C1's ordering rule) |
-| `running` | owner core: wake IPI → user-boundary check → hop+finalize | owner core: frame runs to its hop (commit-failure arm) or syscall completion + boundary. **CONDITIONAL on every in-flight kernel frame being able to COMPLETE (round-8 C-1)**: this cell's whole argument is "the frame runs to its hop or to syscall completion", and a terminator parked in the W3 eviction wait for an thread that will never leave `current` does neither. That is not a hypothetical — it is mutual terminate, and TLC reaches it in 7 states. The §3.6 W3 exits (self carve-out; retired terminator abandons the wait) are what make this column true; without them a `retired` thread sits in a kernel frame forever and L2 is violated permanently | same as K: the frame is the running computation — it completes, discharges its claims (`pin_depth → 0`), then discovery at hop/boundary. Never abandoned (§3.1 rules 1+3), and never STUCK (the W3 exits above) |
+| `running` | owner core: wake IPI → user-boundary check → hop+finalize | owner core: frame runs to its hop (commit-failure arm) or syscall completion + boundary. **CONDITIONAL on every in-flight kernel frame being able to COMPLETE (round-8 C-1)**: this cell's whole argument is "the frame runs to its hop or to syscall completion", and a terminator parked in the W3 eviction wait for a thread that will never leave `current` does neither. That is not a hypothetical — it is mutual terminate, and TLC reaches it in 7 states. The §3.6 W3 exits (self carve-out; retired terminator abandons the wait) are what make this column true; without them a `retired` thread sits in a kernel frame forever and L2 is violated permanently | same as K: the frame is the running computation — it completes, discharges its claims (`pin_depth → 0`), then discovery at hop/boundary. Never abandoned (§3.1 rules 1+3), and never STUCK (the W3 exits above) |
 | `parking` (wait) | n/a (parking is a kernel sequence) | owner's hop commit-failure arm → finalize (whose leading unwind clears the episode's links, §8.2 N4) | reachable — the rendezvous sender holds a claim on its receiver mid-delivery. The sequence is the running computation: it completes delivery (discharging the claim), reaches its hop, hop finds `retired`, finalizes. Routed |
 | `parking` (requeue) | n/a | owner's hop placement-CAS fails → finalize; frame's saved continuation has `pin_depth == 0` (it was preempted under the gate) | **unreachable** (pin gate — X1 cell 2) |
 | `waiting` | retirer, inline (after unwind under container locks) | **n/a — but NOT for the reason rev 9 gave** (round-9 M-7). Rev 9 said "a waiting thread's park sequence completed", which is false as a universal: §8.3's cross-thread suspend of a `.ready` target reaches `waiting` via **5c + edge 7**, with no park sequence anywhere — the thread was claimed out of a run queue and re-contained by its holder. The cell is still n/a, and the correct reason is the one that covers both routes: **whichever party last placed the thread into `waiting` had discharged its claim and left `pin_depth == 0`** — the parking core by the §2.4 publish assert on the park route, the holder by edge 7's discharge on the 5c route. The conclusion survives; the justification did not | unreachable (`pin_depth == 0` on every route into `waiting`, not just the park route) |
@@ -1801,9 +1801,9 @@ definition.
 | futex buckets (**plural** — one waiter links into every bucket of its multi-word wait) | `futex.wake`'s bucket pop, **plus the same function's re-enqueue of the non-matching nodes it dequeued** (`futex.zig:249,255,364` — multiple paddrs hash to one bucket, so a dequeued node may not match the wake's address; VERIFIED present, round 7); **`priority` re-bucket** of every node of the wait (§8.1 — the `WaitNode` SNAPSHOTS `thread.priority` at park, `futex.zig:427,530`) | under the bucket lock(s), sorted all-buckets discipline for multi-bucket ops | gen-checked `node.thread.lockIrqSave` generalized to claim-CAS-or-skip (§3.5) | recall (`futex.zig:434`) + the cited line numbers, re-checked against the tree in round 7 |
 | deadline table | tick scan (`expireTimedWaiters`/`expireTimedRecvWaiters`) | under the table lock | claim CAS fails on `retired`; loser/stale nodes left for the unwind | recall (§8.4) |
 | device-region list | `onIrq` waiter lookup | under the device-region lock | claim CAS fails on `retired`; line stays masked (see G6 note, §8.4) | recall (§5.1) |
-| **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving an thread handle to a `SlabRef` and retiring through it | ref-reached: caller-CD lock, then thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
-| **domain teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying domain's Threads and retiring each | ref-reached, scheduler context: CD `_gen_lock` for the walk, thread `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
-| reply-pin handle slot | reply / reply_transfer / delete-E_ABANDONED via the pin | **ref-reached, NOT container-lock-reached**: the pin is a KernelHandle in the HOLDER's domain table; deref under the holder-CD lock with thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim CAS fails on `retired`; if the HOLDER domain is itself in teardown, its gen is dead and the handle resolution fails — teardown's handle release owns the slot, and finalize's unwind treats a dead-gen pin as already-unlinked (idempotent skip) | recall (§8.3) |
+| **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving a thread handle to a `SlabRef` and retiring through it | ref-reached: caller-process lock, then thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
+| **process teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying process's Threads and retiring each | ref-reached, scheduler context: process `_gen_lock` for the walk, thread `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
+| reply-pin handle slot | reply / reply_transfer / delete-E_ABANDONED via the pin | **ref-reached, NOT container-lock-reached**: the pin is a KernelHandle in the HOLDER's process table; deref under the holder-process lock with thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim CAS fails on `retired`; if the HOLDER process is itself in teardown, its gen is dead and the handle resolution fails — teardown's handle release owns the slot, and finalize's unwind treats a dead-gen pin as already-unlinked (idempotent skip) | recall (§8.3) |
 
 Two memberships the "under each container's lock" phrasing glosses,
 now explicit: a **timed waiter is linked in two container kinds at
@@ -1811,8 +1811,8 @@ once** (its wait container and the deadline table) and a **futex waiter
 in as many buckets as its wait spans** — finalize's unwind (§8.2) MUST
 visit every container the descriptor names, in the container-lock
 discipline of each, and the claim winner's unlink (edge 5a/5b) already
-does. The reply pin's unwind order is holder-CD lock, then the thread gen
-validation inside it — never the reverse (no thread-gen → CD edge exists;
+does. The reply pin's unwind order is holder-process lock, then the thread gen
+validation inside it — never the reverse (no thread-gen → process edge exists;
 §3.5's pinned order stays acyclic).
 
 ---
@@ -1848,7 +1848,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
 - **S6 (word granularity).** Nothing cross-core-readable wider than a
   word outside CAS-won-exclusivity publication. *(Forecloses 3.)*
 - **S7 (dispatch filter + routing).** Edge 2 commits only
-  gen-live-domain `ready` Threads; a filter failure claims the popped thread
+  gen-live-process `ready` Threads; a filter failure claims the popped thread
   (`ready → claimed` under the queue lock) and retires it as holder
   after the lock drops — never a silent drop, and never a
   CoreLock → ThreadGen inversion (F2). *(M-A residue.)*
@@ -1860,7 +1860,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
   in-lock re-bucket (§8.1) unlinks and relinks a `ready` thread **within
   the same run queue, inside that queue's lock section** — the state
   word is not touched and container membership does not change, only
-  intra-container position. Every edit that *does* move an thread between
+  intra-container position. Every edit that *does* move a thread between
   containers is a claim-move and appears above (round 7 C2/M-6).
 
 ### 6.2 Liveness
@@ -1926,7 +1926,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
    `payload_done` are consumed at a hop that unconditionally runs.
 5. **Predicate drift / missing per-arch writer.** One chokepoint, one
    stale predicate, writer-set pinning, paired-arch analyzer.
-6. **Ownerless thread.** Edge 1 (publish = containment, domain-gated);
+6. **Ownerless thread.** Edge 1 (publish = containment, process-gated);
    S7-failure routing retires rather than drops.
 7. **Lost wake / lost enqueue / double enqueue.** S4 + S8 + L3 + L4 +
    T1's no-decline closure; publish-under-lock (container-reached) and
@@ -1955,7 +1955,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
 - **`yieldTo`, target side (round 7 M-4)** — rev 7 gave edge 2 the
   trigger "yieldTo target" and never said which targets qualify.
   Normative: the caller dispatches the target **only if it is `ready`
-  ON THIS CORE'S QUEUE, passes the S7 domain filter, and its affinity
+  ON THIS CORE'S QUEUE, passes the S7 process filter, and its affinity
   mask includes this core**; otherwise the call degenerates to a plain
   `yield` (the caller requeues, edge 3, and the scheduler selects).
   Local-only is what makes edge 2's "one `core_locks[core]` critical
@@ -1963,7 +1963,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
   two core locks and a new CoreLock→CoreLock order edge, and the claim
   route cannot substitute because there is no `claimed → running` edge.
   The mask check is the part the tree lacks today
-  (`scheduler.zig:900` checks state + `domainRefAlive` + local-queue
+  (`scheduler.zig:900` checks state + `processRefAlive` + local-queue
   residency but not the mask) and it is mandatory: dispatching a target
   whose mask excludes this core defeats `affinity` outright. **Spec
   narrowing, named not hidden**: §[yield]'s Description says "that thread is
@@ -1982,7 +1982,7 @@ validation inside it — never the reverse (no thread-gen → CD edge exists;
   > write under the reaching container lock" and specified neither the
   > reach, the re-validation, nor the lock order).
   >
-  > 1. Resolve the handle under the caller's CD lock.
+  > 1. Resolve the handle under the caller's process lock.
   > 2. Under the target's `_gen_lock` with gen validation (R-claim's
   >    second, ref-reached arm — §3.5): **write the word**, and read the
   >    target's state plus the identity of the container(s) it is linked
@@ -2169,24 +2169,24 @@ the zero; identity-compare-only for stale bare pointers; payload writers
 always hold a claim retire respects, and pended-origin payload
 completion precedes the `retired` state itself (edge 9's pre-CAS wait).
 
-**Domain teardown, self-delete path** (`delete(SLOT_SELF)`, unhandled
+**Process teardown, self-delete path** (`delete(SLOT_SELF)`, unhandled
 memory-fault) — revised per round-3 M-A: the syscall validates under the
-CD lock, releases it, then self-retires (edge 9) and stashes the **CD
+process lock, releases it, then self-retires (edge 9) and stashes the **process
 ref** in `PerCore.teardown_pending` — the dead-mark has NOT yet happened.
 The hop finalizes the caller; the park-stack code consumes the slot and
 runs the ENTIRE teardown in scheduler context: **phase 1 (dead-mark,
-under the CD `_gen_lock`) and phase 2** (retire every matching thread —
-quiescent victims inline, owned victims via IPI — `awaitDomainQuiesced`,
+under the process `_gen_lock`) and phase 2** (retire every matching thread —
+quiescent victims inline, owned victims via IPI — `awaitProcessQuiesced`,
 VMAR teardown, handle release, `freeUserAddrSpace`, table blocks, ASID,
 `destroyAlreadyMarked`). Rationale: rev 3 dead-marked in thread context
 before the self-retire, so a tick in between could requeue-preempt the
-caller into a `ready` thread of a dead-marked domain — S7-filtered, never
+caller into a `ready` thread of a dead-marked process — S7-filtered, never
 dispatched, phase 2 never run (class 2 at the exact place the design
 claimed deletion). With the dead-mark moved behind the hop, the caller
 is preemptible-and-resumable right up to its self-retire, after which
 rules 3.1(1)/(3) walk it to the hop; and S7's inline-retire routing
-(§3.2) is defense in depth for any dying-domain thread that still lands
-`ready`. The domain stays live marginally longer; nothing observable
+(§3.2) is defense in depth for any dying-process thread that still lands
+`ready`. The process stays live marginally longer; nothing observable
 depends on the dead-mark preceding the caller's park.
 
 **Create-failure path**: unchanged from rev 3 — publish-last creation
@@ -2200,7 +2200,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
 - **Rendezvous (receiver parked)**, publish-first: stage payload, publish
   `parking(reply_pin, holder=pending)` under the port lock, claim the
   receiver (5a, or 5b → the receiver's own core discharges), drop port
-  lock; delivery in the bounded post-publish window (receiver-CD lock —
+  lock; delivery in the bounded post-publish window (receiver-process lock —
   pin writes legal per §2.2's iff-rule and its **untimed-sender
   assumption**, now explicit: the sender has no deadline registration,
   so no waker can reach it during the pin write); place the receiver
@@ -2216,7 +2216,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
   receiver's claim while `parking` is the §5.2 parking×K+C cell: the
   sequence completes and discharges before its hop.
 - **recv with a queued sender**: pop = 5a claim under the port lock;
-  holder mints the pin under the CD lock (sender holder-contained, S1
+  holder mints the pin under the process lock (sender holder-contained, S1
   intact), places via edge 7; placement failure ⇒ undo mint, deferred
   marking n/a (pin never visible), finalize, re-pop.
 - **reply / reply_transfer / delete-E_ABANDONED / E_CLOSED / expiries /
@@ -2257,13 +2257,13 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
 
 ### 8.5 Creation
 
-Publish-last, fallible-first; the edge-1 publish validates domain
-liveness under the CD `_gen_lock` (mutually exclusive with the
+Publish-last, fallible-first; the edge-1 publish validates process
+liveness under the process `_gen_lock` (mutually exclusive with the
 scheduler-context dead-mark, which takes the same lock), with the
 private-unwind failure arm. The lock-held form is preferred over a
 fence-based re-check for auditability. vCPUs may publish into
 `waiting(port_queue)` with `wait.port = exit_port`; there is no separate
-`exit_port` wait kind. Migration: `create_capability_domain` reordered so
+`exit_port` wait kind. Migration: `create_process` reordered so
 no fallible arm follows a visible mint.
 
 > **<<< IMPLEMENTABLE SPEC — END >>>**
@@ -2438,7 +2438,7 @@ ideal composition is exactly this section's decision list plus
 - **The locked park decision** and the parked-core heartbeat.
 - **The spin inventory is §3.6 (T3), normatively closed**: W1 locks, W2
   `payload_done` (hop), W3 eviction, W4 deferred marking, W5 directive,
-  W6 domain quiesce, W7 retire-from-pended pre-wait, W8 FPU
+  W6 process quiesce, W7 retire-from-pended pre-wait, W8 FPU
   migrate-flush ack, W9 TLB shootdown ack — each with ack-while-spinning
   and an acyclicity row; W8/W9 are rule (b)'s two lock-holding
   exceptions (F4). The release-wait rev 3 carried here is deleted;
@@ -2597,7 +2597,7 @@ ideal composition is exactly this section's decision list plus
    that is acceptable.** The mechanism rejects three cases (§2.5.1):
    the symmetric one, a target that is itself mid-suspend of a third
    thread, and a caller that is itself someone's target. Only the first has
-   a clean userspace setup. The other two require holding an thread *inside*
+   a clean userspace setup. The other two require holding a thread *inside*
    a `suspend` call at a chosen instant, and the machine deliberately
    makes that window short — a running target consumes its directive
    within one unpinned tick (§3.1 rule 3). So the division of labour is:
@@ -2619,17 +2619,17 @@ ideal composition is exactly this section's decision list plus
    suspend state-gate error code) — both touch §[suspend] and it should
    be opened once.**
 
-9. **Domain restart is absent from this machine entirely (round-9 C-5).
+9. **Process restart is absent from this machine entirely (round-9 C-5).
    DECIDED IN REVISION 16 — see the resolution at the end of this item;
    the analysis below is kept because it is what the follow-on will use.**
    `grep -ni restart systems.md` returned **zero** before revision 10.
    `specv3.md` §[restart_semantics] is normative and per-thread — when a
-   domain holding `restart` on its self-handle exits (voluntary, fault
+   process holding `restart` on its self-handle exits (voluntary, fault
    or kill), each thread handle is processed by its `restart_policy`:
    **0 = kill / 1 = restart_at_entry / 2 = persist**.
 
    - `kill` is edge 9 and is covered.
-   - **`restart_at_entry` has NO edge.** An thread in *any* state must be
+   - **`restart_at_entry` has NO edge.** A thread in *any* state must be
      forced runnable with its saved frame reset to its original entry
      point. That is not edge 6 (placement of a claimed thread preserves its
      frame), not edge 7, and not a claim-move. The closest existing
@@ -2641,12 +2641,12 @@ ideal composition is exactly this section's decision list plus
      edge 6. The claim/reset/place skeleton exists; the **frame reset
      under a won claim** is the genuinely new step, and it needs a T2
      row of its own because a restart racing a retire must lose.
-   - **`persist` is the harder half**: it keeps an thread *running* while
-     its domain's VMARs are freed and its handle table rewritten.
+   - **`persist` is the harder half**: it keeps a thread *running* while
+     its process's VMARs are freed and its handle table rewritten.
      Neither §8.2 nor §8.5 addresses an address-space change under a
      live thread, and it interacts directly with `active_root` and
      translation quiescence (§10, W6) — a running thread on a root that is
-     being rewritten is exactly what `awaitDomainQuiesced` exists to
+     being rewritten is exactly what `awaitProcessQuiesced` exists to
      prevent, so `persist` either needs the barrier or needs to state
      why it is exempt.
 
@@ -2660,7 +2660,7 @@ ideal composition is exactly this section's decision list plus
    `restartPolicyMonotone`, `restartPolicyMask`, create/copy ceiling
    bounding), all eight `tests/suite/cases/restart_semantics_*.zig` cases
    test `E_PERM` bounding rather than restart behaviour, and there is no
-   domain-restart implementation anywhere. So committing the machine to an
+   process-restart implementation anywhere. So committing the machine to an
    edge here would have been routing one value of one policy in a feature
    whose semantics will move when it is designed. **The machine routes it
    when restart semantics are built; the sketch above is what that
@@ -2682,10 +2682,10 @@ ideal composition is exactly this section's decision list plus
    >   senders with E_CLOSED — a wake this machine's T1/5a routing does
    >   not enumerate.
    > - **`revoke`** — zero mentions in this document.
-   > - **Unhandled faults**: the kernel initiates domain teardown
+   > - **Unhandled faults**: the kernel initiates process teardown
    >   **from exception context**, i.e. a
    >   DIFFERENT ACTOR than T2's terminator, and T2 names actors.
-   > - **`delete` of an thread handle** is mapped to edge 9 here, while the
+   > - **`delete` of a thread handle** is mapped to edge 9 here, while the
    >   spec says Threads are not destroyed by handle drops.
    >
    > The correct standing statement: **the section walk is a better
@@ -2748,8 +2748,8 @@ ideal composition is exactly this section's decision list plus
    affinity-mask. **Two of those three are what the tree does; the MASK
    IS NOT** — corrected in revision 16 (round-14 sufficiency N-1). The
    target-pick guard at `sched/scheduler.zig:900` is
-   `t.state == .ready and domainRefAlive(t) and state.run_queue.remove(t)`:
-   local-only (this core's queue) and S7 (`domainRefAlive`) are both
+   `t.state == .ready and processRefAlive(t) and state.run_queue.remove(t)`:
+   local-only (this core's queue) and S7 (`processRefAlive`) are both
    there, and there is no affinity check on `t` at all — the four
    `affinity` mentions nearby (`:852-863`) are the CALLER's own
    `cur.affinity` local-allowed test, a different rule about a different
@@ -2786,7 +2786,7 @@ ideal composition is exactly this section's decision list plus
     the write has to wait for the swap. The deferral is the fix for one
     problem; it is what creates this one.
 
-    (`caps/capability_domain.zig:833`/`:1016` stage onto `caller`, which
+    (`caps/process.zig:833`/`:1016` stage onto `caller`, which
     is `running`, so those are outside the window. Enumerating the
     staging sites is a `grep -rn pending_event_word_valid` away and
     should be re-derived, not recalled, whenever this item is revisited.)
@@ -2860,12 +2860,12 @@ on promotion** is a precondition of step 1, and again of step 9 for
    with the enum, in the step that widens it.**
 
    **Tag correction:** the census is tagged **`stygia-2u0`**
-   (`syscall/dispatch.zig:199`), not `stygia-afo`; only its CD-orphan
+   (`syscall/dispatch.zig:199`), not `stygia-afo`; only its process-orphan
    additions (`orphan_by_state` and the surrounding block) carry
    `stygia-afo`. Revision 16 attributed the whole census to `afo`.
    The genuinely `afo` instruments — which are the ones 4b's ordering
    depends on — are `p2_enter`/`p2_after_reap`/`p2_walk_done`/`p2_residue`
-   (`caps/capability_domain.zig:1314-1339`), `in_phase2` +
+   (`caps/process.zig:1314-1339`), `in_phase2` +
    `noteFrameAbandoned` (`:1343-1366`), and
    `slow_post_*`/`inline_finalize_*` (`sched/thread.zig:105-143`).
    Those, plus a census kept honest by the port obligation above, are
@@ -2889,7 +2889,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    wake/move; add the T1 device-region row.
    **The descriptor FOLD lands here too, and it is fast-path asm work,
    not a struct rename**: `suspend_port` (34 refs / 5 files, **15 of them
-   in `arch/x64/interrupts.zig`**) and `pending_reply_holder`/`_domain`/
+   in `arch/x64/interrupts.zig`**) and `pending_reply_holder`/`_process`/
    `_slot` (**48** refs / 5 files — 21 is `pending_reply_holder` alone) become `thread.wait.{port, reply_holder}`.
    They are written by hand through `@offsetOf(Thread, …)` at
    `arch/x64/interrupts.zig:1267-1271`, `:1330-1332`, `:1408`,
@@ -2977,7 +2977,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    breaks — **1354 of 6228 phase-2 destroys (22%) never reached the end
    of the caller-thread reap, orphaning 192 Threads by pass ~14**. **That
    measurement is HISTORICAL: it is already closed at HEAD** by the
-   two-stage `stygia-afo` fix (`caps/capability_domain.zig:1420-1436`
+   two-stage `stygia-afo` fix (`caps/process.zig:1420-1436`
    records `p2_enter == p2_after_reap` over 10428 destroys;
    `sched/thread.zig:2210-2216` closed the walk). It is
    retained because it is the evidence for the ordering, not because the
@@ -2985,7 +2985,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    **(4b) the ad-hoc enable must go before the enable arrives.**
    Revision 15 offered two alternatives here and **alternative B was a
    no-op**: the "temporary explicit mask over `destroyPhase2`" it
-   proposed already exists at `caps/capability_domain.zig:1381-1382`, and
+   proposed already exists at `caps/process.zig:1381-1382`, and
    thirteen lines later `:1394` states why that mask is not sufficient on
    its own. The real hole is `destroyThreadLocked` re-enabling
    interrupts around its `postZombie` fallback at
@@ -3004,7 +3004,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    must-complete sequence.
    **And `pin_depth` is NOT the refuted `preempt_block` counter, which an
    implementer WILL find mid-step and lose a day to.** The comment at
-   `caps/capability_domain.zig:1408-1418` records a `PerCore` depth
+   `caps/process.zig:1408-1418` records a `PerCore` depth
    counter that made `yieldTo` return instead of switching and
    "deadlocks the machine inside the FIRST suite pass". It is
    structurally the gate 4c ships, and it is sound here only because
@@ -3098,7 +3098,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    **And one thing `pending_zombie` is currently the ONLY mechanism for,
    which must route somewhere before it goes**: deferring the CALLER
    thread's finalize off its own kstack during phase 2.
-   `caps/capability_domain.zig:1497-1503` reaps the caller thread while the
+   `caps/process.zig:1497-1503` reaps the caller thread while the
    frame is standing on that thread's stack, and `claimOwnZombieInline`
    (`sched/scheduler.zig:2055-2079`) exists solely for that
    configuration. After this step the finalize routes to the frame's own
@@ -3109,13 +3109,13 @@ on promotion** is a precondition of step 1, and again of step 9 for
    → hop → phase 1 + phase 2 on the park stack; S7 inline-retire
    routing. **ADDS `PerCore.teardown_pending`** (§2.3, §8.2 — the
    self-produced/self-consumed request that carries the self-delete
-   teardown and its pre-teardown CD ref across the hop). §2.6 lists it
+   teardown and its pre-teardown process ref across the hop). §2.6 lists it
    among the words the machine ADDS as "the honest price", and no step
    named it before revision 16 — the same closure gap `committed_thread` had.
    Deletes the phase-2 IRQ-mask fragility, `keep_ref`, the
    thread-context dead-mark window, and — now that the structural fix is in —
    the `stygia-afo` counters step 1 held back.
-7. **Publish-last creation with the CD-locked liveness gate.**
+7. **Publish-last creation with the process-locked liveness gate.**
 8. **Fast-path conformance** (core lock; in-lock CAS publish;
    kstack-clean audit; trace-hook rule; 5b-receiver bail pinned).
    **AND §9.4's suspend-path mask (round-11 M-6) — which must land NO
@@ -3139,7 +3139,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    **Deletes: `committed_thread`** (17 refs / 3 files; decl
    `sched/scheduler.zig:180`, writes `:916`/`:1517`/`:1525`, clears
    `:1289`, `arch/aarch64/cpu.zig:541`, `arch/x64/interrupts.zig:2961`,
-   readers `scheduler.zig:1838` `awaitDomainQuiesced` and `:2067`
+   readers `scheduler.zig:1838` `awaitProcessQuiesced` and `:2067`
    `claimOwnZombieInline`). §0.1 names it as one of the FOUR signals for
    which redundancy is met literally, and no step named it until now.
    §2.3 halves the deletion — the slow path goes at step 4's "`current`
@@ -3217,7 +3217,7 @@ The other was resolved by the maintainer in the other direction:
 
 - **§2.1.1's per-core idle thread — WITHDRAWN, and deliberately given NO
   step.** The section was normative and defined S1's containment answer
-  for an thread that does not exist: `idle_thread` is declared at
+  for a thread that does not exist: `idle_thread` is declared at
   `sched/scheduler.zig:184`, read once unreachably at `:1521`, and
   **never assigned**. Building one to satisfy the paragraph would
   **regress a fixed bug** — `:1098` records that `parkAndAwaitIRQ`
@@ -3357,7 +3357,7 @@ standing lesson arriving again.
   the bead list derived rather than written.
 - **N-1 — §8.1's `yieldTo` affinity-mask gate: mandatory, absent from the
   tree, absent from §12, and §11.12 claimed it was "what the tree does".**
-  Verified: `sched/scheduler.zig:900` guards on `ready` + `domainRefAlive`
+  Verified: `sched/scheduler.zig:900` guards on `ready` + `processRefAlive`
   and nothing else; the nearby `affinity` mentions are the CALLER's own
   test. §11.12 corrected, gate scheduled at step 4. **And it is the
   sharpest evidence for the closure check's limit: the mechanism has no
@@ -3396,7 +3396,7 @@ standing lesson arriving again.
 
 **Revision 14 (2026-08-02)** — closes round 12's blocking set. **The
 boundary is now a TEST, not an enumeration** — *does this affect thread
-lifecycle or scheduler state: where an thread is, what core it is on,
+lifecycle or scheduler state: where a thread is, what core it is on,
 whether it is runnable?* — because an enumeration is exactly what
 drifted: revision 13 wrote one and it contradicted itself eight lines
 apart. Exclusions now name WHICH of two reasons applies: **solved
@@ -3408,7 +3408,7 @@ duplicating it here is complexity this machine must not carry) or
 **Revision 13 (2026-08-02)** — **SCOPE CORRECTION.** The mechanism has
 been stable for six rounds; what churned was the boundary. §0 is new,
 normative, and at the top: the machine owns the thread lifecycle and every
-state change that moves an thread on, off, or between cores, and the
+state change that moves a thread on, off, or between cores, and the
 deliverable is §6's invariants making §2.6's eight legacy signals
 provably redundant. Everything else is named OUT with a reason so it
 cannot be re-opened as an omission.
@@ -3661,7 +3661,7 @@ document SAID and what its tooling actually RAN.
 
 - **C-1 (`dropped` had no clearing rule; fixed by DELETION)**: rev 9's
   fourth directive terminal was modelled on `dead`, but `dead` is written
-  by finalize on an thread being freed, so "never cleared" is correct there
+  by finalize on a thread being freed, so "never cleared" is correct there
   and was inherited without its justification. On a live thread one
   stale-port drop left every future suspender's `none → claiming` CAS
   failing forever — the thread **permanently unsuspendable**, hence
@@ -3714,12 +3714,12 @@ document SAID and what its tooling actually RAN.
   §9.2 asserts IRQs-enabled at spin entry (not just `pin_depth == 0`),
   and §12 step 4 ADDS the entry-path enable in the same step as the pin
   gate.
-- **C-5 (domain restart absent, and the DERIVATION METHOD is why)**:
+- **C-5 (process restart absent, and the DERIVATION METHOD is why)**:
   `grep -ni restart` returned zero while §[restart_semantics] is
-  normative and per-thread. `restart_at_entry` has no edge — forcing an thread
+  normative and per-thread. `restart_at_entry` has no edge — forcing a thread
   runnable with its frame reset to the entry point is not edge 6, not 7,
-  not a claim-move — and `persist` keeps an thread running while its
-  domain's VMARs are freed, colliding with `active_root`/W6. The
+  not a claim-move — and `persist` keeps a thread running while its
+  process's VMARs are freed, colliding with `active_root`/W6. The
   instructive half is the method: the sufficiency table was derived by
   walking the spec's SYSCALL list, and §[restart_semantics] is not a
   syscall section. §11.9 carries my read (in scope, needs a new edge,
@@ -3765,7 +3765,7 @@ enumeration in this revision now carries an explicit
   split into `TermStart`/`TermRetire` so the caller's own mid-syscall
   retirement is expressible at all, self-terminate is now modelled (rev
   8 excluded it citing §8.2 — a WRONG citation: §8.2 is
-  `delete(SLOT_SELF)` on a capability DOMAIN, and §[terminate] licenses
+  `delete(SLOT_SELF)` on a process, and §[terminate] licenses
   no error for a self target), and `mterm` is a permanent falsifier.
 - **C-2 (CRITICAL — the priority fix re-opened in `parking`)**: §8.1
   routed `parking` with the word-alone states. False for
@@ -3783,7 +3783,7 @@ enumeration in this revision now carries an explicit
   is sound; the LEFT edge is false — `port.zig:463-465` states the
   tree's canonical order as **thread → Port**, and `futex.wake` traverses
   the thread/bucket pair in both directions, made safe by an ascending-index
-  discipline and a group opt-out rather than by any chain. The CD
+  discipline and a group opt-out rather than by any chain. The process
   gen-lock class was missing entirely and §8.5 contradicts the chain's
   shape. §3.5 now retracts the claim in place, keeps only the verified
   edge, and §11.10 records that **§8.1's reach protocol cannot be
@@ -3952,8 +3952,8 @@ over except where the README schedules re-runs.
   wait container kind, each row confirming lock-held deref +
   claim-CAS-or-skip, every row marked RECALL-derived (the marking is
   the finding; tool derivation is 9.3(6) future work). Reply pin
-  specified as ref-reached (holder-CD lock + thread gen validation;
-  dead-gen holder domain ⇒ teardown owns the slot, unwind skips
+  specified as ref-reached (holder-process lock + thread gen validation;
+  dead-gen holder process ⇒ teardown owns the slot, unwind skips
   idempotently); idle slot given its row; dual membership (timed
   waiter: container + deadline table; futex waiter: multiple buckets)
   stated with the unwind obligated to visit every named container.
@@ -4145,7 +4145,7 @@ M-A–M-C, text repairs), and adopts its method finding:
   `device_region.onIrq` is the enumerated T1 row.
 - **M-A (dead-mark in thread context / S7 silent drop)**: the self-delete
   dead-mark moves behind the hop into scheduler context —
-  `teardown_pending` now carries the pre-teardown CD ref and the park
+  `teardown_pending` now carries the pre-teardown process ref and the park
   stack runs phase 1 + phase 2 (§8.2); S7 filter failures retire the
   popped thread inline under the queue lock instead of silently dropping it
   (§3.2, S7).
@@ -4170,7 +4170,7 @@ inside the `_gen_lock` hold with a retired-arm CAS and kstack-clean audit
 (F1/F7); interrupt-context same-core 5b decline rule (F2 — superseded in
 rev 4 by `pended`); user-boundary entry-check gate (F3); deferred
 abandoned-marking (F4/F12); saved-frame/descriptor rule split (F5);
-CD-locked publish liveness gate (F6a); create-unwind protection restated
+process-locked publish liveness gate (F6a); create-unwind protection restated
 (F6b); release-before-commit hop order (F8); two-word directive (F9);
 device-IRQ source classified (F10 — completed in rev 4's T1); release-wait
 lock/bound contract (F11 — deleted in rev 4).

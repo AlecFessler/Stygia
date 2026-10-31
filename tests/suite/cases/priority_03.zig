@@ -4,7 +4,7 @@
 //
 // Strategy
 //   The priority syscall checks `[2] new_priority` against the caller's
-//   self-handle `pri` (§[capability_domain] field bits 14-15 of SelfCap).
+//   self-handle `pri` (§[process] field bits 14-15 of SelfCap).
 //   The runner mints each child with `pri = 3` (the maximum), so any
 //   `[2]` in 0..3 cannot exceed the ceiling out of the box. We first
 //   lower our own pri ceiling via `restrict` on the self-handle.
@@ -18,7 +18,7 @@
 //   To isolate the priority-ceiling check, every other priority error
 //   path must miss:
 //     - test 01 (E_BADCAP): use the runner-installed initial thread at
-//       SLOT_INITIAL_THREAD. Per §[create_capability_domain] test 21 the
+//       SLOT_INITIAL_THREAD. Per §[create_process] test 21 the
 //       initial thread carries caps = `thread_inner_ceiling` (0xFF in the
 //       runner), which includes `spri` (ThreadCap bit 3), so the cap is
 //       valid for the priority syscall.
@@ -53,7 +53,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // §[capability_domain] SelfCap. Lower the priority ceiling from 3
+    // §[process] SelfCap. Lower the priority ceiling from 3
     // (runner default) to 1. Every other cap bit drops to 0; that is a
     // strict bitwise subset of the runner-minted self-handle, so
     // restrict accepts it.

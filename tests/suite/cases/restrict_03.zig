@@ -1,6 +1,6 @@
 // Spec §[capabilities] restrict — test 03.
 //
-// "[test 03] returns E_PERM if the handle is an thread handle and [2].caps'
+// "[test 03] returns E_PERM if the handle is a thread handle and [2].caps'
 //  restart_policy (bits 8-9) numeric value exceeds the handle's current
 //  restart_policy."
 //
@@ -18,7 +18,7 @@
 //   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever; the test thread continues independently. No
 //   synchronization is required because the restrict operation
-//   touches the handle's caps slot in our domain's handle table —
+//   touches the handle's caps slot in our process's handle table —
 //   not the running thread's state.
 //
 // Action

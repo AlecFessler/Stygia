@@ -9,7 +9,7 @@
 //   `map_pf` mutates the kernel-side VMAR state (`map` and, on DMA,
 //   `device`); for handle-table consumers to observe that mutation
 //   without an explicit `sync`, the syscall must refresh [1]'s field0
-//   and field1 in the holding domain's (read-only) cap table on every
+//   and field1 in the holding process's (read-only) cap table on every
 //   call where [1] resolves to a valid handle — both the success path
 //   and the post-resolution error paths. We exercise both legs:
 //
@@ -67,7 +67,7 @@
 //      cannot verify the spec assertion.
 //   2: post-success cap-table snapshot of field1's `map` is not 1 —
 //      the success refresh did not propagate the kernel's authoritative
-//      `map = 1` into the holding domain's cap table.
+//      `map = 1` into the holding process's cap table.
 //   3: post-error cap-table snapshot of field1's `map` is not 1 — the
 //      error path failed to refresh the cap table to the kernel's
 //      authoritative state (or, equivalently, drifted it).

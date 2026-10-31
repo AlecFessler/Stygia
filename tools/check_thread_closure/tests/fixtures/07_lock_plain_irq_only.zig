@@ -1,7 +1,7 @@
 // EXPECT: classes=1 plain_thread_classes=0 unresolved=0
 //
 // A plain acquire that only IRQ-context code reaches. IRQs are already off
-// by hardware there, so it is not an thread-context preemption hazard and must
+// by hardware there, so it is not a thread-context preemption hazard and must
 // not be reported as one.
 const interrupts = @import("interrupts.zig");
 const sync = @import("../../utils/sync/spin_lock.zig");

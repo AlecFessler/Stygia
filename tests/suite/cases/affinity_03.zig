@@ -17,7 +17,7 @@
 //   That leaves the [2]-out-of-range check as the only assertion the
 //   call can trigger.
 //
-//   Mint a fresh self-domain thread carrying `saff` (and `term`, `susp` for
+//   Mint a fresh self-process thread carrying `saff` (and `term`, `susp` for
 //   shape parity with other thread tests) using a clean in-bounds initial
 //   affinity. The runner's child thread_inner_ceiling is 0xFF, which
 //   covers bits {move, copy, saff, spri, term, susp, read, write} — so

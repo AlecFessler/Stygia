@@ -63,7 +63,7 @@
 //! while `ptr._gen_lock` and `self.ptr._gen_lock` were counted as two
 //! classes although the kernel proves them the same lock. Receivers whose
 //! terminal name determines no declared class — SlabRef locals such as
-//! `cd_ref`, whose type the DB does not record — still fall back to the
+//! `process_ref`, whose type the DB does not record — still fall back to the
 //! literal text and so remain split per spelling.
 //!
 //! What remains approximate: `++`-joined class labels render the
@@ -86,7 +86,7 @@ const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 const sqlite = @import("sqlite.zig");
 const asm_analyzer = @import("asm_analyzer.zig");
 
-// ── Domain-knowledge tables (carried over from the legacy analyzer) ────
+// ── Process-knowledge tables (carried over from the legacy analyzer) ────
 
 const PLAIN_ACQUIRE_METHODS = [_][]const u8{
     "lock",
@@ -104,8 +104,8 @@ const IRQ_SAVE_ACQUIRE_METHODS = [_][]const u8{
     "lockWithGenOrderedIrqSave",
 };
 
-const PLAIN_RELEASE_METHODS = [_][]const u8{ "unlock" };
-const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{ "unlockIrqRestore" };
+const PLAIN_RELEASE_METHODS = [_][]const u8{"unlock"};
+const IRQ_RESTORE_RELEASE_METHODS = [_][]const u8{"unlockIrqRestore"};
 
 const BARE_PTR_FIELD_EXEMPT_FILES = [_][]const u8{
     "kernel/memory/allocators/secure_slab.zig",
@@ -343,12 +343,24 @@ fn shortName(qname: []const u8) []const u8 {
     return qname;
 }
 
-fn isPlainAcquire(name: []const u8) bool { return inList(name, &PLAIN_ACQUIRE_METHODS); }
-fn isIrqSaveAcquire(name: []const u8) bool { return inList(name, &IRQ_SAVE_ACQUIRE_METHODS); }
-fn isAnyAcquire(name: []const u8) bool { return isPlainAcquire(name) or isIrqSaveAcquire(name); }
-fn isPlainRelease(name: []const u8) bool { return inList(name, &PLAIN_RELEASE_METHODS); }
-fn isIrqRestoreRelease(name: []const u8) bool { return inList(name, &IRQ_RESTORE_RELEASE_METHODS); }
-fn isAnyRelease(name: []const u8) bool { return isPlainRelease(name) or isIrqRestoreRelease(name); }
+fn isPlainAcquire(name: []const u8) bool {
+    return inList(name, &PLAIN_ACQUIRE_METHODS);
+}
+fn isIrqSaveAcquire(name: []const u8) bool {
+    return inList(name, &IRQ_SAVE_ACQUIRE_METHODS);
+}
+fn isAnyAcquire(name: []const u8) bool {
+    return isPlainAcquire(name) or isIrqSaveAcquire(name);
+}
+fn isPlainRelease(name: []const u8) bool {
+    return inList(name, &PLAIN_RELEASE_METHODS);
+}
+fn isIrqRestoreRelease(name: []const u8) bool {
+    return inList(name, &IRQ_RESTORE_RELEASE_METHODS);
+}
+fn isAnyRelease(name: []const u8) bool {
+    return isPlainRelease(name) or isIrqRestoreRelease(name);
+}
 
 // Type-string ref parser. Recognizes `*T`, `?*T`, `*const T`,
 // `SlabRef(T)`, `?SlabRef(T)`. Returns the inner T name.
@@ -548,7 +560,7 @@ fn loadLockClasses(db: *sqlite.Db, st: *State) !void {
     }
 
     // File-agnostic entries, for receivers acquired outside the declaring
-    // file (`cd._gen_lock…` in syscall/ against a decl in caps/). Only when
+    // file (`process._gen_lock…` in syscall/ against a decl in caps/). Only when
     // every declaration of that name agrees — otherwise the name genuinely
     // does not determine the class and we must fall back.
     var it = agreed.iterator();
@@ -622,15 +634,18 @@ fn loadFiles(db: *sqlite.Db, st: *State, target: ?[]const u8) !void {
     // ArrayList mutex inside the indexer or callgraph tool gets pulled into
     // the IRQ-discipline analysis as a "lock class reachable from trap_sync".
     const NON_KERNEL_PREFIXES = [_][]const u8{
-        "routerOS/",  "hyprvOS/",  "bootloader/",
-        "tools/",     "tests/",
+        "routerOS/", "hyprvOS/", "bootloader/",
+        "tools/",    "tests/",
     };
     while (try stmt.step()) {
         const id: u32 = @intCast(stmt.columnInt(0));
         const path = stmt.columnText(1) orelse continue;
         var is_non_kernel = false;
         for (NON_KERNEL_PREFIXES) |pfx| {
-            if (mem.startsWith(u8, path, pfx)) { is_non_kernel = true; break; }
+            if (mem.startsWith(u8, path, pfx)) {
+                is_non_kernel = true;
+                break;
+            }
         }
         if (is_non_kernel) continue;
         // libz/ is userspace (a libc-style library that runs in user context
@@ -1039,9 +1054,9 @@ fn collectSlabFieldNames(db: *sqlite.Db, st: *State) !void {
     }
     // Seed common KernelObject variant names known to be SlabRef-typed.
     const variants = [_][]const u8{
-        "thread", "capability_domain", "vmar",
-        "page_frame",        "device_region",     "virtual_machine",
-        "vcpu",              "port",              "timer",
+        "thread",     "process",       "vmar",
+        "page_frame", "device_region", "virtual_machine",
+        "vcpu",       "port",          "timer",
     };
     for (variants) |v| {
         try st.slab_field_names.put(try a.dupe(u8, v), {});
@@ -1165,7 +1180,7 @@ const TrackedIdent = struct {
 const UnionVariantEntry = struct { variant: []const u8, ty: []const u8 };
 const UNION_VARIANTS = [_]UnionVariantEntry{
     .{ .variant = "thread", .ty = "Thread" },
-    .{ .variant = "capability_domain", .ty = "CapabilityDomain" },
+    .{ .variant = "process", .ty = "Process" },
     .{ .variant = "var_range", .ty = "VAR" },
     .{ .variant = "page_frame", .ty = "PageFrame" },
     .{ .variant = "device_region", .ty = "DeviceRegion" },
@@ -1182,20 +1197,20 @@ const DefaultFieldChainEntry = struct {
 };
 const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
     // Thread.
-    .{ .owner = "Thread", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "Thread", .field = "process", .ty = "Process" },
     .{ .owner = "Thread", .field = "next", .ty = "Thread" },
     .{ .owner = "Thread", .field = "prev", .ty = "Thread" },
     .{ .owner = "Thread", .field = "suspend_port", .ty = "Port" },
-    .{ .owner = "Thread", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
+    .{ .owner = "Thread", .field = "pending_reply_process", .ty = "Process" },
     .{ .owner = "Thread", .field = "vm", .ty = "VirtualMachine" },
     .{ .owner = "Thread", .field = "exit_port", .ty = "Port" },
     // VAR.
-    .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VAR", .field = "process", .ty = "Process" },
     .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },
     .{ .owner = "VAR", .field = "device", .ty = "DeviceRegion" },
     .{ .owner = "VAR", .field = "snapshot_source", .ty = "VAR" },
     // VirtualMachine.
-    .{ .owner = "VirtualMachine", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "VirtualMachine", .field = "process", .ty = "Process" },
     .{ .owner = "VirtualMachine", .field = "policy_pf", .ty = "PageFrame" },
     .{ .owner = "VirtualMachine", .field = "pf", .ty = "PageFrame" },
     // VCpu.
@@ -2582,9 +2597,9 @@ fn scanFnIrq(
         }
         // Skip Zig keywords/builtins.
         const kw_skip = [_][]const u8{
-            "if", "else", "while", "for", "switch", "return", "defer",
-            "errdefer", "try", "catch", "orelse", "comptime", "fn",
-            "const", "var", "pub", "test", "and", "or",
+            "if",       "else", "while", "for",    "switch",   "return", "defer",
+            "errdefer", "try",  "catch", "orelse", "comptime", "fn",     "const",
+            "var",      "pub",  "test",  "and",    "or",
         };
         if (inList(name, &kw_skip)) {
             p = e;
@@ -3281,23 +3296,15 @@ pub fn main() !u8 {
                 const acq = acquires.items[last_aidx];
                 if (acq.is_irq_save and !rel.is_irq_restore) {
                     n_pairing += 1;
-                    const ln = try std.fmt.allocPrint(gpa,
-                        "  {s}:{d}  release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)\n",
-                        .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
+                    const ln = try std.fmt.allocPrint(gpa, "  {s}:{d}  release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)\n", .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
                     try pairing_lines.append(gpa, ln);
-                    const sm = try std.fmt.allocPrint(gpa,
-                        "release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)",
-                        .{ rel.method, acq.line, acq.method });
+                    const sm = try std.fmt.allocPrint(gpa, "release={s} (acquire L{d} was {s} — IrqSave/Restore mismatch)", .{ rel.method, acq.line, acq.method });
                     try pairing_findings.append(gpa, .{ .file_path = rel.file_path, .line = rel.line, .message = sm });
                 } else if (!acq.is_irq_save and rel.is_irq_restore) {
                     n_pairing += 1;
-                    const ln = try std.fmt.allocPrint(gpa,
-                        "  {s}:{d}  release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)\n",
-                        .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
+                    const ln = try std.fmt.allocPrint(gpa, "  {s}:{d}  release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)\n", .{ rel.file_path, rel.line, rel.method, acq.line, acq.method });
                     try pairing_lines.append(gpa, ln);
-                    const sm = try std.fmt.allocPrint(gpa,
-                        "release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)",
-                        .{ rel.method, acq.line, acq.method });
+                    const sm = try std.fmt.allocPrint(gpa, "release={s} (acquire L{d} was {s} — Plain/IrqRestore mismatch)", .{ rel.method, acq.line, acq.method });
                     try pairing_findings.append(gpa, .{ .file_path = rel.file_path, .line = rel.line, .message = sm });
                 }
             }
@@ -3333,7 +3340,7 @@ pub fn main() !u8 {
     // (fat_pointer_field, ptr_bypass, etc.) we suppress the per-entry section
     // entirely so the user only sees what they asked for.
     const PER_ENTRY_RULES = [_][]const u8{
-        "lock_no_release", "no_lock_at_all", "unlock_outside_lock",
+        "lock_no_release",    "no_lock_at_all", "unlock_outside_lock",
         "no_release_on_exit",
     };
     const skip_per_entry = blk: {
@@ -3446,9 +3453,7 @@ pub fn main() !u8 {
         !(mem.startsWith(u8, rf, "asm_"))
     else
         false;
-    const summary_total_errs = total_errs
-        + n_discipline + n_pairing
-        + (if (skip_asm_pre) @as(u32, 0) else @as(u32, @intCast(asm_findings.items.len)));
+    const summary_total_errs = total_errs + n_discipline + n_pairing + (if (skip_asm_pre) @as(u32, 0) else @as(u32, @intCast(asm_findings.items.len)));
 
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{
@@ -3531,7 +3536,8 @@ pub fn main() !u8 {
     // WAL allows concurrent readers.
     db.close();
     writeGenlockFindings(
-        gpa, db_path,
+        gpa,
+        db_path,
         bare_findings.items,
         ptr_findings.items,
         release_findings.items,

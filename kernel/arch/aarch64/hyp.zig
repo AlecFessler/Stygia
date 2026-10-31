@@ -118,7 +118,7 @@ pub fn installHypVectors() void {
     // unusable there. Until that landed, an AP that issued ANY hypcall
     // wedged silently with IRQs masked: `map_guest` on a secondary core
     // reached `stage2InvalidateIpa` -> `hvc`, never returned, and took
-    // the whole machine down behind the CD gen-lock it was holding.
+    // the whole machine down behind the process gen-lock it was holding.
     if (gic.coreID() != 0) return;
     if (@atomicLoad(bool, &vm.hyp_vectors_installed, .acquire)) return;
 
@@ -780,7 +780,7 @@ export fn hyp_sync_lower_a64() linksection(".hyp_text") callconv(.naked) noretur
 // the byte IPA right by 12 to get that page number. The sequence is:
 //
 //   dsb ishst        — order prior stage-2 table stores before the TLBI
-//   tlbi ipas2e1is   — invalidate the specific IPA across the IS domain
+//   tlbi ipas2e1is   — invalidate the specific IPA across the IS process
 //                      (all EL0/EL1 entries that used stage-2 for this
 //                      IPA under the current VMID)
 //   dsb ish          — wait for the TLBI broadcast to complete everywhere

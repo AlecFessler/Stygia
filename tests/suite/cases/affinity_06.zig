@@ -8,9 +8,9 @@
 // Strategy
 //   §[capabilities]: any syscall that takes a handle whose state can
 //   drift implicitly refreshes the holder's field0/field1 snapshot
-//   from the authoritative kernel state. For an thread handle (§[execution_
+//   from the authoritative kernel state. For a thread handle (§[execution_
 //   context]) field1 carries the affinity mask and field0 carries the
-//   priority. The `affinity` syscall takes [1] as an thread handle, so the
+//   priority. The `affinity` syscall takes [1] as a thread handle, so the
 //   implicit-sync rule applies.
 //
 //   To prove the snapshot was refreshed by the affinity call itself
@@ -31,7 +31,7 @@
 //   the caller's snapshot (test 06). The error-path arm of test 06
 //   would require a way to detect a refresh that does not change the
 //   observed value, which requires drift the holder cannot induce
-//   on its own from a single domain — covering the success arm is
+//   on its own from a single process — covering the success arm is
 //   the sharpest we can do with the cap-table-as-only-observation
 //   surface.
 //

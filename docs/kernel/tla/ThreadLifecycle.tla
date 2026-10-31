@@ -93,7 +93,7 @@ CONSTANTS
                 \*          `parking` (T2's parking x K+C cell)
   DIR_ON,       \* BOOLEAN: the suspend directive protocol (Sec 2.5, W5)
   PINLOCK_ON,   \* BOOLEAN: pin-class lock holds (Sec 2.4, F3 surface)
-  S7_ON,        \* BOOLEAN: dead-domain dispatch filter + S7 claim route
+  S7_ON,        \* BOOLEAN: dead-process dispatch filter + S7 claim route
                 \*          (Sec 3.2, F2 state-machine half)
   DROP_BUDGET,  \* Nat: stale/bad-port owner failure events (DirDrop is the
                 \* only unbounded generator in the directive machine --
@@ -337,13 +337,13 @@ VARIABLES
           \*         symmetric-suspend check reads: a suspender u of
           \*         target t rejects iff threads[u].dsrc = t, i.e. "my own
           \*         directive is already claimed BY my target".
-          \*   dd  - the thread's domain is gen-dead (S7 filter input)
+          \*   dd  - the thread's process is gen-dead (S7 filter input)
   cores,  \* per-core record; pc gains "rvdeliver" (rendezvous delivery
           \* window, a pre-hop park-sequence phase holding a claim) and
           \* "s7ret" (S7 retire-as-holder, after the queue lock drops)
   tb,     \* remaining retire budget (environment retire + terminate)
   cb,     \* remaining edge-1 creation budget
-  db,     \* remaining domain-death events (S7 surface)
+  db,     \* remaining process-death events (S7 surface)
   pb      \* remaining stale-port drop events (round-12)
 vars == <<threads, cores, tb, cb, db, pb>>
 
@@ -476,7 +476,7 @@ Init ==
 
 (***************************************************************************)
 (* Edge 2: dispatch. One core_locks[c] critical section (Sec 3.2). The S7  *)
-(* domain filter gates the commit; filter failure takes the S7Claim route  *)
+(* process filter gates the commit; filter failure takes the S7Claim route  *)
 (* below, never a silent drop (S7).                                        *)
 (*                                                                         *)
 (***************************************************************************)
@@ -516,7 +516,7 @@ DispatchLoad(c) ==
                         IF e \in VCPU_THREADS THEN "guest" ELSE "host"]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
-(* Sec 3.2 / S7 / edge 5c (F2): a popped gen-dead-domain thread is CLAIMED     *)
+(* Sec 3.2 / S7 / edge 5c (F2): a popped gen-dead-process thread is CLAIMED     *)
 (* under the queue lock the dispatcher already holds (R-claim-legal),      *)
 (* then -- after the lock drops (next action) -- retired as holder via     *)
 (* T2's `claimed` row. Rev 4 retired it in place under the queue lock,     *)
@@ -560,7 +560,7 @@ StealClaim(c, v, e) ==
 (* running dispatch commit. The intermediate ready state is compressed but *)
 (* the commit is still the edge-2 ready-to-running authority. The stolen   *)
 (* thread then enters the same dispatch-tail split as ordinary dequeue. The    *)
-(* canPublishReady recheck is represented by the live-domain guard: DomDie *)
+(* canPublishReady recheck is represented by the live-process guard: ProcessDie *)
 (* may interleave after StealClaim while c's lock was dropped.             *)
 StealDispatch(c) ==
   LET e == cores[c].outg IN
@@ -579,7 +579,7 @@ StealDispatch(c) ==
 (* Reacquired thief lock, local ready work arrived while c's lock was      *)
 (* dropped: local work wins. The stolen claim is abandoned with no core    *)
 (* lock held through the placement path, then becomes ready in some        *)
-(* affinity-admitted destination queue if the domain is still publishable. *)
+(* affinity-admitted destination queue if the process is still publishable. *)
 StealAbandon(c) ==
   LET e == cores[c].outg IN
   /\ cores[c].pc = "stealCommit" /\ cores[c].irq = NULL
@@ -594,7 +594,7 @@ StealAbandon(c) ==
                              ![e].hld = NULL, ![e].pin = @ - 1]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
-(* DomDie can run while the thief has dropped and re-acquired locks around *)
+(* ProcessDie can run while the thief has dropped and re-acquired locks around *)
 (* stealCommit. Implementation rechecks canPublishReady before dispatch and*)
 (* enqueueOnCore rechecks before abandon placement; an unpublishable stolen*)
 (* claim cannot be dispatched or requeued. Abstract the S7-style teardown  *)
@@ -631,8 +631,8 @@ S7Retire(c) ==
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
-(* Environment: a domain dies (teardown phase 1 dead-mark, abstracted).    *)
-DomDie ==
+(* Environment: a process dies (teardown phase 1 dead-mark, abstracted).    *)
+ProcessDie ==
   /\ S7_ON /\ db > 0 /\ db' = db - 1
   /\ \E e \in Threads:
        /\ threads[e].st \notin {"retired","freed"}
@@ -1579,7 +1579,7 @@ RetireUnwind(e) ==
 (* to be `running`. That made the caller's own retirement mid-syscall     *)
 (* INEXPRESSIBLE, and with it the entire mutual-terminate shape. It also  *)
 (* excluded self-terminate, citing Sec 8.2 -- a WRONG citation: Sec 8.2  *)
-(* is `delete(SLOT_SELF)` on a capability DOMAIN, a different syscall.    *)
+(* is `delete(SLOT_SELF)` on a process, a different syscall.    *)
 (* specv3 Sec [terminate] licenses no error for a self target, so        *)
 (* `terminate(self())` must succeed and the model must contain it.       *)
 (*                                                                        *)
@@ -1737,8 +1737,8 @@ PinUnlock(c) ==
 (* publication, not by publishing the new thread directly into a port wait     *)
 (* container. The exit-port vCPU list/bind pin is outside this model's     *)
 (* wait-container `lnk` bit; the implementation holds a lifecycle pin and *)
-(* the port lock across list publication + enqueue. The CD-lock           *)
-(* domain-liveness gate and private-unwind arm are not modelled (domains  *)
+(* the port lock across list publication + enqueue. The process-lock           *)
+(* process-liveness gate and private-unwind arm are not modelled (processes  *)
 (* are one flag).                                                         *)
 (***************************************************************************)
 CreateThread(c) ==
@@ -1957,7 +1957,7 @@ Next ==
        \/ Request(c)
        \/ BaseStep(c) \/ IrqStep(c) \/ TickPreempt(c)
   \/ \E e \in Threads: FireAny(e) \/ RetireThread(e) \/ RetireUnwind(e)
-  \/ DomDie
+  \/ ProcessDie
   \/ Terminating
 
 SpecNF == Init /\ [][Next]_vars
@@ -2319,7 +2319,7 @@ InvNoSuspendCycle3 ==
 (* T1 no-decline closure (X3): `consumed` means "the one-shot pop was      *)
 (* taken and its discharge is not yet complete" (it is cleared at          *)
 (* placement or finalize). A consumed pop therefore always implies a       *)
-(* claim/pend/retire discharge in flight -- never an thread still sitting in   *)
+(* claim/pend/retire discharge in flight -- never a thread still sitting in   *)
 (* its wait episode with the registration gone and nobody claiming.        *)
 InvNoLostOneShot ==
   \A e \in Threads:

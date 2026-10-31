@@ -17,7 +17,7 @@
 //         NOT park) after the call completes;
 //     (d) the reply handle slot consumed.
 //
-//   Pipeline (single domain, test thread owns everything):
+//   Pipeline (single process, test thread owns everything):
 //
 //     1. Mint port_A with caps = {bind, recv}. bind authorizes the
 //        third-party suspend of W onto this port (§[suspend] [2] cap);

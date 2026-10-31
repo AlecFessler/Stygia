@@ -18,7 +18,7 @@ const scheduler = stygia.sched.scheduler;
 const serial = stygia.arch.x64.serial;
 const vmar = stygia.memory.vmar;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const DeviceRegion = stygia.devices.device_region.DeviceRegion;
 const Thread = stygia.sched.thread.Thread;
 const GateType = stygia.arch.x64.idt.GateType;
@@ -215,16 +215,16 @@ fn exceptionEvent(vector: u5) ?ExceptionEvent {
 
 /// Probe the user-mode instruction byte at `rip` against the HLT opcode
 /// (0xF4, single byte — Intel SDM Vol 2A "HLT"). Walks the current thread's
-/// capability-domain page tables so we don't depend on the page being
+/// process page tables so we don't depend on the page being
 /// resident in any kernel-side cache. Returns false if there is no
 /// current thread, the page is not resident, or the byte mismatches.
 fn isUserHltAt(rip: u64) bool {
     const thread = scheduler.currentThread() orelse return false;
     // caller-pinned: currentThread() runs on this core; its bound capability
-    // domain stays alive for the duration of this exception handler.
-    const domain = thread.domain.ptr;
+    // process stays alive for the duration of this exception handler.
+    const process = thread.process.ptr;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse
+    const phys = paging_mod.resolveVaddr(process.addr_space_root, rip_page) orelse
         return false;
     const physmap_base = VAddr.fromPAddr(phys, null).addr;
     const byte_ptr: *const u8 = @ptrFromInt(physmap_base + (rip & 0xFFF));
@@ -304,8 +304,8 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // Helps catch silent thread terminations from `unreachable` (#UD)
             // and other faults during in-Stygia compiler bring-up.
             // caller-pinned: thread is currentThread() running on this core; its
-            // domain SlabRef stays valid for the fault handler's duration.
-            const dom_root = thread.domain.ptr.addr_space_root;
+            // process SlabRef stays valid for the fault handler's duration.
+            const dom_root = thread.process.ptr.addr_space_root;
             const rip_byte: u8 = if (paging_mod.resolveVaddr(
                 dom_root,
                 VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF)),
@@ -437,9 +437,9 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
             @panic("user page fault with no current thread");
         };
         // caller-pinned: currentThread() runs on this core; its bound
-        // capability domain is alive across this PF handler.
-        const domain = thread.domain.ptr;
-        if (vmar.findVmarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
+        // process is alive across this PF handler.
+        const process = thread.process.ptr;
+        if (vmar.findVmarCovering(process, VAddr.fromInt(faulting_addr))) |v| {
             const v_irq = v._gen_lock.lockIrqSave(@src());
             const is_port_io = v.map == .mmio and
                 v.device != null and
@@ -447,7 +447,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
                 v.device.?.ptr.device_type == .port_io;
             v._gen_lock.unlockIrqRestore(v_irq);
             if (is_port_io) {
-                emulateVirtualBar(ctx, thread, v, faulting_addr, domain);
+                emulateVirtualBar(ctx, thread, v, faulting_addr, process);
                 if (comptime pf_log.enabled) {
                     pf_log.mark(thread, .USER_PORT_IO, faulting_addr, @truncate(ctx.err_code));
                     pf_log.mark(thread, .RESUME, faulting_addr, @truncate(ctx.err_code));
@@ -461,8 +461,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         const thread_for_diag = scheduler.currentThread();
         const vmar_label: []const u8 = if (thread_for_diag) |thread_d| blk: {
             // caller-pinned: thread_d is currentThread() running on this core; its
-            // domain SlabRef stays valid for the fault handler's duration.
-            const cov = vmar.findVmarCovering(thread_d.domain.ptr, VAddr.fromInt(faulting_addr));
+            // process SlabRef stays valid for the fault handler's duration.
+            const cov = vmar.findVmarCovering(thread_d.process.ptr, VAddr.fromInt(faulting_addr));
             break :blk if (cov) |_| "in-vmar" else "no-vmar";
         } else "no-thread";
         // Read instruction bytes at user RIP. Walk the thread's page tables so
@@ -472,8 +472,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         if (thread_for_diag) |thread_b| {
             const rip_page = VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF));
             // caller-pinned: thread_b is currentThread() running on this core; its
-            // domain SlabRef stays valid for the fault handler's duration.
-            if (paging_mod.resolveVaddr(thread_b.domain.ptr.addr_space_root, rip_page)) |phys| {
+            // process SlabRef stays valid for the fault handler's duration.
+            if (paging_mod.resolveVaddr(thread_b.process.ptr.addr_space_root, rip_page)) |phys| {
                 const physmap_base = VAddr.fromPAddr(phys, null).addr;
                 const off = ctx.rip & 0xFFF;
                 var i: usize = 0;
@@ -548,13 +548,13 @@ fn emulateVirtualBar(
     thread: *Thread,
     v: *VMAR,
     faulting_addr: u64,
-    domain: *CapabilityDomain,
+    process: *Process,
 ) void {
     // Snapshot under the lock then release before any path that may
     // suspend or terminate `thread`: the fault handlers may unwind
     // through the scheduler and never return here, so holding the VMAR
     // lock across them would strand the gen and deadlock any future
-    // walk of the domain's vars[]. The DeviceRegion pointer is stable
+    // walk of the process's vars[]. The DeviceRegion pointer is stable
     // for the kernel's lifetime once bound and `base_vaddr` is
     // immutable on the VMAR, so the snapshot is safe to use unlocked.
     const v_irq = v._gen_lock.lockIrqSave(@src());
@@ -564,7 +564,7 @@ fn emulateVirtualBar(
     const var_base_addr = v.base_vaddr.addr;
     v._gen_lock.unlockIrqRestore(v_irq);
 
-    // Fetch instruction bytes from user RIP via the domain's page tables.
+    // Fetch instruction bytes from user RIP via the process's page tables.
     // x86-64 instructions are at most 15 bytes and may straddle a page
     // boundary; gather from up to two consecutive user pages.
     const rip = ctx.rip;
@@ -572,7 +572,7 @@ fn emulateVirtualBar(
     const first_page_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
+    const phys = paging_mod.resolveVaddr(process.addr_space_root, rip_page) orelse {
         port.fireThreadFault(thread, ThreadFaultSubcode.protection, rip);
         // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
         // stashed on this core; an IRQ handler here could spin on
@@ -601,7 +601,7 @@ fn emulateVirtualBar(
     var fetched: u8 = first_page_bytes;
     if (first_page_bytes < 15) {
         const next_page = VAddr.fromInt((rip & ~@as(u64, 0xFFF)) + 0x1000);
-        if (paging_mod.resolveVaddr(domain.addr_space_root, next_page)) |next_phys| {
+        if (paging_mod.resolveVaddr(process.addr_space_root, next_page)) |next_phys| {
             const next_base = VAddr.fromPAddr(next_phys, null).addr;
             const next_ptr: [*]const u8 = @ptrFromInt(next_base);
             const need: u8 = 15 - first_page_bytes;

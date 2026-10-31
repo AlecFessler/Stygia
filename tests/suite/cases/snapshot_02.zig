@@ -3,8 +3,8 @@
 // "[test 02] returns E_BADCAP if [2] is not a valid VMAR handle."
 //
 // Strategy
-//   The child capability domain's table is populated by the kernel at
-//   `create_capability_domain` time:
+//   The child process's table is populated by the kernel at
+//   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
 //     slot 2  → self-IDC
@@ -16,7 +16,7 @@
 //
 //   To isolate that gate from the §[snapshot] test 01 BADCAP gate on
 //   [1], we must create [1] as a valid VMAR handle. Per
-//   §[restart_semantics], the calling domain's
+//   §[restart_semantics], the calling process's
 //   `restart_policy_ceiling.vmar_restart_max` bounds `caps.restart_policy`
 //   on `create_vmar`. The runner's primary.zig grants the child
 //   `vmar_restart_max = 3` (full snapshot policy), so a VMAR may be
@@ -72,7 +72,7 @@ pub fn main(cap_table_base: u64) void {
 
     const target_vmar: caps.HandleId = @truncate(cv.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout. The §[snapshot] test 02 BADCAP gate on [2] must
     // fire because no VMAR lives at this slot.
     const empty_slot: caps.HandleId = caps.HANDLE_TABLE_MAX - 1;

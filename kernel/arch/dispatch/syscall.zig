@@ -77,7 +77,7 @@ pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
 /// Read the saved instruction pointer from a suspending thread — used to
 /// snapshot the sender's RIP/PC at suspend time for delivery as Spec
 /// §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32 (aarch64
-/// `[sp+8]`) at recv time. For an thread that has never executed this
+/// `[sp+8]`) at recv time. For a thread that has never executed this
 /// returns the entry point set up by `prepareThreadContext`; for one
 /// suspended mid-execution it returns the saved iret-frame RIP/PC.
 pub fn getEventRip(ctx: *const ArchCpuContext) u64 {

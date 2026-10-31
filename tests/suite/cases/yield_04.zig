@@ -9,7 +9,7 @@
 //   yield's implicit-sync side effect mirrors the rule sync_03 covers
 //   for the explicit `sync` syscall: any syscall that takes a handle
 //   refreshes that handle's kernel-mutable field0/field1 snapshot. For
-//   an thread handle (§[thread]):
+//   a thread handle (§[thread]):
 //     field0 bits 0-1   = pri
 //     field0 bits 2-63  = _reserved
 //     field1 bits 0-63  = affinity
@@ -19,7 +19,7 @@
 //
 //   Mint a fresh thread with a known priority and a known single-bit
 //   affinity mask:
-//     - priority = 2 (well below the child domain's pri ceiling of 3,
+//     - priority = 2 (well below the child process's pri ceiling of 3,
 //       see runner/primary.zig `child_self.pri = 3`).
 //     - affinity = 0x1 (core 0 always exists per §[affinity] test 03;
 //       avoids the `affinity = 0 → kernel chooses` ambiguity in the

@@ -11,8 +11,8 @@
 //! ─── Rule A — interrupt-context wake-source closure ────────────────────
 //!
 //! Reports every function reachable from an interrupt/exception entry
-//! point that can wake or claim an thread. Adding a new ISR
-//! path that wakes an thread becomes a visible diff instead of a silent one.
+//! point that can wake or claim a thread. Adding a new ISR
+//! path that wakes a thread becomes a visible diff instead of a silent one.
 //!
 //!   seeds       union of three mechanical sources (see `collectIrqSeeds`)
 //!   primitives  the thread claim / run-queue-insertion funnels (`WAKE_PRIMITIVES`)
@@ -39,7 +39,7 @@
 //! `ir_call` alone is NOT a sound base for a closure claim. The indexer
 //! maps LLVM IR callee names back to entities by exact name, and Zig's
 //! monomorphized generics carry decorated IR names
-//! (`…SecureSlab(caps.capability_domain.CapabilityDomain,256).forEachAlive__anon_94571`)
+//! (`…SecureSlab(caps.process.Process,256).forEachAlive__anon_94571`)
 //! that never match an entity row — so every call *through* a generic is
 //! silently absent from `ir_call`. The indexer generic-call fixture
 //! demonstrates this gap through `SecureSlab(...).forEachAlive`.
@@ -1074,7 +1074,7 @@ fn argChain(ctx: *Ctx, toks: []const Tok, from: usize, to: usize) !?[][]const u8
 ///     slot_ptr._gen_lock.class = "SecureSlab(" ++ @typeName(T) ++ ")._gen_lock";
 ///
 /// Every `_gen_lock` field in the tree therefore belongs to that class
-/// family, which is what lets an acquire written `cd._gen_lock…` in
+/// family, which is what lets an acquire written `process._gen_lock…` in
 /// syscall/ resolve against a decl in caps/ — see `resolveLockClass`.
 ///
 /// `++`-joined literals are rendered with `…` for the non-literal parts,
@@ -1266,7 +1266,7 @@ fn collectAliases(ctx: *Ctx, file_i: u32, host: u32) ![]Alias {
         }
         // `for (&chain[, …]) |[*]NAME[, …]|` — the per-core lock arrays
         // are swept this way (`for (&core_locks) |*lock|` in
-        // `scheduler.awaitDomainQuiesced`), and without this the capture
+        // `scheduler.awaitProcessQuiesced`), and without this the capture
         // name shadows nothing resolvable and the acquire is lost.
         if (toks[i].kind == .keyword_for and toks[i + 1].kind == .l_paren) {
             var operands: ArrayList([][]const u8) = .{};
@@ -1325,7 +1325,7 @@ fn collectAliases(ctx: *Ctx, file_i: u32, host: u32) ![]Alias {
 ///     every acquire" on the strength of half its acquire sites.
 ///
 ///   • Unresolvable cross-file receivers. Every slab-backed type declares
-///     `_gen_lock`, so a decl-keyed lookup for `cd._gen_lock…` found ~12
+///     `_gen_lock`, so a decl-keyed lookup for `process._gen_lock…` found ~12
 ///     candidates, none in the acquiring file, and gave up — 33 acquires
 ///     into UNRESOLVED. All 12 decls carry the SAME class, so the
 ///     ambiguity was never real: the answer does not depend on which decl
@@ -1576,11 +1576,11 @@ fn ruleA(ctx: *Ctx, o: Opts, w: W, counts: *Counts) ![]ClaimSite {
 
     // ── Wake sources = the arch → generic frontier of the closure.
     //
-    // A wake source is a function that (a) can reach an thread claim, (b) is
+    // A wake source is a function that (a) can reach a thread claim, (b) is
     // itself reachable from an interrupt entry, (c) lives outside
     // `kernel/arch/` and (d) is called directly by arch code that is also
     // inside the closure. That is precisely "the first thing the ISR
-    // plumbing hands control to that can wake an thread" — the granularity a
+    // plumbing hands control to that can wake a thread" — the granularity a
     // hand-written enumeration table uses.
     //
     // Deliberately NOT "the first non-arch node on a shortest witness
@@ -1873,7 +1873,7 @@ fn ruleB(ctx: *Ctx, o: Opts, w: W, counts: *Counts) !void {
         try w.print("\n", .{});
         try w.print("Direct `SpinLock` and `<x>._gen_lock` acquires ARE resolved (the\n", .{});
         try w.print("latter via the runtime class assignment in secure_slab.zig). What\n", .{});
-        try w.print("remains is dominated by SlabRef receivers — `cd_ref.lockIrqSave(…)`\n", .{});
+        try w.print("remains is dominated by SlabRef receivers — `process_ref.lockIrqSave(…)`\n", .{});
         try w.print("— where the receiver is a local whose type decides the class. The\n", .{});
         try w.print("kernel proves every SlabRef acquire bottoms out in the target's\n", .{});
         try w.print("`self.ptr._gen_lock`, so these ARE that class; the analyzer cannot\n", .{});

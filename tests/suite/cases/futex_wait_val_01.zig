@@ -5,33 +5,33 @@
 //
 // FIDELITY NOTE — DEGRADED SMOKE VARIANT
 //   The check fires on the *caller's* self-handle. `fut_wait_max` lives
-//   in the capability_domain handle's field1 (bits 32-37 per
-//   §[capability_domain]) and is set at `create_capability_domain`
+//   in the process handle's field1 (bits 32-37 per
+//   §[process]) and is set at `create_process`
 //   time via `ceilings_outer`. It is not part of the cap word that
 //   `restrict` operates on (caps are word0 bits 48-63), so this test
-//   domain cannot lower its own `fut_wait_max` from the 63 the runner
-//   grants every spawned domain (see runner/primary.zig
+//   process cannot lower its own `fut_wait_max` from the 63 the runner
+//   grants every spawned process (see runner/primary.zig
 //   `ceilings_outer = 0x0000_003F_01FE_FFFF` — bits 32-37 = 63).
 //
-//   Spawning a sub-domain with `fut_wait_max = 0` does not move the
+//   Spawning a sub-process with `fut_wait_max = 0` does not move the
 //   gate into our reach either: the test 01 check fires on the
 //   *caller's* ceiling, and our caller (this test) keeps `fut_wait_max
-//   = 63`. To exercise the failure mode faithfully, the sub-domain
+//   = 63`. To exercise the failure mode faithfully, the sub-process
 //   would need to load its own ELF that calls `futex_wait_val`, and
 //   the v0 runner manifest pipeline embeds exactly one ELF per test
 //   file — there is no in-test path to nest a second ELF inside this
-//   one as the sub-domain's image.
+//   one as the sub-process's image.
 //
 //   Until the runner exposes either (a) a per-test `fut_wait_max`
-//   override on the spawned domain, or (b) a nested-ELF harness so the
-//   sub-domain can run its own test body, the failure-mode assertion
+//   override on the spawned process, or (b) a nested-ELF harness so the
+//   sub-process can run its own test body, the failure-mode assertion
 //   of test 01 is not reachable from in-process userspace. The test
 //   in its full form is blocked on runner support, not on the kernel
 //   — the kernel-side E_PERM path is straightforward to add once the
 //   v3 implementation lands.
 //
 // Strategy (degraded)
-//   Issue `futex_wait_val` from this domain (which holds `fut_wait_max
+//   Issue `futex_wait_val` from this process (which holds `fut_wait_max
 //   = 63`) so the syscall dispatcher gets exercised end-to-end. The
 //   call cannot return E_PERM-via-fut_wait_max here, so we don't gate
 //   on that specific code; instead we report `pass()` after the call
@@ -61,7 +61,7 @@
 //   This test does not assert that futex_wait_val returns E_PERM when
 //   the caller's self-handle has `fut_wait_max = 0`. See "FIDELITY
 //   NOTE" above. A future faithful variant should be added once the
-//   harness can spawn a test domain with a configured `fut_wait_max`.
+//   harness can spawn a test process with a configured `fut_wait_max`.
 
 const lib = @import("lib");
 

@@ -53,7 +53,7 @@ pub const SPIN_PANIC_ITERS: u64 = 200_000_000;
 /// (`debug.acquire` runs ahead of the CAS loop), so a core's TOP held
 /// entry is ambiguous: it may be a lock the core owns, or the one it is
 /// stuck waiting for. That ambiguity is what stalled the first
-/// bare-metal wedge autopsy — three cores each listing one CD gen-lock
+/// bare-metal wedge autopsy — three cores each listing one process gen-lock
 /// with no way to tell holder from waiter. This table resolves it: a
 /// core appears here only while genuinely spinning, so
 /// `held \ waiting` is the set it actually owns.

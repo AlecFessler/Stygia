@@ -7,12 +7,12 @@
 // caps.dma = 1. Per §[create_vmar] tests 14/15 a dma create_vmar
 // requires [5] to be a valid device_region handle that itself
 // holds the `dma` cap. The runner's child cap_table is populated
-// by create_capability_domain: slot 0 self, slot 1 initial thread,
+// by create_process: slot 0 self, slot 1 initial thread,
 // slot 2 self-IDC, slot 3 the result port. No device_regions are
 // forwarded to children today (see runner/primary.zig spawnOne —
 // `passed[]` carries only the result port). That makes the dma
 // create_vmar prelude — and therefore §[remap] test 05 — structurally
-// unreachable from inside a child capability domain on this branch.
+// unreachable from inside a child process on this branch.
 //
 // This test mirrors the degraded-smoke pattern used by
 // create_var_22.zig: scan the cap table for a device_region with
@@ -85,7 +85,7 @@ pub fn main(cap_table_base: u64) void {
 
 fn findDmaDevice(cap_table_base: u64) ?caps.HandleId {
     // Scan the full handle table. Slots 0/1/2 are self / initial thread
-    // / self-IDC for a child capability domain (§[capability_domain]),
+    // / self-IDC for a child process (§[process]),
     // and passed_handles start at slot 3. Today the runner forwards
     // only the result port at slot 3; no device_regions reach a
     // child. Scan everything to remain robust if that changes.

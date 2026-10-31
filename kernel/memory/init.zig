@@ -4,7 +4,7 @@ const stygia = @import("stygia");
 const address = stygia.memory.address;
 const arch = stygia.arch.dispatch;
 const boot = stygia.boot;
-const capability_domain_mod = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const dev_region_mod = stygia.devices.device_region;
 const thread_mod = stygia.sched.thread;
 const KA = address.KernelVA.KernelAllocators;
@@ -180,10 +180,10 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.dev_region_slab_ptrs,
         KA.dev_region_slab_links,
     );
-    capability_domain_mod.initSlab(
-        KA.capability_domain_slab,
-        KA.capability_domain_slab_ptrs,
-        KA.capability_domain_slab_links,
+    process_mod.initSlab(
+        KA.process_slab,
+        KA.process_slab_ptrs,
+        KA.process_slab_links,
     );
     thread_mod.initSlab(
         KA.managed_thread_slab,

@@ -1,6 +1,6 @@
 // Spec §[capabilities] handle layout, type tags, and per-type cap bit
 // definitions. The handle table is mapped read-only into the holding
-// domain — code constructing handle ids for syscall args wraps a u12;
+// process — code constructing handle ids for syscall args wraps a u12;
 // reading caps from the table reads the full Cap struct verbatim.
 
 pub const HANDLE_ID_BITS: u6 = 12;
@@ -9,8 +9,8 @@ pub const HANDLE_TABLE_MAX: u32 = 1 << HANDLE_ID_BITS;
 pub const HandleId = u12;
 
 pub const HandleType = enum(u4) {
-    capability_domain_self = 0,
-    capability_domain = 1,
+    process_self = 0,
+    process = 1,
     thread = 2,
     page_frame = 3,
     virtual_memory_address_region = 4,
@@ -43,7 +43,7 @@ pub const HANDLE_BYTES: usize = @sizeOf(Cap);
 
 // §[capabilities]: "Some handles carry kernel-mutable snapshots in their
 // field0/field1." Reads here are non-atomic snapshots; the holding
-// domain accepts that the kernel may have mutated the slot mid-read.
+// process accepts that the kernel may have mutated the slot mid-read.
 // Use `sync` to force a fresh kernel-authoritative snapshot when that
 // matters.
 pub fn readCap(cap_table_base: u64, slot: u32) Cap {
@@ -116,9 +116,9 @@ pub fn handleArg(slot: HandleId) u64 {
     return @as(u64, slot);
 }
 
-// §[capability_domain] self-handle cap bits.
+// §[process] self-handle cap bits.
 pub const SelfCap = packed struct(u16) {
-    crcd: bool = false,
+    crproc: bool = false,
     crec: bool = false,
     crvr: bool = false,
     crpf: bool = false,
@@ -138,7 +138,7 @@ pub const SelfCap = packed struct(u16) {
     }
 };
 
-// §[capability_domain] IDC handle cap bits.
+// §[process] IDC handle cap bits.
 pub const IdcCap = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
@@ -257,7 +257,7 @@ pub const VmCap = packed struct(u16) {
     }
 };
 
-// §[create_capability_domain] passed-handle entry encoding.
+// §[create_process] passed-handle entry encoding.
 pub const PassedHandle = packed struct(u64) {
     id: u12,
     _reserved_lo: u4 = 0,
@@ -283,8 +283,8 @@ pub const PairEntry = packed struct(u64) {
     }
 };
 
-// Conventional slot ids for a freshly-created capability domain
-// (§[capability_domain] / §[create_capability_domain]).
+// Conventional slot ids for a freshly-created process
+// (§[process] / §[create_process]).
 pub const SLOT_SELF: HandleId = 0;
 pub const SLOT_INITIAL_THREAD: HandleId = 1;
 pub const SLOT_SELF_IDC: HandleId = 2;

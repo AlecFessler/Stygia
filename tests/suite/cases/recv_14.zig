@@ -7,7 +7,7 @@
 //   The timeout-after-blocking path is fully exercisable from a single
 //   test thread. recv blocks while no sender is queued on the port; with
 //   the test thread as the sole holder of the port handle and no other thread
-//   in this domain, no sender can ever become queued, and the only
+//   in this process, no sender can ever become queued, and the only
 //   spec-defined return path is the timeout one.
 //
 //   We mint a fresh port with caps={bind, recv}:
@@ -16,7 +16,7 @@
 //       bind-cap holder + no queued events) before
 //       the kernel can even arm the deadline.
 //     - recv lets this handle pass test 02 (E_PERM without `recv`).
-//   The handle returned by createPort sits in the test domain's table
+//   The handle returned by createPort sits in the test process's table
 //   with reserved bits clean (the libz wrapper truncates to u12), so
 //   tests 01 (E_BADCAP) and 03 (E_INVAL on reserved bits) cannot fire.
 //
@@ -39,7 +39,7 @@
 //       port handle with the bind cap, keeping the bind refcount at
 //       1, so this gate does not fire.
 //     - test 06 (E_FULL): even though the timeout path returns before
-//       any reply handle is minted, the test domain has plenty of
+//       any reply handle is minted, the test process has plenty of
 //       free slots — this gate is not reachable.
 //
 // Action
@@ -73,7 +73,7 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
     // Step 2: recv with a finite, nonzero timeout. No other thread exists
-    // in this domain, no event
+    // in this process, no event
     // is ever queued, so the kernel's only spec-defined return is the
     // timeout path: vreg 1 = E_TIMEOUT once the 10ms deadline elapses.
     const timeout_ns: u64 = 10_000_000; // 10 ms

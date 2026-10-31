@@ -64,19 +64,19 @@ const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 // ── Public types ──────────────────────────────────────────────────────
 
 pub const Finding = struct {
-    file_path: []const u8,    // arena-owned
+    file_path: []const u8, // arena-owned
     line: u32,
-    fn_qname: []const u8,     // arena-owned
+    fn_qname: []const u8, // arena-owned
     rule: []const u8,
-    message: []const u8,      // arena-owned
+    message: []const u8, // arena-owned
 };
 
 pub const Input = struct {
     qname: []const u8,
     file_path: []const u8,
     file_source: []const u8,
-    fn_text: []const u8,        // bytes of the entire fn (signature + body)
-    fn_byte_start: u32,         // byte offset of fn_text within file_source
+    fn_text: []const u8, // bytes of the entire fn (signature + body)
+    fn_byte_start: u32, // byte offset of fn_text within file_source
 };
 
 // ── Public entry ──────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ fn scanFn(
     // genuinely too coarse — NOT as a way to silence inconvenient
     // findings. An unlocked access through a slab pointer is almost
     // always a real race against operations that other handles to the
-    // same object can mount via their own holding domains, even when
+    // same object can mount via their own holding processes, even when
     // a different lock (e.g. a Port lock) is held.
     if (mem.indexOf(u8, f.fn_text, "// asm-genlock: skip") != null) return;
     // Gate 3: body is a single asm volatile(...) statement.
@@ -280,16 +280,16 @@ fn offsetToLine(s: []const u8, off: usize) u32 {
 // ── Expansion ─────────────────────────────────────────────────────────
 
 const SymRef = struct {
-    placeholder: []const u8,    // "port_lock_off"
-    is_simple: bool,            // single @offsetOf(T, "field")
-    struct_name: []const u8,    // "Port"   (only valid when is_simple)
-    field_name: []const u8,     // "_gen_lock"  (only valid when is_simple)
+    placeholder: []const u8, // "port_lock_off"
+    is_simple: bool, // single @offsetOf(T, "field")
+    struct_name: []const u8, // "Port"   (only valid when is_simple)
+    field_name: []const u8, // "_gen_lock"  (only valid when is_simple)
 };
 
 const AsmLine = struct {
-    text: []const u8,         // arena-owned, post-substitution
+    text: []const u8, // arena-owned, post-substitution
     source_line: u32,
-    refs: []const SymRef,     // arena-owned
+    refs: []const SymRef, // arena-owned
 };
 
 const ExpansionList = ArrayList(AsmLine);
@@ -571,14 +571,14 @@ fn trimAscii(s: []const u8) []const u8 {
 // ── comptimePrint resolution ──────────────────────────────────────────
 
 const ComptimePrintCall = struct {
-    fmt_text: []const u8,    // raw (un-decoded) format string content
-    args_text: []const u8,   // raw struct-literal args
-    end: usize,              // byte AFTER the closing `)` of the call
+    fmt_text: []const u8, // raw (un-decoded) format string content
+    args_text: []const u8, // raw struct-literal args
+    end: usize, // byte AFTER the closing `)` of the call
 };
 
 const ResolvedPrint = struct {
-    text: []const u8,        // arena-owned, with refs substituted
-    refs: []const SymRef,    // arena-owned
+    text: []const u8, // arena-owned, with refs substituted
+    refs: []const SymRef, // arena-owned
 };
 
 /// Parse `<head>(fmt, args)` where `<head>` is the comptimePrint identifier.
@@ -751,8 +751,8 @@ fn parseArgsLiteral(arena: Allocator, args_text: []const u8) !ArrayList(ArgEntry
 }
 
 const SimpleOffset = struct {
-    struct_name: []const u8,    // arena-owned
-    field_name: []const u8,     // arena-owned
+    struct_name: []const u8, // arena-owned
+    field_name: []const u8, // arena-owned
 };
 
 /// Recognize `@offsetOf(<TypeExpr>, "<field>")` as a single simple ref.
@@ -905,12 +905,12 @@ fn attachRefs(
 
 /// Per-line classification.
 const LineClass = union(enum) {
-    label: []const u8,                                  // ".Lname"
-    jmp_uncond: []const u8,                              // jmp .Lname
+    label: []const u8, // ".Lname"
+    jmp_uncond: []const u8, // jmp .Lname
     jmp_cond: struct { cc: []const u8, target: []const u8 }, // jcc .Lname
-    cmpxchg_acquire: AccessSite,                         // lock cmpxchgq ..., <T._gen_lock>(%base)
-    release: AccessSite,                                 // andq $-2, <T._gen_lock>(%base)
-    field_access: AccessSite,                            // <op> ... <T.<field>>(%base)
+    cmpxchg_acquire: AccessSite, // lock cmpxchgq ..., <T._gen_lock>(%base)
+    release: AccessSite, // andq $-2, <T._gen_lock>(%base)
+    field_access: AccessSite, // <op> ... <T.<field>>(%base)
     raw_access: struct { base_reg: []const u8, offset: i64 }, // <op> ... <num>(%base)
     other,
 };
@@ -1157,10 +1157,14 @@ fn parseLastMemOperand(operands: []const u8, refs: []const SymRef) ?Operand {
         if (mem.startsWith(u8, off_text, "<<sym:") and mem.endsWith(u8, off_text, ">>")) {
             const num_text = off_text["<<sym:".len .. off_text.len - 2];
             const idx = std.fmt.parseInt(usize, num_text, 10) catch return .{
-                .ref_idx = -1, .num_offset = null, .base_reg = base_reg,
+                .ref_idx = -1,
+                .num_offset = null,
+                .base_reg = base_reg,
             };
             if (idx >= refs.len) return .{
-                .ref_idx = -1, .num_offset = null, .base_reg = base_reg,
+                .ref_idx = -1,
+                .num_offset = null,
+                .base_reg = base_reg,
             };
             return .{ .ref_idx = @intCast(idx), .num_offset = null, .base_reg = base_reg };
         }

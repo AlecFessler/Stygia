@@ -1,10 +1,10 @@
 // Spec §[create_thread] create_thread — test 12.
 //
-// "[test 12] on success, when [4] is nonzero, the target domain also
+// "[test 12] on success, when [4] is nonzero, the target process also
 //  receives a handle with caps = `[1].target_caps`."
 //
 // Strategy
-//   The runner spawns each test as its own capability domain. The
+//   The runner spawns each test as its own process. The
 //   freshly-created child's handle table has, by construction:
 //     slot 0  → self
 //     slot 1  → initial thread
@@ -12,8 +12,8 @@
 //     slot 3  → result port (passed_handle)
 //   The runner sets `cridc_ceiling = 0x27` (bits 0-5: move, copy, crec,
 //   restart_policy), so slot 2's IDC caps include `crec`
-//   (bit 2). slot 2 is therefore a valid IDC `[4]` for a cross-domain
-//   `create_thread` and points back at this same domain —
+//   (bit 2). slot 2 is therefore a valid IDC `[4]` for a cross-process
+//   `create_thread` and points back at this same process —
 //   so both the caller-side and target-side thread handles materialize in
 //   our own handle table.
 //
@@ -57,13 +57,13 @@
 //      into a previously-empty slot
 //
 // Spec gap
-//   The runner spawns each test in its own capability domain. The only
-//   cross-domain target available without an additional ELF is the
-//   slot-2 self-IDC, which loops back to the calling domain. That keeps
+//   The runner spawns each test in its own process. The only
+//   cross-process target available without an additional ELF is the
+//   slot-2 self-IDC, which loops back to the calling process. That keeps
 //   the verification self-contained but means caller and target share
-//   one handle table; the spec wording "the target domain also receives
+//   one handle table; the spec wording "the target process also receives
 //   a handle" is exercised here as "a second slot in this same table is
-//   populated with caps = target_caps". A two-domain variant would
+//   populated with caps = target_caps". A two-process variant would
 //   require a second embedded ELF in the runner manifest.
 
 const lib = @import("lib");

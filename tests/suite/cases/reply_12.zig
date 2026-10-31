@@ -1,7 +1,7 @@
 // Spec §[reply] reply — test 12.
 //
 // "[test 12] returns E_BADCAP if any pair entry's source handle id is
-//  not valid in the caller's domain."
+//  not valid in the caller's process."
 //
 // Strategy
 //   The assertion needs the kernel to reach the per-entry source-id
@@ -129,12 +129,7 @@ fn replyOneEntry(reply_handle_id: u12, pair_entry: u64) u64 {
                 : [v1] "={x0}" (ov1),
                 : [word] "r" (word),
                   [entry] "r" (pair_entry),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
             return ov1;
         },
         else => @compileError("unsupported target architecture"),
@@ -162,7 +157,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 2: mint W. susp queues W as a suspended sender; term keeps
     // the sender controllable; restart_policy=0 keeps W inside the
-    // runner-granted ceiling and prevents domain-restart from masking
+    // runner-granted ceiling and prevents process-restart from masking
     // the test's lifetime guarantees.
     const w_caps = caps.ThreadCap{
         .term = true,

@@ -40,7 +40,7 @@ const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
 const thread_mod = stygia.sched.thread;
-const capability_domain = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 const spin_diag = stygia.utils.spin_diag;
@@ -314,19 +314,19 @@ fn dumpSpinLiveness(num_cores: u64) void {
 fn dumpLifecycleCounters() void {
     rawWrite("[HANG] lifecycle counters:");
     rawWrite(" p2=");
-    printDecimal(loadCounter(&capability_domain.p2_enter));
+    printDecimal(loadCounter(&process_mod.p2_enter));
     rawWrite("/");
-    printDecimal(loadCounter(&capability_domain.p2_after_reap));
+    printDecimal(loadCounter(&process_mod.p2_after_reap));
     rawWrite("/");
-    printDecimal(loadCounter(&capability_domain.p2_walk_done));
+    printDecimal(loadCounter(&process_mod.p2_walk_done));
     rawWrite("/");
-    printDecimal(loadCounter(&capability_domain.p2_exit));
+    printDecimal(loadCounter(&process_mod.p2_exit));
     rawWrite(" p2_residue=");
-    printDecimal(loadCounter(&capability_domain.p2_residue));
+    printDecimal(loadCounter(&process_mod.p2_residue));
     rawWrite(" abandoned_p2=");
-    printDecimal(loadCounter(&capability_domain.abandoned_in_p2));
+    printDecimal(loadCounter(&process_mod.abandoned_in_p2));
     rawWrite(" abandoned_other=");
-    printDecimal(loadCounter(&capability_domain.abandoned_other));
+    printDecimal(loadCounter(&process_mod.abandoned_other));
     rawWrite(" walk=");
     printDecimal(loadCounter(&thread_mod.walk_visit_enter));
     rawWrite("/");
@@ -370,7 +370,7 @@ fn dumpPreReportTerminalSamples() void {
         if (before != seq) continue;
         const sample_seq = slot.seq;
         const tag = slot.tag;
-        const cd = slot.cd;
+        const process = slot.process;
         const thread = slot.thread;
         const reason = slot.reason;
         const after = slot.publish_seq.load(.acquire);
@@ -382,8 +382,8 @@ fn dumpPreReportTerminalSamples() void {
         printHex(tag);
         rawWrite(" index=");
         printDecimal(tag - 0x8000);
-        rawWrite(" cd=");
-        printHex(@as(u64, cd));
+        rawWrite(" process=");
+        printHex(@as(u64, process));
         rawWrite(" thread=");
         printHex(@as(u64, thread));
         rawWrite(" reason=");
@@ -413,7 +413,7 @@ fn dumpSpawnTraceSamples() void {
         const tag = slot.tag;
         const core = slot.core;
         const thread = slot.thread;
-        const cd = slot.cd;
+        const process = slot.process;
         const gen = slot.gen;
         const state = slot.state;
         const owner = slot.owner;
@@ -434,8 +434,8 @@ fn dumpSpawnTraceSamples() void {
         printDecimal(core);
         rawWrite(" thread=");
         printHex(@as(u64, thread));
-        rawWrite(" cd=");
-        printHex(@as(u64, cd));
+        rawWrite(" process=");
+        printHex(@as(u64, process));
         rawWrite(" gen=");
         printHex(gen);
         rawWrite(" st=");
@@ -651,8 +651,8 @@ fn printWaitSummary(thread: *Thread) void {
     if (thread.pending_reply_holder) |holder| {
         rawWrite(" reply_holder=");
         printHex(@intFromPtr(holder));
-        if (thread.pending_reply_domain) |prd| {
-            rawWrite(" reply_cd=");
+        if (thread.pending_reply_process) |prd| {
+            rawWrite(" reply_process=");
             printHex(@intFromPtr(prd.ptr));
             rawWrite("/slot=");
             printDecimal(@as(u64, thread.pending_reply_slot));

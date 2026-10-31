@@ -156,7 +156,7 @@ pub fn main(cap_table_base: u64) void {
     // Restore unrestricted affinity before returning the result so the
     // self-handle's per-core pin doesn't leak into the thread's post-pass
     // cleanup path (the runner replies, our `_start` then calls
-    // `delete(SLOT_SELF)` to drop the CD; restricting that work to
+    // `delete(SLOT_SELF)` to drop the process; restricting that work to
     // a single core is unnecessary and tightens the dispatch deadline
     // unnecessarily).
     _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);

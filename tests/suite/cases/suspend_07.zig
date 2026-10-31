@@ -4,7 +4,7 @@
 //
 // Strategy
 //   The "already suspended" branch fires only when every preceding
-//   gate (tests 01..06) is inert and the kernel resolves [1] to an thread
+//   gate (tests 01..06) is inert and the kernel resolves [1] to a thread
 //   that is currently in the suspended state. The plan is to mint a
 //   helper thread + a destination port, drive a *first* `suspend(target,
 //   port)` to land the helper in the suspended state, then issue a
@@ -39,7 +39,7 @@
 //     Tests 10/11 (read/write cap gating of event_state) are
 //     orthogonal: this test only cares about the kernel's suspended-
 //     state discriminator, not what the event payload exposes. The
-//     helper's thread handle in this domain carries the minimum caps
+//     helper's thread handle in this process carries the minimum caps
 //     needed to drive `suspend` past the cap gates (just `susp`).
 //
 //   Why a fresh port, not the result port at SLOT_FIRST_PASSED
@@ -52,7 +52,7 @@
 //     calls `recv` on this port, so it accumulates two queued senders
 //     across the two suspend attempts (well, one — the second call
 //     returns E_INVAL and never queues), which is fine since the
-//     port is local to the test domain and gets cleaned up at domain
+//     port is local to the test process and gets cleaned up at process
 //     teardown.
 //
 // Action

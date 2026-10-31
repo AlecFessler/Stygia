@@ -5,7 +5,7 @@
 // Strategy
 //   §[thread] handle ABI: word0 carries cap+id+type, field0
 //   bits 0-1 hold the kernel-mutable scheduling priority `pri`. The
-//   priority an thread starts with is taken from `[1].priority` (bits
+//   priority a thread starts with is taken from `[1].priority` (bits
 //   32-33 of the caps word) at create_thread time.
 //
 //   To isolate the success-path priority assertion we must:

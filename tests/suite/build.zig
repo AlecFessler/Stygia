@@ -25,39 +25,39 @@ const test_entries = [_]TestEntry{
     .{ .name = "affinity_04", .path = "cases/affinity_04.zig" },
     .{ .name = "affinity_05", .path = "cases/affinity_05.zig" },
     .{ .name = "affinity_06", .path = "cases/affinity_06.zig" },
-    .{ .name = "create_capability_domain_01", .path = "cases/create_capability_domain_01.zig" },
-    .{ .name = "create_capability_domain_02", .path = "cases/create_capability_domain_02.zig" },
-    .{ .name = "create_capability_domain_03", .path = "cases/create_capability_domain_03.zig" },
-    .{ .name = "create_capability_domain_04", .path = "cases/create_capability_domain_04.zig" },
-    .{ .name = "create_capability_domain_05", .path = "cases/create_capability_domain_05.zig" },
-    .{ .name = "create_capability_domain_06", .path = "cases/create_capability_domain_06.zig" },
-    .{ .name = "create_capability_domain_07", .path = "cases/create_capability_domain_07.zig" },
-    .{ .name = "create_capability_domain_08", .path = "cases/create_capability_domain_08.zig" },
-    .{ .name = "create_capability_domain_09", .path = "cases/create_capability_domain_09.zig" },
-    .{ .name = "create_capability_domain_10", .path = "cases/create_capability_domain_10.zig" },
-    .{ .name = "create_capability_domain_11", .path = "cases/create_capability_domain_11.zig" },
-    .{ .name = "create_capability_domain_12", .path = "cases/create_capability_domain_12.zig" },
-    .{ .name = "create_capability_domain_13", .path = "cases/create_capability_domain_13.zig" },
-    .{ .name = "create_capability_domain_14", .path = "cases/create_capability_domain_14.zig" },
-    .{ .name = "create_capability_domain_15", .path = "cases/create_capability_domain_15.zig" },
-    .{ .name = "create_capability_domain_16", .path = "cases/create_capability_domain_16.zig" },
-    .{ .name = "create_capability_domain_17", .path = "cases/create_capability_domain_17.zig" },
-    .{ .name = "create_capability_domain_18", .path = "cases/create_capability_domain_18.zig" },
-    .{ .name = "create_capability_domain_19", .path = "cases/create_capability_domain_19.zig" },
-    .{ .name = "create_capability_domain_20", .path = "cases/create_capability_domain_20.zig" },
-    .{ .name = "create_capability_domain_21", .path = "cases/create_capability_domain_21.zig" },
-    .{ .name = "create_capability_domain_22", .path = "cases/create_capability_domain_22.zig" },
-    .{ .name = "create_capability_domain_23", .path = "cases/create_capability_domain_23.zig" },
-    .{ .name = "create_capability_domain_24", .path = "cases/create_capability_domain_24.zig" },
-    .{ .name = "create_capability_domain_25", .path = "cases/create_capability_domain_25.zig" },
-    .{ .name = "create_capability_domain_26", .path = "cases/create_capability_domain_26.zig" },
-    .{ .name = "create_capability_domain_27", .path = "cases/create_capability_domain_27.zig" },
-    .{ .name = "create_capability_domain_28", .path = "cases/create_capability_domain_28.zig" },
-    .{ .name = "create_capability_domain_29", .path = "cases/create_capability_domain_29.zig" },
-    .{ .name = "create_capability_domain_16a", .path = "cases/create_capability_domain_16a.zig" },
-    .{ .name = "create_capability_domain_30", .path = "cases/create_capability_domain_30.zig" },
-    .{ .name = "create_capability_domain_31", .path = "cases/create_capability_domain_31.zig" },
-    .{ .name = "create_capability_domain_32", .path = "cases/create_capability_domain_32.zig" },
+    .{ .name = "create_process_01", .path = "cases/create_process_01.zig" },
+    .{ .name = "create_process_02", .path = "cases/create_process_02.zig" },
+    .{ .name = "create_process_03", .path = "cases/create_process_03.zig" },
+    .{ .name = "create_process_04", .path = "cases/create_process_04.zig" },
+    .{ .name = "create_process_05", .path = "cases/create_process_05.zig" },
+    .{ .name = "create_process_06", .path = "cases/create_process_06.zig" },
+    .{ .name = "create_process_07", .path = "cases/create_process_07.zig" },
+    .{ .name = "create_process_08", .path = "cases/create_process_08.zig" },
+    .{ .name = "create_process_09", .path = "cases/create_process_09.zig" },
+    .{ .name = "create_process_10", .path = "cases/create_process_10.zig" },
+    .{ .name = "create_process_11", .path = "cases/create_process_11.zig" },
+    .{ .name = "create_process_12", .path = "cases/create_process_12.zig" },
+    .{ .name = "create_process_13", .path = "cases/create_process_13.zig" },
+    .{ .name = "create_process_14", .path = "cases/create_process_14.zig" },
+    .{ .name = "create_process_15", .path = "cases/create_process_15.zig" },
+    .{ .name = "create_process_16", .path = "cases/create_process_16.zig" },
+    .{ .name = "create_process_17", .path = "cases/create_process_17.zig" },
+    .{ .name = "create_process_18", .path = "cases/create_process_18.zig" },
+    .{ .name = "create_process_19", .path = "cases/create_process_19.zig" },
+    .{ .name = "create_process_20", .path = "cases/create_process_20.zig" },
+    .{ .name = "create_process_21", .path = "cases/create_process_21.zig" },
+    .{ .name = "create_process_22", .path = "cases/create_process_22.zig" },
+    .{ .name = "create_process_23", .path = "cases/create_process_23.zig" },
+    .{ .name = "create_process_24", .path = "cases/create_process_24.zig" },
+    .{ .name = "create_process_25", .path = "cases/create_process_25.zig" },
+    .{ .name = "create_process_26", .path = "cases/create_process_26.zig" },
+    .{ .name = "create_process_27", .path = "cases/create_process_27.zig" },
+    .{ .name = "create_process_28", .path = "cases/create_process_28.zig" },
+    .{ .name = "create_process_29", .path = "cases/create_process_29.zig" },
+    .{ .name = "create_process_16a", .path = "cases/create_process_16a.zig" },
+    .{ .name = "create_process_30", .path = "cases/create_process_30.zig" },
+    .{ .name = "create_process_31", .path = "cases/create_process_31.zig" },
+    .{ .name = "create_process_32", .path = "cases/create_process_32.zig" },
     .{ .name = "create_thread_01", .path = "cases/create_thread_01.zig" },
     .{ .name = "create_thread_02", .path = "cases/create_thread_02.zig" },
     .{ .name = "create_thread_03", .path = "cases/create_thread_03.zig" },
@@ -654,7 +654,7 @@ pub fn build(b: *std.Build) void {
     // iteration 432 (stygia-utf). Hoisting it to a build option makes
     // that wall A/B-testable without editing test code, and lets the
     // suite be run at higher concurrency deliberately — at BATCH=4 the
-    // kernel is never exercised above ~4 concurrent test domains, which
+    // kernel is never exercised above ~4 concurrent test processes, which
     // is a permanent blind spot for contention bugs.
     // Default 16. It was 4 for as long as the stygia-utf wall stood; at
     // 16 the runner used to wedge in the spawn loop around iteration
@@ -667,7 +667,7 @@ pub fn build(b: *std.Build) void {
     // 16 is chosen for CONTENTION, not speed: the wall-clock difference
     // is only ~6% (5.53s vs 5.90s over 3 runs each), because most of a
     // run is boot and fixed overhead. What it buys is exercising the
-    // kernel at 16 concurrent test domains instead of 4, which is where
+    // kernel at 16 concurrent test processes instead of 4, which is where
     // scheduler/slab/lock contention bugs actually live. At 4 the suite
     // structurally could not reach that regime at all.
     const batch = b.option(
@@ -677,12 +677,12 @@ pub fn build(b: *std.Build) void {
     ) orelse 16;
     if (batch == 0) @panic("-Dbatch must be >= 1");
 
-    // Spread test domains across cores instead of letting them all pile
+    // Spread test processes across cores instead of letting them all pile
     // onto the runner's core.
     //
     // The runner used to pass `initial_thread_affinity = 0` ("kernel picks
-    // any core") for every test domain. Initial placement remains
-    // local-biased, and runner-created test domains should keep
+    // any core") for every test process. Initial placement remains
+    // local-biased, and runner-created test processes should keep
     // deterministic placement for stability triage even though x64 now
     // has pull-side stealing for affinity-0 ready Threads. The old behavior
     // was a single-core pile-up (docs/kernel/open-design-questions.md
@@ -695,14 +695,14 @@ pub fn build(b: *std.Build) void {
     // load-dependent, which is what a stability rig wants: a failure
     // reproduces on the same core on the next boot.
     //
-    // Set `-Dspread_cores=false` to keep runner-spawned test domains on
+    // Set `-Dspread_cores=false` to keep runner-spawned test processes on
     // the historical local-biased initial placement. That does not
     // disable x64 pull-side stealing for affinity-0 Threads created inside
     // a test; `scheduler_balance_01` covers that path explicitly.
     const spread_cores = b.option(
         bool,
         "spread_cores",
-        "Pin test domain N to core N % cores instead of using affinity-0 local-biased initial placement (default true)",
+        "Pin test process N to core N % cores instead of using affinity-0 local-biased initial placement (default true)",
     ) orelse true;
     // The harness provisions four cores on QEMU and Pi 5. Keep this
     // explicit so tests do not depend on the removed public info ABI.

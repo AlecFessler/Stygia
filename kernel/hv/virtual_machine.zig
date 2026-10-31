@@ -2,9 +2,9 @@
 //! physical address space. Threads enter guest mode within
 //! a VM to run. See spec §[virtual_machine].
 //!
-//! Capability-domain lifetime; the VM handle is non-transferable so
+//! Process lifetime; the VM handle is non-transferable so
 //! exactly one user-visible handle exists (held by the binding
-//! capability domain). vCPU Threads back-reference the VM through their
+//! process). vCPU Threads back-reference the VM through their
 //! `vm` field. UAF protection on those back-refs comes from
 //! `_gen_lock`.
 
@@ -14,7 +14,7 @@ const stygia = @import("stygia");
 const arch = stygia.arch.dispatch;
 const arch_smp = stygia.arch.dispatch.smp;
 const capability = stygia.caps.capability;
-const cd_mod = stygia.caps.capability_domain;
+const process_mod = stygia.caps.process;
 const thread_mod = stygia.sched.thread;
 const errors = stygia.syscall.errors;
 const lifecycle = stygia.sched.lifecycle;
@@ -23,7 +23,7 @@ const port_mod = stygia.sched.port;
 const scheduler = stygia.sched.scheduler;
 const vm_dispatch = stygia.arch.dispatch.vm;
 
-const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
+const Process = stygia.caps.process.Process;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const Thread = stygia.sched.thread.Thread;
 const GenLock = stygia.memory.allocators.secure_slab.GenLock;
@@ -71,9 +71,9 @@ pub const VirtualMachine = struct {
     /// liveness AND guards every mutable field below.
     _gen_lock: GenLock = .{},
 
-    /// Owning capability domain. VM cannot outlive its owner —
-    /// `destroyVm` runs ahead of any domain teardown.
-    domain: SlabRef(CapabilityDomain),
+    /// Owning process. VM cannot outlive its owner —
+    /// `destroyVm` runs ahead of any process teardown.
+    process: SlabRef(Process),
 
     /// Physical address of the guest's second-stage / nested page-
     /// table root (EPT root on Intel, NPT root on AMD, stage-2 root
@@ -131,11 +131,11 @@ pub fn releaseHandle(vm: *VirtualMachine) void {
 }
 
 /// Variant of `releaseHandle` for the `destroyPhase2` path:
-/// the owning CD slab slot has already been freed by `destroyPhase1`,
-/// so the `vm.domain.ptr.vm = null` back-pointer clear that `destroyVm`
+/// the owning process slab slot has already been freed by `destroyPhase1`,
+/// so the `vm.process.ptr.vm = null` back-pointer clear that `destroyVm`
 /// performs is omitted — that write would race a reallocation of the
-/// CD slot.
-pub fn releaseHandleAfterDomainDestroyed(vm: *VirtualMachine) void {
+/// process slot.
+pub fn releaseHandleAfterProcessDestroyed(vm: *VirtualMachine) void {
     if (vm.policy_pf) |pf_ref| {
         decPageFrameRef(pf_ref.ptr);
         vm.policy_pf = null;
@@ -155,14 +155,14 @@ pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
 
     const requested_caps: u16 = @truncate(caps);
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = dlr.ptr;
+    defer caller.process.unlockIrqRestore(dlr.irq_state);
 
-    // Spec: handle is non-transferable, exactly one per domain.
-    if (domain.vm != null) return errors.E_FULL;
+    // Spec: handle is non-transferable, exactly one per process.
+    if (process.vm != null) return errors.E_FULL;
 
-    const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
+    const self_caps_struct: process_mod.ProcessCaps = @bitCast(readSelfCaps(process));
     if (!self_caps_struct.crvm) return errors.E_PERM;
 
     // Spec §[virtual_machine] VmCap layout: bit 0 = `policy`, bit 1 =
@@ -172,7 +172,7 @@ pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
     // boundary in `kernel/syscall/virtual_machine.zig` so the inner
     // layer is reachable only with caps already authorized.
 
-    const policy_pf_obj = lookupPageFrame(domain, @truncate(policy_pf)) orelse
+    const policy_pf_obj = lookupPageFrame(process, @truncate(policy_pf)) orelse
         return errors.E_BADCAP;
 
     // Spec §[create_virtual_machine] tests 05/06/07: reject policy
@@ -190,7 +190,7 @@ pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
     // varies by arch (the aarch64 stubs never raise NoDevice), so we
     // compare on @errorName rather than a switch arm to keep the
     // unreached comparison from tripping per-arch error-set diffs.
-    const new_vm = allocVm(domain, policy_pf_obj) catch |err| {
+    const new_vm = allocVm(process, policy_pf_obj) catch |err| {
         if (std.mem.eql(u8, @errorName(err), "NoDevice")) return errors.E_NODEV;
         return errors.E_NOMEM;
     };
@@ -201,8 +201,8 @@ pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
         .gen = @intCast(vm_gen),
     };
 
-    const slot = cd_mod.mintHandle(
-        domain,
+    const slot = process_mod.mintHandle(
+        process,
         erased,
         .virtual_machine,
         requested_caps,
@@ -213,7 +213,7 @@ pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
         return errors.E_FULL;
     };
 
-    domain.vm = SlabRef(VirtualMachine).init(new_vm, vm_gen);
+    process.vm = SlabRef(VirtualMachine).init(new_vm, vm_gen);
     // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
     // tag in bits 12..15 disambiguates a real handle word from the
     // small-positive error range 1..15.
@@ -237,15 +237,15 @@ pub fn createVcpu(
     const requested_priority: Priority = @enumFromInt(@as(u2, @truncate((caps >> 32) & 0x3)));
 
     const created_slot = blk: {
-        const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-        const domain = dlr.ptr;
-        defer caller.domain.unlockIrqRestore(dlr.irq_state);
+        const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        const process = dlr.ptr;
+        defer caller.process.unlockIrqRestore(dlr.irq_state);
 
-        const self_caps_struct: cd_mod.CapabilityDomainCaps = @bitCast(readSelfCaps(domain));
+        const self_caps_struct: process_mod.ProcessCaps = @bitCast(readSelfCaps(process));
         if (!self_caps_struct.crec) return errors.E_PERM;
         if (@intFromEnum(requested_priority) > self_caps_struct.pri) return errors.E_PERM;
 
-        const thread_inner_ceiling: u8 = @truncate(readSelfField0(domain));
+        const thread_inner_ceiling: u8 = @truncate(readSelfField0(process));
         if ((requested_caps & thread_inner_ceiling) != requested_caps) return errors.E_PERM;
 
         if (affinity != 0) {
@@ -257,10 +257,10 @@ pub fn createVcpu(
             if (affinity & ~valid_mask != 0) return errors.E_INVAL;
         }
 
-        const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
+        const vm = lookupVirtualMachine(process, @truncate(vm_handle)) orelse
             return errors.E_BADCAP;
 
-        const port = lookupPort(domain, @truncate(exit_port)) orelse
+        const port = lookupPort(process, @truncate(exit_port)) orelse
             return errors.E_BADCAP;
 
         // Spec §[port] lifetime: the vCPU pins exit_port via
@@ -268,22 +268,22 @@ pub fn createVcpu(
         // fire spontaneously on the bound port — same lifetime class as
         // bind-cap holders). The matching dec runs in
         // `destroyThreadLocked`. observed_zero is structurally
-        // impossible — `lookupPort` resolved against the caller's CD
+        // impossible — `lookupPort` resolved against the caller's process
         // whose handle pins the port.
-        const vcpu_thread = allocVcpu(vm, domain, affinity, port) catch
+        const vcpu_thread = allocVcpu(vm, process, affinity, port) catch
             return errors.E_NOMEM;
         vcpu_thread.priority = requested_priority;
 
         // Take the vCPU's private exit-port pin before minting the
         // handle, but do not publish it on port.vcpu_list_head yet:
         // recv-side teardown cascades are allowed to destroy every
-        // listed vCPU, and an thread without a minted handle is still
+        // listed vCPU, and a thread without a minted handle is still
         // private to this syscall.
         {
             const port_ref = vcpu_thread.exit_port orelse unreachable;
             const port_lr = port_ref.lockIrqSave(@src()) catch {
                 vcpu_thread.exit_port = null;
-                thread_mod.destroyThreadLocked(vcpu_thread, domain);
+                thread_mod.destroyThreadLocked(vcpu_thread, process);
                 return errors.E_BADCAP;
             };
             port_mod.incBindRef(port_lr.ptr) catch unreachable;
@@ -296,36 +296,36 @@ pub fn createVcpu(
             .gen = @intCast(thread_gen),
         };
 
-        const slot = cd_mod.mintHandle(
-            domain,
+        const slot = process_mod.mintHandle(
+            process,
             erased,
             .thread,
             requested_caps,
             @intFromEnum(requested_priority),
             affinity,
         ) catch {
-            rollbackPrivateVcpu(vcpu_thread, domain);
+            rollbackPrivateVcpu(vcpu_thread, process);
             return errors.E_FULL;
         };
         // Hold a lifecycle pin across port-list publication and scheduler
         // enqueue. The handle is minted before the pin can make the vCPU
-        // externally visible; the pin then blocks cross-domain port cascade
+        // externally visible; the pin then blocks cross-process port cascade
         // teardown from retiring/finalizing this thread after it sees the list
         // node but before enqueue has linked it into a run queue.
         if (!lifecycle.tryPinLive(vcpu_thread)) {
-            capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
-            rollbackPrivateVcpu(vcpu_thread, domain);
+            capability.clearAndFreeSlot(process, slot, &process.kernel_table[slot]);
+            rollbackPrivateVcpu(vcpu_thread, process);
             return errors.E_BADCAP;
         }
         publishMintedVcpuAndEnqueue(vcpu_thread) catch {
             lifecycle.releasePin(vcpu_thread);
-            capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
-            rollbackPrivateVcpu(vcpu_thread, domain);
+            capability.clearAndFreeSlot(process, slot, &process.kernel_table[slot]);
+            rollbackPrivateVcpu(vcpu_thread, process);
             return errors.E_BADCAP;
         };
 
         // `publishMintedVcpuAndEnqueue` keeps the exit-port lock held until
-        // the run-queue link is committed, so a recv-side cross-domain close
+        // the run-queue link is committed, so a recv-side cross-process close
         // cannot detach and mark this vCPU before it becomes runnable. The
         // create pin remains held until that commit returns; any adjacent
         // destroy waits for the pin to drain before recycling the slab slot.
@@ -346,7 +346,7 @@ pub fn createVcpu(
 
 fn rollbackPrivateVcpu(
     vcpu_thread: *Thread,
-    domain: *CapabilityDomain,
+    process: *Process,
 ) void {
     if (vcpu_thread.exit_port) |port_ref| {
         const port_lr = port_ref.lockIrqSave(@src()) catch null;
@@ -357,7 +357,7 @@ fn rollbackPrivateVcpu(
         vcpu_thread.exit_port = null;
     }
     vcpu_thread.vcpu_list_next = null;
-    thread_mod.destroyThreadLocked(vcpu_thread, domain);
+    thread_mod.destroyThreadLocked(vcpu_thread, process);
 }
 
 fn publishMintedVcpuAndEnqueue(
@@ -380,11 +380,11 @@ pub fn mapGuest(caller: *Thread, vm_handle: u64, pairs: []const u64) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (pairs.len == 0 or pairs.len % 2 != 0) return errors.E_INVAL;
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = dlr.ptr;
+    defer caller.process.unlockIrqRestore(dlr.irq_state);
 
-    const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
+    const vm = lookupVirtualMachine(process, @truncate(vm_handle)) orelse
         return errors.E_BADCAP;
 
     const pair_count = pairs.len / 2;
@@ -398,14 +398,14 @@ pub fn mapGuest(caller: *Thread, vm_handle: u64, pairs: []const u64) i64 {
         const guest_addr = pairs[2 * i];
         const pf_handle_word = pairs[2 * i + 1];
         if (pf_handle_word >> 12 != 0) return errors.E_INVAL;
-        const pf = lookupPageFrame(domain, @truncate(pf_handle_word)) orelse
+        const pf = lookupPageFrame(process, @truncate(pf_handle_word)) orelse
             return errors.E_BADCAP;
         const stride = pageStride(pf.sz);
         if (guest_addr % stride != 0) return errors.E_INVAL;
 
         var j: usize = 0;
         while (j < i) {
-            const other_pf = lookupPageFrame(domain, @truncate(pairs[2 * j + 1])) orelse
+            const other_pf = lookupPageFrame(process, @truncate(pairs[2 * j + 1])) orelse
                 return errors.E_BADCAP;
             if (rangesOverlap(guest_addr, pf, pairs[2 * j], other_pf)) return errors.E_INVAL;
             j += 1;
@@ -426,8 +426,8 @@ pub fn mapGuest(caller: *Thread, vm_handle: u64, pairs: []const u64) i64 {
     i = 0;
     while (i < pair_count) {
         const pf_slot: u12 = @truncate(pairs[2 * i + 1]);
-        const pf = lookupPageFrame(domain, pf_slot) orelse return errors.E_BADCAP;
-        const pf_caps: PageFrameCaps = @bitCast(Word0.caps(domain.user_table[pf_slot].word0));
+        const pf = lookupPageFrame(process, pf_slot) orelse return errors.E_BADCAP;
+        const pf_caps: PageFrameCaps = @bitCast(Word0.caps(process.user_table[pf_slot].word0));
         const rc = installPageFrame(vm, pairs[2 * i], pf, pageFramePerms(pf_caps));
         if (rc != 0) return rc;
         i += 1;
@@ -441,16 +441,16 @@ pub fn unmapGuest(caller: *Thread, vm_handle: u64, page_frames: []const u64) i64
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (page_frames.len == 0) return errors.E_INVAL;
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = dlr.ptr;
+    defer caller.process.unlockIrqRestore(dlr.irq_state);
 
-    const vm = lookupVirtualMachine(domain, @truncate(vm_handle)) orelse
+    const vm = lookupVirtualMachine(process, @truncate(vm_handle)) orelse
         return errors.E_BADCAP;
 
     for (page_frames) |pf_handle_word| {
         if (pf_handle_word >> 12 != 0) return errors.E_INVAL;
-        const pf = lookupPageFrame(domain, @truncate(pf_handle_word)) orelse
+        const pf = lookupPageFrame(process, @truncate(pf_handle_word)) orelse
             return errors.E_BADCAP;
         const rc = uninstallPageFrame(vm, pf);
         if (rc != 0) return rc;
@@ -471,12 +471,12 @@ pub fn vmInjectIrq(
 ) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = dlr.ptr;
+    defer caller.process.unlockIrqRestore(dlr.irq_state);
 
     const slot: u12 = @truncate(vm_handle);
-    const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
+    const vm = lookupVirtualMachine(process, slot) orelse return errors.E_BADCAP;
 
     // §[vm_inject_irq] [2] is a u64 line number; reject anything that
     // can't fit in u32 up front (no plausible emulated controller has
@@ -503,17 +503,17 @@ pub fn applyVmPolicyTable(
 ) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
 
-    const dlr = caller.domain.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const domain = dlr.ptr;
-    defer caller.domain.unlockIrqRestore(dlr.irq_state);
+    const dlr = caller.process.lockIrqSave(@src()) catch return errors.E_BADCAP;
+    const process = dlr.ptr;
+    defer caller.process.unlockIrqRestore(dlr.irq_state);
 
     const slot: u12 = @truncate(vm_handle);
-    _ = lookupHandle(domain, slot, .virtual_machine) orelse return errors.E_BADCAP;
+    _ = lookupHandle(process, slot, .virtual_machine) orelse return errors.E_BADCAP;
 
-    const vm_caps: VmCaps = @bitCast(Word0.caps(domain.user_table[slot].word0));
+    const vm_caps: VmCaps = @bitCast(Word0.caps(process.user_table[slot].word0));
     if (!vm_caps.policy) return errors.E_PERM;
 
-    const vm = lookupVirtualMachine(domain, slot) orelse return errors.E_BADCAP;
+    const vm = lookupVirtualMachine(process, slot) orelse return errors.E_BADCAP;
     return vm_dispatch.applyVmPolicyTable(vm, kind, count, entries);
 }
 
@@ -529,15 +529,15 @@ pub const INITIAL_STATE_SUBCODE: u8 = switch (@import("builtin").cpu.arch) {
     else => @compileError("unsupported arch"),
 };
 
-/// Allocate a VM bound to `domain`. Allocates stage-2 page-table root
+/// Allocate a VM bound to `process`. Allocates stage-2 page-table root
 /// from PMM, allocates arch control structure, retains a reference on
 /// `policy_pf`. Spec §[virtual_machine].create_virtual_machine.
-fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
+fn allocVm(process: *Process, policy_pf: *PageFrame) !*VirtualMachine {
     const pending = try slab_instance.create();
     const new_vm = pending.ptr;
 
     // Slab zero-on-free covers arch_state=null, policy_pf=null, policy=0.
-    new_vm.domain = SlabRef(CapabilityDomain).init(domain, domain._gen_lock.currentGen());
+    new_vm.process = SlabRef(Process).init(process, process._gen_lock.currentGen());
 
     new_vm.guest_pt_root = vm_dispatch.allocStage2Root(new_vm) catch |err| {
         slab_instance.destroyAlreadyMarked(new_vm);
@@ -564,7 +564,7 @@ fn allocVm(domain: *CapabilityDomain, policy_pf: *PageFrame) !*VirtualMachine {
 
 /// Final teardown — frees guest memory mappings, tears down emulated
 /// devices, frees arch state and stage-2 root, drops the held
-/// `policy_pf` reference, clears `domain.vm`, returns slab slot.
+/// `policy_pf` reference, clears `process.vm`, returns slab slot.
 fn destroyVm(vm: *VirtualMachine) void {
     if (vm.policy_pf) |pf_ref| {
         // caller-pinned: PF refcount kept by VM for its lifetime.
@@ -573,8 +573,8 @@ fn destroyVm(vm: *VirtualMachine) void {
     }
     vm_dispatch.freeVmArchState(vm);
     vm_dispatch.freeStage2Root(vm);
-    // caller-pinned: VM's domain owns it.
-    vm.domain.ptr.vm = null;
+    // caller-pinned: VM's process owns it.
+    vm.process.ptr.vm = null;
     const gen = vm._gen_lock.currentGen();
     slab_instance.destroy(vm, gen) catch {};
 }
@@ -660,21 +660,21 @@ fn uninstallPageFrame(vm: *VirtualMachine, pf: *PageFrame) i64 {
 }
 
 /// Allocate a vCPU thread bound to this VM with `exit_port` set. The
-/// vCPU thread is bound to the capability domain that holds the VM
-/// handle (per spec); on a multi-domain handoff the holder is the
-/// VM's owning domain.
+/// vCPU thread is bound to the process that holds the VM
+/// handle (per spec); on a multi-process handoff the holder is the
+/// VM's owning process.
 fn allocVcpu(
     vm: *VirtualMachine,
-    creator_domain: *CapabilityDomain,
+    creator_process: *Process,
     affinity: u64,
     exit_port: *Port,
 ) !*Thread {
-    _ = creator_domain;
+    _ = creator_process;
 
-    // caller-pinned: VM's domain owns the VM and outlives it (destroyVm
-    // runs ahead of any domain teardown).
+    // caller-pinned: VM's process owns the VM and outlives it (destroyVm
+    // runs ahead of any process teardown).
     const vcpu_thread = try thread_mod.allocThread(
-        vm.domain.ptr, // caller-pinned
+        vm.process.ptr, // caller-pinned
         VAddr.fromInt(0),
         0,
         affinity,
@@ -690,36 +690,36 @@ fn allocVcpu(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn readSelfCaps(domain: *CapabilityDomain) u16 {
-    return Word0.caps(domain.user_table[0].word0);
+fn readSelfCaps(process: *Process) u16 {
+    return Word0.caps(process.user_table[0].word0);
 }
 
-fn readSelfField0(domain: *CapabilityDomain) u64 {
-    return domain.user_table[0].field0;
+fn readSelfField0(process: *Process) u64 {
+    return process.user_table[0].field0;
 }
 
-fn lookupHandle(domain: *CapabilityDomain, slot: u12, expected: CapabilityType) ?*KernelHandle {
-    if (@as(u16, slot) >= capability.MAX_HANDLES_PER_DOMAIN) return null;
-    const entry = &domain.kernel_table[slot];
+fn lookupHandle(process: *Process, slot: u12, expected: CapabilityType) ?*KernelHandle {
+    if (@as(u16, slot) >= capability.MAX_HANDLES_PER_PROCESS) return null;
+    const entry = &process.kernel_table[slot];
     if (entry.ref.ptr == null) return null;
-    if (Word0.typeTag(domain.user_table[slot].word0) != expected) return null;
+    if (Word0.typeTag(process.user_table[slot].word0) != expected) return null;
     return entry;
 }
 
-fn lookupVirtualMachine(domain: *CapabilityDomain, slot: u12) ?*VirtualMachine {
-    const handle = lookupHandle(domain, slot, .virtual_machine) orelse return null;
+fn lookupVirtualMachine(process: *Process, slot: u12) ?*VirtualMachine {
+    const handle = lookupHandle(process, slot, .virtual_machine) orelse return null;
     const ref = capability.typedRef(VirtualMachine, handle.*) orelse return null;
     return ref.ptr;
 }
 
-fn lookupPageFrame(domain: *CapabilityDomain, slot: u12) ?*PageFrame {
-    const handle = lookupHandle(domain, slot, .page_frame) orelse return null;
+fn lookupPageFrame(process: *Process, slot: u12) ?*PageFrame {
+    const handle = lookupHandle(process, slot, .page_frame) orelse return null;
     const ref = capability.typedRef(PageFrame, handle.*) orelse return null;
     return ref.ptr;
 }
 
-fn lookupPort(domain: *CapabilityDomain, slot: u12) ?*Port {
-    const handle = lookupHandle(domain, slot, .port) orelse return null;
+fn lookupPort(process: *Process, slot: u12) ?*Port {
+    const handle = lookupHandle(process, slot, .port) orelse return null;
     const ref = capability.typedRef(Port, handle.*) orelse return null;
     return ref.ptr;
 }

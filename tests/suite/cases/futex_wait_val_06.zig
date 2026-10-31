@@ -19,7 +19,7 @@
 //
 //   A stack-resident `u64` is naturally 8-byte aligned on x86-64 and
 //   sits in the caller's user address space (the loader maps the
-//   capability domain's stack as user-RW), so it satisfies the addr
+//   process's stack as user-RW), so it satisfies the addr
 //   alignment (test 04) and addr-validity (test 05) preconditions.
 //
 //   We seed the watched word with value 0 and pass expected = 0, so
@@ -36,7 +36,7 @@
 //
 //   N = 1 keeps the call within the register-passed argument fast path
 //   (pairs.len = 2 fits in v2/v3 of `futexWaitVal`), and stays well
-//   under the child capability domain's `fut_wait_max = 63` (see
+//   under the child process's `fut_wait_max = 63` (see
 //   runner/primary.zig). The self-handle's `fut_wait_max >= 1`
 //   precondition (test 01) and the N <= fut_wait_max precondition
 //   (test 03) are therefore both satisfied; N = 1 also satisfies the
@@ -60,7 +60,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Naturally 8-byte aligned in this domain's user stack; satisfies
+    // Naturally 8-byte aligned in this process's user stack; satisfies
     // the alignment (test 04) and addr-validity (test 05) preconditions.
     var watched: u64 = 0;
 

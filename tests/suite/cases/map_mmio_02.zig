@@ -20,8 +20,8 @@
 //   VMAR sits in `map = 0` with `caps.mmio = 1`.
 //
 //   For [2] we use slot 4095 — the maximum 12-bit handle id.
-//   The child capability domain's table is populated by the kernel
-//   at create_capability_domain time (slots 0/1/2 are self / initial
+//   The child process's table is populated by the kernel
+//   at create_process time (slots 0/1/2 are self / initial
 //   thread / self-IDC; passed_handles begin at 3) so slot 4095 is
 //   guaranteed empty and therefore invalid as a device_region
 //   handle. The same trick is used by map_pf_01.zig.
@@ -66,7 +66,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const mmio_var_handle: u12 = @truncate(cvar.v1 & 0xFFF);
 
-    // Slot 4095 is guaranteed empty by the create_capability_domain
+    // Slot 4095 is guaranteed empty by the create_process
     // table layout, so it is invalid as a device_region handle. The
     // [2] BADCAP gate must fire even though [1] is a valid MMIO VMAR.
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;

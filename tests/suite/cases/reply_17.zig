@@ -10,7 +10,7 @@
 //         sender is some thread W, with the `xfer` cap so reply with
 //         pair_count > 0 can be invoked at all.
 //     (b) A pair entry that would otherwise be valid — id refers to a
-//         live source handle in the caller's domain, caps are a subset
+//         live source handle in the caller's process, caps are a subset
 //         of the source's caps, and the source carries the per-move
 //         right (`copy` for move=0). This isolates the failure to the
 //         "suspended thread was terminated" path: every other validation
@@ -33,7 +33,7 @@
 //
 //   `recv(port)` then returns immediately (no E_CLOSED, since the test
 //   thread still holds the port handle with its `bind` cap; no E_FULL,
-//   since the test's domain has plenty of free slots). The kernel
+//   since the test's process has plenty of free slots). The kernel
 //   hands back the reply handle id in the recv syscall word; that id
 //   is the handle the spec line under test refers to.
 //
@@ -41,7 +41,7 @@
 //   carrying caps {copy} so the pair entry can name D as a valid
 //   transferable source under the `move=0` (copy) path. D never
 //   executes meaningfully — it sits at dummyEntry. The test does not
-//   care whether D is actually copied into W's domain; the spec line
+//   care whether D is actually copied into W's process; the spec line
 //   under test mandates that on E_TERM, no transfer occurs.
 //
 //   `terminate(W)` then destroys W. With W destroyed, the reply
@@ -66,11 +66,11 @@
 //
 //   SPEC AMBIGUITY: the spec line says "[1] is consumed and no handle
 //   transfer occurs." Verifying "no handle transfer occurs" requires
-//   inspecting the resumed thread's domain after the call — but on E_TERM
+//   inspecting the resumed thread's process after the call — but on E_TERM
 //   the resumed thread does not exist (it was terminated). The "no handle
 //   transfer" wording is presumably defensive for implementations
 //   where partial transfer might have begun before the termination
-//   check; with W gone there is no observable resumed-domain state to
+//   check; with W gone there is no observable resumed-process state to
 //   probe. This test therefore asserts only the error code; the "[1]
 //   is consumed" half is structurally implied by the error path being
 //   "consumes [1]" per the spec text, but not separately probed here
@@ -191,10 +191,7 @@ fn replyOneEntry(reply_handle: u12, pair_entry: u64) errors.Error {
                 : [v1] "={x0}" (x0_out),
                 : [word] "r" (word),
                   [pair] "r" (pair_entry),
-                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-                     .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-                     .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-                     .x29 = true, .x30 = true, .memory = true });
+                : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
             return @enumFromInt(x0_out);
         },
         else => @compileError("unsupported target architecture"),
