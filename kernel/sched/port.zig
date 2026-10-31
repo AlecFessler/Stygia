@@ -689,6 +689,20 @@ pub fn createPort(caller: *Thread, caps: u64) i64 {
 /// waiting) or still running with the receiver dequeued and event state
 /// delivered. State produced here MUST match what the fast path produces
 /// so the two are interchangeable.
+fn terminalSuspendResult(process_ref: SlabRef(Process), target_slot: u12, target_ref: SlabRef(Thread)) i64 {
+    // The thread lock must be released before taking the process lock.
+    // Revalidate the slot identity: another caller may have removed and
+    // reused it while suspend was resolving the target on this core.
+    const lr = process_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+    if (capability.resolveHandleOnProcess(lr.ptr, target_slot, .thread)) |entry| {
+        if (capability.typedRef(Thread, entry.*)) |current_ref| {
+            if (current_ref.eql(target_ref)) capability.clearAndFreeSlot(lr.ptr, target_slot, entry);
+        }
+    }
+    process_ref.unlockIrqRestore(lr.irq_state);
+    return errors.E_TERM;
+}
+
 pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
     const process_ref = caller.process;
     const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
@@ -747,7 +761,8 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
     };
 
     while (true) {
-        var tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+        var tlr = target_ref.lockIrqSave(@src()) catch
+            return terminalSuspendResult(process_ref, target_slot, target_ref);
         var target_thread = tlr.ptr;
         var target_irq_state = tlr.irq_state;
         var target_state = lifecycle.load(target_thread);
@@ -758,15 +773,17 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
             }
             if (lifecycle.canSuspendTarget(target_thread)) break;
             if (!SuspendRetry.fromState(target_thread, target_state)) {
+                const terminal = target_state == .retired or lifecycle.isDestroyMarked(target_thread);
                 target_ref.unlockIrqRestore(target_irq_state);
-                return errors.E_INVAL;
+                return if (terminal) terminalSuspendResult(process_ref, target_slot, target_ref) else errors.E_INVAL;
             }
             target_ref.unlockIrqRestore(target_irq_state);
             spin_diag.note(.suspend_retry, @intFromPtr(target_thread));
             arch.paging.serviceTlbMaintenanceWhileSpinning();
             stygia.sched.fpu.serviceLocalFlushWhileSpinning();
             std.atomic.spinLoopHint();
-            tlr = target_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
+            tlr = target_ref.lockIrqSave(@src()) catch
+                return terminalSuspendResult(process_ref, target_slot, target_ref);
             target_thread = tlr.ptr;
             target_irq_state = tlr.irq_state;
             target_state = lifecycle.load(target_thread);
@@ -782,7 +799,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
         if (target_thread != caller and target_state == .running) {
             if (!lifecycle.tryPinLive(target_thread)) {
                 target_ref.unlockIrqRestore(target_irq_state);
-                return errors.E_INVAL;
+                return terminalSuspendResult(process_ref, target_slot, target_ref);
             }
             const owner_slot_u32 = thread_mod.slab_instance.indexOf(caller);
             const owner_slot: u24 = @intCast(owner_slot_u32);
@@ -820,12 +837,15 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            return ret;
+            return if (ret == errors.E_TERM)
+                terminalSuspendResult(process_ref, target_slot, target_ref)
+            else
+                ret;
         }
         const target_pinned = target_thread != caller;
         if (target_pinned and !lifecycle.tryPinLive(target_thread)) {
             target_ref.unlockIrqRestore(target_irq_state);
-            return errors.E_INVAL;
+            return terminalSuspendResult(process_ref, target_slot, target_ref);
         }
         target_ref.unlockIrqRestore(target_irq_state);
 
@@ -851,6 +871,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
         if (!lifecycle.canSuspendTarget(target_thread)) {
             port_ref.unlockIrqRestore(plr.irq_state);
             const should_retry = SuspendRetry.check(target_thread);
+            const terminal = lifecycle.load(target_thread) == .retired or lifecycle.isDestroyMarked(target_thread);
             if (target_pinned) lifecycle.releasePin(target_thread);
             if (should_retry) {
                 spin_diag.note(.suspend_retry, @intFromPtr(target_thread));
@@ -859,7 +880,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            return errors.E_INVAL;
+            return if (terminal) terminalSuspendResult(process_ref, target_slot, target_ref) else errors.E_INVAL;
         }
         // `suspendOnPort` releases the port lock before returning (directly
         // on the no-receiver path, transitively via `rendezvousWithReceiver`
@@ -882,7 +903,10 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
             std.atomic.spinLoopHint();
             continue;
         }
-        return ret;
+        return if (ret == errors.E_TERM)
+            terminalSuspendResult(process_ref, target_slot, target_ref)
+        else
+            ret;
     }
 }
 
