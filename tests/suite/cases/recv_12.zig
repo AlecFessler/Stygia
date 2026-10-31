@@ -29,7 +29,9 @@
 //   would be visible if the kernel did *not* zero the vregs. With
 //   `read` denied, every vreg in the GPR window must read back as
 //   zero. We probe all 13 GPR vregs and fail on the first non-zero
-//   one. The reply_handle_id field (bits 32-43 of the syscall word)
+//   one. On x86-64 a second event probes stack vreg 14 (RIP) with a
+//   prefilled sentinel, so both a leaked pointer and a missing write
+//   fail. The reply_handle_id field (bits 32-43 of the syscall word)
 //   is used as a positive gate that recv took the success branch —
 //   a non-zero reply_handle_id witnesses that the kernel reached the
 //   reply-handle-mint step (and therefore the vreg-write step also
@@ -82,13 +84,36 @@
 //   6: at least one of vregs 1..13 (GPR window per §[event_state])
 //      was non-zero even though the suspending thread handle did not
 //      have the `read` cap — the spec line under test is violated
+//   7-9: setup or recv failed for the second x86 no-read event
+//   10: the x86 saved RIP lane was nonzero despite the absent read cap
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+
+// x86 event-state vreg 14 lives at [rsp+8] during recv. Prefill the
+// slot with -1 so both a skipped write and a leaked RIP fail the check.
+fn recvCaptureNoReadRipX64(port: u12) struct { status: u64, rip: u64 } {
+    var status: u64 = undefined;
+    var rip: u64 = undefined;
+    asm volatile (
+        \\ subq $8, %%rsp
+        \\ movq $-1, (%%rsp)
+        \\ pushq %%rcx
+        \\ syscall
+        \\ popq %%rcx
+        \\ popq %%rbx
+        : [status] "={rax}" (status),
+          [rip] "={rbx}" (rip),
+        : [word] "{rcx}" (@as(u64, 49)),
+          [port] "{rax}" (@as(u64, port)),
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    return .{ .status = status, .rip = rip };
+}
 
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
@@ -175,9 +200,9 @@ pub fn main(cap_table_base: u64) void {
     // the `read` cap on the thread handle that triggered the event,
     // every one of these slots must read back as zero. The kernel
     // also zeros the higher event-state vregs (RIP/RFLAGS/RSP/etc.
-    // at vregs 14..18 and the event-specific payload at 19..127),
-    // but those live on the receiver's stack and are not captured
-    // by the Regs return type. The 13 GPR slots are sufficient: if
+    // at vregs 14..18 and the event-specific payload at 19..127).
+    // The Regs return type does not capture those stack lanes; the
+    // x86-only helper below probes RIP directly. For these GPRs, if
     // the kernel skipped the read-cap gate, the suspended thread's
     // halt-loop GPRs (rip into rcx-via-syscall side effects, the
     // entry-function argv state, etc.) would be observable here.
@@ -195,6 +220,18 @@ pub fn main(cap_table_base: u64) void {
             return;
         }
         i += 1;
+    }
+
+    if (builtin.cpu.arch == .x86_64) {
+        // A fresh no-read sender gives the stack lane its own event.
+        // The first event above already proved the GPR lanes are zero.
+        const second = syscall.createThread(thread_caps_word, entry, 1, 0, 0);
+        if (testing.isHandleError(second.v1)) return testing.fail(7);
+        const second_handle: u12 = @truncate(second.v1 & 0xFFF);
+        if (syscall.suspendThread(second_handle, port_handle, &.{}).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(8);
+        const stack_state = recvCaptureNoReadRipX64(port_handle);
+        if (stack_state.status != @intFromEnum(errors.Error.OK)) return testing.fail(9);
+        if (stack_state.rip != 0) return testing.fail(10);
     }
 
     testing.pass();
