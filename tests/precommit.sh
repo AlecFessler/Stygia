@@ -1,11 +1,12 @@
 #!/bin/bash
-# Mega precommit: run the full cross-arch gauntlet before a commit.
+# Run the retained cross-arch tests and checkers before a commit.
 #
 # Stages (all gated except [0d], which is report-only):
+#   preflight. staged-source check   (the gate tests the content being committed)
 #   0. arch layering lint           (arch-specific / generic boundaries)
 #   0b. dead-code report             (skip-list checked into the tree)
-#   0c. gen-lock analyzer            (fat-pointer + bracketing invariants)
-#   0d. thread-closure analyzer          (REPORT-ONLY — never affects exit status)
+#   0c. gen-lock analyzer            (all ownership and IRQ rules)
+#   0d. thread-closure analyzer      (REPORT-ONLY — never affects exit status)
 #   0e. spec ↔ test coverage         (verify_coverage.py)
 #   1. x86_64 kernel test suite      (KVM on this dev PC, 3 reps)
 #   2. aarch64 kernel test suite     (Pi 5 bare-metal tryboot @ .107; QEMU/KVM fallback on .106/.104)
@@ -16,7 +17,7 @@
 #
 # Usage:
 #   ./tests/precommit.sh             # full gauntlet (all stages, including optional)
-#   ./tests/precommit.sh --git-hook  # only required stages — used by .githooks/pre-commit
+#   ./tests/precommit.sh --git-hook  # required stages — used by .githooks/pre-commit
 #
 # Env knobs:
 #   PI_BARE_HOST=user@ip       # Pi 5 bare-metal tryboot SSH target (default .107)
@@ -215,6 +216,7 @@ QEMU_SHIM_PATH="$QEMU_SHIM_DIR:$PATH"
 # 1 if any fail, so `git commit` refuses. The rest run in the full
 # manual invocation but don't gate the hook.
 REQUIRED_STAGES=(
+    source_snapshot
     arch_layering_lint
     dead_code_report
     gen_lock_analyzer
@@ -226,6 +228,8 @@ REQUIRED_STAGES=(
     linux_guest_x86_boot
     linux_guest_aarch64_boot
 )
+# Stygia-o4a.4.2 owns adding model-to-code correspondence here once its
+# checker is restored. There is no executable correspondence check today.
 #
 is_required() {
     local s
@@ -240,7 +244,35 @@ run_stage() {
     if [[ $REQUIRED_ONLY -eq 1 ]] && ! is_required "$name"; then
         return 0
     fi
-    "stage_$name" || true
+    local failures_before=${#FAILURES[@]}
+    if ! "stage_$name"; then
+        # A stage's nonzero result must block the commit even when it forgot
+        # to append its own more specific failure message.
+        if [[ ${#FAILURES[@]} -eq $failures_before ]]; then
+            FAILURES+=("$name failed")
+        fi
+    fi
+}
+
+stage_source_snapshot() {
+    # The analyzers and builds read the working tree. A commit containing a
+    # different staged version could pass the gate using unstaged fixes.
+    # Refuse that mismatch, including untracked source files that a build
+    # might read but the commit would omit.
+    if ! (cd "$STYGIA_ROOT" && git diff --quiet --exit-code); then
+        echo "[FAIL] tracked files have unstaged changes; stage them or restore them before committing."
+        FAILURES+=("working tree differs from staged snapshot")
+        return 1
+    fi
+    local untracked
+    untracked=$(cd "$STYGIA_ROOT" && git ls-files --others --exclude-standard -- \
+        kernel bootloader tools tests libz docs .githooks build.zig README.md)
+    if [[ -n "$untracked" ]]; then
+        echo "[FAIL] untracked source files would affect the gate but are absent from the commit:"
+        printf '%s\n' "$untracked"
+        FAILURES+=("untracked source files outside staged snapshot")
+        return 1
+    fi
 }
 
 # ── Pre-stage suite warmup ────────────────────────────────────────────
@@ -306,10 +338,8 @@ stage_arch_layering_lint() {
 # Both are exposed as $CALLGRAPH_DB and $CALLGRAPH_DB_AARCH64 so callers
 # can opt into either or both.
 #
-# Today only the dead-code analyzer (stage_dead_code_report) consumes the
-# aarch64 DB — the arch-layering and gen-lock analyzers are x86_64-only
-# semantics and pass just $CALLGRAPH_DB. Future stages that need
-# cross-arch alive-set coverage can read $CALLGRAPH_DB_AARCH64 directly.
+# Dead-code and gen-lock consume both DBs; architecture layering currently
+# uses the x86_64 DB. Future cross-arch analyzers can use both globals.
 #
 # The aarch64 DB skips the indexer's --elf argument: tools/indexer/src/
 # bin_pass.zig hardcodes `objdump -M intel`, so an aarch64 ELF would
@@ -345,9 +375,7 @@ ensure_callgraph_db() {
     # but-not-ignored file under the indexer's source roots
     # (kernel/, bootloader/, tools/, tests/, libz/). Restricting to
     # those roots keeps the hash stable across gauntlet runs that touch
-    # untracked artifacts elsewhere — notably .stygia-perf/_pending.json
-    # written by stage [5] — so two clean-tree gauntlets share the same
-    # cached DB.
+    # untracked artifacts elsewhere, so clean-tree runs share a cached DB.
     tree_hash=$(
         cd "$STYGIA_ROOT" && {
             git diff HEAD -- kernel bootloader tools tests libz
@@ -529,7 +557,7 @@ stage_dead_code_report() {
 stage_gen_lock_analyzer() {
     echo ""
     echo "=================================================="
-    echo "[0c] Gen-lock analyzer (IRQ discipline)"
+    echo "[0c] Gen-lock analyzer (all rules)"
     echo "=================================================="
     if ! (cd "$STYGIA_ROOT/tools/check_gen_lock" && zig build 2>&1); then
         FAILURES+=("gen-lock analyzer build")
@@ -550,25 +578,19 @@ stage_gen_lock_analyzer() {
     # (`args.db_path = v`), so a second `--db` would silently overwrite
     # the first and analyze only one arch. Hence two invocations.
     #
-    # Why both are needed: check 6's IRQ-discipline pass defers any
-    # acquire site under `kernel/arch/<other-arch>/` to the run for the
-    # arch that actually compiles it — that code is behind a resolved
-    # comptime arch branch and contributes zero ir_fn/ir_call rows here,
-    # so this DB has no evidence about it and every conclusion would rest
-    # on short-name text matching. The deferral is only sound because the
-    # other arch's run covers those sites; running one arch alone leaves
-    # them unanalyzed. The analyzer prints the deferred count on its
-    # summary line so a single-arch invocation can't hide them silently.
+    # Run both arches: the IRQ-discipline rule defers architecture-specific
+    # sites to the DB for the arch that compiles them, and the other rules
+    # must see both retained kernel backends too.
     #
     # Both runs execute even if the first fails, so one arch's findings
     # don't mask the other's.
     local genlock_rc=0
-    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary --rule irq_discipline); then
-        FAILURES+=("gen-lock IRQ-discipline findings (x86_64)")
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB" --target kernel --summary); then
+        FAILURES+=("gen-lock findings (x86_64)")
         genlock_rc=1
     fi
-    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB_AARCH64" --target kernel --summary --rule irq_discipline); then
-        FAILURES+=("gen-lock IRQ-discipline findings (aarch64)")
+    if ! (cd "$STYGIA_ROOT" && "$analyzer" --db "$CALLGRAPH_DB_AARCH64" --target kernel --summary); then
+        FAILURES+=("gen-lock findings (aarch64)")
         genlock_rc=1
     fi
     return $genlock_rc
@@ -1620,6 +1642,14 @@ stage_linux_guest_aarch64_boot() {
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────
+
+if [[ $REQUIRED_ONLY -eq 1 ]]; then
+    run_stage source_snapshot
+    if [[ ${#FAILURES[@]} -ne 0 ]]; then
+        echo "Required precommit preflight FAILED — commit BLOCKED."
+        exit 1
+    fi
+fi
 
 ensure_suite_root_service_elf || true
 

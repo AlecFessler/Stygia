@@ -311,8 +311,8 @@ handler in that directory is silently dropped by `INSERT OR IGNORE`.
 
 - `tests/precommit.sh` stage **[0c]** runs this tool as a gating stage:
   it builds the analyzer, runs `tests/run_tests.sh`, then runs the
-  analyzer against the x86_64 callgraph DB. Any err-severity finding
-  fails the commit gate.
+  full rule set against both x86_64 and aarch64 callgraph DBs. Any
+  err-severity finding fails the commit gate.
 - Runs in ~1.4s against a prebuilt DB.
 - Current finding totals are deliberately not pinned here — they moved
   every time the tree did, and the numbers in this section were stale by

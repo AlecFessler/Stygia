@@ -2,6 +2,17 @@
 
 Stygia is a capability-based microkernel for building secure, fast, and reliable operating systems.
 
+## Commit checks
+
+Run `tools/install-precommit-hook.sh` once per repository to activate the tracked
+hook. It refuses to replace an existing pre-commit hook or custom hooks path.
+Each normal commit then runs `tests/precommit.sh --git-hook`: the supported
+x86-64 and aarch64 kernel suites, VM boot checks, architecture layering,
+dead-code, GenLock, and spec-to-test coverage. Required stages fail closed if
+their toolchain, test rig, or other prerequisite is unavailable. The hook also
+requires the staged files to match the working tree it tests. The thread
+closure analyzer remains report-only in the manual `tests/precommit.sh` run.
+
 ## Kernel Objects
 
 Userspace interacts with the kernel through handles to typed kernel objects. Each row links to the relevant section of [the spec](docs/kernel/specv3.md) for the full handle ABI, capability bits, and syscall surface.
