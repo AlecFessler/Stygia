@@ -97,7 +97,7 @@ process teardown/refcount proof.
 | `RestartFallback` | `scheduler.runProcessTeardown` tries `restartProcess`; on false it clears caller-thread ownership and enters `runProcessTeardownWithoutRestart`. | Source-order gate and fallback mutation; restart fallback TLC configs. Model makes fallback one state update; source can fail at several policy points. |
 | `TermStart` | `thread.terminate` resolves the target handle and enters retirement path, including self target. | Source review; `terminate_*` suite and `mterm`/`mtermfix` TLC pair. The model omits capability resolution errors and gen-lock acquisition. |
 | `TermRetire` | `thread.retireAndBumpDeadGen` marks retiring, waits pins, removes ready queue membership, retires state, flips dead gen. | Source review; `terminate_*` suite. The model's one retire step hides pre-CAS wait and cleanup ordering. The `mark_state` protocol differs (`.7`). |
-| `TermStale` | `thread.terminate` reports E_TERM for a stale handle/gen and may detach its slot. | **Model bug `.8`:** `~RetireEnabled` also accepts a live pinned/pended target, allowing false stale return. `LiveTerm` evidence is provisional for W7/pin waits until this guard is corrected and probed. |
+| `TermStale` | `thread.terminate` returns E_TERM when the target gen lock rejects a stale handle; if `retireAndBumpDeadGen` sees an already retired target, it returns OK. | The model has no return-code variable, so this action covers both terminal outcomes (`retired`, `finalizing`, `freed`). It excludes live pinned, directive-pinned, and pended targets: those remain in `termR` until `TermRetire` is enabled. The `termstale_reach`/`termstale_safe` TLC pair checks a reachable blocked-live state and excludes a stale return there. The pre-CAS pin/payload wait is still represented by a guard, not individual kernel instructions. |
 | `TermWait` | `thread.routeRetiredFinalize` sends remote IPI and waits for the target to leave `current_thread` unless target is self. | **Mismatch `.6`:** no retired-caller escape, so mutual terminate can deadlock. W4 owed-mark wait also has no source counterpart (`.7`). TLC `mtermfix` does not establish source liveness. |
 | `PinAcq`, `PinRel` | Representative model episode for any lock class with a preemptible thread-context hold. Current tree's effective-mask analysis says the production pin-class set is empty. | **Model-only over-approximation**, retained for F3/C1 falsifiers (`pinord`). There is no production `PinAcq` call to map; real claim pins are represented in wake/suspend/steal actions and implemented by `lifecycle.tryPinLive`/`releasePin`. |
 | `PinBump`, `PinUnlock` | `PIN_BUMP_FIRST = FALSE` defective-machine half-states only. | `pinord` TLC falsifier; no production correspondence. |
@@ -130,7 +130,8 @@ not a proof of every interrupt/return interleaving.
 - **Mismatches under active switches:** `.1` vCPU state lifetime, `.2`
   S7 routing, `.3` self-mark scope, `.4` ready priority move, `.5` recv
   queued-sender ownership, `.6` mutual terminate escape, `.7` marking
-  protocol, `.8` false `TermStale` guard. No green TLC or precommit result
+  protocol. The `.8` false `TermStale` guard is closed by the
+  `termstale_reach`/`termstale_safe` pair. No green TLC or precommit result
   resolves these issues.
 
 ### Open kernel mismatch exposed by this review

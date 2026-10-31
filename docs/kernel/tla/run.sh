@@ -182,6 +182,12 @@ expect_violation pr2 ThreadProbes.tla "Invariant ProbeNoRvPendedReceiver is viol
   -deadlock -config ThreadLifecycle_pr2.cfg
 expect_violation pr3 ThreadProbes.tla "Invariant ProbeNoRetireFromPended is violated" \
   -deadlock -config ThreadLifecycle_pr3.cfg
+# TermStale must wait when a live target is pinned or has unfinished payload.
+# The first row proves that blocking state is reachable in this scope; the
+# second proves the stale-return action is disabled there.
+expect_violation termstale_reach ThreadProbes.tla "Invariant ProbeNoBlockedTermTarget is violated" \
+  -deadlock -config ThreadLifecycle_termstale_reach.cfg
+expect_pass termstale_safe ThreadProbes.tla -deadlock -config ThreadLifecycle_termstale_safe.cfg
 # round-10 M-D: prove t1full's LiveTerm PASS is not vacuous — the
 # W3 -> W5 -> W3 configuration must actually be REACHED at that scope.
 expect_violation pr4 ThreadProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \

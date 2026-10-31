@@ -6,6 +6,22 @@
 (* the model lost coverage -- report it, never delete it.                  *)
 EXTENDS ThreadLifecycle
 
+(* A terminator can enter termR while its live target is temporarily blocked
+   from retirement. This is the pin/payload wait that TermStale must preserve. *)
+BlockedTermTarget(w, t) ==
+  /\ w # t /\ threads[w].pc = "termR" /\ threads[w].tg = t
+  /\ threads[w].st \in {"running","retired"}
+  /\ threads[t].st \in {"ready","waiting","running","parking","claimed","pended"}
+  /\ ~RetireEnabled(t)
+
+ProbeNoBlockedTermTarget ==
+  \A w, t \in Threads: ~BlockedTermTarget(w, t)
+
+(* Safety gate: the return action itself cannot use a blocked live target. *)
+InvNoFalseTermStale ==
+  \A c \in Cores: ~\E w, t \in Threads:
+    BlockedTermTarget(w, t) /\ cores[c].cur = w /\ ENABLED TermStale(c)
+
 (* T2's parking x K+C cell actually reached: a rendezvous sender retired   *)
 (* MID-DELIVERY while holding its receiver's claim.                        *)
 ProbeNoRetiredRvSender ==

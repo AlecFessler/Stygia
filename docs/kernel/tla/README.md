@@ -340,8 +340,8 @@ gitignored; keep all generated output under them.
 | File | Purpose |
 |---|---|
 | `ThreadLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
-| `ThreadProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
-| `run.sh` | **runs 51 default rows and six opt-in rows; exits non-zero on any deviation** |
+| `ThreadProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes), plus the blocked-live terminate reachability and stale-return safety pair |
+| `run.sh` | **runs 53 default rows and six opt-in rows; exits non-zero on any deviation** |
 | `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants; TLC core/thread symmetry reduction |
 | `ThreadLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
 | `ThreadLifecycle_medium.cfg` | extended/manual 2c × 3e full directive aggregate, symmetry. **Oversized after dpin/dres; not default evidence.** Two documented scope cuts in-file: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
@@ -350,6 +350,8 @@ gitignored; keep all generated output under them.
 | `ThreadLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 Threads. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
 | `ThreadLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
 | `ThreadLifecycle_g11{,_pin}.cfg` | G11 marker reachability violation plus same-scope safety check that finalizing/dead has no live directive waiter; removing `RetireEnabled`'s `dpin` guard falsifies the latter |
+| `ThreadLifecycle_termstale_{reach,safe}.cfg` | same 2c × 2e scope: reach a live target whose pin blocks retire while caller is in `termR`, then prove `TermStale` is disabled there. The first trace reaches `StealClaim`: target `claimed`, `pin = 1`; the former `~RetireEnabled` guard would return prematurely. This checks the model action, not the source wait loop. |
+
 | `ThreadLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
 | `ThreadLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
 | `ThreadLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
@@ -375,13 +377,21 @@ gitignored; keep all generated output under them.
 | `ThreadLifecycle_medium.cfg` | extended/manual full directive 2c × 3e aggregate; stopped after dpin/dres and not default evidence |
 | `ThreadLifecycle_pr4d.cfg` | extended/manual full-scope non-vacuity probe paired with full `t1d`; kept on disk but not in the default battery |
 
+The `termstale_safe` calibration used a temporary copy of this same model with
+only the old `~RetireEnabled(t)` guard restored. At state 5, after
+`DispatchThread`, `DispatchLoad`, `TermStart`, and `StealClaim`, TLC violated
+`InvNoFalseTermStale` (214 distinct states at first violation): `e1` was
+`running` in `termR` targeting `e2`, while `e2` was live `claimed` with
+`pin = 1` and `pd = FALSE`. The corrected guard passed the identical scope
+with 16,480 distinct states. No calibration copy is tracked.
+
 
 **Config taxonomy** (which machine each family describes). DERIVED from
 `ls ThreadLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
-9–11 and the taxonomy kept describing them. There are **62 `.cfg` files**;
-the default runner invokes **43**, and `RUN_XLARGE=1 RUN_SLOW=1` adds six.
+9–11 and the taxonomy kept describing them. There are **72 `.cfg` files**;
+the default runner invokes **53**, and `RUN_XLARGE=1 RUN_SLOW=1` adds six.
 The 13 outside those runs are `q1`–`q7`, `q7d`, `dirabafix`, full `medium`,
 full `pr4d`, and the superseded focused `g16`/`g16_two` configs. The
 current G16 rows in the runner are `g16_two_core`, `g16_remote`, and
