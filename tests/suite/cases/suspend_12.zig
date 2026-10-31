@@ -1,96 +1,13 @@
-// Spec §[suspend] — test 12.
+// Spec §[suspend] test 12: a valid target handle's priority and affinity
+// snapshots are refreshed on both error and success paths.
 //
-// "[test 12] when [1] is a valid handle, [1]'s field0 and field1 are
-//  refreshed from the kernel's authoritative state as a side effect,
-//  regardless of whether the call returns success or another error
-//  code."
-//
-// Strategy
-//   The spec requires that whenever `suspend` sees a valid thread handle
-//   in [1], the kernel writes back [1]'s field0/field1 from
-//   authoritative state — even when the call fails. The cleanest
-//   proof is the same shape used by map_mmio_09: drive a failure
-//   path that errors *after* [1] has been validated but *before*
-//   any kernel-side mutation of the thread's authoritative state. If the
-//   authoritative state never moved, then the spec-mandated refresh
-//   must leave the cap-table slot bit-identical to the pre-call
-//   snapshot.
-//
-//   The calling thread's own self handle (`SLOT_INITIAL_THREAD`) is a valid
-//   thread handle by construction (the runner installs it at slot 1 with
-//   caps = the child process's `thread_inner_ceiling` per
-//   §[process] / §[create_process] test 21). The
-//   runner sets `thread_inner_ceiling = 0xFF` (primary.zig), so the slot-1
-//   handle carries the `susp` cap (ThreadCap bit 5) — that means the [1]
-//   gates (test 01 BADCAP and test 03 PERM `susp`) cannot fire.
-//
-//   To trigger an error after [1] passes, we pass an empty cap-table
-//   slot as [2]. Slot 4095 is guaranteed empty by the
-//   create_process table layout (slots 0/1/2 = self /
-//   initial thread / self-IPC; passed_handles begin at slot 3, and the
-//   primary passes only one — the result port — at slot 3). The
-//   suspend syscall then returns E_BADCAP on the [2] gate (test 02).
-//   The spec's "[1] is a valid handle" precondition for test 12 is
-//   met, so the refresh requirement applies.
-//
-//   The thread's authoritative field0 / field1 (per §[thread]):
-//     field0 bits 0-1 = `pri` (current scheduling priority)
-//     field1 bits 0-63 = `affinity` (current core affinity mask)
-//   are kernel-mutable but only mutated by the `priority` and
-//   `affinity` syscalls (see §[thread] field-layout note).
-//   This test calls neither between the snapshot and the failing
-//   `suspend`, so the kernel's authoritative state for the calling
-//   thread is unchanged across the call. A faithful refresh on
-//   E_BADCAP must therefore leave field0 and field1 bit-identical to
-//   the pre-call read.
-//
-//   SPEC AMBIGUITY: spec §[suspend] does not explicitly pin the
-//   ordering of the [1] BADCAP gate vs. the [2] BADCAP gate. The
-//   listed order (test 01 then test 02) and the parallel construction
-//   in §[map_mmio] test 09 (which the kernel-test corpus already
-//   relies on for the same refresh shape) imply the [1] gate fires
-//   before the [2] gate. If the kernel orders them in the opposite
-//   direction, [1] is never validated on this path and test 12's
-//   precondition does not hold — a different failure path would be
-//   needed. The test is written assuming the spec-listed order.
-//
-//   SPEC AMBIGUITY: §[suspend] does not pin whether the refresh is
-//   visible in the cap-table slot before the syscall returns to the
-//   caller. The §[capabilities] note that field0/field1 are
-//   "kernel-mutable snapshots" that are "refreshed by the implicit
-//   sync side effect of any syscall that takes the handle" implies
-//   that the cap-table slot is updated as part of syscall
-//   bookkeeping, so a post-call read sees the refreshed value. This
-//   test assumes that visibility model.
-//
-// Action
-//   1. readCap(SLOT_INITIAL_THREAD) → snapshot field0 and field1.
-//      — must report handleType = thread (precondition).
-//   2. issueReg(.@"suspend", 0, .{ v1 = SLOT_INITIAL_THREAD, v2 = 4095 })
-//      — direct syscall, bypassing libz's `suspendThread` wrapper which
-//      panics on attachments-N>0; here N=0 so a wrapper call would
-//      also work, but using `issueReg` directly keeps this test
-//      independent of the wrapper's signature.
-//   3. assert v1 = E_BADCAP (precondition for the test 12 path —
-//      [1] valid, [2] invalid).
-//   4. readCap(SLOT_INITIAL_THREAD) → re-read field0 and field1.
-//   5. assert post-call field0 == pre-call field0 AND post-call
-//      field1 == pre-call field1.
-//
-// Assertions
-//   1: precondition broken — slot 1 was not a thread
-//      handle. The runner contract is violated; cannot evaluate the
-//      spec assertion.
-//   2: the failing `suspend` did not return E_BADCAP — either the
-//      kernel ordered the gates differently or some earlier gate
-//      fired, so the test 12 precondition ("[1] is a valid handle")
-//      may not hold.
-//   3: post-call field0 differs from the pre-call snapshot — the
-//      cap-table slot is no longer a faithful reflection of kernel
-//      state across an error return.
-//   4: post-call field1 differs from the pre-call snapshot — same
-//      shape as assertion 3 but for field1.
+// A suspend attachment copies the target thread handle into this same
+// process. Mutating the thread through the copy leaves the original slot
+// stale. The subsequent suspend must bring that original slot up to date.
+// This distinguishes a real refresh from merely preserving an already
+// synchronized snapshot.
 
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const caps = lib.caps;
@@ -98,49 +15,118 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
+fn worker() callconv(.c) noreturn {
+    while (true) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause"),
+            .aarch64 => asm volatile ("yield"),
+            else => @compileError("unsupported arch"),
+        }
+    }
+}
+
+// PairEntry for N=1 occupies vreg 127. Both instruction sequences mirror
+// handle_attachments_08 and the kernel's firstStackVreg layout.
+fn suspendWithCopyX64(word: u64, target: u64, port: u64, pair: u64) u64 {
+    var result: u64 = undefined;
+    asm volatile (
+        \\ subq $912, %%rsp
+        \\ movq %%rdx, 904(%%rsp)
+        \\ pushq %%rcx
+        \\ syscall
+        \\ addq $920, %%rsp
+        : [result] "={rax}" (result),
+        : [word] "{rcx}" (word),
+          [target] "{rax}" (target),
+          [port] "{rbx}" (port),
+          [pair] "{rdx}" (pair),
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    return result;
+}
+
+fn suspendWithCopyArm(word: u64, target: u64, port: u64, pair: u64) u64 {
+    var result: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #784
+        \\ str %[pair], [sp, #768]
+        \\ str %[word], [sp]
+        \\ svc #0
+        \\ add sp, sp, #784
+        : [result] "={x0}" (result),
+        : [word] "r" (word),
+          [target] "{x0}" (target),
+          [port] "{x1}" (port),
+          [pair] "r" (pair),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return result;
+}
+
+fn checkSnapshot(base: u64, slot: u12, priority: u64, affinity: u64) bool {
+    const cap = caps.readCap(base, slot);
+    return cap.handleType() == .thread and cap.field0 == priority and cap.field1 == affinity;
+}
+
 pub fn main(cap_table_base: u64) void {
-    // Precondition: SLOT_INITIAL_THREAD must be a thread handle. The runner
-    // installs the child's initial thread at slot 1 with the
-    // `thread_inner_ceiling` caps (§[create_process] test 21);
-    // the child's `thread_inner_ceiling` is 0xFF in primary.zig so the
-    // slot carries `susp` (ThreadCap bit 5). If this read disagrees, the
-    // runner contract has shifted out from under the test.
-    const cap_pre = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
-    if (cap_pre.handleType() != caps.HandleType.thread) {
-        testing.fail(1);
-        return;
-    }
-    const field0_pre = cap_pre.field0;
-    const field1_pre = cap_pre.field1;
+    // Keep the initial suspend on this caller's core. After that first
+    // suspend, the target stays parked on the port while its alias
+    // changes priority and affinity, so it cannot starve the caller.
+    const own_core = testing.currentCoreId();
+    const pinned_affinity: u64 = @as(u64, 1) << @truncate(own_core);
+    const sibling_bit: u64 = if (own_core == 0) 2 else 1;
+    const widened_affinity = pinned_affinity | sibling_bit;
+    if (syscall.affinity(caps.SLOT_INITIAL_THREAD, pinned_affinity).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(19);
+    _ = syscall.yieldThread(0);
+    if (testing.currentCoreId() != own_core) return testing.fail(20);
 
-    // Slot 4095 is guaranteed empty by the create_process
-    // table layout, so the [2] BADCAP gate must fire. The [1] gate
-    // has already passed (slot 1 is a valid thread), which is the
-    // precondition for the spec's test 12 refresh requirement.
-    const empty_slot: u64 = caps.HANDLE_TABLE_MAX - 1;
-    const result = syscall.issueReg(.@"suspend", 0, .{
-        .v1 = @as(u64, caps.SLOT_INITIAL_THREAD),
-        .v2 = empty_slot,
-    });
-    if (result.v1 != @intFromEnum(errors.Error.E_BADCAP)) {
-        testing.fail(2);
-        return;
-    }
+    const port_caps = caps.PortCap{ .bind = true, .recv = true, .xfer = true, .@"suspend" = true };
+    const created_port = syscall.createPort(@as(u64, port_caps.toU16()));
+    if (testing.isHandleError(created_port.v1)) return testing.fail(1);
+    const port: u12 = @truncate(created_port.v1 & 0xFFF);
 
-    // The kernel never mutated the calling thread's priority or affinity
-    // (no `priority` / `affinity` syscall ran between the snapshot
-    // and this point), so the authoritative field0 / field1 are
-    // unchanged. A spec-conformant refresh must therefore leave the
-    // cap-table slot bit-identical to the pre-call snapshot.
-    const cap_post = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
-    if (cap_post.field0 != field0_pre) {
-        testing.fail(3);
-        return;
-    }
-    if (cap_post.field1 != field1_pre) {
-        testing.fail(4);
-        return;
-    }
+    const thread_caps = caps.ThreadCap{ .copy = true, .susp = true, .spri = true, .saff = true };
+    const created_thread = syscall.createThread(@as(u64, thread_caps.toU16()), @intFromPtr(&worker), 1, 0, pinned_affinity);
+    if (testing.isHandleError(created_thread.v1)) return testing.fail(2);
+    const source: u12 = @truncate(created_thread.v1 & 0xFFF);
+    if (!checkSnapshot(cap_table_base, source, 0, pinned_affinity)) return testing.fail(3);
+
+    const pair = caps.PairEntry{ .id = source, .caps = thread_caps.toU16(), .move = false };
+    const word = syscall.buildWord(.@"suspend", syscall.extraCount(1));
+    const suspended = switch (builtin.cpu.arch) {
+        .x86_64 => suspendWithCopyX64(word, source, port, pair.toU64()),
+        .aarch64 => suspendWithCopyArm(word, source, port, pair.toU64()),
+        else => @compileError("unsupported arch"),
+    };
+    if (suspended != @intFromEnum(errors.Error.OK)) return testing.fail(4);
+
+    const received = syscall.recv(port, 0);
+    if (((received.word >> 12) & 0xFF) != 1 or ((received.word >> 44) & 0x1F) != 4) return testing.fail(5);
+    const alias: u12 = @truncate((received.word >> 20) & 0xFFF);
+    const reply_id: u12 = @truncate((received.word >> 32) & 0xFFF);
+    if (alias == source or caps.readCap(cap_table_base, alias).handleType() != .thread) return testing.fail(6);
+
+    // Change both authoritative fields through the alias. The source slot
+    // must remain stale until suspend takes it as [1].
+    if (syscall.priority(alias, 2).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(8);
+    if (syscall.affinity(alias, widened_affinity).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(9);
+    if (!checkSnapshot(cap_table_base, source, 0, pinned_affinity)) return testing.fail(10);
+    if (!checkSnapshot(cap_table_base, alias, 2, widened_affinity)) return testing.fail(11);
+
+    // Valid [1], invalid [2]. No later call may refresh source before the
+    // direct read below.
+    const empty_port: u12 = caps.HANDLE_TABLE_MAX - 1;
+    if (syscall.suspendThread(source, empty_port, &.{}).v1 != @intFromEnum(errors.Error.E_BADCAP)) return testing.fail(12);
+    if (!checkSnapshot(cap_table_base, source, 2, widened_affinity)) return testing.fail(13);
+
+    // Lower the parked target's priority and repin it before reply, so
+    // its resumed spin loop cannot outrank this test thread. The source
+    // slot still holds the snapshot from the error leg; a successful
+    // suspend must refresh both fields again.
+    if (syscall.priority(alias, 0).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(14);
+    if (syscall.affinity(alias, pinned_affinity).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(15);
+    if (!checkSnapshot(cap_table_base, source, 2, widened_affinity)) return testing.fail(16);
+    if (syscall.reply(reply_id).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(17);
+    if (syscall.suspendThread(source, port, &.{}).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(18);
+    if (!checkSnapshot(cap_table_base, source, 0, pinned_affinity)) return testing.fail(21);
 
     testing.pass();
 }

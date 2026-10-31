@@ -23,7 +23,7 @@
 //       through the write-cap branch under test.
 //     - W's entry function spins on a global `g_released` flag,
 //       reads its r15 once `g_released` is non-zero, publishes the
-//       value to a global `g_observed`, and halts.
+//       value to a global `g_observed`, and keeps running until teardown.
 //     - The test thread calls `suspend(W, port)` — W is queued as a
 //       suspended sender and stops executing somewhere inside its
 //       spin loop.
@@ -40,9 +40,9 @@
 //     - The test thread spin-waits on `g_observed`; when it lands on
 //       `MAGIC` the modification has been observed end-to-end.
 //
-//   The sibling assertion (suspend_12: write-cap absent → modifications
-//   discarded) is a separate test file. This file exercises only the
-//   write-cap-present branch.
+//   A second worker below exercises the write-cap-absent branch: its
+//   post-reply register must equal the value captured at recv, despite
+//   the receiver placing MAGIC in vreg 13.
 //
 // Why r15 (vreg 13) and not a lower-numbered GPR
 //   libz's `issueReg` puts the syscall input vregs into hardware GPRs
@@ -123,6 +123,7 @@ const MAGIC: u64 = 0xCAFEBABEDEADBEEF;
 // the spin loop.
 var g_released: u64 = 0;
 var g_observed: u64 = 0;
+var g_done: u64 = 0;
 
 fn workerEntry() callconv(.c) noreturn {
     // Spin until the test thread sets `g_released`. The acquire ordering
@@ -157,11 +158,12 @@ fn workerEntry() callconv(.c) noreturn {
     }
 
     @atomicStore(u64, &g_observed, observed, .release);
+    @atomicStore(u64, &g_done, 1, .release);
 
     while (true) {
         switch (builtin.cpu.arch) {
-            .x86_64 => asm volatile ("hlt"),
-            .aarch64 => asm volatile ("wfi"),
+            .x86_64 => asm volatile ("pause"),
+            .aarch64 => asm volatile ("yield"),
             else => @compileError("unsupported arch"),
         }
     }
@@ -263,7 +265,7 @@ pub fn main(cap_table_base: u64) void {
     // to resume W; the runner's outer scheduling will eventually
     // surface that as a hung test, which is the correct user-visible
     // failure mode.
-    while (@atomicLoad(u64, &g_observed, .acquire) == 0) {
+    while (@atomicLoad(u64, &g_done, .acquire) == 0) {
         _ = syscall.yieldThread(w_handle);
     }
 
@@ -272,6 +274,32 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(6);
         return;
     }
+
+    // Repeat with read but without write. `read` gives a precise baseline
+    // for vreg 13; the reply supplies a distinct value which must be
+    // ignored. A separate done flag lets the baseline itself be zero.
+    @atomicStore(u64, &g_released, 0, .release);
+    @atomicStore(u64, &g_observed, 0, .release);
+    @atomicStore(u64, &g_done, 0, .release);
+    const no_write_caps = caps.ThreadCap{ .susp = true, .read = true };
+    const created_no_write = syscall.createThread(@as(u64, no_write_caps.toU16()), entry, 1, 0, 0);
+    if (testing.isHandleError(created_no_write.v1)) return testing.fail(7);
+    const no_write_handle: u12 = @truncate(created_no_write.v1 & 0xFFF);
+    if (syscall.suspendThread(no_write_handle, port_handle, &.{}).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(8);
+    const got_no_write = syscall.recv(port_handle, 0);
+    if (((got_no_write.word >> 44) & 0x1F) != 4) return testing.fail(9);
+    const baseline = got_no_write.regs.v13;
+    if (baseline == MAGIC) return testing.fail(10);
+    const reply_no_write: u12 = @truncate((got_no_write.word >> 32) & 0xFFF);
+    @atomicStore(u64, &g_released, 1, .release);
+    const reply_no_write_extra: u64 = @as(u64, reply_no_write) << 20;
+    if (syscall.issueReg(.reply, reply_no_write_extra, .{ .v13 = MAGIC }).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(11);
+    for (0..4096) |_| {
+        if (@atomicLoad(u64, &g_done, .acquire) != 0) break;
+        _ = syscall.yieldThread(no_write_handle);
+    }
+    if (@atomicLoad(u64, &g_done, .acquire) == 0) return testing.fail(12);
+    if (@atomicLoad(u64, &g_observed, .acquire) != baseline) return testing.fail(13);
 
     testing.pass();
 }
