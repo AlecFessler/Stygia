@@ -899,6 +899,11 @@ fn routeRetiredFinalize(
     if (caller) |c| {
         if (c != thread) {
             while (scheduler.coreCurrentIs(retired_owner, thread)) {
+                // A peer may retire this caller while it is in terminate.
+                // It will never return to user mode, so waiting for that
+                // peer's eviction has no observer. In mutual terminate,
+                // both callers otherwise wait with IRQs masked forever.
+                if (lifecycle.load(c) == .retired) break;
                 spin_diag.note(.route_retired_wait, @intFromPtr(thread));
                 arch.paging.serviceTlbMaintenanceWhileSpinning();
                 // stygia-8xl. This wait runs from the `terminate`

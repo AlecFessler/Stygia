@@ -355,6 +355,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "terminate_06", .path = "cases/terminate_06.zig" },
     .{ .name = "terminate_07", .path = "cases/terminate_07.zig" },
     .{ .name = "terminate_08", .path = "cases/terminate_08.zig" },
+    .{ .name = "terminate_mutual_remote", .path = "cases/terminate_mutual_remote.zig" },
     .{ .name = "time_01", .path = "cases/time_01.zig" },
     .{ .name = "unmap_01", .path = "cases/unmap_01.zig" },
     .{ .name = "unmap_02", .path = "cases/unmap_02.zig" },
