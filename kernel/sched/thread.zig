@@ -975,8 +975,13 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
     // refuses (slot's referenced thread was already destroyed), evict
     // the stale entry and surface E_TERM (spec test 05/06).
     const wlr = worker_ref.lockIrqSave(@src()) catch {
-        capability.clearAndFreeSlot(process, slot, entry);
+        const instance = entry.instance;
         process_ref.unlockIrqRestore(process_irq_state);
+        // Revalidate after dropping the process lock, then unlink from the
+        // copy-derivation tree before returning the stale slot to the free list.
+        _ = stygia.caps.derivation.deleteAndDetachExpected(
+            @bitCast(process_ref), slot, @bitCast(worker_ref), .thread, 0, instance,
+        );
         return errors.E_TERM;
     };
     worker_ref.unlockIrqRestore(wlr.irq_state);
@@ -1199,8 +1204,11 @@ pub fn setPriority(caller: *Thread, target: u64, new_priority: u64) i64 {
     const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target thread was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
-        capability.clearAndFreeSlot(process, slot, entry);
+        const instance = entry.instance;
         process_ref.unlockIrqRestore(process_irq_state);
+        _ = stygia.caps.derivation.deleteAndDetachExpected(
+            @bitCast(process_ref), slot, @bitCast(target_ref), .thread, 0, instance,
+        );
         return errors.E_TERM;
     };
     const target_thread = tlr.ptr;
@@ -1261,8 +1269,11 @@ pub fn setAffinity(caller: *Thread, target: u64, new_affinity: u64) i64 {
     const tlr = target_ref.lockIrqSave(@src()) catch {
         // Stale handle — target thread was terminated. Evict the slot from
         // the caller's table and surface E_TERM (spec test 05).
-        capability.clearAndFreeSlot(process, slot, entry);
+        const instance = entry.instance;
         process_ref.unlockIrqRestore(process_irq_state);
+        _ = stygia.caps.derivation.deleteAndDetachExpected(
+            @bitCast(process_ref), slot, @bitCast(target_ref), .thread, 0, instance,
+        );
         return errors.E_TERM;
     };
     const target_thread = tlr.ptr;
