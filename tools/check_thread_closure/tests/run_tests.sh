@@ -33,14 +33,10 @@ FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 ANALYZER="$TOOL_DIR/zig-out/bin/check_thread_closure"
 INDEXER="$REPO_ROOT/tools/indexer/zig-out/bin/indexer"
 
-if [[ ! -x "$ANALYZER" ]]; then
-    echo "Analyzer not built; running zig build first." >&2
-    (cd "$TOOL_DIR" && zig build) >&2
-fi
-if [[ ! -x "$INDEXER" ]]; then
-    echo "Indexer not built; running zig build in tools/indexer first." >&2
-    (cd "$REPO_ROOT/tools/indexer" && zig build) >&2
-fi
+# Always rebuild both tools: an executable left in zig-out by an earlier
+# checkout can have a different summary format or indexing behavior.
+(cd "$TOOL_DIR" && zig build) >&2
+(cd "$REPO_ROOT/tools/indexer" && zig build) >&2
 
 TMP_ROOT="$(mktemp -d -t check_thread_closure_test.XXXXXX)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
