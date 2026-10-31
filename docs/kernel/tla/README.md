@@ -907,9 +907,10 @@ what its tooling actually RAN.
   `persist` keeps a thread running while its process's VMARs are freed. **The
   instructive part is the method**: this README's sufficiency table was
   derived by walking the spec's SYSCALL list, and `§[restart_semantics]`
-  is not a syscall section. **STATUS as of rev 16: `restart_at_entry` is
-  no longer an obligation** — downgraded by maintainer decision once the
-  tree showed only policy plumbing exists (see the sufficiency table).
+  is not a syscall section. **Current status (2026-10-31): process restart
+  remains a required core feature under the approved spec.** The earlier
+  rev-16 downgrade was incorrect: implementation absence does not remove
+  the obligation. Stygia-o4a.16 tracks implementation and model coverage.
   The FINDING is unaffected and is the reason this entry stays: what C-5
   caught was a derivation method, not a missing edge. A blind spot in the
   derivation, of which the
@@ -1830,7 +1831,7 @@ distinction a closure table exists to make.
 | `delete(SLOT_SELF)` process teardown; vCPU pre-loop | §8.2 / §8.1 | OUT OF SCOPE, stated: scheduler-context teardown phases and the degenerate-hop loop | park-stack code |
 | IPC fast paths | §9.4 fused compositions | `FastPath`, `ReplyFP` as ideal atomic compositions | pinned asm sites |
 | **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireThread` / `Terminate` | the exiting process's teardown |
-| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no process-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — a thread in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **REQUIRED BY APPROVED SPEC; MISSING FROM IMPLEMENTATION AND MODEL (Stygia-o4a.16).** The tree implements policy plumbing and ceiling checks, but no process-restart path. The seven `restart_semantics_*.zig` cases do not test restart behavior; six are labeled degraded smoke variants. A thread in any state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + frame reset under the won claim + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
 | **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps a thread *running* while its process's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live thread, and it collides directly with `active_root` / translation quiescence (W6): a running thread on a root being rewritten is what `awaitProcessQuiesced` exists to prevent | **not modelled** | — |
 | `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any thread's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
