@@ -399,12 +399,6 @@ const test_entries = [_]TestEntry{
     .{ .name = "sync_01", .path = "cases/sync_01.zig" },
     .{ .name = "sync_02", .path = "cases/sync_02.zig" },
     .{ .name = "sync_03", .path = "cases/sync_03.zig" },
-    .{ .name = "system_info_01", .path = "cases/system_info_01.zig" },
-    .{ .name = "system_info_02", .path = "cases/system_info_02.zig" },
-    .{ .name = "system_info_03", .path = "cases/system_info_03.zig" },
-    .{ .name = "system_info_04", .path = "cases/system_info_04.zig" },
-    .{ .name = "system_info_05", .path = "cases/system_info_05.zig" },
-    .{ .name = "system_info_06", .path = "cases/system_info_06.zig" },
     .{ .name = "terminate_01", .path = "cases/terminate_01.zig" },
     .{ .name = "terminate_02", .path = "cases/terminate_02.zig" },
     .{ .name = "terminate_03", .path = "cases/terminate_03.zig" },
@@ -566,6 +560,7 @@ const TestBuildCtx = struct {
     caps_mod: *std.Build.Module,
     errors_mod: *std.Build.Module,
     syscall_extern_mod: *std.Build.Module,
+    environment_mod: *std.Build.Module,
 };
 
 fn buildTestElf(
@@ -622,6 +617,7 @@ fn buildTestElf(
     });
     app_mod.addImport("lib", test_lib_mod);
     app_mod.addImport("test_tag", tag_mod);
+    app_mod.addImport("test_environment", ctx.environment_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "runner/start.zig" },
@@ -830,6 +826,13 @@ pub fn build(b: *std.Build) void {
         "spread_cores",
         "Pin test domain N to core N % cores instead of using affinity-0 local-biased initial placement (default true)",
     ) orelse true;
+    // The harness provisions four cores on QEMU and Pi 5. Keep this
+    // explicit so tests do not depend on the removed public info ABI.
+    const expected_cores = b.option(u8, "expected_cores", "Number of cores provisioned by the test harness (default 4)") orelse 4;
+    if (expected_cores == 0 or expected_cores > 63) @panic("-Dexpected_cores must be in 1..63");
+    // Pi-hosted QEMU/KVM does not expose nested EL2; other current test
+    // environments expose the virtualization path being tested.
+    const expect_hv = b.option(bool, "expect_hv", "Whether this test boot exposes hardware virtualization (default true)") orelse true;
 
     // Build the filtered list of test entries up front. The same
     // selection drives both per-test ELF builds and the manifest the
@@ -1021,6 +1024,16 @@ pub fn build(b: *std.Build) void {
     const libz = addLibz(b, cpu_arch);
     const libz_loader_src: std.Build.LazyPath = .{ .cwd_relative = "../../libz/loader.zig" };
 
+    const test_environment_src = b.addWriteFiles().add(
+        "test_environment.zig",
+        b.fmt("pub const expected_cores: u64 = {d};\npub const expect_hv: bool = {};\n", .{ expected_cores, expect_hv }),
+    );
+    const test_environment_mod = b.createModule(.{
+        .root_source_file = test_environment_src,
+        .target = target_dynlink,
+        .optimize = .ReleaseSmall,
+    });
+
     const ctx = TestBuildCtx{
         .target_freestanding = target_freestanding,
         .target_dynlink = target_dynlink,
@@ -1029,6 +1042,7 @@ pub fn build(b: *std.Build) void {
         .caps_mod = caps_dynlink_mod,
         .errors_mod = errors_dynlink_mod,
         .syscall_extern_mod = syscall_extern_mod,
+        .environment_mod = test_environment_mod,
     };
 
     const embedded_wf = b.addWriteFiles();
@@ -1112,6 +1126,10 @@ pub fn build(b: *std.Build) void {
     manifest.print(
         "pub const spread_cores: bool = {};\n",
         .{spread_cores},
+    ) catch unreachable;
+    manifest.print(
+        "pub const expected_cores: u64 = {d};\n",
+        .{expected_cores},
     ) catch unreachable;
     const manifest_src = embedded_wf.add("embedded_tests.zig", manifest.items);
 

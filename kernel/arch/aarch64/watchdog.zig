@@ -240,7 +240,7 @@ pub fn ceilingSeconds() u64 {
 /// Read CNTFRQ_EL0 — the counter frequency firmware programmed.
 ///
 /// Duplicated from `timers.zig`'s private helper rather than reaching for its
-/// cached `cntFreqHz()`: this runs during devicetree discovery, well before
+/// cached timer frequency: this runs during devicetree discovery, well before
 /// anything has populated that cache, and a lazily-cached read from here would
 /// be a surprising side effect on a module the watchdog otherwise has no
 /// business initialising. ARM ARM D13.8.1.

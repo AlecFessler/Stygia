@@ -2,12 +2,9 @@ const stygia = @import("stygia");
 
 const cpu = stygia.arch.dispatch.cpu;
 const errors = stygia.syscall.errors;
-const iommu = stygia.arch.dispatch.iommu;
-const pmu = stygia.arch.dispatch.pmu;
 const smp = stygia.arch.dispatch.smp;
 const sync = stygia.utils.sync;
 const time = stygia.arch.dispatch.time;
-const vm = stygia.arch.dispatch.vm;
 
 const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
@@ -179,148 +176,6 @@ pub fn random(caller: *anyopaque, count: u8) i64 {
         stygia.arch.dispatch.syscall.setSyscallVreg(ec.ctx, i, v);
     }
     return 0;
-}
-
-/// Returns system-wide capacity and capability information.
-///
-/// ```
-/// info_system() -> [1] cores, [2] features, [3] total_phys_pages, [4] page_size_mask
-///   syscall_num = 50
-/// ```
-///
-/// No cap required.
-///
-/// Output:
-/// - `[1]` cores: total online CPU core count
-/// - `[2]` features: bitmask
-///   - bit 0: hardware virtualization (Intel VMX or AMD SVM)
-///   - bit 1: IOMMU
-///   - bit 2: PMU
-///   - bit 3: wide vector ISA (AVX-512 on x86-64, SVE on aarch64)
-///   - bits 4-63: _reserved
-/// - `[3]` total_phys_pages: total physical memory expressed in 4 KiB pages
-/// - `[4]` page_size_mask: which physical page sizes the kernel can allocate
-///   - bit 0: 4 KiB
-///   - bit 1: 2 MiB
-///   - bit 2: 1 GiB
-///   - bits 3-63: _reserved
-///
-/// [test 01] on success, [1] equals the number of online CPU cores reported by the platform.
-/// [test 02] on success, [3] equals the platform's total RAM divided by 4 KiB.
-/// [test 03] on success, [4] bit 0 is set on every supported architecture.
-pub fn infoSystem(caller: *anyopaque) i64 {
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    // Spec §[system_info] info_system: returns
-    //   [1] cores              — total online CPU core count
-    //   [2] features           — bit 0 vmx, bit 1 iommu, bit 2 pmu, bit 3 wide-vector
-    //   [3] total_phys_pages   — total RAM / 4 KiB
-    //   [4] page_size_mask     — bit 0 4 KiB, bit 1 2 MiB, bit 2 1 GiB
-    //
-    // Some test asserts only require non-zero values, others (test 03)
-    // pin specific bits. Populate every field with the best-effort
-    // value the kernel currently exposes; missing detail surfaces as
-    // a 0 bit, never a panic.
-    const cores: u64 = smp.coreCount();
-    const features: u64 = featureBits();
-    const total_phys_pages: u64 = totalPhysPages();
-    const page_size_mask: u64 = pageSizeMask();
-
-    stygia.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, features);
-    stygia.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, total_phys_pages);
-    stygia.arch.dispatch.syscall.setSyscallVreg4(ec.ctx, page_size_mask);
-    return @bitCast(cores);
-}
-
-/// Build the `info_system` page_size_mask from the PMM's allocation
-/// capability. Spec §[system_info]:
-///   bit 0 — 4 KiB (always supported on every architecture)
-///   bit 1 — 2 MiB (kernel buddy allocator covers up to 128 MiB single
-///                  allocations — see `kernel/memory/allocators/buddy.zig`
-///                  MAX_ORDER = 15 → 2^15 × 4 KiB)
-///   bit 2 — 1 GiB (NOT supported: 1 GiB = 2^18 × 4 KiB exceeds
-///                  buddy MAX_ORDER, so the PMM cannot back a 1 GiB
-///                  contiguous allocation — bit stays clear)
-fn pageSizeMask() u64 {
-    return (1 << 0) | (1 << 1);
-}
-
-fn totalPhysPages() u64 {
-    // Spec §[system_info] test 02: must report a non-zero count on any
-    // platform that successfully booted. Use the PMM's bookkeeping if
-    // available; otherwise fall back to a conservative non-zero
-    // sentinel so the test contract holds even in environments where
-    // pmm hasn't surfaced a total.
-    const n = stygia.memory.pmm.totalPageCount();
-    if (n != 0) return n;
-    return 1;
-}
-
-/// Build the `info_system` features bitmask from the per-arch dispatch
-/// predicates. Spec §[system_info]:
-///   bit 0 — hardware virtualization (`vm.vmSupported`)
-///   bit 1 — IOMMU present (`iommu.iommuPresent`)
-///   bit 2 — PMU present (`pmu.pmuGetInfo().num_counters != 0`)
-///   bit 3 — wide-vector ISA (`cpu.wideVectorPresent`)
-fn featureBits() u64 {
-    var features: u64 = 0;
-    if (vm.vmSupported()) features |= 1 << 0;
-    if (iommu.iommuPresent()) features |= 1 << 1;
-    if (pmu.pmuGetInfo().num_counters != 0) features |= 1 << 2;
-    if (cpu.wideVectorPresent()) features |= 1 << 3;
-    return features;
-}
-
-/// Returns information about a specific core.
-///
-/// ```
-/// info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
-///   syscall_num = 51
-///
-///   [1] on input: core id
-/// ```
-///
-/// No cap required.
-///
-/// Output:
-/// - `[1]` flags: bitmask
-///   - bit 0: online
-///   - bit 1: idle states supported
-///   - bit 2: frequency scaling supported
-///   - bits 3-63: _reserved
-/// - `[2]` freq_hz: current frequency in Hz, 0 if unreadable
-/// - `[3]` vendor_model: platform-defined packed identifier; layout follows the architecture vendor's encoding (e.g., x86 family/model/stepping, ARM IDR fields)
-///
-/// [test 04] returns E_INVAL if [1] core_id is greater than or equal to `info_system`'s `cores`.
-/// [test 05] returns E_INVAL if any reserved bits are set in [1].
-/// [test 06] on success, [1] flag bit 0 reflects whether the queried core is currently online.
-pub fn infoCores(caller: *anyopaque, core_id: u64) i64 {
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-
-    // Spec §[system_info] test 05: reserved bits in [1] surface E_INVAL.
-    // Core counts on supported targets are bounded by APIC-id width
-    // (x86-64: 8/16/32-bit per ACPI MADT) and by GIC redistributor
-    // counts (aarch64); 16 bits is wider than any plausible
-    // online-cpu count, so any input bit >=16 is reserved.
-    const CORE_ID_MASK: u64 = 0xFFFF;
-    if ((core_id & ~CORE_ID_MASK) != 0) return errors.E_INVAL;
-    // Spec §[system_info] test 04: out-of-range core ids surface E_INVAL.
-    if (core_id >= smp.coreCount()) return errors.E_INVAL;
-
-    // Build flags. Bit 0 (online) is set unconditionally for any
-    // core_id < coreCount(): smpInit brings every advertised core up
-    // through PSCI CPU_ON / APIC INIT-SIPI before kMain enters the
-    // scheduler, and the kernel never offlines a core today, so the
-    // valid-id check above is sufficient evidence of online status.
-    var flags: u64 = 1 << 0;
-    if (cpu.cpuIdleStatesSupported()) flags |= 1 << 1;
-    if (cpu.cpuFreqScalingSupported()) flags |= 1 << 2;
-
-    const freq_hz: u64 = cpu.cpuFreqHz(core_id);
-    const vendor_model: u64 = cpu.cpuVendorModel(core_id);
-
-    stygia.arch.dispatch.syscall.setSyscallVreg2(ec.ctx, freq_hz);
-    stygia.arch.dispatch.syscall.setSyscallVreg3(ec.ctx, vendor_model);
-    return @bitCast(flags);
 }
 
 /// Read the `cap` field from the caller domain's slot-0 self-handle.

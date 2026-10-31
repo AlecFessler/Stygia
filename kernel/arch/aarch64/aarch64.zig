@@ -16,7 +16,6 @@ pub const rtc = @import("rtc.zig");
 pub const serial = @import("serial.zig");
 pub const smp = @import("smp.zig");
 pub const stage2 = @import("stage2.zig");
-pub const sysinfo = @import("sysinfo.zig");
 pub const timers = @import("timers.zig");
 pub const vm = @import("vm.zig");
 pub const vm_runloop = @import("vm_runloop.zig");

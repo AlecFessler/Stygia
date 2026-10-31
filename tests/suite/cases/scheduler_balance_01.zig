@@ -9,6 +9,7 @@
 
 const builtin = @import("builtin");
 const lib = @import("lib");
+const test_environment = @import("test_environment");
 
 const caps = lib.caps;
 const errors = lib.errors;
@@ -66,8 +67,7 @@ pub fn main(cap_table_base: u64) void {
     @atomicStore(u64, &observed_mask, 0, .release);
     @atomicStore(u32, &worker_samples, 0, .release);
 
-    const sys = syscall.infoSystem();
-    if (sys.v1 < 2) {
+    if (test_environment.expected_cores < 2) {
         testing.fail(1);
         return;
     }

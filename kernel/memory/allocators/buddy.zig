@@ -11,8 +11,7 @@ pub const BuddyAllocator = struct {
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
-    /// Static total page count, established by `addRegion`. Accessed
-    /// via `totalPageCount()` for the `sys_info` syscall (§2.15.2).
+    /// Static total page count, established by `addRegion`.
     total_pages: u64 = 0,
     /// Current free page count across all order-N freelists. Incremented
     /// in `free`/`addRegion` and decremented in `alloc`. Does **not** account

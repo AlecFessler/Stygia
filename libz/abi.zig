@@ -378,14 +378,6 @@ pub fn random(count: u8) callconv(.c) c.Regs {
     return toCRegs(syscall.random(count));
 }
 
-pub fn infoSystem() callconv(.c) c.Regs {
-    return toCRegs(syscall.infoSystem());
-}
-
-pub fn infoCores(core_id: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.infoCores(core_id));
-}
-
 // ── Dynamic-symbol exports ──────────────────────────────────────────
 //
 // Names match the Zig-native API in syscall.zig — no `_c` suffix.
@@ -446,6 +438,4 @@ comptime {
     @export(&timeGetwall, .{ .name = "timeGetwall" });
     @export(&timeSetwall, .{ .name = "timeSetwall" });
     @export(&random, .{ .name = "random" });
-    @export(&infoSystem, .{ .name = "infoSystem" });
-    @export(&infoCores, .{ .name = "infoCores" });
 }

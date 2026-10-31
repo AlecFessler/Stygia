@@ -48,12 +48,6 @@ pub fn setConduit(c: Conduit) void {
     conduit = c;
 }
 
-/// PSCI is required for supported aarch64 SMP targets.
-/// Used by the retained system-info path until its separate removal.
-pub fn psciAvailable() bool {
-    return true;
-}
-
 /// Reboot after the test runner root service reports its verdict.
 pub fn powerAction(action: PowerAction) i64 {
     switch (action) {

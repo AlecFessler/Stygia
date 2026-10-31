@@ -216,16 +216,3 @@ pub const PhysicalMemoryManager = struct {
 var blk_fail_prints: u32 = 0;
 
 pub var global_pmm: ?PhysicalMemoryManager = null;
-
-
-/// Static total physical page count established by the buddy allocator
-/// at `addRegion` time. Used by `sys_info` to populate `SysInfo.mem_total`
-/// (§2.15.2, §21). Does not change at runtime.
-pub fn totalPageCount() u64 {
-    if (global_pmm == null) return 0;
-    const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
-    const irq = pmm_ptr.lock.lockIrqSave(@src());
-    defer pmm_ptr.lock.unlockIrqRestore(irq);
-    return pmm_ptr.buddy.total_pages;
-}
-

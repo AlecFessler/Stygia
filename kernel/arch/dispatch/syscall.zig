@@ -44,8 +44,7 @@ pub fn setSyscallVreg3(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-/// Write syscall-return vreg 4 — used by syscalls (e.g. info_system)
-/// that surface multi-vreg payloads. Same physical reg as event-state
+/// Write syscall-return vreg 4 for multi-vreg payloads. Same physical reg as event-state
 /// vreg 4 (rbp on x86-64; x3 on aarch64).
 pub fn setSyscallVreg4(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
@@ -67,7 +66,7 @@ pub fn setSyscallVreg4(ctx: *ArchCpuContext, value: u64) void {
 ///            `[ctx.sp_el0 + (idx - 31) * 8]`.
 ///
 /// Used by syscalls that surface a packed array of return values
-/// (e.g. `random`, `idc_read`/`idc_write`, `info_cores`,
+/// (e.g. `random`, `idc_read`/`idc_write`,
 /// `acquire_ecs`/`acquire_vmars`, `create_ecs`, `create_vmars`)
 /// where the count exceeds the small fixed set covered by the
 /// `setSyscallVreg{2,3,4}` helpers.
@@ -192,4 +191,3 @@ pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
         else => unreachable,
     }
 }
-

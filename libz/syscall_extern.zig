@@ -104,8 +104,6 @@ pub const SyscallNum = enum(u12) {
     time_getwall = 61,
     time_setwall = 62,
     random = 63,
-    info_system = 64,
-    info_cores = 65,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -391,8 +389,6 @@ const ext = struct {
     extern fn timeGetwall() callconv(.c) c.Regs;
     extern fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs;
     extern fn random(count: u8) callconv(.c) c.Regs;
-    extern fn infoSystem() callconv(.c) c.Regs;
-    extern fn infoCores(core_id: u64) callconv(.c) c.Regs;
 };
 
 // ── Public Zig-native wrappers ──────────────────────────────────────
@@ -701,7 +697,7 @@ pub fn futexWake(addr: u64, count: u64) Regs {
     return fromCRegs(ext.futexWake(addr, count));
 }
 
-// 46..51: time / rng / sysinfo
+// 46..49: time / rng
 
 pub fn timeMonotonic() Regs {
     return fromCRegs(ext.timeMonotonic());
@@ -717,14 +713,6 @@ pub fn timeSetwall(ns_since_epoch: u64) Regs {
 
 pub fn random(count: u8) Regs {
     return fromCRegs(ext.random(count));
-}
-
-pub fn infoSystem() Regs {
-    return fromCRegs(ext.infoSystem());
-}
-
-pub fn infoCores(core_id: u64) Regs {
-    return fromCRegs(ext.infoCores(core_id));
 }
 
 // Compile-time guard against accidentally reordering the SyscallNum

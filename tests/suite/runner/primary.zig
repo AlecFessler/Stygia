@@ -234,20 +234,12 @@ pub fn main(cap_table_base: u64) void {
 
     // Cores to spread test domains over; see `-Dspread_cores`.
     //
-    // `info_system`'s `[1] cores` is "total online CPU core count"
-    // (spec §[system_info]) — the same number `create_capability_domain`
-    // [5] validates an affinity mask against, so a mask built from it
-    // can never trip that E_INVAL gate. Clamped to 64 because the mask
-    // is 64 bits wide, and floored at 1 so a platform reporting 0 (or
-    // `-Dspread_cores=false`) degrades to the historical single-core
-    // behaviour instead of producing an all-zero mask that would mean
-    // something else entirely.
-    const spread_cores: u64 = blk: {
-        if (!embedded_tests.spread_cores) break :blk 1;
-        const reported = syscall.infoSystem().v1;
-        if (reported == 0) break :blk 1;
-        break :blk @min(reported, 64);
-    };
+    // The suite's expected core count comes from its boot configuration.
+    // `-Dspread_cores=false` retains single-core initial placement.
+    const spread_cores: u64 = if (embedded_tests.spread_cores)
+        embedded_tests.expected_cores
+    else
+        1;
     if (embedded_tests.runner_diag) {
         serial.print("[runner] spreading tests over ");
         serial.printU64(spread_cores);

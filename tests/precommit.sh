@@ -1230,7 +1230,7 @@ stage_aarch64_vm_nodev_pi_kvm() {
 
     echo "Building aarch64 root_service (create_virtual_machine_03 only, runner diagnostics on)..."
     if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
-          zig build -Darch=arm -Dtests='create_virtual_machine_03' -Drunner_diag=true); then
+          zig build -Darch=arm -Dtests='create_virtual_machine_03' -Drunner_diag=true -Dexpect_hv=false); then
         FAILURES+=("aarch64 create_virtual_machine_03 root_service build")
         return 1
     fi
@@ -1339,6 +1339,9 @@ stage_aarch64_kernel_tests_pi() {
         # firmware reboot cycles. The QEMU/KVM fallback keeps the current
         # three separate boots and therefore does not use this repeat knob.
         suite_args+=("-Drepeat=$PI_BARE_REPEAT")
+    else
+        # Pi-hosted QEMU/KVM does not expose nested EL2 to the guest.
+        suite_args+=("-Dexpect_hv=false")
     fi
     if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && zig build "${suite_args[@]}"); then
         FAILURES+=("aarch64 root_service build")

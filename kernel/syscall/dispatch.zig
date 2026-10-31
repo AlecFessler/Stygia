@@ -76,8 +76,6 @@ pub const SyscallNum = enum(u64) {
     time_getwall = 61,
     time_setwall = 62,
     random = 63,
-    info_system = 64,
-    info_cores = 65,
 };
 
 /// Read `args[i]`, returning 0 when the index is past the end. Lets
@@ -144,8 +142,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .time_getwall,
         .time_setwall,
         .random,
-        .info_system,
-        .info_cores,
         => 13,
 
         // create_capability_domain: passed_handles list, no syscall-word
@@ -505,8 +501,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             const count: u8 = @truncate((syscall_word >> 12) & 0xFF);
             break :blk system.random(caller, count);
         },
-        .info_system => system.infoSystem(caller),
-        .info_cores => system.infoCores(caller, arg(args, 0)),
     };
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     logSpawnError(num_raw, dispatch_res);

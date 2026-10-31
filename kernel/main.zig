@@ -118,7 +118,6 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.vm.vmInit();
     arch.vm.bspBootHandoff(boot_info.arrived_at_el2 != 0);
     arch.pmu.pmuInit();
-    arch.cpu.sysInfoInit();
     grantBootFramebuffer(boot_info.framebuffer);
     try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));

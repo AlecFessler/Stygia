@@ -17,8 +17,8 @@
 //   but are not sufficient evidence for test 03 by themselves.
 //
 // Strategy
-//   `info_system` reports the kernel's platform feature mask in vreg 2;
-//   §[system_info] defines bit 0 as hardware virtualization support.
+//   The test harness declares whether this boot exposes hardware
+//   virtualization via -Dexpect_hv. The no-HV gate uses false.
 //   Issue create_virtual_machine with a valid, zeroed VmPolicy page
 //   frame and caps = 0 so that E_BADCAP, E_INVAL, and E_PERM paths are
 //   not intentionally triggered ahead of the E_NODEV path under test.
@@ -33,12 +33,13 @@
 //   1: setup — create_page_frame returned an error word.
 //   2: setup — create_vmar returned an error word.
 //   3: setup — map_pf returned non-OK in vreg 1.
-//   4: info_system reports no hardware virtualization, but
+//   4: the harness expects no hardware virtualization, but
 //      create_virtual_machine did not return E_NODEV.
-//   5: info_system reports hardware virtualization, but
+//   5: the harness expects hardware virtualization, but
 //      create_virtual_machine returned E_NODEV.
 
 const builtin = @import("builtin");
+const test_environment = @import("test_environment");
 
 const lib = @import("lib");
 
@@ -63,8 +64,7 @@ const VM_POLICY_BYTES: usize = switch (builtin.cpu.arch) {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const system_info = syscall.infoSystem();
-    const hardware_virtualization_supported = (system_info.v2 & 1) != 0;
+    const hardware_virtualization_supported = test_environment.expect_hv;
 
     const policy_pf_caps = caps.PfCap{ .r = true, .w = true };
     const cpf = syscall.createPageFrame(

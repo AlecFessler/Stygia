@@ -6,7 +6,7 @@
 // Strategy
 //   Spawn a grandchild via `create_capability_domain` with an
 //   affinity mask whose set bits exceed the system's core count
-//   (queried from `info_system`). Per spec, the kernel must reject
+//   (declared by the test harness). Per spec, the kernel must reject
 //   this with E_INVAL before any other create-side work. Anything
 //   other than E_INVAL means the kernel accepted a malformed
 //   affinity mask, contradicting test 32.
