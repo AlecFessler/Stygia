@@ -1,7 +1,5 @@
 *.elf
 *.img
-*.iso
-*.pdf
 *.pyc
 __pycache__/
 qemu.log
@@ -13,7 +11,4 @@ docs/kernel/tla/states/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
-*.db
 .beads-credential-key
-.beads/proxieddb/
-*.gate.lock*
