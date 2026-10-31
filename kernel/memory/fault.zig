@@ -26,8 +26,7 @@ const PF_DIAG_BUDGET: u32 = 4096;
 var pf_diag_prints: u32 = 0;
 
 fn diagTag(thread: *const stygia.sched.thread.Thread) u64 {
-    if (thread.diag_test_tag != 0) return thread.diag_test_tag;
-    return thread.process.ptr.diag_test_tag;
+    return thread.diag_test_tag;
 }
 
 fn logPfDiag(

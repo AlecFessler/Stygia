@@ -51,6 +51,7 @@ Exit status is nonzero if any err-severity findings are emitted.
 3. **`.ptr` bypass detection.** `<chain>.<slabref_field>.ptr` extracts
    the raw pointer and skips the gen check. Flagged as an error unless:
    - The access is an identity compare (`ref.ptr == other` / `!=`).
+   - The pointer is used only as an address (`@intFromPtr(ref.ptr)`).
    - A `// caller-pinned` annotation applies (see "Annotation
      adjacency" below). The annotation the code actually looks for is
      `caller-pinned`; earlier revisions of this file documented

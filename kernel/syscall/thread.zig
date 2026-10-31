@@ -40,8 +40,8 @@ const YIELD_DIAG_BUDGET: u32 = 96;
 var yield_diag_prints: u32 = 0;
 
 fn diagTag(thread: *Thread) u64 {
-    if (thread.diag_test_tag != 0) return thread.diag_test_tag;
-    return thread.process.ptr.diag_test_tag;
+    // AllocThread copies the process tag into every thread at creation.
+    return thread.diag_test_tag;
 }
 
 fn logYieldDiag(

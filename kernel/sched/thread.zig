@@ -417,8 +417,9 @@ pub const Thread = struct {
     /// Port carried by an armed remote suspend directive.
     directive_port: ?SlabRef(Port) = null,
 
-    /// Caller whose validated pair-entry stash should be handed to this
-    /// thread if an armed remote suspend directive commits.
+    /// caller-pinned: the suspending caller remains on its syscall stack until
+    /// the directive commits or is disarmed; this pointer never outlives it.
+    /// Its validated pair-entry stash is handed to the target on commit.
     directive_owner: ?*Thread = null,
 
     /// Current wait episode descriptor. Container-specific payload fields

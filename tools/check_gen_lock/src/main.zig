@@ -1542,6 +1542,14 @@ fn checkPtrBypasses(
                 {
                     continue;
                 }
+                // Converting the SlabRef's pointer to an integer observes
+                // identity only. Require the conversion to close immediately
+                // after `.ptr`, so a field dereference remains a finding.
+                if (mem.endsWith(u8, trimAscii(stripped_line[0..s]), "@intFromPtr(") and
+                    q < stripped_line.len and stripped_line[q] == ')')
+                {
+                    continue;
+                }
                 const chain_dup = try std.fmt.allocPrint(a, "{s}.ptr", .{chain});
                 const ctx_dup = try a.dupe(u8, trimAscii(stripped_line));
                 try findings.append(st.gpa, .{

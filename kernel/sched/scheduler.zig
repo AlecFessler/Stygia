@@ -36,6 +36,8 @@ var yield_select_diag_prints: u32 = 0;
 
 const YIELD_TARGET_PINNED_BIT: u64 = 1;
 const YieldTarget = struct {
+    // caller-pinned: every non-null target comes from yieldToPinned; the
+    // lifecycle pin is carried across the park-stack hop and released here.
     thread: ?*Thread = null,
     pinned: bool = false,
 
@@ -1062,8 +1064,7 @@ inline fn canPublishReady(thread: *Thread) bool {
 }
 
 fn diagTag(thread: *Thread) u64 {
-    if (thread.diag_test_tag != 0) return thread.diag_test_tag;
-    return thread.process.ptr.diag_test_tag;
+    return thread.diag_test_tag;
 }
 
 fn logYieldSelectDiag(core: u8, target: *Thread, reason: []const u8, publishable: bool) void {

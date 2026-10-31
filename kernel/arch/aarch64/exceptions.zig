@@ -108,8 +108,7 @@ fn isWriteFault(esr: u64) bool {
 }
 
 fn diagTag(thr: *Thread) u64 {
-    if (thr.diag_test_tag != 0) return thr.diag_test_tag;
-    return thr.process.ptr.diag_test_tag;
+    return thr.diag_test_tag;
 }
 
 fn logLowerElAbort(
