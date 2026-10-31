@@ -46,4 +46,10 @@ ProbeNoDisarm ==
 (* Retire-from-pended (the W7 pre-wait path) actually reached.             *)
 ProbeNoRetireFromPended ==
   \A e \in Threads: ~(threads[e].st = "retired" /\ threads[e].po)
+
+(* G11: prove the finalizer's terminal directive publication is reachable
+   before the slot-zero action clears it. A green safety run without this
+   probe could still skip the state whose suspend result matters. *)
+ProbeNoFinalizingDead ==
+  \A e \in Threads: ~(threads[e].st = "finalizing" /\ threads[e].dir = "dead")
 ====================================================================================

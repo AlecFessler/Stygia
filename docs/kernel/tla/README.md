@@ -539,25 +539,16 @@ incomparable/reconstruction.
   correctness. What checks C2 is `specv3.md` [test 06]/[test 07] and the
   doc's lock protocol; do not cite a green battery as evidence about
   priority ordering.
-- **G11 (NEW, rev 14, LP — round-12 M-2; LEDGERED, not modelled, per
-  round-12's blocking bar).** The model **never writes `dir = "dead"`**.
-  The value occurs only in `TypeOK`'s process; every finalize site writes
-  `"none"`, because revision 12 modelled §8.2's `slot zero` (round-11
-  C-1) and collapsed the release body's two writes into one. So §2.5's
-  *"`dead` is still mapped to E_TERM"* and §3.4's *"terminal `dead`
-  distinguishes retired from consumed"* are **entirely unmodelled**, and
-  `InvNoArmedFreed`'s stated justification is stale. **This is LP — the
-  dangerous direction** — because the `dead` arm of the break analysis
-  is unreachable, so no run can exercise it. It is not a soundness
-  problem for what IS checked (the zero is the later of the two writes,
-  so modelling only it is modelling the state a racing suspender
-  actually observes, which is round-11 C-1's whole point), but the
-  `dead` arm gets no coverage at all. **Fix when convenient: model the
-  release body as TWO writes — `dead`, then the zero to `none` — so both
-  arms are reachable.** Recorded rather than fixed because round 12's
-  bar puts parity bookkeeping below the blocking set, and this is the
-  same shape as the C-1 the parity discipline was rewritten for, in the
-  row that fix touched.
+- **G11 (modelled in the current lifecycle module; full battery pending).**
+  Finalization now has two visible steps: `finalizing` publishes
+  `directive_state = dead`, then `ClearFreedDirective` zeroes the word and
+  advances the slab generation. `ProbeNoFinalizingDead` is expected to fail,
+  proving the intermediate state is reached. `DirLoop` treats `dead` as a
+  terminal failure, consistent with the approved `E_TERM` outcome for a
+  suspend after termination commits. The existing generation and target-pin
+  checks remain necessary when the zero or a concurrent retire wins first.
+  Focused `dirf6fix` safety passed 1,949,216 distinct states and the G11
+  reachability probe fired at depth 2; the full battery remains to be run.
 - **G10 (rev 8, MP — round-7 M-1's residue; its LOCK-ORDER half REFUTED
   in round 8, C-3)** — the reach-and-validate protocol (handle → gen
   lock → container lock → re-validate) is doc-side only, and that part
@@ -624,50 +615,16 @@ incomparable/reconstruction.
   `owner_core` to `NOT_IN_RUN_QUEUE`. The model still cannot express a
   future incoherent cache writer without adding a second word, so the
   row remains MP and ledgered rather than modelled.
-- **G14 (NEW, rev 16, LP — round-14 PARITY review's headline finding, and
-  the one nobody would have caught by reading the model or the doc alone,
-  because it is only visible where the two MEET).**
-  **`PerCore.idle_parked` (§3.4) and §6.2's L3 — the locked park decision
-  plus the wake-IPI rule — are normative, sit INSIDE the
-  `<<< IMPLEMENTABLE SPEC >>>` markers, and have no model construct, no
-  parity row and no ledger entry.** `grep idle_parked README.md` returned
-  zero before this entry.
-
-  **Why that is not merely another unmodelled row: a fairness constraint
-  is standing in for the mechanism.** `LiveReady` (L3) is checked under
-  `SpecL3`, which conjoins `FairDisp = SF_vars(DispatchOrS7(c,e))`, and
-  the only justification this file gives for `FairDisp` is *"stands for
-  the FIFO order the set-queue abstraction loses."* That is not what it is
-  doing here. The failure L3 exists to foreclose is **a core parked with a
-  non-empty run queue because no wake IPI was sent** — the lost-enqueue
-  half of failure class 7. With no `idle_parked` and no IPI in the model,
-  that state is **not representable**, and strong fairness on dispatch
-  then *forces* the dispatch to happen regardless. So a green `LiveReady`
-  is not evidence about L3's mechanism; it is evidence about a machine in
-  which L3's failure mode cannot occur.
-
-  **This is the VACUITY family wearing a fairness constraint's clothes,
-  and that framing is the point.** The artifact already knows to ask "is
-  the configuration this property is about actually REACHED?" — that is
-  what every `pr*` probe exists for, and what round-10 M-D forced for
-  `t1full`. G14 is the same question asked one level down: not *is the
-  state reached*, but *is the failure the property forbids even
-  expressible*. A probe cannot catch this one, because there is no state
-  to probe for — the mechanism whose absence matters is an IPI that is
-  never modelled. **The tell is generic and worth carrying forward: when a
-  fairness constraint's stated justification is about ABSTRACTION LOSS
-  (`FairDisp` "stands for FIFO order"), check whether it is also silently
-  supplying the EFFECT of an unmodelled mechanism.** A constraint
-  justified as recovering lost detail is doing something different from
-  one that assumes a mechanism works.
-
-  **What is LOST:** L3's mechanism — the locked park decision and the wake
-  IPI — is unchecked at every scope, and the property named after it
-  passes anyway. **Fix direction:** give `PerCore` a `parked`
-  flag, make dispatch-from-parked require an explicit `WakeIpi` action,
-  and re-check `LiveReady` under a `FairDisp` weakened to WF — then dial
-  the IPI out as the falsifier. Until then, **do not cite a green
-  `LiveReady` as evidence that L3 holds.**
+- **G14 (modelled in the current lifecycle module; focused gate passed).**
+  `ParkDecision` records an empty-queue park under the core lock. Every
+  ready-queue insertion now leaves a pending wake IPI when it sees that
+  decision; `WakeIpi` must run before the parked core can dispatch. The L3
+  check (`LiveReady`) uses weak dispatch fairness and weak wake delivery.
+  A 1-core/1-thread positive check passed on 20 distinct states. With
+  `WAKE_IPI = FALSE`, `InvParkedQueueHasWake` fails and `LiveReady` has a
+  temporal counterexample on that same focused state space. This calibrates
+  the claim that the wake mechanism is represented. The full all-feature
+  safety and liveness battery remains pending after the state-space growth.
 - **G15 (NEW, rev 16, INC — round-14 parity review; RECORDED, not fixed,
   and the reasoning is the reason it is recorded).** **`InvS3` is
   NARROWER than S3, and the narrowing was unnamed.** The formula is
