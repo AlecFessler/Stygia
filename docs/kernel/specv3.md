@@ -2576,7 +2576,11 @@ Event type identifies whether a received event came from an explicit suspension 
 
 Sub-codes within `vm_exit` are carried in the event payload rather than as separate event type values.
 
+### §[breakpoint_fault] Breakpoint Fault
+
 An unbound user breakpoint instruction (`INT3` on x86-64 or `BRK` on AArch64), and an AArch64 hardware breakpoint trap, are unhandled thread faults. The kernel tears down the owning process; it does not advance past the trap or resume the thread. No breakpoint event route exists.
+
+[test 01] An unbound user `INT3` or `BRK` tears down the owning process without resuming the faulting thread. A peer observes teardown through closure of a port whose remaining bind capability belonged to that process.
 
 ### §[event_state] Event State
 
