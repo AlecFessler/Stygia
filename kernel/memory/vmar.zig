@@ -768,6 +768,15 @@ fn verifyDmaRemapLeaves(v: *VMAR, process: *Process, device: *DeviceRegion, expe
     return true;
 }
 
+/// Test-profile teardown oracle: inspect the table independently of the
+/// unmap return value before releaseMapping can recycle the backing page.
+fn assertDmaLeafRemoved(device: *DeviceRegion, iova: u64, sz: PageSize) void {
+    if (!build_options.tests_fixture_devices or builtin.cpu.arch != .x86_64) return;
+    if (!dispatch.iommu.isAvailable()) @panic("DMA teardown without IOMMU");
+    if (dispatch.iommu.inspectLeaf(device, iova, sz) != null)
+        @panic("DMA leaf remains after unmap, before PF release");
+}
+
 fn restoreDmaRemapPrefix(v: *VMAR, device: *DeviceRegion, last_index: usize, last_byte_off: u64) void {
     const leaf_bytes = pageSizeBytes(v.sz);
     for (&v.installed_pfs, 0..) |*entry, idx| {
@@ -967,6 +976,7 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
                     const iova = v.base_vaddr.addr + entry.offset + byte_off;
                     _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, iova, v.sz);
                     dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, iova, v.sz, 1);
+                    assertDmaLeafRemoved(dev_ref.ptr, iova, v.sz);
                 }
             }
         } else {
@@ -1321,6 +1331,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
                         v.sz,
                         1,
                     );
+                    assertDmaLeafRemoved(dev_ref.ptr, v.base_vaddr.addr + off_u, v.sz);
                 } else {
                     _ = dispatch.paging.unmapPageSized(
                         process.addr_space_root,
@@ -1416,6 +1427,7 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
             };
             _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz);
             dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz, 1);
+            assertDmaLeafRemoved(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz);
         } else {
             _ = dispatch.paging.unmapPageSized(
                 process.addr_space_root,
@@ -1651,6 +1663,7 @@ fn unmapAll(v: *VMAR, process: *Process) void {
                 const iova = v.base_vaddr.addr + entry.offset + byte_off;
                 _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, iova, v.sz);
                 dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, iova, v.sz, 1);
+                assertDmaLeafRemoved(dev_ref.ptr, iova, v.sz);
             }
         }
     } else {

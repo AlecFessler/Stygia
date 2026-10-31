@@ -14,6 +14,7 @@
 /// second-stage PML4 and stashes that state on the DeviceRegion's
 /// `iommu_state` slot.
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const arch_paging = stygia.arch.x64.paging;
 const memory_init = stygia.memory.init;
@@ -254,6 +255,38 @@ pub fn init(reg_base_phys: PAddr) !void {
     issueGlobalCommand(GCMD_SRTP, GSTS_RTPS);
 
     initialized = true;
+    if (build_options.tests_fixture_devices) testLeafTeardown();
+}
+
+/// Test-profile table fixture. A private, unreferenced second-stage root
+/// exercises all leaf widths without allocating a 1 GiB backing PF or
+/// enrolling the synthetic domain in hardware. inspectLeaf reads the table
+/// independently of unmapPage's return value.
+fn testLeafTeardown() void {
+    const root = allocZeroedPage() catch @panic("VT-d fixture root allocation failed");
+    var pd = PerDevice{
+        .sl_pt_root_phys = root.phys,
+        .sl_pt_root_virt = root.virt,
+        .provisioned = true,
+    };
+    var device: DeviceRegion = undefined;
+    device.iommu_state = @ptrCast(&pd);
+    const sizes = [_]VmarPageSize{ .sz_4k, .sz_2m, .sz_1g };
+    for (sizes) |sz| {
+        for ([_]MemoryPerms{
+            .{ .write = true },
+            .{},
+        }) |perms| {
+            mapPage(&device, 0x4000_0000, PAddr.fromInt(0x8000_0000), sz, perms) catch
+                @panic("VT-d fixture map failed");
+            const before = inspectLeaf(&device, 0x4000_0000, sz) orelse
+                @panic("VT-d fixture leaf missing before unmap");
+            if (before & 0x3 != permsToBits(perms)) @panic("VT-d fixture permissions wrong");
+            _ = unmapPage(&device, 0x4000_0000, sz);
+            if (inspectLeaf(&device, 0x4000_0000, sz) != null)
+                @panic("VT-d fixture leaf remains after unmap");
+        }
+    }
 }
 
 /// Enable DMA remapping by setting GCMD.TE (Section 11.4.4.1).
@@ -434,34 +467,36 @@ pub fn unmapPage(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?PAddr {
 
     const pml4: *[512]u64 = @ptrFromInt(pd.sl_pt_root_virt.addr);
     const pml4_idx: u9 = @truncate((iova >> 39) & 0x1FF);
-    if (pml4[pml4_idx] & 1 == 0) return null;
+    if (pml4[pml4_idx] & 0x3 == 0) return null;
 
     const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & 0xFFFFFFFFF000), null).addr);
     const pdpt_idx: u9 = @truncate((iova >> 30) & 0x1FF);
 
     if (sz == .sz_1g) {
         const entry = pdpt[pdpt_idx];
-        if (entry & 1 == 0 or (entry & 0x80) == 0) return null;
+        // R=0 is still a mapped leaf when W=1. Remap to no access
+        // retains its encoded address and PS bit until teardown.
+        if (entry == 0 or (entry & 0x80) == 0) return null;
         pdpt[pdpt_idx] = 0;
         return PAddr.fromInt(entry & 0xFFFF_FFFF_C000_0000);
     }
-    if (pdpt[pdpt_idx] & 1 == 0) return null;
+    if (pdpt[pdpt_idx] & 0x3 == 0 or pdpt[pdpt_idx] & 0x80 != 0) return null;
 
     const pd_table: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & 0xFFFFFFFFF000), null).addr);
     const pd_idx: u9 = @truncate((iova >> 21) & 0x1FF);
 
     if (sz == .sz_2m) {
         const entry = pd_table[pd_idx];
-        if (entry & 1 == 0 or (entry & 0x80) == 0) return null;
+        if (entry == 0 or (entry & 0x80) == 0) return null;
         pd_table[pd_idx] = 0;
         return PAddr.fromInt(entry & 0xFFFF_FFFF_FFE0_0000);
     }
-    if (pd_table[pd_idx] & 1 == 0) return null;
+    if (pd_table[pd_idx] & 0x3 == 0 or pd_table[pd_idx] & 0x80 != 0) return null;
 
     const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd_table[pd_idx] & 0xFFFFFFFFF000), null).addr);
     const pt_idx: u9 = @truncate((iova >> 12) & 0x1FF);
     const entry = pt[pt_idx];
-    if (entry & 1 == 0) return null;
+    if (entry == 0) return null;
     pt[pt_idx] = 0;
     return PAddr.fromInt(entry & 0xFFFF_FFFF_FFFF_F000);
 }
