@@ -350,7 +350,7 @@ cap (word 0, bits 48-63):
 ```
  15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
 ┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│pri(2)│_rsv│_rsvd│fut_wk│reply │restrt│_rsv  │setwal│_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│pri(2)│_rsv│_rsvd│fut_wk│reply │restrt│_rsv  │_rsv  │_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
 │      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
 └──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
@@ -364,7 +364,7 @@ cap (word 0, bits 48-63):
 | 4 | `crvm` — create virtual machine | `create_virtual_machine` syscall |
 | 5 | `crpt` — create port | `create_port` syscall |
 | 6 | _reserved | — |
-| 7 | `setwall` — set wall-clock time | `time_setwall` syscall |
+| 7 | _reserved | — |
 | 8 | _reserved | — |
 | 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
 | 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
@@ -3124,53 +3124,3 @@ time_monotonic() -> [1] ns
 **Tests**
 
 [test 01] on success, [1] is a u64 nanosecond count strictly greater than the value returned by any prior call to `time_monotonic`.
-
-
-#### time_getwall
-
-**Summary** — Returns wall-clock time as nanoseconds since the Unix epoch.
-
-**Declaration**
-
-```
-time_getwall() -> [1] ns_since_epoch
-  syscall_num = 61
-```
-
-**Capabilities** — None.
-
-**Return value** — `[1]`: nanoseconds since the Unix epoch.
-
-**Tests**
-
-[test 02] after `time_setwall(X)` succeeds, a subsequent `time_getwall` returns a value within a small bounded delta of X.
-
-
-#### time_setwall
-
-**Summary** — Sets the wall-clock time to the given nanoseconds-since-epoch.
-
-**Declaration**
-
-```
-time_setwall([1] ns_since_epoch) -> void
-  syscall_num = 62
-
-  [1] ns_since_epoch: new wall-clock value (nanoseconds since Unix epoch)
-```
-
-**Capabilities** — Self-handle: `setwall`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `setwall`.
-
-**E_INVAL** — reserved bits set in `[1]`.
-
-**Tests**
-
-[test 03] returns E_PERM if the caller's self-handle lacks `setwall`.
-
-[test 04] returns E_INVAL if any reserved bits are set in [1].
-
-[test 05] on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].

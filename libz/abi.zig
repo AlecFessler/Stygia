@@ -304,14 +304,6 @@ pub fn timeMonotonic() callconv(.c) c.Regs {
     return toCRegs(syscall.timeMonotonic());
 }
 
-pub fn timeGetwall() callconv(.c) c.Regs {
-    return toCRegs(syscall.timeGetwall());
-}
-
-pub fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.timeSetwall(ns_since_epoch));
-}
-
 // ── Dynamic-symbol exports ──────────────────────────────────────────
 //
 // Names match the Zig-native API in syscall.zig — no `_c` suffix.
@@ -356,6 +348,4 @@ comptime {
     @export(&futexWaitChange, .{ .name = "futexWaitChange" });
     @export(&futexWake, .{ .name = "futexWake" });
     @export(&timeMonotonic, .{ .name = "timeMonotonic" });
-    @export(&timeGetwall, .{ .name = "timeGetwall" });
-    @export(&timeSetwall, .{ .name = "timeSetwall" });
 }

@@ -27,7 +27,7 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 **Kernel-event routing.** Per-EC events (memory faults, thread faults, breakpoints) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
 
-**Time.** Monotonic and wall-clock primitives. Internal scheduler ticks and deadline checks drive preemption and timed waits.
+**Time.** A monotonic clock primitive. Internal scheduler ticks and deadline checks drive preemption and timed waits.
 
 **Virtual machines.** KVM-style guest containers. vCPUs are execution contexts in a VM-flavored capability domain; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
 

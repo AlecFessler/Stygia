@@ -79,8 +79,6 @@ pub const SyscallNum = enum(u12) {
     futex_wait_change = 58,
     futex_wake = 59,
     time_monotonic = 60,
-    time_getwall = 61,
-    time_setwall = 62,
 };
 
 // SPEC AMBIGUITY: spec §[syscall_abi] does not pin which bits of the
@@ -593,12 +591,4 @@ pub fn futexWake(addr: u64, count: u64) Regs {
 
 pub fn timeMonotonic() Regs {
     return issueReg(.time_monotonic, 0, .{});
-}
-
-pub fn timeGetwall() Regs {
-    return issueReg(.time_getwall, 0, .{});
-}
-
-pub fn timeSetwall(ns_since_epoch: u64) Regs {
-    return issueReg(.time_setwall, 0, .{ .v1 = ns_since_epoch });
 }

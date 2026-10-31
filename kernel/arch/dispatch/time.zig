@@ -69,18 +69,6 @@ pub inline fn initHangWatchdog() void {
     }
 }
 
-// ── Spec v3 time primitives ──────────────────────────────────────────
-
-/// Write the platform RTC to `unix_ns` since the Unix epoch. Returns 0
-/// on success or a negative spec error code. Spec §[time].time_setwall.
-pub fn writeRtc(unix_ns: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.rtc.writeRtc(unix_ns),
-        .aarch64 => aarch64.rtc.writeRtc(unix_ns),
-        else => unreachable,
-    };
-}
-
 /// Read the monotonic clock in nanoseconds. Convenience wrapper over
 /// `getMonotonicClock` for callers that only want the scalar value.
 /// Spec §[time].time_monotonic.

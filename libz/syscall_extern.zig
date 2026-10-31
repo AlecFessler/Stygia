@@ -88,8 +88,6 @@ pub const SyscallNum = enum(u12) {
     futex_wait_change = 58,
     futex_wake = 59,
     time_monotonic = 60,
-    time_getwall = 61,
-    time_setwall = 62,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -349,8 +347,6 @@ const ext = struct {
     ) callconv(.c) c.Regs;
     extern fn futexWake(addr: u64, count: u64) callconv(.c) c.Regs;
     extern fn timeMonotonic() callconv(.c) c.Regs;
-    extern fn timeGetwall() callconv(.c) c.Regs;
-    extern fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs;
 };
 
 // ── Public Zig-native wrappers ──────────────────────────────────────
@@ -603,18 +599,10 @@ pub fn futexWake(addr: u64, count: u64) Regs {
     return fromCRegs(ext.futexWake(addr, count));
 }
 
-// 46..49: time / rng
+// Time
 
 pub fn timeMonotonic() Regs {
     return fromCRegs(ext.timeMonotonic());
-}
-
-pub fn timeGetwall() Regs {
-    return fromCRegs(ext.timeGetwall());
-}
-
-pub fn timeSetwall(ns_since_epoch: u64) Regs {
-    return fromCRegs(ext.timeSetwall(ns_since_epoch));
 }
 
 // Compile-time guard against accidentally reordering the SyscallNum

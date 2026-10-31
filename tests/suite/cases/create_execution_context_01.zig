@@ -21,7 +21,7 @@
 //   and isolate the E_PERM path.
 //
 //   We do not reduce any other caps — the runner-supplied self-handle
-//   already lacks `restart`, `setwall`, `reply_policy`, and
+//   already lacks `restart`, `reply_policy`, and
 //   the `_reserved` bit, so dropping `crec` alone is sufficient and
 //   keeps the rest of the runner's environment intact for the tail of
 //   the test.

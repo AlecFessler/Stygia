@@ -7,10 +7,7 @@
 //! RTC there is no BCD conversion, no per-field register layout, and
 //! no UIP race window — a single 32-bit MMIO read yields the value.
 //!
-//! Only the read path (RTCDR) is implemented. Writing to RTCLR would
-//! set the counter but the kernel's wall-clock is adjusted in
-//! software above readRtc() via `clock_setwall`, so the hardware
-//! counter is never written from here.
+//! Only the read path (RTCDR) is implemented.
 //!
 //! References:
 //! - ARM DDI 0224B: PrimeCell Real Time Clock (PL031) Technical Reference Manual
@@ -49,16 +46,4 @@ pub fn readRtc() u64 {
     const dr_ptr: *volatile u32 = @ptrFromInt(base + offsets.rtcdr);
     const seconds: u64 = dr_ptr.*;
     return seconds * 1_000_000_000;
-}
-
-/// Write the PL031 RTC to `unix_ns` since the Unix epoch. Returns 0 on
-/// success or a negative spec error code. Spec §[time].time_setwall.
-///
-/// PL031 hardware register-write is unimplemented; the kernel adjusts
-/// its wall-clock offset in software above this layer (mirroring the
-/// x86_64 stub at `arch/x64/rtc.zig`), so this returns success without
-/// touching MMIO.
-pub fn writeRtc(unix_ns: u64) i64 {
-    _ = unix_ns;
-    return 0;
 }

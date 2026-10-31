@@ -9,8 +9,9 @@ const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
 const ExecutionContext = execution_context.ExecutionContext;
 const Word0 = capability.Word0;
 
-/// `caps` argument: bits 0-23 valid (self_caps + idc_rx); bits 24-63 reserved.
-const CREATE_CAPS_MASK: u64 = 0x0000_0000_00FF_FFFF;
+/// `caps` argument: self-cap bit 7 is reserved; bits 16-23 carry idc_rx;
+/// bits 24-63 are reserved.
+const CREATE_CAPS_MASK: u64 = 0x0000_0000_00FF_FF7F;
 
 /// Self-handle is always slot 0 in the calling domain. Spec §[capability_domain].
 const SELF_HANDLE_SLOT: u12 = 0;

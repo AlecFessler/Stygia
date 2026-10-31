@@ -404,8 +404,8 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     // Direct-kernel boot has no ACPI at all — QEMU `virt -kernel` hands
     // us a DTB in x0 which we currently ignore. Skip the XSDP/XSDT walk
     // entirely when the bootloader passes a zero XSDP and fall through
-    // to the PL011/RTC fallback block so the serial upper-half and the
-    // wall-clock still get wired up.
+    // to the PL011/RTC fallback block so the serial upper-half and RTC
+    // driver still get wired up.
     var saw_spcr = false;
     var gic_discovery: gic.GicDiscovery = .{};
     if (xsdp_phys.addr == 0) {
