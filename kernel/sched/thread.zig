@@ -557,6 +557,9 @@ pub const Thread = struct {
     /// r12, r13, r14, r15. aarch64 ordering: x0..x12.
     event_state_gprs: [13]u64 = [_]u64{0} ** 13,
 
+    /// Valid event-state vreg window declared by the originating suspend.
+    event_payload_count: u7 = 0,
+
     /// Spec §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32
     /// (aarch64 `[sp+8]`) — the suspending thread's saved instruction
     /// pointer. Snapshotted in `suspendOnPort` from the thread's saved

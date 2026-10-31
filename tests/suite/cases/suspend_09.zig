@@ -103,7 +103,9 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 3: queue W as a suspension event on the port. Non-blocking
     // for the test thread because [1] (W) is not the calling thread.
-    const sus = syscall.issueReg(.@"suspend", 0, .{
+    // General suspend: pair_count=0, payload_count=32. No attachments
+    // means this port needs suspend, but not xfer.
+    const sus = syscall.issueReg(.@"suspend", syscall.extraTstart(32), .{
         .v1 = w_handle,
         .v2 = port_handle,
     });
@@ -127,6 +129,7 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(5);
         return;
     }
+    if (((got.word >> 49) & 0x7F) != 32) return testing.fail(6);
 
     testing.pass();
 }

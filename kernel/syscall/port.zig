@@ -118,7 +118,7 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
 /// [test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's thread state per §[event_state]; otherwise the state in the payload is zeroed.
 /// [test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's thread state on reply; otherwise modifications are discarded.
 /// [test 12] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i64 {
+pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8, payload_count: u7) i64 {
     if (target & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
@@ -174,7 +174,7 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
         if (validatePairEntries(thread, pair_count)) |err| return err;
     }
 
-    const ret = port_obj.suspendThread(thread, target, port);
+    const ret = port_obj.suspendThread(thread, target, port, payload_count);
     if (ret != errors.OK) {
         port_obj.releasePendingPairEntries(thread);
     }

@@ -184,7 +184,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     // wrong type tag, etc.). Route through the regular suspend handler
     // so the same caps + state mutations apply.
     if (num_raw <= 13) {
-        return port.@"suspend"(caller, arg(args, 0), arg(args, 1), 0);
+        return port.@"suspend"(caller, arg(args, 0), arg(args, 1), 0, @truncate(num_raw));
     }
 
     const num = std.enums.fromInt(SyscallNum, num_raw) orelse return errors.E_INVAL;
@@ -274,7 +274,8 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             // carry the `xfer` cap (test 01), entries must be valid,
             // etc. The handler needs the count to gate that check.
             const pair_count: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            break :blk port.@"suspend"(caller, arg(args, 0), arg(args, 1), pair_count);
+            const payload_count: u7 = @truncate((syscall_word >> 20) & 0x7F);
+            break :blk port.@"suspend"(caller, arg(args, 0), arg(args, 1), pair_count, payload_count);
         },
         .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
 
