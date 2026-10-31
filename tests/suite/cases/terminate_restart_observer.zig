@@ -56,7 +56,14 @@ fn workerEntry() callconv(.c) noreturn {
     // thread arms this flag. A policy-1 replacement enters here after
     // restart and sends the second parent-visible event.
     while (!@atomicLoad(bool, &armed, .acquire)) pause();
-    _ = syscall.suspendThread(ownHandle(), ENTRY, &.{});
+    const result = syscall.suspendThread(ownHandle(), ENTRY, &.{});
+    if (result.v1 == @intFromEnum(errors.Error.E_ABANDONED)) {
+        // The parent deletes the replacement worker's reply only after
+        // checking the foreign terminate and restart results. Drop restart
+        // before exiting so this cleanup cannot create another worker.
+        _ = syscall.restrict(caps.SLOT_SELF, 0);
+        _ = syscall.delete(caps.SLOT_SELF);
+    }
     spin();
 }
 fn raceTerminator() callconv(.c) noreturn {
@@ -187,6 +194,9 @@ fn runMode(comptime mode: Mode, base: u64) void {
         if (syscall.terminate(foreign).v1 != @intFromEnum(errors.Error.E_TERM)) return fail(17);
         const again_reply: caps.HandleId = @truncate((again.word >> 32) & 0xFFF);
         if (again_reply == 0 or syscall.delete(again_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(19);
+        // The child owns the only remaining bind endpoint. Closing it
+        // witnesses that the replacement worker exited before PASS.
+        if (syscall.recv(entry_port, TIMEOUT_NS).regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) return fail(33);
     } else {
         // The helper and child fault are released by the same parent. Its
         // completion event witnesses the foreign terminate result; the
@@ -197,14 +207,15 @@ fn runMode(comptime mode: Mode, base: u64) void {
         race_port = completion;
         race_result = @intFromEnum(errors.Error.E_NOENT);
         @atomicStore(bool, &race_go, false, .release);
-        const helper_caps = caps.ThreadCap{ .susp = true };
-        _ = handle(syscall.createThread(helper_caps.toU16(), @intFromPtr(&raceTerminator), 1, 0, 0).v1) orelse return fail(22);
+        const helper_caps = caps.ThreadCap{ .susp = true, .term = true };
+        const helper = handle(syscall.createThread(helper_caps.toU16(), @intFromPtr(&raceTerminator), 1, 0, 0).v1) orelse return fail(22);
         @atomicStore(bool, &race_go, true, .release);
         if (syscall.reply(trigger_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(23);
         const done = syscall.recv(completion, TIMEOUT_NS);
         if (done.regs.v1 != @intFromEnum(errors.Error.OK)) return fail(24);
         const done_reply: caps.HandleId = @truncate((done.word >> 32) & 0xFFF);
         if (done_reply == 0 or syscall.reply(done_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(25);
+        if (syscall.terminate(helper).v1 != @intFromEnum(errors.Error.OK)) return fail(34);
         const result = @atomicLoad(u64, &race_result, .acquire);
         if (result == @intFromEnum(errors.Error.OK)) {
             race_winner = 1;
@@ -219,6 +230,7 @@ fn runMode(comptime mode: Mode, base: u64) void {
             if (syscall.sync(process).v1 != @intFromEnum(errors.Error.OK)) return fail(32);
             const again_reply: caps.HandleId = @truncate((again.word >> 32) & 0xFFF);
             if (again_reply == 0 or syscall.delete(again_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(30);
+            if (syscall.recv(entry_port, TIMEOUT_NS).regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) return fail(35);
         } else {
             return fail(31 + result);
         }
