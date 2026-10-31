@@ -651,6 +651,11 @@ pub fn build(b: *std.Build) void {
     const wants_usb = b.option(bool, "usb", "Attach a qemu-xhci controller + HID devices (default: off)") orelse false;
 
     const qemu_cmdline = if (arch == .aarch64) blk: {
+        const machine = if (kvm)
+            "virt,gic-version=3"
+        else
+            // Match the ARM TCG test and Linux-guest gates: expose EL2.
+            "virt,gic-version=3,virtualization=on";
         const accel = if (kvm)
             "-enable-kvm -cpu host"
         else if (test_root_reboot_on_exit)
@@ -660,7 +665,7 @@ pub fn build(b: *std.Build) void {
             "-machine accel=tcg -cpu cortex-a72 -d int,cpu_reset -no-shutdown -D qemu.log";
         break :blk b.fmt(
             \\exec qemu-system-aarch64 \
-            \\ -M virt,gic-version=3 \
+            \\ -M {s} \
             \\ -m 1G \
             \\ -bios /usr/share/AAVMF/AAVMF_CODE.fd \
             \\ -drive file=fat:rw:{s}/{s},format=raw \
@@ -669,7 +674,7 @@ pub fn build(b: *std.Build) void {
             \\ -no-reboot \
             \\ {s} \
             \\ -smp cores=4
-        , .{ b.install_path, out_dir, display_type, accel });
+        , .{ machine, b.install_path, out_dir, display_type, accel });
     } else blk: {
         const qemu_accel_args: []const u8 = if (kvm)
             \\-enable-kvm \
