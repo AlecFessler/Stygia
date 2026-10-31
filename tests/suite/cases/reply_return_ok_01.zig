@@ -10,7 +10,7 @@ const testing = lib.testing;
 
 var ready_port: caps.HandleId = 0;
 var request_port: caps.HandleId = 0;
-var result: u64 = ~@as(u64, 0);
+var observed_port: caps.HandleId = 0;
 
 fn pause() void {
     switch (builtin.cpu.arch) {
@@ -30,7 +30,9 @@ fn worker() callconv(.c) noreturn {
     const id: caps.HandleId = @truncate(own.v1 & 0xFFF);
     _ = syscall.suspendThread(id, ready_port, &.{});
     const resumed = syscall.suspendThread(id, request_port, &.{});
-    @atomicStore(u64, &result, resumed.v1, .release);
+    // A completion event gives the observer a scheduling-independent
+    // witness of the saved-frame return code, including on fast Pi cores.
+    _ = syscall.issueRawCaptureWord(0, .{ .v1 = id, .v2 = observed_port, .v3 = resumed.v1 });
     while (true) pause();
 }
 
@@ -46,13 +48,16 @@ fn take(port: caps.HandleId) ?caps.HandleId {
     return if (reply == 0) null else reply;
 }
 
-fn fail(id: u64) void { testing.fail(id); }
+fn fail(id: u64) void {
+    testing.fail(id);
+}
 
 pub fn main(_: u64) void {
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     ready_port = handle(syscall.createPort(port_caps.toU16()).v1) orelse return fail(1);
     request_port = handle(syscall.createPort(port_caps.toU16()).v1) orelse return fail(2);
-    const thread_caps = caps.ThreadCap{ .susp = true };
+    observed_port = handle(syscall.createPort(port_caps.toU16()).v1) orelse return fail(9);
+    const thread_caps = caps.ThreadCap{ .susp = true, .read = true };
     const thread = handle(syscall.createThread(thread_caps.toU16(), @intFromPtr(&worker), 1, 0, 0).v1) orelse return fail(3);
     const ready = take(ready_port) orelse return fail(4);
     if (syscall.reply(ready).v1 != @intFromEnum(errors.Error.OK)) return fail(5);
@@ -61,9 +66,8 @@ pub fn main(_: u64) void {
     _ = syscall.yieldThread(thread);
     const reply = take(request_port) orelse return fail(6);
     if (syscall.reply(reply).v1 != @intFromEnum(errors.Error.OK)) return fail(7);
-    _ = syscall.yieldThread(thread);
-    var spins: u32 = 0;
-    while (@atomicLoad(u64, &result, .acquire) == ~@as(u64, 0) and spins < 10_000_000) : (spins += 1) pause();
-    if (@atomicLoad(u64, &result, .acquire) != @intFromEnum(errors.Error.OK)) return fail(8);
+    const observed = syscall.recv(observed_port, 5_000_000_000);
+    if (observed.regs.v1 != @intFromEnum(errors.Error.OK)) return fail(8);
+    if (observed.regs.v3 != @intFromEnum(errors.Error.OK)) return fail(80 + observed.regs.v3);
     testing.pass();
 }
