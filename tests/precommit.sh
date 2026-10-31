@@ -3,6 +3,7 @@
 #
 # Stages (all gated except [0d], which is report-only):
 #   preflight. staged-source check   (the gate tests the content being committed)
+#   oracle. fault-log regression tests
 #   0. arch layering lint           (arch-specific / generic boundaries)
 #   0b. dead-code report             (skip-list checked into the tree)
 #   0c. gen-lock analyzer            (all ownership and IRQ rules)
@@ -217,6 +218,7 @@ QEMU_SHIM_PATH="$QEMU_SHIM_DIR:$PATH"
 # manual invocation but don't gate the hook.
 REQUIRED_STAGES=(
     source_snapshot
+    kernel_fault_log_oracle
     arch_layering_lint
     dead_code_report
     gen_lock_analyzer
@@ -273,6 +275,14 @@ stage_source_snapshot() {
         FAILURES+=("untracked source files outside staged snapshot")
         return 1
     fi
+}
+
+stage_kernel_fault_log_oracle() {
+    echo ""
+    echo "=================================================="
+    echo "[oracle] Kernel fault-log regression tests"
+    echo "=================================================="
+    (cd "$SCRIPT_DIR" && python3 -m unittest test_kernel_fault_log.py)
 }
 
 # ── Pre-stage suite warmup ────────────────────────────────────────────
@@ -750,12 +760,13 @@ verify_image_arch() {
 # the panic went unnoticed. A run that panics on one core and still reports a
 # clean summary used to PASS this gate outright.
 #
-# Marker choice is measured against a known-clean x86 run (485/485):
-#   KERNEL PANIC  0   Zig `panic:`  0   [UNHANDLED]  0
-#   [USR-PF]    102  <-- NOT a marker; the map_pf tests fault on purpose.
-# `[UNHANDLED]` means an event fired with no bound route and the thread parked
-# forever, so a result that should exist never will — abnormal by
-# construction, and zero in healthy runs.
+# `[UNHANDLED]` usually means a faulted thread will not report a result.
+# The full suite's breakpoint_fault_01 is the one exception: it deliberately
+# faults a nested child, then proves process teardown through E_CLOSED before
+# its parent reports PASS. check_kernel_fault_log.py requires that PASS, the
+# child's diagnostic tag and thread identity, and the architecture's breakpoint
+# subcode. VM subsets and all other unhandled faults still fail the gate.
+# [USR-PF] is not a marker: the map_pf tests fault on purpose.
 #
 # `[HANG]` is diagnostic rather than conclusively terminal: the x86 hang
 # detector can dump once after a long no-newline window, then the runner can
@@ -763,17 +774,20 @@ verify_image_arch() {
 # terminal hangs blocking, but do not fail a recovered dump that is followed by
 # a clean runner verdict.
 #
-# $1 = path to the captured log, $2 = label for the FAILURES entry
+# $1 = path to the captured log, $2 = label for the FAILURES entry,
+# $3 = optional full-suite breakpoint mode (breakpoint_x86/breakpoint_arm).
 verify_no_kernel_faults() {
-    local log="$1" label="$2"
+    local log="$1" label="$2" mode="${3:-none}"
     [[ -f "$log" ]] || return 0
-    # The runner's per-test progress ticks interleave `~` into output, so
-    # strip them before matching (same reason the summary greps do).
     local hard_hits
-    hard_hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[UNHANDLED\]' | head -10)
+    if ! hard_hits=$(python3 "$STYGIA_ROOT/tests/check_kernel_fault_log.py" "$log" --mode "$mode"); then
+        echo "[FAIL] $label: kernel fault-log checker unavailable"
+        FAILURES+=("$label: kernel fault-log checker unavailable")
+        return 1
+    fi
     if [[ -n "$hard_hits" ]]; then
         echo "[FAIL] $label: kernel-level fault in the log (runner summary cannot see this)"
-        echo "$hard_hits" | sed 's/^/    /'
+        echo "$hard_hits" | head -10 | sed 's/^/    /'
         FAILURES+=("$label: kernel fault (panic/unhandled) in serial log")
         return 1
     fi
@@ -872,7 +886,7 @@ stage_x86_kernel_tests() {
 
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
-        if ! verify_no_kernel_faults "$qemu_log" "x86 kernel tests (rep ${rep}/3)"; then
+        if ! verify_no_kernel_faults "$qemu_log" "x86 kernel tests (rep ${rep}/3)" breakpoint_x86; then
             rm -f "$qemu_log"
             return 1
         fi
@@ -1020,7 +1034,7 @@ verify_aarch64_bare_tryboot_log() {
         FAILURES+=("$label: no ordered current-run bare-metal verdict")
         return 1
     fi
-    if ! verify_no_kernel_faults "$current_log" "$label"; then
+    if ! verify_no_kernel_faults "$current_log" "$label" breakpoint_arm; then
         rm -f "$current_log"
         return 1
     fi
@@ -1467,7 +1481,7 @@ stage_aarch64_kernel_tests_pi() {
 
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
-        if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests on $qemu_host (rep ${rep}/3)"; then
+        if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests on $qemu_host (rep ${rep}/3)" breakpoint_arm; then
             rm -f "$pi_log"
             return 1
         fi
@@ -1651,6 +1665,7 @@ if [[ $REQUIRED_ONLY -eq 1 ]]; then
     fi
 fi
 
+run_stage kernel_fault_log_oracle
 ensure_suite_root_service_elf || true
 
 run_stage arch_layering_lint
