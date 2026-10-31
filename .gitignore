@@ -3,6 +3,7 @@
 *.pyc
 __pycache__/
 qemu.log
+.precommit-tmp/
 out/precommit/failed-kernel-runs/
 **/venv/
 **/.zig-cache/
