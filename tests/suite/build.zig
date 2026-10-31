@@ -281,6 +281,8 @@ const test_entries = [_]TestEntry{
     .{ .name = "process_restart_04", .path = "cases/process_restart_04.zig" },
     .{ .name = "process_restart_05", .path = "cases/process_restart_05.zig" },
     .{ .name = "process_restart_06", .path = "cases/process_restart_06.zig" },
+    .{ .name = "process_restart_term_before", .path = "cases/process_restart_term_before.zig" },
+    .{ .name = "process_restart_term_after", .path = "cases/process_restart_term_after.zig" },
     .{ .name = "vmar_restart_00", .path = "cases/vmar_restart_00.zig" },
     .{ .name = "vmar_restart_01", .path = "cases/vmar_restart_01.zig" },
     .{ .name = "vmar_restart_02", .path = "cases/vmar_restart_02.zig" },
