@@ -53,8 +53,11 @@ pub fn build(b: *std.Build) void {
 
     const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse
         if (profile) |p| p.kvm else true;
-    const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse
-        if (profile) |p| p.use_llvm else false;
+    // The freestanding kernel uses instructions not yet supported by Zig
+    // 0.15.2's self-hosted x86 encoder. Match every named profile by using
+    // LLVM for the generic build too; an explicit flag can still override it.
+    const use_llvm = b.option(bool, "use-llvm", "Use LLVM+LLD backend (default: on)") orelse
+        if (profile) |p| p.use_llvm else true;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     // The linux_guest sub-project emits an arch-suffixed ELF
     // (`linux_guest-arm.elf` for aarch64 vs. plain `linux_guest.elf` for
