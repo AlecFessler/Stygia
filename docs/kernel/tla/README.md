@@ -347,7 +347,7 @@ gitignored; keep all generated output under them.
 
 | File | Purpose |
 |---|---|
-| `ECLifecycle.tla` | the model: rev 17 plus the dispatch-tail/PMU hardware-owner and vCPU-cancel extensions, with older/defective machines as switches |
+| `ECLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
 | `ECProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
 | `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
 | `ECLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
@@ -357,7 +357,6 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
 | `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
 | `ECLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
-| `ECLifecycle_pmu_release.cfg` | focused PMU release/destruction lifetime check with per-core `phw` hardware refs and safe remote migration enabled; default battery |
 | `ECLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
 | `ECLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
 | `ECLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
@@ -376,7 +375,6 @@ gitignored; keep all generated output under them.
 | `ECLifecycle_cr3.cfg` | round-7 C3, `"pair"` at 3 ECs: expects `InvNoSuspendCycle3` |
 | `ECLifecycle_crfals.cfg` | round-7 C3, no rejection + no N6 assumptions at the focused no-drop `SpecSus` scope: expects a temporal violation |
 | `ECLifecycle_mterm.cfg` | **round-8 C-1, no retired-terminator escape: expects a DEADLOCK** |
-| `ECLifecycle_pmu_remote_falsifier.cfg` | remote PMU stale-ref bug: `PMU_SAFE_MIGRATION = FALSE` expects `InvPmuHwCoreRefCoherent` |
 | `ECLifecycle_pr{1,2,3}.cfg` | the reachability probes (violation = pass) |
 | **not in `run.sh`** | |
 | `ECLifecycle_q{1..7}.cfg`, `q7d` | per-property liveness at 2c × 3e. `q7` did not converge in 90 min; kept because the scope question is open, NOT because they pass |
@@ -456,7 +454,7 @@ here.
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
 | §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-EC words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
-| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` now distinguishes `dispatchPmu` and `dispatchLoad` from `ecrun`; `committed_ec` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
+| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` distinguishes `dispatchLoad` from `ecrun`; `committed_ec` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
 | §2.4 `owner_core` | `own`, NULL outside validity set | poison = NULL |
 | §2.4 `pin_depth` + pin class (F3) | `pin`; wake/suspend claim actions pin the protected target EC, pin-class locks pin the executing EC via `PinAcq`/`PinRel`; `dpin` is the running-target remote-directive lifetime pin | "computed membership" is the analyzer's job; model has one representative class. `RetireEnabled` gates on target `pin = 0` and `dpin = FALSE`; `InvPinCells` permits transient ready publish pins because containment is still the run queue. `dpin` is deliberately separate because Zig's directive waiter pin blocks retire/finalize but must not block the target owner's tick/boundary directive consumption |
 | §2.4 `pin_depth` ORDER (C1) | `PIN_BUMP_FIRST` + `plk \in {none,held,preB,postD}` + `PinBump`/`PinUnlock` + `InvNoPreemptedLockHolder` | **pin-class half CHECKED** (the `pinord` falsifier); **claim half BELOW GRANULARITY and not checked** — see finding C1 |
@@ -477,7 +475,7 @@ here.
 | §8.1 `yieldTo` target side (M-4) | `DispatchEC(c,e)` requires `e \in cores[c].q` — local-only by construction | the S7 filter is `~ecs[e].dd`; the affinity-mask check is below granularity (masks unmodelled) |
 | §9.4 both fused shapes | `FastPath` (suspend FP), `ReplyFP` (reply FP main) | asm conformance out of boundary (`stygia-qde`) |
 | §3.2 edge-4 claimability-at-the-hop | `E4_AT_HOP` switch + the e4 falsifier | the Phase-3b barrier-zero question, answered with teeth |
-| §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchEC` (selected/current commit) -> `DispatchPmu` (`pmuSwitch`) -> `DispatchLoad` (final context load); `DispatchAbort{Pre,After}Pmu` for lifecycle loss after commit; `PmuRelease` for perfmon-state release/destruction completion; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary. `InvPmuTailOwned` checks that at most one per-core PMU hardware ref names an EC; `InvPmuHwCoreRefCoherent` checks both `hw -> phw` and reverse `phw -> hw`; `InvPmuNoReleasedHw` checks release/destruction cannot complete while any PMU hardware token is live |
+| §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchEC` (selected/current commit) -> `DispatchLoad` (final context load), with `DispatchAbort` for lifecycle loss after commit; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary |
 | stygia-8xl vCPU guest-current retire/cancel | `VCPU_ECS`, `ecs[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitDomainQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
 | §3.2 wake body | `WakeStart` (5a/5b) + `WakePlace`/`WakePendDone`; `FireAt` + irq frame bodies | |
 | §3.3 IRQ discipline | masked sections = atomic actions; handler-active = masked (no nesting) | sync-exception rule outside boundary |
@@ -485,13 +483,13 @@ here.
 | §3.6 T3 spins (**10 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W6's guest-current vCPU cancellation sub-obligation = `VcpuCancelExit`; W7 = `RetireEnabled` pd guard | Full W6 root teardown, W8, W9 **not modelled** — and **W5-N (the domain-pause predicate wait) is not modelled either**, which revision 15's row omitted entirely: it accounted for 9 of 10 rows and read as complete. W5-N is the only PREDICATE-shaped wait in §3.6 and it belongs to G12 |
 | §3.6 assumption (3), no interrupt storm | `SF_vars(BaseStep)` (STRONG, not weak) | rev 7 claimed the set was complete at two; this is the third, and it was always encoded — just not counted |
 | §4 hop | `HopRelease` (release first) -> `HopCommit{Wait,Requeue,Pended,Retired,Claimed}` | retired arm waits for NOTHING (F1); **rev 8: every commit arm that places picks its destination at placement time (M-2)** |
-| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the split dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
+| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
 | §5.1 T1 sources | one generic one-shot (`shot`) = deadline/wheel/device rows; rendezvous row = `RvStart` | periodic-scan loser protocol below granularity |
 | §5.2 T2 matrix | `RetireEcsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
 | §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; running vCPU guest retire sets cancel state when `VCPU_CANCEL`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin and the stygia-8xl arch-cancel requirement |
 | §8.3 rendezvous | `RvStart` + `RvDeliver` | G-RV1 |
 | §8.5 creation | `CreateEC` (publish-last) | CD-lock liveness gate not modelled |
-| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, `InvPmuTailOwned`, `InvPmuHwCoreRefCoherent`, `InvPmuNoReleasedHw`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC. The PMU invariants are hardware-owner/release ownership assertions, not a full PMU counter model |
+| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC. |
 | S1/S3/S4/S8 | `InvS1`, `InvS3`, `InvS4Holder`+`InvS4Pended`; S8 by construction | S2/S5/S6 and S7's lock half outside boundary |
 | L1-L6, W3/W4/W5 | `LiveParking/Retired/Ready/Wake/Mark/Claim/Term/Suspender` | L3 states DISPATCH, not merely "leaves ready" |
 | §0.3 / §3.4 domain pause (`cd.paused`), §2.2 `wait.kind = .domain_pause`, §3.1 rule 3's third arm, §5 edge 1's gated publish, §3.6 W5-N | **NOTHING. No variable, no action, no invariant.** | **G12** — the largest open gap. The model has no domains beyond a per-EC `dd` flag. Round-13 C-1's whole fix, plus revision 16's quiesced-resume rule and boundary-leg fix, are doc-only. G12 carries the four lost properties and the design for closing it. `waiting(domain_pause)` is a boundary edge-3/edge-4 route, not edge 7 |
@@ -512,21 +510,6 @@ incomparable/reconstruction.
   sequential, no other named party); the parking/claimed/pended rows are
   NOT compressed.
 - **U5** — frame death: finalize resets the dead frame's `pc`/`tg`.
-- **U6 (PMU hardware-owner ghost)** — compression, stated. `ecs[e].hw`
-  abstracts `PerfmonState.hw_core`, and `phw[c]` abstracts
-  `pmu_hw_refs[c]`. The pair is persistent across `DispatchLoad`, so it
-  now covers the long-running ownership interval rather than only the
-  dispatch tail. With `PMU_SAFE_MIGRATION = TRUE`, `DispatchPmu` retires
-  every old per-core ref for the EC before installing the new owner. With
-  `PMU_SAFE_MIGRATION = FALSE`, it reproduces the reviewed old behavior:
-  `hw` migrates while a remote `phw` entry remains live, and the
-  non-caller remote syscall falsifier can clear `hw` while leaving that
-  `phw` entry behind. `InvPmuTailOwned` covers duplicate hardware refs;
-  `InvPmuHwCoreRefCoherent` covers both `hw -> phw` and reverse
-  `phw -> hw`. `ecs[e].prel` models perfmon-state release/destruction
-  completion separately from the hardware token. The model still abstracts
-  actual counter values, threshold PMI re-arm cadence, `perfmon_read`
-  sampling values, and the bounded duration of release-pending waits.
 - **G1** — INC, gate-only. Rev 3's hop behavior on a commit-CAS observing
   an already-advanced state is unspecified; the gate machine has an
   "owner proceeds" arm or it wedges on benign schedules.
@@ -1457,7 +1440,6 @@ and are NOT comparanda.
 | Config | `SUSPEND_ON` | rev 17 | rev 18 | |
 |---|---|---|---|---|
 | `vcpu_cancel` | FALSE | 39 | 39 | control |
-| `pmu_release` | FALSE | 31,970 | 31,970 | control |
 | `t1min` | FALSE | 77,498 | 77,498 | control |
 | `cr3self` | FALSE | 941,984 | 941,984 | control |
 | `t1s` | **TRUE** | 82,070 | 82,070 | **load-bearing** |
@@ -1484,13 +1466,9 @@ lives. **No probe covers `RecvPop` or `AffMove`** — so if a later revision
 sets `REQUEUE_ON = FALSE`, nothing fires. See `POSIX_AMENDMENTS.md` §6,
 including why the fix needs a ghost bit rather than five lines.
 
-**Scope correction.** The "31 configs + sany" figure below is STALE.
-`run.sh` now contains **41** `expect_*` invocations (20 `expect_pass`, 21
-`expect_violation`); **35** run by default and 6 sit behind
-`RUN_XLARGE=1` / `RUN_SLOW=1`. The per-config figures recorded under
-"Revision 15" are stale against the current model too — today's `t1r` is
-85,902 where this file records 11,969, because the revision-17 vCPU/PMU
-fields were never folded into these tables.
+**Validation status.** The counts and verdicts in the historical tables below
+predate removal of obsolete model state. Run `run.sh` for the current battery;
+a full post-cleanup rerun is pending.
 
 **What this validation does NOT establish.** It shows the split preserved
 the model. It says nothing about whether the model still describes the
@@ -1510,8 +1488,6 @@ side of the revision-18 split are each covered.
 |---|---|---|---|
 | `vcpu_cancel` | clean, incl. `LiveVcpuCancel` | `No error has been found` | 39 (recorded 39) |
 | `vcpu_nocancel` | `InvRetiredVcpuCancelled` violated | **FIRED** | 29 before the violation, depth 8 |
-| `pmu_release` | clean | `No error has been found` | 31,970 (recorded 31,970) |
-| `pmu_remote` | `InvPmuHwCoreRefCoherent` violated | **FIRED** | 30 before the violation |
 | `t1s` | clean, `LiveTerm` under `SpecTrm` | `No error has been found` | 82,070 (recorded 82,070) |
 
 `sany` clean on both `ECLifecycle.tla` and `ECProbes.tla`. The three
@@ -1974,7 +1950,7 @@ distinction a closure table exists to make.
 | **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an EC in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
 | **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an EC *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live EC, and it collides directly with `active_root` / translation quiescence (W6): a running EC on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
 | **`acquire_vmars` / `idc_read` / `idc_write`** | **THEY DO CHANGE EC STATE, and an earlier version of this table said they could not.** `specv3.md` `:722`/`:1894`/`:1952` say each **pauses every EC in the target domain**: §3.1 rule 3's third boundary arm, an edge-3 park into `waiting(domain_pause)`, edge 1's gated publish, plus the W5-N wait the caller performs. There is no edge-7 domain-pause route | **NOT MODELLED — see G12** | the pauser (entry/resume); each gated EC itself (the park) |
-| `sync`, `restrict`, `ack`, `perfmon_*`, all VMAR/page-frame/VM-policy calls, `create_port`, `bind_event_route`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability, memory or perfmon state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
+| `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `bind_event_route`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
 Two rows in that table are the round-7 additions that closed acceptance
 condition 3's gaps: `yieldTo`'s target side had no rule at all, and the

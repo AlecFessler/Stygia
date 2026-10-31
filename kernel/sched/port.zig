@@ -1673,7 +1673,7 @@ pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
     return 0;
 }
 
-// ── Kernel-internal event firing (called from arch fault/PMU paths) ──
+// ── Kernel-internal event firing (called from arch fault paths) ──
 
 /// Common dispatch for `fire*`. Looks up `ec.event_routes[event_type]`;
 /// if bound, suspends `ec` on the port. Returns true iff the suspend was
@@ -2026,19 +2026,9 @@ pub fn fireBreakpoint(ec: *ExecutionContext, subcode: u8) void {
     // rely on the arch entry path to continue.
 }
 
-/// Fire a pmu_overflow event. Fallback: drop, EC continues running.
-pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
-    const subcode: u8 = @truncate(counter_idx);
-    var info: NoRouteInfo = .{};
-    if (fireRouted(ec, .pmu_overflow, subcode, counter_idx, &info)) return;
-    // No-route fallback: silently drop. The EC keeps running and the
-    // counter has already been re-armed by the arch ISR.
-}
-
 /// Fire a vm_exit event for a vCPU EC. Routes to `ec.exit_port`
 /// directly (not through `event_routes`). Spec §[vm_exit_state].
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
-
     const exit_port_ref = ec.exit_port orelse return;
     const exit_lr = exit_port_ref.lockIrqSave(@src()) catch return;
     const port_ptr = exit_lr.ptr;
@@ -2610,14 +2600,14 @@ fn deliverEvent(
     arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.OK));
     // Surface `subcode` in vreg 2 for events that carry an event-
     // specific sub-code (memory_fault, thread_fault, breakpoint,
-    // vm_exit, pmu_overflow). The firing-site sub-code overlays the
+    // vm_exit). The firing-site sub-code overlays the
     // GPR projection's vreg 2 slot — §[create_vcpu] test 12 requires
     // the synthetic initial vm_exit to surface the initial-state
     // sentinel even though the sender's GPR snapshot is all zero.
     // For `suspension` the spec leaves `subcode` 0, so we leave the
     // snapshot's rbx (the suspending EC's value) untouched.
     switch (event_type) {
-        .memory_fault, .thread_fault, .breakpoint, .vm_exit, .pmu_overflow => {
+        .memory_fault, .thread_fault, .breakpoint, .vm_exit => {
             arch.syscall.setEventSubcode(target_ctx, subcode);
         },
         .none, .suspension => {},

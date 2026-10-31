@@ -118,22 +118,6 @@ pub const VmExitState = extern struct {
     dbgwvr_el1: [4]u64 = .{0} ** 4,
     dbgwcr_el1: [4]u64 = .{0} ** 4,
 
-    // vregs 102..115 — PMU regs
-    pmcr_el0: u64 = 0,
-    pmcntenset_el0: u64 = 0,
-    pmcntenclr_el0: u64 = 0,
-    pmovsr_el0: u64 = 0,
-    pmovsset_el0: u64 = 0,
-    pmselr_el0: u64 = 0,
-    pmccntr_el0: u64 = 0,
-    pmxevtyper_el0: u64 = 0,
-    pmxevcntr_el0: u64 = 0,
-    pmccfiltr_el0: u64 = 0,
-    pmintenset_el1: u64 = 0,
-    pmintenclr_el1: u64 = 0,
-    pmuserenr_el0: u64 = 0,
-    pmevcntr_aggregate: u64 = 0,
-
     // vreg 116 — packed pending (vIRQ/vFIQ/vSError)
     pending_intr: u64 = 0,
 
@@ -237,7 +221,6 @@ const VregOffsets = struct {
     const CNTKCTL_EL1: usize = 49;
     const CNTVOFF_EL2: usize = 50;
     const DBG_BASE: usize = 51; // 20 debug slots
-    const PMU_BASE: usize = 71; // 14 PMU slots
     const PENDING_INTR: usize = 85;
     const EXIT_SUBCODE: usize = 86;
     const EXIT_PAYLOAD_BASE: usize = 87; // 3 payload slots
@@ -300,20 +283,6 @@ inline fn writeBufFrom(state: VmExitState) void {
     inline for (state.dbgbcr_el1, 0..) |v, i| buf[VregOffsets.DBG_BASE + 6 + i] = v;
     inline for (state.dbgwvr_el1, 0..) |v, i| buf[VregOffsets.DBG_BASE + 12 + i] = v;
     inline for (state.dbgwcr_el1, 0..) |v, i| buf[VregOffsets.DBG_BASE + 16 + i] = v;
-    buf[VregOffsets.PMU_BASE + 0] = state.pmcr_el0;
-    buf[VregOffsets.PMU_BASE + 1] = state.pmcntenset_el0;
-    buf[VregOffsets.PMU_BASE + 2] = state.pmcntenclr_el0;
-    buf[VregOffsets.PMU_BASE + 3] = state.pmovsr_el0;
-    buf[VregOffsets.PMU_BASE + 4] = state.pmovsset_el0;
-    buf[VregOffsets.PMU_BASE + 5] = state.pmselr_el0;
-    buf[VregOffsets.PMU_BASE + 6] = state.pmccntr_el0;
-    buf[VregOffsets.PMU_BASE + 7] = state.pmxevtyper_el0;
-    buf[VregOffsets.PMU_BASE + 8] = state.pmxevcntr_el0;
-    buf[VregOffsets.PMU_BASE + 9] = state.pmccfiltr_el0;
-    buf[VregOffsets.PMU_BASE + 10] = state.pmintenset_el1;
-    buf[VregOffsets.PMU_BASE + 11] = state.pmintenclr_el1;
-    buf[VregOffsets.PMU_BASE + 12] = state.pmuserenr_el0;
-    buf[VregOffsets.PMU_BASE + 13] = state.pmevcntr_aggregate;
     buf[VregOffsets.PENDING_INTR] = state.pending_intr;
     buf[VregOffsets.EXIT_SUBCODE] = state.exit_subcode;
     buf[VregOffsets.EXIT_PAYLOAD_BASE + 0] = state.exit_payload[0];
@@ -381,20 +350,6 @@ inline fn readBufInto(state: *VmExitState) void {
     inline for (&state.dbgbcr_el1, 0..) |*v, i| v.* = buf[VregOffsets.DBG_BASE + 6 + i];
     inline for (&state.dbgwvr_el1, 0..) |*v, i| v.* = buf[VregOffsets.DBG_BASE + 12 + i];
     inline for (&state.dbgwcr_el1, 0..) |*v, i| v.* = buf[VregOffsets.DBG_BASE + 16 + i];
-    state.pmcr_el0 = buf[VregOffsets.PMU_BASE + 0];
-    state.pmcntenset_el0 = buf[VregOffsets.PMU_BASE + 1];
-    state.pmcntenclr_el0 = buf[VregOffsets.PMU_BASE + 2];
-    state.pmovsr_el0 = buf[VregOffsets.PMU_BASE + 3];
-    state.pmovsset_el0 = buf[VregOffsets.PMU_BASE + 4];
-    state.pmselr_el0 = buf[VregOffsets.PMU_BASE + 5];
-    state.pmccntr_el0 = buf[VregOffsets.PMU_BASE + 6];
-    state.pmxevtyper_el0 = buf[VregOffsets.PMU_BASE + 7];
-    state.pmxevcntr_el0 = buf[VregOffsets.PMU_BASE + 8];
-    state.pmccfiltr_el0 = buf[VregOffsets.PMU_BASE + 9];
-    state.pmintenset_el1 = buf[VregOffsets.PMU_BASE + 10];
-    state.pmintenclr_el1 = buf[VregOffsets.PMU_BASE + 11];
-    state.pmuserenr_el0 = buf[VregOffsets.PMU_BASE + 12];
-    state.pmevcntr_aggregate = buf[VregOffsets.PMU_BASE + 13];
     state.pending_intr = buf[VregOffsets.PENDING_INTR];
     state.exit_subcode = buf[VregOffsets.EXIT_SUBCODE];
     state.exit_payload[0] = buf[VregOffsets.EXIT_PAYLOAD_BASE + 0];
@@ -498,11 +453,7 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
         : [iv1] "{x0}" (@as(u64, port)),
           [iv2] "{x1}" (@as(u64, 0)),
           [iv3] "{x2}" (timeout_ns),
-        : .{ .x15 = true, .x16 = true, .x17 = true,
-             .x18 = true, .x19 = true, .x20 = true,
-             .x21 = true, .x22 = true, .x23 = true, .x24 = true,
-             .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x15 = true, .x16 = true, .x17 = true, .x18 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     // The §[recv] return word lands at [sp + 0] which is vm_exit_buf[0]
     // because we kept sp = &vm_exit_buf during the syscall.
@@ -646,12 +597,6 @@ pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
           [iv14] "{x13}" (state.x13),
           [iv15] "{x14}" (state.x14),
           [iv16] "{x15}" (state.x15),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true,
-             .x18 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true,
-             .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true,
-             .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x18 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return ox0;
 }

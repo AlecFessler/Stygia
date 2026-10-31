@@ -57,7 +57,6 @@ pub const Register = enum(u32) {
     int_cmd_high_reg = 0x310,
     lvt_timer_reg = 0x320,
     lvt_thermal_sensor_reg = 0x330,
-    lvt_perf_monitoring_counters_reg = 0x340,
     lvt_lint0_reg = 0x350,
     lvt_lint1_reg = 0x360,
     lvt_err_reg = 0x370,

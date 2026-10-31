@@ -26,7 +26,6 @@ pub const CpuidFeatureEcx = enum(u32) {
     fma = 1 << 12, // Fused multiply-add
     cx16 = 1 << 13, // CMPXCHG16B instruction
     xtpr = 1 << 14, // xTPR update control
-    pdcm = 1 << 15, // Perf/Debug capability MSR
     pcid = 1 << 17, // Process-context identifiers
     dca = 1 << 18, // Direct Cache Access
     sse4_1 = 1 << 19, // SSE4.1: adds dot-product, blend ops, rounding control
@@ -241,9 +240,7 @@ pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
     return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
 }
 
-/// Raw CPUID for arbitrary leaf/subleaf numbers. Used by the PMU detection
-/// path which needs leaf `0x0A` (architectural performance monitoring,
-/// Intel SDM Vol 3 §18.2.2) — not worth broadening `CpuidLeaf` for.
+/// Raw CPUID for arbitrary leaf/subleaf numbers used by feature detection.
 pub fn cpuidRaw(leaf: u32, subleaf: u32) struct {
     eax: u32,
     ebx: u32,

@@ -410,7 +410,6 @@ pub fn SecureSlab(
         /// Two concrete async chains, both established from the IR call
         /// graph rather than by inspection:
         ///
-        ///   `arch.x64.amd.pmu.pmiHandler` → `sched.port.firePmuOverflow`
         ///   → `fireRouted` → `suspendOnPort` → `rendezvousWithReceiver`
         ///   → `deliverEvent` → `sched.timer.decHandleRef` →
         ///   `decHandleRefLocked` → `destroyTimer` → `destroy` →
@@ -421,7 +420,7 @@ pub fn SecureSlab(
         ///   `destroyAlreadyMarked`'s acquire below)
         ///
         /// A core holding this lock in process context with IRQs enabled
-        /// that then takes the timer or PMI interrupt will re-enter the
+        /// that then takes a timer interrupt will re-enter the
         /// same class on the same core and spin forever on a lock it
         /// already holds — an unbreakable single-core self-deadlock, and
         /// `debug.checkIrqModeOn`'s `panic_irq_mode_mix`. Lockdep has
@@ -504,8 +503,8 @@ pub fn SecureSlab(
         /// otherwise drive: while gen is even, `lockWithGen` rejects
         /// the slot and `forEachAlive` skips it.
         pub fn create(self: *Self) AllocError!Pending {
-            // IRQ-masked: mixed-mode class, reached from the PMI and
-            // timer entries via `destroy`/`destroyLockedInner`. See the
+            // IRQ-masked: mixed-mode class, reached from timer entries
+            // via `destroy`/`destroyLockedInner`. See the
             // `lock` field doc.
             const irq = self.lock.lockIrqSave(@src());
             defer self.lock.unlockIrqRestore(irq);
@@ -575,7 +574,7 @@ pub fn SecureSlab(
             //
             // The concrete self-deadlock: process context enters
             // `destroy` for slot A and takes A's gen-lock with IRQs
-            // enabled. A timer or PMI lands on that core. The handler
+            // enabled. A timer interrupt lands on that core. The handler
             // still holds a `SlabRef` to A that verifies — the gen has
             // NOT been bumped yet, that only happens in
             // `destroyLockedInner` below — so its `lockWithGen` passes
@@ -715,7 +714,7 @@ pub fn SecureSlab(
         /// established the slot's gen-lock is held at `expected_gen`.
         fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
             // IRQ-masked: this function is itself ON the async chain
-            // (`pmiHandler` → … → `destroyTimer` → `destroy` → here)
+            // (`schedTimerHandler` → … → `destroyTimer` → `destroy` → here)
             // while also running from process context with IRQs enabled.
             // See the `lock` field doc.
             const irq = self.lock.lockIrqSave(@src());

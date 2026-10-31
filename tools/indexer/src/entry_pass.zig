@@ -5,9 +5,8 @@
 //! be as complete as the last person who edited it: on x86_64 it knew
 //! `exceptionHandler`, `pageFaultHandler` and `schedTimerHandler` and missed
 //! the other seven live IDT handlers — `deviceIrqHandler`, `spuriousHandler`,
-//! the TLB-shootdown / FPU-flush IPI vectors, and both the Intel
-//! and AMD `pmiHandler`s — because they are neither in the list nor in
-//! `arch/*/exceptions.zig`.
+//! the TLB-shootdown / FPU-flush IPI vectors — because they are neither
+//! in the list nor in `arch/*/exceptions.zig`.
 //!
 //! This pass derives the set from the two places the kernel actually binds a
 //! vector to a Zig function, so a new handler is discovered the moment it is
@@ -406,9 +405,8 @@ fn resolveFn(
 
     // A dotted chain names its callee; falling back to "the same-named fn
     // in this file" would be a different function. A single-segment chain
-    // is the opposite case — `pmiHandler` passed to `registerVector` has no
-    // qualifier, and file scope is exactly how Zig resolves it (there are
-    // three `pmiHandler`s in the tree).
+    // is the opposite case: a handler passed to `registerVector` has no
+    // qualifier, and file scope is how Zig resolves it.
     if (segs.len == 1) {
         if (local_n == 1) return local;
         if (cands.items.len == 1) return cands.items[0];

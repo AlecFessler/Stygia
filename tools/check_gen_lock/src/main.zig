@@ -1189,7 +1189,6 @@ const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
     .{ .owner = "ExecutionContext", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
     .{ .owner = "ExecutionContext", .field = "vm", .ty = "VirtualMachine" },
     .{ .owner = "ExecutionContext", .field = "exit_port", .ty = "Port" },
-    .{ .owner = "ExecutionContext", .field = "perfmon_state", .ty = "PerfmonState" },
     // VAR.
     .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
     .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },

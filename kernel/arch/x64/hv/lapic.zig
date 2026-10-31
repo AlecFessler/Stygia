@@ -25,7 +25,6 @@ const REG_ICR_LO: u32 = 0x300; // Interrupt Command Register bits 0-31 -- R/W
 const REG_ICR_HI: u32 = 0x310; // Interrupt Command Register bits 32-63 -- R/W
 const REG_LVT_TIMER: u32 = 0x320; // LVT Timer Register -- R/W
 const REG_LVT_THERMAL: u32 = 0x330; // LVT Thermal Sensor Register -- R/W
-const REG_LVT_PERF: u32 = 0x340; // LVT Performance Monitoring Register -- R/W
 const REG_LVT_LINT0: u32 = 0x350; // LVT LINT0 Register -- R/W
 const REG_LVT_LINT1: u32 = 0x360; // LVT LINT1 Register -- R/W
 const REG_LVT_ERROR: u32 = 0x370; // LVT Error Register -- R/W
@@ -54,7 +53,6 @@ pub const Lapic = struct {
     /// LVT registers. Reset to 0x00010000 (masked). Section 13.4.7.1.
     lvt_timer: u32 = 0x00010000,
     lvt_thermal: u32 = 0x00010000,
-    lvt_perf: u32 = 0x00010000,
     lvt_lint0: u32 = 0x00010000,
     lvt_lint1: u32 = 0x00010000,
     lvt_error: u32 = 0x00010000,
@@ -125,7 +123,6 @@ pub const Lapic = struct {
             REG_ICR_HI => self.icr_hi,
             REG_LVT_TIMER => self.lvt_timer,
             REG_LVT_THERMAL => self.lvt_thermal,
-            REG_LVT_PERF => self.lvt_perf,
             REG_LVT_LINT0 => self.lvt_lint0,
             REG_LVT_LINT1 => self.lvt_lint1,
             REG_LVT_ERROR => self.lvt_error,
@@ -157,7 +154,6 @@ pub const Lapic = struct {
             REG_ICR_HI => self.icr_hi = value,
             REG_LVT_TIMER => self.lvt_timer = value,
             REG_LVT_THERMAL => self.lvt_thermal = value,
-            REG_LVT_PERF => self.lvt_perf = value,
             REG_LVT_LINT0 => self.lvt_lint0 = value,
             REG_LVT_LINT1 => self.lvt_lint1 = value,
             REG_LVT_ERROR => self.lvt_error = value,

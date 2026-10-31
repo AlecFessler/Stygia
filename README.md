@@ -26,13 +26,11 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 **IPC.** Capability-gated ports for suspend / receive / reply between capability domains. When the payload fits in architectural general-purpose registers and carries data only (no capability transfer), the rendezvous runs through an L4-style zero-register-copy fast path that does a direct context switch and bypasses the Zig dispatch table. Current round-trip cost is around 1,600 cycles for suspend → receive → reply on a Ryzen 9 7950X3D.
 
-**Kernel-event routing.** Per-EC events (memory faults, thread faults, breakpoints, PMU overflow) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
+**Kernel-event routing.** Per-EC events (memory faults, thread faults, breakpoints) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
 
 **Time.** Monotonic and wall-clock primitives. Programmable one-shot and periodic timers; each fire increments a u64 counter exposed in the timer's handle, and userspace either polls the counter or waits on it via `futex_wait_val`.
 
 **Virtual machines.** KVM-style guest containers. vCPUs are execution contexts in a VM-flavored capability domain; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
-
-**Performance counters.** Hardware PMU counters exposed to userspace through the perfmon syscalls (info, start, read, stop).
 
 ## Status
 
@@ -87,7 +85,7 @@ kernel/                Kernel proper
   devices/               Device region registry
   hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
   memory/                PMM, VMM, VMARs, page frames, paging, allocators/ (SecureSlab lives here)
-  sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU
+  sched/                 Scheduler, EC, futex, port, timer, FPU
   syscall/               Per-object syscall handlers and dispatch
   utils/                 Sync primitives, ELF and DWARF debug info, generic Range
   stygia.zig                Root module (every kernel file imports through this)

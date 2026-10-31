@@ -54,11 +54,6 @@ pub const KernelVA = struct {
             .start = hv_vm_slab.end,
             .end = hv_vm_slab.end + SLAB_RESERVATION,
         };
-        pub const pmu_state_slab: Range = .{
-            .start = hv_vcpu_slab.end,
-            .end = hv_vcpu_slab.end + SLAB_RESERVATION,
-        };
-
         // SecureSlab out-of-band metadata regions. Each gen-protected slab
         // class reserves two sibling regions alongside its data region:
         //   *_slab_ptrs  — dense array of `*T` (one per slot index)
@@ -69,24 +64,16 @@ pub const KernelVA = struct {
         // topology from the same primitive.
 
         pub const shm_slab_ptrs: Range = .{
-            .start = pmu_state_slab.end,
-            .end = pmu_state_slab.end + SLAB_RESERVATION,
+            .start = hv_vcpu_slab.end,
+            .end = hv_vcpu_slab.end + SLAB_RESERVATION,
         };
         pub const shm_slab_links: Range = .{
             .start = shm_slab_ptrs.end,
             .end = shm_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const pmu_state_slab_ptrs: Range = .{
+        pub const thread_slab_ptrs: Range = .{
             .start = shm_slab_links.end,
             .end = shm_slab_links.end + SLAB_RESERVATION,
-        };
-        pub const pmu_state_slab_links: Range = .{
-            .start = pmu_state_slab_ptrs.end,
-            .end = pmu_state_slab_ptrs.end + SLAB_RESERVATION,
-        };
-        pub const thread_slab_ptrs: Range = .{
-            .start = pmu_state_slab_links.end,
-            .end = pmu_state_slab_links.end + SLAB_RESERVATION,
         };
         pub const thread_slab_links: Range = .{
             .start = thread_slab_ptrs.end,

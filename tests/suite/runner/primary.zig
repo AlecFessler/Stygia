@@ -630,7 +630,6 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         .crpf = true,
         .crvm = true,
         .crpt = true,
-        .pmu = true,
         .setwall = true,
         .fut_wake = true,
         .timer = true,

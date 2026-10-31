@@ -462,7 +462,7 @@ pub fn main() !void {
         \\WHERE e.kind = 'fn'
         \\  AND f.path LIKE 'syscall/%.zig'
         \\  AND f.path NOT IN ('syscall/dispatch.zig', 'syscall/errors.zig',
-        \\                     'syscall/pmu.zig', 'syscall/syscall.zig')
+        \\                     'syscall/syscall.zig')
         \\  AND NOT EXISTS (SELECT 1 FROM entry_point ep WHERE ep.kind = 'syscall');
     ;
     try channel.send(.{ .raw_sql = entry_sql });

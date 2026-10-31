@@ -10,7 +10,6 @@ const execution_context_mod = stygia.sched.execution_context;
 const KA = address.KernelVA.KernelAllocators;
 const page_frame_mod = stygia.memory.page_frame;
 const paging = stygia.memory.paging;
-const perfmon_mod = stygia.sched.perfmon;
 const pmm = stygia.memory.pmm;
 const port_mod = stygia.sched.port;
 const timer_mod = stygia.sched.timer;
@@ -31,8 +30,6 @@ pub var kernel_addr_space_root: PAddr = undefined;
 
 var bump_allocator: BumpAllocator = undefined;
 var buddy_allocator: BuddyAllocator = undefined;
-
-
 
 pub fn init(firmware_mmap: MMap) !void {
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
@@ -218,10 +215,5 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.virtual_machine_slab,
         KA.virtual_machine_slab_ptrs,
         KA.virtual_machine_slab_links,
-    );
-    perfmon_mod.initSlab(
-        KA.pmu_state_slab,
-        KA.pmu_state_slab_ptrs,
-        KA.pmu_state_slab_links,
     );
 }

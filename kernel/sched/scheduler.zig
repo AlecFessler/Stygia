@@ -19,14 +19,12 @@ const ec_log = stygia.utils.ec_log;
 const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
 const lifecycle = stygia.sched.lifecycle;
-const perfmon_mod = stygia.sched.perfmon;
 const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const NOT_IN_RUN_QUEUE = stygia.sched.execution_context.NOT_IN_RUN_QUEUE;
-const PerfmonState = stygia.sched.perfmon.PerfmonState;
 const Priority = stygia.sched.execution_context.Priority;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
@@ -34,10 +32,7 @@ const Stack = stygia.memory.stack.Stack;
 const VAddr = stygia.memory.address.VAddr;
 
 const YIELD_SELECT_DIAG_BUDGET: u32 = 4096;
-const DISPATCH_TAIL_DIAG_BUDGET: u32 = 64;
 var yield_select_diag_prints: u32 = 0;
-var dispatch_tail_diag_prints: u32 = 0;
-const PMU_STATE_GROUP: u32 = 0x506D75;
 
 const YIELD_TARGET_PINNED_BIT: u64 = 1;
 const YieldTarget = struct {
@@ -94,13 +89,6 @@ pub const MAX_CORES: u8 = 64;
 var deferred_requeues: [MAX_CORES]EcQueue = [_]EcQueue{.{}} ** MAX_CORES;
 var yield_handoff_targets: [MAX_CORES]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_CORES;
 var yield_handoff_preempt_guard: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
-
-/// Per-core PMU state whose counter file is currently loaded in hardware.
-/// This is deliberately outside `PerCore`: x64 assembly references that
-/// struct's offsets. The value is a `SlabRef` so dispatch can save/disable a
-/// stale hardware file even if the owning EC's `perfmon_state` field is
-/// concurrently being released.
-var pmu_hw_refs: [MAX_CORES]?SlabRef(PerfmonState) = [_]?SlabRef(PerfmonState){null} ** MAX_CORES;
 
 const WORK_STEALING_ENABLED = switch (builtin.cpu.arch) {
     // aarch64 stays local-only until EC migration has FPU parity:
@@ -197,8 +185,7 @@ pub const PerCore = struct {
     /// Slab generation of `current_ec`, captured at publication time.
     /// Split out of the old `SlabRef` so the pointer can stand alone as
     /// a tear-free word — see `current_ec`. Exactly one consumer, and
-    /// it runs on this core (`applyPerfmonSwitch`'s "is the outgoing EC
-    /// still the same slab occupant" check), so the pointer/gen pair
+    /// it runs on this core (the x86 entry snapshot), so the pointer/gen pair
     /// never needs to be read atomically together.
     current_ec_gen: u32 = 0,
 
@@ -359,389 +346,9 @@ pub fn perCoreInit() void {
     // VMLAUNCH/VMRUN; safe no-op when the platform doesn't support
     // hardware virt.
     arch.vm.vmPerCoreInit();
-    // Per-core PMU enable. AMD PerfMonV2 (Zen 4+) requires writing
-    // PerfCntrGlobalCtl on each core or every PMC stays gated even
-    // with PerfEvtSel.EN set; on Intel and pre-PerfMonV2 AMD this is
-    // a no-op.
-    arch.pmu.pmuPerCoreInit();
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
-
-pub const LockedPerfmonState = struct {
-    ref: SlabRef(PerfmonState),
-    ptr: *PerfmonState,
-    irq_state: u64,
-};
-
-/// The EC's `PerfmonState` ref if perfmon is armed on it and the slab slot
-/// still names the generation the EC's ref was minted against. Null when
-/// perfmon was never started, was stopped, or the state has been released
-/// underneath us.
-inline fn livePerfmonRef(ec: *ExecutionContext) ?SlabRef(PerfmonState) {
-    const ref = ec.perfmon_state orelse return null;
-    // caller-pinned: the gen compare below IS the liveness check for the
-    // ref snapshot. The later `lockPmuRef` is the authoritative acquire.
-    if (ref.ptr._gen_lock.currentGen() != @as(u64, ref.gen)) return null;
-    return ref;
-}
-
-fn lockPmuRef(ref: SlabRef(PerfmonState)) ?LockedPerfmonState {
-    const lr = ref.lockOrderedIrqSave(PMU_STATE_GROUP, @src()) catch return null;
-    return .{ .ref = ref, .ptr = lr.ptr, .irq_state = lr.irq_state };
-}
-
-pub fn unlockPmuState(locked: LockedPerfmonState) void {
-    locked.ref.unlockIrqRestore(locked.irq_state);
-}
-
-fn destroyLockedPmuState(locked: LockedPerfmonState) void {
-    perfmon_mod.slab_instance.destroyLocked(locked.ptr, locked.ref.gen);
-    arch.cpu.restoreInterrupts(locked.irq_state);
-}
-
-fn assertNoPmuHardwareRefLocked(locked: LockedPerfmonState) void {
-    var core: u8 = 0;
-    while (core < MAX_CORES) : (core += 1) {
-        if (pmu_hw_refs[core]) |owned| {
-            std.debug.assert(!owned.eql(locked.ref));
-        }
-    }
-}
-
-pub fn assertNoPmuHardwareRef(ref: SlabRef(PerfmonState)) void {
-    var core: u8 = 0;
-    while (core < MAX_CORES) : (core += 1) {
-        if (pmu_hw_refs[core]) |owned| {
-            std.debug.assert(!owned.eql(ref));
-        }
-    }
-}
-
-fn clearPmuHardwareOwnerLocked(core: u8, locked: LockedPerfmonState) void {
-    if (pmu_hw_refs[core]) |ref| {
-        if (ref.eql(locked.ref)) pmu_hw_refs[core] = null;
-    }
-    if (locked.ptr.hw_core == core) {
-        locked.ptr.hw_core = null;
-        assertNoPmuHardwareRefLocked(locked);
-    }
-    if (locked.ptr.hw_core == null) locked.ptr.handoff_pending = false;
-}
-
-fn finishPmuOwnerLocked(core: u8, locked: LockedPerfmonState) void {
-    clearPmuHardwareOwnerLocked(core, locked);
-    if (locked.ptr.release_pending) {
-        locked.ptr.release_pending = false;
-        locked.ptr.handoff_pending = false;
-        destroyLockedPmuState(locked);
-    } else {
-        unlockPmuState(locked);
-    }
-}
-
-fn retirePmuHardwareOwnerExcept(core: u8, keep: ?SlabRef(PerfmonState)) void {
-    const prev_ref = pmu_hw_refs[core] orelse return;
-    if (keep) |keep_ref| {
-        if (prev_ref.eql(keep_ref)) return;
-    }
-
-    if (lockPmuRef(prev_ref)) |prev| {
-        if (prev.ptr.hw_core == core) {
-            arch.pmu.pmuSave(&prev.ptr.arch_state);
-            finishPmuOwnerLocked(core, prev);
-        } else {
-            clearPmuHardwareOwnerLocked(core, prev);
-            unlockPmuState(prev);
-        }
-    } else {
-        pmu_hw_refs[core] = null;
-        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
-        arch.pmu.pmuStop(&empty);
-    }
-}
-
-fn stopStaleLocalPmuOwner(core: u8, ref: SlabRef(PerfmonState)) void {
-    if (pmu_hw_refs[core]) |owned| {
-        if (!owned.eql(ref)) return;
-        pmu_hw_refs[core] = null;
-        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
-        arch.pmu.pmuStop(&empty);
-    }
-}
-
-fn requestRemotePmuHandoffLocked(core: u8, locked: LockedPerfmonState) void {
-    const owner_core = locked.ptr.hw_core orelse return;
-    if (owner_core == core) return;
-    if (owner_core >= MAX_CORES) {
-        locked.ptr.hw_core = null;
-        locked.ptr.handoff_pending = false;
-        assertNoPmuHardwareRefLocked(locked);
-        return;
-    }
-    if (pmu_hw_refs[owner_core]) |owner_ref| {
-        if (!owner_ref.eql(locked.ref)) {
-            locked.ptr.hw_core = null;
-            locked.ptr.handoff_pending = false;
-            assertNoPmuHardwareRefLocked(locked);
-            return;
-        }
-    } else {
-        locked.ptr.hw_core = null;
-        locked.ptr.handoff_pending = false;
-        assertNoPmuHardwareRefLocked(locked);
-        return;
-    }
-    locked.ptr.handoff_pending = true;
-    arch.smp.triggerSchedulerInterrupt(owner_core);
-}
-
-/// Claim this core's PMU hardware file for `ref`.
-///
-/// PMU state migration is a two-phase ownership transfer. The requester
-/// first retires this core's old file, then locks only `ref`. If `ref` is
-/// live on a remote core, the requester sets `handoff_pending`, drops the
-/// lock, pokes the owner, and spins while servicing TLB maintenance until
-/// the owner saves/disables and clears `hw_core`. Only then does the
-/// requester restore and set `hw_core = core`.
-///
-/// Lock contract: callers must not hold any EC gen-lock, PMU gen-lock, or
-/// core lock across this call. The helper may wait for a remote scheduler
-/// IPI and may acquire one PMU state at a time; allowing callers to hold
-/// another object lock would recreate the EC->PMU and PMU->PMU deadlocks
-/// this protocol is meant to avoid.
-pub fn claimPmuHardwareOwner(core: u8, ref: SlabRef(PerfmonState)) ?LockedPerfmonState {
-    retirePmuHardwareOwnerExcept(core, ref);
-
-    while (true) {
-        const locked = lockPmuRef(ref) orelse {
-            stopStaleLocalPmuOwner(core, ref);
-            return null;
-        };
-        if (locked.ptr.release_pending) {
-            if (locked.ptr.hw_core == core) {
-                arch.pmu.pmuSave(&locked.ptr.arch_state);
-                finishPmuOwnerLocked(core, locked);
-            } else if (locked.ptr.hw_core == null) {
-                locked.ptr.handoff_pending = false;
-                destroyLockedPmuState(locked);
-            } else {
-                requestRemotePmuHandoffLocked(core, locked);
-                unlockPmuState(locked);
-                spin_diag.note(.pmu_handoff, 0);
-                arch.paging.serviceTlbMaintenanceWhileSpinning();
-                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
-                std.atomic.spinLoopHint();
-            }
-            return null;
-        }
-        if (locked.ptr.hw_core) |owner_core| {
-            if (owner_core == core) {
-                locked.ptr.handoff_pending = false;
-                pmu_hw_refs[core] = ref;
-                return locked;
-            }
-            requestRemotePmuHandoffLocked(core, locked);
-            unlockPmuState(locked);
-            spin_diag.note(.pmu_handoff, 1);
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        arch.pmu.pmuRestore(&locked.ptr.arch_state);
-        locked.ptr.hw_core = core;
-        locked.ptr.handoff_pending = false;
-        pmu_hw_refs[core] = ref;
-        return locked;
-    }
-}
-
-/// Save/disable whatever core currently owns `ref` without adopting it on
-/// the caller's core. Used by syscalls that inspect or reconfigure a
-/// suspended EC: they need `arch_state` to be authoritative, but they must
-/// not start counting on the syscalling core for an EC that is not running.
-pub fn retirePmuStateHardware(ref: SlabRef(PerfmonState)) bool {
-    const this_core: u8 = @truncate(arch.smp.coreID());
-    while (true) {
-        const locked = lockPmuRef(ref) orelse return false;
-        if (locked.ptr.release_pending) {
-            if (locked.ptr.hw_core == this_core) {
-                arch.pmu.pmuSave(&locked.ptr.arch_state);
-                finishPmuOwnerLocked(this_core, locked);
-            } else if (locked.ptr.hw_core == null) {
-                locked.ptr.handoff_pending = false;
-                destroyLockedPmuState(locked);
-            } else {
-                requestRemotePmuHandoffLocked(this_core, locked);
-                unlockPmuState(locked);
-                spin_diag.note(.pmu_handoff, 2);
-                arch.paging.serviceTlbMaintenanceWhileSpinning();
-                stygia.sched.fpu.serviceLocalFlushWhileSpinning();
-                std.atomic.spinLoopHint();
-            }
-            return false;
-        }
-        if (locked.ptr.hw_core) |owner_core| {
-            if (owner_core == this_core) {
-                arch.pmu.pmuSave(&locked.ptr.arch_state);
-                finishPmuOwnerLocked(this_core, locked);
-                return true;
-            }
-            requestRemotePmuHandoffLocked(this_core, locked);
-            const done = locked.ptr.hw_core == null;
-            unlockPmuState(locked);
-            if (done) continue;
-            spin_diag.note(.pmu_handoff, 3);
-            arch.paging.serviceTlbMaintenanceWhileSpinning();
-            stygia.sched.fpu.serviceLocalFlushWhileSpinning();
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        locked.ptr.handoff_pending = false;
-        unlockPmuState(locked);
-        return true;
-    }
-}
-
-/// Destroy a detached PerfmonState. The owning EC's `perfmon_state` field
-/// must already be null, and callers must not hold that EC's gen-lock. This
-/// function may wait for a remote PMU owner to run its scheduler IPI, but it
-/// services TLB maintenance while spinning and holds at most this PMU state.
-pub fn releasePmuState(ref: SlabRef(PerfmonState)) void {
-    const this_core: u8 = @truncate(arch.smp.coreID());
-    while (true) {
-        const locked = lockPmuRef(ref) orelse return;
-        if (locked.ptr.hw_core) |owner_core| {
-            if (owner_core == this_core) {
-                arch.pmu.pmuStop(&locked.ptr.arch_state);
-                clearPmuHardwareOwnerLocked(this_core, locked);
-            } else if (owner_core < MAX_CORES) {
-                if (pmu_hw_refs[owner_core]) |owner_ref| {
-                    if (owner_ref.eql(ref)) {
-                        locked.ptr.release_pending = true;
-                        locked.ptr.handoff_pending = false;
-                        unlockPmuState(locked);
-                        arch.smp.triggerSchedulerInterrupt(owner_core);
-                        spin_diag.note(.pmu_handoff, 4);
-                        arch.paging.serviceTlbMaintenanceWhileSpinning();
-                        stygia.sched.fpu.serviceLocalFlushWhileSpinning();
-                        std.atomic.spinLoopHint();
-                        continue;
-                    }
-                }
-                locked.ptr.hw_core = null;
-                locked.ptr.handoff_pending = false;
-                assertNoPmuHardwareRefLocked(locked);
-            } else {
-                locked.ptr.hw_core = null;
-                locked.ptr.handoff_pending = false;
-                assertNoPmuHardwareRefLocked(locked);
-            }
-        }
-
-        locked.ptr.release_pending = false;
-        locked.ptr.handoff_pending = false;
-        destroyLockedPmuState(locked);
-        return;
-    }
-}
-
-fn drainPendingPmuRelease(core: u8) void {
-    const ref = pmu_hw_refs[core] orelse return;
-    const locked = lockPmuRef(ref) orelse {
-        pmu_hw_refs[core] = null;
-        var empty: stygia.arch.dispatch.pmu.PmuState = .{};
-        arch.pmu.pmuStop(&empty);
-        return;
-    };
-    if ((locked.ptr.release_pending or locked.ptr.handoff_pending) and locked.ptr.hw_core == core) {
-        arch.pmu.pmuSave(&locked.ptr.arch_state);
-        finishPmuOwnerLocked(core, locked);
-        return;
-    }
-    unlockPmuState(locked);
-}
-
-/// Hand the per-core PMU counter file from the outgoing EC to `next`.
-/// Called from `switchTo` while `current_ec` still names the outgoing
-/// EC, i.e. before `setCurrentEc`.
-///
-/// The PMU register file is per-core hardware, but `perfmon_read`
-/// reports counts per EC: it samples the live registers via `pmuSave`
-/// and spec §[execution_context].perfmon_read requires each counter to
-/// be "greater than or equal to the value returned by the prior
-/// perfmon_read on that target". With no context-switch handoff, an EC
-/// that migrates between two reads samples the DESTINATION core's
-/// register file — another thread's counts, or zero on a core that
-/// never programmed the PMU at all (PMCR_EL0.E clear on aarch64,
-/// IA32_PERF_GLOBAL_CTRL clear on x86) — and the second read comes back
-/// below the first. That is the `perfmon_read_06` aid=5 "cycles ran
-/// backward" failure seen on Pi 5 KVM.
-///
-/// `pmuRestore` reprograms the event selectors and writes the EC's
-/// saved values back into the hardware counters, so counts accumulate
-/// across cores; `pmuSave` reads them back out and disables counting.
-/// Pairing them here gives the invariant the spec wants: while an EC
-/// with perfmon armed is running, its core's counters hold values >=
-/// the EC's saved values, and the saved values only ever move forward.
-///
-/// `PerfmonState.hw_core` is the ownership token. It is needed because
-/// `current_ec` can name an EC that has since migrated (see the
-/// `on_cpu` clear in `switchTo`): saving that EC would capture THIS
-/// core's unrelated counters into a state its new core is actively
-/// driving, moving the saved values backwards — the very bug we are
-/// closing. Only the core that last restored the EC may save it.
-///
-/// Not every switch-away runs through here: the escape-to-`run()` and
-/// park paths clear `current_ec` without a `switchTo`, so an EC parked
-/// that way leaves its counters enabled on the core until something
-/// else restores over them. That loses the counts of the final quantum
-/// but cannot violate monotonicity, because the EC's next dispatch
-/// re-`pmuRestore`s from its own saved values on whatever core it
-/// lands on.
-fn pmuSwitch(core: u8, next: *ExecutionContext) ?LockedPerfmonState {
-    const next_ref = livePerfmonRef(next);
-
-    if (pmu_hw_refs[core]) |prev_ref| {
-        if (next_ref == null or !prev_ref.eql(next_ref.?)) {
-            if (lockPmuRef(prev_ref)) |prev| {
-                if (prev.ptr.hw_core == core) {
-                    arch.pmu.pmuSave(&prev.ptr.arch_state);
-                    finishPmuOwnerLocked(core, prev);
-                } else {
-                    clearPmuHardwareOwnerLocked(core, prev);
-                    unlockPmuState(prev);
-                }
-            } else {
-                // The invariant says this should be unreachable: release must
-                // not destroy a state while this core owns its hardware token.
-                // Disable the hardware defensively if a stale ref is observed.
-                pmu_hw_refs[core] = null;
-                var empty: stygia.arch.dispatch.pmu.PmuState = .{};
-                arch.pmu.pmuStop(&empty);
-            }
-        }
-    }
-
-    const ref = next_ref orelse return null;
-    return claimPmuHardwareOwner(core, ref);
-}
-
-fn abandonPmuDispatch(core: u8, locked: ?LockedPerfmonState) void {
-    const ps = locked orelse return;
-    if (ps.ptr.hw_core == core) {
-        // `pmuSwitch` may have restored this EC's counters before a racing
-        // retire/park changed the lifecycle word. Once dispatch is abandoned,
-        // no user frame will run on this counter file, so save the exact
-        // post-restore value and disable/mask the hardware before dropping the
-        // ownership token. `pmuSave` is the context-switch cleanup primitive:
-        // x64 disables EN/GLOBAL_CTRL before readback; aarch64 clears PMCNTEN
-        // and PMINTEN before readback.
-        arch.pmu.pmuSave(&ps.ptr.arch_state);
-    }
-    finishPmuOwnerLocked(core, ps);
-}
 
 /// Context switch to `ec` on the current core. Saves outgoing EC's
 /// state to its `ctx`, swaps address space (if domain changed),
@@ -943,21 +550,6 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
         dischargeOwnedParking(core);
         run();
     }
-    // Hand the per-core PMU counter file over before `current_ec` is
-    // rewritten — `pmuSwitch` reads the slot to find the outgoing EC.
-    const next_pmu = pmuSwitch(core, current);
-    if ((&core_states[core]).current_ec != current) {
-        abandonPmuDispatch(core, next_pmu);
-        @panic("scheduler.dispatchTailBody: current_ec changed after pmuSwitch");
-    }
-    const post_pmu_state = lifecycle.load(current);
-    if (post_pmu_state != .running) {
-        logDispatchTailAbortDiag(core, current, post_pmu_state);
-        abandonPmuDispatch(core, next_pmu);
-        dischargeOwnedParking(core);
-        run();
-    }
-    if (next_pmu) |ps| unlockPmuState(ps);
     yield_handoff_preempt_guard[core] = yield_handoff_targets[core] == current;
     yield_handoff_targets[core] = null;
     // Give the committed EC a fresh quantum at the dispatch boundary.
@@ -1276,8 +868,6 @@ export fn scheduler_hop_run(arg: u64) callconv(.c) noreturn {
 
 pub fn run() noreturn {
     while (true) {
-        const core: u8 = @truncate(arch.smp.coreID());
-        drainPendingPmuRelease(core);
         if (dequeueOrIdle()) |next| {
             switchTo(next);
         }
@@ -1474,43 +1064,6 @@ inline fn canPublishReady(ec: *ExecutionContext) bool {
 fn diagTag(ec: *ExecutionContext) u64 {
     if (ec.diag_test_tag != 0) return ec.diag_test_tag;
     return ec.domain.ptr.diag_test_tag;
-}
-
-fn logDispatchTailAbortDiag(core: u8, current: *ExecutionContext, observed_state: lifecycle.State) void {
-    if (!build_options.kernel_spawn_diag) return;
-    const n = @atomicRmw(u32, &dispatch_tail_diag_prints, .Add, 1, .monotonic);
-    if (n >= DISPATCH_TAIL_DIAG_BUDGET) return;
-
-    var pmu_hw: u8 = NOT_IN_RUN_QUEUE;
-    var pmu_live: bool = false;
-    if (current.perfmon_state) |ref| {
-        pmu_live = true;
-        if (ref.ptr._gen_lock.currentGen() == @as(u64, ref.gen)) {
-            pmu_hw = ref.ptr.hw_core orelse NOT_IN_RUN_QUEUE;
-        }
-    }
-    const cur_raw: u64 = if ((&core_states[core]).current_ec) |cur| @intFromPtr(cur) else 0;
-
-    const dref = current.domain;
-    arch.boot.print(
-        "[dtaildiag] site=post_pmu_abandon tag=0x{x} core={d} ec=0x{x} state={x} wait={x} owner={x} qcore={x} gen={x} mark={x} domain_gen={x} domain_live_gen={x} pmu_live={d} pmu_hw={x} cur=0x{x}\n",
-        .{
-            diagTag(current),
-            core,
-            @intFromPtr(current),
-            @intFromEnum(observed_state),
-            @intFromEnum(current.wait.kind),
-            current.owner_core,
-            current.current_queue_core.load(.acquire),
-            current._gen_lock.currentGen(),
-            current.mark_state.load(.acquire),
-            dref.gen,
-            dref.ptr._gen_lock.currentGen(),
-            @intFromBool(pmu_live),
-            pmu_hw,
-            cur_raw,
-        },
-    );
 }
 
 fn logYieldSelectDiag(core: u8, target: *ExecutionContext, reason: []const u8, publishable: bool) void {

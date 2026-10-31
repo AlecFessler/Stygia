@@ -1,7 +1,7 @@
 -- Gap 2: every `interrupts.registerVector(vec, handler, .kind)` handler must
 -- be an entry_point, including the ones the legacy name list missed —
 -- alias-qualified (`paging_mod.tlbShootdownHandler`), loop-registered
--- (`deviceIrqHandler`) and same-named-in-two-files (`pmiHandler`).
+-- (`deviceIrqHandler`) and same-named-in-two-files (`vendorIrqHandler`).
 SELECT ep.kind || '  ' || e.qualified_name
   FROM entry_point ep
   JOIN entity e ON e.id = ep.entity_id

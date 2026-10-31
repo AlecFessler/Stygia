@@ -4,7 +4,6 @@ pub const iommu = @import("dispatch/iommu.zig");
 pub const irq = @import("dispatch/irq.zig");
 pub const memory = @import("dispatch/memory.zig");
 pub const paging = @import("dispatch/paging.zig");
-pub const pmu = @import("dispatch/pmu.zig");
 pub const port_io = @import("dispatch/port_io.zig");
 pub const smp = @import("dispatch/smp.zig");
 pub const syscall = @import("dispatch/syscall.zig");

@@ -642,14 +642,7 @@ pub fn initRedistributor(core_idx: usize) void {
         // (PPI 27) is unsafe under Pi 5 KVM vGICv2. CNTV is kept enabled
         // in the GIC anyway for guest-support paths.
         //
-        // PPI 23 is the PMU overflow request line. ARM ARM DDI 0487 K.a
-        // §D13.3.1 "Generating overflow interrupt requests" says the
-        // PMU connects to the GIC as a PPI with ID 23 (GICv3-recommended)
-        // and is level-sensitive. QEMU `virt` and Cortex-A72/A76 both
-        // honour this recommendation. The default GICR_ICFGR1 reset value
-        // leaves PPIs as level-sensitive (2-bit field = 0b00), which is
-        // exactly what PMU overflow needs, so no ICFGR write is required.
-        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 23) | (1 << 27) | (1 << 29) | (1 << 30));
+        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
 
         // Set all SGI/PPI priorities to 0x80. On GICv3 ICC_PMR_EL1 is
         // 0xFF and interrupts with priority >= PMR are masked (IHI 0069H,
@@ -678,14 +671,7 @@ pub fn initRedistributor(core_idx: usize) void {
         // be silently dropped. IHI 0048B, Section 4.3.10.
         gicdWriteOffset(.igroupr0, 0, 0xFFFFFFFF);
 
-        // Enable SGIs (INTID 0-15), timer PPIs (27, 29, 30), and the PMU
-        // overflow PPI (23) via the banked GICD_ISENABLER0. ARM ARM DDI
-        // 0487 K.a §D13.3.1 documents PMU overflow as level-sensitive
-        // PPI 23 on GICv3-compatible implementations; GICv2's banked
-        // GICD_ICFGR1 reset defaults also leave PPIs level-sensitive, so
-        // the trigger config does not need to be rewritten here.
-        // IHI 0048B, Section 4.3.5.
-        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF | (1 << 23) | (1 << 27) | (1 << 29) | (1 << 30));
+        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
 
         // Set all SGI/PPI priorities to 0x80 (see GICv3 note above).
         // IHI 0048B, Section 4.3.11: GICD_IPRIORITYR0-7 (banked per-CPU).
@@ -835,7 +821,7 @@ pub fn mpidrFor(core_idx: usize) ?u64 {
 /// (`/cpus` `reg` = 0x0, 0x100, 0x200, 0x300), so all four report
 /// `Aff0 == 0` and an Aff0-derived ID collapses them onto logical core 0.
 /// Every per-core array the kernel keeps — `gicv2_last_iar`, scheduler
-/// core state, the PMU's per-core context — would then be shared by four
+/// core state, per-core device state — would then be shared by four
 /// cores that each believed they were the BSP, so `dt_discovery` had to
 /// pin `core_count = 1` to stay correct. A reverse lookup removes that
 /// restriction and costs a handful of compares against a table whose
@@ -1259,4 +1245,3 @@ pub fn maskIrq(intid: u32) void {
     // SPI — use distributor (same for v2 and v3).
     gicdWriteOffset(.icenabler0, reg_offset, bit);
 }
-

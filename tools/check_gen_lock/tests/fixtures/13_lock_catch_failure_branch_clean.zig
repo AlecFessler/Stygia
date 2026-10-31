@@ -5,9 +5,7 @@
 // never held). `GenLock.lockWithGenIrqSaveOrdered` restores interrupts
 // and returns `error.StaleHandle` without holding the lock.
 //
-// Real-kernel shape: `pmiHandler` in arch/x64/intel/pmu.zig and
-// arch/x64/amd/pmu.zig, whose `catch` bodies run the defensive PMU
-// cleanup and then `return;`.
+// Exercise failed-acquire branches with both catch and orelse.
 
 const Foo = extern struct {
     _gen_lock: u64 = 0,
@@ -18,14 +16,18 @@ pub fn SlabRef(comptime T: type) type {
     return extern struct {
         ptr: *T,
         gen: u64 = 0,
-        pub fn lock(_: @This()) ?*T { return null; }
-        pub fn lockIrqSave(_: @This(), _: anytype) error{StaleHandle}!*T { return error.StaleHandle; }
+        pub fn lock(_: @This()) ?*T {
+            return null;
+        }
+        pub fn lockIrqSave(_: @This(), _: anytype) error{StaleHandle}!*T {
+            return error.StaleHandle;
+        }
         pub fn unlock(_: @This()) void {}
         pub fn unlockIrqRestore(_: @This()) void {}
     };
 }
 
-// Multi-line `catch` block ending in `return` — the pmiHandler shape.
+// Multi-line `catch` block ending in `return` — a failed-acquire shape.
 pub fn sysCatchBlockReturn(ref: SlabRef(Foo), cond: u64) i64 {
     const p = ref.lockIrqSave(@src()) catch {
         // Acquire failed: nothing is held on this path.

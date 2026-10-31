@@ -99,7 +99,6 @@ pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
 }
 
 pub const IntVecs = enum(u8) {
-    pmu = 0xFB,
     tlb_shootdown = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,

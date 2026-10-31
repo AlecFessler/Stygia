@@ -144,27 +144,6 @@ pub fn affinity(target: u16, new_affinity: u64) callconv(.c) c.Regs {
     return toCRegs(syscall.affinity(@truncate(target), new_affinity));
 }
 
-pub fn perfmonInfo() callconv(.c) c.Regs {
-    return toCRegs(syscall.perfmonInfo());
-}
-
-pub fn perfmonStart(
-    target: u16,
-    num_configs: u64,
-    configs_ptr: [*]const u64,
-    configs_len: usize,
-) callconv(.c) c.Regs {
-    return toCRegs(syscall.perfmonStart(@truncate(target), num_configs, configs_ptr[0..configs_len]));
-}
-
-pub fn perfmonRead(target: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.perfmonRead(@truncate(target)));
-}
-
-pub fn perfmonStop(target: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.perfmonStop(@truncate(target)));
-}
-
 pub fn createVmar(
     caps: u64,
     props: u64,
@@ -399,10 +378,6 @@ comptime {
     @export(&yieldEc, .{ .name = "yieldEc" });
     @export(&priority, .{ .name = "priority" });
     @export(&affinity, .{ .name = "affinity" });
-    @export(&perfmonInfo, .{ .name = "perfmonInfo" });
-    @export(&perfmonStart, .{ .name = "perfmonStart" });
-    @export(&perfmonRead, .{ .name = "perfmonRead" });
-    @export(&perfmonStop, .{ .name = "perfmonStop" });
     @export(&createVmar, .{ .name = "createVmar" });
     @export(&mapPf, .{ .name = "mapPf" });
     @export(&mapMmio, .{ .name = "mapMmio" });

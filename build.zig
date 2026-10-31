@@ -652,12 +652,12 @@ pub fn build(b: *std.Build) void {
 
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)
-            "-enable-kvm -cpu host,pmu=on"
+            "-enable-kvm -cpu host"
         else if (test_root_reboot_on_exit)
             // QEMU must exit on the test-root reboot after the verdict.
-            "-machine accel=tcg -cpu cortex-a72,pmu=on -d int,cpu_reset -D qemu.log"
+            "-machine accel=tcg -cpu cortex-a72 -d int,cpu_reset -D qemu.log"
         else
-            "-machine accel=tcg -cpu cortex-a72,pmu=on -d int,cpu_reset -no-shutdown -D qemu.log";
+            "-machine accel=tcg -cpu cortex-a72 -d int,cpu_reset -no-shutdown -D qemu.log";
         break :blk b.fmt(
             \\exec qemu-system-aarch64 \
             \\ -M virt,gic-version=3 \

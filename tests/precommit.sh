@@ -1136,7 +1136,7 @@ run_aarch64_tcg_3reps() {
             -M virt,gic-version=3,virtualization=on -m 2G \
             -bios /usr/share/AAVMF/AAVMF_CODE.fd \
             -serial stdio -display none -no-reboot \
-            -machine accel=tcg -cpu cortex-a72,pmu=on \
+            -machine accel=tcg -cpu cortex-a72 \
             -smp cores=4 \
             -drive file=fat:rw:"$fat/img",format=raw > "$tcg_log" 2>&1; then
             echo "[FAIL] TCG run ${rep}/3 failed or timed out (${label})"
@@ -1578,7 +1578,7 @@ stage_linux_guest_aarch64_boot() {
         -M virt,gic-version=3,virtualization=on -m 2G \
         -bios /usr/share/AAVMF/AAVMF_CODE.fd \
         -serial stdio -display none -no-reboot \
-        -machine accel=tcg -cpu cortex-a72,pmu=on \
+        -machine accel=tcg -cpu cortex-a72 \
         -smp cores=1 \
         -drive file=fat:rw:"$fat/img",format=raw \
         > "$qemu_log" 2>&1 &

@@ -6,7 +6,7 @@
 //!
 //! ARM interrupt topology:
 //!   SGI  (0-15):    Software Generated Interrupts — IPIs, handled by gic.zig.
-//!   PPI  (16-31):   Private Peripheral Interrupts — per-core (timer, PMU).
+//!   PPI  (16-31):   Private Peripheral Interrupts — per-core timer.
 //!   SPI  (32-1019): Shared Peripheral Interrupts — device IRQs.
 //!
 //! Device IRQs on ARM are SPIs. The mapping from device → SPI number comes

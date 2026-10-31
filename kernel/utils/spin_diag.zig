@@ -64,8 +64,6 @@ pub const Site = enum(u16) {
     claim_cas = 6,
     /// `scheduler.queueCurrentTeardown`.
     queue_teardown = 7,
-    /// PMU hardware-owner handoff spins in `scheduler`.
-    pmu_handoff = 8,
     /// Lazy-FPU cross-core flush mailbox.
     fpu_mailbox = 9,
     /// `port.zig` suspend-directive / running-target retry loops.
@@ -129,7 +127,6 @@ pub fn siteName(s: u16) []const u8 {
         5 => "retire_cas",
         6 => "claim_cas",
         7 => "queue_teardown",
-        8 => "pmu_handoff",
         9 => "fpu_mailbox",
         10 => "suspend_retry",
         11 => "slab_lock",

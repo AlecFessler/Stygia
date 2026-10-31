@@ -38,8 +38,7 @@
 #     re-deriving from the ARM ARM.
 #   * arch/x64/intel/vmx.zig, arch/x64/amd/svm.zig,
 #     arch/x64/amd/vi.zig, arch/x64/intel/vtd.zig,
-#     arch/x64/intel/pmu.zig                            — Intel/AMD MSR /
-#     VMCS / VMCB / IOMMU / PMU encoding sets. Same reasoning: arch
+#     — Intel/AMD MSR / VMCS / VMCB / IOMMU encoding sets. Same reasoning: arch
 #     reference set, kept whole. The VT-d RootEntry / ContextEntry
 #     packed structs (vtd.zig) describe hardware-mandated 128-bit
 #     entries — reserved fields stay so the binary layout matches what
@@ -59,10 +58,9 @@
 #     arch/aarch64/hv/regs.zig (EC),
 #     arch/aarch64/gic.zig                             — ARM ESR_EL1 / ESR_EL2
 #     ExceptionClass / GICD register enum value spaces.
-#   * arch/aarch64/interrupts.zig, arch/aarch64/pmu.zig — register-block /
+#   * arch/aarch64/interrupts.zig — register-block /
 #     register-accessor parity. x18 is part of the AArch64 GPR file even when
-#     the trap save path doesn't touch it; PMOVSCLR is a documented PMUv3
-#     register accessor reserved for the overflow-ISR bring-up.
+#     the trap save path does not touch it.
 #   * arch/x64/serial.zig (com2..com4), arch/x64/exceptions.zig
 #     (invalid_execute), arch/x64/timers.zig                 — hardware port /
 #     register / vector identifiers. Kept for hardware fidelity.
@@ -85,9 +83,6 @@
 #   * sched/execution_context.zig (Priority.high)      — third tier of the
 #     fixed-size priority enum; kept so .high is reachable when bring-up
 #     wires it.
-#   * sched/port.zig (firePmuOverflow)                 — pmu_overflow event
-#     route fire helper; aarch64/pmu.zig and the PMU-overflow ISR path call
-#     it once that bring-up lands.
 #   * syscall/errors.zig (E_REFUSED) — spec error code 13 reserved
 #     for capability-refused conditions, no kernel returner yet.
 #   * sched/priority_queue.zig (enqueueFront) — generic re-queue
@@ -400,7 +395,6 @@ entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.sdbg    sha256:ab3b87620b8
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.fma    sha256:6ebf236a574a838476d70776887f69f48845147c700423ebd919481afabe19ac
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.cx16    sha256:e0a7302ef3e9816f6025154c358ea6c148507c1d7eaf4169fa7c63ccb8c1f2d2
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.xtpr    sha256:f0c8a69f4fcee32471ce8dd60ae42fd76ff651da443254ef615c948f093a785b
-entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.pdcm    sha256:2b4577d0080ff7ff638883e317ee05d3b909e5cd7feca0583815f80978547d78
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.dca    sha256:c4db04d9c55ae3b64e8ea0ec6f599a9ce100999cd69013cee1b66f0aab29f18e
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.sse4_1    sha256:c8df851971eebae66813a140f1dd95f8f55bc23865715941669b5be35a3909d6
 entity:arch/x64/cpu.zig::arch.x64.cpu.CpuidFeatureEcx.sse4_2    sha256:23d03065a0254e32f6e4835a606fb95fae18f6fe2ee1605d541eb37b1426117e
@@ -697,7 +691,6 @@ entity:arch/aarch64/hv/vgic.zig::arch.aarch64.hv.vgic.VtimerState.primed    sha2
 entity:arch/aarch64/hv/vgic.zig::arch.aarch64.hv.vgic.lrState    sha256:55485c2eb3f01f10552af12c0bc9b46d230f72bf23ad5b7b487d30657d593973
 entity:arch/x64/amd/svm.zig::arch.x64.amd.svm.CTRL1_INTERCEPT_SMI    sha256:7a9f97078698e0ca5b28a144836e7cd2b2c32bb96605d91fa348d90d3d537f98
 entity:arch/x64/amd/svm.zig::arch.x64.amd.svm.CTRL1_INTERCEPT_INIT    sha256:4b2152464642525836c6d6472ea4e09744060c96a675832c5404e587dc314500
-entity:arch/x64/intel/pmu.zig::arch.x64.intel.pmu.PERFEVTSEL_OS    sha256:9de7f28f860c5185ecb8e6cef9d3c887465e85fb5e2f037bcc8407064af582fb
 entity:arch/x64/vm.zig::arch.x64.vm.VmPolicy._pad0    sha256:265ea8bcdce50089c418c9fbdfc95855cbbf42b12ea49dd588bbc915a4ca7027
 entity:arch/x64/vm.zig::arch.x64.vm.VmPolicy._pad1    sha256:c5e01d80cf80ac5d1173042061066a91774b8cd9d0881616ff459f09a7986049
 entity:arch/x64/vm.zig::arch.x64.vm.sysregPassthrough    sha256:eb24adf68d3d651169c3d104f62aecec019cdda5a47fe6ad29825d5cfd59c206

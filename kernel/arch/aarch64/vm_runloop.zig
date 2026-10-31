@@ -68,7 +68,6 @@ const SUBCODE_INITIAL_STATE: u8 = 10;
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support EL2).
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
-
     if (!vm_hw.vmSupported()) return null;
 
     const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return null;
@@ -369,7 +368,7 @@ const VREG75_CNTV_CTL_EL0_OFF: u64 = 352;
 const VREG79_CNTP_TVAL_EL0_OFF: u64 = 384;
 const VREG80_CNTKCTL_EL1_OFF: u64 = 392;
 const VREG81_CNTVOFF_EL2_OFF: u64 = 400;
-// vregs 82..115 reserved for debug/PMU regs not stored in GuestState.
+// vregs 82..115 are reserved and not stored in GuestState.
 const VREG117_EXIT_SUBCODE_OFF: u64 = 688;
 const VREG118_EXIT_PAYLOAD_0_OFF: u64 = 696;
 const VREG119_EXIT_PAYLOAD_1_OFF: u64 = 704;
@@ -760,14 +759,37 @@ fn vmPolicyFor(vm_ptr: *VirtualMachine) ?*const vm_hw.VmPolicy {
 /// MRS Xt destinations (ARM ARM B1.2.1).
 fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
     switch (idx) {
-        0 => gs.x0 = val,    1 => gs.x1 = val,    2 => gs.x2 = val,    3 => gs.x3 = val,
-        4 => gs.x4 = val,    5 => gs.x5 = val,    6 => gs.x6 = val,    7 => gs.x7 = val,
-        8 => gs.x8 = val,    9 => gs.x9 = val,    10 => gs.x10 = val,  11 => gs.x11 = val,
-        12 => gs.x12 = val,  13 => gs.x13 = val,  14 => gs.x14 = val,  15 => gs.x15 = val,
-        16 => gs.x16 = val,  17 => gs.x17 = val,  18 => gs.x18 = val,  19 => gs.x19 = val,
-        20 => gs.x20 = val,  21 => gs.x21 = val,  22 => gs.x22 = val,  23 => gs.x23 = val,
-        24 => gs.x24 = val,  25 => gs.x25 = val,  26 => gs.x26 = val,  27 => gs.x27 = val,
-        28 => gs.x28 = val,  29 => gs.x29 = val,  30 => gs.x30 = val,
+        0 => gs.x0 = val,
+        1 => gs.x1 = val,
+        2 => gs.x2 = val,
+        3 => gs.x3 = val,
+        4 => gs.x4 = val,
+        5 => gs.x5 = val,
+        6 => gs.x6 = val,
+        7 => gs.x7 = val,
+        8 => gs.x8 = val,
+        9 => gs.x9 = val,
+        10 => gs.x10 = val,
+        11 => gs.x11 = val,
+        12 => gs.x12 = val,
+        13 => gs.x13 = val,
+        14 => gs.x14 = val,
+        15 => gs.x15 = val,
+        16 => gs.x16 = val,
+        17 => gs.x17 = val,
+        18 => gs.x18 = val,
+        19 => gs.x19 = val,
+        20 => gs.x20 = val,
+        21 => gs.x21 = val,
+        22 => gs.x22 = val,
+        23 => gs.x23 = val,
+        24 => gs.x24 = val,
+        25 => gs.x25 = val,
+        26 => gs.x26 = val,
+        27 => gs.x27 = val,
+        28 => gs.x28 = val,
+        29 => gs.x29 = val,
+        30 => gs.x30 = val,
         else => {},
     }
 }
@@ -776,14 +798,37 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, idx: u8, val: u64) void {
 /// encoding on MSR Xt sources per ARM ARM B1.2.1).
 fn readGuestGpr(gs: *const vm_hw.GuestState, idx: u8) u64 {
     return switch (idx) {
-        0 => gs.x0,    1 => gs.x1,    2 => gs.x2,    3 => gs.x3,
-        4 => gs.x4,    5 => gs.x5,    6 => gs.x6,    7 => gs.x7,
-        8 => gs.x8,    9 => gs.x9,    10 => gs.x10,  11 => gs.x11,
-        12 => gs.x12,  13 => gs.x13,  14 => gs.x14,  15 => gs.x15,
-        16 => gs.x16,  17 => gs.x17,  18 => gs.x18,  19 => gs.x19,
-        20 => gs.x20,  21 => gs.x21,  22 => gs.x22,  23 => gs.x23,
-        24 => gs.x24,  25 => gs.x25,  26 => gs.x26,  27 => gs.x27,
-        28 => gs.x28,  29 => gs.x29,  30 => gs.x30,
+        0 => gs.x0,
+        1 => gs.x1,
+        2 => gs.x2,
+        3 => gs.x3,
+        4 => gs.x4,
+        5 => gs.x5,
+        6 => gs.x6,
+        7 => gs.x7,
+        8 => gs.x8,
+        9 => gs.x9,
+        10 => gs.x10,
+        11 => gs.x11,
+        12 => gs.x12,
+        13 => gs.x13,
+        14 => gs.x14,
+        15 => gs.x15,
+        16 => gs.x16,
+        17 => gs.x17,
+        18 => gs.x18,
+        19 => gs.x19,
+        20 => gs.x20,
+        21 => gs.x21,
+        22 => gs.x22,
+        23 => gs.x23,
+        24 => gs.x24,
+        25 => gs.x25,
+        26 => gs.x26,
+        27 => gs.x27,
+        28 => gs.x28,
+        29 => gs.x29,
+        30 => gs.x30,
         else => 0,
     };
 }

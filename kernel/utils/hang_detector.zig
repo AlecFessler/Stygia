@@ -782,7 +782,6 @@ fn printEventType(event_type: EventType) void {
         .breakpoint => "breakpoint",
         .suspension => "suspension",
         .vm_exit => "vm_exit",
-        .pmu_overflow => "pmu_overflow",
     });
 }
 

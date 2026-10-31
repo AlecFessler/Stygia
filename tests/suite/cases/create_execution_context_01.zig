@@ -5,7 +5,7 @@
 // Strategy
 //   The primary spawns each test as its own child capability domain,
 //   minting a self-handle with caps = {crcd, crec, crvr, crpf, crvm,
-//   crpt, pmu, fut_wake, timer, pri=3} (see runner/primary.zig). To
+//   crpt, fut_wake, timer, pri=3} (see runner/primary.zig). To
 //   exercise the missing-`crec` path we first reduce the self-handle's
 //   caps via `restrict`, dropping just the `crec` bit while leaving
 //   every other cap untouched. `restrict` per §[restrict] requires no
@@ -59,7 +59,6 @@ pub fn main(cap_table_base: u64) void {
         .crpf = true,
         .crvm = true,
         .crpt = true,
-        .pmu = true,
         .fut_wake = true,
         .timer = true,
         .pri = 3,

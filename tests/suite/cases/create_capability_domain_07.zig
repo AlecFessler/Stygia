@@ -77,7 +77,7 @@ pub fn main(cap_table_base: u64) void {
 
     // [1] caps: self_caps subset of the runner-installed self caps.
     // The runner grants the test crcd | crec | crvr | crpf | crvm |
-    // crpt | pmu | fut_wake | timer | pri=3. Pick a strict subset.
+    // crpt | fut_wake | timer | pri=3. Pick a strict subset.
     // idc_rx (bits 16-23) is left zero — runner installs idc_rx = 0
     // implicitly (the runner's [1] is just self_caps), so any nonzero
     // idc_rx in our call would also be a subset violation.

@@ -35,7 +35,6 @@ const ROOT_SELF_CAPS = capdom.CapabilityDomainCaps{
     .crpf = true,
     .crvm = true,
     .crpt = true,
-    .pmu = true,
     .setwall = true,
     .restart = true,
     .reply_policy = true,

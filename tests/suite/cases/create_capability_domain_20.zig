@@ -8,7 +8,7 @@
 //   initial EC of a freshly-minted capability domain. That spawn IS a
 //   `create_capability_domain` call, with `self_caps` populated from
 //   `runner/primary.zig`'s `child_self` SelfCap struct (crcd, crec,
-//   crvr, crpf, crvm, crpt, pmu, fut_wake, timer all set, pri = 3).
+//   crvr, crpf, crvm, crpt, fut_wake, timer all set, pri = 3).
 //
 //   The kernel maps the new domain's read-only cap table view at the
 //   pointer passed in rdi (vreg 1) at entry — surfaced here as the
@@ -68,7 +68,6 @@ const expected_self = caps.SelfCap{
     .crpf = true,
     .crvm = true,
     .crpt = true,
-    .pmu = true,
     .setwall = true,
     .fut_wake = true,
     .timer = true,

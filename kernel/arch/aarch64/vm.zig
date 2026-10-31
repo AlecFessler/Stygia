@@ -496,7 +496,7 @@ pub fn vmPerCoreInit() void {}
 /// Per-core VM initialization. Called from `sched.perCoreInit()` on every
 /// CPU after global init. On ARM the per-core setup is small: ensure EL2
 /// vectors are installed and that per-core trap configuration (HCR_EL2
-/// RES1 bits, MDCR_EL2 for PMU trap sharing, etc.) reflects the boot-time
+/// RES1 bits, MDCR_EL2 for debug trap control, etc.) reflects the boot-time
 /// defaults. All real state is per-VM, so this is essentially a no-op on
 /// a hypervisor that does not switch between host and guest VMIDs outside
 /// of a vCPU run.
@@ -778,4 +778,3 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
         else => .{ .unknown = esr },
     };
 }
-

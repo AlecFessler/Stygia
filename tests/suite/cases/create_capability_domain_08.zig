@@ -84,7 +84,6 @@ pub fn main(cap_table_base: u64) void {
         .crpf = true,
         .crvm = true,
         .crpt = true,
-        .pmu = true,
         .fut_wake = true,
         .timer = true,
         .pri = 3,

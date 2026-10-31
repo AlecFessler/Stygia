@@ -89,8 +89,7 @@ Exit status is nonzero if any err-severity findings are emitted.
    `catch {}` followed by an unreleased exit is still a finding.
    Fixtures `13_lock_catch_failure_branch_clean` /
    `14_lock_catch_still_flags_leaks` pin both directions. Without this,
-   the three `pmiHandler`s — the only kernel sites with a multi-line
-   `catch { … return; }` on an acquire — read as leaks.
+   multi-line `catch { … return; }` acquires read as leaks.
 
 5. **Per-path release coverage.** For every lock acquired in an entry
    body, every reachable control-flow exit (return / `try` error

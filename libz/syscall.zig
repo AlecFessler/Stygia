@@ -60,10 +60,6 @@ pub const SyscallNum = enum(u12) {
     yield = 25,
     priority = 26,
     affinity = 27,
-    perfmon_info = 28,
-    perfmon_start = 29,
-    perfmon_read = 30,
-    perfmon_stop = 31,
     create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
@@ -297,41 +293,6 @@ pub fn priority(target: u12, new_priority: u64) Regs {
 pub fn affinity(target: u12, new_affinity: u64) Regs {
     return issueReg(.affinity, 0, .{ .v1 = target, .v2 = new_affinity });
 }
-
-pub fn perfmonInfo() Regs {
-    return issueReg(.perfmon_info, 0, .{});
-}
-
-pub fn perfmonStart(target: u12, num_configs: u64, configs: []const u64) Regs {
-    var in = Regs{ .v1 = target, .v2 = num_configs };
-    if (configs.len >= 1) in.v3 = configs[0];
-    if (configs.len >= 2) in.v4 = configs[1];
-    if (configs.len >= 3) in.v5 = configs[2];
-    if (configs.len >= 4) in.v6 = configs[3];
-    if (configs.len >= 5) in.v7 = configs[4];
-    if (configs.len >= 6) in.v8 = configs[5];
-    if (configs.len >= 7) in.v9 = configs[6];
-    if (configs.len >= 8) in.v10 = configs[7];
-    if (configs.len >= 9) in.v11 = configs[8];
-    if (configs.len >= 10) in.v12 = configs[9];
-    if (configs.len >= 11) in.v13 = configs[10];
-    if (configs.len > 11) {
-        return issueStack(.perfmon_start, 0, in, configs[11..]);
-    }
-    return issueReg(.perfmon_start, 0, in);
-}
-
-pub fn perfmonRead(target: u12) Regs {
-    return issueReg(.perfmon_read, 0, .{ .v1 = target });
-}
-
-pub fn perfmonStop(target: u12) Regs {
-    return issueReg(.perfmon_stop, 0, .{ .v1 = target });
-}
-
-// ---------------------------------------------------------------
-// 17..24: VMAR ops
-// ---------------------------------------------------------------
 
 pub fn createVmar(
     caps: u64,

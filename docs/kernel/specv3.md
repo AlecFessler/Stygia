@@ -352,7 +352,7 @@ cap (word 0, bits 48-63):
 ```
  15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
 ┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│pri(2)│_rsv│timer│fut_wk│reply │restrt│_rsv  │setwal│  pmu  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│pri(2)│_rsv│timer│fut_wk│reply │restrt│_rsv  │setwal│_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
 │      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
 └──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
@@ -365,7 +365,7 @@ cap (word 0, bits 48-63):
 | 3 | `crpf` — create page frame | `create_page_frame` syscall |
 | 4 | `crvm` — create virtual machine | `create_virtual_machine` syscall |
 | 5 | `crpt` — create port | `create_port` syscall |
-| 6 | `pmu` — performance monitoring | `perfmon_*` syscalls |
+| 6 | _reserved | — |
 | 7 | `setwall` — set wall-clock time | `time_setwall` syscall |
 | 8 | _reserved | — |
 | 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
@@ -1159,219 +1159,6 @@ affinity([1] target, [2] new_affinity) -> void
 [test 04] returns E_INVAL if any reserved bits are set in [1].
 
 [test 05] on success, the target EC's affinity is set to [2].
-
-[test 06] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
-### perfmon_info
-
-#### Summary
-
-Queries system PMU capabilities.
-
-#### Declaration
-
-```
-perfmon_info() -> [1] caps_word, [2] supported_events
-  syscall_num = 28
-
-  [1] caps_word: u64 packed as
-    bits 0-7: num_counters
-    bit 8:    overflow_support
-    bits 9-63: _reserved
-
-  [2] supported_events: u64 bitmask
-```
-
-#### Description
-
-Supported event bits:
-
-| Bit | Event |
-|---|---|
-| 0 | cycles |
-| 1 | instructions |
-| 2 | cache_references |
-| 3 | cache_misses |
-| 4 | branch_instructions |
-| 5 | branch_misses |
-| 6 | bus_cycles |
-| 7 | stalled_cycles_frontend |
-| 8 | stalled_cycles_backend |
-
-#### Capabilities
-
-- Self-handle: `pmu`
-
-#### Return value
-
-`[1]`: caps_word with num_counters and overflow_support. `[2]`: bitmask of supported events.
-
-#### Errors
-
-**E_PERM** — caller's self-handle lacks `pmu`.
-
-#### Tests
-
-[test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
-
-[test 02] [1] bits 0-7 contain the number of available PMU counters.
-
-[test 03] [1] bit 8 is set when the hardware supports counter overflow events.
-
-[test 04] [2] is a bitmask of supported events indexed by the table above.
-
-
-### perfmon_start
-
-#### Summary
-
-Starts hardware performance counters on the target EC.
-
-#### Declaration
-
-```
-perfmon_start([1] target, [2] num_configs, [3 + 2i] config_event, [3 + 2i + 1] config_threshold) -> void
-  syscall_num = 29
-
-  [1] target:        EC handle
-  [2] num_configs:   N, the number of counter configs supplied
-  [3 + 2i] config_event: u64 packed as
-    bits 0-7: event index (per perfmon_info supported_events bitmask)
-    bit 8:    has_threshold
-    bits 9-63: _reserved
-  [3 + 2i + 1] config_threshold: u64 overflow threshold (used only when has_threshold = 1)
-
-  for i in 0..N-1.
-```
-
-#### Capabilities
-
-- Self-handle: `pmu`
-
-#### Errors
-
-**E_PERM** — caller's self-handle lacks `pmu`.
-
-**E_BADCAP** — `[1]` is not a valid EC handle.
-
-**E_INVAL** — `[2]` is 0 or exceeds num_counters; any config's event is not in supported_events; any config has `has_threshold = 1` but the hardware does not support overflow; reserved bits set in any config_event.
-
-**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
-
-#### Tests
-
-[test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
-
-[test 02] returns E_BADCAP if [1] is not a valid EC handle.
-
-[test 03] returns E_INVAL if [2] is 0 or exceeds num_counters.
-
-[test 04] returns E_INVAL if any config's event is not in supported_events.
-
-[test 05] returns E_INVAL if any config has has_threshold = 1 but the hardware does not support overflow.
-
-[test 06] returns E_INVAL if any reserved bits are set in any config_event.
-
-[test 07] returns E_BUSY if [1] is not the calling EC and not currently suspended.
-
-[test 08] on success, a subsequent `perfmon_read` on the target EC returns nonzero values in vregs `[1..2]` after the target EC has executed enough work to register the configured events.
-
-[test 09] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-[test 10] when `has_threshold = 1` is set on a config and the hardware supports overflow, after the target EC has executed enough work for the configured counter to overflow past `config_threshold`, a `pmu_overflow` event is delivered per §[event_route] (delivered to the bound port if a route exists, dropped otherwise).
-
-
-### perfmon_read
-
-#### Summary
-
-Reads the current counter values from the target EC.
-
-#### Declaration
-
-```
-perfmon_read([1] target) -> [1..num_counters] counter_values, [num_counters + 1] timestamp
-  syscall_num = 30
-
-  [1] target: EC handle
-```
-
-#### Capabilities
-
-- Self-handle: `pmu`
-
-#### Return value
-
-`[1..num_counters]`: current counter values. `[num_counters + 1]`: u64 nanosecond timestamp.
-
-#### Errors
-
-**E_PERM** — caller's self-handle lacks `pmu`.
-
-**E_BADCAP** — `[1]` is not a valid EC handle.
-
-**E_INVAL** — perfmon was not started on the target EC.
-
-**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
-
-#### Tests
-
-[test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
-
-[test 02] returns E_BADCAP if [1] is not a valid EC handle.
-
-[test 03] returns E_INVAL if perfmon was not started on the target EC.
-
-[test 04] returns E_BUSY if [1] is not the calling EC and not currently suspended.
-
-[test 05] on success, [1..num_counters] contain the current counter values for the active counters.
-
-[test 06] on success, [num_counters + 1] is a u64 nanosecond timestamp strictly greater than the timestamp from any prior `perfmon_read` on the same target EC, and each counter value is greater than or equal to the value returned by the prior `perfmon_read` on that target.
-
-[test 07] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
-### perfmon_stop
-
-#### Summary
-
-Stops counting on the target EC and releases PMU state.
-
-#### Declaration
-
-```
-perfmon_stop([1] target) -> void
-  syscall_num = 31
-
-  [1] target: EC handle
-```
-
-#### Capabilities
-
-- Self-handle: `pmu`
-
-#### Errors
-
-**E_PERM** — caller's self-handle lacks `pmu`.
-
-**E_BADCAP** — `[1]` is not a valid EC handle.
-
-**E_INVAL** — perfmon was not started on the target EC.
-
-**E_BUSY** — `[1]` is not the calling EC and not currently suspended.
-
-#### Tests
-
-[test 01] returns E_PERM if the caller's self-handle lacks `pmu`.
-
-[test 02] returns E_BADCAP if [1] is not a valid EC handle.
-
-[test 03] returns E_INVAL if perfmon was not started on the target EC.
-
-[test 04] returns E_BUSY if [1] is not the calling EC and not currently suspended.
-
-[test 05] on success, a subsequent `perfmon_read` on the target EC returns E_INVAL (perfmon was not started).
 
 [test 06] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -3021,7 +2808,7 @@ Event type identifies the kind of event an event route binds or that a reply ori
 | 3 | breakpoint | software or hardware breakpoint trap |
 | 4 | suspension | EC suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended EC's state per §[event_state] gated by the `read`/`write` caps on the EC handle the suspender used) |
 | 5 | vm_exit | vCPU exited guest mode |
-| 6 | pmu_overflow | performance counter overflowed |
+| 6 | _reserved | |
 | 7..31 | _reserved | |
 
 Sub-codes within an event type (e.g., read vs write vs execute within memory_fault; arithmetic vs illegal_instruction vs alignment vs stack_overflow within thread_fault; the architecture-specific exit reason within vm_exit) are carried in the event payload rather than as separate event type values.
@@ -3211,7 +2998,7 @@ vreg layout:
 | 58..73 | `[sp + 216..335]` | ID_AA64PFR0_EL1, ID_AA64PFR1_EL1, ID_AA64ZFR0_EL1, ID_AA64SMFR0_EL1, ID_AA64DFR0_EL1, ID_AA64DFR1_EL1, ID_AA64AFR0_EL1, ID_AA64AFR1_EL1, ID_AA64ISAR0_EL1, ID_AA64ISAR1_EL1, ID_AA64ISAR2_EL1, ID_AA64MMFR0_EL1, ID_AA64MMFR1_EL1, ID_AA64MMFR2_EL1, ID_AA64MMFR3_EL1, ID_AA64MMFR4_EL1 |
 | 74..81 | `[sp + 344..399]` | CNTV_CVAL_EL0, CNTV_CTL_EL0, CNTV_TVAL_EL0, CNTP_CVAL_EL0, CNTP_CTL_EL0, CNTP_TVAL_EL0, CNTKCTL_EL1, CNTVOFF_EL2 |
 | 82..101 | `[sp + 408..559]` | debug regs: DBGBVR0..5_EL1, DBGBCR0..5_EL1, DBGWVR0..3_EL1, DBGWCR0..3_EL1 |
-| 102..115 | `[sp + 568..671]` | PMU regs: PMCR_EL0, PMCNTENSET_EL0, PMCNTENCLR_EL0, PMOVSR_EL0, PMOVSSET_EL0, PMSELR_EL0, PMCCNTR_EL0, PMXEVTYPER_EL0, PMXEVCNTR_EL0, PMCCFILTR_EL0, PMINTENSET_EL1, PMINTENCLR_EL1, PMUSERENR_EL0, PMEVCNTR (aggregate) |
+| 102..115 | `[sp + 568..671]` | _reserved |
 | 116 | `[sp + 680]` | packed pending state `{virq u8, vfiq u8, vserror u8}` |
 | 117 | `[sp + 688]` | exit sub-code |
 | 118..120 | `[sp + 696..719]` | exit payload (per sub-code below) |
@@ -3236,7 +3023,7 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 
 An event route is a kernel-held binding of events generated by an execution context to a given port, such that the execution context is suspended on the port when the event occurs. Event routes are not handles — they are identified by the `(execution_context, event_type)` tuple and cleared either by explicit syscall or by destruction of the execution context they are bound to.
 
-The registerable event types (per §[event_type]) are `memory_fault` (1), `thread_fault` (2), `breakpoint` (3), and `pmu_overflow` (6). `suspension` (4) and `vm_exit` (5) are not registered through these syscalls — `suspension` is delivered to the port specified in the `suspend` syscall directly, and `vm_exit` is bound at `create_vcpu` to the vCPU's exit_port.
+The registerable event types (per §[event_type]) are `memory_fault` (1), `thread_fault` (2), and `breakpoint` (3). `suspension` (4) and `vm_exit` (5) are not registered through these syscalls — `suspension` is delivered to the port specified in the `suspend` syscall directly, and `vm_exit` is bound at `create_vcpu` to the vCPU's exit_port.
 
 When an event of a registered type fires for an EC, the kernel suspends the EC and delivers an event of the corresponding type on the bound port per §[event_state]; the receiver may modify the EC's state and reply through the included reply capability to resume it.
 
@@ -3247,7 +3034,6 @@ When an event of a registerable type fires for an EC and no route is bound for `
 | memory_fault | the EC's capability domain is restarted if its self-handle has the `restart` cap (per §[restart_semantics]); otherwise the capability domain is destroyed |
 | thread_fault | the EC is terminated |
 | breakpoint | the event is dropped; the kernel advances past the trapping instruction and resumes the EC |
-| pmu_overflow | the event is dropped; the EC continues running |
 
 `suspension` and `vm_exit` always have a bound port by construction (the `suspend` syscall's `port` argument and the `create_vcpu` `exit_port` respectively), so the no-route fallback does not apply to them.
 
@@ -3429,7 +3215,7 @@ The reply handle id rides in the syscall word rather than vreg 1 so the GPR-back
 The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
 
 - For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
-- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`, `pmu_overflow`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
+- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
 
 The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
 

@@ -52,7 +52,6 @@ const fpu = stygia.sched.fpu;
 const futex = stygia.sched.futex;
 const gic = stygia.arch.aarch64.gic;
 const interrupts = stygia.arch.aarch64.interrupts;
-const pmu = stygia.arch.aarch64.pmu;
 const port = stygia.sched.port;
 const scheduler = stygia.sched.scheduler;
 const serial = stygia.arch.aarch64.serial;
@@ -558,7 +557,6 @@ fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
 }
 
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
-
     const esr = readEsrEl1();
     const ec = extractEc(esr);
     const entry_cur = scheduler.currentEc();
@@ -964,7 +962,7 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const entry_cur = scheduler.currentEc();
     gic.endOfInterrupt(intid);
     if (entry_cur) |ec_ptr| consumeIrqEntrySuspendDirective(ec_ptr, ctx);
-    dispatchIrq(intid, ctx, .user);
+    dispatchIrq(intid);
     // Identity guard, same rationale as the svc tail: the trampoline
     // epilogue ERETs the INTERRUPTED frame, which is only correct while
     // `current_ec` still names the EC that owns it. If dispatchIrq's
@@ -1018,7 +1016,6 @@ fn silenceTimerLineIfFiring(intid: u32) void {
 /// Only Data Aborts (demand paging) are expected in kernel mode.
 /// All other exceptions are fatal.
 fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
-
     const esr = readEsrEl1();
     const ec = extractEc(esr);
 
@@ -1092,6 +1089,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
+    _ = ctx;
 
     // lockdep: see handleIrqLowerEl. The kernel-mode IRQ vector is just as
     // much an async-IRQ-handler entry — the interrupted code may have been
@@ -1110,7 +1108,7 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     // EOI before dispatch — see handleIrqLowerEl for rationale.
     const entry_cur = scheduler.currentEc();
     gic.endOfInterrupt(intid);
-    dispatchIrq(intid, ctx, .kernel);
+    dispatchIrq(intid);
     // Identity guard — see handleIrqLowerEl. Kernel-mode frames live on
     // the current EC's kstack; if the slot changed, that kstack may
     // already be executing elsewhere — hop off it before entering the
@@ -1133,8 +1131,6 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 /// running at EL0 (user) or EL1 (kernel). Recorded in case the callee
 /// needs to attribute time, but the per-core scheduler tick currently
 /// derives that itself from `current_ec`.
-const IrqOrigin = enum { user, kernel };
-
 /// Dispatch a GIC interrupt to the appropriate handler.
 /// The INTID namespace (IHI 0069H, Section 2.2):
 ///   0-15:    SGI (Software Generated Interrupts / IPIs)
@@ -1145,8 +1141,7 @@ const IrqOrigin = enum { user, kernel };
 /// D11.2.4); this is the scheduler's preemption tick. It is routed
 /// directly to `scheduler.preempt`, equivalent of the x64 LAPIC-timer
 /// IDT vector.
-fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
-    _ = origin;
+fn dispatchIrq(intid: u32) void {
 
     // Bare-metal Pi 5 watchdog pet. A no-op — not even a load of the
     // reload constant — on every target whose devicetree has no
@@ -1261,16 +1256,6 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             futex.expireTimedWaiters();
             timer_wheel.wheelExpireDue();
             scheduler.preempt();
-        },
-        23 => {
-            // PMU overflow PPI. ARM ARM DDI 0487 K.a §D13.3.1 documents
-            // INTID 23 as the GICv3-recommended, level-sensitive PPI
-            // raised when PMOVSSET_EL0 has any bit set whose matching
-            // PMINTENSET_EL1 bit is also set. The handler snapshots the
-            // counter values, masks PMINTENSET / clears PMOVSCLR to
-            // drop the line before ERET, and delivers a pmu_overflow
-            // fault to the thread's process fault handler.
-            pmu.pmiHandler(ctx);
         },
         27, 30 => {
 

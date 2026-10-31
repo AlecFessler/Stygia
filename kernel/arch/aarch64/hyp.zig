@@ -375,7 +375,7 @@ pub fn vtcrEl2Value() u64 {
 ///        - VTCR_EL2     (stage-2 format)
 ///        - VTTBR_EL2    (VMID | stage-2 root PA)
 ///        - CPTR_EL2     (FPSIMD / SVE trap config)
-///        - MDCR_EL2     (debug / PMU trap share)
+///        - MDCR_EL2     (debug trap control)
 ///        - CNTVOFF_EL2  (per-VM virtual timer offset)
 ///        - VBAR_EL2     (ensures exits land in our vector)
 ///   4. Load guest EL1 sysregs from GuestState (SCTLR_EL1, TTBR*_EL1, ...).

@@ -1557,28 +1557,13 @@ gate — never by an ambient IRQ mask. (Forecloses class 2.)
    not depend on this window being lock-free.)
 4. The hop (§4).
 
-**The dispatch sequence** (`ready → running → PMU handoff → SP on new
-kstack`): dequeue (or `yieldTo`-target pick), the S7 domain filter **with
-its failure routing**, the `ready → running` CAS,
-`current`/`owner_core`/queue-field writes — one `core_locks[core]`
-critical section; the park-stack tail then performs teardown drain, the
-PMU handoff, one final lifecycle recheck, and the SP/root load. If that
-post-PMU recheck observes that a retire/park won after selected/current
-commit, dispatch is abandoned: any PMU file restored for the would-be
-incoming EC is saved/disabled and its hardware-owner token cleared before
-the core returns to `run()`. A `perfmon_state` release may be requested
-while another core owns that token, but release/destruction cannot
-complete until the owner core clears it; the scheduler keeps a per-core
-`SlabRef(PerfmonState)` for the live hardware file so the owner can do
-that even if the EC field is concurrently being detached. This is the
-invariant that makes a next EC with no perfmon state safe, prevents
-threshold PMI state from leaking into the next dispatch, handles
-same-core redispatch by restoring from the saved values, and leaves
-destroyed perfmon state with no live hardware owner. The same boundary
-applies outside dispatch tail: any syscall path that directly programs
-PMU hardware (`perfmon_start`/`perfmon_read`) first retires a different
-per-core owner through the scheduler before overwriting the register
-file. S7-failure routing
+**The dispatch sequence** (`ready → running → SP on new kstack`): dequeue
+(or `yieldTo`-target pick), the S7 domain filter with its failure routing,
+the `ready → running` CAS, and `current`/`owner_core`/queue-field writes
+occur in one `core_locks[core]` critical section. The park-stack tail
+drains teardown requests, rechecks the lifecycle state, and loads the
+selected context. If retire or park wins after the commit, dispatch is
+abandoned and the core returns to `run()`. S7-failure routing
 (round-3 M-A repair; lock order
 corrected round 4 F2): a popped `ready` EC whose domain ref is gen-dead
 is **claimed, not retired in place** — the dispatcher CASes
@@ -1736,7 +1721,6 @@ with both sides IRQ-masked. Never a silent drop, either way.
 | `ec.ctx` saved-frame payload | multi-word | claim winner only | the EC after re-dispatch | claim CAS + saved-frame ban + discharge ordering |
 | `cd.paused` | 1 byte, on the capability domain | the pausing EC, CAS 0 → 1 under the target CD's `_gen_lock` at pause entry, and 0 at resume under the same lock | **every EC of that domain at its own user boundary, on BOTH legs** (§3.1 rule 3's third arm — the kernel → user return leg is the one that catches a woken `waiting` EC, which enters from nowhere); edge 1's publish, under the CD `_gen_lock` it already holds | single word, CAS-arbitrated, so two pausers of one domain serialize and the loser gets E_BUSY. Read at the boundary WITHOUT the lock — a stale FALSE is safe (the EC runs on and is caught at its next boundary; the pauser is still waiting on the runnable predicate), and a stale TRUE cannot occur because only the pauser clears it and it clears after every gated EC has been resumed (§0.3) |
 | `ec.current_queue_core` | 1 byte (`u8`; `NOT_IN_RUN_QUEUE` sentinel outside the validity set) | **the party holding the DESTINATION queue lock at the CAS-then-link of edges 1 / 6 / 6p / 8** — i.e. whoever makes the EC `ready` writes it in the same section. Whoever takes it out of `ready` (edge 2's dequeue, a 5c claim, pull-side steal's victim removal, retire's ready row) clears it to the sentinel in the section it already holds. The x86-64 IPC fast path mirrors this in R13's ready-enqueue branches: queue links/tail first, then `current_queue_core = local core`, then unlock | `removeFromQueue`; §8.1's reach-and-validate step 2 (which container am I in); §5.3's run-queue row; pull-side steal's victim scan as a hint only | **valid iff `state == ready`**, poisoned to the sentinel otherwise (debug builds assert it). Single byte, so no tearing; written and cleared only under the queue lock that owns the membership it names, which is the same section the state CAS runs in — so it cannot disagree with `state` at any point a reader can observe both. **A stale read is safe by construction**: the reader re-validates under the lock it was directed to and retries on mismatch (§3.5's drop-and-retry). Steal likewise does not trust this field alone: the victim scan validates actual run-queue membership under the victim lock before claiming/removing |
-| `PerfmonState.hw_core` / `release_pending` | 1 byte + 1 bit | the core that restored the PMU file writes/clears `hw_core`; a releaser sets `release_pending` under the PMU state's gen-lock when `hw_core` names another core | scheduler dispatch tail, `perfmon_stop`, EC teardown | `hw_core` is the hardware-owner token. A PMU state may be detached from the EC only after the token is null. Remote release sets `release_pending`, sends a scheduler IPI to the owner, and waits; the owner saves/disables the PMU file, clears the token, and completes destruction through its per-core `SlabRef(PerfmonState)`. The EC field is not the lifetime authority during dispatch tail |
 | `PerCore.current` | 8 bytes | owning core (2 sites) | identity compares only | caller-pinned identity rules; bytes intact until finalize |
 | `PerCore.active_root` | 8 bytes | owning core, release-after-load | teardown barrier | as today |
 | `PerCore.idle_parked` | 1 byte | owning core under its lock | enqueuers under same lock | as today |
@@ -2025,7 +2009,7 @@ failure arm — never a plain store (the resurrection shape S8 prevents).
 | # | Edge | Actor | Trigger | Precondition | Postcondition |
 |---|---|---|---|---|---|
 | 1 | *(slab-private)* → `ready` | creator | `publish`, the last step of creation | all fallible work done; nothing externally visible yet; **domain liveness validated under the CD `_gen_lock` inside the publish section** (§8.5). `create_vcpu` follows the same runnable-first shape: the vCPU is published ready and its first dispatch synthesizes the initial `vm_exit` through the normal running→parking path | gen live + linked, one lock section; domain-dead ⇒ private-unwind arm. **Paused-domain arm (round-13 C-1): the same section reads `cd.paused`, and publishes into `waiting(domain_pause)` rather than `ready` when set** — which is what keeps the pauser's runnable predicate from growing underneath it without the pauser holding any lock |
-| 2 | `ready` → `running` | dispatching core | dequeue / **`yieldTo` target — qualified in §8.1 (round 7 M-4): `ready` ON THIS CORE'S QUEUE, S7-live, and affinity-mask-admitted; anything else degenerates to a plain `yield`** | inside `core_locks[core]` — a single core lock, which is exactly why the `yieldTo` arm is local-only; S7 filter (failure ⇒ dispatcher retires inline, §3.2); CAS wins | `current`, `owner_core`, queue field — same section; then park-stack tail PMU handoff and SP/root load. If lifecycle is no longer `running` after PMU handoff, save/disable the restored PMU file, clear its owner token, complete any pending PMU-state release, and abandon to `run()` |
+| 2 | `ready` → `running` | dispatching core | dequeue / **`yieldTo` target — qualified in §8.1 (round 7 M-4): `ready` ON THIS CORE'S QUEUE, S7-live, and affinity-mask-admitted; anything else degenerates to a plain `yield`** | inside `core_locks[core]` — a single core lock, which is exactly why the `yieldTo` arm is local-only; S7 filter (failure ⇒ dispatcher retires inline, §3.2); CAS wins | `current`, `owner_core`, queue field — same section; then park-stack tail lifecycle recheck and SP/root load. If lifecycle is no longer `running`, abandon to `run()` |
 | 3 | `running` → `parking` | owner core | blocking syscall, wfi/hlt trap, event-route delivery, directive consumption (user boundary), **domain-paused gate (user boundary, BOTH legs, §0.3 / §3.1 rule 3 — the pause's ONLY route, and it is uniform over the target's prior state; the return leg is subject to §3.3's quiesced-resume rule)**, preempt tick (requeue; `pin_depth == 0`), **plain `yield` and the `yieldTo` caller's own requeue park (requeue — round 6 M4; this list is the closure and had omitted both)**, affinity migration (requeue). **PRECEDENCE (round 7 M-5): where directive consumption and the preempt tick are both enabled — i.e. the tick lands on an unpinned user-mode frame with `directive_state == armed` — CONSUMPTION WINS; the tick is an entry from user mode and §3.1 rule 3 runs its checks before the requeue arm.** | park sequence §3.2 (staging pre-publish; links+CAS under final container lock; requeue = bare CAS) | straight line (bounded work) to the hop |
 | 4 | `parking` → `waiting` | owner core | the hop (or degenerate) | SP off kstack / never on it; `current` released (hop step 1) | claimable; `owner_core` poisoned (debug) |
 | 5a | `waiting` → `claimed` | any waker/mover (any context) | see T1 (§5.1) + syscall-context sources: the `futex_wake` syscall, recv pop, close propagation, reply via pin, rendezvous pop, suspend of idle-waiter, **`vm_inject_irq` waking a wfi-parked vCPU (round 6 M4; 5b if it races the vCPU's park; no T1 row unless an IRQ-context injection path is ever added, which would require one)** | CAS under R-claim; one winner per episode | holder owns descriptor+frame; unlinks containers incl. deadline node; **holder discharges** (edges 6/7) |
@@ -2065,7 +2049,7 @@ defects.
 | recv deadline expiry | tick → `expireTimedRecvWaiters` | periodic scan (same unified table, §8.4) | same | same |
 | timer wheel (one-shot & periodic) | tick → `wheelExpireDue` | **one-shot pop** — the firing consumes the registration | same; the pop is consumed by the claim exactly once — no re-insertion, no replay, no double side-effects (X3) | losing to a racing winner is safe: the wake's meaning is level-encoded (futex word / port event already staged) and the winner delivers it |
 | device-region IRQ | device IRQ → `device_region.onIrq` (`device_region.zig:552-586`) — masks the line until userspace acks, then `futex.wake` | **one-shot until user ack** — the would-be acker may be the very EC being woken | same: 5a inline or 5b `pended`; the owner's hop places the waiter, which then runs and acks. **No decline path exists**, so the X3 lost-interrupt (wake dropped, acker parked, line masked forever) is unconstructible | as above — level-encoded ack word |
-| event-route delivery from exception/IRQ context (fault, breakpoint, PMU overflow) that rendezvouses with a parked receiver | `fireRouted` → `rendezvousWithReceiver` | event is carried by the suspending EC; receiver wake is the interrupt-context claim | receiver 5a → place inline; receiver 5b → `pended` | claim loss impossible per-episode (one receiver pop per rendezvous, under the port lock) |
+| event-route delivery from exception/IRQ context (fault, breakpoint) that rendezvouses with a parked receiver | `fireRouted` → `rendezvousWithReceiver` | event is carried by the suspending EC; receiver wake is the interrupt-context claim | receiver 5a → place inline; receiver 5b → `pended` | claim loss impossible per-episode (one receiver pop per rendezvous, under the port lock) |
 
 Row template for future sources: name the entry, the persistence class
 (periodic vs one-shot), and the discharge — which after this revision is
@@ -2486,7 +2470,7 @@ and bytes stay intact until finalize's zero.
 
 `finalize` runs, in order: the idempotent container unwind (above);
 deferred marking (if owed); the release body (routes + bind-ref decs,
-exit_port unlink, perfmon, vCPU arch state, FPU-owner clear,
+exit_port unlink, vCPU arch state, FPU-owner clear,
 `directive_state → dead` — the terminal value that lets a waiting
 suspender distinguish a retired target from a delivered suspension, F6);
 kstack unmap (epoch-quarantined); slot zero + freelist. Finalize runs in

@@ -41,10 +41,6 @@ pub const SyscallNum = enum(u64) {
     yield = 25,
     priority = 26,
     affinity = 27,
-    perfmon_info = 28,
-    perfmon_start = 29,
-    perfmon_read = 30,
-    perfmon_stop = 31,
     create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
@@ -116,9 +112,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .yield,
         .priority,
         .affinity,
-        .perfmon_info,
-        .perfmon_read,
-        .perfmon_stop,
         .create_execution_context,
         .create_vmar,
         .map_mmio,
@@ -147,10 +140,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         // create_capability_domain: passed_handles list, no syscall-word
         // count. Surface the full upper window.
         .create_capability_domain => 127,
-
-        // perfmon_start: vreg 1=target, 2=num_configs, 3..2+2*count =
-        // configs (each config = (event, threshold) pair = 2 vregs).
-        .perfmon_start => @intCast(@min(2 + 2 * n_reg, 127)),
 
         // map_pf, map_guest, futex_wait_val/change: pairs of 2 vregs
         // each. Vreg 1 = handle/timeout, vregs 2..1+2N = pair data.
@@ -260,16 +249,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .yield => execution_context.yield(caller, arg(args, 0)),
         .priority => execution_context.priority(caller, arg(args, 0), arg(args, 1)),
         .affinity => execution_context.affinity(caller, arg(args, 0), arg(args, 1)),
-        .perfmon_info => execution_context.perfmonInfo(caller),
-        .perfmon_start => execution_context.perfmonStart(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            if (args.len > 2) args[2..] else &.{},
-        ),
-        .perfmon_read => execution_context.perfmonRead(caller, arg(args, 0)),
-        .perfmon_stop => execution_context.perfmonStop(caller, arg(args, 0)),
-
         .create_vmar => vmar.createVmar(
             caller,
             arg(args, 0),

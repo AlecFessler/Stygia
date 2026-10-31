@@ -6,7 +6,6 @@ pub const event_route = @import("event_route.zig");
 pub const execution_context = @import("execution_context.zig");
 pub const futex = @import("futex.zig");
 pub const page_frame = @import("page_frame.zig");
-pub const pmu = @import("pmu.zig");
 pub const port = @import("port.zig");
 pub const reply = @import("reply.zig");
 pub const system = @import("system.zig");

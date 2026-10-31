@@ -585,9 +585,8 @@ fn loadIrEdges(ctx: *Ctx, out: *ArrayList(Edge), seen: *std.AutoHashMap(u64, voi
 ///   3. the terminal segment alone, restricted to `pref_file`, uniquely;
 ///   4. the terminal segment alone, globally unique.
 ///
-/// Step 2/3 are what make `registerVector(PMI_VECTOR, pmiHandler, …)`
-/// resolve: there are three `pmiHandler`s in the tree (intel, amd,
-/// aarch64) and only file scope tells them apart.
+/// Step 2/3 resolve single-segment handler names passed to `registerVector`
+/// when file scope distinguishes otherwise ambiguous functions.
 ///
 /// Ambiguity that survives all four steps resolves to "no edge": a guess
 /// would produce phantom wake paths, which is worse than a missing one we
@@ -683,9 +682,8 @@ fn resolveFn(ctx: *const Ctx, segs_in: []const []const u8, pref_file: ?i64) ?u32
     // same-file tiebreak resolved that call to `sched.scheduler.enqueue`
     // and invented a run-queue-insertion claim site inside `yieldTo`.
     //
-    // Single-segment chains are the opposite case: `pmiHandler` passed to
-    // `registerVector` has no qualifier to match against, and file scope is
-    // exactly how Zig resolves it.
+    // Single-segment handler names passed to `registerVector` have no
+    // qualifier to match against, and file scope is how Zig resolves them.
     // `self.method()` inside a generic container is the other legitimate
     // case: the receiver is a value, not a namespace, and the method is
     // defined in the same file. Same-file uniqueness is then the right

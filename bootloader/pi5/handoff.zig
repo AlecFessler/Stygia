@@ -346,12 +346,8 @@ pub fn allocHypStub(alloc: std.mem.Allocator) ?u64 {
 ///   * **HSTR_EL2 = 0.** No AArch32 CP15 trapping. Reset value should already be
 ///     0; Linux writes it anyway and so do we.
 ///
-/// Deliberately NOT set: MDCR_EL2. Its trap bits (TPM, TPMCR, TDE, TDA, ...)
-/// would each route an EL1 debug or PMU access into the stub, but HPMN cannot be
-/// written to a safe value without reading PMCR_EL0.N, and writing HPMN = 0 on a
-/// part without FEAT_HPMN0 is CONSTRAINED UNPREDICTABLE. `dumpEl2State` logs the
-/// register instead: if `arch.pmu.pmuInit()` turns out to hang, one look at the
-/// log says whether MDCR_EL2 is why.
+/// MDCR_EL2 remains at its firmware value. The EL2 stub does not service
+/// debug-register traps.
 ///
 /// Last, the EL1&0 TLBs are invalidated. Nothing in this boot has run at EL1, so
 /// this looks redundant — but the entries that matter are from the PREVIOUS boot.

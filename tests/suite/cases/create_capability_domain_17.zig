@@ -85,7 +85,7 @@ pub fn main(cap_table_base: u64) void {
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
 
     // A SelfCap subset of what the runner granted us. Caller's caps
-    // include crcd/crec/crvr/crpf/crvm/crpt/pmu/fut_wake/timer; we ask
+    // include crcd/crec/crvr/crpf/crvm/crpt/fut_wake/timer; we ask
     // for a strict subset so test 02 (E_PERM on self_caps not subset)
     // can't fire.
     const child_self = caps.SelfCap{ .crpf = true };

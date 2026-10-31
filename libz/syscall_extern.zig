@@ -69,10 +69,6 @@ pub const SyscallNum = enum(u12) {
     yield = 25,
     priority = 26,
     affinity = 27,
-    perfmon_info = 28,
-    perfmon_start = 29,
-    perfmon_read = 30,
-    perfmon_stop = 31,
     create_vmar = 32,
     map_pf = 33,
     map_mmio = 34,
@@ -285,15 +281,6 @@ const ext = struct {
     extern fn yieldEc(target: u64) callconv(.c) c.Regs;
     extern fn priority(target: u16, new_priority: u64) callconv(.c) c.Regs;
     extern fn affinity(target: u16, new_affinity: u64) callconv(.c) c.Regs;
-    extern fn perfmonInfo() callconv(.c) c.Regs;
-    extern fn perfmonStart(
-        target: u16,
-        num_configs: u64,
-        configs_ptr: [*]const u64,
-        configs_len: usize,
-    ) callconv(.c) c.Regs;
-    extern fn perfmonRead(target: u16) callconv(.c) c.Regs;
-    extern fn perfmonStop(target: u16) callconv(.c) c.Regs;
     extern fn createVmar(
         caps: u64,
         props: u64,
@@ -476,24 +463,6 @@ pub fn priority(target: u12, new_priority: u64) Regs {
 pub fn affinity(target: u12, new_affinity: u64) Regs {
     return fromCRegs(ext.affinity(@as(u16, target), new_affinity));
 }
-
-pub fn perfmonInfo() Regs {
-    return fromCRegs(ext.perfmonInfo());
-}
-
-pub fn perfmonStart(target: u12, num_configs: u64, configs: []const u64) Regs {
-    return fromCRegs(ext.perfmonStart(@as(u16, target), num_configs, configs.ptr, configs.len));
-}
-
-pub fn perfmonRead(target: u12) Regs {
-    return fromCRegs(ext.perfmonRead(@as(u16, target)));
-}
-
-pub fn perfmonStop(target: u12) Regs {
-    return fromCRegs(ext.perfmonStop(@as(u16, target)));
-}
-
-// 17..24: VMAR ops
 
 pub fn createVmar(
     caps: u64,

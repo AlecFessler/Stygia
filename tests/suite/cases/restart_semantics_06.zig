@@ -125,7 +125,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Sub-domain self_caps and ceilings: tightly subset of the
     // runner-provided ceilings. The runner gives us self caps that
-    // include crcd, crec, crvr, crpf, crvm, crpt, pmu, fut_wake,
+    // include crcd, crec, crvr, crpf, crvm, crpt, fut_wake,
     // timer, pri=3 (no `restart`). We ask for self_caps
     // = {crpt} — enough that the sub-domain validates without
     // needing rights we don't hold.

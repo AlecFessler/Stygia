@@ -95,7 +95,6 @@ pub fn bindEventRoute(caller: *anyopaque, target: u64, event_type: u64, port: u6
         1 => .memory_fault,
         2 => .thread_fault,
         3 => .breakpoint,
-        6 => .pmu_overflow,
         else => return errors.E_INVAL,
     };
     const slot_idx = execution_context.eventRouteSlot(et) orelse return errors.E_INVAL;
@@ -207,7 +206,6 @@ pub fn clearEventRoute(caller: *anyopaque, target: u64, event_type: u64) i64 {
         1 => .memory_fault,
         2 => .thread_fault,
         3 => .breakpoint,
-        6 => .pmu_overflow,
         else => return errors.E_INVAL,
     };
     const slot_idx = execution_context.eventRouteSlot(et) orelse return errors.E_INVAL;

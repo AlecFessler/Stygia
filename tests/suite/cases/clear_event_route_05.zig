@@ -85,7 +85,7 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // §[event_type]: registerable event types are 1 (memory_fault), 2
-// (thread_fault), 3 (breakpoint), 6 (pmu_overflow). Pick 3 — its
+// (thread_fault), 3 (breakpoint). Pick 3 — its
 // no-route fallback ("drop and resume") is the only benign choice if
 // a stray firing raced this call.
 const EVENT_BREAKPOINT: u64 = 3;

@@ -10,7 +10,6 @@ pub const interrupts = @import("interrupts.zig");
 pub const iommu = @import("iommu.zig");
 pub const hv = @import("hv/hv.zig");
 pub const paging = @import("paging.zig");
-pub const pmu = @import("pmu.zig");
 pub const power = @import("power.zig");
 pub const rtc = @import("rtc.zig");
 pub const serial = @import("serial.zig");

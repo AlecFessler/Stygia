@@ -1,7 +1,7 @@
 exception  arch.x64.exceptions.exceptionHandler
 exception  arch.x64.exceptions.pageFaultHandler
-irq  arch.x64.amd.pmu.pmiHandler
-irq  arch.x64.intel.pmu.pmiHandler
+irq  arch.x64.amd.irq_handlers.vendorIrqHandler
+irq  arch.x64.intel.irq_handlers.vendorIrqHandler
 irq  arch.x64.irq.deviceIrqHandler
 irq  arch.x64.irq.schedTimerHandler
 irq  arch.x64.irq.spuriousHandler
