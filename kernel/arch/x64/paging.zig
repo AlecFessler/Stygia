@@ -88,8 +88,8 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///      between IPIs leaves remote cores executing INVPCID against
 ///      the *next* descriptor instead of the one they were summoned
 ///      for, leaking stale TLB entries (cross-core UAF on unmap+free
-///      races). The syscall-side range-teardown path runs with
-///      interrupts enabled, so the wait is safe.
+///      races). The syscall-side range-teardown path enters with
+///      interrupts enabled, then masks them while holding this lock.
 ///
 ///   2. **Fire-and-forget descriptor** (`flushRemoteTlb`, single-page):
 ///      the initiator holds the lock, publishes a `.invlpg_no_ack`
@@ -472,8 +472,11 @@ pub fn serviceTlbArmsWhileSpinning() void {
     ackPendingSyncArmConservative(apic.coreID());
 }
 
-/// Acquire `shootdown_lock` while staying responsive to concurrent
-/// sync arms. The blind `shootdown_lock.lock()` deadlocks: a core
+/// Acquire `shootdown_lock` with local IRQs masked while staying
+/// responsive to concurrent sync arms. A timer IRQ could otherwise
+/// preempt the holder and dispatch another thread that spins on this
+/// lock, preventing the original holder from running again. The blind
+/// `shootdown_lock.lock()` also deadlocks: a core
 /// spinning here with IRQs masked (destroyPhase2's `freeAddrSpaceId`
 /// → `flushRemotePcid`) cannot take the shootdown IPI, while the
 /// current holder sits in `waitForShootdownAcks` waiting for exactly
@@ -483,23 +486,27 @@ pub fn serviceTlbArmsWhileSpinning() void {
 /// is the standard IPI-vs-spinlock discipline; it is correct for
 /// IRQs-on contenders too (the IPI handler acking concurrently is
 /// idempotent — both store the latest gen).
-fn lockShootdownServicingArms(src: std.builtin.SourceLocation) void {
+fn lockShootdownServicingArms(src: std.builtin.SourceLocation) u64 {
+    // The scheduler tick can preempt a syscall while this lock is held and
+    // dispatch a different thread on this core. If that thread attempts a
+    // shootdown, it spins behind a holder that cannot run to release it.
+    // Preserve the caller's IRQ state across the whole lock-held window.
+    const irq = cpu.saveAndDisableInterrupts();
     const my_core = apic.coreID();
     while (!shootdown_lock.tryLock(src)) {
         ackPendingSyncArmConservative(my_core);
         std.atomic.spinLoopHint();
     }
+    return irq;
 }
 
 /// Wait until every remote core has acked the sync arm at
 /// `expected_gen` by storing it into its `core_acked_gen` slot.
 /// Caller must hold `shootdown_lock`.
 ///
-/// While spinning we explicitly keep interrupts in the caller's
-/// pre-call state — we deliberately do NOT toggle them on/off here,
-/// because callers from inside `switchTo`-style critical sections
-/// rely on the outer IRQ-off invariant being preserved across our
-/// call. The IPI handler runs CPU-side with auto-cli (Intel SDM Vol
+/// While spinning the caller has local IRQs masked by
+/// `lockShootdownServicingArms`. The original IRQ state is restored
+/// after releasing the lock. The IPI handler runs CPU-side with auto-cli (Intel SDM Vol
 /// 3A §6.8.1) and only touches `core_acked_gen[my_core]` plus the
 /// local TLB, so it is safe even when nested inside other kernel
 /// critical sections on the *remote* cores.
@@ -565,8 +572,8 @@ fn flushRemoteTlb(virt_addr: u64) void {
 
     const self_id = apic.coreID();
 
-    lockShootdownServicingArms(@src());
-    defer shootdown_lock.unlock();
+    const irq = lockShootdownServicingArms(@src());
+    defer shootdown_lock.unlockIrqRestore(irq);
 
     // Fire-and-forget: publish the descriptor and fan out, but do NOT
     // bump `sync_arm_gen` and do NOT wait. A handler running for this
@@ -636,8 +643,8 @@ pub fn flushRemotePcid(pcid: u16) void {
         return;
     }
 
-    lockShootdownServicingArms(@src());
-    defer shootdown_lock.unlock();
+    const irq = lockShootdownServicingArms(@src());
+    defer shootdown_lock.unlockIrqRestore(irq);
 
     // Order matters under concurrent handler runs (a stale IPI from a
     // prior arm racing with this publish):
@@ -1559,8 +1566,8 @@ pub fn shootdownTlbRange(
     }
     if (remote_count == 0) return;
 
-    lockShootdownServicingArms(@src());
-    defer shootdown_lock.unlock();
+    const irq = lockShootdownServicingArms(@src());
+    defer shootdown_lock.unlockIrqRestore(irq);
 
     const kind: ShootdownKind = if (cpu.pcid_enabled) .invpcid_addr else .invlpg;
     @atomicStore(u16, &shootdown_pcid, addr_space_id, .release);
@@ -1628,8 +1635,8 @@ pub fn publishKernelUnmapEpoch() u64 {
     if (!@atomicLoad(bool, &remote_shootdown_armed, .acquire)) return 0;
 
     const self_id = apic.coreID();
-    lockShootdownServicingArms(@src());
-    defer shootdown_lock.unlock();
+    const irq = lockShootdownServicingArms(@src());
+    defer shootdown_lock.unlockIrqRestore(irq);
 
     @atomicStore(u8, &shootdown_kind, @intFromEnum(ShootdownKind.flush_all_global), .release);
     const gen = bumpSyncArmGen();
