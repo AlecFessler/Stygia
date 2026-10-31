@@ -916,9 +916,10 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
-            _ = dispatch.paging.unmapPageNoShootdown(
+            _ = dispatch.paging.unmapPageSizedNoShootdown(
                 addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
+                v.sz,
             );
             off += sz_bytes;
         }
@@ -932,9 +933,10 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
-            _ = dispatch.paging.unmapPageNoShootdown(
+            _ = dispatch.paging.unmapPageSizedNoShootdown(
                 addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
+                v.sz,
             );
             off += sz_bytes;
         }

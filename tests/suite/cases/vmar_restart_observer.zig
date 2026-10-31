@@ -23,6 +23,7 @@ pub const Mode = enum {
     snapshot_pf_shared,
     snapshot_demand_write,
     snapshot_multi_page_pf,
+    snapshot_mixed_page_sizes,
 };
 const CHILD_CRIPC: u8 = 0x07;
 const CONTROL_CRIPC: u8 = 0x06;
@@ -36,6 +37,8 @@ const DST: u64 = BASE + 0x3000;
 const A: u64 = 0x7134_a5c2_690d_8be1;
 const B: u64 = 0xb83e_4f16_c927_50ad;
 const OLD: u64 = 0xe291_70ab_5c43_d68f;
+const HUGE_SRC: u64 = 0x0000_1000_0020_0000;
+const HUGE_DST: u64 = HUGE_SRC + 0x200000;
 const TIMEOUT_NS: u64 = 10_000_000_000;
 const MARKER_CAPS: u16 = (caps.PortCap{ .recv = true, .restart_policy = true }).toU16();
 var worker_base: u64 = 0;
@@ -117,6 +120,35 @@ fn fault() noreturn {
     spin();
 }
 fn stage(comptime mode: Mode, cap_table_base: u64) u64 {
+    if (mode == .snapshot_mixed_page_sizes) {
+        // Leave an empty 4 KiB leaf table under the same VA. A later 2 MiB
+        // block must replace that table after its demand page is removed.
+        if (builtin.cpu.arch == .aarch64) {
+            const small = vmar(0, HUGE_SRC, true) orelse return 75;
+            word(HUGE_SRC).* = OLD;
+            if (!ok(syscall.delete(small).v1)) return 76;
+        }
+        const vc = caps.VmarCap{ .r = true, .w = true, .max_sz = 1, .restart_policy = 2 };
+        const src = handle(syscall.createVmar(vc.toU16(), 3 | (1 << 3), 1, HUGE_SRC, 0).v1) orelse return 61;
+        const pf_caps = caps.PfCap{ .r = true, .w = true, .max_sz = 1, .restart_policy = true };
+        const pf = handle(syscall.createPageFrame(pf_caps.toU16(), 1, 1).v1) orelse return 62;
+        if (!ok(syscall.mapPf(src, &.{ 0, pf }).v1)) return 63;
+        word(HUGE_SRC).* = A;
+        word(HUGE_SRC + 0x1000).* = B;
+        word(HUGE_SRC + 0x1ff000).* = OLD;
+        if (!ok(syscall.remap(src, 1).v1)) return 64;
+        if (word(HUGE_SRC).* != A or word(HUGE_SRC + 0x1000).* != B or word(HUGE_SRC + 0x1ff000).* != OLD) return 65;
+        if (!ok(syscall.unmap(src, &.{pf}).v1)) return 66;
+        if (!ok(syscall.mapPf(src, &.{ 0, pf }).v1)) return 67;
+        if (!ok(syscall.remap(src, 1).v1)) return 68;
+        if (word(HUGE_SRC).* != A or word(HUGE_SRC + 0x1000).* != B or word(HUGE_SRC + 0x1ff000).* != OLD) return 69;
+        const target = vmarPages(3, HUGE_DST, true, 512) orelse return 70;
+        word(HUGE_DST).* = 0;
+        word(HUGE_DST + 0x1000).* = 0;
+        word(HUGE_DST + 0x1ff000).* = 0;
+        if (!ok(syscall.snapshot(target, src).v1)) return 71;
+        return 0;
+    }
     if (mode == .snapshot_multi_page_pf) {
         const src = vmarPages(2, SRC_A, true, 2) orelse return 51;
         const pf = handle(syscall.createPageFrame((caps.PfCap{ .r = true, .w = true, .restart_policy = true }).toU16(), 0, 2).v1) orelse return 52;
@@ -188,7 +220,7 @@ fn verify(comptime mode: Mode, cap_table_base: u64) u64 {
         _ = vmar(0, BASE, false) orelse return 42; // reservation was freed
         return 0;
     }
-    const addr = if (mode == .decommit or mode == .preserve) BASE else DST;
+    const addr = if (mode == .decommit or mode == .preserve) BASE else if (mode == .snapshot_mixed_page_sizes) HUGE_DST else DST;
     const id = find(cap_table_base, .virtual_memory_address_region, addr) orelse return 43;
     if (!ok(syscall.sync(id).v1)) return 44;
     const cap = caps.readCap(cap_table_base, id);
@@ -199,6 +231,12 @@ fn verify(comptime mode: Mode, cap_table_base: u64) u64 {
         if (mode == .snapshot_multi_page_pf) {
             if (word(DST).* != A) return 48;
             if (word(DST + 0x1000).* != B) return 49;
+            return 0;
+        }
+        if (mode == .snapshot_mixed_page_sizes) {
+            if (word(HUGE_DST).* != A) return 72;
+            if (word(HUGE_DST + 0x1000).* != B) return 73;
+            if (word(HUGE_DST + 0x1ff000).* != OLD) return 74;
             return 0;
         }
         const expected: u64 = if (mode == .snapshot_replace) B else A;

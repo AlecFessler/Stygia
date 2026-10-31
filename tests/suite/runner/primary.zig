@@ -656,7 +656,8 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
             std.mem.eql(u8, entry.name, "snapshot_09") or
             std.mem.eql(u8, entry.name, "snapshot_10") or
             std.mem.eql(u8, entry.name, "snapshot_11") or
-            std.mem.eql(u8, entry.name, "snapshot_multi_page_pf"),
+            std.mem.eql(u8, entry.name, "snapshot_multi_page_pf") or
+            std.mem.eql(u8, entry.name, "snapshot_mixed_page_sizes"),
         .fut_wake = true,
         .reply_policy = std.mem.startsWith(u8, entry.name, "reply_restart_"),
         .pri = 3,

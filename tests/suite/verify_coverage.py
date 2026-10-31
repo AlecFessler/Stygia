@@ -71,6 +71,7 @@ NON_SPEC_TEST_FILES = {
     "process_restart_term_race.zig",
     "process_restart_persist_trigger.zig",
     "snapshot_multi_page_pf.zig",
+    "snapshot_mixed_page_sizes.zig",
     "terminate_restart_observer.zig",
     "vmar_restart_00.zig",
     "vmar_restart_01.zig",

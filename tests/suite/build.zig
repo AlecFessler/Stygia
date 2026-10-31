@@ -326,6 +326,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "snapshot_10", .path = "cases/snapshot_10.zig" },
     .{ .name = "snapshot_11", .path = "cases/snapshot_11.zig" },
     .{ .name = "snapshot_multi_page_pf", .path = "cases/snapshot_multi_page_pf.zig" },
+    .{ .name = "snapshot_mixed_page_sizes", .path = "cases/snapshot_mixed_page_sizes.zig" },
     .{ .name = "suspend_01", .path = "cases/suspend_01.zig" },
     .{ .name = "suspend_02", .path = "cases/suspend_02.zig" },
     .{ .name = "suspend_03", .path = "cases/suspend_03.zig" },

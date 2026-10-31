@@ -907,7 +907,7 @@ fn tlbiVae1is(vaddr: u64) void {
     isb();
 }
 
-/// Map a single user 4 KiB page with cache attributes drawn from the
+/// Map a user 4 KiB page or 2 MiB block with cache attributes drawn from the
 /// VMAR's `cch` field. Spec §[var] line 1444: 0=wb, 1=uc, 2=wc, 3=wt.
 ///
 /// Cache attribute selection on aarch64 uses the per-PTE `attr_indx`
@@ -924,9 +924,10 @@ pub fn mapPageSized(
     cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
-    std.debug.assert(sz == .sz_4k);
-    std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
-    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
+    std.debug.assert(sz == .sz_4k or sz == .sz_2m);
+    const page_bytes: u64 = if (sz == .sz_2m) paging.PAGE2M else paging.PAGE4K;
+    std.debug.assert(std.mem.isAligned(phys.addr, page_bytes));
+    std.debug.assert(std.mem.isAligned(virt.addr, page_bytes));
 
     if (virt.addr < FIRST_USER_PAGE) {
         // Spec §[address_space]: NULL guard `[0, 0x1000)` must always
@@ -965,7 +966,8 @@ pub fn mapPageSized(
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l3Idx(virt), l2Idx(virt), l1Idx(virt) };
-    for (walk_indices) |idx| {
+    const parent_count: usize = if (sz == .sz_2m) 2 else 3;
+    for (walk_indices[0..parent_count]) |idx| {
         const entry = &table[idx];
         if (!entry.valid) {
             const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
@@ -998,16 +1000,39 @@ pub fn mapPageSized(
                 pmm_mgr.destroy(new_page);
             }
         }
+        // A smaller page cannot be installed through an existing block.
+        // VMAR reservations prevent this in normal operation.
+        if (!entry.is_table) return error.MappingConflict;
         const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
-    const l0_entry = &table[l0Idx(virt)];
+    const leaf = &table[if (sz == .sz_2m) l1Idx(virt) else l0Idx(virt)];
     // Single-store leaf install — same transient-phys-0 hazard as the
     // parent-entry sites above.
     var filled_leaf = leaf_entry;
+    filled_leaf.is_table = sz == .sz_4k;
     filled_leaf.setPAddr(phys);
-    l0_entry.* = filled_leaf;
+    if (leaf.valid) {
+        if (sz == .sz_2m and leaf.is_table) {
+            // A previously unmapped 4 KiB region can leave its empty L3
+            // table behind. Retire it before replacing the table descriptor
+            // with a block; a live child mapping is a real conflict.
+            const old_table_virt = VAddr.fromPAddr(leaf.getPAddr(), null);
+            const old_table: *[page_entry_table_size]PageEntry = @ptrFromInt(old_table_virt.addr);
+            for (old_table) |child| if (child.valid) return error.MappingConflict;
+            leaf.* = default_page_entry;
+            tlbiVae1is(virt.addr);
+            pmm_mgr.freePage(@ptrFromInt(old_table_virt.addr));
+        } else {
+            // ARM requires break-before-make when permissions or output
+            // address change. This also evicts a cached 2 MiB translation
+            // before remap installs its new access permissions.
+            leaf.* = default_page_entry;
+            tlbiVae1is(virt.addr);
+        }
+    }
+    leaf.* = filled_leaf;
 
     // ARM ARM D5.9: after installing a new leaf entry, broadcast TLB
     // maintenance so cached "not-present" (faulting) entries from prior
@@ -1020,8 +1045,22 @@ pub fn unmapPageSized(
     virt: VAddr,
     sz: VmarPageSize,
 ) ?PAddr {
-    std.debug.assert(sz == .sz_4k);
-    return unmapPage(addr_space_root, virt);
+    if (sz == .sz_4k) return unmapPage(addr_space_root, virt);
+    std.debug.assert(sz == .sz_2m);
+    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE2M));
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+    for ([_]u9{ l3Idx(virt), l2Idx(virt) }) |idx| {
+        const entry = &table[idx];
+        if (!entry.valid or !entry.is_table) return null;
+        table = @ptrFromInt(VAddr.fromPAddr(entry.getPAddr(), null).addr);
+    }
+    const block = &table[l1Idx(virt)];
+    if (!block.valid or block.is_table) return null;
+    const phys = block.getPAddr();
+    block.* = default_page_entry;
+    tlbiVae1is(virt.addr);
+    return phys;
 }
 
 /// Allocate a fresh user-half L0 page-table root (TTBR0_EL1 will point at
@@ -1249,12 +1288,13 @@ pub fn shootdownTlbRange(
     page_count: u32,
 ) void {
     _ = addr_space_id;
-    std.debug.assert(sz == .sz_4k);
+    std.debug.assert(sz == .sz_4k or sz == .sz_2m);
+    const page_bytes: u64 = if (sz == .sz_2m) paging.PAGE2M else paging.PAGE4K;
     // ARM ARM D5.9: TLBI VAE1IS broadcasts across the inner-shareable
     // process; no IPI fan-out required (unlike x86's per-core invlpg).
     var i: u32 = 0;
     while (i < page_count) {
-        tlbiVae1is(virt.addr + @as(u64, i) * paging.PAGE4K);
+        tlbiVae1is(virt.addr + @as(u64, i) * page_bytes);
         i += 1;
     }
 }
