@@ -44,9 +44,8 @@
 //   such platforms a vCPU cannot be minted at all and the spec
 //   assertion under test (E_INVAL from suspend on a vCPU handle) is
 //   unreachable. Mirroring create_vcpu_05/_10's smoke shape, we
-//   degrade with pass-with-id-0 — the QEMU/KVM runner exposes VMX/SVM,
-//   so this branch is not expected to fire there but the degraded
-//   path keeps the test honest on no-virt rigs.
+//   skip only when the fixture declares no virtualization through
+//   -Dexpect_hv=false. On a VM-capable boot, E_NODEV is a setup failure.
 //
 // Action
 //   1. createPageFrame(caps={r,w}, props=0, pages=1) — backs VmPolicy.
@@ -64,8 +63,11 @@
 //   1: setup — any setup syscall (page frame, var, map_pf, exit port,
 //      create_vcpu, dest port) returned an error word.
 //   2: suspend did not return E_INVAL.
+//   3: the fixture promised virtualization but E_NODEV made the vCPU
+//      path unreachable.
 
 const lib = @import("lib");
+const test_environment = @import("test_environment");
 
 const caps = lib.caps;
 const errors = lib.errors;
@@ -136,6 +138,7 @@ pub fn main(cap_table_base: u64) void {
         policy_pf,
     );
     if (cvm.v1 == @intFromEnum(errors.Error.E_NODEV)) {
+        if (test_environment.expect_hv) return testing.fail(3);
         testing.pass();
         return;
     }

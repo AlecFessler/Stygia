@@ -140,10 +140,14 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // invalid target with a valid port returned E_PERM (port lacks
     // bind) instead of E_BADCAP.
     const target_slot: u12 = @truncate(target);
-    if (capability.resolveHandleOnProcess(process, target_slot, .thread) == null) {
+    const target_entry = capability.resolveHandleOnProcess(process, target_slot, .thread) orelse {
         process_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
-    }
+    };
+
+    // A valid target handle is an implicit sync operand even when a later
+    // port/capability/state gate rejects the suspension (spec test 12).
+    capability.refreshSnapshot(process, target_slot, target_entry);
 
     const port_slot: u12 = @truncate(port);
     if (capability.resolveHandleOnProcess(process, port_slot, .port) == null) {

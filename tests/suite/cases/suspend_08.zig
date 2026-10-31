@@ -25,12 +25,9 @@
 //   deleted on return from `main`.
 //
 //   The verification has two phases:
-//     1. Liveness: yield a few times, then read the heartbeat. If it
-//        is nonzero the worker is observably running. If the kernel
-//        never schedules the worker (single-core with the parent
-//        spinning, etc.) the heartbeat may stay at zero — in that
-//        case the test degrades to "suspend returned OK", which
-//        already covers the syscall-success leg of the assertion.
+//     1. Liveness: yield until the heartbeat advances. A worker that
+//        never runs cannot prove that suspend stopped execution, so
+//        failure to observe progress is a setup failure.
 //     2. Stop: call suspend(worker, port), require it returned OK, then
 //        sample the heartbeat, yield several times, sample again. If
 //        the first sample was nonzero the worker had been running; the
@@ -67,7 +64,8 @@
 //   1: createPort failed (returned an error word in vreg 1)
 //   2: setup syscall failed (create_thread returned an error)
 //   3: suspend returned non-OK
-//   4: post-suspend heartbeat advanced (worker still executing)
+//   4: worker never advanced before suspend (setup failure)
+//   5: post-suspend heartbeat advanced (worker still executing)
 
 const lib = @import("lib");
 
@@ -137,13 +135,20 @@ pub fn main(cap_table_base: u64) void {
     }
     const worker_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    // Phase 1: liveness probe. Yield a handful of times so on a
-    // single-core system the worker still gets scheduled at least
-    // once. The exact count is a heuristic — the assertion only
-    // depends on it being observably nonzero to graduate beyond
-    // the degraded smoke shape.
-    yieldN(8);
-    const c1: u64 = @atomicLoad(u64, &heartbeat, .monotonic);
+    // Establish a positive witness that this worker actually executes.
+    // A success return alone cannot establish the stop property.
+    var progressed = false;
+    for (0..4096) |_| {
+        _ = syscall.yieldThread(worker_handle);
+        if (@atomicLoad(u64, &heartbeat, .monotonic) != 0) {
+            progressed = true;
+            break;
+        }
+    }
+    if (!progressed) {
+        testing.fail(4);
+        return;
+    }
 
     // Phase 2: suspend. §[suspend]: "[1] may reference the calling thread;
     // the syscall returns after the calling thread is resumed." When [1]
@@ -165,13 +170,8 @@ pub fn main(cap_table_base: u64) void {
     yieldN(16);
     const c3: u64 = @atomicLoad(u64, &heartbeat, .monotonic);
 
-    // If the worker was never scheduled (c1 == 0), we lack a positive
-    // observation that the thread was ever executing. The suspend-OK leg
-    // above is already enforced; pass the test on the smoke shape and
-    // rely on a future scheduler-cooperative variant for the full
-    // assertion.
-    if (c1 != 0 and c3 != c2) {
-        testing.fail(4);
+    if (c3 != c2) {
+        testing.fail(5);
         return;
     }
 
