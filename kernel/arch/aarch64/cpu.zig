@@ -459,9 +459,8 @@ pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
     // receiver is parked (rendezvous wake) — at that moment the kernel
     // is still running in the sender's TTBR0, so the write must be
     // deferred to the resume path. Flush after the TTBR0 swap above and
-    // before the ERET trampoline. Spec §[event_state] vreg 14 = saved
-    // PC; on aarch64 vreg 14 is GPR-backed at x13 — write into the
-    // saved frame so ERET surfaces it. Mirrors arch/x64/interrupts.zig
+    // before the ERET trampoline. Spec §[event_state] vreg 32 is saved
+    // PC on aarch64, at [user_sp+8]. Mirrors arch/x64/interrupts.zig
     // switchTo.
     if (thread.pending_event_word_valid) {
         stygia.arch.aarch64.interrupts.writeUserSyscallWord(thread.ctx, thread.pending_event_word);

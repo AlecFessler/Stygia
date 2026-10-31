@@ -26,6 +26,8 @@
 //     (a) the kernel populated the receiver's vreg layout from W's
 //         saved state, and
 //     (b) the data really is W's RIP and not zero or the calling thread's.
+//   On AArch64 the corresponding PC is stack vreg 32 at [sp+8]. The
+//   ARM helper reads that slot and preserves its own LR around SVC.
 //   The `read=false` companion case is the subject of recv test 12;
 //   this file establishes only the positive direction.
 //
@@ -107,7 +109,7 @@ const testing = lib.testing;
 //     12 registers carry W's GPRs but we don't read them in this
 //     test — they are listed as clobbers so the compiler doesn't
 //     assume any prior value survives.
-const RecvRip = struct { v1: u64, rip: u64 };
+const RecvRip = struct { v1: u64, rip: u64, word: u64, lr: u64 = 0 };
 
 // Portable no-op entry — local to this test so we don't depend on the
 // libz testing.dummyEntry (which is x86-only `hlt`). W never executes
@@ -128,46 +130,55 @@ fn recvCaptureRipX64(port: u12) RecvRip {
     const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
+    var word_out: u64 = undefined;
 
     asm volatile (
         \\ subq $8, %%rsp        // reserve vreg-14 slot (will sit at [rsp+8] post-push)
         \\ pushq %%rcx           // store syscall word at [rsp+0]
         \\ syscall               // kernel writes vreg 14 to [rsp+8] = the reserved slot
-        \\ popq %%rcx            // discard syscall-word slot (now at original rsp - 8)
+        \\ popq %%r10            // capture returned syscall word
         \\ popq %%rbx            // pull RIP from the reserved slot into rbx
         : [v1] "={rax}" (v1_out),
           [rip] "={rbx}" (rip_out),
+          [returned_word] "={r10}" (word_out),
         : [word] "{rcx}" (word),
           [iv1] "{rax}" (@as(u64, port)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
 
-    return .{ .v1 = v1_out, .rip = rip_out };
+    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out };
 }
 
-// aarch64 ABI per spec §[syscall_abi]:
-//   vreg 0     = [sp + 0]            (syscall word)
-//   vreg 1..31 = x0..x30             (vreg 1 = x0; vreg 14 = x13)
-// Per §[event_state] the kernel writes the suspended thread's saved RIP into
-// vreg 14, which on aarch64 is register-backed at x13. We reserve 16
-// bytes (16-byte aligned) for the syscall word slot only and read x13
-// directly out of the asm.
+// aarch64 ABI per spec §[event_state]: vreg 0 is [sp+0], vregs 1..31
+// are x0..x30, and vreg 32 (the saved PC) is [sp+8]. The slot starts
+// at -1, so a missing kernel write cannot accidentally pass as zero.
 fn recvCaptureRipArm(port: u12) RecvRip {
     const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
+    var lr_out: u64 = undefined;
+    var word_out: u64 = undefined;
 
     asm volatile (
-        \\ sub sp, sp, #16
+        \\ sub sp, sp, #32
+        \\ str x30, [sp, #24]
         \\ str %[word], [sp]
+        \\ mov x13, #-1
+        \\ str x13, [sp, #8]
         \\ svc #0
-        \\ add sp, sp, #16
+        \\ mov x14, x30
+        \\ ldr x15, [sp]
+        \\ ldr x13, [sp, #8]
+        \\ ldr x30, [sp, #24]
+        \\ add sp, sp, #32
         : [v1] "={x0}" (v1_out),
           [rip] "={x13}" (rip_out),
+          [lr] "={x14}" (lr_out),
+          [returned_word] "={x15}" (word_out),
         : [word] "r" (word),
           [iv1] "{x0}" (@as(u64, port)),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
-    return .{ .v1 = v1_out, .rip = rip_out };
+    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out, .lr = lr_out };
 }
 
 fn recvCaptureRip(port: u12) RecvRip {
@@ -259,7 +270,7 @@ pub fn main(cap_table_base: u64) void {
     // immediately without blocking the caller. The kernel records W's
     // saved state, gated on this thread handle's `read`/`write` for what
     // the receiver may see/write.
-    const sus = syscall.suspendThread(w_handle, port_handle, &.{});
+    const sus = syscall.issueReg(.@"suspend", syscall.extraTstart(32), .{ .v1 = w_handle, .v2 = port_handle });
     if (sus.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -277,6 +288,7 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(4);
         return;
     }
+    if ((got.word >> 49) & 0x7F != 32) return testing.fail(7);
 
     // Step 5: probe vreg 14. W never executed past creation; per
     // §[create_thread] the kernel sets RIP to the entry we

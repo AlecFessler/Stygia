@@ -29,7 +29,7 @@
 //   would be visible if the kernel did *not* zero the vregs. With
 //   `read` denied, every vreg in the GPR window must read back as
 //   zero. We probe all 13 GPR vregs and fail on the first non-zero
-//   one. On x86-64 a second event probes stack vreg 14 (RIP) with a
+//   one. A second event probes the stack PC lane with a
 //   prefilled sentinel, so both a leaked pointer and a missing write
 //   fail. The reply_handle_id field (bits 32-43 of the syscall word)
 //   is used as a positive gate that recv took the success branch —
@@ -84,8 +84,8 @@
 //   6: at least one of vregs 1..13 (GPR window per §[event_state])
 //      was non-zero even though the suspending thread handle did not
 //      have the `read` cap — the spec line under test is violated
-//   7-9: setup or recv failed for the second x86 no-read event
-//   10: the x86 saved RIP lane was nonzero despite the absent read cap
+//   7-9: setup or recv failed for the second no-read event
+//   10: the saved RIP/PC lane was nonzero despite the absent read cap
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -97,22 +97,47 @@ const testing = lib.testing;
 
 // x86 event-state vreg 14 lives at [rsp+8] during recv. Prefill the
 // slot with -1 so both a skipped write and a leaked RIP fail the check.
-fn recvCaptureNoReadRipX64(port: u12) struct { status: u64, rip: u64 } {
+fn recvCaptureNoReadRipX64(port: u12) struct { status: u64, rip: u64, word: u64 } {
     var status: u64 = undefined;
     var rip: u64 = undefined;
+    var word: u64 = undefined;
     asm volatile (
         \\ subq $8, %%rsp
         \\ movq $-1, (%%rsp)
         \\ pushq %%rcx
         \\ syscall
-        \\ popq %%rcx
+        \\ popq %%r10
         \\ popq %%rbx
         : [status] "={rax}" (status),
           [rip] "={rbx}" (rip),
+          [returned_word] "={r10}" (word),
         : [word] "{rcx}" (@as(u64, 49)),
           [port] "{rax}" (@as(u64, port)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
-    return .{ .status = status, .rip = rip };
+        : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
+    return .{ .status = status, .rip = rip, .word = word };
+}
+
+// AArch64's saved PC is vreg 32 at [sp+8], after the syscall word.
+fn recvCaptureNoReadPcArm(port: u12) struct { status: u64, rip: u64, word: u64 } {
+    var status: u64 = undefined;
+    var pc: u64 = undefined;
+    var word: u64 = undefined;
+    asm volatile (
+        \\ sub sp, sp, #16
+        \\ str %[word], [sp]
+        \\ mov x13, #-1
+        \\ str x13, [sp, #8]
+        \\ svc #0
+        \\ ldr x15, [sp]
+        \\ ldr x13, [sp, #8]
+        \\ add sp, sp, #16
+        : [status] "={x0}" (status),
+          [pc] "={x13}" (pc),
+          [returned_word] "={x15}" (word),
+        : [word] "r" (@as(u64, 49)),
+          [port] "{x0}" (@as(u64, port)),
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x14 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+    return .{ .status = status, .rip = pc, .word = word };
 }
 
 pub fn main(cap_table_base: u64) void {
@@ -162,7 +187,7 @@ pub fn main(cap_table_base: u64) void {
     // §[suspend], when [1] is not the calling thread the call returns
     // immediately after queueing — control returns to this test thread
     // and recv on the same port can dequeue W on the next step.
-    const sus = syscall.issueReg(.@"suspend", 0, .{
+    const sus = syscall.issueReg(.@"suspend", syscall.extraTstart(13), .{
         .v1 = w_handle,
         .v2 = port_handle,
     });
@@ -180,6 +205,7 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(4);
         return;
     }
+    if (((got.word >> 49) & 0x7F) != 13) return testing.fail(11);
 
     // Step 5: positive gate. §[recv] syscall word return layout puts
     // reply_handle_id in bits 32-43. A non-zero reply_handle_id
@@ -222,17 +248,20 @@ pub fn main(cap_table_base: u64) void {
         i += 1;
     }
 
-    if (builtin.cpu.arch == .x86_64) {
-        // A fresh no-read sender gives the stack lane its own event.
-        // The first event above already proved the GPR lanes are zero.
-        const second = syscall.createThread(thread_caps_word, entry, 1, 0, 0);
-        if (testing.isHandleError(second.v1)) return testing.fail(7);
-        const second_handle: u12 = @truncate(second.v1 & 0xFFF);
-        if (syscall.suspendThread(second_handle, port_handle, &.{}).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(8);
-        const stack_state = recvCaptureNoReadRipX64(port_handle);
-        if (stack_state.status != @intFromEnum(errors.Error.OK)) return testing.fail(9);
-        if (stack_state.rip != 0) return testing.fail(10);
-    }
+    // A fresh no-read sender gives the stack lane its own event.
+    // The first event above already proved the GPR lanes are zero.
+    const second = syscall.createThread(thread_caps_word, entry, 1, 0, 0);
+    if (testing.isHandleError(second.v1)) return testing.fail(7);
+    const second_handle: u12 = @truncate(second.v1 & 0xFFF);
+    if (syscall.issueReg(.@"suspend", syscall.extraTstart(32), .{ .v1 = second_handle, .v2 = port_handle }).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(8);
+    const stack_state = switch (builtin.cpu.arch) {
+        .x86_64 => recvCaptureNoReadRipX64(port_handle),
+        .aarch64 => recvCaptureNoReadPcArm(port_handle),
+        else => @compileError("unsupported arch"),
+    };
+    if (stack_state.status != @intFromEnum(errors.Error.OK)) return testing.fail(9);
+    if (((stack_state.word >> 49) & 0x7F) != 32) return testing.fail(12);
+    if (stack_state.rip != 0) return testing.fail(10);
 
     testing.pass();
 }

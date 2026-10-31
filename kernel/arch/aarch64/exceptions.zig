@@ -624,9 +624,8 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // space. The synchronous recv path (caller dequeued a
             // queued sender without blocking) returns through this tail
             // still in the caller's TTBR0, so flush here. Spec
-            // §[event_state] vreg 14 = the suspended thread's saved PC; on
-            // aarch64 vreg 14 is GPR-backed at x13 — write it into the
-            // caller's saved frame so ERET surfaces it. Mirrors
+            // §[event_state] vreg 32 = the suspended thread's saved PC
+            // at [user_sp+8]. Mirrors
             // arch/x64/interrupts.zig syscallDispatch.
             if (caller.pending_event_word_valid and
                 scheduler.coreCurrentIsRunning(core, caller))
