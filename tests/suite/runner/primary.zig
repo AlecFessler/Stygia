@@ -541,11 +541,14 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     // kernel forwards verbatim for passed handles. So the dma+irq
     // device_region forwarded here lands on the child with the same
     // caps the runner asks for.
+    const transferable_device_fixture = std.mem.startsWith(u8, entry.name, "handle_restart_device_region_") or
+        std.mem.eql(u8, entry.name, "restart_semantics_07");
     const child_dma_irq_caps = caps.DeviceCap{
         .move = false,
-        .copy = false,
+        .copy = transferable_device_fixture,
         .dma = true,
         .irq = true,
+        .restart_policy = transferable_device_fixture,
     };
     const child_plain_caps = caps.DeviceCap{
         .move = false,
@@ -619,7 +622,21 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         (@as(u64, 0x01) << 40) |
         (port_ceiling << 48);
 
-    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
+    // These ceiling tests need a caller below the maximum granted to other
+    // cases. The one cleared subfield is the only source of their E_PERM.
+    const restart_ceiling_bit: ?u6 = blk: {
+        if (std.mem.eql(u8, entry.name, "restart_semantics_02")) break :blk 2;
+        if (std.mem.eql(u8, entry.name, "restart_semantics_03")) break :blk 4;
+        if (std.mem.eql(u8, entry.name, "restart_semantics_04")) break :blk 7;
+        if (std.mem.eql(u8, entry.name, "restart_semantics_05")) break :blk 6;
+        if (std.mem.eql(u8, entry.name, "restart_semantics_06")) break :blk 8;
+        if (std.mem.eql(u8, entry.name, "restart_semantics_07")) break :blk 5;
+        break :blk null;
+    };
+    const ceilings_outer: u64 = if (restart_ceiling_bit) |bit|
+        0x0000_003F_01FE_FFFF & ~(@as(u64, 1) << (16 + bit))
+    else
+        0x0000_003F_01FE_FFFF;
 
     const child_self = caps.SelfCap{
         .crproc = true,
@@ -632,12 +649,15 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         // child. It drops its own restart right before reporting.
         .restart = std.mem.startsWith(u8, entry.name, "process_restart_") or
             std.mem.startsWith(u8, entry.name, "vmar_restart_") or
+            std.mem.startsWith(u8, entry.name, "handle_restart_") or
+            std.mem.startsWith(u8, entry.name, "reply_restart_") or
             std.mem.eql(u8, entry.name, "snapshot_07") or
             std.mem.eql(u8, entry.name, "snapshot_08") or
             std.mem.eql(u8, entry.name, "snapshot_09") or
             std.mem.eql(u8, entry.name, "snapshot_10") or
             std.mem.eql(u8, entry.name, "snapshot_11"),
         .fut_wake = true,
+        .reply_policy = std.mem.startsWith(u8, entry.name, "reply_restart_"),
         .pri = 3,
     };
     const self_caps: u64 = @as(u64, child_self.toU16());

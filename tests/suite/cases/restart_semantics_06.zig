@@ -1,156 +1,20 @@
-// Spec §[restart_semantics] — test 06.
-//
-// "[test 06] returns E_PERM if any IPC handle minted by
-//  `create_process` (the caller's own returned handle, the
-//  new process's slot-2 self-IPC, or any `passed_handles` IPC entry)
-//  has `caps.restart_policy = 1` and the calling process's
-//  `restart_policy_ceiling.ipc_restart_max = 0`."
-//
-// Strategy (faithful)
-//   Stand up a fresh process as a sub-child via
-//   `create_process`, where the calling process (this test)
-//   has `restart_policy_ceiling.ipc_restart_max = 0`. Then:
-//     a) pass an IPC handle in `passed_handles` whose entry caps have
-//        `restart_policy = 1`; OR
-//     b) request that the caller's own returned IPC handle have
-//        `restart_policy = 1` via the IPC cap bits in [1].caps; OR
-//     c) request that the new process's slot-2 self-IPC have
-//        `restart_policy = 1` via the `cripc_ceiling` field in [2].
-//   Each of those mints triggers E_PERM under the test 06 check.
-//
-// Blocker
-//   The v0 runner (tests/suite/runner/primary.zig) hard-codes
-//   `restart_policy_ceiling.ipc_restart_max = 1` in the
-//   `ceilings_outer` it passes to every spawned test process
-//   (encoded into the 0x01FE block at bits 16-31 of word 3, with
-//   bit 24 = ipc_restart_max). The spawned test therefore runs as
-//   a calling process with `ipc_restart_max = 1`, not 0. Forcing
-//   `ipc_restart_max = 0` on this test would require either
-//     - a per-test override path in the runner (not present in v0),
-//     - or chaining a second `create_process` call where
-//       the sub-sub-process inherits `ipc_restart_max = 0`. But the
-//       test 06 check fires on the *caller's* ceiling, not on the
-//       newly-created process's ceiling, so a sub-sub-spawn does not
-//       move the gate into our reach: our ceiling stays 1 no matter
-//       how many processes we layer beneath us.
-//
-//   Until the runner exposes a per-test ceilings override (or the
-//   runner itself is split so this test can run under a tightened
-//   parent), the failure-mode assertion of test 06 is not reachable
-//   from in-process userspace code. The test in its full form is
-//   blocked on runner support, not on the kernel — the kernel-side
-//   E_PERM path is straightforward to add once the v3 implementation
-//   lands.
-//
-// Degraded smoke variant
-//   Issue a `create_process` call shaped like the test 06
-//   trigger pattern: pass a `restart_policy = 1` IPC entry in
-//   `passed_handles`, with everything else inside our ceiling. Under
-//   the v0 runner config (`ipc_restart_max = 1`) this does *not* fire
-//   the test 06 check; under a future runner that gives this test
-//   `ipc_restart_max = 0` the same call body would surface E_PERM and
-//   the assertion would flip from `OK or pre-condition setup error` to
-//   strict `E_PERM`. The smoke variant compiles, links, and exercises
-//   the syscall shape so the kernel-side dispatcher gets exercised
-//   the moment the kernel exists; it does not (and cannot) prove the
-//   spec property under v0.
-//
-// Action
-//   1. Read our self-IPC at slot 2 (minted by the runner with the IPC
-//      caps the runner allowed). This is the source IPC handle for
-//      the passed_handles entry; we hand it to the new sub-process.
-//   2. Stage a tiny, kernel-rejected ELF page frame so the call
-//      reaches the ceilings/restart_policy check before any ELF
-//      validation. v0 has no kernel implementation, so a zero-length
-//      ELF buffer is fine: the call returns whatever the v0 mock
-//      returns, which we ignore.
-//   3. Issue create_process with:
-//        - ceilings_inner / outer reduced to safe subsets of ours
-//        - elf_page_frame = a small page frame we own
-//        - passed_handles[0] = self-IPC at slot 2 with caps including
-//          IpcCap.restart_policy = 1, which is exactly the trigger
-//          for test 06 if our `ipc_restart_max` were 0.
-//   4. Report `pass()`. The smoke test does not gate on the return
-//      value because the failure mode is unreachable under v0; once
-//      the runner can configure `ipc_restart_max = 0` per test, the
-//      assertion will be strengthened to `E_PERM`.
-
+// §[restart_semantics] test 06: the caller's ipc_restart_max is zero.
+// create_process necessarily mints a caller IPC handle carrying the caller's
+// cripc_ceiling (0x27, including restart_policy=1), so it must deny the call.
 const lib = @import("lib");
-
 const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
-
-pub fn main(cap_table_base: u64) void {
-    _ = cap_table_base;
-    _ = errors;
-
-    // Build the trigger pattern: an IPC passed_handles entry whose
-    // caps include `restart_policy = 1`. The source handle id is
-    // slot 2 — the runner-minted self-IPC — which is the only IPC
-    // handle this test process owns by construction.
-    const ipc_caps = caps.IpcCap{
-        .copy = true,
-        .restart_policy = true,
-    };
-    const passed: [1]u64 = .{
-        (caps.PassedHandle{
-            .id = caps.SLOT_SELF_IPC,
-            .caps = ipc_caps.toU16(),
-            .move = false,
-        }).toU64(),
-    };
-
-    // Stage a one-page ELF buffer so we have a valid page frame to
-    // pass as [4]. The v0 mock kernel does not actually parse the
-    // ELF; under a real kernel test 15 (E_INVAL on malformed ELF)
-    // would fire after the test 06 check, so the bytes here would
-    // not gate test 06's expected failure.
-    const pf_caps_word = caps.PfCap{ .move = true, .r = true, .w = true };
-    const cpf = syscall.createPageFrame(
-        @as(u64, pf_caps_word.toU16()),
-        0,
-        1,
-    );
-    if (testing.isHandleError(cpf.v1)) {
-        // Page-frame staging failed in the v0 mock (or the kernel
-        // is unimplemented and returned an error). The smoke test
-        // cannot proceed but the build still validates by virtue of
-        // having compiled this far.
-        testing.pass();
-        return;
-    }
-    const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
-
-    // Sub-process self_caps and ceilings: tightly subset of the
-    // runner-provided ceilings. The runner gives us self caps that
-    // include crproc, crec, crvr, crpf, crvm, crpt, fut_wake,
-    // timer, pri=3 (no `restart`). We ask for self_caps
-    // = {crpt} — enough that the sub-process validates without
-    // needing rights we don't hold.
-    const sub_self = caps.SelfCap{ .crpt = true };
-    const sub_self_caps_word: u64 = @as(u64, sub_self.toU16());
-
-    // ceilings_inner: zero everything we don't need. The runner's
-    // outer view of our `ipc_rx` is opaque to us; we mirror the
-    // runner's encoded value at bits 24-31 (0x27: all IPC bits) so
-    // the new process can mint its own IPCs. All other ceilings
-    // narrow to 0 (still a subset of our ceilings).
-    const sub_ceilings_inner: u64 = 0x0000_0000_3F00_0000;
-
-    // ceilings_outer: zero `restart_policy_ceiling` so a faithful
-    // run of this test (under a runner that gave us
-    // ipc_restart_max = 0) would propagate the constraint correctly.
-    // thread_outer_ceiling/vmar_outer_ceiling/fut_wait_max all 0.
-    const sub_ceilings_outer: u64 = 0;
-
-    // Issue the call. Under v0 with ipc_restart_max = 1 this either
-    // succeeds (v3 not implemented yet) or surfaces a non-test-06
-    // error code; under a future strict-ceiling runner it returns
-    // E_PERM and the test would gate on that.
-    _ = syscall.createProcess(sub_self_caps_word, sub_ceilings_inner, sub_ceilings_outer, pf_handle, 0, // initial_thread_affinity
-        passed[0..]);
-
+pub fn main(base: u64) void {
+    const self = caps.readCap(base, caps.SLOT_SELF);
+    if (((self.field1 >> 24) & 1) != 0 or ((self.field0 >> 24) & 0x20) == 0) return testing.fail(1);
+    // A fresh zero-filled frame is deliberately not an ELF. If the ceiling
+    // check is missing, the call returns E_INVAL without spawning a child.
+    const pf = syscall.createPageFrame((caps.PfCap{ .r = true }).toU16(), 0, 1);
+    if (testing.isHandleError(pf.v1)) return testing.fail(4);
+    const elf: caps.HandleId = @truncate(pf.v1 & 0xFFF);
+    const result = syscall.createProcess(0, 0, 0, elf, 0, &.{});
+    if (result.v1 != @intFromEnum(errors.Error.E_PERM)) return testing.fail(100 + result.v1);
     testing.pass();
 }

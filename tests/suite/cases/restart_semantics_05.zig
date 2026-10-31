@@ -1,81 +1,25 @@
-// Spec §[restart_semantics] — test 05.
-//
-// "[test 05] returns E_PERM if `create_port` is called with
-//  `caps.restart_policy = 1` and the calling process's
-//  `restart_policy_ceiling.port_restart_max = 0`."
-//
-// Variant chosen: degraded positive-path smoke.
-//
-//   The faithful negative variant requires running `create_port` from a
-//   process whose `restart_policy_ceiling.port_restart_max = 0`. The
-//   ceiling is fixed on the calling process's self-handle field1 at
-//   `create_process` time and cannot be lowered post-hoc on
-//   the test thread's own self-handle. Reaching a process with that ceiling
-//   from inside this test would mean calling `create_process`
-//   with a reduced `ceilings_outer`, staging a separate ELF (or this
-//   ELF re-entered in a different mode) into a fresh page frame, and
-//   plumbing the grandchild's result back through a port — essentially
-//   recreating the runner. The runner provisions the test thread's process
-//   with `port_restart_max = 1` (see `runner/primary.zig` ceilings_outer
-//   = 0x...01FE_FFFF), so `create_port(restart_policy=1)` from this
-//   process is expected to succeed, not fail.
-//
-//   This test exercises the symmetric positive-path: when the calling
-//   process's `port_restart_max = 1`, `create_port` with
-//   `caps.restart_policy = 1` must succeed and the returned handle's
-//   caps must include the requested `restart_policy` bit. That confirms
-//   the ceiling check accepts the in-bounds case; the E_PERM negative
-//   case for `port_restart_max = 0` is left for the cross-process
-//   construction to land (same blocker as revoke_03/04/06).
-//
-// Strategy
-//   The test thread's process has `port_restart_max = 1` per the runner. Mint
-//   a port with `caps.restart_policy = 1` plus `bind` so the handle is
-//   well-formed (port caps use bitwise subset against `port_ceiling`,
-//   which the runner sets to xfer|recv|bind = 0x1C; restart_policy lives
-//   outside `port_ceiling` and is gated by the separate ceiling).
-//
-//   Read the cap back through the read-only cap table to verify the
-//   handle's installed caps carry the restart_policy bit per
-//   §[create_port] [test 04]: "on success, the caller receives a port
-//   handle with caps = `[1].caps`."
-//
-// Action
-//   1. create_port(caps={bind, restart_policy=1}) — must succeed
-//   2. readCap(cap_table_base, port) — verify caps == requested
-//
-// Assertions
-//   1: create_port returned an error word
-//   2: handle's caps field after create_port does not equal requested
-
+// §[restart_semantics] test 05: port restart ceiling is 0; requesting keep policy 1 must return E_PERM.
+// The runner narrows only this test process's relevant ceiling.
 const lib = @import("lib");
 
 const caps = lib.caps;
+const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    // `recv` is added to satisfy create_port's structural rule (must
-    // include `recv` and one of `{suspend, bind}`); the test's intent
-    // (verify the requested caps appear verbatim on the returned
-    // handle) is preserved by including `recv` in the requested set.
+    const self = caps.readCap(cap_table_base, caps.SLOT_SELF);
+    if (((self.field1 >> 22) & 1) != 0) return testing.fail(99);
+    // A well-formed port requests keep above the zero ceiling.
     const requested = caps.PortCap{
         .recv = true,
         .bind = true,
         .restart_policy = true,
     };
     const cp = syscall.createPort(@as(u64, requested.toU16()));
-    if (testing.isHandleError(cp.v1)) {
-        testing.fail(1);
-        return;
-    }
-    const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
-
-    const cap = caps.readCap(cap_table_base, port_handle);
-    if (cap.caps() != requested.toU16()) {
+    if (cp.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(2);
         return;
     }
-
     testing.pass();
 }
