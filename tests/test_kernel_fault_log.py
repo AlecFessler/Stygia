@@ -3,7 +3,7 @@
 
 import unittest
 
-from check_kernel_fault_log import unexpected_faults
+from check_kernel_fault_log import manifest_test_names, unexpected_faults
 
 
 def log(*lines: str) -> str:
@@ -22,6 +22,50 @@ PASS = "[runner] PASS breakpoint_fault_01"
 
 
 class FaultLogTests(unittest.TestCase):
+    def test_proved_restart_child_fault_on_both_architectures(self) -> None:
+        names = manifest_test_names()
+        index = names.index("process_restart_03")
+        pre = (
+            f"[pre-report-terminal] tag=0x{0x8000 | index:x} index={index:x} "
+            "process=0x0 thread=0xabc reason=unhandled_thread_fault subcode=2"
+        )
+        passed = "[runner] PASS process_restart_03"
+        self.assertEqual(unexpected_faults(log(pre, X86_FAULT, passed), "breakpoint_x86"), [])
+        self.assertEqual(unexpected_faults(log(pre, passed), "breakpoint_x86"), [])
+        self.assertEqual(unexpected_faults(log(
+            pre.replace("subcode=2", "subcode=0"), ARM_FAULT, passed,
+        ), "breakpoint_arm"), [])
+
+        rejected = (
+            log(pre),
+            log(pre, X86_FAULT),
+            log(pre, X86_FAULT, "[runner] PASS process_restart_04"),
+            log(passed, pre, X86_FAULT),
+            log(pre, passed, X86_FAULT),
+            log(pre.replace(f"tag=0x{0x8000 | index:x}", "tag=0x8000"), X86_FAULT, passed),
+            log(pre.replace(f"index={index:x}", "index=0"), X86_FAULT, passed),
+            log(pre.replace("thread=0xabc", "thread=0xdef"), X86_FAULT, passed),
+            log(pre.replace("subcode=2", "subcode=0"), X86_FAULT, passed),
+            log(pre, X86_FAULT, "[runner] === run 2/2 ===", passed),
+        )
+        for body in rejected:
+            with self.subTest(body=body):
+                self.assertTrue(unexpected_faults(body, "breakpoint_x86"))
+
+        unrelated = names.index("reply_01")
+        unrelated_pre = (
+            f"[pre-report-terminal] tag=0x{0x8000 | unrelated:x} index={unrelated:x} "
+            "process=0x0 thread=0xabc reason=unhandled_thread_fault subcode=2"
+        )
+        self.assertTrue(unexpected_faults(log(
+            unrelated_pre, X86_FAULT, "[runner] PASS reply_01",
+        ), "breakpoint_x86"))
+        # A print-budget-exhausted, untagged fault still emits the raw
+        # marker and must fail even when every known restart test passed.
+        self.assertTrue(unexpected_faults(log(
+            pre, passed, "[UNHANDLED] thread_fault thread=0xdef subcode=2 payload=0x1",
+        ), "breakpoint_x86"))
+
     def test_proved_breakpoint_fault_on_both_architectures(self) -> None:
         self.assertEqual(unexpected_faults(log(PRE, X86_FAULT, PASS), "breakpoint_x86"), [])
         self.assertEqual(unexpected_faults(log(ARM_PRE, ARM_FAULT, PASS), "breakpoint_arm"), [])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report kernel faults in a runner serial log, with one proved test exception."""
+"""Report kernel faults in a runner serial log, allowing proved child faults."""
 
 import argparse
 from pathlib import Path
@@ -15,18 +15,36 @@ UNHANDLED = re.compile(
     r"\[UNHANDLED\] thread_fault thread=(0x[0-9a-f]+) "
     r"subcode=([0-9a-f]+)(?: |$)"
 )
-PASS = "[runner] PASS breakpoint_fault_01"
+PASS = re.compile(r"^\[runner\] PASS ([A-Za-z0-9_]+)$")
 MODES = {"none": None, "breakpoint_x86": "2", "breakpoint_arm": "0"}
 
+# These observers deliberately use INT3/BRK in a nested process and report
+# PASS only after the parent has witnessed the specified restart or teardown.
+# The tag check below binds each fault to its exact manifest test, so a fault
+# from any other suite entry still fails the gate.
+RESTART_FAULT_TESTS = frozenset({
+    "handle_restart_page_frame_drop", "handle_restart_page_frame_keep",
+    "handle_restart_device_region_drop", "handle_restart_device_region_keep",
+    "handle_restart_port_drop", "handle_restart_port_keep",
+    "handle_restart_virtual_machine_drop", "handle_restart_virtual_machine_keep",
+    "handle_restart_ipc_drop", "handle_restart_ipc_keep",
+    "reply_restart_drop", "reply_restart_keep",
+    "process_restart_01", "process_restart_03", "process_restart_04",
+    "process_restart_05", "process_restart_06",
+    "vmar_restart_00", "vmar_restart_01", "vmar_restart_02",
+    "vmar_restart_03", "vmar_restart_pf_shared",
+    "snapshot_07", "snapshot_08", "snapshot_09", "snapshot_10", "snapshot_11",
+})
+EXPECTED_FAULT_TESTS = RESTART_FAULT_TESTS | {"breakpoint_fault_01"}
 
-def first_manifest_test() -> str | None:
+
+def manifest_test_names() -> list[str]:
     manifest = Path(__file__).parent / "suite" / "build.zig"
     body = manifest.read_text()
     entries = body.split("const test_entries = [_]TestEntry{", 1)
     if len(entries) != 2:
-        return None
-    match = re.search(r'\.name\s*=\s*"([^"]+)"', entries[1])
-    return match.group(1) if match else None
+        return []
+    return re.findall(r'\.name\s*=\s*"([^"]+)"', entries[1].split("};", 1)[0])
 
 
 def unexpected_faults(body: str, mode: str) -> list[str]:
@@ -34,7 +52,7 @@ def unexpected_faults(body: str, mode: str) -> list[str]:
     lines = body.replace("~", "").splitlines()
     run = 0
     fault_terminals: list[tuple[int, int, str, str, str, str, str]] = []
-    passes: dict[int, list[int]] = {}
+    passes: dict[int, dict[str, list[int]]] = {}
     faults: list[tuple[int, int, str]] = []
     bad: list[str] = []
 
@@ -50,18 +68,21 @@ def unexpected_faults(body: str, mode: str) -> list[str]:
                 fault_terminals.append((run, number, line, tag, index, thread, subcode))
             else:
                 bad.append(line)
-        if line == PASS:
-            passes.setdefault(run, []).append(number)
+        if match := PASS.match(line):
+            passes.setdefault(run, {}).setdefault(match.group(1), []).append(number)
         if "[UNHANDLED]" in line:
             faults.append((run, number, line))
 
     expected_subcode = MODES[mode]
-    manifest_matches = first_manifest_test() == "breakpoint_fault_01"
+    manifest = manifest_test_names()
     matched_faults: set[int] = set()
     for fault_run, number, line, tag, index, thread, subcode in fault_terminals:
-        later_passes = [entry for entry in passes.get(fault_run, []) if entry > number]
-        if (expected_subcode is None or not manifest_matches or tag != "8000" or index != "0"
-                or subcode != expected_subcode or not later_passes):
+        test_index = int(index, 16)
+        test_name = manifest[test_index] if test_index < len(manifest) else None
+        later_passes = [entry for entry in passes.get(fault_run, {}).get(test_name, []) if entry > number]
+        if (expected_subcode is None or test_name not in EXPECTED_FAULT_TESTS
+                or int(tag, 16) != (0x8000 | test_index) or subcode != expected_subcode
+                or not later_passes):
             bad.append(line)
             continue
         pass_at = later_passes[0]
