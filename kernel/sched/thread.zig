@@ -85,7 +85,10 @@ pub var inline_finalize_no: u64 = 0;
 var report_enter_prints: u32 = 0;
 const REPORT_TAG_MAGIC: u64 = 0x8000;
 const REPORT_PRINT_BUDGET: u32 = 4096;
-const PRE_REPORT_TERMINAL_PRINT_BUDGET: u32 = 64;
+// A full Pi gate runs the manifest three times in one boot. The restart
+// observers alone emit more than 64 proved child-fault records across those
+// runs, so retain a bounded record for every expected fault.
+const PRE_REPORT_TERMINAL_PRINT_BUDGET: u32 = 256;
 var pre_report_terminal_prints: u32 = 0;
 pub const PRE_REPORT_TERMINAL_RING_LEN: usize = if (build_options.kernel_spawn_diag) 32 else 0;
 pub const SPAWN_TRACE_RING_LEN: usize = if (build_options.kernel_spawn_diag) 128 else 0;
@@ -168,17 +171,17 @@ pub fn printPreReportTerminal(
     process: ?*Process,
     reason: []const u8,
     fault_subcode: ?u8,
-) void {
-    if (!build_options.kernel_spawn_diag) return;
+) bool {
+    if (!build_options.kernel_spawn_diag) return false;
     if (thread) |e| {
-        if (e.diag_report_entered) return;
+        if (e.diag_report_entered) return false;
     }
     const tag: u64 = blk: {
         if (thread) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
         if (process) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
         break :blk 0;
     };
-    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+    if ((tag & REPORT_TAG_MAGIC) == 0) return false;
 
     recordSpawnTrace(thread, process, .terminal, 0);
 
@@ -192,7 +195,7 @@ pub fn printPreReportTerminal(
     slot.thread = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
     slot.reason = reason;
     slot.publish_seq.store(seq, .release);
-    if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return;
+    if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return false;
 
     const process_addr = if (process) |d| @intFromPtr(d) else @as(usize, 0);
     const thread_addr = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
@@ -209,6 +212,7 @@ pub fn printPreReportTerminal(
             .{ tag, tag - REPORT_TAG_MAGIC, process_addr, thread_addr, reason },
         );
     }
+    return true;
 }
 
 pub fn recordSpawnTrace(

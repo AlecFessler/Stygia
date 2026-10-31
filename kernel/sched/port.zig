@@ -1482,7 +1482,13 @@ fn reportUnhandledFault(
     subcode: u8,
     payload: u64,
 ) void {
-    thread_mod.printPreReportTerminal(thread, null, terminal_reason, subcode);
+    const structured = thread_mod.printPreReportTerminal(thread, null, terminal_reason, subcode);
+    // The structured record is locked and contains the test tag, thread,
+    // reason, and subcode in one line. The raw duplicate below writes many
+    // fragments without a serial lock and can corrupt other cores' records.
+    // Keep it for faults with no structured record (including print-budget
+    // exhaustion) so the gate still sees every unproved fault it can log.
+    if (structured) return;
     const n = @atomicRmw(u32, &unhandled_prints, .Add, 1, .monotonic);
     if (n >= UNHANDLED_PRINT_BUDGET) return;
 

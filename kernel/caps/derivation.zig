@@ -435,7 +435,7 @@ pub fn deleteAndDetach(caller_process: ErasedSlabRef, slot: u12) i64 {
         caller_process.unlockTypedIrqRestore(Process, process_lr.irq_state);
         tree_mutex.unlockIrqRestore(tree_irq);
 
-        stygia.sched.thread.printPreReportTerminal(caller_thread, process, "delete_slot_self", null);
+        _ = stygia.sched.thread.printPreReportTerminal(caller_thread, process, "delete_slot_self", null);
 
         if (exit_decision != .already_claimed) {
             stygia.sched.scheduler.queueCurrentTeardown(.{
