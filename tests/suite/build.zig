@@ -83,6 +83,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_page_frame_08", .path = "cases/create_page_frame_08.zig" },
     .{ .name = "create_page_frame_09", .path = "cases/create_page_frame_09.zig" },
     .{ .name = "create_page_frame_10", .path = "cases/create_page_frame_10.zig" },
+    .{ .name = "create_page_frame_1g_limit", .path = "cases/create_page_frame_1g_limit.zig" },
     .{ .name = "create_port_01", .path = "cases/create_port_01.zig" },
     .{ .name = "create_port_02", .path = "cases/create_port_02.zig" },
     .{ .name = "create_port_03", .path = "cases/create_port_03.zig" },

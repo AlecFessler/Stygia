@@ -1622,7 +1622,7 @@ create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
 
 **E_INVAL** — `[3] pages = 0`; `caps.max_sz = 3` (reserved); `props.sz = 3` (reserved); `props.sz` exceeds `caps.max_sz`; reserved bits set in `[1]` or `[2]`.
 
-**E_NOMEM** — insufficient physical memory.
+**E_NOMEM** — no contiguous physical allocation is available for the requested size, including requests larger than the physical allocator's maximum block.
 
 **E_FULL** — caller's handle table has no free slot.
 
