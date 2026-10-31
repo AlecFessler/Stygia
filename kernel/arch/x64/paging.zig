@@ -507,8 +507,20 @@ inline fn waitForShootdownAcks(expected_gen: u64, self_id: u64, core_count: u64)
     var i: u64 = 0;
     while (i < core_count) : (i += 1) {
         if (i == self_id) continue;
+        var spins_since_ipi: u32 = 0;
         while (@atomicLoad(u64, &core_acked_gen[i], .acquire) < expected_gen) {
             stygia.utils.spin_diag.note(.shootdown_ack, i);
+            spins_since_ipi += 1;
+            if (spins_since_ipi == 1_000_000) {
+                // The descriptor stays fixed while we hold shootdown_lock,
+                // and duplicate IPIs are idempotent. Re-poke a core whose
+                // first IPI was missed or deferred rather than waiting for
+                // an unrelated interrupt to service the arm. Keep the retry
+                // bounded to one per million pauses to avoid an IPI storm
+                // while a remote core has interrupts masked.
+                apic.sendIpi(@intCast(apic.lapics.?[i].apic_id), @intFromEnum(interrupts.IntVecs.tlb_shootdown));
+                spins_since_ipi = 0;
+            }
             asm volatile ("pause" ::: .{ .memory = true });
         }
     }
