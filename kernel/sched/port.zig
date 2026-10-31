@@ -2096,7 +2096,9 @@ fn deliverEvent(
     const target_ctx = receiver.iret_frame orelse receiver.ctx;
     receiver.pending_event_word = ret_word;
     receiver.pending_event_word_valid = true;
-    receiver.pending_event_rip = sender.event_rip;
+    // The instruction pointer is an event-state lane too. A receiver
+    // without the originating handle's read cap must not see it.
+    receiver.pending_event_rip = if (sender.originating_read_cap) sender.event_rip else 0;
     receiver.pending_event_rip_valid = true;
     _ = event_addr;
     if (sender.originating_read_cap) {
