@@ -37,8 +37,8 @@
 //       port_B.
 //     - Test thread mints a page frame whose handle rides as the single
 //       pair entry attached to the W-resume side. Page frame is a
-//       non-IDC type, so the install caps land verbatim — no
-//       idc_rx intersection to disentangle (matches
+//       non-IPC type, so the install caps land verbatim — no
+//       ipc_rx intersection to disentangle (matches
 //       reply_transfer_12.zig's reasoning).
 //     - W and the test thread share a process, so the kernel-chosen
 //       tstart slot is visible to us through the read-only cap
@@ -120,7 +120,7 @@ const EVENT_TYPE_SUSPENSION: u8 = 4;
 // Caps minted on the page frame whose handle we attach via the pair
 // entry. Captured at module scope so the post-resume verification can
 // confirm the kernel installed the handle "verbatim" per
-// §[handle_attachments] (page_frame is a non-IDC type, so no idc_rx
+// §[handle_attachments] (page_frame is a non-IPC type, so no ipc_rx
 // intersection is applied — caps land exactly as written).
 const ATTACH_PF_CAPS: caps.PfCap = .{ .move = true, .r = true, .w = true };
 
@@ -234,7 +234,7 @@ pub fn main(cap_table_base: u64) void {
     const port_b: HandleId = @truncate(cp_b.v1 & 0xFFF);
 
     // 3. Mint the page frame attached as the single pair entry. A
-    //    page frame is a non-IDC type, so the receiver's idc_rx does
+    //    page frame is a non-IPC type, so the receiver's ipc_rx does
     //    NOT mask the entry's caps — they land verbatim, which is the
     //    branch we assert in step 11 (matches reply_transfer_12.zig).
     const cpf = syscall.createPageFrame(
@@ -389,7 +389,7 @@ pub fn main(cap_table_base: u64) void {
 
     // The next N=1 slot at S=tstart in the resumed thread's process (== ours)
     // must hold the inserted page_frame handle with caps verbatim
-    // (no idc_rx intersection — page_frame is non-IDC).
+    // (no ipc_rx intersection — page_frame is non-IPC).
     const installed = caps.readCap(cap_table_base, @as(u32, w_tstart));
     if (installed.handleType() != .page_frame or
         installed.caps() != ATTACH_PF_CAPS.toU16())

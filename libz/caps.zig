@@ -138,8 +138,8 @@ pub const SelfCap = packed struct(u16) {
     }
 };
 
-// §[process] IDC handle cap bits.
-pub const IdcCap = packed struct(u16) {
+// §[process] IPC handle cap bits.
+pub const IpcCap = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     crec: bool = false,
@@ -147,7 +147,7 @@ pub const IdcCap = packed struct(u16) {
     restart_policy: bool = false,
     _reserved: u10 = 0,
 
-    pub fn toU16(self: IdcCap) u16 {
+    pub fn toU16(self: IpcCap) u16 {
         return @bitCast(self);
     }
 };
@@ -287,5 +287,5 @@ pub const PairEntry = packed struct(u64) {
 // (§[process] / §[create_process]).
 pub const SLOT_SELF: HandleId = 0;
 pub const SLOT_INITIAL_THREAD: HandleId = 1;
-pub const SLOT_SELF_IDC: HandleId = 2;
+pub const SLOT_SELF_IPC: HandleId = 2;
 pub const SLOT_FIRST_PASSED: HandleId = 3;

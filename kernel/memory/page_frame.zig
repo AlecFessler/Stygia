@@ -361,7 +361,7 @@ fn selfHandleLacksCrpf(thread: *Thread) bool {
 /// §[process] Self handle — pf_ceiling lives at field0 bits
 /// 40..47 with `max_rwx` at bits 40..42 and `max_sz` at bits 43..44.
 /// (Self-handle field0 differs from [2] ceilings_inner: it inserts
-/// idc_rx at bits 32..39, shifting pf/vm/port ceilings up by 8.)
+/// ipc_rx at bits 32..39, shifting pf/vm/port ceilings up by 8.)
 fn rwxIsSubsetOfCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
     const process = callerProcess(thread);
     const self_field0 = process.user_table[0].field0;
@@ -375,7 +375,7 @@ fn rwxIsSubsetOfCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
 /// Spec §[create_page_frame] test 03: returns E_PERM if `caps.max_sz`
 /// exceeds the caller's `pf_ceiling.max_sz`. Stored in self-handle
 /// field0 bits 43..44 per §[process] layout (shifted by 8
-/// vs the [2] ceilings_inner layout to make room for idc_rx).
+/// vs the [2] ceilings_inner layout to make room for ipc_rx).
 fn maxSzWithinCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
     const process = callerProcess(thread);
     const self_field0 = process.user_table[0].field0;

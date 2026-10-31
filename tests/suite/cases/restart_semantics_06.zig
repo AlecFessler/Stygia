@@ -1,34 +1,34 @@
 // Spec §[restart_semantics] — test 06.
 //
-// "[test 06] returns E_PERM if any IDC handle minted by
+// "[test 06] returns E_PERM if any IPC handle minted by
 //  `create_process` (the caller's own returned handle, the
-//  new process's slot-2 self-IDC, or any `passed_handles` IDC entry)
+//  new process's slot-2 self-IPC, or any `passed_handles` IPC entry)
 //  has `caps.restart_policy = 1` and the calling process's
-//  `restart_policy_ceiling.idc_restart_max = 0`."
+//  `restart_policy_ceiling.ipc_restart_max = 0`."
 //
 // Strategy (faithful)
 //   Stand up a fresh process as a sub-child via
 //   `create_process`, where the calling process (this test)
-//   has `restart_policy_ceiling.idc_restart_max = 0`. Then:
-//     a) pass an IDC handle in `passed_handles` whose entry caps have
+//   has `restart_policy_ceiling.ipc_restart_max = 0`. Then:
+//     a) pass an IPC handle in `passed_handles` whose entry caps have
 //        `restart_policy = 1`; OR
-//     b) request that the caller's own returned IDC handle have
-//        `restart_policy = 1` via the IDC cap bits in [1].caps; OR
-//     c) request that the new process's slot-2 self-IDC have
-//        `restart_policy = 1` via the `cridc_ceiling` field in [2].
+//     b) request that the caller's own returned IPC handle have
+//        `restart_policy = 1` via the IPC cap bits in [1].caps; OR
+//     c) request that the new process's slot-2 self-IPC have
+//        `restart_policy = 1` via the `cripc_ceiling` field in [2].
 //   Each of those mints triggers E_PERM under the test 06 check.
 //
 // Blocker
 //   The v0 runner (tests/suite/runner/primary.zig) hard-codes
-//   `restart_policy_ceiling.idc_restart_max = 1` in the
+//   `restart_policy_ceiling.ipc_restart_max = 1` in the
 //   `ceilings_outer` it passes to every spawned test process
 //   (encoded into the 0x01FE block at bits 16-31 of word 3, with
-//   bit 24 = idc_restart_max). The spawned test therefore runs as
-//   a calling process with `idc_restart_max = 1`, not 0. Forcing
-//   `idc_restart_max = 0` on this test would require either
+//   bit 24 = ipc_restart_max). The spawned test therefore runs as
+//   a calling process with `ipc_restart_max = 1`, not 0. Forcing
+//   `ipc_restart_max = 0` on this test would require either
 //     - a per-test override path in the runner (not present in v0),
 //     - or chaining a second `create_process` call where
-//       the sub-sub-process inherits `idc_restart_max = 0`. But the
+//       the sub-sub-process inherits `ipc_restart_max = 0`. But the
 //       test 06 check fires on the *caller's* ceiling, not on the
 //       newly-created process's ceiling, so a sub-sub-spawn does not
 //       move the gate into our reach: our ceiling stays 1 no matter
@@ -44,11 +44,11 @@
 //
 // Degraded smoke variant
 //   Issue a `create_process` call shaped like the test 06
-//   trigger pattern: pass a `restart_policy = 1` IDC entry in
+//   trigger pattern: pass a `restart_policy = 1` IPC entry in
 //   `passed_handles`, with everything else inside our ceiling. Under
-//   the v0 runner config (`idc_restart_max = 1`) this does *not* fire
+//   the v0 runner config (`ipc_restart_max = 1`) this does *not* fire
 //   the test 06 check; under a future runner that gives this test
-//   `idc_restart_max = 0` the same call body would surface E_PERM and
+//   `ipc_restart_max = 0` the same call body would surface E_PERM and
 //   the assertion would flip from `OK or pre-condition setup error` to
 //   strict `E_PERM`. The smoke variant compiles, links, and exercises
 //   the syscall shape so the kernel-side dispatcher gets exercised
@@ -56,8 +56,8 @@
 //   spec property under v0.
 //
 // Action
-//   1. Read our self-IDC at slot 2 (minted by the runner with the IDC
-//      caps the runner allowed). This is the source IDC handle for
+//   1. Read our self-IPC at slot 2 (minted by the runner with the IPC
+//      caps the runner allowed). This is the source IPC handle for
 //      the passed_handles entry; we hand it to the new sub-process.
 //   2. Stage a tiny, kernel-rejected ELF page frame so the call
 //      reaches the ceilings/restart_policy check before any ELF
@@ -67,12 +67,12 @@
 //   3. Issue create_process with:
 //        - ceilings_inner / outer reduced to safe subsets of ours
 //        - elf_page_frame = a small page frame we own
-//        - passed_handles[0] = self-IDC at slot 2 with caps including
-//          IdcCap.restart_policy = 1, which is exactly the trigger
-//          for test 06 if our `idc_restart_max` were 0.
+//        - passed_handles[0] = self-IPC at slot 2 with caps including
+//          IpcCap.restart_policy = 1, which is exactly the trigger
+//          for test 06 if our `ipc_restart_max` were 0.
 //   4. Report `pass()`. The smoke test does not gate on the return
 //      value because the failure mode is unreachable under v0; once
-//      the runner can configure `idc_restart_max = 0` per test, the
+//      the runner can configure `ipc_restart_max = 0` per test, the
 //      assertion will be strengthened to `E_PERM`.
 
 const lib = @import("lib");
@@ -86,18 +86,18 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
     _ = errors;
 
-    // Build the trigger pattern: an IDC passed_handles entry whose
+    // Build the trigger pattern: an IPC passed_handles entry whose
     // caps include `restart_policy = 1`. The source handle id is
-    // slot 2 — the runner-minted self-IDC — which is the only IDC
+    // slot 2 — the runner-minted self-IPC — which is the only IPC
     // handle this test process owns by construction.
-    const idc_caps = caps.IdcCap{
+    const ipc_caps = caps.IpcCap{
         .copy = true,
         .restart_policy = true,
     };
     const passed: [1]u64 = .{
         (caps.PassedHandle{
-            .id = caps.SLOT_SELF_IDC,
-            .caps = idc_caps.toU16(),
+            .id = caps.SLOT_SELF_IPC,
+            .caps = ipc_caps.toU16(),
             .move = false,
         }).toU64(),
     };
@@ -133,19 +133,19 @@ pub fn main(cap_table_base: u64) void {
     const sub_self_caps_word: u64 = @as(u64, sub_self.toU16());
 
     // ceilings_inner: zero everything we don't need. The runner's
-    // outer view of our `idc_rx` is opaque to us; we mirror the
-    // runner's encoded value at bits 24-31 (0x27: all IDC bits) so
-    // the new process can mint its own IDCs. All other ceilings
+    // outer view of our `ipc_rx` is opaque to us; we mirror the
+    // runner's encoded value at bits 24-31 (0x27: all IPC bits) so
+    // the new process can mint its own IPCs. All other ceilings
     // narrow to 0 (still a subset of our ceilings).
     const sub_ceilings_inner: u64 = 0x0000_0000_3F00_0000;
 
     // ceilings_outer: zero `restart_policy_ceiling` so a faithful
     // run of this test (under a runner that gave us
-    // idc_restart_max = 0) would propagate the constraint correctly.
+    // ipc_restart_max = 0) would propagate the constraint correctly.
     // thread_outer_ceiling/vmar_outer_ceiling/fut_wait_max all 0.
     const sub_ceilings_outer: u64 = 0;
 
-    // Issue the call. Under v0 with idc_restart_max = 1 this either
+    // Issue the call. Under v0 with ipc_restart_max = 1 this either
     // succeeds (v3 not implemented yet) or surfaces a non-test-06
     // error code; under a future strict-ceiling runner it returns
     // E_PERM and the test would gate on that.

@@ -17,7 +17,7 @@
 //        expected=copy.field1.irq_count)` ahead of the second IRQ so
 //        the wake side of the assertion has someone to deliver to.
 //     4. A bounded-delay timing primitive (time_monotonic or a timer
-//        IDC service) so "within a bounded delay" can be asserted.
+//        IPC service) so "within a bounded delay" can be asserted.
 //
 // What's reachable on this branch
 //   None of pieces 1-4 land in this commit. The runner-fix

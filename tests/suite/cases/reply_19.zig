@@ -3,7 +3,7 @@
 // "[test 19] on success when `pair_count > 0`, the resumed thread's syscall
 //  word carries `pair_count = N` and `tstart = S`; the next N slots
 //  `[S, S+N)` in the resumed thread's process contain the inserted handles
-//  per §[handle_attachments] (caps intersected with `idc_rx` for IDC
+//  per §[handle_attachments] (caps intersected with `ipc_rx` for IPC
 //  handles, verbatim otherwise)."
 //
 // Strategy
@@ -24,8 +24,8 @@
 //       reply handle in the test thread's table and returns its slot in
 //       the recv syscall word.
 //     - The test thread issues reply with pair_count=1 and a single pair
-//       entry referencing a page frame handle (a non-IDC type so the
-//       caps land verbatim — no idc_rx intersection to disentangle).
+//       entry referencing a page frame handle (a non-IPC type so the
+//       caps land verbatim — no ipc_rx intersection to disentangle).
 //       The pair entry is in vreg 127 per §[handle_attachments]; the
 //       libz `replyTransfer` wrapper owns that high-vreg layout.
 //
@@ -42,7 +42,7 @@
 //   3. Sibling-observed pair_count == 1.
 //   4. Sibling-observed tstart S references a page_frame handle in our
 //      cap table whose caps == the entry's caps verbatim (the source
-//      was a page frame, not an IDC handle, so no intersection).
+//      was a page frame, not an IPC handle, so no intersection).
 //
 // SPEC AMBIGUITY: the spec talks about "the resumed thread's syscall word
 // `pair_count = N` and `tstart = S`" without distinguishing how the
@@ -155,7 +155,7 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: HandleId = @truncate(cp.v1 & 0xFFF);
 
     // 2. Mint the page frame whose handle we'll attach as a pair entry.
-    //    A page frame is a non-IDC type, so the receiver's `idc_rx`
+    //    A page frame is a non-IPC type, so the receiver's `ipc_rx`
     //    does NOT mask the entry's caps — they land verbatim, which is
     //    the branch we want to assert in test 19.
     const cpf = syscall.createPageFrame(
@@ -293,8 +293,8 @@ pub fn main(cap_table_base: u64) void {
     // 8. The next N=1 slots starting at S=tstart in the resumed thread's
     //    process (== ours) must hold the inserted handles. For our
     //    page-frame entry, the install caps are the entry's caps
-    //    verbatim (no idc_rx intersection because page_frame is not an
-    //    IDC handle type).
+    //    verbatim (no ipc_rx intersection because page_frame is not an
+    //    IPC handle type).
     const installed = caps.readCap(cap_table_base, @as(u32, tstart));
     if (installed.handleType() != .page_frame or
         installed.caps() != ATTACH_PF_CAPS.toU16())

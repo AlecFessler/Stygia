@@ -23,9 +23,9 @@
 //   word whose pair_count, tstart, and reply_handle_id are populated.
 //
 //   For the source handle S we mint a fresh port and use a strict-
-//   subset cap pattern in the pair entry. Picking a non-IDC source
+//   subset cap pattern in the pair entry. Picking a non-IPC source
 //   keeps the post-condition simple: per §[handle_attachments],
-//   "caps = entry.caps intersected with `idc_rx` for IDC handles, or
+//   "caps = entry.caps intersected with `ipc_rx` for IPC handles, or
 //   entry.caps verbatim for other handle types" — so the inserted
 //   handle's caps must equal the entry caps verbatim. We use move = 0
 //   (copy), which requires the source's `copy` cap (§[handle_attachments]
@@ -217,7 +217,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint the source handle S. We pick a fresh port so the
     // post-condition (§[handle_attachments] test 08: "caps =
     // entry.caps verbatim for other handle types") applies cleanly
-    // without involving idc_rx. S needs `copy` so the move=0 entry
+    // without involving ipc_rx. S needs `copy` so the move=0 entry
     // can pass §[handle_attachments] test 05. `bind` is added to
     // satisfy create_port's structural rule (must include `recv` and
     // one of `{suspend, bind}`); the entry caps subset check (test 03)
@@ -309,7 +309,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 9: per §[handle_attachments] test 08, for non-IDC handle
+    // Step 9: per §[handle_attachments] test 08, for non-IPC handle
     // types the inserted handle's caps equal entry.caps verbatim.
     if (inserted.caps() != entry_caps.toU16()) {
         testing.fail(9);

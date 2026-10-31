@@ -255,7 +255,7 @@ fn deriveInternal(
 
     // Every further entry acquire in this call (the ancestor hops, the
     // child) must skip the process whose gen-lock the parent acquire
-    // just took — the same-process shape (self-IDC capability derivation,
+    // just took — the same-process shape (self-IPC capability derivation,
     // single-process pair transfers) has parent and child in ONE process,
     // and a second blocking acquire of the same gen-lock is a
     // self-deadlock (caught by lockdep as a recursive acquire). This is

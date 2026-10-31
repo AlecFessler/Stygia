@@ -15,7 +15,7 @@
 //   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
-//     slot 2  → self-IDC
+//     slot 2  → self-IPC
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   The test then mints a small handful of additional handles for the
 //   VM staging — none of which approach the high end of the table.

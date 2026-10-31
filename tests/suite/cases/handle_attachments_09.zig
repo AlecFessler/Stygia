@@ -12,7 +12,7 @@
 //   the assertion is observable directly via `readCap` on the test
 //   thread's slot ids.
 //
-//   Source object choice: thread handles. thread handles are non-IDC and
+//   Source object choice: thread handles. thread handles are non-IPC and
 //   their caps install verbatim, matching test 08's choice. We need
 //   two distinct source slots so the move=1 / move=0 polarities can
 //   be inspected independently. Both sources are minted with

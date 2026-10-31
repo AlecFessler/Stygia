@@ -8,7 +8,7 @@
 //   conditions hold simultaneously: no bind-cap holder and no queued event. Mint a port with only the
 //   `recv` cap on the creator's own handle — no `bind` — so by
 //   construction the port has zero bind-cap holders. The caller's
-//   self-IDC and the runner's result-port handle (passed at slot 3) are
+//   self-IPC and the runner's result-port handle (passed at slot 3) are
 //   unrelated handles; they don't satisfy the keep-alive
 //   conditions for the freshly created port. No sender has suspended
 //   on it, so the queue is empty.

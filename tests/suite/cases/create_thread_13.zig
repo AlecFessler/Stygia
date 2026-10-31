@@ -11,7 +11,7 @@
 //   To isolate the success-path priority assertion we must:
 //     - have `crec` on the self-handle (granted by the runner; see
 //       runner/primary.zig SelfCap)
-//     - keep target = 0 (self) so the outer-ceiling and IDC paths are
+//     - keep target = 0 (self) so the outer-ceiling and IPC paths are
 //       all bypassed (tests 02, 04, 05, 07 cannot fire)
 //     - keep caps a strict subset of `thread_inner_ceiling` (test 03 OK)
 //     - keep priority within the caller's pri ceiling (test 06 OK).

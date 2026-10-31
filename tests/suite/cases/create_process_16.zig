@@ -219,7 +219,7 @@ pub fn main(cap_table_base: u64) void {
     // construction (see Strategy). Spec line under test mandates
     // E_INVAL.
     const result = syscall.createProcess(
-        0, // [1] caps:           self_caps=0, idc_rx=0, reserved=0
+        0, // [1] caps:           self_caps=0, ipc_rx=0, reserved=0
         0, // [2] ceilings_inner: all subset of any caller value
         0, // [3] ceilings_outer: all subset of any caller value
         pf_handle, // [4] elf_page_frame

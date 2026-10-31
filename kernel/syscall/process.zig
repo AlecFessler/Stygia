@@ -9,7 +9,7 @@ const ProcessCaps = process_mod.ProcessCaps;
 const Thread = thread_mod.Thread;
 const Word0 = capability.Word0;
 
-/// `caps` argument: self-cap bit 7 is reserved; bits 16-23 carry idc_rx;
+/// `caps` argument: self-cap bit 7 is reserved; bits 16-23 carry ipc_rx;
 /// bits 24-63 are reserved.
 const CREATE_CAPS_MASK: u64 = 0x0000_0000_00FF_FF7F;
 
@@ -21,16 +21,16 @@ const SELF_HANDLE_SLOT: u12 = 0;
 const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 
 /// Creates a new process from an ELF image carried in a page
-/// frame. The caller receives back an IDC handle to the new process.
+/// frame. The caller receives back an IPC handle to the new process.
 ///
 /// ```
 /// create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
-///   -> [1] idc_handle
+///   -> [1] ipc_handle
 ///   syscall_num = 4
 ///
 ///   [1] caps: u64 packed as
 ///     bits  0-15: self_caps          — caps on the new process's slot-0 self-handle
-///     bits 16-23: idc_rx             — new process's idc_rx (see §[process] Self handle)
+///     bits 16-23: ipc_rx             — new process's ipc_rx (see §[process] Self handle)
 ///     bits 24-63: _reserved
 ///
 ///   [2] ceilings_inner: u64 packed as (matches self-handle field0)
@@ -43,7 +43,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///                    bits 14-15: max_sz (enum)
 ///                    bit 16:     dma
 ///                    bits 17-23: _reserved
-///     bits 24-31: cridc_ceiling      — new process's cridc_ceiling (see §[process] Self handle)
+///     bits 24-31: cripc_ceiling      — new process's cripc_ceiling (see §[process] Self handle)
 ///     bits 32-39: pf_ceiling:
 ///                    bits 32-34: max_rwx (r/w/x)
 ///                    bits 35-36: max_sz (enum)
@@ -68,7 +68,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///                    bit 21:     dr_restart_max     (drop / keep)
 ///                    bit 22:     port_restart_max   (drop / keep)
 ///                    bit 23:     vm_restart_max     (drop / keep)
-///                    bit 24:     idc_restart_max    (drop / keep)
+///                    bit 24:     ipc_restart_max    (drop / keep)
 ///                    bits 25-31: _reserved
 ///     bits 32-37: fut_wait_max         — max addresses per `futex_wait_*` call (0..63); 0 disables futex wait
 ///     bits 38-63: _reserved
@@ -93,14 +93,14 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// pointer to the new process's read-only view of its capability table is
 /// passed as the first argument to the initial thread's entry point.
 ///
-/// The caller receives an IDC handle to the new process with caps = the
-/// caller's own `cridc_ceiling`. The new process's slot-2 self-IDC handle
-/// is minted with caps = the `cridc_ceiling` passed in [2]. The new
+/// The caller receives an IPC handle to the new process with caps = the
+/// caller's own `cripc_ceiling`. The new process's slot-2 self-IPC handle
+/// is minted with caps = the `cripc_ceiling` passed in [2]. The new
 /// process's slot-1 initial-thread handle is minted with caps = the new
 /// process's `thread_inner_ceiling` from [2].
 ///
 /// Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the
-/// caller's handle table has no free slot for the returned IDC handle.
+/// caller's handle table has no free slot for the returned IPC handle.
 ///
 /// [test 01] returns E_PERM if the caller's self-handle lacks `crproc`.
 /// [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
@@ -110,7 +110,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 06] returns E_PERM if `vmar_outer_ceiling` is not a subset of the caller's `vmar_outer_ceiling`.
 /// [test 07] returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
 /// [test 08] returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
-/// [test 09] returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
+/// [test 09] returns E_PERM if `cripc_ceiling` is not a subset of the caller's `cripc_ceiling`.
 /// [test 10] returns E_PERM if `pf_ceiling` is not a subset of the caller's `pf_ceiling`.
 /// [test 11] returns E_PERM if `vm_ceiling` is not a subset of the caller's `vm_ceiling`.
 /// [test 12] returns E_PERM if `port_ceiling` is not a subset of the caller's `port_ceiling`.
@@ -120,16 +120,16 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 16] returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
 /// [test 17] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
 /// [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
-/// [test 19] on success, the caller receives an IDC handle to the new process with caps = the caller's `cridc_ceiling`.
+/// [test 19] on success, the caller receives an IPC handle to the new process with caps = the caller's `cripc_ceiling`.
 /// [test 20] on success, the new process's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 /// [test 21] on success, the new process's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
-/// [test 22] on success, the new process's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
+/// [test 22] on success, the new process's handle table contains an IPC handle to itself at slot 2 with caps = the passed `cripc_ceiling`.
 /// [test 23] on success, passed handles occupy slots 3+ of the new process's handle table in the order supplied, each with the caps specified in its entry.
 /// [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 /// [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-/// [test 26] on success, the new process's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+/// [test 26] on success, the new process's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cripc_ceiling`, `ipc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
 /// [test 27] on success, the new process's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
-/// [test 28] on success, the new process's `idc_rx` in field0 is set to the value supplied in [1].
+/// [test 28] on success, the new process's `ipc_rx` in field0 is set to the value supplied in [1].
 /// [test 29] the initial thread begins executing at the entry point declared in the ELF header.
 /// [test 31] on success, the new process's initial thread has affinity equal to `[5]`.
 /// [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
@@ -193,7 +193,7 @@ pub fn createProcess(
     //   bit 21     dr_restart_max   (bool)
     //   bit 22     port_restart_max (bool)
     //   bit 23     vm_restart_max   (bool)
-    //   bit 24     idc_restart_max  (bool)
+    //   bit 24     ipc_restart_max  (bool)
     //   bits 25-31 _reserved
     // For numeric fields "exceeds" means a strict numeric greater-than;
     // for bool fields it reduces to the bitwise-superset case (a 1-bit
@@ -225,7 +225,7 @@ pub fn createProcess(
     // (or numeric ≤ for the fut_wait_max counter) of the caller's
     // corresponding self-handle field. Layout note: [2] ceilings_inner
     // is the syscall-arg shape (pf/vm/port live at bits 32-55), while
-    // self-handle field0 inserts idc_rx at bits 32-39 and shifts pf/vm/
+    // self-handle field0 inserts ipc_rx at bits 32-39 and shifts pf/vm/
     // port up by 8 bits to land at 40-63. The reads below hit the
     // field0 offsets per spec §[process] field0 layout.
     // Reserved-bit violations belong to test 17 (E_INVAL) and are
@@ -248,10 +248,10 @@ pub fn createProcess(
         return errors.E_PERM;
     }
 
-    // [test 09] cridc_ceiling: [2] bits 24-31 ⊆ field0 bits 24-31.
-    const caller_cridc_ceiling: u8 = @truncate((caller_field0 >> 24) & 0xFF);
-    const requested_cridc_ceiling: u8 = @truncate((ceilings_inner >> 24) & 0xFF);
-    if (requested_cridc_ceiling & ~caller_cridc_ceiling != 0) {
+    // [test 09] cripc_ceiling: [2] bits 24-31 ⊆ field0 bits 24-31.
+    const caller_cripc_ceiling: u8 = @truncate((caller_field0 >> 24) & 0xFF);
+    const requested_cripc_ceiling: u8 = @truncate((ceilings_inner >> 24) & 0xFF);
+    if (requested_cripc_ceiling & ~caller_cripc_ceiling != 0) {
         process_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }

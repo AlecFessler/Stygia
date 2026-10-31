@@ -22,7 +22,7 @@
 //     5. unified reply syscall with pair_count = 0 and
 //        recv_port_handle_id = 4095. Slot 4095 is guaranteed empty by
 //        the create_process table layout (slot 0 = self,
-//        1 = initial thread, 2 = self-IDC, 3+ = passed_handles), so it
+//        1 = initial thread, 2 = self-IPC, 3+ = passed_handles), so it
 //        cannot name a valid port handle. The kernel must return
 //        E_BADCAP and must NOT consume the reply handle.
 //

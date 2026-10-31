@@ -19,7 +19,7 @@
 //        bits 16-31 cleared).
 //     2. inside that child, call `create_page_frame(caps.restart_policy
 //        = 1)` and assert the return is E_PERM.
-//     3. report the result back across the IDC link.
+//     3. report the result back across the IPC link.
 //
 //   The current test infrastructure embeds each test ELF directly in
 //   the primary's manifest and spawns each as a single capability

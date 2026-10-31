@@ -101,7 +101,7 @@ pub fn main(cap_table_base: u64) void {
     // reserved bits are zero so test 17 cannot fire.
     //
     // [1] caps: minimal `crproc` only. self_caps = 0x0001 (crproc bit 0),
-    // idc_rx = 0 (bits 16-23). Subset of the runner's child_self mask,
+    // ipc_rx = 0 (bits 16-23). Subset of the runner's child_self mask,
     // which has crproc set, so test 02 cannot fire.
     const caps_word: u64 = @as(u64, (caps.SelfCap{ .crproc = true }).toU16());
 

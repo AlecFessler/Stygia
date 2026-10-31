@@ -6,7 +6,7 @@
 //   Stage a recv whose dequeued sender attached zero handles, then
 //   inspect the receiver's syscall word to confirm pair_count = 0.
 //   The sender side and the receiver side both run inside the test's
-//   own process so no IDC dance is required.
+//   own process so no IPC dance is required.
 //
 //   Setup:
 //     1. create_port(caps={bind, recv}) — the test holds the bind cap

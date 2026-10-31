@@ -20,7 +20,7 @@
 //   `create_process` time:
 //     slot 0 → self
 //     slot 1 → initial thread
-//     slot 2 → self-IDC
+//     slot 2 → self-IPC
 //     slot 3 → result port (the only passed_handle from the runner)
 //   Slot 4095 — the maximum 12-bit handle id — is therefore guaranteed
 //   to be empty (same construction used by map_pf_02 and restrict_01).

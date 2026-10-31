@@ -1,5 +1,5 @@
 //! Port — rendezvous point between a calling thread and a receiving thread,
-//! used for IDC, capability transfer, and thread event delivery.
+//! used for IPC, capability transfer, and thread event delivery.
 //! See docs/kernel/specv3.md §[port].
 //!
 //! Lifecycle invariant: a port is alive iff
@@ -1286,15 +1286,15 @@ pub fn replyTransfer(caller: *Thread, reply_handle: u64, n: u8) i64 {
         return errors.E_FULL;
     };
 
-    // Spec §[idc_rx] test 01: IDC handles delivered to the sender's
-    // process get caps ∩ sender_process.idc_rx (self-handle field0 bits 32-39).
-    const sender_idc_rx: u16 = @truncate((sender_process.user_table[0].field0 >> 32) & 0xFF);
+    // Spec §[ipc_rx] test 01: IPC handles delivered to the sender's
+    // process get caps ∩ sender_process.ipc_rx (self-handle field0 bits 32-39).
+    const sender_ipc_rx: u16 = @truncate((sender_process.user_table[0].field0 >> 32) & 0xFF);
     var k: u8 = 0;
     while (k < n) : (k += 1) {
         const stash = caller.pending_pair_entries[k];
         const target_slot: u12 = @intCast(@as(u16, tstart) + k);
         const installed_caps: u16 = if (stash.obj_type == .process)
-            stash.caps & sender_idc_rx
+            stash.caps & sender_ipc_rx
         else
             stash.caps;
         acquireTransferredHandleRef(stash, installed_caps);
@@ -1957,18 +1957,18 @@ fn deliverEvent(
             arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.E_FULL));
             return errors.E_FULL;
         };
-        // Spec §[idc_rx] test 01: when a process receives an IDC handle
-        // over IDC, the installed caps = granted ∩ receiver's idc_rx.
-        // idc_rx lives in receiver self-handle field0 bits 32-39.
-        const dom_idc_rx: u16 = @truncate((dom.user_table[0].field0 >> 32) & 0xFF);
+        // Spec §[ipc_rx] test 01: when a process receives an IPC handle
+        // over IPC, the installed caps = granted ∩ receiver's ipc_rx.
+        // ipc_rx lives in receiver self-handle field0 bits 32-39.
+        const dom_ipc_rx: u16 = @truncate((dom.user_table[0].field0 >> 32) & 0xFF);
         var k: u8 = 0;
         while (k < pair_count) {
             const entry = sender.pending_pair_entries[k];
             const target_slot: u12 = @intCast(@as(u16, tstart) + k);
-            // Spec §[idc_rx] test 01: when receiving an IDC handle over
-            // IDC, installed caps = granted ∩ receiver's idc_rx.
+            // Spec §[ipc_rx] test 01: when receiving an IPC handle over
+            // IPC, installed caps = granted ∩ receiver's ipc_rx.
             const installed_caps: u16 = if (entry.obj_type == .process)
-                entry.caps & dom_idc_rx
+                entry.caps & dom_ipc_rx
             else
                 entry.caps;
             // Spec §[handle_attachments]: refcount-lifetime types

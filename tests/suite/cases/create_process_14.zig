@@ -7,7 +7,7 @@
 //   Issue a create_process call where every other check is
 //   structured to pass:
 //     - self-handle has `crproc` (the runner grants this in primary.zig)
-//     - `self_caps` (bits 0-15 of [1]) and `idc_rx` (bits 16-23 of [1])
+//     - `self_caps` (bits 0-15 of [1]) and `ipc_rx` (bits 16-23 of [1])
 //       are 0, which is a subset of whatever the caller has (test 02)
 //     - all ceiling fields in [2] and [3] are 0, which is a subset of
 //       any caller ceiling (tests 03-12), and `restart_policy_ceiling`
@@ -39,7 +39,7 @@
 //   1. create_page_frame(caps={r,w}, props=0, pages=1)
 //      -> elf_pf_handle (must succeed)
 //   2. create_process(
-//          caps         = 0,                     // self_caps=0, idc_rx=0
+//          caps         = 0,                     // self_caps=0, ipc_rx=0
 //          ceilings_inner = 0,                   // all ceilings 0
 //          ceilings_outer = 0,                   // all ceilings 0
 //          elf_pf       = elf_pf_handle,
@@ -79,7 +79,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Single passed handle entry whose id is the maximum 12-bit slot.
     // The freshly-spawned test process's handle table only populates
-    // slots 0..3 (self, initial thread, self-IDC, result port), so slot
+    // slots 0..3 (self, initial thread, self-IPC, result port), so slot
     // HANDLE_TABLE_MAX - 1 = 4095 is empty by construction.
     const invalid_slot: caps.HandleId = @intCast(caps.HANDLE_TABLE_MAX - 1);
     const passed: [1]u64 = .{
@@ -91,7 +91,7 @@ pub fn main(cap_table_base: u64) void {
     };
 
     const result = syscall.createProcess(
-        0, // [1] self_caps=0, idc_rx=0, reserved=0
+        0, // [1] self_caps=0, ipc_rx=0, reserved=0
         0, // [2] ceilings_inner: all fields 0
         0, // [3] ceilings_outer: all fields 0 (incl. restart_policy_ceiling, fut_wait_max)
         elf_pf_handle,

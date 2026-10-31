@@ -16,7 +16,7 @@
 //   handle in this slot").
 //
 //   Mint a target thread inside the calling process (target = self, so
-//   no IDC is needed) with caps {term, spri, restart_policy = 0}:
+//   no IPC is needed) with caps {term, spri, restart_policy = 0}:
 //     - `term` lets the test thread actually terminate the target,
 //     - `spri` lets the test invoke `priority` on the thread handle,
 //     - `restart_policy = 0` (kill) keeps the target inside the

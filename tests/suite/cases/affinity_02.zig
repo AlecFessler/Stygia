@@ -28,7 +28,7 @@
 //     - restart_policy = 0 keeps the numeric restart_policy ceiling
 //       check (§[restart_semantics]) trivially satisfied.
 //     - priority = 0 stays under the priority ceiling.
-//     - target = 0 (self) avoids the IDC-target paths.
+//     - target = 0 (self) avoids the IPC-target paths.
 //
 //   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever; the test thread continues independently. No

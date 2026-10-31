@@ -232,10 +232,3 @@ export fn rand() callconv(.c) c_int {
 export fn srand(seed: c_uint) callconv(.c) void {
     rand_state = seed;
 }
-
-// arc4random — non-cryptographic; same LCG. Static-builds of LLVM's
-// hash tables only need *some* entropy; this is enough.
-export fn arc4random() callconv(.c) u32 {
-    rand_state = rand_state *% 6364136223846793005 +% 1442695040888963407;
-    return @truncate(rand_state >> 32);
-}

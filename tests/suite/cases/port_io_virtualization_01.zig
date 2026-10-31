@@ -58,7 +58,7 @@
 //      device_region.
 //   2. mapMmio(mmio_var, HANDLE_TABLE_MAX - 1) — slot 4095 is
 //      guaranteed empty by the create_process table layout
-//      (slots 0/1/2 are self / initial_thread / self_idc; passed_handles
+//      (slots 0/1/2 are self / initial_thread / self_ipc; passed_handles
 //      begin at slot 3 and the runner forwards at most the result
 //      port + ELF pf + libz pf + two mmio fixtures, so the upper
 //      slots stay empty). The call returns E_BADCAP via §[map_mmio]

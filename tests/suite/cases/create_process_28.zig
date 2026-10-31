@@ -1,6 +1,6 @@
 // Spec §[create_process] — test 28.
 //
-// "[test 28] on success, the new process's `idc_rx` in field0 is set to
+// "[test 28] on success, the new process's `ipc_rx` in field0 is set to
 //  the value supplied in [1]."
 //
 // Strategy
@@ -11,30 +11,30 @@
 //   was minted by the kernel during the same create call whose
 //   post-condition we are asserting.
 //
-//   Per §[process] Self handle, field0 lays idc_rx at bits
+//   Per §[process] Self handle, field0 lays ipc_rx at bits
 //   32-39:
 //     bits  0-7   thread_inner_ceiling
 //     bits  8-23  vmar_inner_ceiling
-//     bits 24-31  cridc_ceiling
-//     bits 32-39  idc_rx
+//     bits 24-31  cripc_ceiling
+//     bits 32-39  ipc_rx
 //     bits 40-47  pf_ceiling
 //     bits 48-55  vm_ceiling
 //     bits 56-63  port_ceiling
 //
 //   Per §[create_process] [1] caps:
 //     bits  0-15  self_caps
-//     bits 16-23  idc_rx
+//     bits 16-23  ipc_rx
 //     bits 24-63  _reserved
 //
-//   The runner supplies `idc_rx` via the [1] caps word at child-spawn
+//   The runner supplies `ipc_rx` via the [1] caps word at child-spawn
 //   time. The expected value is fixed by the runner contract — see
 //   `runner/primary.zig` `caps_word` construction. Kept as an explicit
 //   constant in this file so a runner change that drops/changes
-//   idc_rx in [1] forces this test to be re-evaluated against the
+//   ipc_rx in [1] forces this test to be re-evaluated against the
 //   actual contract rather than silently re-pinning to a moving
 //   target.
 //
-//   `idc_rx` is part of the static handle layout — it is set at
+//   `ipc_rx` is part of the static handle layout — it is set at
 //   create time and not a kernel-mutable snapshot — so a fresh
 //   `readCap` of slot 0 is authoritative without calling `sync`
 //   (cf. restrict_06.zig).
@@ -49,26 +49,26 @@
 // Assertions
 //   1: slot 0 is not a process_self handle (runner contract
 //      drift or kernel mis-installed the self-handle).
-//   2: field0[32:40] does not equal the runner-supplied idc_rx — the
+//   2: field0[32:40] does not equal the runner-supplied ipc_rx — the
 //      spec post-condition this test guards.
 //
 // Coupling note
 //   The runner currently passes [1].caps with `self_caps` populated
-//   from `caps.SelfCap{...}.toU16()` and `idc_rx` left at zero (bits
+//   from `caps.SelfCap{...}.toU16()` and `ipc_rx` left at zero (bits
 //   16-23 of the caps word = 0). If/when the runner starts passing a
-//   non-zero idc_rx, update `EXPECTED_IDC_RX` to match. The assertion
-//   semantics (slot-0 idc_rx == runner-supplied value) are stable.
+//   non-zero ipc_rx, update `EXPECTED_IPC_RX` to match. The assertion
+//   semantics (slot-0 ipc_rx == runner-supplied value) are stable.
 
 const lib = @import("lib");
 
 const caps = lib.caps;
 const testing = lib.testing;
 
-// Runner-supplied idc_rx in the [1] caps word, bits 16-23. Mirrors
+// Runner-supplied ipc_rx in the [1] caps word, bits 16-23. Mirrors
 // `runner/primary.zig`'s `self_caps` construction, which packs
-// `SelfCap.toU16()` into bits 0-15 and leaves bits 16-23 (idc_rx)
+// `SelfCap.toU16()` into bits 0-15 and leaves bits 16-23 (ipc_rx)
 // zero. If the runner contract changes, update this constant.
-const EXPECTED_IDC_RX: u8 = 0;
+const EXPECTED_IPC_RX: u8 = 0;
 
 pub fn main(cap_table_base: u64) void {
     const cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
@@ -78,9 +78,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // field0 bits 32-39 = idc_rx.
-    const idc_rx: u8 = @truncate((cap.field0 >> 32) & 0xFF);
-    if (idc_rx != EXPECTED_IDC_RX) {
+    // field0 bits 32-39 = ipc_rx.
+    const ipc_rx: u8 = @truncate((cap.field0 >> 32) & 0xFF);
+    if (ipc_rx != EXPECTED_IPC_RX) {
         testing.fail(2);
         return;
     }

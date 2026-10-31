@@ -7,7 +7,7 @@
 //   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
-//     slot 2  → self-IDC
+//     slot 2  → self-IPC
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid
@@ -15,12 +15,12 @@
 //
 //   §[suspend] test 02 says E_BADCAP fires if [2] is not a valid port
 //   handle. To exercise the [1] BADCAP gate without [2] preempting it,
-//   pass slot 2 (the self-IDC port, guaranteed valid) for [2]. The
+//   pass slot 2 (the self-IPC port, guaranteed valid) for [2]. The
 //   BADCAP gate on [1] must fire before [2] is dereferenced; the
 //   `bind` cap status of slot 2 is irrelevant once [1] is rejected.
 //
 // Action
-//   1. suspend(invalid_thread_slot, self_idc_port) — must return E_BADCAP
+//   1. suspend(invalid_thread_slot, self_ipc_port) — must return E_BADCAP
 //      because the thread slot is empty.
 //
 // Assertions
@@ -40,9 +40,9 @@ pub fn main(cap_table_base: u64) void {
     // table layout. The BADCAP gate on [1] must fire before any
     // validation of [2], so the port slot's caps are irrelevant.
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;
-    const self_idc_port: u12 = 2;
+    const self_ipc_port: u12 = 2;
 
-    const result = syscall.suspendThread(empty_slot, self_idc_port, &.{});
+    const result = syscall.suspendThread(empty_slot, self_ipc_port, &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_BADCAP)) {
         testing.fail(1);

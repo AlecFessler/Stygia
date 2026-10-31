@@ -1,18 +1,18 @@
 // Spec §[create_process] — test 19.
 //
-// "[test 19] on success, the caller receives an IDC handle to the new
-//  process with caps = the caller's `cridc_ceiling`."
+// "[test 19] on success, the caller receives an IPC handle to the new
+//  process with caps = the caller's `cripc_ceiling`."
 //
 // Strategy
-//   The post-condition concerns the caller-side IDC handle that
+//   The post-condition concerns the caller-side IPC handle that
 //   `create_process` returns in vreg 1. Per the spec text
-//   immediately above the test list and §[cridc_ceiling], that handle
-//   is minted with caps = the caller's `cridc_ceiling`, which lives at
+//   immediately above the test list and §[cripc_ceiling], that handle
+//   is minted with caps = the caller's `cripc_ceiling`, which lives at
 //   bits 24-31 of the caller's slot-0 self-handle field0.
 //
 //   The test therefore:
 //     1. Reads the caller's self-handle to extract the authoritative
-//        `cridc_ceiling` value (no hardcoding — the runner's spawn
+//        `cripc_ceiling` value (no hardcoding — the runner's spawn
 //        config is the only ground truth and may evolve).
 //     2. Stages a minimal-but-valid ELF image into a page frame so
 //        the create call has a parsable ELF and reaches the success
@@ -22,8 +22,8 @@
 //        check (tests 01-12) and every E_INVAL/E_BADCAP setup check
 //        (tests 13-18) must be cleared so the kernel reaches the
 //        success path.
-//     4. Reads the cap-table slot of the returned IDC handle and
-//        asserts its caps field equals the caller's `cridc_ceiling`.
+//     4. Reads the cap-table slot of the returned IPC handle and
+//        asserts its caps field equals the caller's `cripc_ceiling`.
 //
 //   Minimal ELF construction: one ELF64 little-endian executable
 //   header, one program header of type PT_LOAD covering the single
@@ -53,14 +53,14 @@
 // step. That is not yet wired; degraded smoke noted here.
 //
 // Action
-//   1. readCap(slot 0) — extract caller's cridc_ceiling
+//   1. readCap(slot 0) — extract caller's cripc_ceiling
 //   2. create_page_frame(1 page, r|w|x) — staging area for the ELF
 //   3. create_vmar(r|w, 1 page) and map_pf — get a writable mapping
 //   4. write minimal ELF64 header into the page
 //   5. delete the staging VMAR (mirrors primary.zig — kernel re-reads
 //      the page frame independently)
 //   6. create_process(...) with strict-subset ceilings
-//   7. readCap(returned slot) — verify caps == cridc_ceiling
+//   7. readCap(returned slot) — verify caps == cripc_ceiling
 //
 // Assertions
 //   1: readCap of slot 0 produced a non-self-handle type (sanity)
@@ -68,8 +68,8 @@
 //   3: create_vmar returned an error word
 //   4: map_pf returned non-OK
 //   5: create_process returned an error word in vreg 1
-//   6: returned IDC handle's type tag is not `process`
-//   7: returned IDC handle's caps field != caller's cridc_ceiling
+//   6: returned IPC handle's type tag is not `process`
+//   7: returned IPC handle's caps field != caller's cripc_ceiling
 
 const lib = @import("lib");
 
@@ -81,7 +81,7 @@ const testing = lib.testing;
 const Cap = caps.Cap;
 const HandleId = caps.HandleId;
 const HandleType = caps.HandleType;
-const IdcCap = caps.IdcCap;
+const IpcCap = caps.IpcCap;
 const PassedHandle = caps.PassedHandle;
 const PfCap = caps.PfCap;
 const SelfCap = caps.SelfCap;
@@ -184,7 +184,7 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     // Self-destruct stub at e_entry: invoke `delete(SLOT_SELF)` so the
     // child process tears itself down and its slab slot
     // returns to the freelist. Without this the child stays alive
-    // indefinitely (per spec §[delete] process IDC handle
+    // indefinitely (per spec §[delete] process IPC handle
     // drops do NOT terminate the bound process — only an in-process
     // delete(SLOT_SELF) does), and ~10 reps of the test runner exhaust
     // the process slab class and wedge later test batches.
@@ -265,14 +265,14 @@ fn writeU64(dst: [*]volatile u8, off: usize, v: u64) void {
 }
 
 pub fn main(cap_table_base: u64) void {
-    // 1. Read caller's self-handle to extract cridc_ceiling.
+    // 1. Read caller's self-handle to extract cripc_ceiling.
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
     if (self_cap.handleType() != .process_self) {
         testing.fail(1);
         return;
     }
-    // §[process] Self handle field0: cridc_ceiling at bits 24-31.
-    const caller_cridc_ceiling: u16 = @truncate((self_cap.field0 >> 24) & 0xFF);
+    // §[process] Self handle field0: cripc_ceiling at bits 24-31.
+    const caller_cripc_ceiling: u16 = @truncate((self_cap.field0 >> 24) & 0xFF);
 
     // 2. Create a 1-page page frame to hold the ELF.
     const pf_caps = PfCap{
@@ -330,7 +330,7 @@ pub fn main(cap_table_base: u64) void {
     //    using the exact caller ceilings (read from self-handle) keeps
     //    the test robust against runner-spawn changes.
     //
-    //    self_caps in [1] bits 0-15 plus idc_rx in bits 16-23.
+    //    self_caps in [1] bits 0-15 plus ipc_rx in bits 16-23.
     const new_self = SelfCap{
         .crproc = false,
         .crec = true,
@@ -338,13 +338,13 @@ pub fn main(cap_table_base: u64) void {
         .crpf = true,
         .crpt = true,
     };
-    const idc_rx_byte: u64 = (self_cap.field0 >> 32) & 0xFF;
-    const caps_word: u64 = @as(u64, new_self.toU16()) | (idc_rx_byte << 16);
+    const ipc_rx_byte: u64 = (self_cap.field0 >> 32) & 0xFF;
+    const caps_word: u64 = @as(u64, new_self.toU16()) | (ipc_rx_byte << 16);
 
     // ceilings_inner ([2] arg layout): build from the caller's field0
-    // (which uses §[process] Self handle layout — idc_rx at
-    // bits 32-39 between cridc and pf). Copy bits 0-31 verbatim
-    // (thread/var/cridc) and shift bits 40-63 (pf/vm/port) down by 8 to
+    // (which uses §[process] Self handle layout — ipc_rx at
+    // bits 32-39 between cripc and pf). Copy bits 0-31 verbatim
+    // (thread/var/cripc) and shift bits 40-63 (pf/vm/port) down by 8 to
     // place them at [2]-layout bits 32-55.
     const field0_low: u64 = self_cap.field0 & 0x0000_0000_FFFF_FFFF;
     const field0_pf_vm_port: u64 = (self_cap.field0 >> 40) & 0x0000_0000_00FF_FFFF;
@@ -368,21 +368,21 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // 8. The returned handle id is in vreg 1 bits 0-11. Confirm the
-    //    type tag is `process` (IDC handles to other processes
+    //    type tag is `process` (IPC handles to other processes
     //    use this type per §[capabilities] HandleType table).
-    const idc_handle: HandleId = @truncate(result.v1 & 0xFFF);
-    const idc_cap = caps.readCap(cap_table_base, idc_handle);
-    if (idc_cap.handleType() != .process) {
+    const ipc_handle: HandleId = @truncate(result.v1 & 0xFFF);
+    const ipc_cap = caps.readCap(cap_table_base, ipc_handle);
+    if (ipc_cap.handleType() != .process) {
         testing.fail(6);
         return;
     }
 
-    // 9. The post-condition: caps field equals caller's cridc_ceiling.
-    //    cridc_ceiling is an 8-bit value; the IDC cap field is 16 bits
-    //    wide. Per §[cridc_ceiling] the minted caps are exactly the
-    //    caller's cridc_ceiling, zero-extended into the cap field.
-    const got: u16 = idc_cap.caps();
-    const expected: u16 = @as(u16, caller_cridc_ceiling);
+    // 9. The post-condition: caps field equals caller's cripc_ceiling.
+    //    cripc_ceiling is an 8-bit value; the IPC cap field is 16 bits
+    //    wide. Per §[cripc_ceiling] the minted caps are exactly the
+    //    caller's cripc_ceiling, zero-extended into the cap field.
+    const got: u16 = ipc_cap.caps();
+    const expected: u16 = @as(u16, caller_cripc_ceiling);
     if (got != expected) {
         testing.fail(7);
         return;

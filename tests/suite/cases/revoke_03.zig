@@ -11,7 +11,7 @@
 //   passes a port to a grandchild via `copy`, then asserts that
 //   revoke([port]) releases the grandchild's copy. Verifying state
 //   inside a separate process from the test thread requires an end-to-end
-//   IDC round-trip (handle attachment encoding §[handle_attachments]
+//   IPC round-trip (handle attachment encoding §[handle_attachments]
 //   on suspend, then recv decoding on the test side, plus a follow-up
 //   probe of the grandchild's table). The libz suspend wrapper does not
 //   yet implement the high-vreg pair layout — `suspendThread` panics when

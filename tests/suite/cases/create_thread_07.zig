@@ -1,6 +1,6 @@
 // Spec §[create_thread] — test 07.
 //
-// "[test 07] returns E_BADCAP if [4] is nonzero and not a valid IDC
+// "[test 07] returns E_BADCAP if [4] is nonzero and not a valid IPC
 //  handle."
 //
 // Strategy
@@ -8,13 +8,13 @@
 //   `create_process` time:
 //     slot 0  → self
 //     slot 1  → initial thread
-//     slot 2  → self-IDC
+//     slot 2  → self-IPC
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   Every other slot is empty by construction. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid.
 //
-//   `[4]` is the target IDC handle: 0 means "target = self", any
-//   nonzero value must resolve to a valid IDC handle with `crec` or
+//   `[4]` is the target IPC handle: 0 means "target = self", any
+//   nonzero value must resolve to a valid IPC handle with `crec` or
 //   the kernel rejects the call. With slot 4095 (empty) the resolution
 //   itself fails before the cap check, so the kernel must return
 //   E_BADCAP per test 07. The other early-error paths are kept clean
@@ -29,7 +29,7 @@
 //     - reserved bits in [1] are zero → test 10 does not fire.
 //
 // Action
-//   create_thread(caps_word, entry, 1, invalid_idc, 0)
+//   create_thread(caps_word, entry, 1, invalid_ipc, 0)
 //
 // Assertion
 //   1: result.v1 != E_BADCAP
@@ -60,13 +60,13 @@ pub fn main(cap_table_base: u64) void {
 
     // Slot 4095 is the highest 12-bit handle id and is never populated
     // by `create_process` (only slots 0..3 are filled here).
-    const invalid_idc: u64 = caps.HANDLE_TABLE_MAX - 1;
+    const invalid_ipc: u64 = caps.HANDLE_TABLE_MAX - 1;
 
     const result = syscall.createThread(
         caps_word,
         entry,
         1,
-        invalid_idc,
+        invalid_ipc,
         0,
     );
 

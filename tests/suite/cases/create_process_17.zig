@@ -43,11 +43,11 @@
 //
 //   Branch B: reserved bit 24 of [1] (self_caps) set.
 //     Caps word low 16 bits hold a valid SelfCap subset of what the
-//     runner granted us; idc_rx (bits 16-23) zero; bit 24 is reserved.
+//     runner granted us; ipc_rx (bits 16-23) zero; bit 24 is reserved.
 //
 //   Branch C: passed_handle entry with reserved bit 12 set.
 //     Use the result port handle (slot 3) — the only handle the test
-//     process is guaranteed to have besides self/thread/IDC. Build a
+//     process is guaranteed to have besides self/thread/IPC. Build a
 //     PassedHandle equivalent encoding manually with bit 12 set.
 //
 // Assertions

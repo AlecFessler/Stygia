@@ -25,7 +25,7 @@ const CREATE_VCPU_CAPS_MASK: u64 = 0x0000_0003_0000_FFFF;
 const INJECT_IRQ_ASSERT_MASK: u64 = 0x1;
 
 /// Bit position of `vm_ceiling` within self-handle `field0`.
-/// Per §[process] Self handle layout — field0 has idc_rx at
+/// Per §[process] Self handle layout — field0 has ipc_rx at
 /// bits 32-39, so vm_ceiling occupies bits 48-55 with `policy` at bit
 /// 48 (shifted up by 8 from the [2] ceilings_inner layout).
 const VM_CEILING_FIELD0_SHIFT: u6 = 48;

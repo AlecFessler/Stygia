@@ -22,13 +22,13 @@
 //     a successful map_mmio. The successful map_mmio itself requires
 //     a *valid* device_region handle (test 02). Per §[device_region]
 //     device_region handles are kernel-issued at boot to the root
-//     service and otherwise propagate via xfer/IDC. The v0 runner
+//     service and otherwise propagate via xfer/IPC. The v0 runner
 //     (runner/primary.zig) spawns each test child with passed_handles
 //     carrying only the result port at slot 3 — no device_region is
 //     forwarded. The same `findCom1`-style scan that runner/serial.zig
 //     uses to bootstrap the primary's serial VMAR cannot succeed
 //     inside a test child, because the child's table holds self /
-//     initial_thread / self_idc / port and nothing else. So the
+//     initial_thread / self_ipc / port and nothing else. So the
 //     "first map_mmio succeeds, second map_mmio rejects" path is
 //     unreachable: the first call cannot succeed without a real
 //     device_region.

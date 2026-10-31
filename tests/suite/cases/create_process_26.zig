@@ -1,15 +1,15 @@
 // Spec §[create_process] create_process — test 26.
 //
 // "[test 26] on success, the new process's `thread_inner_ceiling`,
-//  `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`,
+//  `vmar_inner_ceiling`, `cripc_ceiling`, `ipc_rx`, `pf_ceiling`,
 //  `vm_ceiling`, and `port_ceiling` in field0 are set to the values
 //  supplied in [2] and [1]."
 //
 // Spec §[process] Self handle field0 layout:
 //   bits  0-7   thread_inner_ceiling   <- from [2] ceilings_inner bits  0-7
 //   bits  8-23  vmar_inner_ceiling  <- from [2] ceilings_inner bits  8-23
-//   bits 24-31  cridc_ceiling      <- from [2] ceilings_inner bits 24-31
-//   bits 32-39  idc_rx             <- from [1] caps           bits 16-23
+//   bits 24-31  cripc_ceiling      <- from [2] ceilings_inner bits 24-31
+//   bits 32-39  ipc_rx             <- from [1] caps           bits 16-23
 //   bits 40-47  pf_ceiling         <- from [2] ceilings_inner bits 32-39
 //   bits 48-55  vm_ceiling         <- from [2] ceilings_inner bits 40-47
 //   bits 56-63  port_ceiling       <- from [2] ceilings_inner bits 48-55
@@ -19,7 +19,7 @@
 //   new process's own address space; the parent cannot reach across the
 //   boundary to read it. We use the parent-spawn + child-probe pattern
 //   (mirrors create_process_31): the parent spawns a
-//   sub-process with a chosen set of ceiling sub-fields and idc_rx
+//   sub-process with a chosen set of ceiling sub-fields and ipc_rx
 //   byte, and the child reads its own slot-0 self-handle field0 and
 //   asserts every sub-field landed at the expected bit position.
 //
@@ -31,7 +31,7 @@
 //   own field0.
 //
 //   Cross-process `acquire_*` is not implemented in v3 for foreign
-//   IDC handles, so the assertion has to live inside the child.
+//   IPC handles, so the assertion has to live inside the child.
 //   `caps.readCap(cap_table_base, SLOT_SELF)` directly reads the
 //   read-only-mapped table at the kernel-supplied base; spec
 //   §[capabilities] guarantees this is the kernel-authoritative
@@ -43,7 +43,7 @@
 // Action
 //   parent path:
 //     1. createProcess(... ceilings_inner=CHILD_INNER,
-//        idc_rx=CHILD_IDC_RX, ...)                          — must succeed
+//        ipc_rx=CHILD_IPC_RX, ...)                          — must succeed
 //     2. return — child reports
 //   child path:
 //     1. read SLOT_SELF cap                                  — observation only
@@ -56,8 +56,8 @@
 //   child path:
 //     2: thread_inner_ceiling sub-field mismatch
 //     3: vmar_inner_ceiling sub-field mismatch
-//     4: cridc_ceiling sub-field mismatch
-//     5: idc_rx sub-field mismatch
+//     4: cripc_ceiling sub-field mismatch
+//     5: ipc_rx sub-field mismatch
 //     6: pf_ceiling sub-field mismatch
 //     7: vm_ceiling sub-field mismatch
 //     8: port_ceiling sub-field mismatch  ← any of 2..8 fail = THE SPEC ASSERTION
@@ -98,8 +98,8 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // the child halt immediately at startup (MISS).
 const CHILD_THREAD_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of thread inner caps (susp+read+write set)
 const CHILD_VMAR_INNER: u16 = 0x00BE; // strict subset of runner 0x01FF (copy|r|w|x|mmio|max_sz=2)
-const CHILD_CRIDC: u8 = 0x05; // strict subset of runner 0x27 (move|crec)
-const CHILD_IDC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
+const CHILD_CRIPC: u8 = 0x05; // strict subset of runner 0x27 (move|crec)
+const CHILD_IPC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
 const CHILD_PF_CLG: u8 = 0x0F; // strict subset of runner 0x1F (max_rwx all + max_sz=01)
 const CHILD_VM_CLG: u8 = 0x01; // matches runner 0x01 (only valid bit is bit 0 = policy)
 const CHILD_PORT_CLG: u8 = 0x14; // strict subset of runner 0x5C (recv | bind), discriminator
@@ -117,8 +117,8 @@ pub fn main(cap_table_base: u64) void {
         const f0 = self_cap.field0;
         const got_thread_inner: u8 = @truncate(f0 & 0xFF);
         const got_vmar_inner: u16 = @truncate((f0 >> 8) & 0xFFFF);
-        const got_cridc: u8 = @truncate((f0 >> 24) & 0xFF);
-        const got_idc_rx: u8 = @truncate((f0 >> 32) & 0xFF);
+        const got_cripc: u8 = @truncate((f0 >> 24) & 0xFF);
+        const got_ipc_rx: u8 = @truncate((f0 >> 32) & 0xFF);
         const got_pf_clg: u8 = @truncate((f0 >> 40) & 0xFF);
         const got_vm_clg: u8 = @truncate((f0 >> 48) & 0xFF);
         const got_port_clg: u8 = @truncate((f0 >> 56) & 0xFF);
@@ -131,11 +131,11 @@ pub fn main(cap_table_base: u64) void {
             testing.fail(3);
             return;
         }
-        if (got_cridc != CHILD_CRIDC) {
+        if (got_cripc != CHILD_CRIPC) {
             testing.fail(4);
             return;
         }
-        if (got_idc_rx != CHILD_IDC_RX) {
+        if (got_ipc_rx != CHILD_IPC_RX) {
             testing.fail(5);
             return;
         }
@@ -157,7 +157,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // ── Parent path ─────────────────────────────────────────────────
-    // Spawn a sub-process with the chosen ceiling/idc_rx mix. Self caps
+    // Spawn a sub-process with the chosen ceiling/ipc_rx mix. Self caps
     // must include `crec`/`crvr` so libz bootstrap and downstream
     // syscalls work. The runner-installed self caps are wider than
     // CHILD_THREAD_INNER and friends; what matters here is that the
@@ -169,24 +169,24 @@ pub fn main(cap_table_base: u64) void {
         .pri = 3,
     };
 
-    // [1] caps word = self_caps (low 16 bits) | idc_rx (bits 16-23).
+    // [1] caps word = self_caps (low 16 bits) | ipc_rx (bits 16-23).
     const caps_word: u64 =
         @as(u64, child_self.toU16()) |
-        (@as(u64, CHILD_IDC_RX) << 16);
+        (@as(u64, CHILD_IPC_RX) << 16);
 
     // §[create_process] [2] ceilings_inner — packed per
     // syscall ABI (NB: pf/vm/port_ceiling shift to field0 bits 40-63
-    // in the new process to make room for idc_rx at field0 bits 32-39):
+    // in the new process to make room for ipc_rx at field0 bits 32-39):
     //   bits  0-7   thread_inner_ceiling   = CHILD_THREAD_INNER
     //   bits  8-23  vmar_inner_ceiling  = CHILD_VMAR_INNER
-    //   bits 24-31  cridc_ceiling      = CHILD_CRIDC
+    //   bits 24-31  cripc_ceiling      = CHILD_CRIPC
     //   bits 32-39  pf_ceiling         = CHILD_PF_CLG
     //   bits 40-47  vm_ceiling         = CHILD_VM_CLG
     //   bits 48-55  port_ceiling       = CHILD_PORT_CLG
     const ceilings_inner: u64 =
         @as(u64, CHILD_THREAD_INNER) |
         (@as(u64, CHILD_VMAR_INNER) << 8) |
-        (@as(u64, CHILD_CRIDC) << 24) |
+        (@as(u64, CHILD_CRIPC) << 24) |
         (@as(u64, CHILD_PF_CLG) << 32) |
         (@as(u64, CHILD_VM_CLG) << 40) |
         (@as(u64, CHILD_PORT_CLG) << 48);

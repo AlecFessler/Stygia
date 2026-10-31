@@ -3,7 +3,7 @@
 // "[test 08] on recv, the receiver's syscall word `pair_count` equals
 //  `N` and the next `N` table slots `[tstart, tstart+N)` contain the
 //  inserted handles, each with caps = entry.caps intersected with
-//  `idc_rx` for IDC handles, or entry.caps verbatim for other handle
+//  `ipc_rx` for IPC handles, or entry.caps verbatim for other handle
 //  types."
 //
 // Strategy
@@ -30,9 +30,9 @@
 //   has time to insert the attachment into the receiver's table at a
 //   contiguous slot range.
 //
-//   Choice of attachment type: a thread handle, not an IDC handle. The
-//   spec line under test gives two formulations — IDC handles install
-//   with caps intersected with idc_rx, "or entry.caps verbatim for
+//   Choice of attachment type: a thread handle, not an IPC handle. The
+//   spec line under test gives two formulations — IPC handles install
+//   with caps intersected with ipc_rx, "or entry.caps verbatim for
 //   other handle types." The verbatim arm is the tighter assertion
 //   (an exact equality, no intersection sieve), and thread handles
 //   trivially fall on that arm. C is minted with caps {copy=1,
@@ -259,7 +259,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 5: build the pair entry. The entry's caps field carries
     // the caps the kernel will install verbatim on the receiver-side
-    // handle (thread, non-IDC). bits 0-11 = id, bits 16-31 = caps,
+    // handle (thread, non-IPC). bits 0-11 = id, bits 16-31 = caps,
     // bit 32 = move, all others reserved (= 0).
     const entry_caps = caps.ThreadCap{ .copy = true, .saff = true };
     const pair = caps.PairEntry{
@@ -320,7 +320,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 9: read the inserted handle and verify type + caps. thread
-    // is a non-IDC handle so caps install verbatim per the spec line
+    // is a non-IPC handle so caps install verbatim per the spec line
     // under test.
     const inserted = caps.readCap(cap_table_base, @as(u32, @intCast(tstart)));
     if (inserted.handleType() != .thread) {

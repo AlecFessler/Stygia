@@ -12,7 +12,7 @@
 //     bit  5:   dr_restart_max     (drop / keep)
 //     bit  6:   port_restart_max   (drop / keep)
 //     bit  7:   vm_restart_max     (drop / keep)
-//     bit  8:   idc_restart_max    (drop / keep)
+//     bit  8:   ipc_restart_max    (drop / keep)
 //     bits 9-15: _reserved
 //
 //   The runner (runner/primary.zig) installs ceilings_outer
@@ -77,9 +77,9 @@ pub fn main(cap_table_base: u64) void {
     // [1] caps: self_caps subset of the runner-installed self caps.
     // The runner grants the test crproc | crec | crvr | crpf | crvm |
     // crpt | fut_wake | timer | pri=3. Pick a strict subset.
-    // idc_rx (bits 16-23) is left zero — runner installs idc_rx = 0
+    // ipc_rx (bits 16-23) is left zero — runner installs ipc_rx = 0
     // implicitly (the runner's [1] is just self_caps), so any nonzero
-    // idc_rx in our call would also be a subset violation.
+    // ipc_rx in our call would also be a subset violation.
     const self_caps = caps.SelfCap{
         .crproc = true,
     };
@@ -99,7 +99,7 @@ pub fn main(cap_table_base: u64) void {
     // restart_policy_ceiling sub-field encoding:
     //   bits 0-1: thread_restart_max = 0b11 (= 3)   -> exceeds caller's 2
     //   bits 2-3: vmar_restart_max = 0           -> subset
-    //   bits 4-9: pf/dr/port/vm/idc/tm = 0      -> subsets
+    //   bits 4-9: pf/dr/port/vm/ipc/tm = 0      -> subsets
     //   bits 10-15: reserved = 0
     // = 0x0003
     const restart_policy_ceiling: u64 = 0x0003;

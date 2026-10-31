@@ -207,8 +207,8 @@ pub fn init(root_service_elf: []const u8) !void {
     // Self-handle field0 layout per §[process] Self handle:
     //   bits  0-7   thread_inner_ceiling          = 0xFF
     //   bits  8-23  vmar_inner_ceiling         = 0xFFFF
-    //   bits 24-31  cridc_ceiling             = 0x27
-    //   bits 32-39  idc_rx                    = 0x27
+    //   bits 24-31  cripc_ceiling             = 0x27
+    //   bits 32-39  ipc_rx                    = 0x27
     //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
     //   bits 48-55  vm_ceiling                = 0x01  (policy=1)
     //   bits 56-63  port_ceiling              = 0x5C  (xfer|recv|bind|suspend)

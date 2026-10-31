@@ -27,7 +27,7 @@
 //   To trigger an error after [1] passes, we pass an empty cap-table
 //   slot as [2]. Slot 4095 is guaranteed empty by the
 //   create_process table layout (slots 0/1/2 = self /
-//   initial thread / self-IDC; passed_handles begin at slot 3, and the
+//   initial thread / self-IPC; passed_handles begin at slot 3, and the
 //   primary passes only one — the result port — at slot 3). The
 //   suspend syscall then returns E_BADCAP on the [2] gate (test 02).
 //   The spec's "[1] is a valid handle" precondition for test 12 is

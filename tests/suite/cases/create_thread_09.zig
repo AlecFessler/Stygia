@@ -9,7 +9,7 @@
 //   `thread_inner_ceiling` is also wide open (0xFF in primary.zig), so a
 //   minimal ThreadCap with `restart_policy = 0` is a subset and won't trip
 //   test 03. Likewise `priority = 0` stays under the pri ceiling and
-//   `target = 0` (self) sidesteps the test 02/04/05/07 IDC paths.
+//   `target = 0` (self) sidesteps the test 02/04/05/07 IPC paths.
 //   `stack_pages = 1` keeps test 08 from firing.
 //
 //   That leaves the affinity mask as the only spec-mandated failure

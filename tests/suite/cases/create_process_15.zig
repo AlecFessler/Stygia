@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
     // and keeps every reserved field clean, dodging test 17. The
     // empty passed_handles slice avoids tests 14 and 18.
     const result = syscall.createProcess(
-        0, // caps (self_caps + idc_rx + reserved all zero)
+        0, // caps (self_caps + ipc_rx + reserved all zero)
         0, // ceilings_inner
         0, // ceilings_outer
         pf_handle,

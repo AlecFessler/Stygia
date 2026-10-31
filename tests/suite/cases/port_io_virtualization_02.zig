@@ -18,7 +18,7 @@
 //   process's table via `create_process`'s passed_handles,
 //   which on this branch carry only the result port at slot 3.
 //   Slots 0/1/2 are kernel-installed as self / initial thread /
-//   self-IDC. No device_region of any `dev_type` reaches a test
+//   self-IPC. No device_region of any `dev_type` reaches a test
 //   child today — and a port_io device_region in particular has no
 //   ambient host-platform analogue the runner could carve out.
 //

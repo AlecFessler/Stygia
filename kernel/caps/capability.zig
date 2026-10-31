@@ -56,7 +56,7 @@ pub const CapabilityType = enum(u4) {
     /// Slot 0 in every process. References the process itself (its
     /// self-handle, with the full ceiling-bearing cap word).
     process_self = 0,
-    /// IDC handle to another (or this) process.
+    /// IPC handle to another (or this) process.
     process = 1,
     thread = 2,
     page_frame = 3,
@@ -480,7 +480,7 @@ pub fn resolveHandleOnProcess(
 /// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion)
 /// call their `decHandleRef` to release their per-handle
 /// increment; process-lifetime types (thread, VMAR, VM) and
-/// system-lifetime IDC handles do not — those die only with the
+/// system-lifetime IPC handles do not — those die only with the
 /// owning process. Spec §[capabilities].delete table.
 pub fn releaseHandle(holder: *Process, slot: u12, entry: *KernelHandle) void {
     const user_entry = &holder.user_table[slot];
@@ -499,7 +499,7 @@ pub fn releaseHandle(holder: *Process, slot: u12, entry: *KernelHandle) void {
             @panic("releaseHandle on process_self: route via deleteAndDetach SLOT_SELF instead");
         },
         .process => {
-            // System-lifetime: dropping an IDC handle does not destroy
+            // System-lifetime: dropping an IPC handle does not destroy
             // the referenced process. No per-handle refcount.
         },
         .thread => {
@@ -620,7 +620,7 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
         .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
         .virtual_machine => 0b1 << 1, // VmCaps bit 1
-        .process => 0b1 << 5, // IdcCaps bit 5
+        .process => 0b1 << 5, // IpcCaps bit 5
         else => 0,
     };
 }

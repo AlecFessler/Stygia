@@ -42,12 +42,12 @@
 //
 //   Reaching the faithful observation would require either:
 //     - the runner gaining a per-test "restart-and-observe" harness:
-//       hold a self-IDC handle to the test process plus a watch on its
+//       hold a self-IPC handle to the test process plus a watch on its
 //       lifecycle, fault one of its Threads, and report whether the process
 //       reappears; or
 //     - this test spawning a sub-sub-process, embedding an inner ELF
 //       that performs the snapshot/delete/fault sequence, and reading
-//       termination back through the sub-sub-process's IDC handle (a
+//       termination back through the sub-sub-process's IPC handle (a
 //       full nested test driver — the same infrastructure that
 //       restart_semantics_04's notes call out).
 //
@@ -95,7 +95,7 @@
 //
 // Faithful-test note
 //   Faithful test deferred pending a runner-side restart-observability
-//   harness: a parent that holds a self-IDC handle to the test process,
+//   harness: a parent that holds a self-IPC handle to the test process,
 //   triggers the test process's restart (e.g., by faulting one of its
 //   Threads whose self-handle has the `restart` cap), and reports back
 //   whether the process restarted or was terminated. With that, the

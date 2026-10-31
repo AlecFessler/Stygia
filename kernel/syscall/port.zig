@@ -257,7 +257,7 @@ fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
         // handle's current caps. Bitwise subset suffices for every
         // cap type that ships through pair entries today (port,
         // thread, page_frame, var, device_region, timer,
-        // process IDC) — none of them carry the 2-bit
+        // process IPC) — none of them carry the 2-bit
         // restart_policy enum that `restrict` special-cases.
         if (entry_caps & ~src_caps != 0) {
             thread.pending_pair_count = @intCast(i);
@@ -293,7 +293,7 @@ fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
         // across the suspend → recv rendezvous; the at-recv
         // mintHandleAlwaysNew installs a fresh slot in the receiver
         // process with the entry's caps verbatim (or intersected with
-        // idc_rx for IDC handles, when that path is wired).
+        // ipc_rx for IPC handles, when that path is wired).
         const obj_type = Word0.typeTag(process.user_table[slot].word0);
         thread.pending_pair_entries[i] = .{
             .obj_ref = handle.ref,

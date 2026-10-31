@@ -25,7 +25,7 @@
 //      child process via `create_process`'s
 //      `passed_handles`, which on this branch carry only the
 //      result port at slot 3 — slots 0/1/2 are kernel-installed as
-//      self / initial thread / self-IDC. Without a port_io
+//      self / initial thread / self-IPC. Without a port_io
 //      device_region in [2] the kernel rejects `map_mmio` at
 //      §[map_mmio] test 02 (E_BADCAP) before the port_io install
 //      path ever runs, so no MMIO VMAR has a port_io range to

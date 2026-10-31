@@ -600,7 +600,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     // Spec §[create_process] [2] ceilings_inner field layout:
     //   bits  0-7   thread_inner_ceiling   = 0xFF
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF
-    //   bits 24-31  cridc_ceiling      = 0x27
+    //   bits 24-31  cripc_ceiling      = 0x27
     //   bits 32-39  pf_ceiling         = 0x1F   (max_rwx | max_sz)
     //   bits 40-47  vm_ceiling         = 0x01   (policy bit)
     //   bits 48-55  port_ceiling       = 0x5C   (xfer | recv | bind | suspend)
@@ -673,13 +673,13 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     //     `incHandleRef` on alias the PF refcount is 2 here, so dropping
     //     the runner side leaves the child's reference at 1 and the PF
     //     stays alive until the child's process destroys.
-    //   - idc_handle (returned slot in r.v1 low 12 bits): the runner
-    //     never sends IDCs to children, so it doesn't need this handle
+    //   - ipc_handle (returned slot in r.v1 low 12 bits): the runner
+    //     never sends IPCs to children, so it doesn't need this handle
     //     past spawn. Reclaiming the slot is required for N>>1 reps to
     //     avoid filling the runner's 4096-entry table after ~5 reps.
     syscall.issueRegDiscard(.delete, 0, .{ .v1 = pf_handle });
-    const idc_slot: caps.HandleId = @truncate(r.v1 & 0xFFF);
-    syscall.issueRegDiscard(.delete, 0, .{ .v1 = idc_slot });
+    const ipc_slot: caps.HandleId = @truncate(r.v1 & 0xFFF);
+    syscall.issueRegDiscard(.delete, 0, .{ .v1 = ipc_slot });
     if (embedded_tests.runner_diag) {
         serial.print("[runner] spawn ");
         serial.printU64(index);

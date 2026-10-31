@@ -79,8 +79,8 @@ pub fn main(cap_table_base: u64) void {
     const ceilings_inner: u64 =
         RUNNER_CEILINGS_INNER_NON_VMAR | (caller_vmar_inner_ceiling << 8);
 
-    // Compose the [1] caps word: self_caps in bits 0-15, idc_rx in
-    // 16-23. Use the runner's cridc/idc_rx-friendly defaults with all
+    // Compose the [1] caps word: self_caps in bits 0-15, ipc_rx in
+    // 16-23. Use the runner's cripc/ipc_rx-friendly defaults with all
     // self-cap bits clear; the call doesn't need real self-caps to
     // reach the test-05 subset check.
     const self_caps_word: u64 = 0;

@@ -4,18 +4,18 @@
 //
 // Strategy
 //   The kernel populates slot 2 of every fresh process with
-//   an IDC handle to the process itself (§[process] /
+//   an IPC handle to the process itself (§[process] /
 //   §[create_process] test 22). The primary builds the test
-//   child with `cridc_ceiling = 0x27` (all six IDC cap bits set,
+//   child with `cripc_ceiling = 0x27` (all six IPC cap bits set,
 //   including `crec` at bit 2), so slot 2 starts with `crec`.
 //
 //   To isolate the test 02 failure path we drop `crec` from the
-//   self-IDC via `restrict`, leaving every other IDC bit intact. After
-//   the restrict, slot 2 is a structurally valid IDC handle that
+//   self-IPC via `restrict`, leaving every other IPC bit intact. After
+//   the restrict, slot 2 is a structurally valid IPC handle that
 //   resolves to a real process (so test 07's E_BADCAP check cannot
 //   fire) but lacks the cap that test 02 requires.
 //
-//   With the IDC handle prepared, call create_thread with:
+//   With the IPC handle prepared, call create_thread with:
 //     - caps = 0                — vacuously a subset of any ceiling
 //                                  (so tests 03/04/05 do not fire);
 //                                  reserved bits are zero (test 10);
@@ -23,7 +23,7 @@
 //                                  restart_policy is 0
 //     - entry = arbitrary       — never executed; we expect E_PERM
 //     - stack_pages = 1         — nonzero (test 08)
-//     - target = SLOT_SELF_IDC  — nonzero, valid IDC, missing `crec`
+//     - target = SLOT_SELF_IPC  — nonzero, valid IPC, missing `crec`
 //     - vm_handle = 0           — no VM
 //     - affinity = 0            — any core (test 09)
 //   The caller's self-handle holds `crec` (the runner mints it on
@@ -39,8 +39,8 @@
 //   the wrapper bug.
 //
 // Action
-//   1. restrict(SLOT_SELF_IDC, idc_caps_without_crec)  — must succeed
-//   2. create_thread(target = SLOT_SELF_IDC) — must return
+//   1. restrict(SLOT_SELF_IPC, ipc_caps_without_crec)  — must succeed
+//   2. create_thread(target = SLOT_SELF_IPC) — must return
 //      E_PERM
 //
 // Assertions
@@ -57,20 +57,20 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Drop `crec` from the self-IDC. Keep the other defined bits set so the
-    // handle stays a fully-formed IDC reference — only the cap test 02
+    // Drop `crec` from the self-IPC. Keep the other defined bits set so the
+    // handle stays a fully-formed IPC reference — only the cap test 02
     // checks is missing. `restart_policy` is a single bool field on
-    // IdcCap; clearing it would force the bit to 0, so leave it set
+    // IpcCap; clearing it would force the bit to 0, so leave it set
     // here to keep behavior change isolated to `crec`.
-    const reduced_idc = caps.IdcCap{
+    const reduced_ipc = caps.IpcCap{
         .move = true,
         .copy = true,
         .crec = false,
         .restart_policy = true,
     };
     const restrict_result = syscall.restrict(
-        caps.SLOT_SELF_IDC,
-        @as(u64, reduced_idc.toU16()),
+        caps.SLOT_SELF_IPC,
+        @as(u64, reduced_ipc.toU16()),
     );
     if (restrict_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(1);
@@ -92,14 +92,14 @@ pub fn main(cap_table_base: u64) void {
     //   v1 = caps word
     //   v2 = entry
     //   v3 = stack_pages
-    //   v4 = target (IDC handle)
+    //   v4 = target (IPC handle)
     //   v5 = vm_handle
     //   v6 = affinity mask
     const result = syscall.issueReg(.create_thread, 0, .{
         .v1 = caps_word,
         .v2 = entry_addr,
         .v3 = 1,
-        .v4 = caps.SLOT_SELF_IDC,
+        .v4 = caps.SLOT_SELF_IPC,
         .v5 = 0,
         .v6 = 0,
     });

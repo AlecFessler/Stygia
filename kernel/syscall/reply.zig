@@ -154,7 +154,7 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 /// [test 09] returns E_INVAL if two pair entries reference the same source handle.
 /// [test 10] returns E_TERM if the suspended thread was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
 /// [test 11] returns E_FULL if the resumed thread's process handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
-/// [test 12] on success, the reply handle is consumed; the resumed thread's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+/// [test 12] on success, the reply handle is consumed; the resumed thread's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `ipc_rx` for IPC handles, verbatim otherwise).
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 /// [test 14] on success when the originating thread handle had the `write` cap, the resumed thread's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
 /// [test 15] on success, the suspended thread is resumed.

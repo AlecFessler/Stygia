@@ -64,7 +64,7 @@ Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success
 | 10 | E_NOMEM | insufficient kernel memory to complete the operation |
 | 11 | E_NOSPC | insufficient address space for the requested range |
 | 12 | E_PERM | required cap is missing on the handle (or self-handle), or argument exceeds a ceiling |
-| 13 | E_REFUSED | a pending IDC call was rejected by policy before a reply could be produced |
+| 13 | E_REFUSED | a pending IPC call was rejected by policy before a reply could be produced |
 | 14 | E_TERM | handle references a thread that was terminated; the stale handle is removed from the caller's table on the same call |
 | 15 | E_TIMEOUT | a wait expired before its wakeup condition was met |
 
@@ -105,7 +105,7 @@ word 2 (field1):
 
 Syscall arguments that take a handle carry only the 12-bit handle id — the caller's handle-table index. Such arguments may be named `handle` directly or after the role they play (e.g. `target`, `exit_port`). The kernel resolves the id against the caller's table and reads the full capability for cap checks and dispatch.
 
-A process's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
+A process's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `ipc_rx`), and its slot id is unchanged.
 
 Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., a thread handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
 
@@ -114,7 +114,7 @@ Handle types a process can hold:
 | Type | How obtained |
 |---|---|
 | process_self | inherent (slot 0 at process creation) |
-| process (IDC handle) | `create_process`; received via suspend/reply transfer |
+| process (IPC handle) | `create_process`; received via suspend/reply transfer |
 | thread | `create_thread`; received via suspend/reply transfer |
 | page_frame | `create_page_frame`; received via suspend/reply transfer |
 | virtual_memory_address_region | `create_vmar`; received via suspend/reply transfer |
@@ -207,7 +207,7 @@ Per-type observable behavior:
 | Handle type | Observable delete behavior |
 |---|---|
 | `process_self` | The calling process is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
-| `process` (IDC) | Release handle. Process has system lifetime; it does not terminate when IDC handles drop |
+| `process` (IPC) | Release handle. Process has system lifetime; it does not terminate when IPC handles drop |
 | `thread` | Release handle. Threads have process lifetime; they are not destroyed by handle drops |
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
@@ -333,7 +333,7 @@ word 0:
 word 1 (field0):
  63    56 55     48 47     40 39     32 31     24 23                  8 7         0
 ┌────────┬─────────┬─────────┬─────────┬─────────┬──────────────────────┬───────────┐
-│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   vmar_inner_clg     │thread_inner_clg│
+│port_clg│vm_clg   │ pf_clg  │ ipc_rx  │cripc_clg│   vmar_inner_clg     │thread_inner_clg│
 │  (8)   │  (8)    │   (8)   │   (8)   │   (8)   │       (16)           │    (8)    │
 └────────┴─────────┴─────────┴─────────┴─────────┴──────────────────────┴───────────┘
 
@@ -378,8 +378,8 @@ field0:
 |---|---|---|
 | thread_inner_ceiling | 0-7 | max caps on thread handles held by this process itself referencing its own Threads |
 | vmar_inner_ceiling | 8-23 | max caps on VMAR handles held by this process itself referencing its own VMARs (16 bits to fit all VMAR caps) |
-| cridc_ceiling | 24-31 | see §[cridc_ceiling] |
-| idc_rx | 32-39 | mask intersected with sent caps when this process receives an IDC handle |
+| cripc_ceiling | 24-31 | see §[cripc_ceiling] |
+| ipc_rx | 32-39 | mask intersected with sent caps when this process receives an IPC handle |
 | pf_ceiling | 40-47 | max caps `create_page_frame` may mint when called from this process (`max_rwx` bits 40-42, `max_sz` bits 43-44) |
 | vm_ceiling | 48-55 | max caps `create_virtual_machine` may mint when called from this process (`policy` bit 48) |
 | port_ceiling | 56-63 | max caps `create_port` may mint when called from this process (`xfer` bit 58, `recv` bit 59, `bind` bit 60, `suspend` bit 62) |
@@ -393,25 +393,25 @@ field1:
 | restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this process (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
 | fut_wait_max | 32-37 | max number of addresses the process may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
 
-#### §[cridc_ceiling] cridc_ceiling
+#### §[cripc_ceiling] cripc_ceiling
 
 At `create_process`:
 
-- The IDC handle the caller receives to the new process has caps = the caller's `cridc_ceiling`.
-- The IDC handle placed in the new process's slot 2 has caps = the `cridc_ceiling` passed in the ceilings word.
+- The IPC handle the caller receives to the new process has caps = the caller's `cripc_ceiling`.
+- The IPC handle placed in the new process's slot 2 has caps = the `cripc_ceiling` passed in the ceilings word.
 
-All subsequent IDC handles to the new process derive from these two originals by copy or move, subject to cap-subset rules.
+All subsequent IPC handles to the new process derive from these two originals by copy or move, subject to cap-subset rules.
 
-#### §[idc_rx] idc_rx
+#### §[ipc_rx] ipc_rx
 
-When a process receives an IDC handle over IDC:
+When a process receives an IPC handle over IPC:
 
-- The installed handle has caps = the intersection of the caps attempted to be granted and the receiving process's `idc_rx`.
+- The installed handle has caps = the intersection of the caps attempted to be granted and the receiving process's `ipc_rx`.
 
-[test 01] when a process receives an IDC handle over IDC, the installed handle's caps = intersection of the granted caps and the receiver's `idc_rx`.
+[test 01] when a process receives an IPC handle over IPC, the installed handle's caps = intersection of the granted caps and the receiver's `ipc_rx`.
 
 
-### IDC handle
+### IPC handle
 
 Handle ABI:
 
@@ -450,24 +450,24 @@ cap (word 0, bits 48-63):
 | 0 | `move` | transferring this handle via move to another process |
 | 1 | `copy` | transferring this handle via copy to another process |
 | 2 | `crec` — create thread in referenced process | `create_thread` with this handle as `target` |
-| 5 | `restart_policy` | IDC handle behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
+| 5 | `restart_policy` | IPC handle behavior on process restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_process
 
 #### Summary
 
-Creates a new process from an ELF image carried in a page frame. The caller receives back an IDC handle to the new process.
+Creates a new process from an ELF image carried in a page frame. The caller receives back an IPC handle to the new process.
 
 #### Declaration
 
 ```
 create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
-  -> [1] idc_handle
+  -> [1] ipc_handle
   syscall_num = 19
 
   [1] caps: u64 packed as
     bits  0-15: self_caps          — caps on the new process's slot-0 self-handle
-    bits 16-23: idc_rx             — new process's idc_rx (see §[process] Self handle)
+    bits 16-23: ipc_rx             — new process's ipc_rx (see §[process] Self handle)
     bits 24-63: _reserved
 
   [2] ceilings_inner: u64 packed as (matches self-handle field0)
@@ -480,7 +480,7 @@ create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_fr
                    bits 14-15: max_sz (enum)
                    bit 16:     dma
                    bits 17-23: _reserved
-    bits 24-31: cridc_ceiling      — new process's cridc_ceiling (see §[process] Self handle)
+    bits 24-31: cripc_ceiling      — new process's cripc_ceiling (see §[process] Self handle)
     bits 32-39: pf_ceiling:
                    bits 32-34: max_rwx (r/w/x)
                    bits 35-36: max_sz (enum)
@@ -505,7 +505,7 @@ create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_fr
                    bit 21:     dr_restart_max     (drop / keep)
                    bit 22:     port_restart_max   (drop / keep)
                    bit 23:     vm_restart_max     (drop / keep)
-                   bit 24:     idc_restart_max    (drop / keep)
+                   bit 24:     ipc_restart_max    (drop / keep)
                    bits 25-31: _reserved
     bits 32-37: fut_wait_max         — max addresses per `futex_wait_*` call (0..63); 0 disables futex wait
     bits 38-63: _reserved
@@ -529,7 +529,7 @@ create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_fr
 
 The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new process's read-only view of its capability table is passed as the first argument to the initial thread's entry point.
 
-The caller receives an IDC handle to the new process with caps = the caller's own `cridc_ceiling`. The new process's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new process's slot-1 initial-thread handle is minted with caps = the new process's `thread_inner_ceiling` from [2].
+The caller receives an IPC handle to the new process with caps = the caller's own `cripc_ceiling`. The new process's slot-2 self-IPC handle is minted with caps = the `cripc_ceiling` passed in [2]. The new process's slot-1 initial-thread handle is minted with caps = the new process's `thread_inner_ceiling` from [2].
 
 #### Capabilities
 
@@ -537,7 +537,7 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 - `[1].self_caps` ⊆ caller's self-handle caps
 - `[2].thread_inner_ceiling` ⊆ caller's `thread_inner_ceiling`
 - `[2].vmar_inner_ceiling` ⊆ caller's `vmar_inner_ceiling`
-- `[2].cridc_ceiling` ⊆ caller's `cridc_ceiling`
+- `[2].cripc_ceiling` ⊆ caller's `cripc_ceiling`
 - `[2].pf_ceiling` ⊆ caller's `pf_ceiling`
 - `[2].vm_ceiling` ⊆ caller's `vm_ceiling`
 - `[2].port_ceiling` ⊆ caller's `port_ceiling`
@@ -548,7 +548,7 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 
 #### Return value
 
-`[1]`: IDC handle to the new process with caps = caller's `cridc_ceiling`.
+`[1]`: IPC handle to the new process with caps = caller's `cripc_ceiling`.
 
 #### Errors
 
@@ -560,7 +560,7 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 
 **E_NOMEM** — insufficient kernel memory.
 
-**E_FULL** — caller's handle table has no free slot for the returned IDC handle.
+**E_FULL** — caller's handle table has no free slot for the returned IPC handle.
 
 #### Tests
 
@@ -580,7 +580,7 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 
 [test 08] returns E_PERM if `fut_wait_max` exceeds the caller's `fut_wait_max`.
 
-[test 09] returns E_PERM if `cridc_ceiling` is not a subset of the caller's `cridc_ceiling`.
+[test 09] returns E_PERM if `cripc_ceiling` is not a subset of the caller's `cripc_ceiling`.
 
 [test 10] returns E_PERM if `pf_ceiling` is not a subset of the caller's `pf_ceiling`.
 
@@ -602,13 +602,13 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 
 [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 
-[test 19] on success, the caller receives an IDC handle to the new process with caps = the caller's `cridc_ceiling`.
+[test 19] on success, the caller receives an IPC handle to the new process with caps = the caller's `cripc_ceiling`.
 
 [test 20] on success, the new process's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 
 [test 21] on success, the new process's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
 
-[test 22] on success, the new process's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
+[test 22] on success, the new process's handle table contains an IPC handle to itself at slot 2 with caps = the passed `cripc_ceiling`.
 
 [test 23] on success, passed handles occupy slots 3+ of the new process's handle table in the order supplied, each with the caps specified in its entry.
 
@@ -616,11 +616,11 @@ The caller receives an IDC handle to the new process with caps = the caller's ow
 
 [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
 
-[test 26] on success, the new process's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+[test 26] on success, the new process's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cripc_ceiling`, `ipc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
 
 [test 27] on success, the new process's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 
-[test 28] on success, the new process's `idc_rx` in field0 is set to the value supplied in [1].
+[test 28] on success, the new process's `ipc_rx` in field0 is set to the value supplied in [1].
 
 [test 29] the initial thread begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
 
@@ -646,7 +646,7 @@ Per-handle policies are ordered least-to-most privileged. The `restart_policy` c
 | `device_region` | 0=drop / 1=keep | |
 | `port` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `virtual_machine` | 0=drop / 1=keep | |
-| `process` (IDC) | 0=drop / 1=keep | |
+| `process` (IPC) | 0=drop / 1=keep | |
 | `reply` | governed by process `reply_policy` | drop: pending callers resume with `E_REFUSED`; keep: reply remains valid, caller stays suspended |
 
 Each handle's `restart_policy` value is bounded at create time (and at copy time) by the process's `restart_policy_ceiling` corresponding field on its self-handle.
@@ -661,7 +661,7 @@ Each handle's `restart_policy` value is bounded at create time (and at copy time
 
 [test 05] returns E_PERM if `create_port` is called with `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.port_restart_max = 0`.
 
-[test 06] returns E_PERM if any IDC handle minted by `create_process` (the caller's own returned handle, the new process's slot-2 self-IDC, or any `passed_handles` IDC entry) has `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.idc_restart_max = 0`.
+[test 06] returns E_PERM if any IPC handle minted by `create_process` (the caller's own returned handle, the new process's slot-2 self-IPC, or any `passed_handles` IPC entry) has `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.ipc_restart_max = 0`.
 
 [test 07] returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling process's `restart_policy_ceiling.dr_restart_max = 0`.
 
@@ -729,7 +729,7 @@ cap (word 0, bits 48-63):
 
 #### Summary
 
-Creates a new thread either in the caller's own process or in a target process referenced by an IDC handle.
+Creates a new thread either in the caller's own process or in a target process referenced by an IPC handle.
 
 #### Declaration
 
@@ -748,7 +748,7 @@ create_thread([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [
   [2] entry:        instruction pointer where the thread begins execution
   [3] stack_pages:  number of stack pages the kernel allocates in the target's address space;
                     kernel installs unmapped guard pages above and below the stack
-  [4] target:       0 = self, else IDC handle with crec cap to the target process
+  [4] target:       0 = self, else IPC handle with crec cap to the target process
   [5] affinity:     64-bit core mask; bit N = 1 allows the thread to run on core N.
                     0 = any core (kernel chooses)
 ```
@@ -760,7 +760,7 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 #### Capabilities
 
 - Self-handle: `crec`
-- IDC handle `[4]` (when nonzero): `crec`
+- IPC handle `[4]` (when nonzero): `crec`
 - `[1].caps` ⊆ self's `thread_inner_ceiling` (when `[4] = 0`) or target process's `thread_outer_ceiling` (when `[4] != 0`)
 - `[1].target_caps` ⊆ target process's `thread_inner_ceiling` (when `[4] != 0`)
 - `[1].priority` ≤ caller's priority ceiling
@@ -773,7 +773,7 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 **E_PERM** — self-handle lacks `crec`; `[4]` lacks `crec` (when nonzero); any cap/priority argument exceeds the corresponding ceiling.
 
-**E_BADCAP** — `[4]` is nonzero and not a valid IDC handle.
+**E_BADCAP** — `[4]` is nonzero and not a valid IPC handle.
 
 **E_INVAL** — `[3] stack_pages` is 0; `[5] affinity` has bits set outside the system's core count; reserved bits set in `[1]`.
 
@@ -797,7 +797,7 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 [test 06] returns E_PERM if priority exceeds the caller's priority ceiling.
 
-[test 07] returns E_BADCAP if [4] is nonzero and not a valid IDC handle.
+[test 07] returns E_BADCAP if [4] is nonzero and not a valid IPC handle.
 
 [test 08] returns E_INVAL if [3] stack_pages is 0.
 
@@ -2284,7 +2284,7 @@ None beyond holding `[1]`.
 
 ## §[port] Port
 
-A port is a rendezvous point between a calling thread and a receiving thread, used for IDC, transfer of capabilities, and thread event delivery.
+A port is a rendezvous point between a calling thread and a receiving thread, used for IPC, transfer of capabilities, and thread event delivery.
 
 Handle ABI:
 
@@ -2564,7 +2564,7 @@ Event type identifies whether a received event came from an explicit suspension 
 | 1 | _reserved | |
 | 2 | _reserved | |
 | 3 | _reserved | |
-| 4 | suspension | thread suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended thread's state per §[event_state] gated by the `read`/`write` caps on the thread handle the suspender used) |
+| 4 | suspension | thread suspended via the `suspend` syscall (subsumes IPC call delivery; the receiver inspects/mutates the suspended thread's state per §[event_state] gated by the `read`/`write` caps on the thread handle the suspender used) |
 | 5 | vm_exit | vCPU exited guest mode |
 | 6 | _reserved | |
 | 7..31 | _reserved | |
@@ -2633,7 +2633,7 @@ bits 33-63: _reserved
 
 The kernel validates the entries at suspend time. The actual move/copy is performed at recv time — if the suspend resumes with `E_CLOSED` before any recv, no attachment is moved or copied and the sender's table is unchanged.
 
-At recv time the kernel inserts the `N` handles into the receiving thread's table at contiguous slots `[S, S+N)` with `S` chosen by the kernel, and sets the receiver's syscall word with `pair_count = N`, `tstart = S`, `reply_handle_id` (slot id of the inserted reply handle), and `event_type` per the layout in §[event_state]. Each installed handle's caps are the entry's `caps` intersected with the receiver's `idc_rx` for IDC handles, or the entry's `caps` verbatim for other handle types.
+At recv time the kernel inserts the `N` handles into the receiving thread's table at contiguous slots `[S, S+N)` with `S` chosen by the kernel, and sets the receiver's syscall word with `pair_count = N`, `tstart = S`, `reply_handle_id` (slot id of the inserted reply handle), and `event_type` per the layout in §[event_state]. Each installed handle's caps are the entry's `caps` intersected with the receiver's `ipc_rx` for IPC handles, or the entry's `caps` verbatim for other handle types.
 
 [test 01] returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
 
@@ -2649,7 +2649,7 @@ At recv time the kernel inserts the `N` handles into the receiving thread's tabl
 
 [test 07] returns E_INVAL if two entries reference the same source handle.
 
-[test 08] on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `idc_rx` for IDC handles, or entry.caps verbatim for other handle types.
+[test 08] on recv, the receiver's syscall word `pair_count` equals `N` and the next `N` table slots `[tstart, tstart+N)` contain the inserted handles, each with caps = entry.caps intersected with `ipc_rx` for IPC handles, or entry.caps verbatim for other handle types.
 
 [test 09] on recv, source entries with `move = 1` are removed from the sender's table; entries with `move = 0` are not removed.
 
@@ -2916,7 +2916,7 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 18] returns E_FULL if `pair_count > 0` and the resumed thread's process handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
 
-[test 19] on success when `pair_count > 0`, the resumed thread's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+[test 19] on success when `pair_count > 0`, the resumed thread's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed thread's process contain the inserted handles per §[handle_attachments] (caps intersected with `ipc_rx` for IPC handles, verbatim otherwise).
 
 [test 20] on success when `pair_count > 0`, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 

@@ -1,25 +1,25 @@
 // Spec §[create_process] — test 09.
 //
-// "[test 09] returns E_PERM if `cridc_ceiling` is not a subset of the
-//  caller's `cridc_ceiling`."
+// "[test 09] returns E_PERM if `cripc_ceiling` is not a subset of the
+//  caller's `cripc_ceiling`."
 //
 // Strategy
-//   `cridc_ceiling` is the 8-bit field at bits 24-31 of the self-handle
-//   field0 (= ceilings_inner). Only bits 0-5 are valid IDC cap bits
+//   `cripc_ceiling` is the 8-bit field at bits 24-31 of the self-handle
+//   field0 (= ceilings_inner). Only bits 0-5 are valid IPC cap bits
 //   (move/copy/crec/restart_policy); bits 6-7 are reserved
 //   and trip the reserved-bits rule (test 17), so they cannot be used
 //   to construct a superset for this test.
 //
-//   The runner mints each child with `cridc_ceiling = 0x27` (full 6
+//   The runner mints each child with `cripc_ceiling = 0x27` (full 6
 //   valid bits set — see runner/primary.zig `ceilings_inner`). When the
 //   caller already holds the full set there is no valid superset to
 //   pass, so a faithful E_PERM probe of test 09 is impossible from this
 //   child.
 //
 //   This is the degraded smoke variant the brief authorises: read the
-//   caller's `cridc_ceiling` and, if any of bits 0-5 is unset, build a
+//   caller's `cripc_ceiling` and, if any of bits 0-5 is unset, build a
 //   true superset and assert E_PERM. Otherwise (caller has 0x27),
-//   submit a request with `cridc_ceiling = caller_value` (an equal-set,
+//   submit a request with `cripc_ceiling = caller_value` (an equal-set,
 //   which is a subset by definition) and assert the kernel does not
 //   return E_PERM — proving the subset rule does not fire on a non-
 //   superset value. `elf_page_frame = 0` keeps the call from succeeding
@@ -28,17 +28,17 @@
 //   instead. That is acceptable: the assertion only excludes E_PERM.
 //
 // Action — faithful path
-//   1. create_process(... ceilings_inner with cridc bits =
-//      caller_cridc | missing_bit ...) — must return E_PERM
+//   1. create_process(... ceilings_inner with cripc bits =
+//      caller_cripc | missing_bit ...) — must return E_PERM
 //
 // Action — degraded path (caller already at 0x27)
-//   1. create_process(... ceilings_inner with cridc bits =
-//      caller_cridc ...) — must return anything except E_PERM
+//   1. create_process(... ceilings_inner with cripc bits =
+//      caller_cripc ...) — must return anything except E_PERM
 //
 // Assertions
 //   1: faithful path — kernel returned something other than E_PERM
 //   2: degraded path — kernel returned E_PERM despite an equal-set
-//      cridc_ceiling (the subset check must accept equal sets)
+//      cripc_ceiling (the subset check must accept equal sets)
 
 const lib = @import("lib");
 
@@ -48,13 +48,13 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 // Bit layouts. The self-handle field0 and the [2] ceilings_inner
-// argument are NOT the same shape: field0 inserts `idc_rx` at bits
+// argument are NOT the same shape: field0 inserts `ipc_rx` at bits
 // 32-39 and shifts pf/vm/port up by 8 bits, while ceilings_inner
-// packs pf/vm/port at bits 32-55 with no idc_rx slot. See
+// packs pf/vm/port at bits 32-55 with no ipc_rx slot. See
 // §[process] Self handle vs §[create_process] [2].
-// `thread_inner`, `var_inner`, and `cridc_ceiling` (bits 0-31) are the
+// `thread_inner`, `var_inner`, and `cripc_ceiling` (bits 0-31) are the
 // only sub-fields that share an offset between the two.
-const CRIDC_SHIFT: u6 = 24;
+const CRIPC_SHIFT: u6 = 24;
 
 // Self-handle field0 sub-field offsets (per §[process]).
 const FIELD0_PF_SHIFT: u6 = 40;
@@ -67,16 +67,16 @@ const INNER_VM_SHIFT: u6 = 40;
 const INNER_PORT_SHIFT: u6 = 48;
 
 pub fn main(cap_table_base: u64) void {
-    // Read the caller's self-handle. cridc_ceiling lives at field0
+    // Read the caller's self-handle. cripc_ceiling lives at field0
     // bits 24-31 — see §[process] Self handle.
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
-    const caller_cridc: u8 = @truncate((self_cap.field0 >> CRIDC_SHIFT) & 0xFF);
+    const caller_cripc: u8 = @truncate((self_cap.field0 >> CRIPC_SHIFT) & 0xFF);
 
     // Translate the caller's field0 sub-fields into the ceilings_inner
     // packing so the request mirrors the caller exactly on every
-    // sub-field except `cridc_ceiling`. Without this translation,
+    // sub-field except `cripc_ceiling`. Without this translation,
     // pf/vm/port sub-fields land at the wrong offsets and trip
-    // tests 10/11/12 before the test 09 cridc check fires.
+    // tests 10/11/12 before the test 09 cripc check fires.
     const caller_thread_inner: u64 = self_cap.field0 & 0xFF;
     const caller_vmar_inner: u64 = (self_cap.field0 >> 8) & 0xFFFF;
     const caller_pf: u64 = (self_cap.field0 >> FIELD0_PF_SHIFT) & 0xFF;
@@ -90,20 +90,20 @@ pub fn main(cap_table_base: u64) void {
         (caller_port << INNER_PORT_SHIFT);
     const ceilings_outer: u64 = self_cap.field1;
 
-    // self_caps and elf_page_frame don't influence the cridc check;
+    // self_caps and elf_page_frame don't influence the cripc check;
     // pass values that match the runner's own grant set so the kernel
-    // does not bail on a different rule before reaching the cridc
+    // does not bail on a different rule before reaching the cripc
     // subset check. The kernel evaluates ceiling subset checks in the
     // order they appear in the spec; tests 02-08 appear before test
     // 09 and use fields we leave unchanged from the caller's view.
     const self_caps_word: u64 = self_cap.word0 >> 48; // caps live in bits 48-63 of word0.
 
-    // Only bits 0, 1, 2, and 5 remain defined for IDC handles.
+    // Only bits 0, 1, 2, and 5 remain defined for IPC handles.
     var missing_bit: u8 = 0;
     var found_missing = false;
     for ([_]u3{ 0, 1, 2, 5 }) |i| {
         const bit: u8 = @as(u8, 1) << i;
-        if ((caller_cridc & bit) == 0) {
+        if ((caller_cripc & bit) == 0) {
             missing_bit = bit;
             found_missing = true;
             break;
@@ -112,9 +112,9 @@ pub fn main(cap_table_base: u64) void {
 
     if (found_missing) {
         // Faithful path: superset by setting a bit the caller lacks.
-        const new_cridc: u8 = caller_cridc | missing_bit;
+        const new_cripc: u8 = caller_cripc | missing_bit;
         const ceilings_inner: u64 =
-            base_inner | (@as(u64, new_cridc) << CRIDC_SHIFT);
+            base_inner | (@as(u64, new_cripc) << CRIPC_SHIFT);
 
         const result = syscall.createProcess(
             self_caps_word,
@@ -136,9 +136,9 @@ pub fn main(cap_table_base: u64) void {
     // superset exists. Submit an equal-set value (a subset by
     // definition) and assert the kernel does NOT return E_PERM —
     // proving the subset check does not misfire on equal sets.
-    const equal_cridc: u8 = caller_cridc;
+    const equal_cripc: u8 = caller_cripc;
     const ceilings_inner: u64 =
-        base_inner | (@as(u64, equal_cridc) << CRIDC_SHIFT);
+        base_inner | (@as(u64, equal_cripc) << CRIPC_SHIFT);
 
     const result = syscall.createProcess(
         self_caps_word,

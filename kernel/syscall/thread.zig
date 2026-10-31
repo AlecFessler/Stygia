@@ -13,7 +13,7 @@ const Process = process_mod.Process;
 const ProcessCaps = process_mod.ProcessCaps;
 const ThreadCaps = thread_mod.ThreadCaps;
 const Thread = thread_mod.Thread;
-const IdcCaps = process_mod.IdcCaps;
+const IpcCaps = process_mod.IpcCaps;
 const Priority = thread_mod.Priority;
 const VAddr = stygia.memory.address.VAddr;
 const Word0 = capability.Word0;
@@ -80,7 +80,7 @@ fn logYieldDiag(
 }
 
 /// Creates a new thread either in the caller's own process or
-/// in a target process referenced by an IDC handle.
+/// in a target process referenced by an IPC handle.
 ///
 /// ```
 /// create_thread([1] caps, [2] entry, [3] stack_pages, [4] target, [5] affinity)
@@ -97,14 +97,14 @@ fn logYieldDiag(
 ///   [2] entry:        instruction pointer where the thread begins execution
 ///   [3] stack_pages:  number of stack pages the kernel allocates in the target's address space;
 ///                     kernel installs unmapped guard pages above and below the stack
-///   [4] target:       0 = self, else IDC handle with crec cap to the target process
+///   [4] target:       0 = self, else IPC handle with crec cap to the target process
 ///   [5] affinity:     64-bit core mask; bit N = 1 allows the thread to run on core N.
 ///                     0 = any core (kernel chooses)
 /// ```
 ///
 /// Caps required:
 /// - Caller's self-handle must always have `crec`.
-/// - If `[4] != 0`: the IDC handle in `[4]` must additionally have `crec`.
+/// - If `[4] != 0`: the IPC handle in `[4]` must additionally have `crec`.
 ///
 /// The kernel allocates `[3]` pages of stack in the target's address space
 /// with unmapped guard pages above and below to catch overflow and
@@ -122,7 +122,7 @@ fn logYieldDiag(
 /// [test 04] returns E_PERM if [4] is nonzero and caps is not a subset of the target process's `thread_outer_ceiling`.
 /// [test 05] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target process's `thread_inner_ceiling`.
 /// [test 06] returns E_PERM if priority exceeds the caller's priority ceiling.
-/// [test 07] returns E_BADCAP if [4] is nonzero and not a valid IDC handle.
+/// [test 07] returns E_BADCAP if [4] is nonzero and not a valid IPC handle.
 /// [test 08] returns E_INVAL if [3] stack_pages is 0.
 /// [test 09] returns E_INVAL if [5] affinity has bits set outside the system's core count.
 /// [test 10] returns E_INVAL if any reserved bits are set in [1].
@@ -206,25 +206,25 @@ pub fn createThread(
     }
 
     // Resolve the target process. For target=0 this is the caller's own
-    // process; for target!=0 it's the IDC handle's referenced process.
+    // process; for target!=0 it's the IPC handle's referenced process.
     // Cross-process (target_process != process) requires a second gen-lock acquire
     // with stable ordering against the caller's lock; the spec test
-    // surface only exercises the self-IDC shape (slot 2 minted by the
+    // surface only exercises the self-IPC shape (slot 2 minted by the
     // runner points back at the caller's own process), so for now bail
-    // E_BADCAP on a non-self-IDC to keep the unimplemented path loud.
+    // E_BADCAP on a non-self-IPC to keep the unimplemented path loud.
     if (target != 0) {
-        const idc_slot: u12 = @truncate(target);
-        const idc_entry = capability.resolveHandleOnProcess(process, idc_slot, .process) orelse {
+        const ipc_slot: u12 = @truncate(target);
+        const ipc_entry = capability.resolveHandleOnProcess(process, ipc_slot, .process) orelse {
             process_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         };
-        const idc_caps: IdcCaps = @bitCast(Word0.caps(process.user_table[idc_slot].word0));
-        if (!idc_caps.crec) {
+        const ipc_caps: IpcCaps = @bitCast(Word0.caps(process.user_table[ipc_slot].word0));
+        if (!ipc_caps.crec) {
             process_ref.unlockIrqRestore(irq_state);
             return errors.E_PERM;
         }
 
-        const target_ref_ptr = idc_entry.ref.ptr orelse {
+        const target_ref_ptr = ipc_entry.ref.ptr orelse {
             process_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
         };
@@ -281,7 +281,7 @@ pub fn createThread(
 
     // Caller-side handle. Always minted in the caller's process `process`
     // with caps = `new_caps` per spec test 11. When target != 0 and
-    // target_process == process (self-IDC shape), bypass the at-most-one-per-
+    // target_process == process (self-IPC shape), bypass the at-most-one-per-
     // (process, object) coalescing so the caller and target sides get
     // distinct slots — spec test 12 verifies a second slot is populated
     // for the target side.
@@ -320,7 +320,7 @@ pub fn createThread(
 
     // Target-side handle (only when [4] != 0). Spec test 12 mandates
     // the target process receives an additional handle with caps =
-    // `target_caps`. With self-IDC the target process is `process` itself
+    // `target_caps`. With self-IPC the target process is `process` itself
     // (cross-process target_process != process is bailed E_BADCAP above), so use
     // mintHandleAlwaysNew on `process` to allocate a fresh slot rather than
     // coalescing onto the caller-side handle just minted above.

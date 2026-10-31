@@ -118,7 +118,7 @@ pub fn main(cap_table_base: u64) void {
     // sub-process has the cap budget needed to walk through libz
     // bootstrap (crvr for createVmar at LIBZ_SLIDE) and to call
     // sync (no cap required, but other path-shaped checks on the
-    // child's self-handle and IDC ceiling subset shapes hold).
+    // child's self-handle and IPC ceiling subset shapes hold).
     const child_self = caps.SelfCap{
         .crec = true,
         .crvr = true,
@@ -128,7 +128,7 @@ pub fn main(cap_table_base: u64) void {
     // §[create_process] [2] ceilings_inner sub-fields:
     //   bits  0-7   thread_inner_ceiling   = 0x7F (bit 7 cleared)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
-    //   bits 24-31  cridc_ceiling      = 0x27  (matches runner)
+    //   bits 24-31  cripc_ceiling      = 0x27  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
     //   bits 48-55  port_ceiling       = 0x5C  (matches runner: xfer|recv|bind|suspend)

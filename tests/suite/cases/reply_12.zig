@@ -213,7 +213,7 @@ pub fn main(cap_table_base: u64) void {
     //   bits 33-63: _reserved         = 0
     const pair_entry = (caps.PairEntry{
         .id = 0xFFF,
-        .caps = (caps.IdcCap{ .move = true }).toU16(),
+        .caps = (caps.IpcCap{ .move = true }).toU16(),
         .move = true,
     }).toU64();
 

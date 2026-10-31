@@ -56,7 +56,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
 /// | Handle type | Observable delete behavior |
 /// |---|---|
 /// | `process_self` | The calling process is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
-/// | `process` (IDC) | Release handle. Process has system lifetime; it does not terminate when IDC handles drop |
+/// | `process` (IPC) | Release handle. Process has system lifetime; it does not terminate when IPC handles drop |
 /// | `thread` | Release handle. Threads have process lifetime; they are not destroyed by handle drops |
 /// | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 /// | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |

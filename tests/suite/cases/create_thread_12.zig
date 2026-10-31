@@ -8,11 +8,11 @@
 //   freshly-created child's handle table has, by construction:
 //     slot 0  → self
 //     slot 1  → initial thread
-//     slot 2  → self-IDC  (caps = parent's `cridc_ceiling`)
+//     slot 2  → self-IPC  (caps = parent's `cripc_ceiling`)
 //     slot 3  → result port (passed_handle)
-//   The runner sets `cridc_ceiling = 0x27` (bits 0-5: move, copy, crec,
-//   restart_policy), so slot 2's IDC caps include `crec`
-//   (bit 2). slot 2 is therefore a valid IDC `[4]` for a cross-process
+//   The runner sets `cripc_ceiling = 0x27` (bits 0-5: move, copy, crec,
+//   restart_policy), so slot 2's IPC caps include `crec`
+//   (bit 2). slot 2 is therefore a valid IPC `[4]` for a cross-process
 //   `create_thread` and points back at this same process —
 //   so both the caller-side and target-side thread handles materialize in
 //   our own handle table.
@@ -42,7 +42,7 @@
 //        caps_word = caps | (target_caps << 16) | (priority << 32),
 //        entry = &dummyEntry,
 //        stack_pages = 1,
-//        target = SLOT_SELF_IDC,
+//        target = SLOT_SELF_IPC,
 //        affinity = 0)
 //      — must succeed (caller-side handle in vreg 1).
 //   3. Verify caller's returned handle has caps = `caps`.
@@ -59,7 +59,7 @@
 // Spec gap
 //   The runner spawns each test in its own process. The only
 //   cross-process target available without an additional ELF is the
-//   slot-2 self-IDC, which loops back to the calling process. That keeps
+//   slot-2 self-IPC, which loops back to the calling process. That keeps
 //   the verification self-contained but means caller and target share
 //   one handle table; the spec wording "the target process also receives
 //   a handle" is exercised here as "a second slot in this same table is
@@ -112,7 +112,7 @@ pub fn main(cap_table_base: u64) void {
         caps_word,
         entry,
         1, // stack_pages
-        @as(u64, caps_mod.SLOT_SELF_IDC),
+        @as(u64, caps_mod.SLOT_SELF_IPC),
         0, // affinity (kernel chooses)
     );
     if (testing.isHandleError(result.v1)) {

@@ -19,8 +19,8 @@
 //   the value the spec test calls out.
 //
 //   Holding all other ceiling/check inputs valid:
-//     - target = 0 (self) → no IDC-handle E_BADCAP path (test 07)
-//       and no IDC-side `crec` E_PERM path (test 02)
+//     - target = 0 (self) → no IPC-handle E_BADCAP path (test 07)
+//       and no IPC-side `crec` E_PERM path (test 02)
 //     - stack_pages = 1 → not zero (test 08)
 //     - affinity = 0 → "any core" sentinel, no out-of-range bits
 //       (test 09)

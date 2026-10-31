@@ -22,7 +22,7 @@
 //   process's table via `create_process`'s
 //   passed_handles, which on this branch carry only the result port
 //   at slot 3. Slots 0/1/2 are kernel-installed as self / initial thread
-//   / self-IDC. No device_region reaches a test child today.
+//   / self-IPC. No device_region reaches a test child today.
 //
 //   Without a valid device_region in [2], the kernel rejects the
 //   call at test 02 (E_BADCAP) before the size comparison in test 05

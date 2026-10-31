@@ -7,7 +7,7 @@
 //!   - Flat list of bound VARs
 //!   - Optional bound VM
 //!
-//! All per-process ceilings (thread_inner/outer, var_inner/outer, cridc, idc_rx,
+//! All per-process ceilings (thread_inner/outer, var_inner/outer, cripc, ipc_rx,
 //! pf, vm, port, restart_policy, fut_wait_max) live in the self-handle at
 //! slot 0 of the handle table — kernel reads them from `user_table[0]`
 //! like anyone else, no duplication on the struct.
@@ -66,9 +66,9 @@ pub const ProcessCaps = packed struct(u16) {
     pri: u2 = 0,
 };
 
-/// Cap bits in `Capability.word0[48..63]` for IDC (process)
-/// handles. Spec §[process] IDC handle.
-pub const IdcCaps = packed struct(u16) {
+/// Cap bits in `Capability.word0[48..63]` for IPC (process)
+/// handles. Spec §[process] IPC handle.
+pub const IpcCaps = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     crec: bool = false,
@@ -231,7 +231,7 @@ pub fn initSlab(
 ///      first arg is a pointer to the read-only cap-table view).
 ///   6. For each entry in passed_handles[0..], derive into child slot
 ///      3+ via mintHandle. `move = 1` releases the source handle.
-///   7. Mint the IDC handle into the caller's process pointing at the
+///   7. Mint the IPC handle into the caller's process pointing at the
 ///      new child; return its slot in vreg 1 / via i64.
 ///   8. Enqueue the initial thread for dispatch.
 ///
@@ -316,16 +316,16 @@ pub fn createProcess(
 
     // Allocate the child process. Self caps come from caps[0..15];
     // self-handle field0 layout differs from the [2] ceilings_inner shape —
-    // §[process] Self handle puts idc_rx at field0 bits 32-39,
+    // §[process] Self handle puts ipc_rx at field0 bits 32-39,
     // sourced from [1] caps bits 16-23, with pf/vm/port ceilings shifted
     // up by 8 bits relative to ceilings_inner. See spec
     // §[create_process] doc for the [2] layout vs §[process]
     // for the field0 layout.
     const self_caps: u16 = @truncate(caps & 0xFFFF);
-    const idc_rx: u64 = (caps >> 16) & 0xFF;
-    const thread_var_cridc: u64 = ceilings_inner & 0x0000_0000_FFFF_FFFF;
+    const ipc_rx: u64 = (caps >> 16) & 0xFF;
+    const thread_var_cripc: u64 = ceilings_inner & 0x0000_0000_FFFF_FFFF;
     const pf_vm_port: u64 = (ceilings_inner >> 32) & 0x0000_0000_00FF_FFFF;
-    const self_field0: u64 = thread_var_cridc | (idc_rx << 32) | (pf_vm_port << 40);
+    const self_field0: u64 = thread_var_cripc | (ipc_rx << 32) | (pf_vm_port << 40);
     const child_process = allocProcess(
         self_caps,
         self_field0,
@@ -418,11 +418,11 @@ pub fn createProcess(
     // Convention adopted here: an all-zero entry terminates the list.
     // The runner always passes a non-zero packed-entry (caps != 0 or
     // move != 0) for live entries, so this is unambiguous in practice.
-    // Spec §[idc_rx] test 01: IDC handles delivered into the new
-    // child's table get caps ∩ child.idc_rx. idc_rx lives in the child
+    // Spec §[ipc_rx] test 01: IPC handles delivered into the new
+    // child's table get caps ∩ child.ipc_rx. ipc_rx lives in the child
     // self-handle's field0 at bits 32-39 — already populated by
     // `allocProcess` from `[1] caps[16:24]` above.
-    const child_idc_rx: u16 = @truncate((child_process.user_table[0].field0 >> 32) & 0xFF);
+    const child_ipc_rx: u16 = @truncate((child_process.user_table[0].field0 >> 32) & 0xFF);
     const DeriveRecord = struct {
         caller_ref: ErasedSlabRef,
         src_slot: u12,
@@ -471,7 +471,7 @@ pub fn createProcess(
         const src_ref = src_kh.ref;
         const src_instance = src_kh.instance;
         const installed_caps: u16 = if (src_type == .process)
-            new_caps & child_idc_rx
+            new_caps & child_ipc_rx
         else
             new_caps;
 
@@ -550,13 +550,13 @@ pub fn createProcess(
         pass_idx += 1;
     }
 
-    // Reserve the caller's returned IDC slot before deleting moved
+    // Reserve the caller's returned IPC slot before deleting moved
     // sources. Because moved source slots are still occupied here, the
-    // returned IDC cannot reuse one. Because the slot remains unpublished
+    // returned IPC cannot reuse one. Because the slot remains unpublished
     // until after move cleanup, another thread in the caller's process cannot
-    // observe both the moved source and the new child IDC alias.
-    const caller_cridc: u16 = @truncate((readSelfField0(caller_dom) >> 24) & 0xFF);
-    const idc_slot = reserveHandleSlot(caller_dom) catch {
+    // observe both the moved source and the new child IPC alias.
+    const caller_cripc: u16 = @truncate((readSelfField0(caller_dom) >> 24) & 0xFF);
+    const ipc_slot = reserveHandleSlot(caller_dom) catch {
         caller_dom_ref.unlockIrqRestore(caller_irq_state);
         cleanupPartiallyCreatedCd(child_process, child_thread);
         return errors.E_FULL;
@@ -578,7 +578,7 @@ pub fn createProcess(
         )) {
             const cleanup_lr = caller_dom_ref.lockIrqSave(@src()) catch null;
             if (cleanup_lr) |lr| {
-                releaseReservedHandleSlot(lr.ptr, idc_slot);
+                releaseReservedHandleSlot(lr.ptr, ipc_slot);
                 caller_dom_ref.unlockIrqRestore(lr.irq_state);
             }
             cleanupPartiallyCreatedCd(child_process, child_thread);
@@ -592,7 +592,7 @@ pub fn createProcess(
     // witness advances. The batch delete prevalidates every moved source
     // under tree_mutex -> caller process before consuming any of them; therefore
     // this failure path does not return after partially moving the caller's
-    // source handles. The caller's return IDC slot was already reserved
+    // source handles. The caller's return IPC slot was already reserved
     // above, so these deletes cannot make the returned handle reuse a moved
     // source slot.
     const delete_result = stygia.caps.derivation.deleteAndDetachExpectedBatch(
@@ -602,34 +602,34 @@ pub fn createProcess(
     if (delete_result != 0) {
         const cleanup_lr = caller_dom_ref.lockIrqSave(@src()) catch null;
         if (cleanup_lr) |lr| {
-            releaseReservedHandleSlot(lr.ptr, idc_slot);
+            releaseReservedHandleSlot(lr.ptr, ipc_slot);
             caller_dom_ref.unlockIrqRestore(lr.irq_state);
         }
         cleanupPartiallyCreatedCd(child_process, child_thread);
         return delete_result;
     }
 
-    // Publish the returned IDC in the pre-reserved caller slot only after
+    // Publish the returned IPC in the pre-reserved caller slot only after
     // all moved source handles have been deleted. Per spec §[19]: caps =
-    // caller's cridc_ceiling.
+    // caller's cripc_ceiling.
     const publish_lr = caller_dom_ref.lockIrqSave(@src()) catch {
         cleanupPartiallyCreatedCd(child_process, child_thread);
         return errors.E_BADCAP;
     };
-    if (!stygia.caps.capability.isReservedHandleSlot(&publish_lr.ptr.kernel_table[idc_slot])) {
+    if (!stygia.caps.capability.isReservedHandleSlot(&publish_lr.ptr.kernel_table[ipc_slot])) {
         caller_dom_ref.unlockIrqRestore(publish_lr.irq_state);
         cleanupPartiallyCreatedCd(child_process, child_thread);
         return errors.E_BADCAP;
     }
     mintHandleAt(
         publish_lr.ptr,
-        idc_slot,
+        ipc_slot,
         .{
             .ptr = child_process,
             .gen = @intCast(child_process._gen_lock.currentGen()),
         },
         .process,
-        caller_cridc,
+        caller_cripc,
         0,
         0,
     );
@@ -669,7 +669,7 @@ pub fn createProcess(
     // range 1..15. Returning the bare slot would alias slots 1..15
     // with the spec error codes, so userspace's standard error check
     // would treat valid handle slots as failures.
-    return @intCast(Word0.pack(idc_slot, .process, caller_cridc));
+    return @intCast(Word0.pack(ipc_slot, .process, caller_cripc));
 }
 
 inline fn pageFrameSizeBytes(sz: stygia.memory.vmar.PageSize) u64 {
@@ -837,7 +837,7 @@ const KERNEL_TABLE_BYTES: u64 = handleTableBlockBytes(KernelHandle);
 
 /// Allocate a new Process — slab slot, handle tables from PMM,
 /// address-space root, slot-0 self-handle, slot-1 placeholder for the
-/// initial thread handle (filled by caller via `mintHandle`), slot-2 self-IDC.
+/// initial thread handle (filled by caller via `mintHandle`), slot-2 self-IPC.
 /// Spec §[process].
 pub fn allocProcess(
     self_caps: u16,
@@ -912,9 +912,9 @@ pub fn allocProcess(
     user_table[1] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     kernel_table[1].ref = .{};
 
-    // Slot 2 — self-IDC. Caps come from the process's cridc ceiling.
-    const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
-    user_table[2].word0 = Word0.pack(2, .process, cridc_ceiling);
+    // Slot 2 — self-IPC. Caps come from the process's cripc ceiling.
+    const cripc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
+    user_table[2].word0 = Word0.pack(2, .process, cripc_ceiling);
     user_table[2].field0 = 0;
     user_table[2].field1 = 0;
     kernel_table[2].ref = .{
@@ -1481,7 +1481,7 @@ fn allocFreeSlot(process: *Process) ?u12 {
 /// yet. The non-null reserved sentinel keeps both free-list and
 /// contiguous-scan allocators from treating the slot as free, while
 /// `resolveHandleOnProcess` keeps it invisible to callers until
-/// `mintHandleAt` overwrites it with the returned IDC handle.
+/// `mintHandleAt` overwrites it with the returned IPC handle.
 fn reserveHandleSlot(process: *Process) !u12 {
     const slot = allocFreeSlot(process) orelse return error.OutOfHandles;
     process.user_table[slot] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };

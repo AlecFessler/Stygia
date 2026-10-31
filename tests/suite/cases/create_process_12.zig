@@ -91,7 +91,7 @@ pub fn main(cap_table_base: u64) void {
     // values to remain subsets:
     //   bits  0-7  thread_inner_ceiling   = 0xFF
     //   bits  8-23 vmar_inner_ceiling  = 0x01FF
-    //   bits 24-31 cridc_ceiling      = 0x27
+    //   bits 24-31 cripc_ceiling      = 0x27
     //   bits 32-39 pf_ceiling         = 0x1F
     //   bits 40-47 vm_ceiling         = 0x01
     //   bits 48-55 port_ceiling       = 0x1D  <-- violator

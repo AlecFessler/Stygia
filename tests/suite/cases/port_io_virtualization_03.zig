@@ -19,7 +19,7 @@
 //   all, since create_vmar refuses the construction up front. The
 //   eventual faithful test must therefore obtain such a VMAR from a
 //   path the runner has not wired (e.g., a downgraded mmio handle
-//   delivered via xfer/IDC from a peer that has the bit set on a
+//   delivered via xfer/IPC from a peer that has the bit set on a
 //   non-mmio VMAR).
 //
 //   Second, the same blocker documented in port_io_virtualization_01
@@ -28,7 +28,7 @@
 //   process's table via `create_process`'s passed_handles,
 //   which on this branch carry only the result port at slot 3.
 //   Slots 0/1/2 are kernel-installed as self / initial thread /
-//   self-IDC. No device_region of any `dev_type` reaches a test
+//   self-IPC. No device_region of any `dev_type` reaches a test
 //   child today — and a port_io device_region in particular has no
 //   ambient host-platform analogue the runner could carve out.
 //
@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
     const mmio_var_handle: caps.HandleId = @truncate(cvar.v1 & 0xFFF);
 
     // Slot 4095 is guaranteed empty by the create_process
-    // table layout (slots 0/1/2 are self / initial_thread / self_idc;
+    // table layout (slots 0/1/2 are self / initial_thread / self_ipc;
     // passed_handles begin at slot 3 and only the result port lands
     // there for tests). The §[map_mmio] gate order rejects an
     // invalid [2] (test 02, E_BADCAP) before the port_io / caps.x
