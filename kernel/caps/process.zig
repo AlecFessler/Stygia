@@ -96,6 +96,19 @@ pub const Process = struct {
     /// liveness AND guards every mutable field below.
     _gen_lock: GenLock = .{},
 
+    /// Set while the restart owner has stopped dispatch into this address
+    /// space. The process generation stays live so IPC handles and the
+    /// handle table retain their identity across the restart.
+    restarting: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// First exit/fault owner decides from the self-handle caps while the
+    /// process lock serializes with restrict(SLOT_SELF). Reset only after a
+    /// successful restart has finished its handle and thread policy pass.
+    exit_decision: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    /// Original initial-thread entry ABI, needed if slot 1 is restarted.
+    initial_stack_top: u64 = 0,
+    initial_table_base: u64 = 0,
+
     // ── Address space ─────────────────────────────────────────────────
 
     /// Physical address of this process's top-level page table (PML4 on
@@ -386,6 +399,8 @@ pub fn createProcess(
     };
     child_thread.diag_test_tag = diag_test_tag;
     child_thread.diag_report_entered = false;
+    child_process.initial_stack_top = layout.stack_top;
+    child_process.initial_table_base = layout.table_base;
 
     // Patch the initial thread's iret frame for user-mode dispatch.
     stygia.arch.dispatch.cpu.patchUserModeIretFrame(
@@ -983,6 +998,182 @@ pub const DestroyDeferred = struct {
     /// walk only uses it for pointer-identity comparison.
     caller_thread: ?SlabRef(Thread),
 };
+
+pub const ExitDecision = enum(u8) { already_claimed = 0, restart = 1, retire = 2 };
+
+/// The trigger caller holds the process gen-lock. Its cap snapshot and
+/// first-owner claim linearize against restrict(SLOT_SELF) at the actual
+/// exit/fault, before the scheduler queues deferred teardown. A second
+/// trigger parks its own thread and leaves the queued owner in charge.
+pub fn claimExitLocked(process: *Process) ExitDecision {
+    if (process.exit_decision.load(.acquire) != 0) return .already_claimed;
+    const self_caps: ProcessCaps = @bitCast(Word0.caps(process.user_table[0].word0));
+    const decision: ExitDecision = if (self_caps.restart) .restart else .retire;
+    if (decision == .restart) process.restarting.store(true, .release);
+    process.exit_decision.store(@intFromEnum(decision), .release);
+    return decision;
+}
+
+fn restartHandleKept(tag: CapabilityType, caps: u16, keep_replies: bool) bool {
+    return switch (tag) {
+        .process_self, .thread, .virtual_memory_address_region => true,
+        .process, .port => ((caps >> 5) & 1) != 0,
+        .page_frame => ((caps >> 7) & 1) != 0,
+        .device_region => ((caps >> 4) & 1) != 0,
+        .virtual_machine => ((caps >> 1) & 1) != 0,
+        .reply => keep_replies,
+        else => false,
+    };
+}
+
+/// Restart may relaunch the same process repeatedly. Once every core has
+/// left its address space, reclaim the old private thread stack pages so
+/// each policy-1 relaunch does not permanently consume physical memory.
+fn releaseRestartUserStack(process: *Process, stack: stygia.memory.stack.Stack) void {
+    const pmm_mgr = if (pmm.global_pmm) |*manager| manager else return;
+    var va = stack.base.addr;
+    while (va < stack.top.addr) : (va += 4096) {
+        // The process will run again with the same PCID/ASID. Clear cached
+        // translations before returning the frame to PMM.
+        const phys = arch.paging.unmapPage(process.addr_space_root, VAddr.fromInt(va)) orelse continue;
+        const page: [*]u8 = @ptrFromInt(VAddr.fromPAddr(phys, null).addr);
+        pmm_mgr.freePage(page);
+    }
+}
+
+/// Execute the restart after the caller has left its kernel stack. The
+/// dispatch gate stops new commitments; scheduler IPIs evict cores already
+/// running this address space before any mapping or thread stack changes.
+/// Returns false only when a required allocation fails, in which case the
+/// caller falls through to the normal process destroy path.
+pub fn restartProcess(process_ref: SlabRef(Process)) bool {
+    const process = process_ref.ptr;
+    const root = process.addr_space_root;
+    const self_core = arch.smp.coreID();
+    var core: u64 = 0;
+    while (core < arch.smp.coreCount()) : (core += 1) {
+        if (core != self_core) arch.smp.triggerSchedulerInterrupt(core);
+    }
+    if (arch.paging.detachDyingUserRoot(root, stygia.memory.init.kernel_addr_space_root)) {
+        scheduler.publishActiveRoot(@truncate(self_core), 0);
+    }
+    scheduler.awaitProcessQuiesced(root.addr, process);
+
+    // A stopped thread can still have an outstanding reply in another
+    // process. Retiring its generation before relaunch makes that reply
+    // resolve E_TERM; a persist thread is left untouched.
+    var survivors: u16 = 0;
+    var slot: u16 = 1;
+    while (slot < MAX_HANDLES_PER_PROCESS) : (slot += 1) {
+        const kh = &process.kernel_table[slot];
+        const old_ptr = kh.ref.ptr orelse continue;
+        if (Word0.typeTag(process.user_table[slot].word0) != .thread) continue;
+        const old: *Thread = @ptrCast(@alignCast(old_ptr));
+        const old_ref = SlabRef(Thread).init(old, kh.ref.gen);
+        // A foreign process may hold a thread handle and terminate it
+        // concurrently. Validate and copy metadata under its generation
+        // lock; never read a bare slab after the generation can be reused.
+        const old_lr = old_ref.lockIrqSave(@src()) catch continue;
+        if (old_lr.ptr.process.ptr != process or old_lr.ptr.process.gen != process_ref.gen) {
+            old_ref.unlockIrqRestore(old_lr.irq_state);
+            continue;
+        }
+        const caps_word = Word0.caps(process.user_table[slot].word0);
+        const policy: u2 = @truncate(caps_word >> 8);
+        if (policy == 2) {
+            survivors += 1;
+            old_ref.unlockIrqRestore(old_lr.irq_state);
+            continue;
+        }
+
+        const entry = old_lr.ptr.entry_point;
+        const affinity = old_lr.ptr.affinity;
+        const priority = old_lr.ptr.priority;
+        const old_stack = old_lr.ptr.user_stack;
+        const stack_pages: u32 = if (old_stack) |us|
+            @intCast((us.top.addr - us.base.addr) / 4096)
+        else
+            1;
+        old_ref.unlockIrqRestore(old_lr.irq_state);
+        if (!thread_mod.destroyThreadForRestart(old_ref)) continue;
+        if (old_stack) |stack| releaseRestartUserStack(process, stack);
+        if (policy == 0) continue;
+
+        const fresh = thread_mod.allocThread(process, entry, stack_pages, affinity, priority, null, null) catch return false;
+        survivors += 1;
+        if (slot == 1 and process.initial_stack_top != 0) {
+            arch.cpu.patchUserModeIretFrame(
+                fresh.ctx,
+                entry,
+                VAddr.fromInt(process.initial_stack_top),
+                process.initial_table_base,
+            );
+        }
+        // A process may hold more than one alias to the thread. All local
+        // aliases keep their slots and caps; foreign reply/thread aliases
+        // retain the old generation and fail with E_TERM.
+        var alias: u16 = slot;
+        while (alias < MAX_HANDLES_PER_PROCESS) : (alias += 1) {
+            const e = &process.kernel_table[alias];
+            if (e.ref.ptr == @as(*anyopaque, @ptrCast(old)) and e.ref.gen == old_ref.gen and
+                Word0.typeTag(process.user_table[alias].word0) == .thread)
+            {
+                e.ref.ptr = fresh;
+                e.ref.gen = @intCast(fresh._gen_lock.currentGen());
+            }
+        }
+    }
+    // If a foreign terminate won the last relaunch candidate before its
+    // generation flip, finish through ordinary teardown. A restart with no
+    // surviving thread would otherwise leave the process gate live forever.
+    if (survivors == 0) return false;
+
+    slot = 3;
+    while (slot < MAX_HANDLES_PER_PROCESS) : (slot += 1) {
+        if (process.kernel_table[slot].ref.ptr == null) continue;
+        if (Word0.typeTag(process.user_table[slot].word0) != .virtual_memory_address_region) continue;
+        const policy: u2 = @truncate(Word0.caps(process.user_table[slot].word0) >> 9);
+        switch (policy) {
+            0 => {
+                _ = stygia.caps.derivation.deleteAndDetach(@bitCast(process_ref), @intCast(slot));
+            },
+            1 => stygia.memory.vmar.restartDecommit(process, @intCast(slot)),
+            2 => {},
+            3 => if (!stygia.memory.vmar.restartSnapshot(process, @intCast(slot))) return false,
+        }
+    }
+
+    const keep_replies: bool = (Word0.caps(process.user_table[0].word0) & (1 << 10)) != 0;
+    slot = 2;
+    while (slot < MAX_HANDLES_PER_PROCESS) : (slot += 1) {
+        if (process.kernel_table[slot].ref.ptr == null) continue;
+        const word0 = process.user_table[slot].word0;
+        const tag = Word0.typeTag(word0);
+        if (restartHandleKept(tag, Word0.caps(word0), keep_replies)) continue;
+        if (tag == .reply) {
+            _ = stygia.caps.derivation.dropReplyForRestart(@bitCast(process_ref), @intCast(slot));
+        } else {
+            _ = stygia.caps.derivation.deleteAndDetach(@bitCast(process_ref), @intCast(slot));
+        }
+    }
+
+    process.exit_decision.store(0, .release);
+    process.restarting.store(false, .release);
+    slot = 1;
+    while (slot < MAX_HANDLES_PER_PROCESS) : (slot += 1) {
+        const kh = &process.kernel_table[slot];
+        const ptr = kh.ref.ptr orelse continue;
+        if (Word0.typeTag(process.user_table[slot].word0) != .thread) continue;
+        const thread: *Thread = @ptrCast(@alignCast(ptr));
+        if (thread._gen_lock.currentGen() != kh.ref.gen) continue;
+        if (stygia.sched.lifecycle.load(thread) == .ready and
+            thread.current_queue_core.load(.acquire) == thread_mod.NOT_IN_RUN_QUEUE)
+        {
+            scheduler.enqueue(thread);
+        }
+    }
+    return true;
+}
 
 /// Phase-1 destroy: runs WITH the process's `_gen_lock` held by the caller
 /// AND with `caps.derivation.tree_mutex` held by the caller. Disarms

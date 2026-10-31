@@ -83,6 +83,7 @@ pub const TeardownRequest = struct {
     kind: TeardownKind,
     process: SlabRef(Process),
     caller_thread: ?SlabRef(Thread) = null,
+    restart_chosen: bool = false,
 };
 
 /// Maximum cores the scheduler supports. Matches `affinity` mask width.
@@ -669,6 +670,15 @@ fn runProcessTeardown(req: TeardownRequest) void {
         stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
         return;
     };
+    if (req.restart_chosen) {
+        req.process.unlockIrqRestore(process_lr.irq_state);
+        stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+        if (stygia.caps.process.restartProcess(req.process)) return;
+        // Restart could not finish (for example a replacement thread
+        // allocation failed). Destroy the same process through the normal
+        // phase-1/phase-2 path below.
+        return runProcessTeardownWithoutRestart(req);
+    }
     const deferred = stygia.caps.process.destroyPhase1(
         process_lr.ptr,
         req.caller_thread,
@@ -679,6 +689,24 @@ fn runProcessTeardown(req: TeardownRequest) void {
     switch (req.kind) {
         .self_delete, .unhandled_fault => stygia.caps.process.destroyPhase2(deferred),
     }
+}
+
+fn runProcessTeardownWithoutRestart(req: TeardownRequest) void {
+    const tree_irq = stygia.caps.derivation.tree_mutex.lockIrqSaveOrdered(
+        @src(),
+        stygia.caps.derivation.TREE_MUTEX_GROUP,
+    );
+    const process_lr = req.process.lockOrderedIrqSave(
+        stygia.caps.derivation.TREE_PROCESS_GROUP,
+        @src(),
+    ) catch {
+        stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+        return;
+    };
+    const deferred = stygia.caps.process.destroyPhase1(process_lr.ptr, req.caller_thread);
+    arch.cpu.restoreInterrupts(process_lr.irq_state);
+    stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
+    stygia.caps.process.destroyPhase2(deferred);
 }
 
 pub fn drainTeardown(core: u8, incoming: ?*Thread) void {
@@ -1056,7 +1084,8 @@ export fn scheduler_run_after_park() callconv(.c) noreturn {
 /// the dequeue filter.
 inline fn processRefAlive(thread: *Thread) bool {
     const dref = thread.process;
-    return dref.ptr._gen_lock.currentGen() == @as(u64, dref.gen);
+    return dref.ptr._gen_lock.currentGen() == @as(u64, dref.gen) and
+        !dref.ptr.restarting.load(.acquire);
 }
 
 inline fn canPublishReady(thread: *Thread) bool {

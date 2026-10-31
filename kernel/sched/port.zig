@@ -1533,7 +1533,18 @@ fn maybePrintReportDelivered(sender: *Thread, receiver: *Thread, reply_slot: u12
 }
 
 fn queueFaultProcessTeardown(thread: *Thread, kind: scheduler.TeardownKind) void {
-    scheduler.queueCurrentTeardown(.{ .kind = kind, .process = thread.process });
+    const process_ref = thread.process;
+    if (process_ref.lockIrqSave(@src())) |lr| {
+        const decision = stygia.caps.process.claimExitLocked(lr.ptr);
+        process_ref.unlockIrqRestore(lr.irq_state);
+        if (decision != .already_claimed) {
+            scheduler.queueCurrentTeardown(.{
+                .kind = kind,
+                .process = process_ref,
+                .restart_chosen = decision == .restart,
+            });
+        }
+    } else |_| {}
     thread_mod.parkSelfFaulted(thread);
     if (scheduler.currentThread() == thread) scheduler.hopParkRun();
 }
@@ -2373,12 +2384,22 @@ fn consumeReply(
 /// `.suspended_on_port` — a sender on the queue side or already woken
 /// is not eligible.
 pub fn resumeWithAbandoned(sender: *Thread) void {
+    resumeWithError(sender, errors.E_ABANDONED);
+}
+
+/// Dropping a reply because its holder restarted refuses the pending call.
+/// This is distinct from a holder explicitly deleting the reply handle.
+pub fn resumeWithRefused(sender: *Thread) void {
+    resumeWithError(sender, errors.E_REFUSED);
+}
+
+fn resumeWithError(sender: *Thread, code: i64) void {
     if (!lifecycle.isPortSuspended(sender) or sender.wait.kind != .reply) return;
 
     if (sender.iret_frame) |frame| {
-        arch.syscall.setSyscallReturn(frame, @bitCast(errors.E_ABANDONED));
+        arch.syscall.setSyscallReturn(frame, @bitCast(code));
     } else {
-        arch.syscall.setSyscallReturn(sender.ctx, @bitCast(errors.E_ABANDONED));
+        arch.syscall.setSyscallReturn(sender.ctx, @bitCast(code));
     }
     thread_mod.resumeFromReply(sender, false);
 }

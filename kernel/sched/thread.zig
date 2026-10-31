@@ -758,7 +758,8 @@ pub fn self(caller: *Thread) i64 {
     while (slot < capability.MAX_HANDLES_PER_PROCESS) {
         const entry = &process.kernel_table[slot];
         if (entry.ref.ptr == @as(*anyopaque, @ptrCast(caller)) and
-            entry.ref.gen == caller._gen_lock.currentGen()) {
+            entry.ref.gen == caller._gen_lock.currentGen())
+        {
             const user_word0 = process.user_table[slot].word0;
             if (capability.Word0.typeTag(user_word0) == .thread) {
                 const caps_word = capability.Word0.caps(user_word0);
@@ -825,7 +826,12 @@ pub var park_calls: u64 = 0;
 pub fn parkSelfFaulted(thread: *Thread) void {
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     park_calls +%= 1;
-    _ = retireAndBumpCurrentGen(thread);
+    // Leave the generation live until the queued process exit has decided
+    // between restart and destroy. A restart must be able to read this
+    // thread's entry and stack metadata after the core hops to its park
+    // stack. The queued owner retires the slab after that hop.
+    _ = lifecycle.markRetiring(thread);
+    _ = lifecycle.retire(thread);
 }
 
 /// Park the calling thread into `.idle_wait` — used by the aarch64 wfi/wfe
@@ -1938,6 +1944,18 @@ pub fn dischargeClaimedHolderDead(thread: *Thread) void {
 }
 
 pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Process) void {
+    _ = destroyThreadRefLockedMode(thread_ref, caller_process, false);
+}
+
+/// Restart retires the old thread generation so outstanding reply handles
+/// resolve to E_TERM. Terminate's E_ABANDONED marker must not be applied to
+/// those replies: the old generation, rather than explicit termination, is
+/// what invalidates them.
+pub fn destroyThreadForRestart(thread_ref: SlabRef(Thread)) bool {
+    return destroyThreadRefLockedMode(thread_ref, null, true);
+}
+
+fn destroyThreadRefLockedMode(thread_ref: SlabRef(Thread), caller_process: ?*Process, restarting: bool) bool {
     const thread = thread_ref.ptr;
 
     // Route the slab destroy through the deferred-finalize path
@@ -1953,9 +1971,13 @@ pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Pro
     // unmap that `finalizeDestroyMarkedDead` does only fires once the
     // thread's `last_dispatched_core` has done a `switchTo` — i.e. the
     // running core is provably off the kstack.
-    const retired = retireAndBumpDeadGen(thread_ref, thread) orelse return;
+    const retired = retireAndBumpDeadGen(thread_ref, thread) orelse return false;
 
-    if (thread.pending_reply_holder != null) {
+    if (restarting) {
+        thread.pending_reply_holder = null;
+        thread.pending_reply_process = null;
+        thread.pending_reply_slot = 0;
+    } else if (thread.pending_reply_holder != null) {
         if (thread.pending_reply_process) |dom_ref| {
             if (caller_process != null and dom_ref.ptr == caller_process.?) {
                 // Same-process reply pin — the user_table has already been
@@ -2027,4 +2049,5 @@ pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Pro
     scheduler.removeFromQueue(thread);
 
     routeRetiredFinalize(thread, retired.gen, retired.from, retired.owner, null);
+    return true;
 }
