@@ -49,9 +49,10 @@ that does not separate the two hands you the whole syscall surface as an
 
 **Primitives** are the thread claim funnels, in two tiers:
 
-* `claim` — `sched.thread.tryClaimWake`, the single cmpxchg that
-  transfers ownership of a waiting thread to the waker. Every genuine wake routes
-  through it.
+* `claim` — `sched.lifecycle.beginWaitingClaim` and
+  `beginWaitingClaimPinned`, which claim a waiting thread or pend a wake
+  while it is parking. Genuine waiting-thread wakes route through one of
+  these functions.
 * `enqueue` — `sched.scheduler.enqueue` / `enqueueOnCore`. Strictly broader:
   also covers re-enqueue of an already-owned thread, which is a run-queue
   mutation from interrupt context but not a wake.
@@ -147,8 +148,11 @@ test of the callback repair rather than a tautology.
   ISR seed is not necessarily reachable on every dynamic path; runtime guards
   (`if (is_vcpu)`, mode checks) are not modelled. The tool answers "can this
   ISR reach a wake", not "does it always".
-* Each DB carries IR for one arch. Seeds under the other arch's directory are
-  dropped, so per-DB output is a per-arch answer; pass both DBs for the union.
+* Interrupt seeds are filtered to the DB's arch. A source-only DB has no IR
+  edges and its syntactic overlay still covers files from both arch trees;
+  Rule B can therefore report a lock declared in the other arch (for example,
+  the x86 shootdown lock also appears in an aarch64 source-only report).
+  Per-arch Rule B counts must not be read as compiled-code counts.
 * Rule B's `[unreachable]` context tag means the static graph reaches the
   acquiring function from no entry point — usually because its only call
   sites are inside monomorphized generics. Context is then *unproven*, not
@@ -166,5 +170,6 @@ test of the callback repair rather than a tautology.
 (`rule='irq_wake_source'` / `rule='plain_lock_acquire'`) so the callgraph MCP
 `findings` tool can serve them.
 
-This tool is **not** wired into `tests/precommit.sh`. See the report that
-accompanied its introduction for the suggested gating shape.
+`tests/precommit.sh` runs this tool in the full manual gauntlet when callgraph
+DBs are present. It remains report-only and is not a required git-hook stage.
+`--strict` is available for investigation but is not the precommit policy.

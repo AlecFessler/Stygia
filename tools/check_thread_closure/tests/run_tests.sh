@@ -51,11 +51,12 @@ mkdir -p "$TMP_ROOT/kernel/sched" \
 # The three wake primitives the analyzer resolves by qualified name. If a
 # rename ever breaks them the analyzer exits 2, and every fixture fails
 # loudly — which is the intended failure mode.
-cat > "$TMP_ROOT/kernel/sched/thread.zig" <<'EOF'
-pub const State = enum { running, ready, futex_wait };
-pub fn tryClaimWake(thread: *u64, expected: State) bool {
-    _ = expected;
+cat > "$TMP_ROOT/kernel/sched/lifecycle.zig" <<'EOF'
+pub fn beginWaitingClaim(thread: *u64) bool {
     return thread.* != 0;
+}
+pub fn beginWaitingClaimPinned(thread: *u64) bool {
+    return beginWaitingClaim(thread);
 }
 EOF
 
@@ -123,13 +124,13 @@ EOF
 
 # Fixture 02: a plain generic-kernel wake path.
 cat > "$TMP_ROOT/kernel/sched/expiry.zig" <<'EOF'
-const thread = @import("thread.zig");
+const lifecycle = @import("lifecycle.zig");
 const scheduler = @import("scheduler.zig");
 
 var thread_slot: u64 = 1;
 
 pub fn expireDeadlines() void {
-    if (thread.tryClaimWake(&thread_slot, .futex_wait)) {
+    if (lifecycle.beginWaitingClaimPinned(&thread_slot)) {
         scheduler.enqueue(&thread_slot);
     }
 }
@@ -139,7 +140,7 @@ EOF
 # a method on a generic type, so the real indexer emits no ir_call edge for
 # it and the visitor is reachable only through the address-taken reference.
 cat > "$TMP_ROOT/kernel/sched/propagate.zig" <<'EOF'
-const thread = @import("thread.zig");
+const lifecycle = @import("lifecycle.zig");
 
 pub fn Slab(comptime T: type) type {
     return struct {
@@ -155,7 +156,7 @@ pub fn Slab(comptime T: type) type {
 var slab_instance: Slab(u64) = .{};
 
 fn wakeVisitor(slot: *u64) bool {
-    return thread.tryClaimWake(slot, .futex_wait);
+    return lifecycle.beginWaitingClaim(slot);
 }
 
 pub fn propagateAndWake() void {

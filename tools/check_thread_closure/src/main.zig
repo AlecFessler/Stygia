@@ -92,9 +92,8 @@ const sqlite = @import("sqlite.zig");
 // the tool loudly, not quietly weaken every finding it produces.
 
 const PrimTier = enum {
-    /// `tryClaimWake` — the single cmpxchg that transfers ownership of a
-    /// waiting thread to the waker. Every genuine wake routes through it (see
-    /// the doc comment on `scheduler.markReady`).
+    /// `beginWaitingClaim{,Pinned}` claims a waiting thread or records a
+    /// pending wake while it is parking.
     claim,
     /// Run-queue insertion. Strictly broader than `claim`: also covers
     /// re-enqueue of an already-owned thread, which is a run-queue mutation
@@ -112,7 +111,8 @@ const PrimTier = enum {
 const PrimSpec = struct { qname: []const u8, tier: PrimTier };
 
 const WAKE_PRIMITIVES = [_]PrimSpec{
-    .{ .qname = "sched.thread.tryClaimWake", .tier = .claim },
+    .{ .qname = "sched.lifecycle.beginWaitingClaim", .tier = .claim },
+    .{ .qname = "sched.lifecycle.beginWaitingClaimPinned", .tier = .claim },
     .{ .qname = "sched.scheduler.enqueue", .tier = .enqueue },
     .{ .qname = "sched.scheduler.enqueueOnCore", .tier = .enqueue },
 };

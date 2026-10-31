@@ -1,6 +1,6 @@
 // EXPECT: entries=1 sources=1 async_sources=1
 //
-// ISR → generic helper → tryClaimWake. The wake source is the helper (the
+// ISR → generic helper → beginWaitingClaimPinned. The wake source is the helper (the
 // first non-arch/ function on the path), not the handler.
 const interrupts = @import("interrupts.zig");
 const expiry = @import("../../sched/expiry.zig");
