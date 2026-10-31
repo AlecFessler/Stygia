@@ -49,7 +49,8 @@ const EventType = stygia.sched.thread.EventType;
 const State = stygia.sched.thread.State;
 const WaitKind = stygia.sched.thread.WaitKind;
 
-/// 4s of no-newline-progress = hang. Used as a backstop only — the
+/// 4s of no-newline-progress = hang, except for a bounded grace covering
+/// a short timed receive. Used as a backstop only — the
 /// primary detector on this branch is `allCoresIdle()` driven from the
 /// HPET-NMI watchdog, which fires within ~30 ms of every core entering
 /// the user-mode idle hlt loop with current_thread=null (the smp=4 reply-FP
@@ -57,6 +58,38 @@ const WaitKind = stygia.sched.thread.WaitKind;
 /// userspace IS still running but a single thread is wedged in a fault
 /// loop.
 pub const HANG_THRESHOLD_NS: u64 = 4_000_000_000;
+/// A receive waiting up to 6s can be an intentional absence probe. The
+/// restart-policy suite uses 5s and emitted false [HANG] reports at 4s.
+/// Longer waits (including the runner's 30s result wait) get no grace.
+const MAX_QUIET_RECV_NS: u64 = 6_000_000_000;
+const RECV_GRACE_NS: u64 = 1_000_000_000;
+
+/// Latest bounded receive deadline. A canceled receive may leave this value
+/// until its deadline plus one second; that is the maximum stale grace.
+var quiet_recv_deadline_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn noteTimedRecv(deadline_ns: u64, timeout_ns: u64) void {
+    if (builtin.cpu.arch != .x86_64 or timeout_ns > MAX_QUIET_RECV_NS) return;
+    _ = quiet_recv_deadline_ns.fetchMax(deadline_ns, .monotonic);
+}
+
+fn shouldDumpForSilence(now: u64, last: u64, quiet_deadline: u64) bool {
+    if (now < last or now - last < HANG_THRESHOLD_NS) return false;
+    if (quiet_deadline > now and quiet_deadline - now <= MAX_QUIET_RECV_NS) return false;
+    if (now >= quiet_deadline and now - quiet_deadline < RECV_GRACE_NS) return false;
+    return true;
+}
+
+test "short timed receive gets bounded grace without hiding a real hang" {
+    // A 5s absence probe starts 1.7s after the last serial newline.
+    const deadline: u64 = 6_700_000_000;
+    try std.testing.expect(!shouldDumpForSilence(4_000_000_000, 0, deadline));
+    try std.testing.expect(!shouldDumpForSilence(7_600_000_000, 0, deadline));
+    try std.testing.expect(shouldDumpForSilence(7_700_000_000, 0, deadline));
+    try std.testing.expect(shouldDumpForSilence(4_000_000_000, 0, 0));
+    // The runner's long result wait is deliberately not registered.
+    try std.testing.expect(shouldDumpForSilence(4_000_000_000, 0, 30_000_000_000));
+}
 
 /// Last monotonic-ns timestamp anything emitted on the serial path. Bumped
 /// from `arch.x64.serial.printRaw`. Read from the scheduler tick.
@@ -150,7 +183,7 @@ pub fn tickCheck() void {
     // Threshold-based detector. Trips when no userspace newline has
     // emitted for HANG_THRESHOLD_NS — the canonical Type B / slow-tail
     // signature.
-    if (delta >= HANG_THRESHOLD_NS) {
+    if (shouldDumpForSilence(now, last, quiet_recv_deadline_ns.load(.monotonic))) {
         // stygia-8xl: the one-shot latch used to cost us every event
         // after the first in a repeat-100 boot. The runner RECOVERS from
         // one of these (it skips the batch and carries on), so a boot can
@@ -169,7 +202,7 @@ pub fn tickCheck() void {
     }
 
     // The original all-cores-idle detector tripped on transient between-
-    // batch all-idle windows. The 2 s newline-progress threshold above
+    // batch all-idle windows. The 4 s newline-progress threshold above
     // is the reliable signal — a real lost-wakeup hang never emits more
     // newlines.
 }
