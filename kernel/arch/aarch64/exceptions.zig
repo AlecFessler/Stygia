@@ -142,25 +142,13 @@ fn logLowerElAbort(
     );
 }
 
-/// Stable sub-code values delivered alongside a `thread_fault` event
-/// (spec §[event_type] line 1841: arithmetic / illegal_instruction /
-/// alignment / stack_overflow). Numeric values are an arch contract
-/// shared with userspace fault handlers; the spec leaves the mapping
-/// to the implementation, so these are the kernel-internal canonical
-/// encodings.
+/// Kernel-internal sub-codes for unhandled user thread faults.
 const ThreadFaultSubcode = enum(u8) {
     illegal_instruction = 0,
     alignment_fault = 1,
     protection_fault = 2,
     arithmetic = 3,
     stack_overflow = 4,
-};
-
-/// Sub-code delivered alongside a `breakpoint` event (spec §[event_type]
-/// line 1842: software or hardware breakpoint trap).
-const BreakpointSubcode = enum(u8) {
-    software = 0,
-    hardware = 1,
 };
 
 // ── Exception Vector Table ──────────────────────────────────────────────
@@ -454,7 +442,7 @@ fn readFarEl1() u64 {
 ///   EC=0x15 (SVC64): syscall -- dispatch to syscall handler.
 ///   EC=0x24 (Data Abort from lower EL): page fault -- dispatch to fault handler.
 ///   EC=0x20 (Instruction Abort from lower EL): page fault -- dispatch to fault handler.
-///   Others: handle via `port.fireThreadFault` / `port.fireBreakpoint`.
+///   Others: handle via `port.fireThreadFault`.
 /// Intercept a data-abort that hit a userspace port-IO VMAR (no PTEs
 /// installed → every access faults) and forward the access to the
 /// underlying port-IO device. Returns `true` when the fault was
@@ -747,11 +735,11 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .breakpoint_lower_el => {
-            deliverBreakpoint(.hardware);
+            deliverThreadFault(.illegal_instruction, ctx.elr_el1);
         },
 
         .brk_instruction => {
-            deliverBreakpoint(.software);
+            deliverThreadFault(.illegal_instruction, ctx.elr_el1);
         },
 
         .software_step_lower_el => {
@@ -1387,17 +1375,5 @@ fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     // hop publishes its deferred on_cpu release before the scheduler
     // loop idles/dispatches.
     // Mirrors arch/x64/exceptions.zig user-exception handler tail.
-    if (scheduler.currentThread() == null) scheduler.hopParkRun();
-}
-
-/// Handle a user breakpoint, then yield.
-fn deliverBreakpoint(subcode: BreakpointSubcode) void {
-    const thr = scheduler.currentThread() orelse
-        @panic("user breakpoint with no current thread");
-    port.fireBreakpoint(thr, @intFromEnum(subcode));
-    // Masked + hop for the same kstack-release reasons as
-    // `deliverThreadFault`.
-    scheduler.yieldTo(null);
-    // Keep the post-yieldTo guard used by the other exception paths.
     if (scheduler.currentThread() == null) scheduler.hopParkRun();
 }

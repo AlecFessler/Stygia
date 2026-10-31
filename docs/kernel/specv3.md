@@ -2572,6 +2572,8 @@ Event type identifies whether a received event came from an explicit suspension 
 
 Sub-codes within `vm_exit` are carried in the event payload rather than as separate event type values.
 
+An unbound user breakpoint instruction (`INT3` on x86-64 or `BRK` on AArch64), and an AArch64 hardware breakpoint trap, are unhandled thread faults. The kernel tears down the owning process; it does not advance past the trap or resume the thread. No breakpoint event route exists.
+
 ### §[event_state] Event State
 
 When the thread handle that triggered the event held the `read` and/or `write` cap, the kernel exposes the suspended thread's state through the vreg layout at recv time and consumes modifications on reply. GPRs are 1:1 with hardware registers during handler execution — the handler reads or modifies thread state by directly reading or writing the hardware register. Non-GPR state lives on the stack at fixed offsets. The reply handle id is returned in the receiver's syscall word, not a vreg, so receivers handling small events do not need to allocate stack to reach a high vreg slot. VM exit events expose additional state — see §[vm_exit_state]. Handle attachments ride in pair vregs at the top of the vreg range — see §[handle_attachments].

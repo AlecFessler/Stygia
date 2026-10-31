@@ -1526,12 +1526,6 @@ pub fn fireThreadFault(thread: *Thread, subcode: u8, payload: u64) void {
     queueFaultProcessTeardown(thread, .unhandled_fault);
 }
 
-/// A breakpoint trap has no userspace route. The architecture owns trap advancement.
-pub fn fireBreakpoint(thread: *Thread, subcode: u8) void {
-    _ = thread;
-    _ = subcode;
-}
-
 /// Fire a vm_exit event for a vCPU thread through its exit_port.
 /// Spec §[vm_exit_state].
 pub fn fireVmExit(thread: *Thread, subcode: u8, payload: [3]u64) void {

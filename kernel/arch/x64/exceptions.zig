@@ -27,9 +27,7 @@ const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
 const VMAR = stygia.memory.vmar.VMAR;
 const VAddr = stygia.memory.address.VAddr;
 
-/// thread_fault sub-codes for exception-derived faults (spec §[event_type]
-/// row 2). Values are local to this file; the spec leaves sub-code
-/// numbering to implementations and only the routed handler observes them.
+/// Kernel-internal sub-codes for unhandled user thread faults.
 const ThreadFaultSubcode = struct {
     const arithmetic: u8 = 1;
     const illegal_instruction: u8 = 2;
@@ -185,28 +183,22 @@ pub fn wireIstGates() void {
     idt.setIst(@intFromEnum(Exception.page_fault), gdt.IST_PAGE_FAULT);
 }
 
-/// Classification of an architectural exception. `null` for
-/// vectors handled out-of-band (lazy FPU trap, single-step, NMI, machine
-/// check, double fault).
-const ExceptionEvent = union(enum) {
-    thread_fault: u8,
-    breakpoint,
-};
-
-fn exceptionEvent(vector: u5) ?ExceptionEvent {
+/// `null` for vectors handled out of band (lazy FPU trap, single-step,
+/// NMI, machine check, double fault).
+fn threadFaultSubcode(vector: u5) ?u8 {
     return switch (@as(Exception, @enumFromInt(vector))) {
-        .divide_by_zero, .overflow, .bound_range_exceeded => .{ .thread_fault = ThreadFaultSubcode.arithmetic },
-        .x87_floating_point, .simd_floating_point => .{ .thread_fault = ThreadFaultSubcode.arithmetic },
-        .invalid_opcode => .{ .thread_fault = ThreadFaultSubcode.illegal_instruction },
+        .divide_by_zero, .overflow, .bound_range_exceeded => ThreadFaultSubcode.arithmetic,
+        .x87_floating_point, .simd_floating_point => ThreadFaultSubcode.arithmetic,
+        .invalid_opcode => ThreadFaultSubcode.illegal_instruction,
         // device_not_available is handled out-of-band (lazy FPU trap)
         // before we reach exceptionEvent — see exceptionHandler.
         .device_not_available => null,
-        .alignment_check => .{ .thread_fault = ThreadFaultSubcode.alignment },
-        .general_protection_fault, .stack_segment_fault => .{ .thread_fault = ThreadFaultSubcode.protection },
-        .invalid_task_state_segment, .segment_not_present => .{ .thread_fault = ThreadFaultSubcode.protection },
-        .virtualization, .security => .{ .thread_fault = ThreadFaultSubcode.protection },
+        .alignment_check => ThreadFaultSubcode.alignment,
+        .general_protection_fault, .stack_segment_fault => ThreadFaultSubcode.protection,
+        .invalid_task_state_segment, .segment_not_present => ThreadFaultSubcode.protection,
+        .virtualization, .security => ThreadFaultSubcode.protection,
         .single_step_debug => null,
-        .breakpoint_debug => .breakpoint,
+        .breakpoint_debug => ThreadFaultSubcode.illegal_instruction,
         .double_fault, .machine_check => null,
         .non_maskable_interrupt, .coprocessor_segment_overrun => null,
         .page_fault => unreachable,
@@ -297,7 +289,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             scheduler.hopParkRun();
         }
 
-        if (exceptionEvent(vector)) |event| {
+        if (threadFaultSubcode(vector)) |subcode| {
             const thread = scheduler.currentThread() orelse
                 @panic("user exception with no current thread");
             // Diag: print vector + RIP + first byte at RIP for any user fault.
@@ -317,10 +309,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             serial.print("[USR-FAULT] vec={d} rip=0x{x} byte=0x{x}\n", .{
                 vector, ctx.rip, rip_byte,
             });
-            switch (event) {
-                .thread_fault => |subcode| port.fireThreadFault(thread, subcode, ctx.rip),
-                .breakpoint => port.fireBreakpoint(thread, 0),
-            }
+            port.fireThreadFault(thread, subcode, ctx.rip);
             // IRQs deliberately stay MASKED through the dispatch
             // attempt: fault handling may have parked `thread` with its
             // kstack release stashed on this core, and an IRQ handler
