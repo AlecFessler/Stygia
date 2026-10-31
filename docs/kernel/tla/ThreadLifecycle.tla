@@ -1295,8 +1295,9 @@ DirArm(c) ==
 (* when the loop can decide; the pure spin (target running, still armed)   *)
 (* is stuttering -- the spinner is preemptible with pin = 0 (W5).          *)
 (* On breaking because directive_state left `armed`: `none` = consumed     *)
-(* (success), `dead` = finalize cleared it (E_TERM, round-4 F6). On a      *)
-(* disarm CAS win the re-dispatch by settled state is abstracted to        *)
+(* (success), `dead` maps to E_TERM (round-4 F6). With dpin held, the      *)
+(* latter is an unreachable waiter observation in the current machine.   *)
+(* On a disarm CAS win the re-dispatch by settled state is abstracted to    *)
 (* returning to user (the 5c / 5a re-dispatch paths exist as their own     *)
 (* model actions; transients re-read per Sec 8.3).                         *)
 DirLoop(c) ==
@@ -1327,10 +1328,10 @@ DirLoop(c) ==
         (* writes `dead` and then `slot zero + freelist` a few steps      *)
         (* later in the SAME routine, and `none` must be all-zeroes or a  *)
         (* recycled slot is permanently unsuspendable (round-9 C-1). So   *)
-        (* the zero converts `dead` back to `none`, and a suspender whose *)
-        (* target was terminated + finalized reads `none` beside a LIVE   *)
-        (* port and returns SUCCESS -- round-4 F6 re-opened by a later    *)
-        (* step of its own row. Fix: also re-validate the TARGET's gen.   *)
+        (* the zero converts `dead` back to `none`. The historical F6     *)
+        (* false-success trace requires a live waiter to span target      *)
+        (* retirement and finalization. dpin excludes that trace here;    *)
+        (* target-gen revalidation remains the specified disambiguator.   *)
         /\ LET staleGen == threads[t].gen # threads[u].dgen
                concludesSuccess ==
                  /\ ~threads[u].dlv     \* MY arm was never delivered
@@ -1759,9 +1760,11 @@ RetireUnwind(e) ==
   /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* G11: finalize publishes a terminal directive marker before the slab
-   release body clears the slot to all zeroes. Keep that intermediate value
-   reachable so a competing directive waiter can observe failure. Reuse is
-   held until the clear; a new thread must never inherit a dead directive. *)
+   release body clears the slot to all zeroes. This intermediate is reachable,
+   but not by a live directive waiter: dpin blocks RetireEnabled. The model's
+   gen is the slot reuse epoch, not the kernel's physical slab parity, which
+   flips during retire before this marker. Reuse is held until the clear; a
+   new thread must never inherit a dead directive. *)
 ClearFreedDirective(e) ==
   /\ threads[e].st = "finalizing" /\ threads[e].dir = "dead"
   /\ threads' = [threads EXCEPT ![e].st = "freed", ![e].dir = "none",

@@ -338,7 +338,7 @@ gitignored; keep all generated output under them.
 |---|---|
 | `ThreadLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
 | `ThreadProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
-| `run.sh` | **runs 43 default rows and six opt-in rows; exits non-zero on any deviation** |
+| `run.sh` | **runs 51 default rows and six opt-in rows; exits non-zero on any deviation** |
 | `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants; TLC core/thread symmetry reduction |
 | `ThreadLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
 | `ThreadLifecycle_medium.cfg` | extended/manual 2c × 3e full directive aggregate, symmetry. **Oversized after dpin/dres; not default evidence.** Two documented scope cuts in-file: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
@@ -346,6 +346,7 @@ gitignored; keep all generated output under them.
 | `ThreadLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
 | `ThreadLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 Threads. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
 | `ThreadLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
+| `ThreadLifecycle_g11{,_pin}.cfg` | G11 marker reachability violation plus same-scope safety check that finalizing/dead has no live directive waiter; removing `RetireEnabled`'s `dpin` guard falsifies the latter |
 | `ThreadLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
 | `ThreadLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
 | `ThreadLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
@@ -434,7 +435,7 @@ here.
 
 | Spec | Model | Notes |
 |---|---|---|
-| §2.1 lifecycle word, 7 states | `threads[e].st`, CAS = guarded atomic actions | + `"finalizing"`/`"freed"` as model-only release-body phases around G11's `dead` marker and slot zero |
+| §2.1 lifecycle word, 7 states | `threads[e].st`, CAS = guarded atomic actions | + `"finalizing"`/`"freed"` as model-only release-body phases around G11's `dead` marker and slot zero. Model `gen` is a slot reuse epoch; kernel physical slab parity flips earlier at retirement. `dpin` excludes a directive waiter during that interval |
 | ~~§2.1.1 idle thread~~ | **nothing to model — §2.1.1 WITHDRAWN in doc rev 16** | **G7 CLOSED by the doc retracting.** There is no per-core idle thread (`idle_thread` never assigned; `parkAndAwaitIRQ` is the real mechanism and replaced it to fix a cross-core kstack-sharing bug). A core with an empty run queue holds no thread, so the model having none is faithful, not a gap. Unaffected: the `.idle_wait` thread state / `wait.kind == .idle`, which are a USER thread choosing to idle |
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
@@ -544,30 +545,51 @@ incomparable/reconstruction.
 - **G11 (modelled in the current lifecycle module; default battery passed).**
   Finalization now has two visible steps: `finalizing` publishes
   `directive_state = dead`, then `ClearFreedDirective` zeroes the word and
-  advances the slab generation. `ProbeNoFinalizingDead` is expected to fail,
-  proving the intermediate state is reached. `DirLoop` treats `dead` as a
-  terminal failure, consistent with the approved `E_TERM` outcome for a
-  suspend after termination commits. The existing generation and target-pin
-  checks remain necessary when the zero or a concurrent retire wins first.
-  The G11 reachability probe fired; the current `dirf6fix` and all-feature
-  `small` safety rows passed, as did the full default battery recorded below.
-  **Code correspondence limit (2026-10-31):** the model advances its abstract
-  slot `gen` at `ClearFreedDirective`, after the `dead` marker. The kernel's
-  `retireAndBumpDeadGen` flips the physical slab generation before
-  `finalizeDestroyMarkedDead` stores `dead`, and `destroyAlreadyMarked`
-  later zeroes the slot. A remote suspender that acquired the target pin
-  cannot overlap that flip: `tryPinLive` holds `pin_depth` until
-  `waitForSuspendDirective` returns, and the retirer calls
-  `waitPinsDrained` before `bumpDeadGenLocked`. New suspend attempts fail
-  the generation lock/mark check and return E_TERM through
-  `terminalSuspendResult`; a previously armed waiter can observe `retired`
-  and return E_TERM before releasing its pin. The model's `dpin` likewise
-  blocks retire while the waiter owns the target pin. Its G11 probe proves
-  the intermediate `dead` marker is reachable, which is also true of the
-  kernel after the physical gen flip, but does not prove a live waiter can
-  observe it. The delayed abstract gen advance is a bookkeeping
-  abstraction, not the physical slab update order. G11 is deliberately
-  outside the source-order gate pending a focused abstraction review.
+  advances the model's slot reuse epoch. `ProbeNoFinalizingDead` fails,
+  proving the intermediate state is reached. `DirLoop` maps `dead` to
+  terminal failure, consistent with the approved `E_TERM` result if it
+  could read that value. `InvNoLiveWaiterAtFinalizingDead` establishes
+  that this branch is unreachable for a live directive waiter in this
+  machine. The generation and target-pin checks remain necessary.
+
+  **Abstraction mapping (2026-10-31, awaiting owner acceptance):** The
+  model's `gen` is a *slot reuse epoch*. `ClearFreedDirective` advances
+  it with slot zero. The kernel's physical `_gen_lock` parity flips
+  earlier: `retireAndBumpDeadGen` marks retirement, waits for
+  `pin_depth == 0`, retires the lifecycle state, and calls
+  `bumpDeadGenLocked`; only later does `finalizeDestroyMarkedDead` store
+  `dead`, followed by slot zero. Between the physical flip and model
+  epoch advance, both systems reject new suspend claims: kernel
+  generation/mark/state validation fails; model `DirClaim` requires
+  `running`. The extra abstract live-gen interval grants no successful
+  suspend step.
+
+  Concrete races: (1) A pins B and arms B, then C tries to retire B.
+  C waits at `waitPinsDrained`; A completes its directive wait and
+  releases the pin before C can flip the physical gen or publish `dead`.
+  (2) C marks/retire-flips B first. A's `tryPinLive` or generation-lock/
+  state recheck fails and `suspendThread` returns `E_TERM`; A never enters
+  the directive wait. The model mirrors these with `dpin` versus
+  `RetireEnabled` and `running` versus `retired`/`finalizing`. Thus the
+  finalizing/dead state is a safe *state* over-approximation but does not
+  establish a live waiter observing `dead`. It does not prove physical
+  source ordering; the source order above is the required code evidence.
+
+  Focused TLC evidence at the 2-core/2-thread G11 scope: marker
+  reachability fired at 13 distinct states; the no-live-waiter invariant
+  passed the complete 3,548,584-distinct-state graph (58 s, 0 queued).
+  A calibration copy with only `RetireEnabled`'s `~dpin` guard removed
+  violated the invariant at state 9 after `DirClaim`, `DirArm`, retire,
+  and `DispatchAbort` (2,728 distinct states in that run). The calibration
+  copy and log are ignored `out/` artifacts, not a new model variant.
+  The complete default `TLC_HEAP=5g TLC_WORKERS=4 TLC_TIMEOUT=1800 ./run.sh`
+  battery then exited `RESULT: OK`: 51 TLC rows plus SANY, all expected
+  verdicts, from 06:43:33 to 07:10:40 CDT (about 27m08s). `g11pin`,
+  `dirf6`, and `dirf6fix` each passed at 3,548,584 distinct states;
+  all-feature `small` passed at 4,828,424; the final `cr1minself`
+  liveness row passed at 208,032 distinct / 416,064 temporal product
+  states in 13m13s. Transcript: `/tmp/stygia_g11_battery.log` on the
+  verification host. `RUN_XLARGE` and `RUN_SLOW` were not enabled.
 - **G10 (rev 8, MP — round-7 M-1's residue; its LOCK-ORDER half REFUTED
   in round 8, C-3)** — the reach-and-validate protocol (handle → gen
   lock → container lock → re-validate) is doc-side only, and that part
