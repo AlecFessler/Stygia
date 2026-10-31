@@ -123,11 +123,9 @@ fn stage(comptime mode: Mode, cap_table_base: u64) u64 {
     if (mode == .snapshot_mixed_page_sizes) {
         // Leave an empty 4 KiB leaf table under the same VA. A later 2 MiB
         // block must replace that table after its demand page is removed.
-        if (builtin.cpu.arch == .aarch64) {
-            const small = vmar(0, HUGE_SRC, true) orelse return 75;
-            word(HUGE_SRC).* = OLD;
-            if (!ok(syscall.delete(small).v1)) return 76;
-        }
+        const small = vmar(0, HUGE_SRC, true) orelse return 75;
+        word(HUGE_SRC).* = OLD;
+        if (!ok(syscall.delete(small).v1)) return 76;
         const vc = caps.VmarCap{ .r = true, .w = true, .max_sz = 1, .restart_policy = 2 };
         const src = handle(syscall.createVmar(vc.toU16(), 3 | (1 << 3), 1, HUGE_SRC, 0).v1) orelse return 61;
         const pf_caps = caps.PfCap{ .r = true, .w = true, .max_sz = 1, .restart_policy = true };

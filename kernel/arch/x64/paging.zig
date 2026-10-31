@@ -1240,15 +1240,10 @@ pub fn mapPageSized(
     cch: VmarCacheType,
     perms: MemoryPerms,
 ) !void {
-    // v0: only 4 KiB pages supported through the VMAR-side map path.
-    // 2 MiB / 1 GiB landings go through `mapPageBoot` for the kernel
-    // address space; userspace VARs are spec'd over 4 KiB throughout
-    // the test runner so the simple fallback covers what the runner
-    // exercises.
-    std.debug.assert(sz == .sz_4k);
-
-    std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
-    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
+    std.debug.assert(sz == .sz_4k or sz == .sz_2m);
+    const page_bytes: u64 = if (sz == .sz_2m) paging.PAGE2M else paging.PAGE4K;
+    std.debug.assert(std.mem.isAligned(phys.addr, page_bytes));
+    std.debug.assert(std.mem.isAligned(virt.addr, page_bytes));
 
     // Spec §[address_space]: NULL guard `[0, 0x1000)` must always fault.
     // Runtime check (active in all build modes) so a buggy caller cannot
@@ -1278,7 +1273,7 @@ pub fn mapPageSized(
         .user_accessible = true,
         .write_through = pat_bits.pwt,
         .not_cacheable = pat_bits.pcd,
-        .huge_page = pat_bits.pat, // bit 7 = PAT in 4 KiB leaf
+        .huge_page = if (sz == .sz_2m) true else pat_bits.pat,
         .global = false,
         .not_executable = not_executable,
     };
@@ -1288,7 +1283,8 @@ pub fn mapPageSized(
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
-    for (walk_indices) |idx| {
+    const parent_count: usize = if (sz == .sz_2m) 2 else 3;
+    for (walk_indices[0..parent_count]) |idx| {
         const entry = &table[idx];
         // Intermediate-entry install must be atomic. Two cores mapping
         // DIFFERENT VAs that happen to share a parent table both see the
@@ -1345,16 +1341,32 @@ pub fn mapPageSized(
         // some future clear site starts leaving stale bits behind.
         const cur_entry: PageEntry = @bitCast(cur);
         std.debug.assert(cur_entry.present);
+        if (cur_entry.huge_page) return error.MappingConflict;
         const next_virt = VAddr.fromPAddr(cur_entry.getPAddr(), null);
         table = @ptrFromInt(next_virt.addr);
     }
 
-    const l1_entry = &table[l1Idx(virt)];
+    const leaf = &table[if (sz == .sz_2m) l2Idx(virt) else l1Idx(virt)];
     // Single-store leaf install — same transient-phys-0 hazard as the
     // parent-entry sites above.
     var filled_leaf = leaf_entry;
     filled_leaf.setPAddr(phys);
-    l1_entry.* = filled_leaf;
+    // In a 2 MiB PDE bit 7 is PS and bit 12 is PAT. The physical
+    // address is 2 MiB aligned, leaving bit 12 available for PAT.
+    if (sz == .sz_2m and pat_bits.pat) filled_leaf.addr |= 1;
+    if (sz == .sz_2m and leaf.present and !leaf.huge_page) {
+        // A prior 4 KiB VMAR may have left an empty PT at this address.
+        // The active address space supplies the PCID for a synchronous
+        // shootdown before we recycle the old table page.
+        const old_table_virt = VAddr.fromPAddr(leaf.getPAddr(), null);
+        const old_table: *[page_entry_table_size]PageEntry = @ptrFromInt(old_table_virt.addr);
+        for (old_table) |child| if (child.present) return error.MappingConflict;
+        if (getAddrSpaceRoot().addr != addr_space_root.addr) return error.MappingConflict;
+        leaf.* = default_page_entry;
+        shootdownTlbRange(@truncate(cpu.readCr3() & 0xFFF), virt, sz, 1);
+        pmm_mgr.freePage(@ptrFromInt(old_table_virt.addr));
+    }
+    leaf.* = filled_leaf;
 }
 
 pub fn unmapPageSized(
@@ -1362,8 +1374,45 @@ pub fn unmapPageSized(
     virt: VAddr,
     sz: VmarPageSize,
 ) ?PAddr {
-    std.debug.assert(sz == .sz_4k);
-    return unmapPage(addr_space_root, virt);
+    if (sz == .sz_4k) return unmapPage(addr_space_root, virt);
+    std.debug.assert(sz == .sz_2m);
+    std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE2M));
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+    for ([_]u9{ l4Idx(virt), l3Idx(virt) }) |idx| {
+        const entry = &table[idx];
+        if (!entry.present or entry.huge_page) return null;
+        table = @ptrFromInt(VAddr.fromPAddr(entry.getPAddr(), null).addr);
+    }
+    const block = &table[l2Idx(virt)];
+    if (!block.present or !block.huge_page) return null;
+    const phys = PAddr.fromInt(block.getPAddr().addr & ~(paging.PAGE2M - 1));
+    block.* = default_page_entry;
+    cpu.invlpg(virt.addr);
+    // VMAR's caller performs the synchronous per-PCID range shootdown
+    // before releasing the backing PF. Match the 4 KiB unmap path's
+    // immediate remote notification as well.
+    flushRemoteTlb(virt.addr);
+    return phys;
+}
+
+/// Process teardown has already quiesced this address space on every core.
+/// Clear the correctly sized leaf before releasing its PageFrame backing.
+pub fn unmapPageSizedNoShootdown(addr_space_root: PAddr, virt: VAddr, sz: VmarPageSize) ?PAddr {
+    if (sz == .sz_4k) return unmapPageNoShootdown(addr_space_root, virt);
+    std.debug.assert(sz == .sz_2m);
+    const root_virt = VAddr.fromPAddr(addr_space_root, null);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
+    for ([_]u9{ l4Idx(virt), l3Idx(virt) }) |idx| {
+        const entry = &table[idx];
+        if (!entry.present or entry.huge_page) return null;
+        table = @ptrFromInt(VAddr.fromPAddr(entry.getPAddr(), null).addr);
+    }
+    const block = &table[l2Idx(virt)];
+    if (!block.present or !block.huge_page) return null;
+    const phys = PAddr.fromInt(block.getPAddr().addr & ~(paging.PAGE2M - 1));
+    block.* = default_page_entry;
+    return phys;
 }
 
 /// Allocate a fresh PML4 table for a new process. Kernel
@@ -1487,7 +1536,8 @@ fn freePd(pmm_mgr: *pmm.PhysicalMemoryManager, pd_phys: PAddr, skip1_start: u64,
         if (!entry.present) continue;
         if (entry.huge_page) {
             // 2 MiB leaf at L2.
-            const phys = entry.getPAddr().addr;
+            // Bit 12 is PAT for a huge PDE, not part of the output PA.
+            const phys = entry.getPAddr().addr & ~(paging.PAGE2M - 1);
             entry.* = default_page_entry;
             if (!leafSkipped(phys, skip1_start, skip1_bytes, skip2_start, skip2_bytes)) {
                 pmm_mgr.freePage(physToPagePtr(phys));
@@ -1550,7 +1600,8 @@ pub fn shootdownTlbRange(
     sz: VmarPageSize,
     page_count: u32,
 ) void {
-    std.debug.assert(sz == .sz_4k);
+    std.debug.assert(sz == .sz_4k or sz == .sz_2m);
+    const page_bytes: u64 = if (sz == .sz_2m) paging.PAGE2M else paging.PAGE4K;
     if (page_count == 0) return;
 
     const core_count = apic.coreCount();
@@ -1562,7 +1613,7 @@ pub fn shootdownTlbRange(
     // one core online.
     var i: u32 = 0;
     while (i < page_count) : (i += 1) {
-        cpu.invlpg(virt.addr + @as(u64, i) * paging.PAGE4K);
+        cpu.invlpg(virt.addr + @as(u64, i) * page_bytes);
     }
     if (remote_count == 0) return;
 
@@ -1574,7 +1625,7 @@ pub fn shootdownTlbRange(
 
     var j: u32 = 0;
     while (j < page_count) : (j += 1) {
-        const va = virt.addr + @as(u64, j) * paging.PAGE4K;
+        const va = virt.addr + @as(u64, j) * page_bytes;
         @atomicStore(u64, &shootdown_addr, va, .release);
         @atomicStore(u8, &shootdown_kind, @intFromEnum(kind), .release);
         // Bump the sync-arm gen AFTER publishing the descriptor so a
