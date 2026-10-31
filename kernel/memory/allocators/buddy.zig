@@ -130,8 +130,10 @@ pub const BuddyAllocator = struct {
         std.debug.assert(len > 0);
         const num_pages = len / PAGE_SIZE;
         std.debug.assert((num_pages & (num_pages - 1)) == 0);
+        // An order beyond MAX_ORDER has no freelist. Check before narrowing
+        // to u4: a 1 GiB request has order 18 and would trap on that cast.
+        if (num_pages > (1 << MAX_ORDER)) return null;
         const order: u4 = @intCast(@ctz(num_pages));
-        std.debug.assert(order < NUM_ORDERS);
 
         const addr = self.recursiveSplit(order) orelse return null;
         self.bitmap.setBit(addr, 0);
