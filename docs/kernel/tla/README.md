@@ -11,12 +11,12 @@ default historical configs set `VCPU_THREADS = {}` so their old scope remains
 unchanged; `vcpu_cancel` and `vcpu_nocancel` are the new load-bearing
 focused pair.
 
-**On `main`: the model battery is manual.** There is no active
-`tla_battery` precommit stage or model-to-code correspondence checker.
-Run `run.sh` explicitly and review the parity ledger before citing a
-model verdict as evidence about the implementation. The recorded rows
-were reproduced by hand at the landing commit; later code changes can
-introduce drift until correspondence checks are restored.
+**The model battery is manual.** `tests/precommit.sh` runs the focused
+`tools/check_model_correspondence.py` gate for G14 park/wake, G16 teardown
+handoff, and restart ordering, with mutation fixtures. It detects source
+changes to those obligations; it does not establish a full refinement proof
+or run TLC. Run `run.sh` explicitly and review the parity ledger before
+citing a model verdict as evidence about the implementation.
 
 Revisions 6 through 10 were CO-EVOLVED with this model: model findings
 (N1–N6) were fed back into the doc, doc findings back into the model, and
@@ -551,6 +551,23 @@ incomparable/reconstruction.
   checks remain necessary when the zero or a concurrent retire wins first.
   The G11 reachability probe fired; the current `dirf6fix` and all-feature
   `small` safety rows passed, as did the full default battery recorded below.
+  **Code correspondence limit (2026-10-31):** the model advances its abstract
+  slot `gen` at `ClearFreedDirective`, after the `dead` marker. The kernel's
+  `retireAndBumpDeadGen` flips the physical slab generation before
+  `finalizeDestroyMarkedDead` stores `dead`, and `destroyAlreadyMarked`
+  later zeroes the slot. A remote suspender that acquired the target pin
+  cannot overlap that flip: `tryPinLive` holds `pin_depth` until
+  `waitForSuspendDirective` returns, and the retirer calls
+  `waitPinsDrained` before `bumpDeadGenLocked`. New suspend attempts fail
+  the generation lock/mark check and return E_TERM through
+  `terminalSuspendResult`; a previously armed waiter can observe `retired`
+  and return E_TERM before releasing its pin. The model's `dpin` likewise
+  blocks retire while the waiter owns the target pin. Its G11 probe proves
+  the intermediate `dead` marker is reachable, which is also true of the
+  kernel after the physical gen flip, but does not prove a live waiter can
+  observe it. The delayed abstract gen advance is a bookkeeping
+  abstraction, not the physical slab update order. G11 is deliberately
+  outside the source-order gate pending a focused abstraction review.
 - **G10 (rev 8, MP — round-7 M-1's residue; its LOCK-ORDER half REFUTED
   in round 8, C-3)** — the reach-and-validate protocol (handle → gen
   lock → container lock → re-validate) is doc-side only, and that part
@@ -628,6 +645,13 @@ incomparable/reconstruction.
   the claim that the wake mechanism is represented. The symmetry-reduced
   all-feature `small` safety row also passed with parked-core interleavings
   enabled; the full default battery passed as recorded below.
+  `dequeueOrIdle` holds `core_locks[core]` across the empty-queue decision;
+  `finishEnqueuePublish` publishes queue membership and snapshots
+  `idle_parked` under that lock, then sends the IPI after unlocking. The
+  model fuses enqueue and pending wake into one action, so its parked-queue
+  safety invariant does not describe the brief pre-IPI instruction window.
+  The source-order gate checks the lock and delivery path; liveness still
+  depends on the enqueuer continuing to the send.
 - **G15 (NEW, rev 16, INC — round-14 parity review; RECORDED, not fixed,
   and the reasoning is the reason it is recorded).** **`InvS3` is
   NARROWER than S3, and the narrowing was unnamed.** The formula is
@@ -679,6 +703,14 @@ incomparable/reconstruction.
   physical refcount arithmetic. The bounded restart extension below
   covers the process gate and lifecycle outcomes, not physical byte counts. The full all-feature G16
   safety and liveness configuration remains unverified.
+
+  The source-order gate checks request publication under the core lock,
+  safe-stack drain after `scheduler_run_after_park`, pending-slot clear,
+  and restart fallback. `TeardownRequest` carries the process slab
+  generation; the kernel's active reference is the local `req` in
+  `drainTeardown`, not a persistent per-core `active` field as in the
+  model. Reference lifetime across phase 2 still needs code review and
+  runtime tests.
 
 ## Validation gates — results
 
@@ -1354,8 +1386,9 @@ G14 obligation. The symmetry-reduced full all-feature safety row and the
 default liveness ladder now have verdicts as stated above.
 
 **What this validation does NOT establish.** It shows the split preserved
-the model, not that the model still describes the code. No active
-model-to-code correspondence checker exists on this branch.
+the model, not that the model still describes the code. The later focused
+source-order gate covers G14/G16/restart dependencies only; the remaining
+action correspondence still depends on the parity ledger and code review.
 
 ### Reproduced at the `main` landing commit
 

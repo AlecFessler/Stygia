@@ -9,6 +9,7 @@
 #   0c. gen-lock analyzer            (all ownership and IRQ rules)
 #   0d. thread-closure analyzer      (REPORT-ONLY — never affects exit status)
 #   0e. spec ↔ test coverage         (verify_coverage.py)
+#   0f. lifecycle correspondence     (focused source-order and model tripwire)
 #   1. x86_64 kernel test suite      (KVM on this dev PC, 3 reps)
 #   2. aarch64 kernel test suite     (Pi 5 bare-metal tryboot @ .107; QEMU/KVM fallback on .106/.104)
 #   2a. aarch64 VM-TCG vCPU subset   (local TCG, gic-version=3, EL2 exposed)
@@ -241,6 +242,7 @@ REQUIRED_STAGES=(
     dead_code_report
     gen_lock_analyzer
     verify_coverage
+    model_correspondence
     x86_kernel_tests
     aarch64_kernel_tests_pi
     aarch64_vm_tests_tcg
@@ -248,9 +250,6 @@ REQUIRED_STAGES=(
     linux_guest_x86_boot
     linux_guest_aarch64_boot
 )
-# Stygia-o4a.4.2 owns adding model-to-code correspondence here once its
-# checker is restored. There is no executable correspondence check today.
-#
 is_required() {
     local s
     for s in "${REQUIRED_STAGES[@]}"; do
@@ -705,6 +704,21 @@ stage_verify_coverage() {
     # tags, missing files, orphan files, or any non-zero mismatch.
     if ! python3 "$SCRIPT_DIR/suite/verify_coverage.py"; then
         FAILURES+=("spec/test coverage mismatch")
+        return 1
+    fi
+}
+
+stage_model_correspondence() {
+    echo ""
+    echo "=================================================="
+    echo "[0f] Lifecycle model ↔ code correspondence"
+    echo "=================================================="
+    if ! python3 "$STYGIA_ROOT/tools/test_model_correspondence.py"; then
+        FAILURES+=("model correspondence mutation fixtures failed")
+        return 1
+    fi
+    if ! python3 "$STYGIA_ROOT/tools/check_model_correspondence.py"; then
+        FAILURES+=("lifecycle model/code correspondence drift")
         return 1
     fi
 }
@@ -1697,6 +1711,7 @@ run_stage dead_code_report
 run_stage gen_lock_analyzer
 run_stage thread_closure_report
 run_stage verify_coverage
+run_stage model_correspondence
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi
 run_stage aarch64_vm_tests_tcg
