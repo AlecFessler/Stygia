@@ -365,18 +365,15 @@ pub fn main() !void {
         try qmap_local.ensureTotalCapacity(palloc, @intCast(resolve_result.final_entities.len));
         for (resolve_result.final_entities) |e| try qmap_local.put(palloc, e.qualified_name, e.id);
 
-        // Build basename → file_id map for DWARF line resolution. The ELF is
-        // the kernel ELF, so only kernel files (the first `kernel_file_count`
-        // in `merged_files`) map. Including non-kernel files would hijack
-        // basename collisions like `main.zig` (kernel vs hyprvOS).
-        var basemap: std.StringHashMapUnmanaged(u32) = .empty;
-        try basemap.ensureTotalCapacity(palloc, @intCast(kernel_file_count));
+        // DWARF compilation-unit headers carry source paths. Match those to
+        // kernel-relative paths; basenames collide across architecture trees.
+        var pathmap: std.StringHashMapUnmanaged(u32) = .empty;
+        try pathmap.ensureTotalCapacity(palloc, @intCast(kernel_file_count));
         for (merged_files[0..kernel_file_count]) |f| {
-            const base = std.fs.path.basename(f.path);
-            try basemap.put(palloc, base, f.id);
+            try pathmap.put(palloc, f.path, f.id);
         }
 
-        const bin_result = try bin_pass.pass(palloc, elf_path, &qmap_local, &basemap);
+        const bin_result = try bin_pass.pass(palloc, elf_path, &qmap_local, &pathmap);
         bin_symbols_count = bin_result.bin_symbols.len;
         bin_insts_count = bin_result.bin_insts.len;
         dwarf_lines_count = bin_result.dwarf_lines.len;

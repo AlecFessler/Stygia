@@ -17,7 +17,7 @@ pub fn pass(
     palloc: std.mem.Allocator,
     elf_path: []const u8,
     entity_by_qname: *const std.StringHashMapUnmanaged(u32),
-    file_by_basename: *const std.StringHashMapUnmanaged(u32),
+    file_by_path: *const std.StringHashMapUnmanaged(u32),
 ) !PassResult {
     const sym_out = try runCmd(palloc, &.{ "objdump", "--syms", elf_path });
     const dis_out = try runCmd(palloc, &.{ "objdump", "-d", "-M", "intel", elf_path });
@@ -26,7 +26,7 @@ pub fn pass(
     return .{
         .bin_symbols = try parseSymbols(palloc, sym_out, entity_by_qname),
         .bin_insts = try parseDisasm(palloc, dis_out),
-        .dwarf_lines = try parseLines(palloc, line_out, file_by_basename),
+        .dwarf_lines = try parseLines(palloc, line_out, file_by_path),
     };
 }
 
@@ -183,7 +183,7 @@ fn parseHexBytes(palloc: std.mem.Allocator, text: []const u8) ![]const u8 {
 fn parseLines(
     palloc: std.mem.Allocator,
     text: []const u8,
-    file_by_basename: *const std.StringHashMapUnmanaged(u32),
+    file_by_path: *const std.StringHashMapUnmanaged(u32),
 ) ![]DwarfLineRow {
     // First pass: parse raw entries (file, line, addr) sorted by addr.
     const RawEntry = struct {
@@ -192,18 +192,32 @@ fn parseLines(
         addr: u64,
     };
     var raw: std.ArrayList(RawEntry) = .empty;
+    defer raw.deinit(palloc);
 
+    var current_file_id: ?u32 = null;
+    var current_basename: []const u8 = "";
     var line_iter = std.mem.splitScalar(u8, text, '\n');
     while (line_iter.next()) |raw_line| {
-        if (raw_line.len == 0) continue;
-        // Skip CU headers (lines ending with `:`) and section headers.
-        if (raw_line[0] != ' ' and raw_line[0] != '\t') {
-            // Most entry lines start with a non-space basename (e.g. "ubsan_rt.zig").
-            // Only accept lines containing ".zig" or ".c" and a hex address.
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        // objdump prints a full file path before each group of line rows,
+        // whose first field is only the basename. Resolve the path once and
+        // keep it until the next group; unknown files must not inherit it.
+        if (std.mem.endsWith(u8, line, ":")) {
+            const header_path = line[0 .. line.len - 1];
+            const relative_path = if (std.mem.lastIndexOf(u8, header_path, "/kernel/")) |i|
+                header_path[i + "/kernel/".len ..]
+            else if (std.mem.startsWith(u8, header_path, "kernel/"))
+                header_path["kernel/".len..]
+            else
+                header_path;
+            current_file_id = file_by_path.get(relative_path);
+            current_basename = std.fs.path.basename(relative_path);
+            continue;
         }
 
         // Tokenize on whitespace.
-        var tok_iter = std.mem.tokenizeAny(u8, raw_line, " \t");
+        var tok_iter = std.mem.tokenizeAny(u8, line, " \t");
         const fname = tok_iter.next() orelse continue;
         const line_str = tok_iter.next() orelse continue;
         const addr_str = tok_iter.next() orelse continue;
@@ -215,7 +229,8 @@ fn parseLines(
         if (!std.mem.startsWith(u8, addr_str, "0x")) continue;
         const addr = std.fmt.parseInt(u64, addr_str[2..], 16) catch continue;
 
-        const file_id = file_by_basename.get(fname) orelse continue;
+        if (!std.mem.eql(u8, fname, current_basename)) continue;
+        const file_id = current_file_id orelse continue;
         try raw.append(palloc, .{ .file_id = file_id, .line = line_no, .addr = addr });
     }
     if (raw.items.len == 0) return &.{};
@@ -265,6 +280,37 @@ fn parseLines(
     });
 
     return try rows.toOwnedSlice(palloc);
+}
+
+test "DWARF line paths distinguish same-named files across architectures" {
+    const allocator = std.testing.allocator;
+    var paths: std.StringHashMapUnmanaged(u32) = .empty;
+    defer paths.deinit(allocator);
+    try paths.put(allocator, "arch/aarch64/cpu.zig", 11);
+    try paths.put(allocator, "arch/x64/cpu.zig", 22);
+
+    const decoded =
+        \\Contents of the .debug_line section:
+        \\/build/kernel/arch/x64/cpu.zig:
+        \\File name                        Line number    Starting address    View    Stmt
+        \\cpu.zig                                427  0x1000               x
+        \\cpu.zig                                429  0x1004               x
+        \\/build/kernel/arch/aarch64/cpu.zig:
+        \\cpu.zig                                99  0x2000               x
+        \\/build/stdlib/cpu.zig:
+        \\cpu.zig                                10  0x3000               x
+        \\kernel/arch/x64/cpu.zig:
+        \\cpu.zig                                430  0x4000               x
+    ;
+    const rows = try parseLines(allocator, decoded, &paths);
+    defer allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    try std.testing.expectEqual(@as(u32, 22), rows[0].file_id);
+    try std.testing.expectEqual(@as(u32, 427), rows[0].line);
+    try std.testing.expectEqual(@as(u32, 22), rows[1].file_id);
+    try std.testing.expectEqual(@as(u32, 429), rows[1].line);
+    try std.testing.expectEqual(@as(u32, 11), rows[2].file_id);
+    try std.testing.expectEqual(@as(u32, 22), rows[3].file_id);
 }
 
 fn stripMonoSuffix(name: []const u8) []const u8 {
