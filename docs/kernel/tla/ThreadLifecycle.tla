@@ -73,6 +73,8 @@ CONSTANTS
   PINLOCK_ON,   \* BOOLEAN: pin-class lock holds (Sec 2.4, F3 surface)
   S7_ON,        \* BOOLEAN: dead-process dispatch filter + S7 claim route
                 \*          (Sec 3.2, F2 state-machine half)
+  WAKE_IPI,     \* BOOLEAN: G14 locked enqueue sends a wake to a parked core.
+                \* FALSE is the missing-wake falsifier.
   DROP_BUDGET,  \* Nat: stale/bad-port owner failure events (DirDrop is the
                 \* only unbounded generator in the directive machine --
                 \* arm/fail/ack/arm cycles freely -- and at 3 Threads that
@@ -200,6 +202,7 @@ ASSUME DIR_OWNED \in BOOLEAN
 ASSUME DIR_GENCHK \in BOOLEAN
 ASSUME SUSPEND_ON \in BOOLEAN
 ASSUME REQUEUE_ON \in BOOLEAN
+ASSUME WAKE_IPI \in BOOLEAN
 
 (***************************************************************************)
 (* State                                                                   *)
@@ -268,6 +271,9 @@ ASSUME REQUEUE_ON \in BOOLEAN
 (*                  "dispatchLoad" | "hopRel" |           *)
 (*                  "hopCommit" | "stealCommit"                           *)
 (*           outg - outgoing thread being walked through park-sequence/hop    *)
+(*           parked - §3.4 idle_parked: empty-queue park decision under the  *)
+(*                    queue lock; dispatch waits for a wake IPI.             *)
+(*           wake - an enqueue committed a wake IPI for a parked core.       *)
 (*           irq  - nested interrupt frame: NULL or                       *)
 (*                  [op|->"wake", tgt|->e, ph|->"place"|"pend"|"relwait"] *)
 (*                  While irq[c] # NULL the base continuation of c CANNOT *)
@@ -326,7 +332,7 @@ VARIABLES
 vars == <<threads, cores, tb, cb, db, pb>>
 
 States   == {"ready","running","parking","waiting","claimed","pended",
-             "retired","freed"}
+             "retired","finalizing","freed"}
 Holders  == {NULL} \cup [ty: {"thread"},  id: Threads]
                    \cup [ty: {"irq"}, cid: Cores]
                    \cup [ty: {"cpu"}, cid: Cores]   \* S7 retire-as-holder
@@ -411,6 +417,7 @@ TypeOK ==
                       dd: BOOLEAN]]
   /\ cores \in [Cores -> [q: SUBSET Threads,
                           cur: Threads \cup {NULL},
+                          parked: BOOLEAN, wake: BOOLEAN,
                           pc: {"idle","dispatchLoad",
                                "ecrun","hopRel","hopCommit",
                                "rvdeliver","s7ret","stealCommit"},
@@ -434,7 +441,8 @@ Init ==
   /\ \E f \in [Threads -> Cores]:
        /\ cores = [c \in Cores |->
                     [q |-> {e \in Threads : f[e] = c},
-                     cur |-> NULL, pc |-> "idle", outg |-> NULL, irq |-> NULL]]
+                     cur |-> NULL, pc |-> "idle", outg |-> NULL, irq |-> NULL,
+                     parked |-> FALSE, wake |-> FALSE]]
        /\ threads = [e \in Threads |->
                   [st |-> "ready", pk |-> "none",
                    shot |-> "none", own |-> NULL, pin |-> 0, pd |-> FALSE,
@@ -453,13 +461,30 @@ Init ==
   /\ pb = DROP_BUDGET
 
 (***************************************************************************)
+(* G14: the empty-queue decision and a subsequent enqueue are both under
+   core_locks[c]. A parked core cannot dispatch until its committed wake
+   IPI arrives. Every ready placement sets `wake` in the same action that
+   adds the queue entry when it observes `parked`. *)
+ParkDecision(c) ==
+  /\ cores[c].pc = "idle" /\ cores[c].cur = NULL
+  /\ cores[c].irq = NULL /\ cores[c].q = {}
+  /\ ~cores[c].parked
+  /\ cores' = [cores EXCEPT ![c].parked = TRUE]
+  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+
+WakeIpi(c) ==
+  /\ cores[c].parked /\ cores[c].wake
+  /\ cores' = [cores EXCEPT ![c].parked = FALSE, ![c].wake = FALSE]
+  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+
+(***************************************************************************)
 (* Edge 2: dispatch. One core_locks[c] critical section (Sec 3.2). The S7  *)
 (* process filter gates the commit; filter failure takes the S7Claim route  *)
 (* below, never a silent drop (S7).                                        *)
 (*                                                                         *)
 (***************************************************************************)
 DispatchThread(c, e) ==
-  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL
+  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ ~threads[e].dd                                    \* S7 filter passes
   /\ c \in threads[e].am
@@ -474,12 +499,11 @@ DispatchAbort(c) ==
   /\ threads[e].st # "running"
   /\ cores' = [cores EXCEPT ![c].cur = NULL, ![c].pc = "idle"]
   /\ threads' = IF threads[e].st = "retired"
-            THEN [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
+            THEN [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
                              ![e].ks = NULL,
                              ![e].own = NULL, ![e].pk = "none",
-                             ![e].hld = NULL, ![e].dir = "none",
-                             ![e].dres = "none", ![e].dpin = FALSE,
-                             ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE,
+                             ![e].hld = NULL, ![e].dir = "dead",
+                             ![e].dres = "none", ![e].dpin = FALSE, ![e].dlv = FALSE,
                              ![e].dsrc = NULL, ![e].pc = "user",
                              ![e].tg = NULL]
             ELSE [threads EXCEPT ![e].ks = NULL]
@@ -503,7 +527,7 @@ DispatchLoad(c) ==
 (* claim-then-retire-as-holder state shape is checked here.                *)
 S7Claim(c, e) ==
   /\ S7_ON
-  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL
+  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ c \in threads[e].am
   /\ threads[e].dd                                     \* S7 filter fails
@@ -521,7 +545,7 @@ S7Claim(c, e) ==
 (* and leaves dispatch/abandon to the thief after it reacquires c's lock.  *)
 StealClaim(c, v, e) ==
   /\ c # v
-  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL
+  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
   /\ cores[c].q = {}
   /\ e \in cores[v].q                              \* ready-in-victim-queue
   /\ threads[e].st = "ready" /\ threads[e].own = NULL
@@ -567,7 +591,7 @@ StealAbandon(c) ==
   /\ ~threads[e].dd
   /\ \E d \in threads[e].am:
        /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL,
-                                 ![d].q = @ \cup {e}]
+                                 ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
        /\ threads' = [threads EXCEPT ![e].st = "ready", ![e].own = NULL,
                              ![e].hld = NULL, ![e].pin = @ - 1]
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -585,10 +609,10 @@ StealDropDead(c) ==
   /\ threads[e].pin > 0
   /\ threads[e].dd
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
-  /\ threads' = [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
+  /\ threads' = [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
                         ![e].hld = NULL, ![e].pin = @ - 1,
-                        ![e].dir = "none", ![e].dres = "none",
-                        ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8,
+                        ![e].dir = "dead", ![e].dres = "none",
+                        ![e].dpin = FALSE,
                         ![e].dlv = FALSE, ![e].dsrc = NULL,
                         ![e].own = NULL, ![e].pc = "user",
                         ![e].tg = NULL]
@@ -602,8 +626,8 @@ S7Retire(c) ==
   LET e == cores[c].outg IN
   /\ cores[c].pc = "s7ret" /\ cores[c].irq = NULL
   /\ threads[e].st \in {"claimed","retired"}
-  /\ threads' = [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
-                        ![e].hld = NULL, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+  /\ threads' = [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
+                        ![e].hld = NULL, ![e].dir = "dead", ![e].dres = "none", ![e].dpin = FALSE, ![e].dlv = FALSE, ![e].dsrc = NULL,
                         ![e].own = NULL,
                         ![e].pc = "user", ![e].tg = NULL]
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
@@ -703,7 +727,7 @@ HopCommitRequeue(c) ==
        /\ threads' = [threads EXCEPT ![e].st = "ready", ![e].pk = "none",
                              ![e].own = NULL]
        /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL,
-                                 ![d].q = @ \cup {e}]
+                                 ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (* Hop step 2, pended arm (rev 5, edge 6p): wait payload_done (spin W2,    *)
@@ -725,7 +749,7 @@ HopCommitPended(c) ==
                         ![e].shot = "none"]        \* pop discharged
   /\ \E d \in Cores:
        cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL,
-                              ![d].q = @ \cup {e}]
+                              ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (* Hop step 2, retired arm (rev 5, Sec 4): deferred marking + finalize     *)
@@ -750,11 +774,11 @@ HopCommitRetired(c) ==
      (* plain `parking` (no claimant ever existed) there is no writer     *)
      (* and the owner wedges: the F1 deadlock gate.                       *)
   /\ IF PENDED \/ threads[e].hld = NULL
-     THEN threads' = [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
+     THEN threads' = [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
                              ![e].po = FALSE,
                              ![e].pd = FALSE, ![e].own = NULL,
                              ![e].pk = "none",
-                             ![e].hld = NULL, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                             ![e].hld = NULL, ![e].dir = "dead", ![e].dres = "none", ![e].dpin = FALSE, ![e].dlv = FALSE, ![e].dsrc = NULL,
                              ![e].pc = "user", ![e].tg = NULL,
                              (* Rev 6 (FIN_UNWIND): finalize's FIRST act  *)
                              (* is the idempotent container unwind under  *)
@@ -912,7 +936,7 @@ WakePlace(c) ==
   /\ threads' = [threads EXCEPT ![t].st = "ready", ![t].hld = NULL,
                         ![t].pin = @ - 1,
                         ![w].pc = "user", ![w].tg = NULL]
-  /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}]
+  /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (* Rev-5 5b claimant completion: payload + payload_done release-store,     *)
@@ -937,10 +961,10 @@ WakeTgtRetired(c) ==
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ w # NULL
   /\ threads[w].pc = "wakeC" /\ threads[w].st \in {"running","retired"}
   /\ threads[t].st = "retired"     \* no po read: a wakeC claim is 5a-origin
-  /\ threads' = [threads EXCEPT ![t].st = "freed", ![t].mo = FALSE,
+  /\ threads' = [threads EXCEPT ![t].st = "finalizing", ![t].mo = FALSE,
                         ![t].hld = NULL,
                         ![t].pin = @ - 1,
-                        ![t].shot = "none", ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
+                        ![t].shot = "none", ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                         ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
@@ -958,12 +982,12 @@ RelwaitPlace(c) ==
                                 ![t].own = NULL,
                                 ![t].pk = "none", ![t].pin = @ - 1,
                                 ![w].pc = "user", ![w].tg = NULL]
-          /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}]
+          /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
      ELSE /\ threads[t].st = "retired"
-          /\ threads' = [threads EXCEPT ![t].st = "freed", ![t].mo = FALSE,
+          /\ threads' = [threads EXCEPT ![t].st = "finalizing", ![t].mo = FALSE,
                                 ![t].hld = NULL,
                                 ![t].pin = @ - 1,
-                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
+                                ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                                 ![w].pc = "user", ![w].tg = NULL]
           /\ cores' = cores
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -1006,9 +1030,9 @@ SuspendTgtRetired(c) ==
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ w # NULL
   /\ threads[w].pc = "suspC" /\ threads[w].st \in {"running","retired"}
   /\ threads[t].st = "retired"
-  /\ threads' = [threads EXCEPT ![t].st = "freed", ![t].mo = FALSE,
+  /\ threads' = [threads EXCEPT ![t].st = "finalizing", ![t].mo = FALSE,
                         ![t].hld = NULL, ![t].pin = @ - 1,
-                        ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL,
+                        ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                         ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
@@ -1074,7 +1098,7 @@ RvDeliver(c) ==
                     ![s].pc = "user", ![s].tg = NULL]
               /\ \E d \in Cores:
                    cores' = [cores EXCEPT ![c].pc = "hopRel",
-                                          ![d].q = @ \cup {r}]
+                                          ![d].q = @ \cup {r}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
            \/ /\ threads' = [threads EXCEPT           \* mint failure: edge 7
                     ![r].st = "waiting", ![r].hld = NULL,
                     ![r].pin = @ - 1, ![r].lnk = TRUE,
@@ -1089,9 +1113,9 @@ RvDeliver(c) ==
         (* retire of a pended r pre-waits pd, which only this delivery    *)
         (* could set -- so a retired r here came from `claimed`.          *)
         /\ threads' = [threads EXCEPT
-             ![r].st = "freed", ![r].mo = FALSE,
+             ![r].st = "finalizing", ![r].mo = FALSE,
              ![r].hld = NULL, ![r].pin = @ - 1,
-             ![r].dir = "none", ![r].dres = "none", ![r].dpin = FALSE, ![r].gen = (@ + 1) % 8, ![r].dlv = FALSE, ![r].dsrc = NULL,
+             ![r].dir = "dead", ![r].dres = "none", ![r].dpin = FALSE, ![r].dlv = FALSE, ![r].dsrc = NULL,
              ![s].pc = "user", ![s].tg = NULL]
         /\ cores' = [cores EXCEPT ![c].pc = "hopRel"]
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -1269,6 +1293,7 @@ DirLoop(c) ==
                concludesSuccess ==
                  /\ ~threads[u].dlv     \* MY arm was never delivered
                  /\ threads[t].pok    \* port re-validation passes (rev 11)
+                 /\ threads[t].dir # "dead"  \* G11: terminal marker fails suspend
                  /\ ~(DIR_GENCHK /\ staleGen)  \* target gen (rev 12, C-1)
            IN threads' = [threads EXCEPT ![u].pc = "user", ![u].tg = NULL,
                                  ![u].dfs = @ \/ concludesSuccess,
@@ -1417,12 +1442,12 @@ IrqWakePlace(c) ==
      THEN /\ threads' = [threads EXCEPT ![t].st = "ready", ![t].hld = NULL,
                                 ![t].pin = @ - 1, ![t].shot = "none"]
           /\ \E d \in Cores:
-               cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}]
+               cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
      ELSE /\ threads[t].st = "retired"          \* holder's placement CAS fails
-          /\ threads' = [threads EXCEPT ![t].st = "freed", ![t].mo = FALSE,
+          /\ threads' = [threads EXCEPT ![t].st = "finalizing", ![t].mo = FALSE,
                                 ![t].hld = NULL, ![t].pin = @ - 1,
                                 ![t].shot = "none",
-                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
+                                ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1451,12 +1476,12 @@ IrqRelwait(c) ==
                                 ![t].pk = "none", ![t].pin = @ - 1,
                                 ![t].shot = "none"]
           /\ \E d \in Cores:
-               cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}]
+               cores' = [cores EXCEPT ![c].irq = NULL, ![d].q = @ \cup {t}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
      ELSE /\ threads[t].st = "retired"
-          /\ threads' = [threads EXCEPT ![t].st = "freed", ![t].mo = FALSE,
+          /\ threads' = [threads EXCEPT ![t].st = "finalizing", ![t].mo = FALSE,
                                 ![t].hld = NULL, ![t].pin = @ - 1,
                                 ![t].shot = "none",
-                                ![t].dir = "none", ![t].dres = "none", ![t].dpin = FALSE, ![t].gen = (@ + 1) % 8, ![t].dlv = FALSE, ![t].dsrc = NULL]
+                                ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
@@ -1497,15 +1522,15 @@ RetireThreadsAfter(e) ==
   CASE threads[e].st = "ready" ->                      \* inline finalize; the
          \* frame dies with the slot (pc/tg reset) -- safe per T2 ready x
          \* K: the lock dichotomy + pin gate mean it holds nothing
-         [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
+         [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
                      ![e].shot = "none",
                      ![e].own = NULL, ![e].pk = "none",
-                     ![e].lnk = FALSE, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                     ![e].lnk = FALSE, ![e].dir = "dead", ![e].dres = "none", ![e].dpin = FALSE, ![e].dlv = FALSE, ![e].dsrc = NULL,
                      ![e].pc = "user", ![e].tg = NULL]
     [] threads[e].st = "waiting" ->                    \* inline, after unwind
-         [threads EXCEPT ![e].st = "freed", ![e].mo = FALSE,
+         [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
                      ![e].shot = "none",
-                     ![e].own = NULL, ![e].lnk = FALSE, ![e].dir = "none", ![e].dres = "none", ![e].dpin = FALSE, ![e].gen = (@ + 1) % 8, ![e].dlv = FALSE, ![e].dsrc = NULL,
+                     ![e].own = NULL, ![e].lnk = FALSE, ![e].dir = "dead", ![e].dres = "none", ![e].dpin = FALSE, ![e].dlv = FALSE, ![e].dsrc = NULL,
                      ![e].pc = "user", ![e].tg = NULL]
     [] threads[e].st = "running" ->                    \* boundary/hop discovery
          [threads EXCEPT ![e].st = "retired", ![e].mo = FALSE,
@@ -1549,6 +1574,16 @@ RetireUnwind(e) ==
   /\ threads[e].st \in {"retired","freed"}
   /\ threads[e].lnk \/ threads[e].shot = "armed"
   /\ threads' = [threads EXCEPT ![e].lnk = FALSE, ![e].shot = "none"]
+  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+
+(* G11: finalize publishes a terminal directive marker before the slab
+   release body clears the slot to all zeroes. Keep that intermediate value
+   reachable so a competing directive waiter can observe failure. Reuse is
+   held until the clear; a new thread must never inherit a dead directive. *)
+ClearFreedDirective(e) ==
+  /\ threads[e].st = "finalizing" /\ threads[e].dir = "dead"
+  /\ threads' = [threads EXCEPT ![e].st = "freed", ![e].dir = "none",
+                        ![e].gen = (@ + 1) % 8]
   /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (* thread-context terminate (L5), SPLIT in revision 9 (round-8 C-1).        *)
@@ -1725,7 +1760,7 @@ CreateThread(c) ==
   /\ ThreadCtx(c) /\ threads[w].pc = "user" /\ threads[w].st = "running"
   /\ threads[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ \E e \in Threads \ {w}, d \in Cores:
-       /\ threads[e].st = "freed"
+       /\ threads[e].st = "freed" /\ threads[e].dir = "none"
        /\ threads' = [threads EXCEPT ![e] =
                      [st |-> "ready",
                       pk |-> "none", shot |-> "none",
@@ -1739,7 +1774,7 @@ CreateThread(c) ==
                      dgen |-> 0,
                      dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
                      dsrc |-> NULL, dd |-> FALSE]]
-       /\ cores' = [cores EXCEPT ![d].q = @ \cup {e}]
+       /\ cores' = [cores EXCEPT ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
 
 (***************************************************************************)
 (* recv with a queued sender (Sec 8.3): pop = 5a claim under the port      *)
@@ -1807,7 +1842,7 @@ ReplyFP(c) ==
             ![r].shot = "none", ![r].lnk = FALSE,
             ![w].st = "ready", ![w].own = NULL, ![w].ks = NULL,
             ![w].vm = "host", ![w].pk = "none"]
-       /\ cores' = [cores EXCEPT ![c].cur = r, ![d].q = @ \cup {w}]
+       /\ cores' = [cores EXCEPT ![c].cur = r, ![d].q = @ \cup {w}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
   /\ UNCHANGED <<tb, cb, db, pb>>
 
 (* M4's affinity claim-move: cross-thread `affinity` on a READY target whose   *)
@@ -1886,7 +1921,7 @@ StealAny(c, e) == \E v \in Cores: StealClaim(c, v, e)
 (* exercises only the suspend-directive protocol plus the minimal owner    *)
 (* and hop outcomes needed to move directive waiters off-core.             *)
 DirectiveDispatchThread(c, e) ==
-  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL
+  /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ ~threads[e].dd
   /\ c \in threads[e].am
@@ -1916,6 +1951,8 @@ DirectiveNext ==
        \/ DirectiveRequest(c)
        \/ DirectiveBaseStep(c)
        \/ TickPreempt(c)
+       \/ ParkDecision(c) \/ WakeIpi(c)
+  \/ \E e \in Threads: ClearFreedDirective(e)
   \/ Terminating
 
 SpecDirNF == Init /\ [][DirectiveNext]_vars
@@ -1934,7 +1971,9 @@ Next ==
        \/ \E e \in Threads: StealAny(c, e)
        \/ Request(c)
        \/ BaseStep(c) \/ IrqStep(c) \/ TickPreempt(c)
+       \/ ParkDecision(c) \/ WakeIpi(c)
   \/ \E e \in Threads: FireAny(e) \/ RetireThread(e) \/ RetireUnwind(e)
+                       \/ ClearFreedDirective(e)
   \/ ProcessDie
   \/ Terminating
 
@@ -1966,6 +2005,7 @@ SpecNF == Init /\ [][Next]_vars
 Fairness ==
   /\ \A c \in Cores: /\ SF_vars(BaseStep(c))
                      /\ WF_vars(IrqStep(c))
+                     /\ WF_vars(WakeIpi(c))
                      /\ SF_vars(TickPreempt(c))
                      (* Per-spin SF for the two deliberately-preemptible  *)
                      (* waits (W3/W4 terminate, W5 directive): disjunction *)
@@ -1992,6 +2032,7 @@ Fairness ==
   /\ \A c \in Cores, e \in Threads: SF_vars(DispatchOrS7(c, e))
   /\ \A e \in Threads: /\ SF_vars(FireAny(e))
                    /\ WF_vars(RetireUnwind(e))
+                   /\ WF_vars(ClearFreedDirective(e))
                       \* retire step 3 is the retirer's own synchronous
                       \* continuation; it always completes (Sec 8.2)
 
@@ -2006,10 +2047,12 @@ SpecFair == SpecNF /\ Fairness
 FairnessCore ==
   /\ \A c \in Cores: /\ SF_vars(BaseStep(c))
                      /\ WF_vars(IrqStep(c))
+                     /\ WF_vars(WakeIpi(c))
                      /\ SF_vars(TickPreempt(c))
   /\ \A c \in Cores, e \in Threads: SF_vars(DispatchOrS7(c, e))
   /\ \A e \in Threads: /\ SF_vars(FireAny(e))
                    /\ WF_vars(RetireUnwind(e))
+                   /\ WF_vars(ClearFreedDirective(e))
 
 SpecFairCore == SpecNF /\ FairnessCore
 
@@ -2033,6 +2076,7 @@ FairnessN3 ==
   /\ \A c \in Cores, e \in Threads: SF_vars(DispatchOrS7(c, e))
   /\ \A e \in Threads: /\ SF_vars(FireAny(e))
                    /\ WF_vars(RetireUnwind(e))
+                   /\ WF_vars(ClearFreedDirective(e))
 
 SpecFairN3 == SpecNF /\ FairnessN3
 
@@ -2054,9 +2098,11 @@ SpecFairN3 == SpecNF /\ FairnessN3
 FairCPU ==            \* the floor: a CPU executes its enabled continuation,
                       \* and a live interrupt frame runs to its return
   \A c \in Cores: SF_vars(BaseStep(c)) /\ WF_vars(IrqStep(c))
+                 /\ WF_vars(WakeIpi(c))
 
 FairUnwind ==         \* retire step 3 is the retirer's own continuation
   \A e \in Threads: WF_vars(RetireUnwind(e))
+                   /\ WF_vars(ClearFreedDirective(e))
 
 FairTick ==           \* the periodic timer fires
   \A c \in Cores: SF_vars(TickPreempt(c))
@@ -2064,6 +2110,9 @@ FairTick ==           \* the periodic timer fires
 FairDisp ==           \* stands for the FIFO order the set-queue abstraction
                       \* loses; the family that grows as |Cores| x |Threads|
   \A c \in Cores, e \in Threads: SF_vars(DispatchOrS7(c, e))
+
+FairDispWeak ==
+  \A c \in Cores, e \in Threads: WF_vars(DispatchOrS7(c, e))
 
 FairFire ==           \* armed T1 sources eventually fire
   \A e \in Threads: SF_vars(FireAny(e))
@@ -2080,7 +2129,7 @@ SpecL1  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveParking
 SpecL6  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveClaim
 SpecL5  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveMark
 SpecL4  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveWake
-SpecL3  == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp          \* LiveReady
+SpecL3  == SpecNF /\ FairCPU /\ FairUnwind /\ FairDispWeak      \* LiveReady, G14
 SpecL2  == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp /\ FairTick  \* LiveRetired
 SpecTrm == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp /\ FairTick
                   /\ FairSpinTerm                                \* LiveTerm
@@ -2104,13 +2153,16 @@ TermDirNext ==
        \/ TermDirRequest(c)
        \/ BaseStep(c) \/ IrqStep(c)
        \/ TickPreempt(c)
+       \/ ParkDecision(c) \/ WakeIpi(c)
   \/ \E e \in Threads: FireAny(e) \/ RetireThread(e) \/ RetireUnwind(e)
+                       \/ ClearFreedDirective(e)
   \/ Terminating
 
 SpecTermDirNF == Init /\ [][TermDirNext]_vars
 
 FairTermDirCPU ==
   \A c \in Cores: SF_vars(BaseStep(c)) /\ WF_vars(IrqStep(c))
+                 /\ WF_vars(WakeIpi(c))
 
 FairTermDirDisp ==
   \A c \in Cores, e \in Threads: SF_vars(DirectiveDispatchThread(c, e))
@@ -2161,7 +2213,7 @@ InvS1 ==
          Cardinality({c \in Cores: e \in cores[c].q}) = 1
     /\ threads[e].st = "running" =>
          threads[e].own # NULL /\ cores[threads[e].own].cur = e
-    /\ threads[e].st \in {"waiting","claimed","pended","retired","freed"} =>
+    /\ threads[e].st \in {"waiting","claimed","pended","retired","finalizing","freed"} =>
          \A c \in Cores: e \notin cores[c].q
     /\ (threads[e].st = "waiting"
           \/ (threads[e].st = "parking" /\ threads[e].pk = "wait")) => threads[e].lnk
@@ -2171,7 +2223,7 @@ InvS1 ==
     \* `freed` IS included: under FIN_UNWIND (the rev-6 N4 mechanism,
     \* finalizer-owned unwind) freed-while-linked is unreachable; under
     \* ~FIN_UNWIND (the rev-5 literal machine) it is the n4 falsifier.
-    /\ (threads[e].st \in {"ready","running","claimed","pended","freed"}
+    /\ (threads[e].st \in {"ready","running","claimed","pended","finalizing","freed"}
           \/ (threads[e].st = "parking" /\ threads[e].pk = "requeue")) =>
          ~threads[e].lnk
 
@@ -2180,7 +2232,7 @@ InvS1 ==
 (* legitimately keep the owner on it.)                                     *)
 InvS3 ==
   \A e \in Threads:
-    threads[e].st \in {"ready","waiting","claimed","freed"} => threads[e].ks = NULL
+    threads[e].st \in {"ready","waiting","claimed","finalizing","freed"} => threads[e].ks = NULL
 
 (* S4: claim uniqueness + holder persistence. A won claim always has a     *)
 (* live discharger: the holding frame still exists (not finalized) and is  *)
@@ -2351,6 +2403,12 @@ InvRetiredVcpuCancelled ==
 (* protocol grounds, labeled doc-only in the README ledger.               *)
 InvNoArmedFreed ==
   \A e \in Threads: threads[e].st = "freed" => threads[e].dir # "armed"
+
+(* G14: an enqueuer that sees the locked park decision must leave a wake
+   pending with its queue insertion. WAKE_IPI=FALSE violates this invariant
+   at the first enqueue into a parked core. *)
+InvParkedQueueHasWake ==
+  \A c \in Cores: (cores[c].parked /\ cores[c].q # {}) => cores[c].wake
 
 InvNoUAF ==
   /\ \A e \in Threads:
