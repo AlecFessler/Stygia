@@ -1,4 +1,4 @@
---------------------------------- MODULE ECProbes ---------------------------------
+--------------------------------- MODULE ThreadProbes ---------------------------------
 (* Reachability gates (permanent deliverable, round-6 minor): each probe   *)
 (* asserts the ABSENCE of a state the battery's meaning depends on         *)
 (* reaching, so TLC violating it PROVES the surface is exercised. run.sh   *)

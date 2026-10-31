@@ -342,7 +342,7 @@ gitignored; keep all generated output under them.
 | File | Purpose |
 |---|---|
 | `ThreadLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
-| `ECProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
+| `ThreadProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
 | `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
 | `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
 | `ThreadLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
@@ -1391,7 +1391,7 @@ side of the revision-18 split are each covered.
 | `vcpu_nocancel` | `InvRetiredVcpuCancelled` violated | **FIRED** | 29 before the violation, depth 8 |
 | `t1s` | clean, `LiveTerm` under `SpecTrm` | `No error has been found` | 82,070 (recorded 82,070) |
 
-`sany` clean on both `ThreadLifecycle.tla` and `ECProbes.tla`. The three
+`sany` clean on both `ThreadLifecycle.tla` and `ThreadProbes.tla`. The three
 recorded counts reproduce **exactly**, which is the evidence that the
 port carried the model across without perturbing the transition relation.
 

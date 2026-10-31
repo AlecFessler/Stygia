@@ -121,7 +121,7 @@ expect_unconverged() {
 
 echo "== syntax =="
 if java -cp "$JAR" tla2sany.SANY ThreadLifecycle.tla > out/sany.log 2>&1 \
-   && java -cp "$JAR" tla2sany.SANY ECProbes.tla >> out/sany.log 2>&1; then
+   && java -cp "$JAR" tla2sany.SANY ThreadProbes.tla >> out/sany.log 2>&1; then
   echo "PASS  sany"
 else echo "FAIL  sany (see out/sany.log)"; fail=1; fi
 
@@ -176,20 +176,20 @@ expect_violation diraba ThreadLifecycle.tla "Invariant InvNoForeignDisarm is vio
 expect_pass dirf6 ThreadLifecycle.tla -deadlock -config ThreadLifecycle_dirf6.cfg
 
 echo "== reachability probes: the violation IS the pass =="
-expect_violation pr1 ECProbes.tla "Invariant ProbeNoRetiredRvSender is violated" \
+expect_violation pr1 ThreadProbes.tla "Invariant ProbeNoRetiredRvSender is violated" \
   -deadlock -config ThreadLifecycle_pr1.cfg
-expect_violation pr2 ECProbes.tla "Invariant ProbeNoRvPendedReceiver is violated" \
+expect_violation pr2 ThreadProbes.tla "Invariant ProbeNoRvPendedReceiver is violated" \
   -deadlock -config ThreadLifecycle_pr2.cfg
-expect_violation pr3 ECProbes.tla "Invariant ProbeNoRetireFromPended is violated" \
+expect_violation pr3 ThreadProbes.tla "Invariant ProbeNoRetireFromPended is violated" \
   -deadlock -config ThreadLifecycle_pr3.cfg
 # round-10 M-D: prove t1full's LiveTerm PASS is not vacuous — the
 # W3 -> W5 -> W3 configuration must actually be REACHED at that scope.
-expect_violation pr4 ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
+expect_violation pr4 ThreadProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
   -deadlock -config ThreadLifecycle_pr4.cfg
 # round-11 M-3: InvNoForeignDisarm is analytically vacuous under
 # DIR_OWNED = TRUE (the disarm guard forces dsrc = u). This probe is the
 # other half of the honesty: it proves the drop/disarm path is exercised.
-expect_violation pr5 ECProbes.tla "Invariant ProbeNoDisarm is violated" \
+expect_violation pr5 ThreadProbes.tla "Invariant ProbeNoDisarm is violated" \
   -deadlock -config ThreadLifecycle_pr5.cfg
 
 echo "== current safety, TLC deadlock detection ON =="
@@ -230,7 +230,7 @@ expect_pass t1r   ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1r
 # the rung exists to cover. Keep these two adjacent and edit their
 # CONSTANTS together (both .cfg headers say so).
 expect_pass t1d_min ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1d_min.cfg
-expect_violation pr4d_min ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
+expect_violation pr4d_min ThreadProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
   -deadlock -config ThreadLifecycle_pr4d_min.cfg
 # LiveSuspender under SpecSus (neither N6 assumption), paired with crfals.
 expect_pass cr1minself ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_cr1minself.cfg
