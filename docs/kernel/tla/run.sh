@@ -209,6 +209,19 @@ expect_violation g16bad ThreadLifecycle.tla "Invariant InvTeardownRefHandoff is 
 # self-retire. The positive row below must still complete through the hop.
 expect_violation g16remoteprobe ThreadProbes.tla "Invariant ProbeNoRemoteRetiredTeardown is violated" \
   -deadlock -config ThreadLifecycle_g16_remote_probe.cfg
+# §[restart_semantics] reaches both outcomes of the existing G16 handoff.
+expect_violation restart_success ThreadProbes.tla "Invariant ProbeNoRestartSuccess is violated" \
+  -deadlock -config ThreadLifecycle_restart_success.cfg
+expect_violation restart_snapshot ThreadProbes.tla "Invariant ProbeNoRestartSnapshotFallback is violated" \
+  -deadlock -config ThreadLifecycle_restart_snapshot_fallback.cfg
+expect_violation restart_zero ThreadProbes.tla "Invariant ProbeNoRestartZeroSurvivorFallback is violated" \
+  -deadlock -config ThreadLifecycle_restart_zero_survivor.cfg
+expect_violation restart_reply_drop ThreadProbes.tla "Invariant ProbeNoRestartReplyDrop is violated" \
+  -deadlock -config ThreadLifecycle_restart_reply_drop.cfg
+expect_violation restart_reply_keep ThreadProbes.tla "Invariant ProbeNoRestartReplyKeep is violated" \
+  -deadlock -config ThreadLifecycle_restart_reply_keep.cfg
+expect_violation restart_persist ThreadProbes.tla "Invariant ProbeNoPersistSurvivor is violated" \
+  -deadlock -config ThreadLifecycle_restart_persist.cfg
 
 echo "== current safety, TLC deadlock detection ON =="
 expect_pass mtermfix  ThreadLifecycle.tla -config ThreadLifecycle_mtermfix.cfg
@@ -237,6 +250,7 @@ expect_pass g16remote ThreadLifecycle.tla -lncheck final -config ThreadLifecycle
 # Two-core safety exercises same-process and distinct-process assignments
 # with an external retire. Its temporal phase is measured-unconverged.
 expect_pass g16remote2 ThreadLifecycle.tla -config ThreadLifecycle_g16_remote_two_core.cfg
+expect_pass restart ThreadLifecycle.tla -deadlock -config ThreadLifecycle_restart.cfg
 expect_pass large    ThreadLifecycle.tla -config ThreadLifecycle_large.cfg
 expect_pass cr3self  ThreadLifecycle.tla -deadlock -config ThreadLifecycle_cr3self.cfg
 expect_pass medium_nodir ThreadLifecycle.tla -config ThreadLifecycle_medium_nodir.cfg
