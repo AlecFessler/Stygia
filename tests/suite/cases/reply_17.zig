@@ -1,43 +1,43 @@
 // Spec §[reply] reply — test 17.
 //
-// "[test 17] returns E_TERM if the suspended EC was terminated before
+// "[test 17] returns E_TERM if the suspended thread was terminated before
 //  reply could deliver and `pair_count > 0`; the reply handle is
 //  consumed and no handle transfer occurs."
 //
 // Strategy
 //   The assertion needs a witness shape:
 //     (a) A reply handle in the caller's table whose recorded suspended
-//         sender is some EC W, with the `xfer` cap so reply with
+//         sender is some thread W, with the `xfer` cap so reply with
 //         pair_count > 0 can be invoked at all.
 //     (b) A pair entry that would otherwise be valid — id refers to a
 //         live source handle in the caller's domain, caps are a subset
 //         of the source's caps, and the source carries the per-move
 //         right (`copy` for move=0). This isolates the failure to the
-//         "suspended EC was terminated" path: every other validation
+//         "suspended thread was terminated" path: every other validation
 //         the kernel performs prior to attempting the resume passes.
 //     (c) After terminate(W) succeeds, reply with pair_count = 1 on
 //         the reply handle must return E_TERM and the spec line under
 //         test requires that no handle transfer occurs.
 //
-//   The test EC owns both ends of the pipeline: it mints a port with
+//   The test thread owns both ends of the pipeline: it mints a port with
 //   bind+recv+xfer caps (xfer is what mints the reply handle with the
 //   `xfer` cap per §[reply]: "kernel mints reply handle with move=1,
 //   copy=0, and xfer=1 if and only if the recv'ing port had the xfer
-//   cap"). It then mints a sibling EC W with caps
+//   cap"). It then mints a sibling thread W with caps
 //   {term, susp} and restart_policy=0 so it is a one-shot terminable
-//   target. Per §[suspend] "[1] may reference the calling EC; the
-//   syscall returns after the calling EC is resumed" — when [1] is
-//   *not* the calling EC the call simply suspends the target without
-//   blocking the caller. So the test EC stays runnable, and W is
+//   target. Per §[suspend] "[1] may reference the calling thread; the
+//   syscall returns after the calling thread is resumed" — when [1] is
+//   *not* the calling thread the call simply suspends the target without
+//   blocking the caller. So the test thread stays runnable, and W is
 //   queued as a suspended sender on the port.
 //
 //   `recv(port)` then returns immediately (no E_CLOSED, since the test
-//   EC still holds the port handle with its `bind` cap; no E_FULL,
+//   thread still holds the port handle with its `bind` cap; no E_FULL,
 //   since the test's domain has plenty of free slots). The kernel
 //   hands back the reply handle id in the recv syscall word; that id
 //   is the handle the spec line under test refers to.
 //
-//   For the pair entry source, the test mints a *separate* dummy EC D
+//   For the pair entry source, the test mints a *separate* dummy thread D
 //   carrying caps {copy} so the pair entry can name D as a valid
 //   transferable source under the `move=0` (copy) path. D never
 //   executes meaningfully — it sits at dummyEntry. The test does not
@@ -51,7 +51,7 @@
 //   The spec line under test demands E_TERM.
 //
 //   SPEC AMBIGUITY: §[terminate] [test 07] separately asserts that
-//   reply handles whose suspended sender was the terminated EC return
+//   reply handles whose suspended sender was the terminated thread return
 //   E_ABANDONED on subsequent operations — i.e., the same scenario
 //   names a different error code. The two spec lines read in tension:
 //   reply test 17 names E_TERM for the pair-attachment path, while
@@ -66,8 +66,8 @@
 //
 //   SPEC AMBIGUITY: the spec line says "[1] is consumed and no handle
 //   transfer occurs." Verifying "no handle transfer occurs" requires
-//   inspecting the resumed EC's domain after the call — but on E_TERM
-//   the resumed EC does not exist (it was terminated). The "no handle
+//   inspecting the resumed thread's domain after the call — but on E_TERM
+//   the resumed thread does not exist (it was terminated). The "no handle
 //   transfer" wording is presumably defensive for implementations
 //   where partial transfer might have begun before the termination
 //   check; with W gone there is no observable resumed-domain state to
@@ -80,12 +80,12 @@
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer})    — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, rp=0}, entry=dummy) — must succeed (W)
-//   3. create_execution_context(target=self,
+//   3. create_thread(target=self,
 //        caps={copy, rp=0}, entry=dummy)       — must succeed (D)
 //   4. suspend(W, port)                        — must return OK
-//      (non-blocking on the test EC since [1] != self; queues W as a
+//      (non-blocking on the test thread since [1] != self; queues W as a
 //      suspended sender on the port)
 //   5. recv(port)                              — must return OK and
 //      yield a reply_handle_id in the syscall word
@@ -96,8 +96,8 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed for W (returned an error word)
-//   3: setup EC creation failed for D (returned an error word)
+//   2: setup thread creation failed for W (returned an error word)
+//   3: setup thread creation failed for D (returned an error word)
 //   4: suspend itself did not return OK
 //   5: recv did not return OK
 //   6: terminate did not return OK
@@ -224,17 +224,17 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W. term lets the test eventually destroy W; susp
     // lets the test queue W onto the port via suspend. restart_policy
     // = 0 (kill) keeps the call inside the runner-granted ceiling.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15;
+    // §[create_thread] caps word: caps in bits 0-15;
     // priority/target_caps default to 0 which stays inside the runner
     // pri ceiling (3) and is irrelevant when target = self.
     const w_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const w_cec = syscall.createExecutionContext(
+    const w_cec = syscall.createThread(
         w_caps_word,
         entry,
         1,
@@ -252,12 +252,12 @@ pub fn main(cap_table_base: u64) void {
     // with caps={copy} and move=0, which §[handle_attachments] [test
     // 05] gates on the source's `copy` cap. restart_policy=0 keeps
     // the create call inside the runner ceiling.
-    const d_caps = caps.EcCap{
+    const d_caps = caps.ThreadCap{
         .copy = true,
         .restart_policy = 0,
     };
     const d_caps_word: u64 = @as(u64, d_caps.toU16());
-    const d_cec = syscall.createExecutionContext(
+    const d_cec = syscall.createThread(
         d_caps_word,
         entry,
         1,
@@ -281,7 +281,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 5: recv. The port has the test EC as a live bind-cap holder
+    // Step 5: recv. The port has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the reply handle id encoded in the syscall word per §[recv].
     const got = syscall.recv(port_handle, 0);
@@ -309,7 +309,7 @@ pub fn main(cap_table_base: u64) void {
     // reserved.
     const pair = caps.PairEntry{
         .id = d_handle,
-        .caps = (caps.EcCap{ .copy = true }).toU16(),
+        .caps = (caps.ThreadCap{ .copy = true }).toU16(),
         .move = false,
     };
     const result = replyOneEntry(reply_handle_id, pair.toU64());

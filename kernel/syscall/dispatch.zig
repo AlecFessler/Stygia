@@ -4,9 +4,9 @@
 //! register-passed args and any vreg-passed extras into the `args`
 //! slice before calling here. See docs/kernel/specv3.md §[syscall].
 //!
-//! `caller` is the calling EC, type-erased to keep the syscall surface
+//! `caller` is the calling thread, type-erased to keep the syscall surface
 //! free of the per-arch context type. Each handler casts it back to
-//! `*ExecutionContext` internally.
+//! `*Thread` internally.
 
 const std = @import("std");
 const stygia = @import("stygia");
@@ -15,7 +15,7 @@ const build_options = @import("build_options");
 const capability = stygia.syscall.capability;
 const capability_domain = stygia.syscall.capability_domain;
 const errors = stygia.syscall.errors;
-const execution_context = stygia.syscall.execution_context;
+const thread_mod = stygia.syscall.thread;
 const futex = stygia.syscall.futex;
 const page_frame = stygia.syscall.page_frame;
 const port = stygia.syscall.port;
@@ -31,7 +31,7 @@ pub const SyscallNum = enum(u64) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    create_execution_context = 22,
+    create_thread = 22,
     self = 23,
     terminate = 24,
     yield = 25,
@@ -96,7 +96,7 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .yield,
         .priority,
         .affinity,
-        .create_execution_context,
+        .create_thread,
         .create_vmar,
         .map_mmio,
         .remap,
@@ -136,7 +136,7 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         // reply / reply_transfer: pair_count in bits 12-19; pair entries
         // in the high band [128-N..127]. The arch entry path has the
         // syscall-time user SP; the reply handler must consume entries
-        // from `args` rather than re-reading `ec.ctx`, which may still
+        // from `args` rather than re-reading `thread.ctx`, which may still
         // hold the prior saved user frame for the current syscall.
         .reply => if (n_reg > 0) @as(u8, 127) else @as(u8, 13),
     };
@@ -160,7 +160,7 @@ fn logSpawnError(num_raw: u64, res: i64) void {
     if (!build_options.kernel_spawn_diag) return;
     if (res >= 0) return;
     if (num_raw != @intFromEnum(SyscallNum.create_capability_domain) and
-        num_raw != @intFromEnum(SyscallNum.create_execution_context)) return;
+        num_raw != @intFromEnum(SyscallNum.create_thread)) return;
     const n = @atomicRmw(u32, &spawn_err_prints, .Add, 1, .monotonic);
     if (n >= 24) return;
     stygia.arch.dispatch.boot.print(
@@ -204,7 +204,7 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 4),
             if (args.len > 5) args[5..] else &.{},
         ),
-        .create_execution_context => execution_context.createExecutionContext(
+        .create_thread => thread_mod.createThread(
             caller,
             arg(args, 0),
             arg(args, 1),
@@ -212,11 +212,11 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 3),
             arg(args, 4),
         ),
-        .self => execution_context.self(caller),
-        .terminate => execution_context.terminate(caller, arg(args, 0)),
-        .yield => execution_context.yield(caller, arg(args, 0)),
-        .priority => execution_context.priority(caller, arg(args, 0), arg(args, 1)),
-        .affinity => execution_context.affinity(caller, arg(args, 0), arg(args, 1)),
+        .self => thread_mod.self(caller),
+        .terminate => thread_mod.terminate(caller, arg(args, 0)),
+        .yield => thread_mod.yield(caller, arg(args, 0)),
+        .priority => thread_mod.priority(caller, arg(args, 0), arg(args, 1)),
+        .affinity => thread_mod.affinity(caller, arg(args, 0), arg(args, 1)),
         .create_vmar => vmar.createVmar(
             caller,
             arg(args, 0),

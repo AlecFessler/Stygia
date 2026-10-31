@@ -6,7 +6,7 @@ const ctx_trace = stygia.utils.ctx_trace;
 const hang_detector = stygia.utils.hang_detector;
 const hpet_watchdog = stygia.arch.x64.hpet_watchdog;
 const pf_log = stygia.utils.pf_log;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const fpu = stygia.sched.fpu;
 const gdt = stygia.arch.x64.gdt;
 const idt = stygia.arch.x64.idt;
@@ -20,7 +20,7 @@ const vmar = stygia.memory.vmar;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = stygia.devices.device_region.DeviceRegion;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GateType = stygia.arch.x64.idt.GateType;
 const PageFaultContext = stygia.arch.x64.interrupts.PageFaultContext;
 const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
@@ -171,12 +171,12 @@ pub fn init() void {
 /// the rsp value at the time of the fault.
 ///
 /// Concretely this protects the L4 IPC fast path: that path runs with
-/// `rsp = ec.kstack.top` and stores the user iret frame at
-/// `ec.kstack.top - 40 .. ec.kstack.top - 8`, which exactly overlaps
-/// `ec.ctx`'s iret slots. Without IST, a #PF taken in the fast path
+/// `rsp = thread.kstack.top` and stores the user iret frame at
+/// `thread.kstack.top - 40 .. thread.kstack.top - 8`, which exactly overlaps
+/// `thread.ctx`'s iret slots. Without IST, a #PF taken in the fast path
 /// would have the CPU push its own 5-word iret frame at `rsp - 40`,
-/// corrupting `ec.ctx`. With IST, the CPU loads RSP from
-/// `TSS.IST[IST_PAGE_FAULT]` first, so the in-flight `ec.ctx` window
+/// corrupting `thread.ctx`. With IST, the CPU loads RSP from
+/// `TSS.IST[IST_PAGE_FAULT]` first, so the in-flight `thread.ctx` window
 /// is untouched.
 pub fn wireIstGates() void {
     idt.setIst(@intFromEnum(Exception.double_fault), gdt.IST_DOUBLE_FAULT);
@@ -214,15 +214,15 @@ fn exceptionEvent(vector: u5) ?ExceptionEvent {
 }
 
 /// Probe the user-mode instruction byte at `rip` against the HLT opcode
-/// (0xF4, single byte — Intel SDM Vol 2A "HLT"). Walks the current EC's
+/// (0xF4, single byte — Intel SDM Vol 2A "HLT"). Walks the current thread's
 /// capability-domain page tables so we don't depend on the page being
 /// resident in any kernel-side cache. Returns false if there is no
-/// current EC, the page is not resident, or the byte mismatches.
+/// current thread, the page is not resident, or the byte mismatches.
 fn isUserHltAt(rip: u64) bool {
-    const ec = scheduler.currentEc() orelse return false;
-    // caller-pinned: currentEc() runs on this core; its bound capability
+    const thread = scheduler.currentThread() orelse return false;
+    // caller-pinned: currentThread() runs on this core; its bound capability
     // domain stays alive for the duration of this exception handler.
-    const domain = ec.domain.ptr;
+    const domain = thread.domain.ptr;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse
         return false;
@@ -239,24 +239,24 @@ fn exceptionHandler(ctx: *cpu.Context) void {
 
     if (from_user) {
         scheduler.clearYieldHandoffGuard(@truncate(apic.coreID()));
-        if (scheduler.currentEc()) |ec| {
-            if (execution_context.consumeSuspendDirective(ec, ctx)) {
+        if (scheduler.currentThread()) |thread| {
+            if (thread_mod.consumeSuspendDirective(thread, ctx)) {
                 scheduler.hopParkRun();
             }
         }
     }
 
-    // Lazy-FPU trap. CR0.TS was set by switchTo when this EC last got
+    // Lazy-FPU trap. CR0.TS was set by switchTo when this thread last got
     // dispatched (because it wasn't the last FPU owner on this core).
     // Userspace's first FP/SSE instruction trapped #NM here — swap
     // state and return so the instruction re-executes.
     if (exception == .device_not_available) {
-        const ec = scheduler.currentEc() orelse
-            @panic("#NM with no current EC");
-        if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), ec)) {
+        const thread = scheduler.currentThread() orelse
+            @panic("#NM with no current thread");
+        if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), thread)) {
             scheduler.hopParkRun();
         }
-        fpu.handleTrap(ec);
+        fpu.handleTrap(thread);
         return;
     }
 
@@ -265,47 +265,47 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         if (exception == .single_step_debug) return;
 
         // EL0 hlt trap. Intel SDM Vol 2A "HLT" — executing HLT at CPL > 0
-        // raises #GP(0). Park the EC in `.idle_wait` so it stops consuming
+        // raises #GP(0). Park the thread in `.idle_wait` so it stops consuming
         // CPU but stays alive and suspendable; the aarch64 wfi-trap path
         // (kernel/arch/aarch64/exceptions.zig `.wf_trapped`) makes the
         // same choice for the same reason. Treating user-mode hlt as a
-        // protection_fault would `parkSelfFaulted` the EC into `.exited`,
-        // breaking any later `suspend(this_ec, port)` call (suspend's
+        // protection_fault would `parkSelfFaulted` the thread into `.exited`,
+        // breaking any later `suspend(this_thread, port)` call (suspend's
         // gate rejects non-{running,ready,idle_wait} targets with
         // E_INVAL — the precise failure that flaked reply_transfer_14
         // aid=3 on x86 when W1's dummy entry got dispatched and trapped
-        // before the test EC's suspend syscall observed it).
+        // before the test thread's suspend syscall observed it).
         if (exception == .general_protection_fault and
             ctx.err_code == 0 and
             isUserHltAt(ctx.rip))
         {
-            const ec = scheduler.currentEc() orelse
-                @panic("hlt trap with no current EC");
-            if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), ec)) {
+            const thread = scheduler.currentThread() orelse
+                @panic("hlt trap with no current thread");
+            if (!scheduler.coreCurrentIsRunning(@truncate(apic.coreID()), thread)) {
                 scheduler.hopParkRun();
             }
             ctx.rip += 1; // advance past the 1-byte HLT opcode
-            execution_context.parkIdleWait(ec);
+            thread_mod.parkIdleWait(thread);
             // Hop to the park kstack, do NOT run the scheduler loop in
-            // place: this frame lives on the just-parked EC's kstack,
-            // the EC is already claimable (`suspend` accepts
+            // place: this frame lives on the just-parked thread's kstack,
+            // the thread is already claimable (`suspend` accepts
             // `.idle_wait`), and its deferred on_cpu release is stashed
             // for the hop. Entering `run()` here — and formerly with
-            // IRQs re-enabled — raced the EC's re-dispatch for this
+            // IRQs re-enabled — raced the thread's re-dispatch for this
             // very kstack. IRQs stay masked until the park/dispatch
             // machinery's own unmask points.
             scheduler.hopParkRun();
         }
 
         if (exceptionEvent(vector)) |event| {
-            const ec = scheduler.currentEc() orelse
-                @panic("user exception with no current EC");
+            const thread = scheduler.currentThread() orelse
+                @panic("user exception with no current thread");
             // Diag: print vector + RIP + first byte at RIP for any user fault.
-            // Helps catch silent EC terminations from `unreachable` (#UD)
+            // Helps catch silent thread terminations from `unreachable` (#UD)
             // and other faults during in-Stygia compiler bring-up.
-            // caller-pinned: ec is currentEc() running on this core; its
+            // caller-pinned: thread is currentThread() running on this core; its
             // domain SlabRef stays valid for the fault handler's duration.
-            const dom_root = ec.domain.ptr.addr_space_root;
+            const dom_root = thread.domain.ptr.addr_space_root;
             const rip_byte: u8 = if (paging_mod.resolveVaddr(
                 dom_root,
                 VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF)),
@@ -318,34 +318,34 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 vector, ctx.rip, rip_byte,
             });
             switch (event) {
-                .thread_fault => |subcode| port.fireThreadFault(ec, subcode, ctx.rip),
-                .breakpoint => port.fireBreakpoint(ec, 0),
+                .thread_fault => |subcode| port.fireThreadFault(thread, subcode, ctx.rip),
+                .breakpoint => port.fireBreakpoint(thread, 0),
             }
             // IRQs deliberately stay MASKED through the dispatch
-            // attempt: fault handling may have parked `ec` with its
+            // attempt: fault handling may have parked `thread` with its
             // kstack release stashed on this core, and an IRQ handler
             // here could spin on that very release (deadline wakes
             // routed through `markReady`'s kstack barrier) — a
             // self-deadlock on our own pending stash.
             scheduler.yieldTo(null);
-            // If `yieldTo` dispatched a fresh EC it would never return
+            // If `yieldTo` dispatched a fresh thread it would never return
             // here (the park-kstack hop into the dispatch tail is
             // noreturn). Reaching this line means the run queue was
             // empty — the unhandled-fault path (`parkSelfFaulted` for
-            // thread_fault, `markReady` of the resumed EC was the last
-            // work) drained `current_ec` to null. We CANNOT iretq back
+            // thread_fault, `markReady` of the resumed thread was the last
+            // work) drained `current_thread` to null. We CANNOT iretq back
             // to the kernel-stack iret frame: that frame still holds
             // the now-stale faulting user context, and returning there
             // would re-fault on the same RIP and re-enter this handler
-            // with `currentEc() == null`, hitting the
-            // user-exception-with-no-current-EC panic.
+            // with `currentThread() == null`, hitting the
+            // user-exception-with-no-current-thread panic.
             //
             // Hop to the park kstack and enter the scheduler loop
             // there (noreturn) — this frame lives on the suspended
-            // EC's kstack and the EC is claimable; `run()` in place
+            // thread's kstack and the thread is claimable; `run()` in place
             // raced its re-dispatch for this kstack. The hop publishes
             // the stashed on_cpu release.
-            if (scheduler.currentEc() == null) scheduler.hopParkRun();
+            if (scheduler.currentThread() == null) scheduler.hopParkRun();
             return;
         }
     }
@@ -406,20 +406,20 @@ fn exceptionHandler(ctx: *cpu.Context) void {
 /// address; the error code on the stack encodes the fault reason per
 /// Figure 5-12.
 fn pageFaultHandler(ctx: *cpu.Context) void {
-    if (scheduler.currentEc()) |ec_for_trace| {
-        ctx_trace.mark(ec_for_trace, .pf_handler);
+    if (scheduler.currentThread()) |thread_for_trace| {
+        ctx_trace.mark(thread_for_trace, .pf_handler);
     }
 
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {
         if (comptime pf_log.enabled) {
-            pf_log.mark(scheduler.currentEc(), .RSVD_PANIC, cpu.readCr2(), @truncate(ctx.err_code));
+            pf_log.mark(scheduler.currentThread(), .RSVD_PANIC, cpu.readCr2(), @truncate(ctx.err_code));
         }
         @panic("Page tables have reserved bits set (RSVD).");
     }
     const faulting_addr = cpu.readCr2();
     if (comptime pf_log.enabled) {
-        pf_log.mark(scheduler.currentEc(), .ENTER, faulting_addr, @truncate(ctx.err_code));
+        pf_log.mark(scheduler.currentThread(), .ENTER, faulting_addr, @truncate(ctx.err_code));
     }
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
@@ -428,17 +428,17 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     // generic handler. A VMAR mapped via `map_mmio` to a port-IO
     // device_region intentionally has no PTEs — every CPU access faults
     // and the kernel decodes the MOV, performs the port I/O on behalf
-    // of the EC, and advances RIP. Spec §[port_io_virtualization].
+    // of the thread, and advances RIP. Spec §[port_io_virtualization].
     if (from_user and !pf_err.present) {
-        const ec = scheduler.currentEc() orelse {
+        const thread = scheduler.currentThread() orelse {
             if (comptime pf_log.enabled) {
-                pf_log.mark(null, .USER_NO_EC, faulting_addr, @truncate(ctx.err_code));
+                pf_log.mark(null, .USER_NO_THREAD, faulting_addr, @truncate(ctx.err_code));
             }
-            @panic("user page fault with no current EC");
+            @panic("user page fault with no current thread");
         };
-        // caller-pinned: currentEc() runs on this core; its bound
+        // caller-pinned: currentThread() runs on this core; its bound
         // capability domain is alive across this PF handler.
-        const domain = ec.domain.ptr;
+        const domain = thread.domain.ptr;
         if (vmar.findVmarCovering(domain, VAddr.fromInt(faulting_addr))) |v| {
             const v_irq = v._gen_lock.lockIrqSave(@src());
             const is_port_io = v.map == .mmio and
@@ -447,10 +447,10 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
                 v.device.?.ptr.device_type == .port_io;
             v._gen_lock.unlockIrqRestore(v_irq);
             if (is_port_io) {
-                emulateVirtualBar(ctx, ec, v, faulting_addr, domain);
+                emulateVirtualBar(ctx, thread, v, faulting_addr, domain);
                 if (comptime pf_log.enabled) {
-                    pf_log.mark(ec, .USER_PORT_IO, faulting_addr, @truncate(ctx.err_code));
-                    pf_log.mark(ec, .RESUME, faulting_addr, @truncate(ctx.err_code));
+                    pf_log.mark(thread, .USER_PORT_IO, faulting_addr, @truncate(ctx.err_code));
+                    pf_log.mark(thread, .RESUME, faulting_addr, @truncate(ctx.err_code));
                 }
                 return;
             }
@@ -458,22 +458,22 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     }
 
     if (from_user) {
-        const ec_for_diag = scheduler.currentEc();
-        const vmar_label: []const u8 = if (ec_for_diag) |ec_d| blk: {
-            // caller-pinned: ec_d is currentEc() running on this core; its
+        const thread_for_diag = scheduler.currentThread();
+        const vmar_label: []const u8 = if (thread_for_diag) |thread_d| blk: {
+            // caller-pinned: thread_d is currentThread() running on this core; its
             // domain SlabRef stays valid for the fault handler's duration.
-            const cov = vmar.findVmarCovering(ec_d.domain.ptr, VAddr.fromInt(faulting_addr));
+            const cov = vmar.findVmarCovering(thread_d.domain.ptr, VAddr.fromInt(faulting_addr));
             break :blk if (cov) |_| "in-vmar" else "no-vmar";
-        } else "no-ec";
-        // Read instruction bytes at user RIP. Walk the EC's page tables so
+        } else "no-thread";
+        // Read instruction bytes at user RIP. Walk the thread's page tables so
         // we see the correct user-mode mapping (kernel page tables don't
         // include the user code).
         var rip_bytes: [16]u8 = @splat(0);
-        if (ec_for_diag) |ec_b| {
+        if (thread_for_diag) |thread_b| {
             const rip_page = VAddr.fromInt(ctx.rip & ~@as(u64, 0xFFF));
-            // caller-pinned: ec_b is currentEc() running on this core; its
+            // caller-pinned: thread_b is currentThread() running on this core; its
             // domain SlabRef stays valid for the fault handler's duration.
-            if (paging_mod.resolveVaddr(ec_b.domain.ptr.addr_space_root, rip_page)) |phys| {
+            if (paging_mod.resolveVaddr(thread_b.domain.ptr.addr_space_root, rip_page)) |phys| {
                 const physmap_base = VAddr.fromPAddr(phys, null).addr;
                 const off = ctx.rip & 0xFFF;
                 var i: usize = 0;
@@ -524,13 +524,13 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     };
     stygia.memory.fault.handlePageFault(&pf_ctx);
 
-    // Resume snapshot. If `handlePageFault` yielded to another EC the
-    // resumed RIP is for THAT EC; if it returned to the faulter the
+    // Resume snapshot. If `handlePageFault` yielded to another thread the
+    // resumed RIP is for THAT thread; if it returned to the faulter the
     // RIP should advance past the faulting instruction OR the page
     // mapping should now resolve. The smp=4 fault-loop bug shows up
     // here as RESUME with rip == previous fault rip, repeatedly.
     if (comptime pf_log.enabled) {
-        pf_log.mark(scheduler.currentEc(), .RESUME, faulting_addr, @truncate(ctx.err_code));
+        pf_log.mark(scheduler.currentThread(), .RESUME, faulting_addr, @truncate(ctx.err_code));
     }
 }
 
@@ -545,13 +545,13 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 /// sub-codes.
 fn emulateVirtualBar(
     ctx: *cpu.Context,
-    ec: *ExecutionContext,
+    thread: *Thread,
     v: *VMAR,
     faulting_addr: u64,
     domain: *CapabilityDomain,
 ) void {
     // Snapshot under the lock then release before any path that may
-    // suspend or terminate `ec`: the fault handlers may unwind
+    // suspend or terminate `thread`: the fault handlers may unwind
     // through the scheduler and never return here, so holding the VMAR
     // lock across them would strand the gen and deadlock any future
     // walk of the domain's vars[]. The DeviceRegion pointer is stable
@@ -573,20 +573,20 @@ fn emulateVirtualBar(
 
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
-        port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
+        port.fireThreadFault(thread, ThreadFaultSubcode.protection, rip);
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireThreadFault`'s unhandled-fault path (`parkSelfFaulted`)
-        // cleared `current_ec`; if `yieldTo` couldn't dispatch fresh
+        // cleared `current_thread`; if `yieldTo` couldn't dispatch fresh
         // work, returning would iretq back to the now-stale faulting
         // user RIP. Hand off to `scheduler.run()` (noreturn) — it idles
         // until an IRQ delivers more work, at which point dispatch via
-        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // `loadThreadContextAndReturn` resets `rsp` and abandons this
         // kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.hopParkRun();
+        if (scheduler.currentThread() == null) scheduler.hopParkRun();
         unreachable;
     };
 
@@ -612,8 +612,8 @@ fn emulateVirtualBar(
 
     // Decode the instruction
     const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
-        port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
+        port.fireThreadFault(thread, ThreadFaultSubcode.protection, rip);
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
@@ -622,7 +622,7 @@ fn emulateVirtualBar(
         // empty after firing the unhandled-fault park, return into
         // `scheduler.run()` rather than letting iretq return to a stale
         // user frame.
-        if (scheduler.currentEc() == null) scheduler.hopParkRun();
+        if (scheduler.currentThread() == null) scheduler.hopParkRun();
         unreachable;
     };
 
@@ -633,13 +633,13 @@ fn emulateVirtualBar(
             MemoryFaultSubcode.invalid_write
         else
             MemoryFaultSubcode.invalid_read;
-        port.fireMemoryFault(ec, subcode, faulting_addr);
-        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
+        port.fireMemoryFault(thread, subcode, faulting_addr);
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        if (scheduler.currentEc() == null) scheduler.hopParkRun();
+        if (scheduler.currentThread() == null) scheduler.hopParkRun();
         return;
     }
 
@@ -659,13 +659,13 @@ fn emulateVirtualBar(
             2 => cpu.outw(@truncate(value), io_port),
             4 => cpu.outd(value, io_port),
             else => {
-                port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
+                port.fireThreadFault(thread, ThreadFaultSubcode.protection, rip);
+                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
                 // stashed on this core; an IRQ handler here could spin on
                 // that very release (markReady's kstack barrier) — a
                 // self-deadlock on our own pending stash.
                 scheduler.yieldTo(null);
-                if (scheduler.currentEc() == null) scheduler.hopParkRun();
+                if (scheduler.currentThread() == null) scheduler.hopParkRun();
                 return;
             },
         }
@@ -675,13 +675,13 @@ fn emulateVirtualBar(
             2 => @as(u32, cpu.inw(io_port)),
             4 => cpu.ind(io_port),
             else => {
-                port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
+                port.fireThreadFault(thread, ThreadFaultSubcode.protection, rip);
+                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the thread with its kstack release
                 // stashed on this core; an IRQ handler here could spin on
                 // that very release (markReady's kstack barrier) — a
                 // self-deadlock on our own pending stash.
                 scheduler.yieldTo(null);
-                if (scheduler.currentEc() == null) scheduler.hopParkRun();
+                if (scheduler.currentThread() == null) scheduler.hopParkRun();
                 unreachable;
             },
         };

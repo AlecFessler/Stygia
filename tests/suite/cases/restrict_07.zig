@@ -4,7 +4,7 @@
 //  return E_PERM when invoked via this handle."
 //
 // Strategy
-//   Pick a non-EC, non-VMAR handle so the cap-update path is the plain
+//   Pick a non-thread, non-VMAR handle so the cap-update path is the plain
 //   bitwise subset rule and the gated syscall is side-effect free.
 //   Port handles fit: §[port] caps include `recv` (bit 3) which gates
 //   the `recv` syscall (§[recv] test 02 is the matching E_PERM
@@ -18,7 +18,7 @@
 //
 //   IMPORTANT: do NOT call recv before the restrict. recv blocks
 //   waiting for an event; calling it on a still-recv-capable port
-//   without a queued sender hangs the test EC. After restrict drops
+//   without a queued sender hangs the test thread. After restrict drops
 //   the recv cap, the kernel must return E_PERM immediately
 //   without entering the wait path (per §[recv] [test 02]).
 //

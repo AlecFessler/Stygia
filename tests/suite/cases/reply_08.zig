@@ -12,7 +12,7 @@
 //   time. A reply typed `vm_exit` ordinarily routes to the vCPU's
 //   guest-state writeback path: the kernel reads the §[vm_exit_state]
 //   window from the receiver's user stack (vregs 14..N), projects it
-//   onto guest state gated by the EC `write` cap, and re-enters guest
+//   onto guest state gated by the thread `write` cap, and re-enters guest
 //   mode. The `initial_state` sub-code (13 on x86-64, 10 on aarch64) is
 //   the receiver's signal that no real guest state is being supplied —
 //   it acknowledges the synthetic create-time vm_exit (§[create_vcpu])
@@ -53,7 +53,7 @@
 //     guest state; without it the spec routes the writeback away from
 //     guest state and the re-deliver-initial branch would never fire on
 //     a no-`write` rig. `read` keeps the corresponding read path live.
-//     Bits 6-7 stay within ec_inner_ceiling = 0xFF. We omit `susp` —
+//     Bits 6-7 stay within thread_inner_ceiling = 0xFF. We omit `susp` —
 //     test 08 never calls `suspend` on the vCPU.
 //   - reply: no self-handle cap required (per §[reply]) — the reply
 //     handle itself authorizes the operation.
@@ -206,7 +206,7 @@ pub fn main(cap_table_base: u64) void {
     //    vm_exit-state writeback the kernel inspects on reply, which is
     //    the path we need active for the kernel to even consider the
     //    initial_state-sub-code-special-case branch under test.
-    const vcpu_caps = caps.EcCap{ .read = true, .write = true };
+    const vcpu_caps = caps.ThreadCap{ .read = true, .write = true };
     const caps_word: u64 = @as(u64, vcpu_caps.toU16());
     const cvcpu = syscall.createVcpu(
         caps_word,

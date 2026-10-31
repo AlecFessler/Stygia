@@ -4,7 +4,7 @@ const stygia = @import("stygia");
 const arch = stygia.arch.dispatch;
 const ctx_trace = stygia.utils.ctx_trace;
 const debug_info = stygia.utils.debug_info;
-const ec_log = stygia.utils.ec_log;
+const thread_log = stygia.utils.thread_log;
 const pf_log = stygia.utils.pf_log;
 
 /// Kernel panic handler.
@@ -51,7 +51,7 @@ pub var panic_owner: std.atomic.Value(u32) = std.atomic.Value(u32).init(PANIC_OW
 ///
 /// Measured on the aarch64 KVM rig under 4-core spread: the entire panic
 /// output was the single line `KERNEL PANIC: user page fault with no
-/// current EC` — not even the `\n` that follows the message, let alone a
+/// current thread` — not even the `\n` that follows the message, let alone a
 /// frame. With this guard the second entry halts immediately, so the
 /// first panic's message is the last thing written and stays readable.
 ///
@@ -280,7 +280,7 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     }
 
     ctx_trace.dumpAllRingsToSerial();
-    ec_log.dumpAllRingsToSerial();
+    thread_log.dumpAllRingsToSerial();
     pf_log.dumpAllRingsToSerial();
 
     arch.cpu.halt();

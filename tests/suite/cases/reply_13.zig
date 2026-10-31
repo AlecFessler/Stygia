@@ -16,7 +16,7 @@
 //
 //   Producing (a) follows the same pipeline used by terminate_07: mint
 //   a port with `xfer | recv | bind` (so the kernel issues a reply
-//   handle with `xfer = 1` per §[reply] handle ABI), mint a worker EC
+//   handle with `xfer = 1` per §[reply] handle ABI), mint a worker thread
 //   `W` with `susp | term`, `suspend(W, port)` to queue W as a
 //   suspended sender, then `recv(port)` to dequeue it. The recv
 //   syscall word carries `reply_handle_id` in bits 32-43 per §[recv].
@@ -57,7 +57,7 @@
 //   1. createPort(caps = {xfer, recv, bind}) — must succeed; xfer is
 //      what propagates to the reply handle so test 09 doesn't fire
 //      ahead of test 13.
-//   2. createExecutionContext(target = self, caps = {susp, term,
+//   2. createThread(target = self, caps = {susp, term,
 //      copy, restart_policy = 0}) — must succeed; W's `copy` bit
 //      keeps reply test 15 happy when the entry has move = 0.
 //   3. suspend(W, port) — must return OK; queues W as a suspended
@@ -75,7 +75,7 @@
 //
 // Assertions
 //   1: createPort failed (precondition for the assertion under test).
-//   2: createExecutionContext failed (precondition).
+//   2: createThread failed (precondition).
 //   3: suspend(W, port) did not return OK (precondition).
 //   4: recv(port) did not return OK (precondition).
 //   5: reply returned something other than E_PERM (the spec assertion
@@ -171,17 +171,17 @@ pub fn main(cap_table_base: u64) void {
     // suspend. copy keeps reply test 15 (move = 0 needs the copy cap
     // on the source) satisfied so test 13 fires first. term lets the
     // test tear W down at the end. restart_policy = 0 stays inside
-    // ec_inner_ceiling.
-    const w_caps = caps.EcCap{
+    // thread_inner_ceiling.
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .copy = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -216,9 +216,9 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 5: build a pair entry whose caps are NOT a subset of W's
     // current caps. W has {susp, term, copy}; entry adds `write`
-    // (EcCap bit 7) which W lacks. move = 0, so the source's `copy`
+    // (ThreadCap bit 7) which W lacks. move = 0, so the source's `copy`
     // bit (which W has) clears reply test 15 ahead of test 13.
-    const entry_caps = caps.EcCap{
+    const entry_caps = caps.ThreadCap{
         .copy = true,
         .term = true,
         .susp = true,

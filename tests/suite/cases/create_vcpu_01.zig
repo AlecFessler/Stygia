@@ -15,7 +15,7 @@
 // Strategy
 //   The runner mints each test's child capability domain with a
 //   SelfCap that includes `crec` (see runner/primary.zig — the child
-//   needs crec to construct EC handles tested elsewhere in the
+//   needs crec to construct thread handles tested elsewhere in the
 //   suite). To exercise the missing-`crec` failure path, the test
 //   itself must drop `crec` from its self-handle before calling
 //   create_vcpu.
@@ -30,7 +30,7 @@
 //
 // Action
 //   1. restrict(SLOT_SELF, runner_caps_minus_crec) — must succeed.
-//   2. create_vcpu(caps=EcCap{}, vm_handle=0, affinity=0, exit_port=0)
+//   2. create_vcpu(caps=ThreadCap{}, vm_handle=0, affinity=0, exit_port=0)
 //      — must return E_PERM.
 //
 // Assertions
@@ -73,16 +73,16 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // §[create_vcpu] caps layout: bits 0-15 = EcCap, bits 32-33 =
-    // priority. EcCap{} = all bits clear, priority = 0; reserved bits
+    // §[create_vcpu] caps layout: bits 0-15 = ThreadCap, bits 32-33 =
+    // priority. ThreadCap{} = all bits clear, priority = 0; reserved bits
     // clean. vm_handle = 0, affinity = 0, exit_port = 0 — the cap
     // check on the self-handle's `crec` bit runs before any per-arg
     // validation (vm-handle lookup, port-handle lookup, affinity
     // mask), so the kernel must short-circuit to E_PERM regardless of
     // the values supplied for those arguments.
-    const ec_caps = caps.EcCap{};
+    const thread_caps = caps.ThreadCap{};
     const result = syscall.createVcpu(
-        @as(u64, ec_caps.toU16()),
+        @as(u64, thread_caps.toU16()),
         0,
         0,
         0,

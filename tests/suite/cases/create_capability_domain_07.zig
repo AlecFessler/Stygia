@@ -6,7 +6,7 @@
 // Strategy
 //   `restart_policy_ceiling` lives in ceilings_outer ([3]) bits 16-31.
 //   Within that 16-bit sub-field:
-//     bits 0-1: ec_restart_max     (numeric: 0=kill / 1=restart / 2=persist / 3=_reserved)
+//     bits 0-1: thread_restart_max     (numeric: 0=kill / 1=restart / 2=persist / 3=_reserved)
 //     bits 2-3: vmar_restart_max    (numeric: 0=free / 1=decommit / 2=preserve / 3=snapshot)
 //     bit  4:   pf_restart_max     (drop / keep)
 //     bit  5:   dr_restart_max     (drop / keep)
@@ -17,11 +17,11 @@
 //
 //   The runner (runner/primary.zig) installs ceilings_outer
 //   = 0x0000_003F_01FE_FFFF, so the test domain's restart_policy_ceiling
-//   sub-field = 0x01FE — ec_restart_max=2, vmar_restart_max=3, all type
+//   sub-field = 0x01FE — thread_restart_max=2, vmar_restart_max=3, all type
 //   bools=1.
 //
 //   We construct a `ceilings_outer` whose `restart_policy_ceiling`
-//   sub-field has `ec_restart_max = 3`, which exceeds the caller's 2.
+//   sub-field has `thread_restart_max = 3`, which exceeds the caller's 2.
 //   Every other ceiling field in [3] is set within the caller's
 //   bounds (or zeroed) so the kernel's only available reject reason
 //   is the restart_policy_ceiling check.
@@ -38,7 +38,7 @@
 //
 // Action
 //   1. create_capability_domain(self_caps subset, ceilings_inner valid,
-//        ceilings_outer with rpc.ec_restart_max = 3, valid pf, no passed)
+//        ceilings_outer with rpc.thread_restart_max = 3, valid pf, no passed)
 //      — must return E_PERM
 //
 // Assertions
@@ -89,15 +89,15 @@ pub fn main(cap_table_base: u64) void {
     // ceiling. Reserved bits stay zero — see test 17.
     const ceilings_inner: u64 = 0;
 
-    // [3] ceilings_outer: build the violator. ec_outer_ceiling and
+    // [3] ceilings_outer: build the violator. thread_outer_ceiling and
     // vmar_outer_ceiling (bits 0-15) are zeroed (subsets); fut_wait_max
     // (bits 32-37) is zero (subset of caller's 63). The
     // restart_policy_ceiling sub-field at bits 16-31 has
-    // ec_restart_max = 3, which exceeds the caller's ec_restart_max =
+    // thread_restart_max = 3, which exceeds the caller's thread_restart_max =
     // 2 installed by the runner.
     //
     // restart_policy_ceiling sub-field encoding:
-    //   bits 0-1: ec_restart_max = 0b11 (= 3)   -> exceeds caller's 2
+    //   bits 0-1: thread_restart_max = 0b11 (= 3)   -> exceeds caller's 2
     //   bits 2-3: vmar_restart_max = 0           -> subset
     //   bits 4-9: pf/dr/port/vm/idc/tm = 0      -> subsets
     //   bits 10-15: reserved = 0
@@ -110,7 +110,7 @@ pub fn main(cap_table_base: u64) void {
     // through to a child here — we never construct the child.
     const passed_handles: [0]u64 = .{};
 
-    const result = syscall.createCapabilityDomain(v1_caps, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(v1_caps, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_thread_affinity
         passed_handles[0..]);
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {

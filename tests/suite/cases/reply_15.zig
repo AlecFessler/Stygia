@@ -51,7 +51,7 @@
 // Assertions
 //   1: setup — create_port(p_recv) returned an error word
 //   2: setup — create_port(p_src)  returned an error word
-//   3: setup — same-core pin or create_execution_context failed
+//   3: setup — same-core pin or create_thread failed
 //   5: setup — recv(p_recv) did not return OK
 //   6: reply returned something other than E_PERM (i.e. the kernel
 //      did not surface the missing-`copy`/move=0 contract this test
@@ -94,9 +94,9 @@ fn siblingEntry() callconv(.c) noreturn {
         spinHint();
     }
 
-    const self_ec_id = @atomicLoad(u64, &g_self_handle, .acquire);
+    const self_thread_id = @atomicLoad(u64, &g_self_handle, .acquire);
     const port_id = @atomicLoad(u64, &g_port_handle, .acquire);
-    _ = syscall.suspendEc(@truncate(self_ec_id), @truncate(port_id), &.{});
+    _ = syscall.suspendThread(@truncate(self_thread_id), @truncate(port_id), &.{});
 
     parkForever();
 }
@@ -152,7 +152,7 @@ pub fn main(cap_table_base: u64) void {
     }
     const p_src: HandleId = @truncate(cp_src.v1 & 0xFFF);
 
-    // Step 3: pin this test EC to the core where W will be created.
+    // Step 3: pin this test thread to the core where W will be created.
     // This removes cross-core progress from the setup: once we block in
     // recv, the same scheduler queue can run W until it self-suspends.
     const pinned_core = testing.currentCoreId();
@@ -160,16 +160,16 @@ pub fn main(cap_table_base: u64) void {
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, sibling_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -180,19 +180,19 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: sibling EC W. susp authorizes W's self-suspend; term lets
+    // Step 4: sibling thread W. susp authorizes W's self-suspend; term lets
     // the spec test_07 cleanup happen if needed (not required here, but
-    // mirrors terminate_07's recipe). restart_policy = 0 keeps the EC
+    // mirrors terminate_07's recipe). restart_policy = 0 keeps the thread
     // inside the runner's ceiling and prevents any restart fallback.
-    // Priority 1 lets W make progress after this EC parks in recv.
-    const w_caps = caps.EcCap{
+    // Priority 1 lets W make progress after this thread parks in recv.
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16()) | (@as(u64, 1) << 32);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16()) | (@as(u64, 1) << 32);
+    const cec = syscall.createThread(
+        thread_caps_word,
         @intFromPtr(&siblingEntry),
         1, // stack_pages
         0, // target = self

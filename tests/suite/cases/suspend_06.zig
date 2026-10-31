@@ -3,24 +3,24 @@
 // "[test 06] returns E_INVAL if [1] references a vCPU."
 //
 // Spec semantics
-//   §[suspend]: the syscall suspends a non-vCPU EC and delivers a
-//   suspension event on a port. vCPU ECs have their own delivery channel
+//   §[suspend]: the syscall suspends a non-vCPU thread and delivers a
+//   suspension event on a port. vCPU Threads have their own delivery channel
 //   (the exit_port bound at create_vcpu time) and are resumed via reply
 //   on vm_exit reply handles, not via the suspend syscall — so
-//   `suspend` on a vCPU EC handle is rejected with E_INVAL.
+//   `suspend` on a vCPU thread handle is rejected with E_INVAL.
 //
 // Strategy
 //   To isolate the vCPU rejection branch, every preceding gate must be
-//   defused so the kernel's only remaining check is the EC-is-vCPU
+//   defused so the kernel's only remaining check is the thread-is-vCPU
 //   discriminator:
-//     - test 01 (E_BADCAP [1] not a valid EC handle): we mint a real
-//       vCPU EC via create_vcpu and pass its handle.
+//     - test 01 (E_BADCAP [1] not a valid thread handle): we mint a real
+//       vCPU thread via create_vcpu and pass its handle.
 //     - test 02 (E_BADCAP [2] not a valid port handle): we mint a real
 //       destination port via create_port.
-//     - test 03 (E_PERM [1] lacks `susp`): the vCPU EC is minted with
+//     - test 03 (E_PERM [1] lacks `susp`): the vCPU thread is minted with
 //       `susp` set in its caps word. The vCPU's `susp` bit must lie
-//       within the VM's owning domain `ec_inner_ceiling` (the runner
-//       grants ec_inner_ceiling = 0xFF, which covers `susp` = bit 5).
+//       within the VM's owning domain `thread_inner_ceiling` (the runner
+//       grants thread_inner_ceiling = 0xFF, which covers `susp` = bit 5).
 //     - test 04 (E_PERM [2] lacks `bind`): the destination port is
 //       minted with `bind` set.
 //     - test 05 (E_INVAL reserved bits): the syscall word stays clean
@@ -56,9 +56,9 @@
 //      E_NODEV (degraded smoke pass).
 //   5. createPort(caps={bind}) — exit_port for the vCPU.
 //   6. createVcpu(caps_word with susp=1, vm_handle, affinity=0,
-//      exit_port) — vCPU EC handle held by this domain.
+//      exit_port) — vCPU thread handle held by this domain.
 //   7. createPort(caps={bind}) — destination port for the suspend call.
-//   8. suspendEc(vcpu_handle, dest_port, &.{}) — must return E_INVAL.
+//   8. suspendThread(vcpu_handle, dest_port, &.{}) — must return E_INVAL.
 //
 // Assertions
 //   1: setup — any setup syscall (page frame, var, map_pf, exit port,
@@ -157,13 +157,13 @@ pub fn main(cap_table_base: u64) void {
     }
     const exit_port: HandleId = @truncate(cep.v1 & 0xFFF);
 
-    // 6. §[create_vcpu] caps word layout: bits 0-15 = EcCap, bits 32-33
+    // 6. §[create_vcpu] caps word layout: bits 0-15 = ThreadCap, bits 32-33
     //    = priority. We need `susp` set on the resulting handle so
     //    suspend test 03's E_PERM gate cannot fire ahead of test 06.
     //    Priority = 0 stays within any ceiling. All other bits clean.
-    const vcpu_ec_caps = caps.EcCap{ .susp = true };
+    const vcpu_thread_caps = caps.ThreadCap{ .susp = true };
     const cvcpu = syscall.createVcpu(
-        @as(u64, vcpu_ec_caps.toU16()),
+        @as(u64, vcpu_thread_caps.toU16()),
         vm_handle,
         0, // affinity = 0 (any core)
         exit_port,
@@ -191,7 +191,7 @@ pub fn main(cap_table_base: u64) void {
     //    `susp` on [1] (defuses test 03), `bind` on [2] (defuses test
     //    04), and reserved bits clean (defuses test 05), the only
     //    remaining rejection path is the vCPU-discriminator check.
-    const result = syscall.suspendEc(vcpu_handle, dest_port, &.{});
+    const result = syscall.suspendThread(vcpu_handle, dest_port, &.{});
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(2);
         return;

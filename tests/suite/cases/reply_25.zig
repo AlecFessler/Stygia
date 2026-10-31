@@ -1,7 +1,7 @@
 // Spec §[reply] reply — test 25.
 //
 // "[test 25] returns E_TERM when `recv_port_handle_id != 0` and the
-//  suspended EC was terminated before reply could deliver; the reply
+//  suspended thread was terminated before reply could deliver; the reply
 //  handle is consumed and the caller does NOT park on the recv port."
 //
 // Strategy
@@ -17,23 +17,23 @@
 //         NOT park) after the call completes;
 //     (d) the reply handle slot consumed.
 //
-//   Pipeline (single domain, test EC owns everything):
+//   Pipeline (single domain, test thread owns everything):
 //
 //     1. Mint port_A with caps = {bind, recv}. bind authorizes the
 //        third-party suspend of W onto this port (§[suspend] [2] cap);
-//        recv lets the test EC dequeue the suspension event.
+//        recv lets the test thread dequeue the suspension event.
 //     2. Mint port_B with caps = {bind, recv}. This is the "we WOULD
 //        park here" port that the recv-port gate must accept as a
 //        valid handle. We never queue an event onto it; if the kernel
 //        incorrectly parks the caller on port_B, recv blocks
 //        indefinitely and the test never reports pass.
-//     3. Mint EC W with caps = {susp, term, restart_policy = 0}.
+//     3. Mint thread W with caps = {susp, term, restart_policy = 0}.
 //        susp authorizes step 4 (third-party suspend of W on port_A);
 //        term authorizes step 6 (terminate of W). entry =
 //        testing.dummyEntry — W never actually runs; suspend queues a
 //        suspended-sender event on port_A directly without any EL0
 //        execution by W.
-//     4. suspend(W, port_A). Non-blocking on the test EC since
+//     4. suspend(W, port_A). Non-blocking on the test thread since
 //        [1] = W != self per §[suspend].
 //     5. recv(port_A, 0). Returns immediately with the reply handle id
 //        in syscall word bits 32-43. After this point W is parked in
@@ -41,7 +41,7 @@
 //     6. terminate(W). Per §[terminate] test 04 W stops executing;
 //        per the §[terminate] paragraph "Termination also clears ...
 //        marks any reply handles whose suspended sender was the
-//        terminated EC such that subsequent operations on those reply
+//        terminated thread such that subsequent operations on those reply
 //        handles return E_ABANDONED."
 //     7. replyRecv(reply_handle, port_B). Per spec test 25 the reply
 //        portion observes the terminated sender, returns E_TERM, and
@@ -70,7 +70,7 @@
 // Action
 //   1. create_port(caps = {bind, recv})           — must succeed (port_A)
 //   2. create_port(caps = {bind, recv})           — must succeed (port_B)
-//   3. create_execution_context(target = self,
+//   3. create_thread(target = self,
 //        caps = {susp, term, restart_policy = 0}) — must succeed (W)
 //   4. suspend(W, port_A)                         — must return OK
 //   5. recv(port_A, 0)                            — must return OK and
@@ -83,7 +83,7 @@
 // Assertions
 //   1: setup port_A creation failed
 //   2: setup port_B creation failed
-//   3: setup EC creation failed
+//   3: setup thread creation failed
 //   4: third-party suspend(W, port_A) did not return OK
 //   5: recv on port_A did not return OK
 //   6: recv returned reply_handle_id == 0
@@ -102,8 +102,8 @@ const HandleId = caps.HandleId;
 
 pub fn main(cap_table_base: u64) void {
     // Step 1: mint port_A with bind|recv. xfer not needed (pair_count = 0).
-    // bind lets the test EC issue the third-party suspend of W onto port_A
-    // (§[suspend] [2] bind cap); recv lets the test EC dequeue the
+    // bind lets the test thread issue the third-party suspend of W onto port_A
+    // (§[suspend] [2] bind cap); recv lets the test thread dequeue the
     // resulting suspension event.
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cpa = syscall.createPort(@as(u64, port_caps.toU16()));
@@ -130,16 +130,16 @@ pub fn main(cap_table_base: u64) void {
     // (kill) keeps the call inside the runner-granted ceiling. W never
     // actually runs — suspend queues the suspended-sender event directly
     // — but we still need a valid entry pointer to satisfy
-    // create_execution_context.
-    const w_caps = caps.EcCap{
+    // create_thread.
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1, // stack_pages
         0, // target = self
@@ -153,7 +153,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 4: queue W as a suspended sender on port_A. Since [1] = W
     // != self, the call returns immediately without blocking the test
-    // EC (§[suspend]).
+    // thread (§[suspend]).
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_a,

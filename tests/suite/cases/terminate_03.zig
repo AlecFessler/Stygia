@@ -1,4 +1,4 @@
-// Spec §[execution_context] terminate — test 03.
+// Spec §[thread] terminate — test 03.
 //
 // "[test 03] returns E_INVAL if any reserved bits are set in [1]."
 //
@@ -10,41 +10,41 @@
 //
 //   To isolate the reserved-bit check we make every other check
 //   pass. terminate's failure paths are:
-//     [test 01] E_BADCAP if [1] is not a valid EC handle.
+//     [test 01] E_BADCAP if [1] is not a valid thread handle.
 //     [test 02] E_PERM   if [1] does not have the `term` cap.
 //     [test 03] E_INVAL  if any reserved bits are set in [1].
 //
-//   So [1]'s low 12 bits must reference a valid EC handle that
-//   has the `term` cap. We mint a fresh EC via
-//   `create_execution_context(target=self, caps={susp,term,rp=0})`
-//   — same shape as restrict_03's setup. The new EC begins
+//   So [1]'s low 12 bits must reference a valid thread handle that
+//   has the `term` cap. We mint a fresh thread via
+//   `create_thread(target=self, caps={susp,term,rp=0})`
+//   — same shape as restrict_03's setup. The new thread begins
 //   executing at `testing.dummyEntry`, which halts forever; the
-//   test EC continues independently and the `terminate` call
-//   targets the new EC's handle slot in our table, not its
+//   test thread continues independently and the `terminate` call
+//   targets the new thread's handle slot in our table, not its
 //   running state.
 //
 //   We then dispatch terminate with reserved bit 12 of [1] set
-//   while the low 12 bits hold the valid EC slot id. The libz
+//   while the low 12 bits hold the valid thread slot id. The libz
 //   `syscall.terminate` wrapper takes `target: u12`, which cannot
 //   carry reserved bits in [1]. We bypass that wrapper and
 //   dispatch through `syscall.issueReg` directly so we can stuff
 //   bit 12 into vreg 1.
 //
-//   We do NOT invoke the EC handle's terminate path with low bits
-//   alone first — that would actually terminate the EC and is
+//   We do NOT invoke the thread handle's terminate path with low bits
+//   alone first — that would actually terminate the thread and is
 //   irrelevant to the assertion. The reserved-bit check fires at
 //   the ABI dispatch layer before any termination side effect, so
-//   the target EC remains alive after this call.
+//   the target thread remains alive after this call.
 //
 // Action
-//   1. create_execution_context(target=self, caps={susp,term,rp=0})
-//      — must succeed (yields a valid EC handle with `term` cap)
+//   1. create_thread(target=self, caps={susp,term,rp=0})
+//      — must succeed (yields a valid thread handle with `term` cap)
 //   2. terminate(handle | (1 << 12))
 //      — must return E_INVAL (reserved bit 12 of [1] set;
-//        low 12 bits hold the valid EC id)
+//        low 12 bits hold the valid thread id)
 //
 // Assertions
-//   1: setup syscall failed (create_execution_context returned an
+//   1: setup syscall failed (create_thread returned an
 //      error word in v1)
 //   2: terminate with reserved bit 12 of [1] returned something
 //      other than E_INVAL
@@ -59,17 +59,17 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    const initial = caps.EcCap{
+    const initial = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target=self), priority in
     // 32-33. priority=0 keeps the call within the child's pri ceiling.
     const caps_word: u64 = @as(u64, initial.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1,
@@ -80,12 +80,12 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const thread_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    // Reserved bit 12 of [1] set; low 12 bits hold the valid EC id.
+    // Reserved bit 12 of [1] set; low 12 bits hold the valid thread id.
     // Bypass the typed wrapper since it takes u12 and would truncate
     // the reserved bit before it reaches the kernel.
-    const handle_with_reserved: u64 = @as(u64, ec_handle) | (@as(u64, 1) << 12);
+    const handle_with_reserved: u64 = @as(u64, thread_handle) | (@as(u64, 1) << 12);
     const r = syscall.issueReg(.terminate, 0, .{ .v1 = handle_with_reserved });
     if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(2);

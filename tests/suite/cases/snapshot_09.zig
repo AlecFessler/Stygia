@@ -32,14 +32,14 @@
 //   domain via the v0 test child surface as currently provisioned:
 //
 //   (a) A domain cannot trigger its own restart and then continue
-//       executing as the same EC instance with its register/stack state
+//       executing as the same thread instance with its register/stack state
 //       intact. `restart` (syscall 14) restarts a *child* domain, not
-//       the calling domain; calling it on the test EC's own enclosing
+//       the calling domain; calling it on the test thread's own enclosing
 //       domain is not how the spec frames the restart entry point. To
-//       observe the post-restart side effect from a single test EC we
+//       observe the post-restart side effect from a single test thread we
 //       would need either: (i) a parent harness that holds a handle to
 //       this test domain, restarts it, and inspects T after resume; or
-//       (ii) a re-entry hook so the test EC's `main` is invoked again
+//       (ii) a re-entry hook so the test thread's `main` is invoked again
 //       on restart with enough fixture state preserved across the
 //       boundary to compare against the pre-restart sentinel.
 //
@@ -67,7 +67,7 @@
 //
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in a
-//   single test EC: mint S as a preserve-policy VMAR, mint T as a
+//   single test thread: mint S as a preserve-policy VMAR, mint T as a
 //   snapshot-policy VMAR, call `snapshot(T, S)` and verify it does not
 //   return an error word. That confirms the binding-establishment path
 //   wired into snapshot_07 (replacement) reaches the same dispatch

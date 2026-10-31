@@ -160,7 +160,7 @@ pub fn issueRegDiscard(word: u64, in: Regs) void {
 //
 // Stack reservation = 144 bytes (not 16). Rationale: §[event_state]
 // vreg 14 is delivered by `recv` at `[user_rsp + 8]` of the syscall-
-// time RSP — the kernel writes the suspended-EC's RIP there during
+// time RSP — the kernel writes the suspended-thread's RIP there during
 // rendezvous. With a 16-byte reservation, [rsp+8] from inside the asm
 // equals (caller_rsp - 16) + 8 = caller_rsp - 8 — squarely inside the
 // SysV AMD64 red zone (caller_rsp - 128 .. caller_rsp - 1) where LLVM

@@ -8,7 +8,7 @@
 //   restart_policy on a VMAR handle is a 2-bit numeric enum in cap bits
 //   9-10 (0=free, 1=decommit, 2=preserve, 3=snapshot) that uses
 //   numeric monotonicity, not bitwise subset semantics. Test 04 is the
-//   VMAR-handle analogue of test 03 (which covers the EC-handle path).
+//   VMAR-handle analogue of test 03 (which covers the thread-handle path).
 //
 //   Mint a regular VMAR (mmio=0, dma=0) with `restart_policy = 0`
 //   (free) plus r/w. Then call restrict, keeping every other cap bit

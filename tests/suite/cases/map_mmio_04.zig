@@ -28,7 +28,7 @@
 //     forwarded. The same `findCom1`-style scan that runner/serial.zig
 //     uses to bootstrap the primary's serial VMAR cannot succeed
 //     inside a test child, because the child's table holds self /
-//     initial_ec / self_idc / port and nothing else. So the
+//     initial_thread / self_idc / port and nothing else. So the
 //     "first map_mmio succeeds, second map_mmio rejects" path is
 //     unreachable: the first call cannot succeed without a real
 //     device_region.

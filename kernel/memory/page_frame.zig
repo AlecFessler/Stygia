@@ -20,7 +20,7 @@ const vmar = stygia.memory.vmar;
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const PAddr = stygia.memory.address.PAddr;
 const Refcount = stygia.utils.refcount.Refcount;
@@ -114,18 +114,18 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
     if (pages > std.math.maxInt(u32)) return errors.E_INVAL;
     const page_count: u32 = @intCast(pages);
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const thread: *Thread = @ptrCast(@alignCast(caller));
 
-    if (selfHandleLacksCrpf(ec)) return errors.E_PERM;
-    if (!rwxIsSubsetOfCeiling(ec, caps_bits)) return errors.E_PERM;
-    if (!maxSzWithinCeiling(ec, caps_bits)) return errors.E_PERM;
+    if (selfHandleLacksCrpf(thread)) return errors.E_PERM;
+    if (!rwxIsSubsetOfCeiling(thread, caps_bits)) return errors.E_PERM;
+    if (!maxSzWithinCeiling(thread, caps_bits)) return errors.E_PERM;
 
     const pf = allocPageFrame(sz, page_count) catch return errors.E_NOMEM;
 
     // Mint the user-visible handle into the caller's table. The kernel
     // table entry holds the `SlabRef(PageFrame)` (gen-validated); the
     // user table mirrors caps + field0/field1 snapshot.
-    const cd = callerDomain(ec);
+    const cd = callerDomain(thread);
     const erased: ErasedSlabRef = .{
         .ptr = @ptrCast(pf),
         .gen = @intCast(pf._gen_lock.currentGen()),
@@ -340,17 +340,17 @@ inline fn packField0(page_count: u32, sz: PageSize) u64 {
 }
 
 /// Resolve the caller's owning capability domain. The syscall ABI
-/// dispatches via `*anyopaque`; the concrete type is `*ExecutionContext`
+/// dispatches via `*anyopaque`; the concrete type is `*Thread`
 /// whose `domain` SlabRef names the owner.
-fn callerDomain(ec: *ExecutionContext) *CapabilityDomain {
-    return ec.domain.ptr; // caller-pinned: ec is the running EC; its domain stays alive across this syscall
+fn callerDomain(thread: *Thread) *CapabilityDomain {
+    return thread.domain.ptr; // caller-pinned: thread is the running thread; its domain stays alive across this syscall
 }
 
 /// Spec §[create_page_frame] test 01: returns E_PERM if the caller's
 /// self-handle lacks `crpf`. The self-handle's caps live in the
 /// capability domain's user_table[0].word0 caps field.
-fn selfHandleLacksCrpf(ec: *ExecutionContext) bool {
-    const cd = callerDomain(ec);
+fn selfHandleLacksCrpf(thread: *Thread) bool {
+    const cd = callerDomain(thread);
     const self_caps_word: u16 = capability.Word0.caps(cd.user_table[0].word0);
     const self_caps: capability_domain.CapabilityDomainCaps = @bitCast(self_caps_word);
     return !self_caps.crpf;
@@ -362,8 +362,8 @@ fn selfHandleLacksCrpf(ec: *ExecutionContext) bool {
 /// 40..47 with `max_rwx` at bits 40..42 and `max_sz` at bits 43..44.
 /// (Self-handle field0 differs from [2] ceilings_inner: it inserts
 /// idc_rx at bits 32..39, shifting pf/vm/port ceilings up by 8.)
-fn rwxIsSubsetOfCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
-    const cd = callerDomain(ec);
+fn rwxIsSubsetOfCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
+    const cd = callerDomain(thread);
     const self_field0 = cd.user_table[0].field0;
     const max_rwx: u3 = @truncate((self_field0 >> 40) & 0b111);
     const requested_rwx: u3 = (@as(u3, @intFromBool(caps_bits.r))) |
@@ -376,8 +376,8 @@ fn rwxIsSubsetOfCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
 /// exceeds the caller's `pf_ceiling.max_sz`. Stored in self-handle
 /// field0 bits 43..44 per §[capability_domain] layout (shifted by 8
 /// vs the [2] ceilings_inner layout to make room for idc_rx).
-fn maxSzWithinCeiling(ec: *ExecutionContext, caps_bits: PageFrameCaps) bool {
-    const cd = callerDomain(ec);
+fn maxSzWithinCeiling(thread: *Thread, caps_bits: PageFrameCaps) bool {
+    const cd = callerDomain(thread);
     const self_field0 = cd.user_table[0].field0;
     const ceiling_max_sz: u2 = @truncate((self_field0 >> 43) & 0b11);
     return caps_bits.max_sz <= ceiling_max_sz;

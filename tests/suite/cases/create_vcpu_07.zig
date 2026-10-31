@@ -4,7 +4,7 @@
 //
 // Strategy
 //   §[create_vcpu] pins the layout of [1] explicitly:
-//     [1] caps:  bits  0-15 = caps (EcCap on the EC handle returned)
+//     [1] caps:  bits  0-15 = caps (ThreadCap on the thread handle returned)
 //                bits 32-33 = priority (0..3, bounded by caller's
 //                             priority ceiling)
 //                bits 16-31, 34-63 = _reserved.
@@ -17,7 +17,7 @@
 //   defusing approach — and then dial in a single reserved bit on top
 //   of an otherwise-valid caps word. We use bit 63 of [1] (the top of
 //   the bits 34-63 reserved range) which sits well above the priority
-//   field (bits 32-33) and the EcCap field (bits 0-15), so it cannot
+//   field (bits 32-33) and the ThreadCap field (bits 0-15), so it cannot
 //   be mistaken for a real cap that the kernel would reject for a
 //   different reason.
 //
@@ -29,8 +29,8 @@
 // Defusing other create_vcpu error paths
 //   - test 01 (E_PERM no `crec`): runner spawns the child with `crec`
 //     in `child_self` (see runner/primary.zig spawnOne).
-//   - test 02 (E_PERM caps not subset of ec_inner_ceiling): runner
-//     grants `ec_inner_ceiling = 0xFF` (EcCap bits 0-7). Our valid
+//   - test 02 (E_PERM caps not subset of thread_inner_ceiling): runner
+//     grants `thread_inner_ceiling = 0xFF` (ThreadCap bits 0-7). Our valid
 //     caps below stay within that subset.
 //   - test 03 (E_PERM priority exceeds ceiling): runner grants
 //     `pri = 3`. We set priority = 0, well under the ceiling.
@@ -121,11 +121,11 @@ pub fn main(cap_table_base: u64) void {
     }
     const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
 
-    // EcCap subset of ec_inner_ceiling = 0xFF (bits 0-7). `read|write`
+    // ThreadCap subset of thread_inner_ceiling = 0xFF (bits 0-7). `read|write`
     // is well within that subset and is the same shape used by other
-    // create_ec test setups in the suite.
-    const ec_caps = caps.EcCap{ .read = true, .write = true };
-    const valid_caps_word: u64 = @as(u64, ec_caps.toU16());
+    // create_thread test setups in the suite.
+    const thread_caps = caps.ThreadCap{ .read = true, .write = true };
+    const valid_caps_word: u64 = @as(u64, thread_caps.toU16());
     // priority = 0 — under the runner-granted pri = 3 ceiling.
     const caps_with_reserved: u64 = valid_caps_word | (@as(u64, 1) << 63);
 

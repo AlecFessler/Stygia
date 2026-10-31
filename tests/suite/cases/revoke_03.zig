@@ -10,11 +10,11 @@
 //   ancestry chain spanning two capability domains: the test domain
 //   passes a port to a grandchild via `copy`, then asserts that
 //   revoke([port]) releases the grandchild's copy. Verifying state
-//   inside a separate domain from the test EC requires an end-to-end
+//   inside a separate domain from the test thread requires an end-to-end
 //   IDC round-trip (handle attachment encoding §[handle_attachments]
 //   on suspend, then recv decoding on the test side, plus a follow-up
 //   probe of the grandchild's table). The libz suspend wrapper does not
-//   yet implement the high-vreg pair layout — `suspendEc` panics when
+//   yet implement the high-vreg pair layout — `suspendThread` panics when
 //   attachments are non-empty — so the cross-domain construction is
 //   currently unreachable from a single test ELF.
 //

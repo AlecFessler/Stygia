@@ -13,7 +13,7 @@
 //   To isolate the reserved-bit check from the BADCAP check (test 01),
 //   the low 12 bits must hold a valid handle id. The runner does not
 //   forward a device_region handle to test children today (slots 0/1/2
-//   are self / initial EC / self-IDC, slot 3 is the result port). Mint
+//   are self / initial thread / self-IDC, slot 3 is the result port). Mint
 //   a fresh port handle via create_port and use its id in the low 12
 //   bits — sync_02 / delete_02 use the same shape (any valid id is
 //   sufficient because the reserved-bit check is ABI-layer and fires

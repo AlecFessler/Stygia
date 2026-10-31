@@ -21,40 +21,40 @@
 //   can resolve the suspend with E_INVAL:
 //     - test 01 (port lacks xfer): the runner mints the result port
 //       at SLOT_FIRST_PASSED with `{xfer, bind}`.            cleared
-//     - test 02 (BADCAP for invalid source): SLOT_INITIAL_EC is a
+//     - test 02 (BADCAP for invalid source): SLOT_INITIAL_THREAD is a
 //       live, valid handle in this domain.                    cleared
 //     - test 03 (entry caps ⊄ source caps): entry.caps = 0,
 //       trivially a subset of any source caps.                cleared
 //     - test 04 (move=1 with no move cap): we use move=0; test 04
 //       only fires for move=1 entries.                        cleared
 //     - test 05 (move=0 lacking copy): per §[create_capability_domain]
-//       test 21 the initial-EC handle's caps equal the runner's
-//       `ec_inner_ceiling` (0xFF), so bit 1 (`copy`) is set.   cleared
+//       test 21 the initial-thread handle's caps equal the runner's
+//       `thread_inner_ceiling` (0xFF), so bit 1 (`copy`) is set.   cleared
 //     - test 07 (duplicate sources): N=1.                     cleared
 //   Bit 12 of the entry is set → test 06 must fire → E_INVAL.
 //
 //   We also need the §[suspend] preludes to be inert so the syscall
 //   reaches the §[handle_attachments] entry-validation step:
-//     - §[suspend] test 03 (no `susp` on EC) — slot 1's caps = 0xFF
+//     - §[suspend] test 03 (no `susp` on thread) — slot 1's caps = 0xFF
 //       includes `susp` (bit 5).
 //     - §[suspend] test 04 (no `bind` on port) — slot 3's caps include
 //       `bind`.
 //     - §[suspend] test 05 (reserved bits in syscall word/[1]/[2]) —
 //       only the syscall_num and pair_count fields are populated.
-//     - §[suspend] test 06 (vCPU target) — slot 1 is a plain EC.
+//     - §[suspend] test 06 (vCPU target) — slot 1 is a plain thread.
 //     - §[suspend] test 07 (already-suspended) — slot 1 is the
-//       calling, running EC.
+//       calling, running thread.
 //
 //   The §[handle_attachments] entry layout places pair entries in
 //   vregs `[128-N..127]`. With N=1 the lone entry occupies vreg 127,
 //   which per §[syscall_abi] lives at `[rsp + (127-13)*8] = [rsp + 912]`
-//   when the syscall executes. libz's `suspendEc` panics on N>0
+//   when the syscall executes. libz's `suspendThread` panics on N>0
 //   because its high-vreg path is unwired, so we issue the syscall
 //   directly via inline asm with a 920-byte stack pad — matching the
 //   shape used by handle_attachments_02/03/04/05.
 //
 // Action
-//   1. Build a clean PairEntry { id = SLOT_INITIAL_EC, caps = 0,
+//   1. Build a clean PairEntry { id = SLOT_INITIAL_THREAD, caps = 0,
 //      move = false } and encode to u64.
 //   2. OR `1 << 12` into the encoded word to set the lowest reserved
 //      bit (`_reserved_lo` band, bit 12).
@@ -212,14 +212,14 @@ pub fn main(cap_table_base: u64) void {
     // pollute a single reserved bit in the `_reserved_lo` band so
     // test 06 is the unique applicable check.
     const clean_entry: u64 = (caps.PairEntry{
-        .id = caps.SLOT_INITIAL_EC,
+        .id = caps.SLOT_INITIAL_THREAD,
         .caps = 0,
         .move = false,
     }).toU64();
     const dirty_entry: u64 = clean_entry | (@as(u64, 1) << 12);
 
     const result = suspendWithOnePairAtV127(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         caps.SLOT_FIRST_PASSED,
         dirty_entry,
     );

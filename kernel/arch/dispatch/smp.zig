@@ -42,7 +42,7 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
 /// Cross-core wake. The wake's only job is to make a halted core's
 /// `hlt`/`wfi` retire so its park primitive falls through to
 /// `scheduler_run_after_park` -> `run()` -> `dequeueOrIdle`, which finds
-/// the freshly enqueued EC. It does NOT need to dispatch by itself, and
+/// the freshly enqueued thread. It does NOT need to dispatch by itself, and
 /// on aarch64 it deliberately must not — see `exceptions.dispatchIrq`
 /// case 3.
 ///
@@ -62,7 +62,7 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
 ///     ends in `scheduler.preempt()`, which dispatches and never
 ///     returns, so `parkAndAwaitIRQ`'s trailing
 ///     `b scheduler_run_after_park` was skipped and the previously
-///     dispatched EC's `on_cpu` was stranded set. Details at
+///     dispatched thread's `on_cpu` was stranded set. Details at
 ///     `exceptions.dispatchIrq` case 3.
 ///
 /// So: its own INTID, its own do-nothing handler.
@@ -78,7 +78,7 @@ const wake_ipi_vector: u8 = switch (builtin.cpu.arch) {
 };
 
 /// Wake an idle remote core so it picks up freshly enqueued work.
-/// Spec §[execution_context] cross-core enqueue.
+/// Spec §[thread] cross-core enqueue.
 pub fn sendWakeIpi(core_id: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.apic.sendIpiToCore(core_id, wake_ipi_vector),

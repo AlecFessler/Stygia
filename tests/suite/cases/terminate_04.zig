@@ -1,18 +1,18 @@
 // Spec §[terminate] terminate — test 04.
 //
-// "[test 04] on success, the target EC stops executing."
+// "[test 04] on success, the target thread stops executing."
 //
 // Strategy
-//   Mint a worker EC inside this domain (target = self) that runs a
+//   Mint a worker thread inside this domain (target = self) that runs a
 //   tight loop incrementing a shared u64 in this ELF's .bss. Because
-//   create_execution_context with target = 0 puts the new EC in the
+//   create_thread with target = 0 puts the new thread in the
 //   caller's own capability domain — and therefore in the same
-//   address space — the parent test EC can observe the worker's
+//   address space — the parent test thread can observe the worker's
 //   progress by reading the same memory location.
 //
 //   The worker uses an atomic increment so the value the parent reads
 //   is the value the worker last wrote (the kernel gives no other
-//   memory-ordering guarantee between unrelated user ECs). The parent
+//   memory-ordering guarantee between unrelated user Threads). The parent
 //   uses an atomic load for the symmetric reason.
 //
 //   The verification has two phases:
@@ -28,26 +28,26 @@
 //        the post-terminate samples must be equal — the worker must
 //        not advance the counter after it has been terminated.
 //
-//   Caps on the worker EC handle:
+//   Caps on the worker thread handle:
 //     - term  : required by §[terminate].
 //     - susp  : not strictly needed here; included so a future
 //               variant can suspend if termination ever needs to be
 //               serialized against a known-quiescent worker.
-//     - restart_policy = 0 (kill): test ECs in this runner spawn
+//     - restart_policy = 0 (kill): test Threads in this runner spawn
 //                                   without restart context, and
-//                                   create_execution_context with
+//                                   create_thread with
 //                                   restart_policy > 0 would require
-//                                   ec_restart_max > 0 in the
+//                                   thread_restart_max > 0 in the
 //                                   parent's restart_policy_ceiling
 //                                   — granted by the runner — but
 //                                   adds no value to this assertion.
 //
 //   The worker's entry function is a Zig fn living in this ELF's
-//   .text. The new EC's stack is allocated by the kernel; the worker
+//   .text. The new thread's stack is allocated by the kernel; the worker
 //   never returns from `workerLoop` so no stack-unwind concerns arise.
 //
 // Action
-//   1. create_execution_context(target=self, caps={susp,term,rp=0},
+//   1. create_thread(target=self, caps={susp,term,rp=0},
 //                               entry=&workerLoop, stack_pages=1,
 //                               affinity=0)                      — must succeed
 //   2. yield-spin briefly to let the worker run; sample heartbeat
@@ -57,7 +57,7 @@
 //      c2 == c3 after terminate
 //
 // Assertions
-//   1: setup syscall failed (create_execution_context returned an error)
+//   1: setup syscall failed (create_thread returned an error)
 //   2: terminate returned non-OK
 //   3: post-terminate heartbeat advanced (worker still executing)
 
@@ -83,7 +83,7 @@ fn workerLoop() noreturn {
 fn yieldN(n: u32) void {
     var i: u32 = 0;
     while (i < n) {
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldThread(0);
         i += 1;
     }
 }
@@ -95,17 +95,17 @@ pub fn main(cap_table_base: u64) void {
     // and aligns with the typical "controllable child" cap set.
     // restart_policy = 0 keeps the call free of restart-ceiling
     // checks (§[restart_semantics] test 01).
-    const worker_caps = caps.EcCap{
+    const worker_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target = self), priority in
     // 32-33. priority = 0 stays within the runner-granted pri ceiling.
     const caps_word: u64 = @as(u64, worker_caps.toU16());
     const entry: u64 = @intFromPtr(&workerLoop);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
     const c3: u64 = @atomicLoad(u64, &heartbeat, .monotonic);
 
     // If the worker was never scheduled (c1 == 0), we lack a positive
-    // observation that the EC was ever executing. The terminate-OK
+    // observation that the thread was ever executing. The terminate-OK
     // leg above is already enforced; pass the test on the smoke shape
     // and rely on a future scheduler-cooperative variant for the full
     // assertion.

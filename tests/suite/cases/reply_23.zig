@@ -21,17 +21,17 @@
 //   does not lock the underlying port object before this gate, so the
 //   syscall returns E_PERM purely from the user_table caps word.
 //
-//   Pipeline (test EC owns both ports + W):
+//   Pipeline (test thread owns both ports + W):
 //     1. mint port_A with caps = {bind, recv, suspend} — used to obtain
 //        a reply handle via the suspend → recv choreography.
 //     2. mint port_B with caps = {bind, recv} — temporarily holds
 //        `recv` so create_port's shape rule is satisfied.
 //     3. restrict(port_B, {bind}) — drops `recv` from port_B's caps.
 //        This is the recv-less handle test 23 names.
-//     4. mint sibling EC W with caps = {susp, restart_policy = 0} and
-//        target = self so it runs in the test EC's address space.
+//     4. mint sibling thread W with caps = {susp, restart_policy = 0} and
+//        target = self so it runs in the test thread's address space.
 //     5. suspend(W, port_A)                      — queues W as a
-//        suspended sender on port_A; non-blocking on the test EC since
+//        suspended sender on port_A; non-blocking on the test thread since
 //        [1] != self per §[suspend].
 //     6. recv(port_A, 0)                         — returns immediately
 //        with reply_handle_id in syscall-word bits 32-43.
@@ -57,7 +57,7 @@
 //   1. create_port(caps = {bind, recv, suspend}) — must succeed (port_A)
 //   2. create_port(caps = {bind, recv})          — must succeed (port_B)
 //   3. restrict(port_B, {bind})                  — drops `recv`; OK
-//   4. create_execution_context(target = self,
+//   4. create_thread(target = self,
 //        caps = {susp, restart_policy = 0})      — must succeed
 //   5. suspend(W, port_A)                        — must return OK
 //   6. recv(port_A, 0)                           — must return OK
@@ -69,7 +69,7 @@
 //   1: setup port_A creation failed
 //   2: setup port_B creation failed
 //   3: restrict on port_B did not return OK
-//   4: setup EC creation failed
+//   4: setup thread creation failed
 //   5: suspend did not return OK
 //   6: recv did not return OK
 //   7: recv-mode reply returned something other than E_PERM
@@ -85,7 +85,7 @@ const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
     // Step 1: mint port_A with bind + recv. bind keeps the port alive
-    // for the recv on the test-EC side, recv lets the test EC dequeue
+    // for the recv on the test-thread side, recv lets the test thread dequeue
     // the suspension event and obtain a reply handle.
     const port_a_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp_a = syscall.createPort(@as(u64, port_a_caps.toU16()));
@@ -118,17 +118,17 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: mint sibling EC W. susp lets the test EC queue W onto
+    // Step 4: mint sibling thread W. susp lets the test thread queue W onto
     // port_A via suspend. restart_policy = 0 (kill) keeps the call
-    // inside the runner-granted ec_restart_max ceiling.
-    const w_caps = caps.EcCap{
+    // inside the runner-granted thread_restart_max ceiling.
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -141,7 +141,7 @@ pub fn main(cap_table_base: u64) void {
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
     // Step 5: queue W as a suspended sender on port_A. [1] = W != self,
-    // so the call returns immediately without blocking the test EC.
+    // so the call returns immediately without blocking the test thread.
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_a_handle,
@@ -151,7 +151,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 6: recv on port_A. The test EC holds port_A's bind cap
+    // Step 6: recv on port_A. The test thread holds port_A's bind cap
     // (alive) and W is queued, so recv returns immediately with the
     // minted reply handle id in syscall-word bits 32-43.
     const got = syscall.recv(port_a_handle, 0);

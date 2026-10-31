@@ -27,7 +27,7 @@ kernel/ directory automatically):
 ```
 tools/check_gen_lock/zig-out/bin/check_gen_lock           # full report
 tools/check_gen_lock/zig-out/bin/check_gen_lock --summary # one line per entry
-tools/check_gen_lock/zig-out/bin/check_gen_lock --entry createExecutionContext
+tools/check_gen_lock/zig-out/bin/check_gen_lock --entry createThread
 tools/check_gen_lock/zig-out/bin/check_gen_lock --list-slab-types
 tools/check_gen_lock/zig-out/bin/check_gen_lock --list-methods
 tools/check_gen_lock/zig-out/bin/check_gen_lock --help
@@ -178,7 +178,7 @@ provenance along the path is recorded and printed
   `secure_slab.forEachAlive` is one entity carrying the union of every
   visitor's callees, so a path can enter through one instantiation and
   leave through another (`hang_detector.dump → forEachAlive →
-  destroyEcsInDomain` is such a phantom).
+  destroyThreadsInDomain` is such a phantom).
 
 Both are over-approximations: they cost false positives, not false
 negatives. The next one does not.

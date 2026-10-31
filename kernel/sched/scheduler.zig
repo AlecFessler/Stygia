@@ -1,10 +1,10 @@
-//! Per-core scheduler — owns the run queues, dispatches ECs, handles
-//! preemption + voluntary yield, tracks the current EC per core, and
+//! Per-core scheduler — owns the run queues, dispatches Threads, handles
+//! preemption + voluntary yield, tracks the current thread per core, and
 //! coordinates lazy-FPU eviction across cores.
 //!
 //! Each core has a `PerCore` slot holding its run queue (priority-
-//! ordered intrusive PQ over EC.next), the currently dispatched EC,
-//! the last-FPU-owner EC, and a flag for whether CR0.TS is currently
+//! ordered intrusive PQ over thread.next), the currently dispatched thread,
+//! the last-FPU-owner thread, and a flag for whether CR0.TS is currently
 //! armed. Cross-core enqueue is supported (the source core sends an
 //! IPI to the destination if the destination is idle).
 
@@ -15,17 +15,17 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const spin_diag = stygia.utils.spin_diag;
-const ec_log = stygia.utils.ec_log;
+const thread_log = stygia.utils.thread_log;
 const memory_init = stygia.memory.init;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const lifecycle = stygia.sched.lifecycle;
 const port_mod = stygia.sched.port;
 const stack_mod = stygia.memory.stack;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
-const NOT_IN_RUN_QUEUE = stygia.sched.execution_context.NOT_IN_RUN_QUEUE;
-const Priority = stygia.sched.execution_context.Priority;
+const Thread = stygia.sched.thread.Thread;
+const NOT_IN_RUN_QUEUE = stygia.sched.thread.NOT_IN_RUN_QUEUE;
+const Priority = stygia.sched.thread.Priority;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
 const Stack = stygia.memory.stack.Stack;
@@ -36,11 +36,11 @@ var yield_select_diag_prints: u32 = 0;
 
 const YIELD_TARGET_PINNED_BIT: u64 = 1;
 const YieldTarget = struct {
-    ec: ?*ExecutionContext = null,
+    thread: ?*Thread = null,
     pinned: bool = false,
 
     fn encodeForHop(self: YieldTarget) u64 {
-        const target = self.ec orelse return 0;
+        const target = self.thread orelse return 0;
         const raw = @intFromPtr(target);
         std.debug.assert(raw & YIELD_TARGET_PINNED_BIT == 0);
         return raw | if (self.pinned) YIELD_TARGET_PINNED_BIT else 0;
@@ -50,26 +50,26 @@ const YieldTarget = struct {
         if (arg == 0) return .{};
         const raw = arg & ~YIELD_TARGET_PINNED_BIT;
         return .{
-            .ec = @as(*ExecutionContext, @ptrFromInt(raw)),
+            .thread = @as(*Thread, @ptrFromInt(raw)),
             .pinned = (arg & YIELD_TARGET_PINNED_BIT) != 0,
         };
     }
 
     fn release(self: *YieldTarget) void {
         if (self.pinned) {
-            lifecycle.releasePin(self.ec.?);
+            lifecycle.releasePin(self.thread.?);
             self.pinned = false;
         }
-        self.ec = null;
+        self.thread = null;
     }
 };
 
-/// Intrusive priority queue of ECs, linked through the EC's `next`
+/// Intrusive priority queue of Threads, linked through the thread's `next`
 /// field and ordered by `priority`. Shared by per-core run queues and
 /// port wait queues. Futex buckets use a separate WaitNode-based queue
 /// (see sched/futex.zig).
-pub const EcQueue = stygia.sched.priority_queue.PriorityQueue(
-    ExecutionContext,
+pub const ThreadQueue = stygia.sched.priority_queue.PriorityQueue(
+    Thread,
     "next",
     "priority",
     @typeInfo(Priority).@"enum".fields.len,
@@ -80,18 +80,18 @@ pub const TeardownKind = enum(u8) { self_delete, unhandled_fault };
 pub const TeardownRequest = struct {
     kind: TeardownKind,
     cd: SlabRef(CapabilityDomain),
-    caller_ec: ?SlabRef(ExecutionContext) = null,
+    caller_thread: ?SlabRef(Thread) = null,
 };
 
 /// Maximum cores the scheduler supports. Matches `affinity` mask width.
 pub const MAX_CORES: u8 = 64;
 
-var deferred_requeues: [MAX_CORES]EcQueue = [_]EcQueue{.{}} ** MAX_CORES;
-var yield_handoff_targets: [MAX_CORES]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_CORES;
+var deferred_requeues: [MAX_CORES]ThreadQueue = [_]ThreadQueue{.{}} ** MAX_CORES;
+var yield_handoff_targets: [MAX_CORES]?*Thread = [_]?*Thread{null} ** MAX_CORES;
 var yield_handoff_preempt_guard: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
 
 const WORK_STEALING_ENABLED = switch (builtin.cpu.arch) {
-    // aarch64 stays local-only until EC migration has FPU parity:
+    // aarch64 stays local-only until thread migration has FPU parity:
     // scheduler.migrateFlush, sched/fpu.migrateFlush via SGI, V0-V31 plus
     // FPCR/FPSR save/restore, and CPACR_EL1.FPEN trap-state handoff.
     .aarch64 => false,
@@ -102,7 +102,7 @@ const WORK_STEALING_ENABLED = switch (builtin.cpu.arch) {
 /// layout is referenced by x64 assembly and must not grow for policy state.
 var steal_victim_cursors: [MAX_CORES]u8 = [_]u8{0} ** MAX_CORES;
 
-/// Per-EC quantum between preemption ticks. Spec doesn't pin this.
+/// Per-thread quantum between preemption ticks. Spec doesn't pin this.
 ///
 /// x86 uses 2 ms — matches the old kernel and gives the LAPIC one-shot
 /// timer (which auto-disarms on fire per Intel SDM Vol 3A §13.5.4) a
@@ -114,7 +114,7 @@ var steal_victim_cursors: [MAX_CORES]u8 = [_]u8{0} ** MAX_CORES;
 /// SVC handler re-pend at the GIC the moment EOI clears the active bit.
 /// The next ERET to userspace then drops PSTATE.I, the pending tick
 /// fires before any user instruction completes, and a freshly-dispatched
-/// low-priority EC (e.g. the W in `reply_05`'s `yieldEc(W)`) gets robbed
+/// low-priority thread (e.g. the W in `reply_05`'s `yieldThread(W)`) gets robbed
 /// of its first-instruction window. Higher-priority queue residents then
 /// starve W indefinitely. A longer quantum gives explicitly-yielded
 /// targets enough head start to make observable progress before the next
@@ -127,34 +127,34 @@ pub const TIMESLICE_NS: u64 = switch (builtin.cpu.arch) {
 
 /// Per-core scheduler state. One entry per active core in `core_states[]`.
 ///
-/// `?SlabRef(EC)` requires a tagged-union layout that's not extern-
+/// `?SlabRef(thread)` requires a tagged-union layout that's not extern-
 /// compatible, so `PerCore` is a regular struct.
 ///
 /// CAUTION — the x86-64 IPC fast path DOES reference field offsets in
 /// here. `arch/x64/interrupts.zig` steps FP-S14 / R-14 open-code
-/// `setCurrentEc` in asm using `@offsetOf(PerCore, "current_ec")` and
-/// `@offsetOf(PerCore, "current_ec_gen")`. Any change to the shape of
+/// `setCurrentThread` in asm using `@offsetOf(PerCore, "current_thread")` and
+/// `@offsetOf(PerCore, "current_thread_gen")`. Any change to the shape of
 /// those two fields must be mirrored there; the offsets are computed
 /// with `@offsetOf` so a rename is a build error, but a change in
 /// WIDTH or in the meaning of the bytes is not.
 pub const PerCore = struct {
-    /// Priority-ordered intrusive PQ over EC.next. Drained by
+    /// Priority-ordered intrusive PQ over thread.next. Drained by
     /// `dequeue` on context switch / yield / preempt.
-    run_queue: EcQueue = .{},
+    run_queue: ThreadQueue = .{},
 
-    /// EC currently dispatched on this core. `null` ⇒ core is idle.
+    /// thread currently dispatched on this core. `null` ⇒ core is idle.
     ///
     /// SINGLE-WORD BY CONSTRUCTION, and that is a correctness
     /// requirement, not a micro-optimisation. This slot is written
-    /// without any lock by its owning core (`setCurrentEc` /
-    /// `clearCurrentEc`) and read WITHOUT A LOCK by other cores —
+    /// without any lock by its owning core (`setCurrentThread` /
+    /// `clearCurrentThread`) and read WITHOUT A LOCK by other cores —
     /// `awaitDomainQuiesced`'s teardown barrier, `markReady`'s
-    /// wake/preempt decision, `currentEcPtrOn`, the hang detector and
+    /// wake/preempt decision, `currentThreadPtrOn`, the hang detector and
     /// the fatal-fault reporter all do it.
     ///
-    /// It used to be `?SlabRef(ExecutionContext)`, i.e. a 24-byte
+    /// It used to be `?SlabRef(Thread)`, i.e. a 24-byte
     /// `{ ptr, gen, is_non_null }` aggregate. Measured on the Pi 5
-    /// (stygia-eu4): that layout tears. `state.current_ec = null`
+    /// (stygia-eu4): that layout tears. `state.current_thread = null`
     /// compiles to `stp xzr, xzr, [x]` + `str xzr, [x, #0x10]` — it
     /// ZEROES THE POINTER WORD — and `= SlabRef.init(...)` compiles to
     /// `str ptr` / `strb tag` / `str gen` with no release barrier, in
@@ -163,37 +163,37 @@ pub const PerCore = struct {
     /// alongside `ptr = 0`, which is not a state any writer ever
     /// intends. `awaitDomainQuiesced` then dereferenced it and took
     /// `KERNEL PAGE FAULT at 0x488` — exactly
-    /// `@offsetOf(ExecutionContext, "domain")` — killing core 1 at
+    /// `@offsetOf(Thread, "domain")` — killing core 1 at
     /// pass 14 of a 100-pass bare-metal run.
     ///
-    /// As a plain `?*ExecutionContext` the optional IS the pointer
+    /// As a plain `?*Thread` the optional IS the pointer
     /// (Zig's null-pointer niche), so publication is one naturally
     /// aligned 8-byte store and observation is one 8-byte load. Neither
     /// can tear on either supported arch, and "non-null" now implies
     /// "dereferenceable" with no ordering argument required. The gen
-    /// moved to `current_ec_gen`; it has exactly one consumer, and that
+    /// moved to `current_thread_gen`; it has exactly one consumer, and that
     /// consumer runs on the owning core.
     ///
-    /// caller-pinned: bare `*T` is deliberate, matching `committed_ec`
+    /// caller-pinned: bare `*T` is deliberate, matching `committed_thread`
     /// directly below. Cross-core readers perform identity-only
-    /// compares (`== ec`, `.domain.ptr == cd_key`) and never lock
+    /// compares (`== thread`, `.domain.ptr == cd_key`) and never lock
     /// through this pointer; a slab slot's bytes outlive its gen flip,
     /// so a stale-but-non-null value simply mismatches and the reader
     /// moves on.
-    current_ec: ?*ExecutionContext = null,
+    current_thread: ?*Thread = null,
 
-    /// Slab generation of `current_ec`, captured at publication time.
+    /// Slab generation of `current_thread`, captured at publication time.
     /// Split out of the old `SlabRef` so the pointer can stand alone as
-    /// a tear-free word — see `current_ec`. Exactly one consumer, and
+    /// a tear-free word — see `current_thread`. Exactly one consumer, and
     /// it runs on this core (the x86 entry snapshot), so the pointer/gen pair
     /// never needs to be read atomically together.
-    current_ec_gen: u32 = 0,
+    current_thread_gen: u32 = 0,
 
-    /// EC whose FP/SIMD state currently lives in this core's CPU
-    /// registers. May be a different EC than `current_ec` (lazy FPU —
+    /// thread whose FP/SIMD state currently lives in this core's CPU
+    /// registers. May be a different thread than `current_thread` (lazy FPU —
     /// eviction happens on the next FP-disabled trap, not on context
-    /// switch). `null` if no EC has used FP on this core since boot.
-    last_fpu_owner: ?SlabRef(ExecutionContext) = null,
+    /// switch). `null` if no thread has used FP on this core since boot.
+    last_fpu_owner: ?SlabRef(Thread) = null,
 
     /// Whether CR0.TS / FPEN is currently armed on this core. Tracked
     /// here so we don't issue redundant CR-writes (each one costs a
@@ -204,31 +204,31 @@ pub const PerCore = struct {
     /// LOADED (x86: CR3 root; aarch64: TTBR0), published with
     /// `.release` immediately AFTER each hardware root load. 0 = no
     /// user root (kernel root / parked / detached). This — not
-    /// `on_cpu`, not `current_ec` — is the authoritative "may this
+    /// `on_cpu`, not `current_thread` — is the authoritative "may this
     /// core still walk translations of root R" signal that domain
     /// teardown must wait on before freeing R's tables (stygia-rs6):
     /// `on_cpu` stays stale-true across the migration boundary and
-    /// its gated clears race, and `current_ec` flips BEFORE the
+    /// its gated clears race, and `current_thread` flips BEFORE the
     /// dispatch path's root swap. Publishing after the load closes
     /// both windows.
     active_root: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
-    /// Gen-dead EC whose final stack/slab cleanup must wait until this
-    /// core is no longer executing on that EC's kernel stack. G16 records
+    /// Gen-dead thread whose final stack/slab cleanup must wait until this
+    /// core is no longer executing on that thread's kernel stack. G16 records
     /// this as normative kernel behavior but keeps it out of the TLA model.
     teardown_pending: ?TeardownRequest = null,
 
     /// Per-core "park" kstack — the kstack this core uses while no real
-    /// EC is dispatched. Allocated at `perCoreInit`; sized like any
+    /// thread is dispatched. Allocated at `perCoreInit`; sized like any
     /// other kernel stack (KERNEL_STACK_PAGES). When `run()` empties the
     /// queue and falls through the dispatch arm, `parkAndAwaitIRQ`
     /// swaps gs:0 / TSS.RSP0 / rsp to `park_stack.top` so subsequent
     /// kernel-mode IRQs and any future syscall entries land here
-    /// instead of on the previously-suspended EC's kstack. Without
+    /// instead of on the previously-suspended thread's kstack. Without
     /// this, multiple idle cores can hold stale `gs:0` pointing at the
-    /// same suspended EC's kstack and concurrently push IRQ frames
+    /// same suspended thread's kstack and concurrently push IRQ frames
     /// onto it from kernel mode — silent cross-core stack corruption
-    /// that surfaces as iretq #GP / NO-EC PF when the corrupted slot
+    /// that surfaces as iretq #GP / NO-thread PF when the corrupted slot
     /// is later popped.
     park_stack: Stack = .{
         .top = .{ .addr = 0 },
@@ -243,16 +243,16 @@ pub const PerCore = struct {
     /// sitting in) its idle park.
     ///
     /// This exists because `enqueueOnCore`'s wake decision cannot use
-    /// `current_ec` alone. `current_ec` is cleared by the parking core
+    /// `current_thread` alone. `current_thread` is cleared by the parking core
     /// AFTER it has dropped `core_locks[core]` (see `yieldTo`'s
     /// empty-queue arm and `run`'s park fall-through, both of which
-    /// need the old value for their disowned-EC bookkeeping first), so
+    /// need the old value for their disowned-thread bookkeeping first), so
     /// there is a window in which the core has committed to parking but
-    /// its slot still names the EC it was running. An `enqueueOnCore`
-    /// landing in that window reads a non-null `current_ec`, concludes
-    /// "target is busy, it will pick the EC up at its next reschedule",
+    /// its slot still names the thread it was running. An `enqueueOnCore`
+    /// landing in that window reads a non-null `current_thread`, concludes
+    /// "target is busy, it will pick the thread up at its next reschedule",
     /// skips the wake IPI — and the target then parks forever with a
-    /// `.ready` EC sitting in its queue. The EC is never dispatched and
+    /// `.ready` thread sitting in its queue. The thread is never dispatched and
     /// whatever was waiting on it (a test result, an IPC reply) never
     /// arrives. Nothing else necessarily disturbs that core: futex
     /// wakes and affinity-0 enqueues both prefer the *local* core, so
@@ -260,8 +260,8 @@ pub const PerCore = struct {
     ///
     /// Publishing the parking decision under the same lock that guards
     /// the run queue closes the window in both directions:
-    ///   - enqueuer wins the lock: it queues the EC before the parking
-    ///     decision is made, so `dequeueOrIdleLocked` returns that EC
+    ///   - enqueuer wins the lock: it queues the thread before the parking
+    ///     decision is made, so `dequeueOrIdleLocked` returns that thread
     ///     and the core never parks.
     ///   - parker wins the lock: `idle_parked` is already true when the
     ///     enqueuer reads it, so the wake IPI is sent. A wake that
@@ -282,8 +282,8 @@ pub const PerCore = struct {
 pub var core_states: [MAX_CORES]PerCore = [_]PerCore{.{}} ** MAX_CORES;
 
 /// Parallel array of per-core spinlocks guarding `core_states[i]`'s
-/// `run_queue` and `current_ec`. Held only across queue ops and a
-/// snapshot of `current_ec`; never held across `loadEcContextAndReturn`.
+/// `run_queue` and `current_thread`. Held only across queue ops and a
+/// snapshot of `current_thread`; never held across `loadThreadContextAndReturn`.
 /// Kept out of `PerCore` itself so the IPC fast-path's hardcoded field
 /// offsets (72/80) inside `extern struct PerCore` stay pinned.
 ///
@@ -291,7 +291,7 @@ pub var core_states: [MAX_CORES]PerCore = [_]PerCore{.{}} ** MAX_CORES;
 /// acquire the target core's lock while holding the local core's lock,
 /// so the class is registered as ordered to opt out of pair-edge
 /// cycle detection. Callers must always release before invoking
-/// scheduler dispatch (`switchTo` / `loadEcContextAndReturn`).
+/// scheduler dispatch (`switchTo` / `loadThreadContextAndReturn`).
 pub var core_locks: [MAX_CORES]SpinLock = [_]SpinLock{.{ .class = "sched.core_lock" }} ** MAX_CORES;
 
 /// Lockdep group tag for `core_locks`. Non-zero so that overlapping
@@ -300,13 +300,13 @@ pub var core_locks: [MAX_CORES]SpinLock = [_]SpinLock{.{ .class = "sched.core_lo
 pub const SCHED_CORE_GROUP: u32 = 0x5C00; // arbitrary non-zero tag
 
 /// Set true after `globalInit` returns. Read by the boot path before
-/// enqueueing the root service's initial EC.
+/// enqueueing the root service's initial thread.
 pub var initialized: bool = false;
 
 // ── Init ─────────────────────────────────────────────────────────────
 
 /// Boot-time global init — called once on the BSP before SMP brings
-/// other cores up. Initializes `core_states[0]`'s idle EC and any
+/// other cores up. Initializes `core_states[0]`'s idle thread and any
 /// scheduler-wide state.
 pub fn globalInit() !void {
     initialized = true;
@@ -315,12 +315,12 @@ pub fn globalInit() !void {
 /// Per-core init — called once per core during SMP bring-up after the
 /// core's APIC / GIC is online. Arms the per-core preemption timer so
 /// the scheduler tick fires every `TIMESLICE_NS` and round-robin
-/// between equal-priority ECs is honored. Without this call no LAPIC
-/// timer interrupt ever fires and a CPU-bound EC runs forever until
+/// between equal-priority Threads is honored. Without this call no LAPIC
+/// timer interrupt ever fires and a CPU-bound thread runs forever until
 /// it voluntarily yields.
 pub fn perCoreInit() void {
     // Allocate this core's park kstack. Used while the run queue is
-    // empty AND no EC is dispatched — see `PerCore.park_stack` doc and
+    // empty AND no thread is dispatched — see `PerCore.park_stack` doc and
     // `parkAndAwaitIRQ`.
     const core: u8 = @truncate(arch.smp.coreID());
     const park = stack_mod.createKernel() catch @panic("park kstack alloc failed");
@@ -350,18 +350,18 @@ pub fn perCoreInit() void {
 
 // ── Dispatch ─────────────────────────────────────────────────────────
 
-/// Context switch to `ec` on the current core. Saves outgoing EC's
+/// Context switch to `thread` on the current core. Saves outgoing thread's
 /// state to its `ctx`, swaps address space (if domain changed),
-/// updates `current_ec`, applies lazy-FPU policy (arm/clear CR0.TS),
-/// loads `ec.ctx` and returns to userspace via iretq/sysretq.
+/// updates `current_thread`, applies lazy-FPU policy (arm/clear CR0.TS),
+/// loads `thread.ctx` and returns to userspace via iretq/sysretq.
 ///
-/// `current_ec` is written without the per-core lock — only this core
-/// ever writes its own `current_ec`, and cross-core readers (FPU flush,
+/// `current_thread` is written without the per-core lock — only this core
+/// ever writes its own `current_thread`, and cross-core readers (FPU flush,
 /// `coreRunning`) take an inherent snapshot semantics and re-check on
 /// the target.
-pub fn switchTo(ec: *ExecutionContext) void {
+pub fn switchTo(thread: *Thread) void {
     // vCPU dispatch: spec-v3 §[create_vcpu] requires that every time the
-    // vCPU EC becomes runnable (initial creation, reply-induced resume),
+    // vCPU thread becomes runnable (initial creation, reply-induced resume),
     // the kernel re-enters guest mode and on the subsequent guest exit
     // delivers a vm_exit event on its `exit_port`. Real VMX/SVM guest
     // re-entry (loadGuestState → VMLAUNCH/VMRESUME → exit decode) is
@@ -370,19 +370,19 @@ pub fn switchTo(ec: *ExecutionContext) void {
     // observable end-to-end. The vCPU re-suspends on its exit_port via
     // `fireVmExit` (which may rendezvous with a parked VMM receiver and
     // mark it ready) and we keep dispatching. We MUST NOT return here
-    // with `current_ec == null` — the caller (yieldTo / dispatchInterrupt)
+    // with `current_thread == null` — the caller (yieldTo / dispatchInterrupt)
     // would iretq back to whatever interrupted-user RIP sits on the
-    // kernel stack, and that EC has typically already been suspended
+    // kernel stack, and that thread has typically already been suspended
     // (e.g. fault path called fireThreadFault before yieldTo). The next
     // user fault on that stale RIP would re-enter `exceptionHandler`
-    // with `currentEc() == null` and panic on the no-current-EC guard.
-    // Loop instead: pick the next ready EC; if it's another vCPU, fire
-    // its synthetic exit too; eventually we either dispatch a real EC
-    // via `loadEcContextAndReturn` (noreturn) or run dry and fall
-    // through to the empty-queue return path that leaves `current_ec`
+    // with `currentThread() == null` and panic on the no-current-thread guard.
+    // Loop instead: pick the next ready thread; if it's another vCPU, fire
+    // its synthetic exit too; eventually we either dispatch a real thread
+    // via `loadThreadContextAndReturn` (noreturn) or run dry and fall
+    // through to the empty-queue return path that leaves `current_thread`
     // null but is safe because `run()`'s outer `arch.cpu.idle()` and
     // `yieldTo`'s no-next branch are both designed for that.
-    var current = ec;
+    var current = thread;
     while (current.vm != null) {
         const core: u8 = @truncate(arch.smp.coreID());
 
@@ -409,7 +409,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
             // Either way we re-deliver a vm_exit with sub-code
             // `initial_state` so the receiver observes the well-defined
             // not-yet-started condition rather than a synthetic cpuid /
-            // unknown exit. Zero out ec.ctx.regs so the receiver sees a
+            // unknown exit. Zero out thread.ctx.regs so the receiver sees a
             // clean "guest not running" GPR snapshot rather than the
             // prior `consumeReply`'s reply-time values.
             @memset(std.mem.asBytes(&current.ctx.regs), 0);
@@ -421,8 +421,8 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // stygia-8xl: a CANCELLED entry means another core retired this
         // vCPU while it was executing guest code, and the run loop left
         // guest mode to acknowledge that rather than exiting on a guest
-        // event. There is no event to report and no live EC to suspend —
-        // `fireVmExit` would publish a wait episode on a dead EC. Skip it
+        // event. There is no event to report and no live thread to suspend —
+        // `fireVmExit` would publish a wait episode on a dead thread. Skip it
         // and fall straight through to `dischargeOwnedParking`, which is
         // the owner-side eviction the remote retire has been waiting for.
         if (!delivery.cancelled) {
@@ -431,10 +431,10 @@ pub fn switchTo(ec: *ExecutionContext) void {
         arch.cpu.restoreInterrupts(irq);
 
         // `fireVmExit` suspends the vCPU through the normal running
-        // EC lifecycle. Keep `current_ec` naming the vCPU until that
+        // thread lifecycle. Keep `current_thread` naming the vCPU until that
         // call has published `.parking`, then complete the owner-side
         // handoff here on the scheduler's park stack before selecting
-        // another EC. Clearing `current_ec` first makes
+        // another thread. Clearing `current_thread` first makes
         // `suspendOnPort(.running)` reject the event as E_BUSY and
         // strands the VMM's follow-up recv.
         dischargeOwnedParking(core);
@@ -443,14 +443,14 @@ pub fn switchTo(ec: *ExecutionContext) void {
         // VMM receiver, putting it in this core's run queue. Pull it
         // (or anything else ready) and dispatch.
         const next = dequeueOrIdle() orelse {
-            // Empty queue, no idle EC. Returning here unwinds to
+            // Empty queue, no idle thread. Returning here unwinds to
             // run() (→ parkAndAwaitIRQ updates caches) or to yieldTo
             // (→ iretq back to the caller's user mode from the
-            // current kstack). In either case `current_ec` is null
+            // current kstack). In either case `current_thread` is null
             // but the per-core caches (gs:0 kernel_rsp, TSS.RSP0,
-            // gs:32/40/48/56/176 EC-identity slots) still name the
-            // most-recently-dispatched EC's kstack. A peer-core
-            // terminate of that EC can free its kstack at any time
+            // gs:32/40/48/56/176 thread-identity slots) still name the
+            // most-recently-dispatched thread's kstack. A peer-core
+            // terminate of that thread can free its kstack at any time
             // after we drop the run-queue lock — the very next ring-3
             // → ring-0 entry on this core (timer IRQ, syscall, fault)
             // would push its iret frame onto freed memory, surfacing
@@ -476,7 +476,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
             // a running core makes every `enqueueOnCore` targeting it
             // send a wake IPI, and on x86 that vector IS the scheduler
             // vector (`IntVecs.sched` — see `arch.smp.sendWakeIpi`), so
-            // the "wake" preempts an EC that was running fine. That
+            // the "wake" preempts an thread that was running fine. That
             // shows up as latency, e.g. a 5 ms deadline
             // arm-then-observe window closing late.
             (&core_states[core]).idle_parked = false;
@@ -490,20 +490,20 @@ pub fn switchTo(ec: *ExecutionContext) void {
     //
     // Everything from here to the iretq trampoline used to execute on
     // whatever kstack the caller happened to be standing on — usually
-    // the OUTGOING EC's. That is fatal whenever the outgoing EC is
+    // the OUTGOING thread's. That is fatal whenever the outgoing thread is
     // already claimable by another core (recv/futex/suspend published
     // its wait state; a preempt re-enqueued it): the other core
-    // dispatches it, the EC's next kernel entry builds frames from its
+    // dispatches it, the thread's next kernel entry builds frames from its
     // kstack top downward, and both cores stomp each other's live
     // frames on one kstack. Autopsied as core 2's `syscallDispatch`
     // memcpy running away over the kstack guard (Kernel stack overflow
-    // panic) with core 1's switchTo/loadEcContextAndReturn frames
+    // panic) with core 1's switchTo/loadThreadContextAndReturn frames
     // interleaved on the same kstack.
     //
     // Hop to this core's park kstack FIRST, releasing the pending
     // kstack-release stash (if any) at the exact swap instruction, and
     // run the whole dispatch tail there. After the hop, no core ever
-    // executes scheduler machinery on a claimable EC's kstack —
+    // executes scheduler machinery on a claimable thread's kstack —
     // the collision is structurally impossible, independent of wake
     // ordering.
     //
@@ -534,17 +534,17 @@ var hop_release_dummy: u8 = 0;
 /// per-core park kstack; must never return.
 export fn scheduler_dispatch_tail(arg: u64) callconv(.c) noreturn {
     const core: u8 = @truncate(arch.smp.coreID());
-    const current: *ExecutionContext = @ptrFromInt(arg);
+    const current: *Thread = @ptrFromInt(arg);
     dispatchTailBody(core, current);
 }
 
 /// The dispatch tail: everything between the dispatch decision and the
 /// context-load trampoline. Runs on the park kstack (or the boot stack
-/// before `perCoreInit`). noreturn via `loadEcContextAndReturn`.
-fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
+/// before `perCoreInit`). noreturn via `loadThreadContextAndReturn`.
+fn dispatchTailBody(core: u8, current: *Thread) noreturn {
     drainTeardown(core, current);
-    if ((&core_states[core]).current_ec != current) {
-        @panic("scheduler.dispatchTailBody: current_ec changed during teardown drain");
+    if ((&core_states[core]).current_thread != current) {
+        @panic("scheduler.dispatchTailBody: current_thread changed during teardown drain");
     }
     if (lifecycle.load(current) != .running) {
         dischargeOwnedParking(core);
@@ -552,39 +552,39 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
     }
     yield_handoff_preempt_guard[core] = yield_handoff_targets[core] == current;
     yield_handoff_targets[core] = null;
-    // Give the committed EC a fresh quantum at the dispatch boundary.
-    // The old deadline belongs to the outgoing EC; carrying it across a
+    // Give the committed thread a fresh quantum at the dispatch boundary.
+    // The old deadline belongs to the outgoing thread; carrying it across a
     // voluntary targeted yield can let an already-due tick preempt the
     // target before it executes one user instruction, which violates the
     // observable-progress contract of yield(target).
     arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
-    execution_context.recordSpawnTrace(current, null, .dispatch_tail, core);
-    arch.cpu.loadEcContextAndReturn(current);
+    thread_mod.recordSpawnTrace(current, null, .dispatch_tail, core);
+    arch.cpu.loadThreadContextAndReturn(current);
 }
 
 fn dischargeOwnedParking(core: u8) void {
-    const ec = (&core_states[core]).current_ec orelse return;
-    switch (lifecycle.load(ec)) {
-        .parking => switch (ec.wait.kind) {
+    const thread = (&core_states[core]).current_thread orelse return;
+    switch (lifecycle.load(thread)) {
+        .parking => switch (thread.wait.kind) {
             .requeue => {
-                clearCurrentEc(core);
-                enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+                clearCurrentThread(core);
+                enqueueOnCore(pickCoreForAffinity(thread.affinity), thread);
             },
             else => {
-                if (lifecycle.commitParkingWaiting(ec, NOT_IN_RUN_QUEUE)) {
-                    clearCurrentEc(core);
+                if (lifecycle.commitParkingWaiting(thread, NOT_IN_RUN_QUEUE)) {
+                    clearCurrentThread(core);
                 }
             },
         },
         .pended => {
-            lifecycle.waitForPendedPayload(ec);
-            clearCurrentEc(core);
-            enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+            lifecycle.waitForPendedPayload(thread);
+            clearCurrentThread(core);
+            enqueueOnCore(pickCoreForAffinity(thread.affinity), thread);
         },
         .retired => {
-            clearCurrentEc(core);
-            if (ec._gen_lock.currentGen() % 2 == 0 and !stackContains(ec, arch.cpu.currentSp())) {
-                execution_context.finalizeDestroyMarkedDead(ec);
+            clearCurrentThread(core);
+            if (thread._gen_lock.currentGen() % 2 == 0 and !stackContains(thread, arch.cpu.currentSp())) {
+                thread_mod.finalizeDestroyMarkedDead(thread);
             }
         },
         else => {},
@@ -593,31 +593,31 @@ fn dischargeOwnedParking(core: u8) void {
 
 fn drainDeferredRequeuesLocked(core: u8) void {
     const state = &core_states[core];
-    while ((&deferred_requeues[core]).dequeue()) |ec| {
-        if (lifecycle.load(ec) != .parking or ec.wait.kind != .requeue) continue;
-        if (!canPublishReady(ec)) continue;
-        if (!lifecycle.cas(ec, .parking, .ready)) continue;
-        ec.owner_core = NOT_IN_RUN_QUEUE;
-        ec.wait.clear();
-        if (!canPublishReady(ec)) continue;
-        state.run_queue.enqueue(ec);
-        ec.current_queue_core.store(core, .release);
+    while ((&deferred_requeues[core]).dequeue()) |thread| {
+        if (lifecycle.load(thread) != .parking or thread.wait.kind != .requeue) continue;
+        if (!canPublishReady(thread)) continue;
+        if (!lifecycle.cas(thread, .parking, .ready)) continue;
+        thread.owner_core = NOT_IN_RUN_QUEUE;
+        thread.wait.clear();
+        if (!canPublishReady(thread)) continue;
+        state.run_queue.enqueue(thread);
+        thread.current_queue_core.store(core, .release);
     }
 }
 
-pub fn deferLocalRunningRequeue(ec: *ExecutionContext) bool {
+pub fn deferLocalRunningRequeue(thread: *Thread) bool {
     const core: u8 = @truncate(arch.smp.coreID());
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     defer lock.unlockIrqRestore(irq);
 
-    if (!lifecycle.prepareRunningPark(ec, core, .requeue)) return false;
-    (&deferred_requeues[core]).enqueue(ec);
+    if (!lifecycle.prepareRunningPark(thread, core, .requeue)) return false;
+    (&deferred_requeues[core]).enqueue(thread);
     return true;
 }
 
-fn stackContains(ec: *ExecutionContext, sp: u64) bool {
-    return sp >= ec.kernel_stack.base.addr and sp < ec.kernel_stack.top.addr;
+fn stackContains(thread: *Thread, sp: u64) bool {
+    return sp >= thread.kernel_stack.base.addr and sp < thread.kernel_stack.top.addr;
 }
 
 pub fn queueTeardown(core: u8, req: TeardownRequest) bool {
@@ -644,14 +644,14 @@ pub fn queueCurrentTeardown(req: TeardownRequest) void {
     }
 }
 
-pub fn claimOwnTeardownInline(ec: *ExecutionContext) bool {
+pub fn claimOwnTeardownInline(thread: *Thread) bool {
     const core: u8 = @truncate(arch.smp.coreID());
-    if (ec.owner_core != core) return false;
+    if (thread.owner_core != core) return false;
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     defer lock.unlockIrqRestore(irq);
-    if ((&core_states[core]).current_ec == ec) return false;
-    if (stackContains(ec, arch.cpu.currentSp())) return false;
+    if ((&core_states[core]).current_thread == thread) return false;
+    if (stackContains(thread, arch.cpu.currentSp())) return false;
     return true;
 }
 
@@ -669,7 +669,7 @@ fn runDomainTeardown(req: TeardownRequest) void {
     };
     const deferred = stygia.caps.capability_domain.destroyPhase1(
         cd_lr.ptr,
-        req.caller_ec,
+        req.caller_thread,
     );
     arch.cpu.restoreInterrupts(cd_lr.irq_state);
     stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
@@ -679,7 +679,7 @@ fn runDomainTeardown(req: TeardownRequest) void {
     }
 }
 
-pub fn drainTeardown(core: u8, incoming: ?*ExecutionContext) void {
+pub fn drainTeardown(core: u8, incoming: ?*Thread) void {
     while (true) {
         const req = blk: {
             const lock = &core_locks[core];
@@ -687,14 +687,14 @@ pub fn drainTeardown(core: u8, incoming: ?*ExecutionContext) void {
             defer lock.unlockIrqRestore(irq);
             const slot = &(&core_states[core]).teardown_pending;
             const req = slot.* orelse return;
-            if (incoming) |ec| {
-                const dref = ec.domain;
+            if (incoming) |thread| {
+                const dref = thread.domain;
                 // `dispatchTailBody` calls this after committing
-                // `current_ec` but before entering userspace. Phase-2
+                // `current_thread` but before entering userspace. Phase-2
                 // domain teardown deliberately skips the executing
                 // core in `awaitDomainQuiesced`; if this core drained
                 // teardown for `incoming`'s own domain here, it could
-                // retire the EC after scheduler selection and before
+                // retire the thread after scheduler selection and before
                 // the first user instruction. Leave it pending until
                 // the core reaches a null-incoming park/yield drain.
                 if (req.cd.ptr == dref.ptr and req.cd.gen == dref.gen) {
@@ -708,17 +708,17 @@ pub fn drainTeardown(core: u8, incoming: ?*ExecutionContext) void {
     }
 }
 
-/// Voluntary yield — current EC drops back into ready, scheduler
+/// Voluntary yield — current thread drops back into ready, scheduler
 /// picks the next. If `target` is non-null and runnable, it runs next.
-pub fn yieldTo(target: ?*ExecutionContext) void {
-    yieldToTarget(.{ .ec = target });
+pub fn yieldTo(target: ?*Thread) void {
+    yieldToTarget(.{ .thread = target });
 }
 
 /// Voluntary yield to a target whose lifecycle pin is already held by
 /// the caller. Scheduler owns and releases the pin, including paths that
 /// abandon the caller's kernel stack through a park-stack hop.
-pub fn yieldToPinned(target: *ExecutionContext) void {
-    yieldToTarget(.{ .ec = target, .pinned = true });
+pub fn yieldToPinned(target: *Thread) void {
+    yieldToTarget(.{ .thread = target, .pinned = true });
 }
 
 fn yieldToTarget(initial_target: YieldTarget) void {
@@ -728,14 +728,14 @@ fn yieldToTarget(initial_target: YieldTarget) void {
     const lock = &core_locks[core];
 
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). A null `current_ec` here means
-    // this frame has no EC to be re-enqueued under, so if we go on to
-    // `switchTo` some other EC the C stack we are standing on is
+    // TEMP DIAGNOSTIC (stygia-afo, REMOVE). A null `current_thread` here means
+    // this frame has no thread to be re-enqueued under, so if we go on to
+    // `switchTo` some other thread the C stack we are standing on is
     // ABANDONED — nothing will ever resume it. That is the exact
     // mechanism blamed for the leaked domain teardowns; count the events
     // instead of inferring them from a counter gap.
-    const disowned_at_entry = state.current_ec == null;
-    if (state.current_ec) |cur| {
+    const disowned_at_entry = state.current_thread == null;
+    if (state.current_thread) |cur| {
         switch (lifecycle.load(cur)) {
             .running => {
                 if (lifecycle.prepareRunningPark(cur, core, .requeue)) {
@@ -761,7 +761,7 @@ fn yieldToTarget(initial_target: YieldTarget) void {
         // `switchTo` is normally `noreturn` (the park-kstack hop into
         // `scheduler_dispatch_tail`), but for a vCPU target the vCPU
         // pre-loop can RETURN when the synthetic vm_exit fires and the
-        // subsequent `dequeueOrIdle` runs dry. `current_ec` is null in
+        // subsequent `dequeueOrIdle` runs dry. `current_thread` is null in
         // that case and the caller's iretq path handles it (the
         // affinity-migration arm above never reaches here — it escapes
         // via the hop before selecting `next`).
@@ -773,7 +773,7 @@ fn yieldToTarget(initial_target: YieldTarget) void {
         return;
     }
 
-    if ((&core_states[core]).current_ec != null) {
+    if ((&core_states[core]).current_thread != null) {
         escapeToRun();
     }
 
@@ -783,21 +783,21 @@ fn yieldToTarget(initial_target: YieldTarget) void {
 }
 
 /// Preemption tick — invoked from the per-core timer interrupt when
-/// the current EC's quantum expires. Re-enqueues current and dispatches.
+/// the current thread's quantum expires. Re-enqueues current and dispatches.
 pub fn preempt() void {
     yieldTo(null);
 }
 
 /// Main scheduler loop entry — called from `kMain` (BSP) and
 /// `arch.x64.smp.coreInit` (APs) once their per-core state is ready.
-/// Picks the highest-priority ready EC (or falls back to per-core idle
-/// EC when set, otherwise `sti+hlt` until an IPI arrives), and
+/// Picks the highest-priority ready thread (or falls back to per-core idle
+/// thread when set, otherwise `sti+hlt` until an IPI arrives), and
 /// dispatches; never returns.
 /// Shared exit for `yieldTo`'s noreturn escapes into `run()`. The
 /// escapes abandon the caller's IRQ epilogue, so on x86 the in-service
 /// sched vector (0xFE) must be EOI'd first: it outranks both the wake
 /// IPI and tlb_shootdown vectors, so a core that parks with it still
-/// in service goes deaf to cross-core wakes (stranded-RDY-EC hangs)
+/// in service goes deaf to cross-core wakes (stranded-RDY-thread hangs)
 /// and shootdown IPIs (initiator spins forever on the missing ack).
 /// Safe from syscall-context callers too — LAPIC EOI with an empty ISR
 /// is a no-op. aarch64 EOIs before dispatching the handler (early-EOI),
@@ -814,7 +814,7 @@ fn hopParkYield(target: YieldTarget) noreturn {
     if (park_top == 0) {
         dischargeOwnedParking(core);
         var local_target = target;
-        const incoming = local_target.ec;
+        const incoming = local_target.thread;
         drainTeardown(core, incoming);
         if (dequeueYieldTarget(core, &local_target)) |next| switchTo(next);
         run();
@@ -831,14 +831,14 @@ export fn scheduler_hop_yield(arg: u64) callconv(.c) noreturn {
     const core: u8 = @truncate(arch.smp.coreID());
     var target = YieldTarget.decodeFromHop(arg);
     dischargeOwnedParking(core);
-    drainTeardown(core, target.ec);
+    drainTeardown(core, target.thread);
     if (dequeueYieldTarget(core, &target)) |next| switchTo(next);
     run();
 }
 
 /// Abandon the current kernel stack for this core's park kstack and
 /// enter `run()` there. The landing pad completes any owned
-/// `parking`/`pended` episode after the hop, when the EC's stack is no
+/// `parking`/`pended` episode after the hop, when the thread's stack is no
 /// longer live on this core.
 ///
 /// Boot fallback: before `perCoreInit` allocates the park stacks
@@ -871,17 +871,17 @@ pub fn run() noreturn {
         if (dequeueOrIdle()) |next| {
             switchTo(next);
         }
-        // Run queue empty and no idle_ec set up. Park this core on its
+        // Run queue empty and no idle_thread set up. Park this core on its
         // dedicated park kstack and sti+hlt until an IRQ wakes us.
         // `parkAndAwaitIRQ` swaps rsp / gs:0 / TSS.RSP0 / per-core
         // caches to park-state and tail-jumps back into `run()` on
         // wake — the outer call frame on the previously-dispatched
-        // EC's kstack is abandoned. This eliminates the cross-core
+        // thread's kstack is abandoned. This eliminates the cross-core
         // kstack-sharing bug where multiple idle cores held stale
-        // gs:0 pointing at the same suspended EC's kstack and
+        // gs:0 pointing at the same suspended thread's kstack and
         // concurrently pushed IRQ frames onto it from kernel mode,
         // silently stomping each other's saved state and surfacing
-        // as iretq #GP or NO-EC PF when the corrupted iret slot was
+        // as iretq #GP or NO-thread PF when the corrupted iret slot was
         // later popped.
         parkAndAwaitIRQ();
     }
@@ -889,7 +889,7 @@ pub fn run() noreturn {
 
 /// Park this core on its per-core park kstack and idle until an IRQ
 /// arrives. Updates the per-core caches (gs:0/32/40/48/56/176, TSS.RSP0,
-/// PerCore.current_ec) to "no EC dispatched" state, swaps rsp to the
+/// PerCore.current_thread) to "no thread dispatched" state, swaps rsp to the
 /// park kstack top, then sti+hlt. On IRQ-driven wake jumps back into
 /// `run()` via the exported entry symbol — the original caller's call
 /// frame is abandoned. See `PerCore.park_stack`.
@@ -897,7 +897,7 @@ pub fn run() noreturn {
 /// Returns early WITHOUT parking when a peer race-enqueued work between
 /// `run()`'s queue check and our lock-protected re-check of the same
 /// queue (see "lost-wake race" below). Caller (`run()`) loops and
-/// re-runs `dequeueOrIdle`, which now sees the raced-in EC and
+/// re-runs `dequeueOrIdle`, which now sees the raced-in thread and
 /// dispatches it via the normal path. Hence `void` rather than
 /// `noreturn`.
 fn parkAndAwaitIRQ() void {
@@ -911,26 +911,26 @@ fn parkAndAwaitIRQ() void {
     //
     // Without the lock-protected re-check below, this sequence loses a
     // wakeup at smp=4 once per ~5-10 reps on terminate/affinity/yield
-    // batches. The original signature is "core 0 has 2 RDY ECs in its
-    // run_queue, current_ec=null, all 4 cores parked" with no further
+    // batches. The original signature is "core 0 has 2 RDY Threads in its
+    // run_queue, current_thread=null, all 4 cores parked" with no further
     // LAPIC ticks for the rest of the run.
     //
     //   T0: this core's `dequeueOrIdle()` returned null (lock taken+dropped).
-    //   T1: peer P calls `enqueueOnCore(this_core, ec)`:
+    //   T1: peer P calls `enqueueOnCore(this_core, thread)`:
     //         - takes core_locks[this_core]
-    //         - run_queue.enqueue(ec)
-    //         - reads `current_ec` slot — STILL the stale prev_ref
+    //         - run_queue.enqueue(thread)
+    //         - reads `current_thread` slot — STILL the stale prev_ref
     //           (this core hasn't published null yet)
     //         - drops the lock
     //         - sees `target_current_ptr != null` → "busy" branch
-    //         - if `ec.priority <= prev.priority` → no IPI sent
-    //   T2: this core writes `current_ec = null` (no lock)
+    //         - if `thread.priority <= prev.priority` → no IPI sent
+    //   T2: this core writes `current_thread = null` (no lock)
     //   T3: this core sti+hlt — never wakes because no IPI is coming
     //       and no prior caller re-armed our LAPIC for a near-future
     //       fire (the peer's enqueue path doesn't re-arm; only our
     //       own schedTimerHandler does, and we're parked).
     //
-    // The fix: publish `current_ec = null` UNDER core_locks[this_core]
+    // The fix: publish `current_thread = null` UNDER core_locks[this_core]
     // and re-check the run queue in the same critical section. If a
     // peer raced an enqueue in, signal "abandon park" to the caller
     // (`run()`) by returning early; the caller's loop re-runs
@@ -945,25 +945,25 @@ fn parkAndAwaitIRQ() void {
     // pad anyway, so any zombie posted between the pre-park drain and
     // the lock acquire below gets reaped on the next wake — what
     // matters at THIS instant is that the run-queue check and the
-    // current_ec-null publish are atomic.
+    // current_thread-null publish are atomic.
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     // Use `dequeueOrIdleLocked` rather than a raw `isEmpty` check: the
-    // queue may contain `.exited` ECs that yieldTo's race-prone re-enqueue
+    // queue may contain `.exited` Threads that yieldTo's race-prone re-enqueue
     // window dropped in (a yieldTo that read `state == .running` from a
-    // racing terminate's pre-flip can re-enqueue an EC after the second
+    // racing terminate's pre-flip can re-enqueue an thread after the second
     // sweep, leaving it dangling). dequeue filters those — if we bailed on
     // a queue containing only stale entries, `run()` would loop right back
     // through dequeueOrIdle, see only filterable junk, and re-park,
     // burning CPU on a tight cycle until the queue is cleaned out.
     if (dequeueOrIdleLocked(core)) |raced_in| {
-        // Peer race: an EC landed in our queue between `run()`'s
+        // Peer race: an thread landed in our queue between `run()`'s
         // `dequeueOrIdle()` and now. Bail park, dispatch directly under
         lock.unlockIrqRestore(irq);
         switchTo(raced_in);
-        // switchTo is conventionally noreturn (loadEcContextAndReturn);
+        // switchTo is conventionally noreturn (loadThreadContextAndReturn);
         // it can return only via the vCPU-loop empty-queue exit, in
-        // which case current_ec is null and the per-core caches are
+        // which case current_thread is null and the per-core caches are
         // already in the parked-stack state. Returning to our caller
         // (`run()`) then re-runs the queue check; if still empty the
         // next iteration calls back into us with a clean state.
@@ -975,7 +975,7 @@ fn parkAndAwaitIRQ() void {
     // unreferenced; the outer noreturn semantics make abandonment
     // safe.
     arch.cpu.parkPerCoreCaches(core, park_top);
-    (&core_states[core]).current_ec = null;
+    (&core_states[core]).current_thread = null;
     // Drop the lock but deliberately do NOT restore the caller's IRQ
     // state — everything from here to `arch.cpu.parkAndAwaitIRQ` is a
     // straight line into a noreturn primitive that requires IRQs MASKED
@@ -991,7 +991,7 @@ fn parkAndAwaitIRQ() void {
     // (and the x86 #GP-on-`hlt` and port-IO paths do the same). Restoring
     // there reopens the exact lost-wake hole the masked-park idiom
     // closes: a wake IPI delivered between here and the halt is taken,
-    // EOI'd and CONSUMED, after which the halt sleeps with `ec` sitting
+    // EOI'd and CONSUMED, after which the halt sleeps with `thread` sitting
     // `.ready` in this core's queue and nothing left to poke us.
     //
     // Discarding the saved state is sound precisely because this path
@@ -1022,7 +1022,7 @@ fn parkAndAwaitIRQ() void {
     // periodic wake source at all and exactly one stale wake decision
     // in enqueueOnCore strands its run queue forever. Measured on the
     // .106 KVM reproducer as the persistent affinity_05/06 +
-    // create_execution_context_14 MISS: pass 1 parks cores 1..3 with
+    // create_thread_14 MISS: pass 1 parks cores 1..3 with
     // silenced timers, and the first pinned enqueue that reads a stale
     // busy/parked snapshot never gets a second chance. With the
     // heartbeat, a missed wake costs one timeslice instead of the run.
@@ -1041,32 +1041,32 @@ export fn scheduler_run_after_park() callconv(.c) noreturn {
     run();
 }
 
-/// Internal helper — dequeues the highest-priority EC, or returns the
-/// per-core idle EC if the queue is empty. Returns null when both are
+/// Internal helper — dequeues the highest-priority thread, or returns the
+/// per-core idle thread if the queue is empty. Returns null when both are
 /// empty (caller drops to `sti+hlt` and waits for a wake IPI).
-/// True while `ec`'s domain SlabRef still names the CD slot's live
+/// True while `thread`'s domain SlabRef still names the CD slot's live
 /// gen. Turns false the instant `destroyPhase1` dead-marks the CD —
 /// i.e. it covers the phase1→phase2 teardown gap in which the
-/// domain's ECs are themselves still gen-live and `.ready` but their
+/// domain's Threads are themselves still gen-live and `.ready` but their
 /// domain (and imminently its translation root) is being destroyed.
-/// Every dispatch-commitment site must refuse such ECs BEFORE the
+/// Every dispatch-commitment site must refuse such Threads BEFORE the
 /// `switchTo` domain deref; see the stygia-rs6 CR3=0 corpse notes at
 /// the dequeue filter.
-inline fn domainRefAlive(ec: *ExecutionContext) bool {
-    const dref = ec.domain;
+inline fn domainRefAlive(thread: *Thread) bool {
+    const dref = thread.domain;
     return dref.ptr._gen_lock.currentGen() == @as(u64, dref.gen);
 }
 
-inline fn canPublishReady(ec: *ExecutionContext) bool {
-    return ec._gen_lock.currentGen() % 2 == 1 and !lifecycle.isDestroyMarked(ec) and domainRefAlive(ec);
+inline fn canPublishReady(thread: *Thread) bool {
+    return thread._gen_lock.currentGen() % 2 == 1 and !lifecycle.isDestroyMarked(thread) and domainRefAlive(thread);
 }
 
-fn diagTag(ec: *ExecutionContext) u64 {
-    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
-    return ec.domain.ptr.diag_test_tag;
+fn diagTag(thread: *Thread) u64 {
+    if (thread.diag_test_tag != 0) return thread.diag_test_tag;
+    return thread.domain.ptr.diag_test_tag;
 }
 
-fn logYieldSelectDiag(core: u8, target: *ExecutionContext, reason: []const u8, publishable: bool) void {
+fn logYieldSelectDiag(core: u8, target: *Thread, reason: []const u8, publishable: bool) void {
     if (!build_options.kernel_spawn_diag) return;
     const n = @atomicRmw(u32, &yield_select_diag_prints, .Add, 1, .monotonic);
     if (n >= YIELD_SELECT_DIAG_BUDGET) return;
@@ -1089,7 +1089,7 @@ fn logYieldSelectDiag(core: u8, target: *ExecutionContext, reason: []const u8, p
     );
 }
 
-fn dequeueOrIdle() ?*ExecutionContext {
+fn dequeueOrIdle() ?*Thread {
     const core: u8 = @truncate(arch.smp.coreID());
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
@@ -1100,72 +1100,72 @@ fn dequeueOrIdle() ?*ExecutionContext {
 
 /// Lock-held variant of `dequeueOrIdle` — caller must hold
 /// `core_locks[core]` with IRQs masked.
-fn dequeueOrIdleLocked(core: u8) ?*ExecutionContext {
+fn dequeueOrIdleLocked(core: u8) ?*Thread {
     const state = &core_states[core];
     drainDeferredRequeuesLocked(core);
-    if (dequeueLocalReadyLocked(core)) |ec| return ec;
-    if (tryStealReadyLocked(core)) |ec| return ec;
+    if (dequeueLocalReadyLocked(core)) |thread| return thread;
+    if (tryStealReadyLocked(core)) |thread| return thread;
     // Nothing to run: the caller parks this core. Publish that decision
     // under `core_locks[core]` so a concurrent `enqueueOnCore` knows to
-    // send the wake IPI even though `current_ec` has not been cleared
+    // send the wake IPI even though `current_thread` has not been cleared
     // yet. See `PerCore.idle_parked`.
     state.idle_parked = true;
     return null;
 }
 
-fn dequeueLocalReadyLocked(core: u8) ?*ExecutionContext {
+fn dequeueLocalReadyLocked(core: u8) ?*Thread {
     const state = &core_states[core];
     yield_handoff_targets[core] = null;
-    while (state.run_queue.dequeue()) |ec| {
-        // Clear queue residency on every popped EC, regardless of
+    while (state.run_queue.dequeue()) |thread| {
+        // Clear queue residency on every popped thread, regardless of
         // whether we end up dispatching it or skipping it as stale —
         // either way it is no longer linked into any run queue.
         // Performed under `core_locks[core]` so a concurrent
         // `removeFromQueue` reader that observed a stale `core`
         // residency hint and is now waiting on this lock will see the
         // cleared sentinel after acquiring.
-        ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
-        if (!canPublishReady(ec)) {
-            execution_context.recordSpawnTrace(ec, null, .dequeue_skip_not_publishable, core);
+        thread.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+        if (!canPublishReady(thread)) {
+            thread_mod.recordSpawnTrace(thread, null, .dequeue_skip_not_publishable, core);
             continue;
         }
-        if (!lifecycle.prepareDispatchLocked(ec, core, NOT_IN_RUN_QUEUE)) continue;
-        setCurrentEc(core, ec);
+        if (!lifecycle.prepareDispatchLocked(thread, core, NOT_IN_RUN_QUEUE)) continue;
+        setCurrentThread(core, thread);
         state.idle_parked = false;
-        execution_context.recordSpawnTrace(ec, null, .dequeue_select, core);
-        return ec;
+        thread_mod.recordSpawnTrace(thread, null, .dequeue_select, core);
+        return thread;
     }
     return null;
 }
 
-fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*ExecutionContext {
+fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*Thread {
     const state = &core_states[victim];
     var idx: usize = state.run_queue.levels.len;
     while (idx > 0) {
         idx -= 1;
         var cur = state.run_queue.levels[idx].head;
-        while (cur) |ec| {
-            cur = ec.next;
-            if (!affinityAdmitsCore(ec.affinity, thief)) continue;
-            if (!canPublishReady(ec)) continue;
-            if (ec.owner_core != NOT_IN_RUN_QUEUE) continue;
-            if (lifecycle.load(ec) != .ready) continue;
+        while (cur) |thread| {
+            cur = thread.next;
+            if (!affinityAdmitsCore(thread.affinity, thief)) continue;
+            if (!canPublishReady(thread)) continue;
+            if (thread.owner_core != NOT_IN_RUN_QUEUE) continue;
+            if (lifecycle.load(thread) != .ready) continue;
 
-            const queue_core = ec.current_queue_core.load(.acquire);
+            const queue_core = thread.current_queue_core.load(.acquire);
             if (queue_core != victim and queue_core != NOT_IN_RUN_QUEUE) continue;
-            if (!runQueueContains(&state.run_queue, ec)) continue;
-            if (!lifecycle.beginReadyClaimPinned(ec)) continue;
+            if (!runQueueContains(&state.run_queue, thread)) continue;
+            if (!lifecycle.beginReadyClaimPinned(thread)) continue;
 
-            const removed = state.run_queue.remove(ec);
+            const removed = state.run_queue.remove(thread);
             std.debug.assert(removed);
-            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
-            return ec;
+            thread.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+            return thread;
         }
     }
     return null;
 }
 
-fn stealFromVictimsUnlocked(thief: u8) ?*ExecutionContext {
+fn stealFromVictimsUnlocked(thief: u8) ?*Thread {
     if (!WORK_STEALING_ENABLED) return null;
 
     const core_count_u64 = @min(arch.smp.coreCount(), @as(u64, MAX_CORES));
@@ -1188,9 +1188,9 @@ fn stealFromVictimsUnlocked(thief: u8) ?*ExecutionContext {
 
         checked += 1;
         const next_victim = (victim + 1) % core_count;
-        if (stolen) |ec| {
+        if (stolen) |thread| {
             steal_victim_cursors[thief] = @intCast(next_victim);
-            return ec;
+            return thread;
         }
         victim = next_victim;
     }
@@ -1199,33 +1199,33 @@ fn stealFromVictimsUnlocked(thief: u8) ?*ExecutionContext {
     return null;
 }
 
-fn abandonStolenReadyUnlocked(ec: *ExecutionContext) void {
-    if (!canPublishReady(ec)) {
-        execution_context.dischargeClaimedHolderDead(ec);
+fn abandonStolenReadyUnlocked(thread: *Thread) void {
+    if (!canPublishReady(thread)) {
+        thread_mod.dischargeClaimedHolderDead(thread);
         return;
     }
-    switch (enqueuePinnedClaimed(ec)) {
+    switch (enqueuePinnedClaimed(thread)) {
         .published, .not_claimed => {},
         .not_publishable, .claimed_unpublishable => {
-            execution_context.dischargeClaimedHolderDead(ec);
+            thread_mod.dischargeClaimedHolderDead(thread);
             return;
         },
     }
-    lifecycle.releasePin(ec);
+    lifecycle.releasePin(thread);
 }
 
-fn commitStolenDispatchLocked(core: u8, ec: *ExecutionContext) bool {
-    if (!canPublishReady(ec)) return false;
-    if (!lifecycle.finishClaimedDispatch(ec, core, NOT_IN_RUN_QUEUE)) return false;
-    setCurrentEc(core, ec);
+fn commitStolenDispatchLocked(core: u8, thread: *Thread) bool {
+    if (!canPublishReady(thread)) return false;
+    if (!lifecycle.finishClaimedDispatch(thread, core, NOT_IN_RUN_QUEUE)) return false;
+    setCurrentThread(core, thread);
     yield_handoff_targets[core] = null;
     (&core_states[core]).idle_parked = false;
-    lifecycle.releasePin(ec);
-    execution_context.recordSpawnTrace(ec, null, .dequeue_select, core);
+    lifecycle.releasePin(thread);
+    thread_mod.recordSpawnTrace(thread, null, .dequeue_select, core);
     return true;
 }
 
-fn tryStealReadyLocked(core: u8) ?*ExecutionContext {
+fn tryStealReadyLocked(core: u8) ?*Thread {
     if (!WORK_STEALING_ENABLED) return null;
 
     const thief_lock = &core_locks[core];
@@ -1233,17 +1233,17 @@ fn tryStealReadyLocked(core: u8) ?*ExecutionContext {
     const stolen = stealFromVictimsUnlocked(core);
     const thief_irq = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
 
-    const ec = stolen orelse return null;
+    const thread = stolen orelse return null;
     if (dequeueLocalReadyLocked(core)) |local| {
         thief_lock.unlockIrqRestore(thief_irq);
-        abandonStolenReadyUnlocked(ec);
+        abandonStolenReadyUnlocked(thread);
         _ = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
         return local;
     }
-    if (commitStolenDispatchLocked(core, ec)) return ec;
+    if (commitStolenDispatchLocked(core, thread)) return thread;
 
     thief_lock.unlockIrqRestore(thief_irq);
-    abandonStolenReadyUnlocked(ec);
+    abandonStolenReadyUnlocked(thread);
     _ = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     return null;
 }
@@ -1252,16 +1252,16 @@ fn affinityAdmitsCore(affinity: u64, core: u8) bool {
     return affinity == 0 or (core < 64 and (affinity & (@as(u64, 1) << @truncate(core))) != 0);
 }
 
-fn dequeueYieldTarget(core: u8, target: *YieldTarget) ?*ExecutionContext {
+fn dequeueYieldTarget(core: u8, target: *YieldTarget) ?*Thread {
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
     defer lock.unlockIrqRestore(irq);
     return dequeueYieldTargetLocked(core, target);
 }
 
-fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*ExecutionContext {
+fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*Thread {
     const state = &core_states[core];
-    if (target.ec) |t| {
+    if (target.thread) |t| {
         defer target.release();
 
         // `domainRefAlive`: same dying-domain dispatch gate as the
@@ -1284,7 +1284,7 @@ fn dequeueYieldTargetLocked(core: u8, target: *YieldTarget) ?*ExecutionContext {
             }
             if (lifecycle.prepareDispatchLocked(t, core, NOT_IN_RUN_QUEUE)) {
                 logYieldSelectDiag(core, t, "selected", true);
-                setCurrentEc(core, t);
+                setCurrentThread(core, t);
                 yield_handoff_targets[core] = t;
                 state.idle_parked = false;
                 return t;
@@ -1304,38 +1304,38 @@ const EnqueuePinnedResult = enum {
     claimed_unpublishable,
 };
 
-fn finishEnqueuePublish(core: u8, ec: *ExecutionContext, irq: u64) void {
+fn finishEnqueuePublish(core: u8, thread: *Thread, irq: u64) void {
     const lock = &core_locks[core];
-    (&core_states[core]).run_queue.enqueue(ec);
+    (&core_states[core]).run_queue.enqueue(thread);
     // Publish queue residency under the target core's lock so a
-    // racing `removeFromQueue(ec)` from a third core can target the
+    // racing `removeFromQueue(thread)` from a third core can target the
     // right lock instead of sweeping all 64. `.release` pairs with
     // the `.acquire` load in `removeFromQueue`.
-    ec.current_queue_core.store(core, .release);
-    // Snapshot the target's current EC before deciding whether to
-    // wake / preempt. Reading the remote core's `current_ec` is a racy
+    thread.current_queue_core.store(core, .release);
+    // Snapshot the target's current thread before deciding whether to
+    // wake / preempt. Reading the remote core's `current_thread` is a racy
     // hint — the worst case if it changes after we decide is a spurious
     // wake or a missed preempt that the next preempt tick covers.
     // caller-pinned: read-only snapshot of the target core's
-    // `current_ec` for the wake/preempt decision. Worst-case stale ptr
+    // `current_thread` for the wake/preempt decision. Worst-case stale ptr
     // just costs a spurious IPI; any real deref is gated below. Now a
     // single tear-free word — under the old `?SlabRef` layout a torn
     // read could yield a NON-NULL optional wrapping a ZERO pointer,
     // which reads as "target is busy" and silently suppresses the wake
-    // IPI (see `PerCore.current_ec`).
-    const target_current_ptr: ?*ExecutionContext = (&core_states[core]).current_ec;
+    // IPI (see `PerCore.current_thread`).
+    const target_current_ptr: ?*Thread = (&core_states[core]).current_thread;
     // Read the target's parking decision under the SAME lock that just
-    // published `ec` into its queue. `current_ec` alone is not enough:
+    // published `thread` into its queue. `current_thread` alone is not enough:
     // a core that has already committed to parking still names its last
-    // EC there until after it drops this lock, and treating that as
-    // "busy, it will pick `ec` up later" strands `ec` on a core that
+    // thread there until after it drops this lock, and treating that as
+    // "busy, it will pick `thread` up later" strands `thread` on a core that
     // never wakes. See `PerCore.idle_parked`.
     const target_parked = (&core_states[core]).idle_parked;
     const publish_aux: u64 =
         @as(u64, core) |
         (if (target_current_ptr != null) @as(u64, 1) << 8 else 0) |
         (if (target_parked) @as(u64, 1) << 9 else 0);
-    execution_context.recordSpawnTrace(ec, null, .enqueue_publish, publish_aux);
+    thread_mod.recordSpawnTrace(thread, null, .enqueue_publish, publish_aux);
     lock.unlockIrqRestore(irq);
 
     const self_core: u8 = @truncate(arch.smp.coreID());
@@ -1343,14 +1343,14 @@ fn finishEnqueuePublish(core: u8, ec: *ExecutionContext, irq: u64) void {
     // Wake and preempt are independent decisions; evaluate both.
     //
     // Wake: the target is idle, or has committed to parking and is
-    // merely still carrying a stale `current_ec`. Either way the only
+    // merely still carrying a stale `current_thread`. Either way the only
     // thing that will make it look at its queue again is a wake.
     //
     // Local self-wake is unnecessary — the caller is running, not
     // halted. That holds for the parked case too: an IRQ handler that
     // wakes a core out of its park (timer tick → `expireTimedWaiters`,
     // futex wake with affinity 0) runs on that core and returns through
-    // the park loop, which re-runs `dequeueOrIdle` and finds `ec`.
+    // the park loop, which re-runs `dequeueOrIdle` and finds `thread`.
     if (target_current_ptr == null or target_parked) {
         if (core != self_core) arch.smp.sendWakeIpi(core);
     }
@@ -1361,167 +1361,167 @@ fn finishEnqueuePublish(core: u8, ec: *ExecutionContext, irq: u64) void {
     // leaving `idle_parked` stale-true while it is genuinely busy.
     // Folding the preempt into the wake's `else` would swallow the
     // priority decision in exactly that case and delay a higher-
-    // priority EC by up to a full quantum. A wake IPI to a running core
+    // priority thread by up to a full quantum. A wake IPI to a running core
     // does not reschedule; only the scheduler IPI does.
     //
     // caller-pinned: snapshot ptr; race-tolerant priority compare.
     const cur = target_current_ptr orelse return;
-    if (@intFromEnum(ec.priority) <= @intFromEnum(cur.priority)) return;
+    if (@intFromEnum(thread.priority) <= @intFromEnum(cur.priority)) return;
 
     // Same-core higher-pri: send a LAPIC self-IPI (deferred until the
     // caller exits the current critical section / IRQ handler and IF=1
     // is restored). We can't inline-yield here because callers like
     // `futex.wake` hold a bucket spinlock across `enqueueOnCore`, and
-    // a context-switch via `loadEcContextAndReturn` would strand it.
+    // a context-switch via `loadThreadContextAndReturn` would strand it.
     //
     // Cross-core higher-pri: same scheduler IPI. The receiver runs
     // `preempt()` which re-evaluates the queue and switches.
     arch.smp.triggerSchedulerInterrupt(core);
 }
 
-fn enqueueClaimedOnCorePinned(core: u8, ec: *ExecutionContext) EnqueuePinnedResult {
+fn enqueueClaimedOnCorePinned(core: u8, thread: *Thread) EnqueuePinnedResult {
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
 
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+    if (!canPublishReady(thread)) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_not_publishable, core);
         lock.unlockIrqRestore(irq);
         return .not_publishable;
     }
-    if (lifecycle.load(ec) != .claimed) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(ec)));
+    if (lifecycle.load(thread) != .claimed) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(thread)));
         lock.unlockIrqRestore(irq);
         return .not_claimed;
     }
-    if (!lifecycle.finishClaimedReady(ec, NOT_IN_RUN_QUEUE)) {
+    if (!lifecycle.finishClaimedReady(thread, NOT_IN_RUN_QUEUE)) {
         lock.unlockIrqRestore(irq);
         return .not_claimed;
     }
 
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
-        std.debug.assert(ec.current_queue_core.load(.acquire) == NOT_IN_RUN_QUEUE);
-        std.debug.assert(lifecycle.cas(ec, .ready, .claimed));
+    if (!canPublishReady(thread)) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_not_publishable, core);
+        std.debug.assert(thread.current_queue_core.load(.acquire) == NOT_IN_RUN_QUEUE);
+        std.debug.assert(lifecycle.cas(thread, .ready, .claimed));
         lock.unlockIrqRestore(irq);
         return .claimed_unpublishable;
     }
 
-    finishEnqueuePublish(core, ec, irq);
+    finishEnqueuePublish(core, thread, irq);
     return .published;
 }
 
-fn enqueuePinnedClaimed(ec: *ExecutionContext) EnqueuePinnedResult {
-    return enqueueClaimedOnCorePinned(pickCoreForAffinity(ec.affinity), ec);
+fn enqueuePinnedClaimed(thread: *Thread) EnqueuePinnedResult {
+    return enqueueClaimedOnCorePinned(pickCoreForAffinity(thread.affinity), thread);
 }
 
-/// Enqueue `ec` on `core`'s run queue. Used by recv → ready transitions,
+/// Enqueue `thread` on `core`'s run queue. Used by recv → ready transitions,
 /// futex wake, timer fires, and the boot path.
 ///
 /// Wake / preempt policy after queueing:
-///   - target idle (no `current_ec`) or parking (`idle_parked`, set
+///   - target idle (no `current_thread`) or parking (`idle_parked`, set
 ///     under this same lock) and target != self: send wake IPI so the
 ///     parked `hlt`/`wfi` exits and `run` re-runs `dequeueOrIdle`.
-///   - target current EC outranks `ec`: nothing to do — `ec` waits its
+///   - target current thread outranks `thread`: nothing to do — `thread` waits its
 ///     turn. Only sound because `idle_parked` was checked first: a
-///     target that has committed to parking still names its last EC in
-///     `current_ec`, and trusting that alone strands `ec` forever.
-///   - `ec` outranks target's current EC: send a scheduler IPI to the
+///     target that has committed to parking still names its last thread in
+///     `current_thread`, and trusting that alone strands `thread` forever.
+///   - `thread` outranks target's current thread: send a scheduler IPI to the
 ///     target. Self-IPI (when target == self) is LAPIC-ICR-based, so
 ///     it's IF-gated and fires once the caller exits its current IRQ /
 ///     spinlock-held window. We deliberately do NOT inline-yield: many
 ///     callers (e.g. `futex.wake`) hold a bucket lock across this call,
-///     and a context-switch via `loadEcContextAndReturn` would strand
+///     and a context-switch via `loadThreadContextAndReturn` would strand
 ///     it.
-pub fn enqueueOnCore(core: u8, ec: *ExecutionContext) void {
-    execution_context.recordSpawnTrace(ec, null, .enqueue_attempt, core);
-    if (!lifecycle.tryPinLive(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_live, core);
+pub fn enqueueOnCore(core: u8, thread: *Thread) void {
+    thread_mod.recordSpawnTrace(thread, null, .enqueue_attempt, core);
+    if (!lifecycle.tryPinLive(thread)) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_not_live, core);
         return;
     }
-    defer lifecycle.releasePin(ec);
+    defer lifecycle.releasePin(thread);
 
     const lock = &core_locks[core];
     const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
 
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+    if (!canPublishReady(thread)) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_not_publishable, core);
         lock.unlockIrqRestore(irq);
         return;
     }
-    switch (lifecycle.load(ec)) {
+    switch (lifecycle.load(thread)) {
         .ready => {},
         .claimed => {
-            if (!lifecycle.finishClaimedReady(ec, NOT_IN_RUN_QUEUE)) {
+            if (!lifecycle.finishClaimedReady(thread, NOT_IN_RUN_QUEUE)) {
                 lock.unlockIrqRestore(irq);
                 return;
             }
         },
         .pended => {
-            if (!lifecycle.finishPendedReady(ec, NOT_IN_RUN_QUEUE)) {
+            if (!lifecycle.finishPendedReady(thread, NOT_IN_RUN_QUEUE)) {
                 lock.unlockIrqRestore(irq);
                 return;
             }
         },
         .parking => {
-            if (ec.wait.kind != .requeue or !lifecycle.cas(ec, .parking, .ready)) {
+            if (thread.wait.kind != .requeue or !lifecycle.cas(thread, .parking, .ready)) {
                 lock.unlockIrqRestore(irq);
                 return;
             }
-            ec.owner_core = NOT_IN_RUN_QUEUE;
-            ec.wait.clear();
+            thread.owner_core = NOT_IN_RUN_QUEUE;
+            thread.wait.clear();
         },
         else => {
-            execution_context.recordSpawnTrace(ec, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(ec)));
+            thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_state, @intFromEnum(lifecycle.load(thread)));
             lock.unlockIrqRestore(irq);
             return;
         },
     }
 
-    if (!canPublishReady(ec)) {
-        execution_context.recordSpawnTrace(ec, null, .enqueue_skip_not_publishable, core);
+    if (!canPublishReady(thread)) {
+        thread_mod.recordSpawnTrace(thread, null, .enqueue_skip_not_publishable, core);
         lock.unlockIrqRestore(irq);
         return;
     }
 
-    finishEnqueuePublish(core, ec, irq);
+    finishEnqueuePublish(core, thread, irq);
 }
 
-/// Enqueue `ec` on the kernel's choice of core, honoring `ec.affinity`.
-pub fn enqueue(ec: *ExecutionContext) void {
-    enqueueOnCore(pickCoreForAffinity(ec.affinity), ec);
+/// Enqueue `thread` on the kernel's choice of core, honoring `thread.affinity`.
+pub fn enqueue(thread: *Thread) void {
+    enqueueOnCore(pickCoreForAffinity(thread.affinity), thread);
 }
 
-/// Remove `ec` from whichever per-core run queue it currently occupies.
-/// Used by terminate / suspendOnPort / destroyExecutionContextLocked.
+/// Remove `thread` from whichever per-core run queue it currently occupies.
+/// Used by terminate / suspendOnPort / destroyThreadLocked.
 ///
-/// Fast path (bd-mlpx / bd-vzdh): consult `ec.current_queue_core` —
-/// the per-EC residency hint Zig enqueue/dequeue/remove sites maintain
+/// Fast path (bd-mlpx / bd-vzdh): consult `thread.current_queue_core` —
+/// the per-thread residency hint Zig enqueue/dequeue/remove sites maintain
 /// under `core_locks[core]` — and target only that one core's lock
 /// when the hint is non-sentinel. This drops the per-call cost from
-/// `MAX_CORES = 64` lock acquires down to one for the EC-not-in-queue
+/// `MAX_CORES = 64` lock acquires down to one for the thread-not-in-queue
 /// case (terminate / paired post-`.exited` sweep / destroyPhase2 reap
-/// on faulted ECs, the bd-vzdh contention scenario), eliminating the
+/// on faulted Threads, the bd-vzdh contention scenario), eliminating the
 /// O(MAX_CORES) cache-line bouncing that compounded into ~2.5 s of
 /// LAPIC-tick suppression under SMP=4 concurrent CD destroys.
 ///
 /// Fallback (`current_queue_core == NOT_IN_RUN_QUEUE`): sweep all 64
-/// per-core locks. Required for stale-hint races and for any EC that
+/// per-core locks. Required for stale-hint races and for any thread that
 /// was removed from one queue while the caller's hint snapshot was old;
 /// the x64 IPC fast path now publishes this field in its ready-enqueue
 /// branches, matching the Zig enqueue discipline.
-pub fn removeFromQueue(ec: *ExecutionContext) void {
-    const hint = ec.current_queue_core.load(.acquire);
+pub fn removeFromQueue(thread: *Thread) void {
+    const hint = thread.current_queue_core.load(.acquire);
     if (hint < MAX_CORES) {
         const lock = &core_locks[hint];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const removed = (&core_states[hint]).run_queue.remove(ec) or
-            (&deferred_requeues[hint]).remove(ec);
+        const removed = (&core_states[hint]).run_queue.remove(thread) or
+            (&deferred_requeues[hint]).remove(thread);
         if (removed) {
-            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+            thread.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
         }
         lock.unlockIrqRestore(irq);
         if (removed) return;
-        // Hint was stale (EC migrated between our load and our lock
+        // Hint was stale (thread migrated between our load and our lock
         // acquire, or the asm fast-path put it in a different queue).
         // Fall through to the legacy sweep.
     }
@@ -1529,10 +1529,10 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
     while (i < MAX_CORES) {
         const lock = &core_locks[i];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const removed = (&core_states[i]).run_queue.remove(ec) or
-            (&deferred_requeues[i]).remove(ec);
+        const removed = (&core_states[i]).run_queue.remove(thread) or
+            (&deferred_requeues[i]).remove(thread);
         if (removed) {
-            ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+            thread.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
         }
         lock.unlockIrqRestore(irq);
         if (removed) return;
@@ -1540,48 +1540,48 @@ pub fn removeFromQueue(ec: *ExecutionContext) void {
     }
 }
 
-fn runQueueContains(queue: *EcQueue, target: *ExecutionContext) bool {
+fn runQueueContains(queue: *ThreadQueue, target: *Thread) bool {
     for (&queue.levels) |*level| {
         var cur = level.head;
-        while (cur) |ec| {
-            if (ec == target) return true;
-            cur = ec.next;
+        while (cur) |thread| {
+            if (thread == target) return true;
+            cur = thread.next;
         }
     }
     return false;
 }
 
-fn claimReadyFromLockedQueue(core: u8, ec: *ExecutionContext, expected_gen: ?u32) bool {
+fn claimReadyFromLockedQueue(core: u8, thread: *Thread, expected_gen: ?u32) bool {
     const state = &core_states[core];
-    const queue_core = ec.current_queue_core.load(.acquire);
+    const queue_core = thread.current_queue_core.load(.acquire);
     if (queue_core != core and queue_core != NOT_IN_RUN_QUEUE) return false;
 
-    const ec_gen = ec._gen_lock.currentGen();
+    const thread_gen = thread._gen_lock.currentGen();
     if (expected_gen) |gen| {
-        if (ec_gen != @as(u63, gen)) return false;
+        if (thread_gen != @as(u63, gen)) return false;
     }
-    if (ec_gen % 2 == 0 or !domainRefAlive(ec)) return false;
-    if (ec.owner_core != NOT_IN_RUN_QUEUE) return false;
-    if (lifecycle.load(ec) != .ready) return false;
-    if (!runQueueContains(&state.run_queue, ec)) return false;
-    if (!lifecycle.beginReadyClaimPinned(ec)) return false;
+    if (thread_gen % 2 == 0 or !domainRefAlive(thread)) return false;
+    if (thread.owner_core != NOT_IN_RUN_QUEUE) return false;
+    if (lifecycle.load(thread) != .ready) return false;
+    if (!runQueueContains(&state.run_queue, thread)) return false;
+    if (!lifecycle.beginReadyClaimPinned(thread)) return false;
 
-    const removed = state.run_queue.remove(ec);
+    const removed = state.run_queue.remove(thread);
     std.debug.assert(removed);
-    ec.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
+    thread.current_queue_core.store(NOT_IN_RUN_QUEUE, .release);
     return true;
 }
 
-/// Claim a ready EC under the run-queue lock that proves its membership,
-/// then unlink it from that queue. On success, the returned EC is in
+/// Claim a ready thread under the run-queue lock that proves its membership,
+/// then unlink it from that queue. On success, the returned thread is in
 /// `.claimed`, no longer belongs to any run queue, and the caller owns a
 /// lifecycle pin until it re-publishes or drops the claim.
-pub fn claimReadyFromQueue(ec: *ExecutionContext, expected_gen: ?u32) bool {
-    const hint = ec.current_queue_core.load(.acquire);
+pub fn claimReadyFromQueue(thread: *Thread, expected_gen: ?u32) bool {
+    const hint = thread.current_queue_core.load(.acquire);
     if (hint < MAX_CORES) {
         const lock = &core_locks[hint];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const claimed = claimReadyFromLockedQueue(hint, ec, expected_gen);
+        const claimed = claimReadyFromLockedQueue(hint, thread, expected_gen);
         lock.unlockIrqRestore(irq);
         if (claimed) return true;
     }
@@ -1594,7 +1594,7 @@ pub fn claimReadyFromQueue(ec: *ExecutionContext, expected_gen: ?u32) bool {
         }
         const lock = &core_locks[i];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const claimed = claimReadyFromLockedQueue(i, ec, expected_gen);
+        const claimed = claimReadyFromLockedQueue(i, thread, expected_gen);
         lock.unlockIrqRestore(irq);
         if (claimed) return true;
         i += 1;
@@ -1602,41 +1602,41 @@ pub fn claimReadyFromQueue(ec: *ExecutionContext, expected_gen: ?u32) bool {
     return false;
 }
 
-/// Currently dispatched EC on this core (the calling core).
+/// Currently dispatched thread on this core (the calling core).
 ///
 /// IMPORTANT: indexes via `&core_states[i]` rather than the direct
 /// `(&core_states[i]).field` form. In Debug builds Zig codegens the
 /// latter as a `memcpy` of the entire `[MAX_CORES]PerCore` array onto
 /// the caller's stack (≈ 6 KiB) followed by an index-of-the-copy
 /// load — see `__zig_probe_stack` + `memcpy($0x1800, ...)` in the
-/// disassembly. `currentEc` is on every page-fault, syscall, and
+/// disassembly. `currentThread` is on every page-fault, syscall, and
 /// dispatch path, so unbounded 6 KiB-per-call stack blowups quickly
 /// overflow the 48 KiB kernel stack and corrupt return addresses,
 /// surfacing as `cpu.idle` returning to a `.bss` byte (#GP) or as
-/// `pageFaultHandler` re-entering with `currentEc() == null` because
-/// the stack-frame for the saved EC pointer was clobbered. Pointer
+/// `pageFaultHandler` re-entering with `currentThread() == null` because
+/// the stack-frame for the saved thread pointer was clobbered. Pointer
 /// indexing avoids the per-call array snapshot.
-pub fn currentEc() ?*ExecutionContext {
+pub fn currentThread() ?*Thread {
     const core: u8 = @truncate(arch.smp.coreID());
-    // caller-pinned: `current_ec` names the EC actually executing on this
+    // caller-pinned: `current_thread` names the thread actually executing on this
     // very core; the slot can't be freed under us while this code runs.
-    return (&core_states[core]).current_ec;
+    return (&core_states[core]).current_thread;
 }
 
-/// True if this core's `current_ec` slot names `ec`. Identity-compare
+/// True if this core's `current_thread` slot names `thread`. Identity-compare
 /// helper used by suspend / terminate / fault paths to clear the
-/// dispatch slot when the running EC parks itself.
-pub inline fn coreCurrentIs(core: u8, ec: *ExecutionContext) bool {
-    // caller-pinned: identity compare on `current_ec` slot.
-    return (&core_states[core]).current_ec == ec;
+/// dispatch slot when the running thread parks itself.
+pub inline fn coreCurrentIs(core: u8, thread: *Thread) bool {
+    // caller-pinned: identity compare on `current_thread` slot.
+    return (&core_states[core]).current_thread == thread;
 }
 
-pub inline fn coreCurrentIsRunning(core: u8, ec: *ExecutionContext) bool {
-    return coreCurrentIs(core, ec) and lifecycle.load(ec) == .running;
+pub inline fn coreCurrentIsRunning(core: u8, thread: *Thread) bool {
+    return coreCurrentIs(core, thread) and lifecycle.load(thread) == .running;
 }
 
-/// Clear this core's `current_ec` slot. Called by suspend / terminate /
-/// idle paths when the running EC stops being runnable.
+/// Clear this core's `current_thread` slot. Called by suspend / terminate /
+/// idle paths when the running thread stops being runnable.
 /// Publish the user translation root this core has just LOADED (0 =
 /// none / kernel root). Callers MUST issue the hardware root load
 /// BEFORE this store — see the `PerCore.active_root` field doc.
@@ -1650,31 +1650,31 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
 ///   1. `active_root == root_addr` — the core has the dying root
 ///      LOADED (published with release-after-load; see
 ///      `PerCore.active_root`).
-///   2. `current_ec` names an EC whose `domain.ptr == cd_ptr` — the
-///      core has COMMITTED to dispatching a dying-domain EC but may
-///      not have loaded (or published) its root yet. `current_ec`
-///      flips at `setCurrentEc`, well before the dispatch path's
+///   2. `current_thread` names an thread whose `domain.ptr == cd_ptr` — the
+///      core has COMMITTED to dispatching a dying-domain thread but may
+///      not have loaded (or published) its root yet. `current_thread`
+///      flips at `setCurrentThread`, well before the dispatch path's
 ///      root swap, so it is the conservative early signal for
 ///      in-flight dispatches: a corpse showed a core dying INSIDE
-///      `interrupts.switchTo` (post-`setCurrentEc`, pre-publish,
+///      `interrupts.switchTo` (post-`setCurrentThread`, pre-publish,
 ///      stalled in migrateFlush) when the teardown freed the root
 ///      it was about to load.
 ///
 /// Domain teardown calls this after the destroy walk (zombies + wake
 /// IPIs posted, gens bumped) and before freeing any table. Both
-/// clauses converge: dying-domain ECs are gen-dead so no NEW dequeue
+/// clauses converge: dying-domain Threads are gen-dead so no NEW dequeue
 /// can dispatch them (dequeueOrIdleLocked filters even-gen), running
 /// victims get evicted within one IRQ delivery, and an in-flight
 /// dispatch either completes (publishing the root — clause 1 holds
-/// it) or aborts. Residual window: the dequeue→setCurrentEc sliver
-/// carries a committed EC in neither signal; it contains no spins
-/// and its close (`setCurrentEc`'s SlabRef.init) asserts on the
+/// it) or aborts. Residual window: the dequeue→setCurrentThread sliver
+/// carries a committed thread in neither signal; it contains no spins
+/// and its close (`setCurrentThread`'s SlabRef.init) asserts on the
 /// bumped gen, so it cannot silently dispatch. Cross-core reads of
-/// `ec.domain.ptr` are identity-only; slab memory persists after
+/// `thread.domain.ptr` are identity-only; slab memory persists after
 /// reap (zeroed ⇒ ptr mismatch ⇒ clause exits).
 ///
-/// The EXECUTING core is skipped: a self-destroying caller EC still
-/// occupies its own core's `current_ec` slot through phase 2 (and is
+/// The EXECUTING core is skipped: a self-destroying caller thread still
+/// occupies its own core's `current_thread` slot through phase 2 (and is
 /// standing on its kstack by design), so including self in clause 2
 /// would deadlock — the destroyer core detached its root separately
 /// and runs only kernel-mapped teardown code from here. All other 64
@@ -1685,12 +1685,12 @@ pub inline fn publishActiveRoot(core: u8, root_addr: u64) void {
 /// commitments are written under `core_locks[core]`
 /// (dequeueOrIdleLocked / yieldTo's target arm), and the gen flips
 /// the caller performed before this barrier are what stop NEW
-/// commitments (the dequeue filter drops even-gen ECs) — but a
+/// commitments (the dequeue filter drops even-gen Threads) — but a
 /// commitment made just BEFORE a flip may sit in a core's store
 /// buffer, or the committing core may be host-descheduled mid-window
 /// for milliseconds (KVM vCPU preemption breaks every "visible soon"
 /// argument). Taking each lock once forces the sweep to serialize
-/// after any in-progress locked commit, making `committed_ec` (and
+/// after any in-progress locked commit, making `committed_thread` (and
 /// everything the committer wrote before its unlock) visible to the
 /// clause scan below.
 pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
@@ -1716,20 +1716,20 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
                 std.atomic.spinLoopHint();
                 continue;
             }
-            if (state.current_ec) |cur| {
+            if (state.current_thread) |cur| {
                 // caller-pinned: identity-only compare of the raw
                 // domain pointer against the dying CD's address — no
                 // field of the CD is read through it. Slab bytes of a
-                // current EC persist past its gen flip (deferred
+                // current thread persist past its gen flip (deferred
                 // finalize), and a zeroed domain field simply
                 // mismatches and exits the clause.
                 //
                 // The deref below is UNCONDITIONAL, so "non-null implies
                 // dereferenceable" has to hold for a lock-free
                 // cross-core read. It does now, and did not before:
-                // `current_ec` is a single pointer word (see its field
+                // `current_thread` is a single pointer word (see its field
                 // doc), where the old `?SlabRef` aggregate let this
-                // exact load fault at 0x488 == @offsetOf(EC, "domain")
+                // exact load fault at 0x488 == @offsetOf(thread, "domain")
                 // on a torn `{ is_non_null = 1, ptr = 0 }`.
                 if (@intFromPtr(cur.domain.ptr) == @intFromPtr(cd_ptr)) {
                     std.atomic.spinLoopHint();
@@ -1741,20 +1741,20 @@ pub fn awaitDomainQuiesced(root_addr: u64, cd_ptr: *const anyopaque) void {
     }
 }
 
-pub inline fn clearCurrentEc(core: u8) void {
-    if (comptime ec_log.enabled) {
-        ec_log.mark(.clear_current_ec, (&core_states[core]).current_ec, null);
+pub inline fn clearCurrentThread(core: u8) void {
+    if (comptime thread_log.enabled) {
+        thread_log.mark(.clear_current_thread, (&core_states[core]).current_thread, null);
     }
-    (&core_states[core]).current_ec = null;
+    (&core_states[core]).current_thread = null;
 }
 
-/// Set this core's `current_ec` to `ec`, capturing the gen at write time.
+/// Set this core's `current_thread` to `thread`, capturing the gen at write time.
 /// Dispatch callers do this under `core_locks[core]`, making
-/// `current_ec` the sole dispatch-commitment signal for teardown
+/// `current_thread` the sole dispatch-commitment signal for teardown
 /// quiescence.
-pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
-    if (comptime ec_log.enabled) {
-        ec_log.mark(.set_current_ec, (&core_states[core]).current_ec, ec);
+pub inline fn setCurrentThread(core: u8, thread: *Thread) void {
+    if (comptime thread_log.enabled) {
+        thread_log.mark(.set_current_thread, (&core_states[core]).current_thread, thread);
     }
     // Gen BEFORE pointer. A cross-core observer keys entirely off the
     // pointer word, so publishing it last means anyone who sees the new
@@ -1762,31 +1762,31 @@ pub inline fn setCurrentEc(core: u8, ec: *ExecutionContext) void {
     // the gen runs on this core anyway). The reverse order would
     // additionally expose the previous occupant's pointer paired with
     // the new gen.
-    (&core_states[core]).current_ec_gen = @intCast(ec._gen_lock.currentGen());
-    (&core_states[core]).current_ec = ec;
-    ec.owner_core = core;
+    (&core_states[core]).current_thread_gen = @intCast(thread._gen_lock.currentGen());
+    (&core_states[core]).current_thread = thread;
+    thread.owner_core = core;
 }
 
 // ── State transitions used by other subsystems ───────────────────────
 
-/// Transition `ec` to ready and enqueue. Used by event delivery
+/// Transition `thread` to ready and enqueue. Used by event delivery
 /// resumes (reply, futex wake, timer fire, recv→ready, etc.).
 ///
 /// Routed through `tryClaimWake` so a resume that races a second waker
 /// for the same wait — classically a recv/futex timeout expiring on the
 /// timer core while the event it was waiting for arrives on another —
-/// enqueues the EC exactly once. The loser returns silently; the winner
-/// owns the wake. See `execution_context.tryClaimWake` for why a
+/// enqueues the thread exactly once. The loser returns silently; the winner
+/// owns the wake. See `thread_mod.tryClaimWake` for why a
 /// per-core queue lock cannot serialize this.
-pub fn markReady(ec: *ExecutionContext) void {
-    switch (lifecycle.beginWaitingClaimPinned(ec)) {
+pub fn markReady(thread: *Thread) void {
+    switch (lifecycle.beginWaitingClaimPinned(thread)) {
         .claimed => {
-            enqueue(ec);
-            lifecycle.releasePin(ec);
+            enqueue(thread);
+            lifecycle.releasePin(thread);
         },
         .pended => {
-            lifecycle.publishPendedPayload(ec);
-            lifecycle.releasePin(ec);
+            lifecycle.publishPendedPayload(thread);
+            lifecycle.releasePin(thread);
         },
         .none => {},
     }
@@ -1808,7 +1808,7 @@ pub fn consumeYieldHandoffGuard(core: u8) bool {
     return true;
 }
 
-/// Pick the right core for `ec` based on its affinity mask.
+/// Pick the right core for `thread` based on its affinity mask.
 /// `affinity == 0` is the spec-defined "any core" sentinel; we fall
 /// back to the calling core for cache locality.
 fn pickCoreForAffinity(affinity: u64) u8 {
@@ -1818,12 +1818,12 @@ fn pickCoreForAffinity(affinity: u64) u8 {
 
 // ── Lazy FPU coordination ────────────────────────────────────────────
 
-/// Cross-core FPU flush — if `ec.last_fpu_core` points to a different
+/// Cross-core FPU flush — if `thread.last_fpu_core` points to a different
 /// core than the calling core, IPI that core to FXSAVE its CPU regs
-/// into `ec.fpu_state`, then clear `last_fpu_core`. Called before
+/// into `thread.fpu_state`, then clear `last_fpu_core`. Called before
 /// the destination core arms its FPU trap so the trap handler can
 /// safely FXRSTOR from a fresh buffer. Delegates to `sched.fpu` which
 /// owns the per-arch mailbox protocol.
-pub fn migrateFlush(ec: *ExecutionContext) void {
-    stygia.sched.fpu.migrateFlush(ec);
+pub fn migrateFlush(thread: *Thread) void {
+    stygia.sched.fpu.migrateFlush(thread);
 }

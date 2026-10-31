@@ -19,7 +19,7 @@
 //!
 //! The kernel writes field0/field1 directly on the user table pages
 //! (via the kernel-side R/W view of the same physical pages) when an
-//! object's kernel-mutable snapshot changes (e.g. EC priority).
+//! object's kernel-mutable snapshot changes (e.g. thread priority).
 
 const stygia = @import("stygia");
 
@@ -28,7 +28,7 @@ const capability_domain = stygia.caps.capability_domain;
 const derivation = stygia.caps.derivation;
 const device_region = stygia.devices.device_region;
 const errors = stygia.syscall.errors;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const page_frame = stygia.memory.page_frame;
 const port = stygia.sched.port;
 const secure_slab = stygia.memory.allocators.secure_slab;
@@ -37,7 +37,7 @@ const virtual_machine = stygia.hv.virtual_machine;
 
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;
-const ExecutionContext = execution_context.ExecutionContext;
+const Thread = thread_mod.Thread;
 const PageFrame = page_frame.PageFrame;
 const Port = port.Port;
 const VMAR = vmar.VMAR;
@@ -58,7 +58,7 @@ pub const CapabilityType = enum(u4) {
     capability_domain_self = 0,
     /// IDC handle to another (or this) capability domain.
     capability_domain = 1,
-    execution_context = 2,
+    thread = 2,
     page_frame = 3,
     virtual_memory_address_region = 4,
     device_region = 5,
@@ -341,8 +341,8 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (caps_arg & ~RESTRICT_CAPS_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = cd_lr.ptr;
     defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
@@ -409,8 +409,8 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
 pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.domain);
 
     const slot: u12 = @truncate(handle);
     return derivation.deleteAndDetach(caller_dom_ref, slot);
@@ -424,8 +424,8 @@ pub fn delete(caller: *anyopaque, handle: u64) i64 {
 pub fn revoke(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const caller_dom_ref: ErasedSlabRef = @bitCast(ec.domain);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const caller_dom_ref: ErasedSlabRef = @bitCast(thread.domain);
     return derivation.revoke(caller_dom_ref, handle);
 }
 
@@ -433,8 +433,8 @@ pub fn revoke(caller: *anyopaque, handle: u64) i64 {
 pub fn sync(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const cd_lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = cd_lr.ptr;
     defer cd_ref.unlockIrqRestore(cd_lr.irq_state);
@@ -479,7 +479,7 @@ pub fn resolveHandleOnDomain(
 /// the parallel user `Capability`) and apply the type-specific delete
 /// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion)
 /// call their `decHandleRef` to release their per-handle
-/// increment; capability-domain-lifetime types (EC, VMAR, VM) and
+/// increment; capability-domain-lifetime types (thread, VMAR, VM) and
 /// system-lifetime IDC handles do not — those die only with the
 /// owning domain. Spec §[capabilities].delete table.
 pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle) void {
@@ -502,8 +502,8 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             // System-lifetime: dropping an IDC handle does not destroy
             // the referenced domain. No per-handle refcount.
         },
-        .execution_context => {
-            // Capability-domain lifetime: ECs die with their domain,
+        .thread => {
+            // Capability-domain lifetime: Threads die with their domain,
             // not with the last handle drop.
         },
         .page_frame => {
@@ -544,13 +544,13 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
         },
         .reply => {
             // The reply slot holds a back-pointer to a suspended
-            // sender EC; the entry's ref.ptr is that EC. Resume them
+            // sender thread; the entry's ref.ptr is that thread. Resume them
             // with E_ABANDONED if still parked. The reply is not a
             // separate slab object — clearing the slot below severs
             // the back-pointer. Spec §[capabilities] line 176: "If
             // the suspended sender is still waiting, resume them
             // with E_ABANDONED. Release handle."
-            const ref = typedRef(ExecutionContext, entry.*) orelse return;
+            const ref = typedRef(Thread, entry.*) orelse return;
             const sender_lr = ref.lockIrqSave(@src()) catch return;
             const sender = sender_lr.ptr;
             defer ref.unlockIrqRestore(sender_lr.irq_state);
@@ -610,11 +610,11 @@ fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType)
 
 /// Bit mask of the `restart_policy` field within a handle's caps word
 /// for the given type, or 0 if the type carries no restart_policy.
-/// Tracks the per-type cap layouts in §[execution_context], §[var],
+/// Tracks the per-type cap layouts in §[thread], §[var],
 /// §[port], §[page_frame], §[device_region], §[capability_domain].
 fn restartPolicyMask(type_tag: CapabilityType) u16 {
     return switch (type_tag) {
-        .execution_context => 0b11 << 8, // EcCaps bits 8-9
+        .thread => 0b11 << 8, // ThreadCaps bits 8-9
         .virtual_memory_address_region => 0b11 << 9, // VmarCaps bits 9-10
         .port => 0b1 << 5, // PortCaps bit 5
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
@@ -636,15 +636,15 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
     const user_entry = &holder.user_table[slot];
     const type_tag = Word0.typeTag(user_entry.word0);
     switch (type_tag) {
-        .execution_context => {
-            const ref = typedRef(ExecutionContext, entry.*) orelse return;
+        .thread => {
+            const ref = typedRef(Thread, entry.*) orelse return;
             const lr = ref.lockIrqSave(@src()) catch return;
             defer ref.unlockIrqRestore(lr.irq_state);
-            const ec = lr.ptr;
-            // field0 bits 0-1 = priority (Spec §[execution_context])
-            user_entry.field0 = @intFromEnum(ec.priority);
+            const thread = lr.ptr;
+            // field0 bits 0-1 = priority (Spec §[thread])
+            user_entry.field0 = @intFromEnum(thread.priority);
             // field1 bits 0-63 = affinity mask
-            user_entry.field1 = ec.affinity;
+            user_entry.field1 = thread.affinity;
         },
         .virtual_memory_address_region => {
             const ref = typedRef(VMAR, entry.*) orelse return;

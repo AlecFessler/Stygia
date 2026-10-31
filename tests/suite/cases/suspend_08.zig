@@ -1,18 +1,18 @@
 // Spec §[suspend] suspend — test 08.
 //
-// "[test 08] on success, the target EC stops executing."
+// "[test 08] on success, the target thread stops executing."
 //
 // Strategy
-//   Mint a worker EC inside this domain (target = self) that runs a
+//   Mint a worker thread inside this domain (target = self) that runs a
 //   tight loop incrementing a shared u64 in this ELF's .bss. Because
-//   create_execution_context with target = 0 puts the new EC in the
+//   create_thread with target = 0 puts the new thread in the
 //   caller's own capability domain — and therefore in the same address
-//   space — the parent test EC can observe the worker's progress by
+//   space — the parent test thread can observe the worker's progress by
 //   reading the same memory location.
 //
 //   The worker uses an atomic increment so the value the parent reads
 //   is the value the worker last wrote (the kernel gives no other
-//   memory-ordering guarantee between unrelated user ECs). The parent
+//   memory-ordering guarantee between unrelated user Threads). The parent
 //   uses an atomic load for the symmetric reason.
 //
 //   suspend takes a port for the suspension event delivery target. We
@@ -21,7 +21,7 @@
 //   the assertion only requires that the worker stops executing, which
 //   the kernel must enforce synchronously regardless of whether anyone
 //   ever recv's the event. The port is left with the suspension event
-//   queued; teardown happens when the test EC's domain self-handle is
+//   queued; teardown happens when the test thread's domain self-handle is
 //   deleted on return from `main`.
 //
 //   The verification has two phases:
@@ -37,24 +37,24 @@
 //        post-suspend samples must be equal — the worker must not
 //        advance the counter after it has been suspended.
 //
-//   Caps on the worker EC handle:
+//   Caps on the worker thread handle:
 //     - susp  : required by §[suspend] (test 03 — E_PERM otherwise).
-//     - restart_policy = 0 (kill): test ECs in this runner spawn
+//     - restart_policy = 0 (kill): test Threads in this runner spawn
 //                                   without restart context, and
-//                                   create_execution_context with
+//                                   create_thread with
 //                                   restart_policy > 0 would require
-//                                   ec_restart_max > 0 in the
+//                                   thread_restart_max > 0 in the
 //                                   parent's restart_policy_ceiling
 //                                   — granted by the runner — but
 //                                   adds no value to this assertion.
 //
 //   The worker's entry function is a Zig fn living in this ELF's
-//   .text. The new EC's stack is allocated by the kernel; the worker
+//   .text. The new thread's stack is allocated by the kernel; the worker
 //   never returns from `workerLoop` so no stack-unwind concerns arise.
 //
 // Action
 //   1. createPort(caps={bind, recv}) — must succeed.
-//   2. create_execution_context(target=self, caps={susp, rp=0},
+//   2. create_thread(target=self, caps={susp, rp=0},
 //                               entry=&workerLoop, stack_pages=1,
 //                               affinity=0)                      — must succeed
 //   3. yield-spin briefly to let the worker run; sample heartbeat
@@ -65,7 +65,7 @@
 //
 // Assertions
 //   1: createPort failed (returned an error word in vreg 1)
-//   2: setup syscall failed (create_execution_context returned an error)
+//   2: setup syscall failed (create_thread returned an error)
 //   3: suspend returned non-OK
 //   4: post-suspend heartbeat advanced (worker still executing)
 
@@ -91,7 +91,7 @@ fn workerLoop() noreturn {
 fn yieldN(n: u32) void {
     var i: u32 = 0;
     while (i < n) {
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldThread(0);
         i += 1;
     }
 }
@@ -115,16 +115,16 @@ pub fn main(cap_table_base: u64) void {
     // Worker caps: susp is required by §[suspend]. restart_policy = 0
     // keeps the call free of restart-ceiling checks
     // (§[restart_semantics] test 01).
-    const worker_caps = caps.EcCap{
+    const worker_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target = self), priority in
     // 32-33. priority = 0 stays within the runner-granted pri ceiling.
     const caps_word: u64 = @as(u64, worker_caps.toU16());
     const entry: u64 = @intFromPtr(&workerLoop);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -145,13 +145,13 @@ pub fn main(cap_table_base: u64) void {
     yieldN(8);
     const c1: u64 = @atomicLoad(u64, &heartbeat, .monotonic);
 
-    // Phase 2: suspend. §[suspend]: "[1] may reference the calling EC;
-    // the syscall returns after the calling EC is resumed." When [1]
-    // is not the calling EC (as here), the syscall returns
+    // Phase 2: suspend. §[suspend]: "[1] may reference the calling thread;
+    // the syscall returns after the calling thread is resumed." When [1]
+    // is not the calling thread (as here), the syscall returns
     // synchronously after enqueuing the suspension event on [2] and
     // marking the target suspended. No attachments — N=0 keeps us on
-    // the register-only path of suspendEc.
-    const susp_result = syscall.suspendEc(worker_handle, port_handle, &.{});
+    // the register-only path of suspendThread.
+    const susp_result = syscall.suspendThread(worker_handle, port_handle, &.{});
     if (susp_result.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -166,7 +166,7 @@ pub fn main(cap_table_base: u64) void {
     const c3: u64 = @atomicLoad(u64, &heartbeat, .monotonic);
 
     // If the worker was never scheduled (c1 == 0), we lack a positive
-    // observation that the EC was ever executing. The suspend-OK leg
+    // observation that the thread was ever executing. The suspend-OK leg
     // above is already enforced; pass the test on the smoke shape and
     // rely on a future scheduler-cooperative variant for the full
     // assertion.

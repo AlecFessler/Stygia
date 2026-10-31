@@ -8,10 +8,10 @@
 //   event_type so the test can compare what the kernel reports
 //   against ground truth. The simplest deterministic path is to
 //   queue a `suspension` event (§[event_type] = 4) by calling
-//   `suspend(W, port)` from the test EC, where W is a freshly
-//   minted EC. Per §[suspend], when [1] is not the calling EC the
+//   `suspend(W, port)` from the test thread, where W is a freshly
+//   minted thread. Per §[suspend], when [1] is not the calling thread the
 //   call returns immediately after queueing W as a suspended sender
-//   on the port — so the test EC stays runnable and a follow-up
+//   on the port — so the test thread stays runnable and a follow-up
 //   `recv(port)` returns immediately rather than blocking.
 //
 //   Mint the port with caps {bind, recv}: bind keeps the port from
@@ -21,7 +21,7 @@
 //   {susp, term} and restart_policy = 0; susp lets the test queue
 //   W via `suspend`, term keeps the cleanup path open, and a
 //   restart_policy of 0 (kill) keeps the call inside the runner-
-//   granted EC ceiling.
+//   granted thread ceiling.
 //
 //   §[recv] syscall word return layout puts event_type in bits
 //   44-48 (5 bits). After a successful recv we mask those bits and
@@ -36,21 +36,21 @@
 //
 // Action
 //   1. create_port(caps={bind, recv})        — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={susp, term, restart_policy=0}) — must succeed
 //      (entry = dummyEntry; W never executes meaningfully — it is
 //      suspended before scheduling matters)
 //   3. suspend(W, port)                      — must return OK
-//      (non-blocking on the test EC since [1] != self; queues W as a
+//      (non-blocking on the test thread since [1] != self; queues W as a
 //      suspended sender on the port with event_type = suspension)
 //   4. recv(port)                            — must return OK
-//      (the test EC holds the port's bind cap, so no E_CLOSED)
+//      (the test thread holds the port's bind cap, so no E_CLOSED)
 //   5. extract event_type from the recv syscall word bits 44-48 and
 //      compare against 4 (suspension)
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -79,15 +79,15 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,

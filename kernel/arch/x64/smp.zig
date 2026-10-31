@@ -67,7 +67,7 @@ pub fn smpInit() !void {
     // Patch the IDT gate descriptors for #DF/#NMI/#MC/#PF so the CPU
     // hardware-switches to the per-core IST stack on entry. From this
     // point forward those exceptions cannot land on the L4 fast path's
-    // `rsp = ec.kstack.top` window and corrupt `ec.ctx`.
+    // `rsp = thread.kstack.top` window and corrupt `thread.ctx`.
     exceptions.wireIstGates();
 
     const trampoline_phys = PAddr.fromInt(TRAMPOLINE_PHYS);
@@ -222,7 +222,7 @@ fn coreInit() callconv(.c) noreturn {
     serial.print("[ap {}] entering sched.run\n", .{core_id});
 
     // Drop into the scheduler loop. APs start with empty run queues
-    // and no per-core idle EC, so `sched.run` will fall through to
+    // and no per-core idle thread, so `sched.run` will fall through to
     // `sti+hlt` and wait for a cross-core wake / preempt IPI from
     // `enqueueOnCore`. `sched.run` is `noreturn`.
     sched.run();

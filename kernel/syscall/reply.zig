@@ -8,7 +8,7 @@ const port = stygia.sched.port;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const DeviceRegion = device_region.DeviceRegion;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const HANDLE_ARG_MASK = capability.HANDLE_ARG_MASK;
 const PAddr = stygia.memory.address.PAddr;
 const ReplyCaps = port.ReplyCaps;
@@ -28,12 +28,12 @@ const MAX_PAIR_COUNT: usize = 63;
 /// stack. Matches `MAX_PAIR_COUNT`.
 const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 
-/// Consumes a reply handle and resumes the suspended EC. State
+/// Consumes a reply handle and resumes the suspended thread. State
 /// modifications written to the receiver's event-state vregs (per
 /// §[event_state] / §[vm_exit_state]) between recv and reply are applied
-/// to the suspended EC's state on resume, gated by the `write` cap on the
-/// EC handle that originated the binding (the suspending EC handle for
-/// explicit suspend, the vCPU EC handle for vm_exit).
+/// to the suspended thread's state on resume, gated by the `write` cap on the
+/// thread handle that originated the binding (the suspending thread handle for
+/// explicit suspend, the vCPU thread handle for vm_exit).
 ///
 /// ```
 /// reply -> void
@@ -54,11 +54,11 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 ///
 /// [test 01] returns E_BADCAP if `reply_handle_id` is not a valid reply handle.
 /// [test 02] returns E_INVAL if any reserved bits are set in the syscall word.
-/// [test 03] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed.
+/// [test 03] returns E_TERM if the suspended thread was terminated before reply could deliver; the reply handle is consumed.
 /// [test 04] on success, the reply handle is consumed (removed from the caller's table).
-/// [test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
-/// [test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
-/// [test 07] on success, the suspended EC is resumed.
+/// [test 05] on success when the originating thread handle had the `write` cap, the resumed thread's state reflects modifications written to the receiver's event-state vregs between recv and reply.
+/// [test 06] on success when the originating thread handle did not have the `write` cap, the resumed thread's state matches its pre-suspension state, ignoring any modifications made by the receiver.
+/// [test 07] on success, the suspended thread is resumed.
 pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     // Spec §[reply] unified syscall word:
     //   bits  0-11: syscall_num
@@ -72,14 +72,14 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     const pair_count: u8 = @truncate((syscall_word >> 12) & 0xFF);
     const reply_handle: u64 = (syscall_word >> 20) & 0xFFF;
     const recv_port: u64 = (syscall_word >> 32) & 0xFFF;
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const thread: *Thread = @ptrCast(@alignCast(caller));
 
     // Test 10 — pair_count range. 0 is the bare-reply path.
     if (@as(usize, pair_count) > MAX_PAIR_COUNT) return errors.E_INVAL;
 
     if (recv_port != 0) {
         const port_slot: u12 = @truncate(recv_port);
-        const cd_ref_p = ec.domain;
+        const cd_ref_p = thread.domain;
         const lr_p = cd_ref_p.lockIrqSave(@src()) catch return errors.E_BADCAP;
         const cd_p = lr_p.ptr;
         const entry_p = capability.resolveHandleOnDomain(cd_p, port_slot, .port);
@@ -95,16 +95,16 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
     }
 
     const reply_result = if (pair_count > 0)
-        replyTransferInternal(ec, syscall_word, pair_count, args)
+        replyTransferInternal(thread, syscall_word, pair_count, args)
     else blk: {
         const slot: u12 = @truncate(reply_handle);
-        const cd_ref = ec.domain;
+        const cd_ref = thread.domain;
         const lr = cd_ref.lockIrqSave(@src()) catch break :blk errors.E_BADCAP;
         const cd = lr.ptr;
         const entry_present = capability.resolveHandleOnDomain(cd, slot, .reply) != null;
         cd_ref.unlockIrqRestore(lr.irq_state);
         if (!entry_present) break :blk errors.E_BADCAP;
-        break :blk port.reply(ec, reply_handle);
+        break :blk port.reply(thread, reply_handle);
     };
 
     if (reply_result != errors.OK) return reply_result;
@@ -114,16 +114,16 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         // caller on the named port for the next event. The recv contract's
         // return word + vregs ride out via the iretq epilogue (port.recv
         // stages `pending_event_word` on synchronous match or suspend).
-        return port.recv(ec, recv_port, 0);
+        return port.recv(thread, recv_port, 0);
     }
 
     return errors.OK;
 }
 
-/// Consumes a reply handle, resumes the suspended EC, and attaches N
-/// handles to the resumption. The resumed EC's syscall word carries
+/// Consumes a reply handle, resumes the suspended thread, and attaches N
+/// handles to the resumption. The resumed thread's syscall word carries
 /// `pair_count = N` and `tstart = S` (slot id of the first attached
-/// handle in the resumed EC's domain). State writes are applied per
+/// handle in the resumed thread's domain). State writes are applied per
 /// `reply` semantics.
 ///
 /// ```
@@ -152,20 +152,20 @@ pub fn reply(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
 /// [test 07] returns E_PERM if any pair entry with `move = 1` references a source handle that lacks the `move` cap.
 /// [test 08] returns E_PERM if any pair entry with `move = 0` references a source handle that lacks the `copy` cap.
 /// [test 09] returns E_INVAL if two pair entries reference the same source handle.
-/// [test 10] returns E_TERM if the suspended EC was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
-/// [test 11] returns E_FULL if the resumed EC's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
-/// [test 12] on success, the reply handle is consumed; the resumed EC's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+/// [test 10] returns E_TERM if the suspended thread was terminated before reply could deliver; the reply handle is consumed and no handle transfer occurs.
+/// [test 11] returns E_FULL if the resumed thread's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+/// [test 12] on success, the reply handle is consumed; the resumed thread's syscall word `pair_count = N` and `tstart = S`; the next N slots [S, S+N) in the resumed thread's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
 /// [test 13] on success, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
-/// [test 14] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
-/// [test 15] on success, the suspended EC is resumed.
-fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8, args: []const u64) i64 {
+/// [test 14] on success when the originating thread handle had the `write` cap, the resumed thread's state reflects modifications written to the receiver's event-state vregs between recv and reply_transfer; otherwise modifications are discarded.
+/// [test 15] on success, the suspended thread is resumed.
+fn replyTransferInternal(caller: *Thread, syscall_word: u64, n: u8, args: []const u64) i64 {
     // Caller (`reply`) already validated the unified-syscall reserved
     // bits (44-63) and N ≤ 63. N == 0 is the bare-reply path and never
     // reaches here.
     std.debug.assert(n > 0 and @as(usize, n) <= MAX_PAIR_COUNT);
 
     const reply_handle: u64 = (syscall_word >> 20) & 0xFFF;
-    const ec: *ExecutionContext = caller;
+    const thread: *Thread = caller;
     const slot: u12 = @truncate(reply_handle);
 
     // Pre-resolve the reply handle so test 02 (xfer cap) can fire
@@ -176,7 +176,7 @@ fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8, ar
     // before test 01 *only when the slot is occupied as a non-reply
     // handle* (per tests/reply_transfer_04 case B which uses
     // SLOT_SELF, an in-domain capability_domain entry).
-    const cd_ref = ec.domain;
+    const cd_ref = thread.domain;
     const lr_pre = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd_pre = lr_pre.ptr;
     const slot_occupied = capability.resolveHandleOnDomain(cd_pre, slot, null) != null;
@@ -225,20 +225,20 @@ fn replyTransferInternal(caller: *ExecutionContext, syscall_word: u64, n: u8, ar
     // Spec §[reply].reply_transfer per-entry gates (tests 05/06/07/08).
     // Resolved under the domain lock so the check is atomic against
     // concurrent revoke/delete on the source handles. While the lock is
-    // held we also stash decoded entries on the caller's EC for the
+    // held we also stash decoded entries on the caller's thread for the
     // port-layer install pass — capturing each source's ErasedSlabRef
     // here pins the underlying object across the upcoming reply ops
     // even if the source slot is later cleared on a `move = 1` path.
     const lr2 = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr2.ptr;
-    if (validatePairEntrySources(cd, ec, pair_entries)) |err| {
-        port.releasePendingPairEntries(ec);
+    if (validatePairEntrySources(cd, thread, pair_entries)) |err| {
+        port.releasePendingPairEntries(thread);
         cd_ref.unlockIrqRestore(lr2.irq_state);
         return err;
     }
     cd_ref.unlockIrqRestore(lr2.irq_state);
 
-    return port.replyTransfer(ec, reply_handle, n);
+    return port.replyTransfer(thread, reply_handle, n);
 }
 
 /// Reserved-bit check for every pair entry — Spec §[handle_attachments]
@@ -254,14 +254,14 @@ fn validatePairEntryBits(entries: []const u64) ?i64 {
 /// for `reply_transfer`. Spec §[reply].reply_transfer tests 05/06/07/08.
 /// Caller holds `cd._gen_lock`. Returns `null` on full pass; otherwise
 /// the first failing test's error code. Stashes each decoded entry on
-/// `ec.pending_pair_entries` as a side effect — the kernel-side
+/// `thread.pending_pair_entries` as a side effect — the kernel-side
 /// `port.replyTransfer` consumes the stash to install handles in the
-/// resumed sender's domain. `ec.pending_pair_count` is published only
+/// resumed sender's domain. `thread.pending_pair_count` is published only
 /// on full pass to keep partial failure observably equivalent to "no
 /// entries stashed" for cleanup / re-entry.
 fn validatePairEntrySources(
     cd: *CapabilityDomain,
-    ec: *ExecutionContext,
+    thread: *Thread,
     entries: []const u64,
 ) ?i64 {
     const source_domain: capability.ErasedSlabRef = .{
@@ -277,8 +277,8 @@ fn validatePairEntrySources(
 
         // Test 05: source handle must resolve in the caller's domain.
         const src = capability.resolveHandleOnDomain(cd, slot, null) orelse {
-            ec.pending_pair_count = @intCast(idx);
-            port.releasePendingPairEntries(ec);
+            thread.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
 
@@ -289,8 +289,8 @@ fn validatePairEntrySources(
         // transferable handle type (none of them carry `restrict`'s
         // restart_policy enum special-case).
         if (entry_caps & ~src_caps != 0) {
-            ec.pending_pair_count = @intCast(idx);
-            port.releasePendingPairEntries(ec);
+            thread.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(thread);
             return errors.E_PERM;
         }
 
@@ -300,14 +300,14 @@ fn validatePairEntrySources(
         const has_copy = (src_caps & 0x2) != 0;
         if (move_flag) {
             if (!has_move) {
-                ec.pending_pair_count = @intCast(idx);
-                port.releasePendingPairEntries(ec);
+                thread.pending_pair_count = @intCast(idx);
+                port.releasePendingPairEntries(thread);
                 return errors.E_PERM;
             }
         } else {
             if (!has_copy) {
-                ec.pending_pair_count = @intCast(idx);
-                port.releasePendingPairEntries(ec);
+                thread.pending_pair_count = @intCast(idx);
+                port.releasePendingPairEntries(thread);
                 return errors.E_PERM;
             }
         }
@@ -316,7 +316,7 @@ fn validatePairEntrySources(
         // ErasedSlabRef under `cd._gen_lock` so the gen baked into the
         // ref matches a live object until at least the install phase.
         const obj_type = Word0.typeTag(cd.user_table[slot].word0);
-        ec.pending_pair_entries[idx] = .{
+        thread.pending_pair_entries[idx] = .{
             .obj_ref = src.ref,
             .source_domain = source_domain,
             .source_instance = src.instance,
@@ -327,14 +327,14 @@ fn validatePairEntrySources(
             .move = move_flag,
             .src_slot = slot,
         };
-        ec.pending_pair_entries[idx].pending_ref_caps = port.pendingRefCapsForEntry(ec.pending_pair_entries[idx]);
-        port.acquirePendingPairEntryRef(ec.pending_pair_entries[idx]) catch {
-            ec.pending_pair_count = @intCast(idx);
-            port.releasePendingPairEntries(ec);
+        thread.pending_pair_entries[idx].pending_ref_caps = port.pendingRefCapsForEntry(thread.pending_pair_entries[idx]);
+        port.acquirePendingPairEntryRef(thread.pending_pair_entries[idx]) catch {
+            thread.pending_pair_count = @intCast(idx);
+            port.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
     }
-    ec.pending_pair_count = @intCast(entries.len);
+    thread.pending_pair_count = @intCast(entries.len);
     return null;
 }
 
@@ -381,10 +381,10 @@ fn hasDuplicateSources(entries: []const u64) bool {
 pub fn ack(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
+    const thread: *Thread = @ptrCast(@alignCast(caller));
     const slot: u12 = @truncate(handle);
 
-    const cd_ref = ec.domain;
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const cd_irq_state = lr.irq_state;

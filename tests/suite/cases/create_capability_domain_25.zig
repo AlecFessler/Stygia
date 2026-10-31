@@ -105,7 +105,7 @@ pub fn main(cap_table_base: u64) void {
     };
 
     // §[create_capability_domain] [2] ceilings_inner sub-fields:
-    //   bits  0-7   ec_inner_ceiling   = 0xFF   (matches runner)
+    //   bits  0-7   thread_inner_ceiling   = 0xFF   (matches runner)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
     //   bits 24-31  cridc_ceiling      = CHILD_CRIDC (discriminator)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
@@ -170,7 +170,7 @@ pub fn main(cap_table_base: u64) void {
         ceilings_inner,
         ceilings_outer,
         SLOT_TEST_ELF_PF,
-        0, // initial_ec_affinity = any core
+        0, // initial_thread_affinity = any core
         passed[0..],
     );
     if (testing.isHandleError(r.v1)) {

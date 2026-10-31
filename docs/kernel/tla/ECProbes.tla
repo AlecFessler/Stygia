@@ -4,18 +4,18 @@
 (* reaching, so TLC violating it PROVES the surface is exercised. run.sh   *)
 (* runs each as an expect_violation gate; a probe that stops firing means  *)
 (* the model lost coverage -- report it, never delete it.                  *)
-EXTENDS ECLifecycle
+EXTENDS ThreadLifecycle
 
 (* T2's parking x K+C cell actually reached: a rendezvous sender retired   *)
 (* MID-DELIVERY while holding its receiver's claim.                        *)
 ProbeNoRetiredRvSender ==
-  \A e \in ECs: ~(ecs[e].st = "retired" /\ ecs[e].pc = "rvC")
+  \A e \in Threads: ~(threads[e].st = "retired" /\ threads[e].pc = "rvC")
 
 (* The 5b-shaped rendezvous receiver branch actually reached.              *)
 ProbeNoRvPendedReceiver ==
-  \A e \in ECs:
-    ~(ecs[e].pc = "rvC" /\ ecs[e].tg # NULL
-        /\ ecs[ecs[e].tg].st = "pended")
+  \A e \in Threads:
+    ~(threads[e].pc = "rvC" /\ threads[e].tg # NULL
+        /\ threads[threads[e].tg].st = "pended")
 
 (* ROUND-10 M-D, updated in revision 16. `t1full`'s old LiveTerm PASS was *)
 (* billed as machine-checking the W3 -> W5 -> W3 cycle (A terminates B    *)
@@ -25,10 +25,10 @@ ProbeNoRvPendedReceiver ==
 (* its exact CONSTANTS mirror. TLC violating this probe proves that rung  *)
 (* actually reaches the cycle it exists to cover.                         *)
 ProbeNoTermSuspendCycle ==
-  \A a, b \in ECs:
+  \A a, b \in Threads:
     ~(/\ a # b
-      /\ ecs[a].pc = "termW" /\ ecs[a].tg = b
-      /\ ecs[b].pc = "dirW"  /\ ecs[b].tg = a)
+      /\ threads[a].pc = "termW" /\ threads[a].tg = b
+      /\ threads[b].pc = "dirW"  /\ threads[b].tg = a)
 
 (* ROUND-11 M-3. `InvNoForeignDisarm` is ANALYTICALLY VACUOUS under       *)
 (* DIR_OWNED = TRUE: the disarm action's own guard forces dsrc = u, so    *)
@@ -40,10 +40,10 @@ ProbeNoTermSuspendCycle ==
 (* is EXERCISED at all, so the clean run is at least a statement about a  *)
 (* reachable path rather than an unvisited one.                           *)
 ProbeNoDisarm ==
-  \A e \in ECs: ~(ecs[e].dir = "none" /\ ecs[e].dbad = FALSE
-                  /\ ecs[e].dsrc = NULL /\ ecs[e].pok = FALSE)
+  \A e \in Threads: ~(threads[e].dir = "none" /\ threads[e].dbad = FALSE
+                  /\ threads[e].dsrc = NULL /\ threads[e].pok = FALSE)
 
 (* Retire-from-pended (the W7 pre-wait path) actually reached.             *)
 ProbeNoRetireFromPended ==
-  \A e \in ECs: ~(ecs[e].st = "retired" /\ ecs[e].po)
+  \A e \in Threads: ~(threads[e].st = "retired" /\ threads[e].po)
 ====================================================================================

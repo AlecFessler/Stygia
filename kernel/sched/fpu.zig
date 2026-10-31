@@ -4,22 +4,22 @@
 //! in build.zig), so user-mode FP/SIMD state survives across syscalls
 //! and interrupts untouched in the CPU registers. There is no eager
 //! FXSAVE/FXRSTOR on syscall entry/exit and no save/restore on context
-//! switch — eviction happens only when a different EC on the same core
+//! switch — eviction happens only when a different thread on the same core
 //! actually issues an FP/SIMD instruction and traps the FPU-disabled
 //! bit (CR0.TS on x86-64, CPACR_EL1.FPEN on aarch64).
 //!
 //! Per core, `scheduler.core_states[core_id].last_fpu_owner` names the
-//! EC whose FP regs currently live in that core's hardware. The
+//! thread whose FP regs currently live in that core's hardware. The
 //! receiving-side bookkeeping in `arm` only writes the trap-arm bit
 //! when the new dispatch target differs from this slot, avoiding
 //! redundant CR-writes (each costs a vmexit under KVM).
 //!
-//! Cross-core migration: if a stolen EC's FP state still lives on a
+//! Cross-core migration: if a stolen thread's FP state still lives on a
 //! different core's registers, the destination core sends an IPI to
-//! the source core to FXSAVE into the EC's own buffer and clear its
+//! the source core to FXSAVE into the thread's own buffer and clear its
 //! `last_fpu_owner` slot. See `migrateFlush`.
 //!
-//! Spec §[execution_context] lazy FPU.
+//! Spec §[thread] lazy FPU.
 
 const std = @import("std");
 const stygia = @import("stygia");
@@ -28,15 +28,15 @@ const arch = stygia.arch.dispatch;
 const spin_diag = stygia.utils.spin_diag;
 const scheduler = stygia.sched.scheduler;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 
 /// Called from the arch-specific FP-trap handler (#NM on x64,
-/// ESR_EL1.EC=0x07 on aarch64). Swaps FPU state ownership on this core
+/// ESR_EL1.thread=0x07 on aarch64). Swaps FPU state ownership on this core
 /// from the previous owner (if any) to `current`, then clears the
 /// trap. Safe to call with interrupts disabled (which is the natural
 /// state inside an exception entry).
-pub fn handleTrap(current: *ExecutionContext) void {
+pub fn handleTrap(current: *Thread) void {
 
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];
@@ -54,7 +54,7 @@ pub fn handleTrap(current: *ExecutionContext) void {
         // `flushIpiHandler` keeps this slot consistent.
         const p = prev_ref.ptr;
         if (p == current) {
-            // Same EC re-acquiring on the same core. Regs are still
+            // Same thread re-acquiring on the same core. Regs are still
             // valid — no save, no restore, just leave the trap clear.
             return;
         }
@@ -63,34 +63,34 @@ pub fn handleTrap(current: *ExecutionContext) void {
     }
 
     arch.cpu.fpuRestore(&current.fpu_state);
-    per_core.last_fpu_owner = SlabRef(ExecutionContext).init(current, current._gen_lock.currentGen());
+    per_core.last_fpu_owner = SlabRef(Thread).init(current, current._gen_lock.currentGen());
     current.last_fpu_core = core_id;
 }
 
-/// Clear `ec` from any core's `last_fpu_owner` slot. Called from
-/// `terminate` / `destroyExecutionContextLocked` before the gen-bump
-/// + kstack-free, so the next FP trap on `ec.last_fpu_core` doesn't
-/// `fpuSave(&ec.fpu_state)` into a slab slot that's about to be
+/// Clear `thread` from any core's `last_fpu_owner` slot. Called from
+/// `terminate` / `destroyThreadLocked` before the gen-bump
+/// + kstack-free, so the next FP trap on `thread.last_fpu_core` doesn't
+/// `fpuSave(&thread.fpu_state)` into a slab slot that's about to be
 /// freed (or already has been, with the slot reallocated to a
-/// different live EC). Mirrors the cancel-on-destroy pattern used
+/// different live thread). Mirrors the cancel-on-destroy pattern used
 /// for `futex_wait_nodes` / `timed_recv_waiters`.
 ///
-/// Only the core named by `ec.last_fpu_core` could have the slot
-/// pointing at this EC (set/cleared atomically with the slot). If the
-/// EC is on the local core's FPU-owner slot, clear it directly; if
+/// Only the core named by `thread.last_fpu_core` could have the slot
+/// pointing at this thread (set/cleared atomically with the slot). If the
+/// thread is on the local core's FPU-owner slot, clear it directly; if
 /// remote, send a flush IPI (which is what `flushIpiHandler` is for).
 /// For now we just clear the slot directly via the per-core pointer
-/// — there's no concurrency concern because (a) the EC isn't running
+/// — there's no concurrency concern because (a) the thread isn't running
 /// on the named core (either `terminate` is from another core, or
-/// the EC is parked / .exited), and (b) FPU traps on the named core
-/// for a different EC would re-evict and clear the slot anyway.
-/// Validate a core id that was read back out of an EC field rather than
+/// the thread is parked / .exited), and (b) FPU traps on the named core
+/// for a different thread would re-evict and clear the slot anyway.
+/// Validate a core id that was read back out of an thread field rather than
 /// derived from `coreID()` on the core we are currently running on.
 ///
-/// `ec.last_fpu_core` is only ever written as `@truncate(coreID())` (see
+/// `thread.last_fpu_core` is only ever written as `@truncate(coreID())` (see
 /// `fpuSwap`) or cleared to null, so by construction it is always either
 /// null or a live core index. A value outside `[0, MAX_CORES)` therefore
-/// means we observed the slab slot mid-recycle — the EC is being torn
+/// means we observed the slab slot mid-recycle — the thread is being torn
 /// down under us and the byte we read is not a core id at all. 0xFF is
 /// the value that shows up in practice, matching both
 /// `LAST_DISPATCHED_NEVER` and a never-written byte.
@@ -101,7 +101,7 @@ pub fn handleTrap(current: *ExecutionContext) void {
 ///
 /// Gate it where the stored value is read, not at each subscript. The
 /// deliberate tradeoff: we return null (skip the flush) rather than
-/// assert, because the EC this refers to is already being destroyed —
+/// assert, because the thread this refers to is already being destroyed —
 /// there is no live FPU state left worth saving into a dying slab slot,
 /// and turning a teardown race into a kernel panic would be strictly
 /// worse than skipping work that no longer has an owner.
@@ -117,22 +117,22 @@ inline fn storedCore(raw: ?u8) ?u8 {
     return c;
 }
 
-pub fn clearFromLastFpuOwner(ec: *ExecutionContext) void {
-    const core = storedCore(ec.last_fpu_core) orelse return;
+pub fn clearFromLastFpuOwner(thread: *Thread) void {
+    const core = storedCore(thread.last_fpu_core) orelse return;
     const per_core = &scheduler.core_states[core];
     if (per_core.last_fpu_owner) |ref| {
-        if (ref.ptr == ec) per_core.last_fpu_owner = null;
+        if (ref.ptr == thread) per_core.last_fpu_owner = null;
     }
-    ec.last_fpu_core = null;
+    thread.last_fpu_core = null;
 }
 
 // ── Cross-core flush IPI: epoch-stamped + per-target-serialized ──────
 //
 // `migrateFlush` is the requester side of the cross-core lazy-FPU flush
 // IPI. The arch-owned mailbox (`cpu.fpu_flush_mailbox[target]`) carries
-// the EC pointer and a `done` bit; the IDT (#NM-vec `IntVecs.fpu_flush`
+// the thread pointer and a `done` bit; the IDT (#NM-vec `IntVecs.fpu_flush`
 // on x86-64, SGI 2 on aarch64) lands on the target core and calls
-// `flushIpiHandler` to FXSAVE the regs into `ec.fpu_state`.
+// `flushIpiHandler` to FXSAVE the regs into `thread.fpu_state`.
 //
 // The unhardened version of this protocol (a naive write-mailbox /
 // send-IPI / spin-on-`done`) has two bugs that this module fixes:
@@ -144,11 +144,11 @@ pub fn clearFromLastFpuOwner(ec: *ExecutionContext) void {
 //      fires; both wedge until something else perturbs the system.
 //
 //   2. **Stale-IPI double-process.** The arch mailbox has only one
-//      EC slot and one bool. If a late-delivered IPI fires after the
+//      thread slot and one bool. If a late-delivered IPI fires after the
 //      original requester has already observed `done = true` and
 //      moved on, the receiver re-reads `requested_thread` (still the
-//      old EC pointer — nobody clears it) and re-FXSAVEs into
-//      `ec.fpu_state`. The EC may have migrated to yet another core
+//      old thread pointer — nobody clears it) and re-FXSAVEs into
+//      `thread.fpu_state`. The thread may have migrated to yet another core
 //      by then; FXSAVE captures the WRONG hardware state into its
 //      buffer. Likewise, the inline-service path described below can
 //      race with the IDT vector against the same arch slot.
@@ -218,29 +218,29 @@ const FlushSlot = struct {
 
 var flush_slot_state: [scheduler.MAX_CORES]FlushSlot = [_]FlushSlot{.{}} ** scheduler.MAX_CORES;
 
-/// Inner save: if this core still owns `ec`'s regs, FXSAVE them into
-/// `ec.fpu_state` and clear the per-core slot. Always clears
-/// `ec.last_fpu_core` so the EC's next dispatch on any core treats its
+/// Inner save: if this core still owns `thread`'s regs, FXSAVE them into
+/// `thread.fpu_state` and clear the per-core slot. Always clears
+/// `thread.last_fpu_core` so the thread's next dispatch on any core treats its
 /// `fpu_state` buffer as authoritative.
 ///
 /// FPU trap discipline: FXSAVE / FXRSTOR raise `#NM` when CR0.TS is
 /// set (Intel SDM Vol 2A "FXSAVE — Operation"). On the source core,
 /// the trap may be armed at IPI-arrival time (the prior context
-/// switch armed it because the now-running EC isn't the FPU owner).
+/// switch armed it because the now-running thread isn't the FPU owner).
 /// We must clear the trap before the FXSAVE — and, since this flush
 /// is an EVICTION (`last_fpu_owner = null` after), leave the trap in
 /// the cleared state with `fpu_trap_armed = false` to preserve the
 /// scheduler's invariant `fpu_trap_armed ↔ CR0.TS`. The next
 /// `switchTo` on this core will observe `last_fpu_owner == null`,
 /// recompute `desired_armed = true`, and re-arm.
-inline fn doFlushSave(local_core: u8, ec: *ExecutionContext) void {
+inline fn doFlushSave(local_core: u8, thread: *Thread) void {
     const per_core = &scheduler.core_states[local_core];
     if (per_core.last_fpu_owner) |ref| {
         // caller-pinned: identity compare on `last_fpu_owner` slot.
-        if (ref.ptr == ec) {
+        if (ref.ptr == thread) {
             // Clear the trap before FXSAVE — even on the IDT/SGI path
             // where the IPI may arrive on a core whose TS bit was set
-            // by an earlier `switchTo` to a non-FPU-owning EC.
+            // by an earlier `switchTo` to a non-FPU-owning thread.
             // `fpuClearTrap` is a no-op on TS=0 and a CR0 write on
             // TS=1; we eat the cost here because it's mandatory for
             // FXSAVE not to recursively trap.
@@ -248,11 +248,11 @@ inline fn doFlushSave(local_core: u8, ec: *ExecutionContext) void {
                 arch.cpu.fpuClearTrap();
                 per_core.fpu_trap_armed = false;
             }
-            arch.cpu.fpuSave(&ec.fpu_state);
+            arch.cpu.fpuSave(&thread.fpu_state);
             per_core.last_fpu_owner = null;
         }
     }
-    ec.last_fpu_core = null;
+    thread.last_fpu_core = null;
 }
 
 /// Try to claim and process a pending flush request targeting THIS core.
@@ -278,9 +278,9 @@ fn drainLocalFlush(local_core: u8) void {
     // see null and bail. This makes inline-service-vs-IDT-fire safe.
     const arch_mailbox = arch.cpu.fpuFlushMailbox(local_core);
     const opaque_ptr = @atomicRmw(?*anyopaque, &arch_mailbox.requested_thread, .Xchg, null, .acq_rel) orelse return;
-    const ec: *ExecutionContext = @ptrCast(@alignCast(opaque_ptr));
+    const thread: *Thread = @ptrCast(@alignCast(opaque_ptr));
 
-    doFlushSave(local_core, ec);
+    doFlushSave(local_core, thread);
 
     // Publish completion. Requester spins on done_seq == my_seq;
     // because the request_lock serializes requesters per target,
@@ -313,15 +313,15 @@ fn drainLocalFlush(local_core: u8) void {
 ///
 ///   core A: `terminate(X)` retired X, saw `X.owner_core == B`, and now
 ///           spins in `routeRetiredFinalize` until B drops X from
-///           `current_ec`. IRQs masked (syscall).
-///   core B: dispatching X — `current_ec` is already published — is
+///           `current_thread`. IRQs masked (syscall).
+///   core B: dispatching X — `current_thread` is already published — is
 ///           inside `interrupts.switchTo` → `migrateFlush(X)`, waiting
 ///           for A to flush X's FP regs. IRQs masked.
 ///
 /// B cannot reach `dispatchTailBody` (which would notice X is retired
 /// and discharge it), so A's condition never becomes false. The
-/// terminal photograph is a core holding a RETIRED, gen-dead EC in
-/// `current_ec` with ready ECs stranded behind a second wedged core.
+/// terminal photograph is a core holding a RETIRED, gen-dead thread in
+/// `current_thread` with ready Threads stranded behind a second wedged core.
 ///
 /// ## Why doing the save HERE is sound
 ///
@@ -339,7 +339,7 @@ fn drainLocalFlush(local_core: u8) void {
 /// EARLIER. What remains is to show that the reorder is harmless for
 /// every reader of the state `doFlushSave` touches.
 ///
-/// `fpu_state` and CR0.TS are quick. The drained EC's `fpu_state` is
+/// `fpu_state` and CR0.TS are quick. The drained thread's `fpu_state` is
 /// read by the requesting core only after it observes `done_seq`, which
 /// we publish last. CR0.TS / `fpu_trap_armed` clear early, and the
 /// kernel is built without SSE/NEON, so no kernel instruction between
@@ -376,12 +376,12 @@ fn drainLocalFlush(local_core: u8) void {
 ///      `pin_depth != 0`) and only then calls it. Safe in both
 ///      branches, but NOT for the same reason, and the second one is
 ///      easy to get wrong:
-///        - If it names the EC we just drained, `doFlushSave` already
-///          nulled that EC's `last_fpu_core` — unconditionally, at its
+///        - If it names the thread we just drained, `doFlushSave` already
+///          nulled that thread's `last_fpu_core` — unconditionally, at its
 ///          tail, outside both `if`s — so `storedCore` returns null and
 ///          it exits before touching any slot.
-///        - If it names a DIFFERENT EC, our slot may still name it.
-///          `doFlushSave`'s inner `if (ref.ptr == ec)` can be false —
+///        - If it names a DIFFERENT thread, our slot may still name it.
+///          `doFlushSave`'s inner `if (ref.ptr == thread)` can be false —
 ///          the mailbox named Y while our slot named X — and then
 ///          `clearFromLastFpuOwner(X)` does match and does null the
 ///          slot. That is NOT a no-op. It is still correct, because in
@@ -396,8 +396,8 @@ fn drainLocalFlush(local_core: u8) void {
 /// undrained timelines DIFFER, they differ toward MORE trap-arming,
 /// never less. In the `switchTo`-in-between case, draining makes it see
 /// null and arm TS; not draining lets it see the stale owner, arm TS,
-/// `iretq` into the new EC, and only then take the IPI — which clears
-/// TS and nulls the slot, leaving that EC running with another EC's FP
+/// `iretq` into the new thread, and only then take the IPI — which clears
+/// TS and nulls the slot, leaving that thread running with another thread's FP
 /// registers live and no trap armed. The reorder is not state-identical;
 /// it is safe in the direction that matters.
 ///
@@ -409,30 +409,30 @@ pub fn serviceLocalFlushWhileSpinning() void {
 }
 
 /// IPI handler invoked on the source core when another core needs to
-/// take ownership of `ec`'s FPU state across a migration. Saves the
+/// take ownership of `thread`'s FPU state across a migration. Saves the
 /// regs (if this core still owns them) and clears `last_fpu_owner`
 /// so the source core won't try to save them again on its next trap.
 ///
-/// The `ec` argument is supplied by the arch-side IDT/SGI dispatcher
+/// The `thread` argument is supplied by the arch-side IDT/SGI dispatcher
 /// from its own load of `mailbox.requested_thread`. We re-claim the
 /// mailbox atomically here and trust the seq-number bookkeeping over
 /// the dispatcher's captured pointer — if a peer's inline-service has
 /// already drained the slot, we no-op even though the dispatcher
 /// passed us a non-null pointer.
-pub fn flushIpiHandler(_: *ExecutionContext) void {
+pub fn flushIpiHandler(_: *Thread) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
     drainLocalFlush(core_id);
 }
 
-/// Cross-core FPU flush — if `ec.last_fpu_core` names a different core
+/// Cross-core FPU flush — if `thread.last_fpu_core` names a different core
 /// than the calling one, the destination core would FXRSTOR from a
-/// stale `ec.fpu_state` because the live regs still sit on the source
+/// stale `thread.fpu_state` because the live regs still sit on the source
 /// core. Coordinate via the per-target arch mailbox + IPI:
 ///
 ///   1. Acquire `flush_slot_state[src].request_lock` (serializes
 ///      requesters; while spinning, drain incoming flushes targeting
 ///      THIS core to break symmetric-flush deadlock).
-///   2. Write `mailbox[src].requested_thread = ec`, bump
+///   2. Write `mailbox[src].requested_thread = thread`, bump
 ///      `flush_slot_state[src].request_seq`. The arch mailbox `done`
 ///      bool is unused by this protocol (the IDT wrapper still sets
 ///      it via `ackDone` after the handler returns; we don't read it).
@@ -449,11 +449,11 @@ pub fn flushIpiHandler(_: *ExecutionContext) void {
 ///     lock-protected window; done_seq advances monotonically to it).
 ///   * deadlock freedom under arbitrary cycles of mutual flushes
 ///     (each spinning core cooperatively services its own mailbox).
-pub fn migrateFlush(ec: *ExecutionContext) void {
+pub fn migrateFlush(thread: *Thread) void {
     // `storedCore` gate: `last_fpu_core` came out of a slab slot that a
     // concurrent teardown may be recycling. See its doc for why an
     // out-of-range value is skipped rather than asserted.
-    const src_core = storedCore(ec.last_fpu_core) orelse return;
+    const src_core = storedCore(thread.last_fpu_core) orelse return;
     const cur_core: u8 = @truncate(arch.smp.coreID());
     if (src_core == cur_core) return;
 
@@ -488,7 +488,7 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // in this protocol reads it, but we keep the wrapper's existing
     // contract intact.
     const arch_mailbox = arch.cpu.fpuFlushMailbox(src_core);
-    @atomicStore(?*anyopaque, &arch_mailbox.requested_thread, ec, .release);
+    @atomicStore(?*anyopaque, &arch_mailbox.requested_thread, thread, .release);
     slot.request_seq.store(my_seq, .release);
 
     arch.cpu.sendFpuFlushIpi(src_core);
@@ -510,9 +510,9 @@ pub fn migrateFlush(ec: *ExecutionContext) void {
     // `request_lock` and (via `switchTo`) run with IRQs masked.
     //
     // Structurally the same send-once-then-spin defect as the
-    // `postZombie` loops in execution_context.zig, and it presents
+    // `postZombie` loops in thread.zig, and it presents
     // identically: one core live but emitting nothing, another parked
-    // with ready ECs stranded in its own run_queue.
+    // with ready Threads stranded in its own run_queue.
     var flush_spins: u32 = 0;
     while (slot.done_seq.load(.acquire) != my_seq) {
         if (flush_spins % FLUSH_IPI_RETRY_SPINS == 0) {

@@ -24,7 +24,7 @@
 //
 //     3. A live xfer transport that attaches the device_region handle
 //        with caps.restart_policy = 1. Both call sites that attach
-//        handles in libz — `syscall.suspendEc(..., attachments)` and
+//        handles in libz — `syscall.suspendThread(..., attachments)` and
 //        `syscall.replyTransfer(..., attachments)` — `@panic` because
 //        the high-vreg pair layout (§[handle_attachments]: entries
 //        spill into vregs [128-N..127]) is not yet wired through

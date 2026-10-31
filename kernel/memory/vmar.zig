@@ -19,7 +19,7 @@ const secure_slab = stygia.memory.allocators.secure_slab;
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const DeviceRegion = stygia.devices.device_region.DeviceRegion;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GenLock = secure_slab.GenLock;
 const KernelHandle = stygia.caps.capability.KernelHandle;
 const MemoryPerms = stygia.memory.address.MemoryPerms;
@@ -208,7 +208,7 @@ inline fn rwxToPerms(rwx: u3) MemoryPerms {
 
 /// `create_vmar` syscall handler. Spec §[var].create_vmar.
 pub fn createVmar(
-    caller: *ExecutionContext,
+    caller: *Thread,
     caps: u64,
     props: u64,
     pages: u64,
@@ -258,7 +258,7 @@ pub fn createVmar(
         }
     }
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
 
     // DMA VARs require a valid device_region handle with the dma cap.
     var dev_ptr: ?*DeviceRegion = null;
@@ -345,10 +345,10 @@ pub fn createVmar(
 }
 
 /// `map_pf` syscall handler. Spec §[var].map_pf.
-pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i64 {
+pub fn mapPf(caller: *Thread, vmar_handle: u64, pairs: []const u64) i64 {
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -481,8 +481,8 @@ pub fn mapPf(caller: *ExecutionContext, vmar_handle: u64, pairs: []const u64) i6
 }
 
 /// `map_mmio` syscall handler. Spec §[var].map_mmio.
-pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+pub fn mapMmio(caller: *Thread, vmar_handle: u64, device_region: u64) i64 {
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
     const vmar_slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, vmar_slot) orelse return errors.E_BADCAP;
 
@@ -566,8 +566,8 @@ pub fn mapMmio(caller: *ExecutionContext, vmar_handle: u64, device_region: u64) 
 }
 
 /// `unmap` syscall handler. Spec §[var].unmap.
-pub fn unmap(caller: *ExecutionContext, vmar_handle: u64, selectors: []const u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+pub fn unmap(caller: *Thread, vmar_handle: u64, selectors: []const u64) i64 {
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -621,10 +621,10 @@ pub fn unmap(caller: *ExecutionContext, vmar_handle: u64, selectors: []const u64
 }
 
 /// `remap` syscall handler. Spec §[var].remap.
-pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 {
+pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
     if (new_cur_rwx >> 3 != 0) return errors.E_INVAL;
 
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
     const slot: u12 = @truncate(vmar_handle & 0xFFF);
     const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
 
@@ -747,8 +747,8 @@ pub fn remap(caller: *ExecutionContext, vmar_handle: u64, new_cur_rwx: u64) i64 
 }
 
 /// `snapshot` syscall handler. Spec §[var].snapshot.
-pub fn snapshot(caller: *ExecutionContext, target_vmar: u64, source_vmar: u64) i64 {
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+pub fn snapshot(caller: *Thread, target_vmar: u64, source_vmar: u64) i64 {
+    const domain = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
     const t_slot: u12 = @truncate(target_vmar & 0xFFF);
     const s_slot: u12 = @truncate(source_vmar & 0xFFF);
 
@@ -901,7 +901,7 @@ pub fn destroyVmar(v: *VMAR) void {
 ///
 /// Skipping the shootdown is only legal AFTER `awaitDomainQuiesced`
 /// has confirmed that no core has the dying CD's translation root
-/// loaded and no core holds one of its ECs in its dispatch slot
+/// loaded and no core holds one of its Threads in its dispatch slot
 /// (stygia-1im). Do not call this from a context that cannot make that
 /// guarantee — use `destroyVmar` there instead.
 pub fn destroyVmarDuringDomainTeardown(v_ref: SlabRef(VMAR), addr_space_root: PAddr) void {
@@ -1374,7 +1374,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // release before invoking the port-IO emulator. Spec
             // §[port_io_virtualization] tests 06/09/10/11 require the
             // emulator to fire `memory_fault` / `thread_fault` inline
-            // and yield the EC; in those paths the emulator never
+            // and yield the thread; in those paths the emulator never
             // returns, so a still-held VMAR `_gen_lock` would strand
             // forever and deadlock any future walk of the domain's
             // `vars[]`. The DeviceRegion pointer is stable for the
@@ -1519,16 +1519,16 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
 /// `var_base` is a pre-snapshot copy of `v.base_vaddr.addr` taken
 /// under the VMAR's `_gen_lock` by `handlePageFault`; the lock has
 /// already been released because the emulator may suspend or
-/// terminate the running EC (firing thread_fault / memory_fault
+/// terminate the running thread (firing thread_fault / memory_fault
 /// inline per spec tests 06/09/10/11) and a still-held lock would
-/// strand. The currently-dispatched EC is `scheduler.currentEc()` —
+/// strand. The currently-dispatched thread is `scheduler.currentThread()` —
 /// it owns the page-fault frame and is the target of any inline
 /// event delivery.
 ///
 /// Always returns 0 on successful emulation (the emulator advanced
 /// the user RIP and the caller iretq's the user back to the next
 /// instruction). On inline-fired event paths the emulator yields
-/// and never returns; the caller's iretq window resumes whatever EC
+/// and never returns; the caller's iretq window resumes whatever thread
 /// the scheduler dispatches next.
 fn decodePortIoFault(
     cd: *CapabilityDomain,
@@ -1537,9 +1537,9 @@ fn decodePortIoFault(
     dev: *DeviceRegion,
 ) i64 {
     _ = cd;
-    // caller-pinned: currentEc() is the EC whose page-fault we're
+    // caller-pinned: currentThread() is the thread whose page-fault we're
     // servicing; its kernel stack is the running stack and its bound
     // domain is alive across this handler.
-    const ec = scheduler.currentEc() orelse return errors.E_BADADDR;
-    return stygia.arch.dispatch.port_io.emulatePortIoFault(ec, fault_vaddr, var_base, dev);
+    const thread = scheduler.currentThread() orelse return errors.E_BADADDR;
+    return stygia.arch.dispatch.port_io.emulatePortIoFault(thread, fault_vaddr, var_base, dev);
 }

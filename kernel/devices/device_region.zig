@@ -527,7 +527,7 @@ pub fn ack(dr: *DeviceRegion, callers_field1_paddr: PAddr) u64 {
 /// Hardware IRQ entry. Per Spec §[device_irq]:
 ///   1. Mask the line (kept masked until `ack` to coalesce duplicates).
 ///   2. Bump every domain-local copy's `irq_count` (saturating u64).
-///   3. Wake recv-blocked ECs that may be sitting in `futex_wait_val`
+///   3. Wake recv-blocked Threads that may be sitting in `futex_wait_val`
 ///      against any of those counters.
 ///
 /// Called from per-arch ISR context. The caller must already have
@@ -566,7 +566,7 @@ pub fn onIrq(snapshot: IrqSnapshot) void {
     // copy bump `field1.irq_count` saturating at u64::MAX via
     // `userio.atomicAddU64Saturating` and futex-wake every waiter parked
     // in `futex_wait_val` on that paddr. Idle remote cores hosting a
-    // recv-blocked EC are kicked from inside `futex.wake` via
+    // recv-blocked thread are kicked from inside `futex.wake` via
     // `scheduler.enqueueOnCore` -> `arch.smp.sendWakeIpi`, so this
     // path doesn't need its own IPI fan-out.
     //

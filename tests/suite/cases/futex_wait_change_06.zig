@@ -23,7 +23,7 @@
 //
 //   We seed the watched word with value 0 and pass target = 1, so
 //   `*addr == target` is false at entry and stays false for the whole
-//   call (no other EC ever writes to it). With no other EC issuing a
+//   call (no other thread ever writes to it). With no other thread issuing a
 //   futex_wake on this address either, the only remaining return path
 //   the spec defines is the timeout one.
 //

@@ -6,20 +6,20 @@
 //   The child capability domain's table is populated by the kernel at
 //   `create_capability_domain` time:
 //     slot 0  → self
-//     slot 1  → initial EC
+//     slot 1  → initial thread
 //     slot 2  → self-IDC
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid
 //   as a port handle.
 //
-//   To exercise the [2] BADCAP gate we must pass a valid EC handle
+//   To exercise the [2] BADCAP gate we must pass a valid thread handle
 //   for [1]; otherwise the [1] BADCAP gate (test 01) would preempt
-//   it. Slot 1 is the initial EC for this domain and is guaranteed
-//   valid as an EC handle.
+//   it. Slot 1 is the initial thread for this domain and is guaranteed
+//   valid as an thread handle.
 //
 // Action
-//   1. suspend(self_ec, invalid_port_slot) — must return E_BADCAP
+//   1. suspend(self_thread, invalid_port_slot) — must return E_BADCAP
 //      because the port slot is empty.
 //
 // Assertions
@@ -35,13 +35,13 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Slot 1 is the initial EC — guaranteed a valid EC handle by the
+    // Slot 1 is the initial thread — guaranteed a valid thread handle by the
     // create_capability_domain table layout. Slot 4095 is guaranteed
     // empty, so referencing it as a port handle must trip E_BADCAP.
-    const self_ec: u12 = 1;
+    const self_thread: u12 = 1;
     const empty_slot: u12 = caps.HANDLE_TABLE_MAX - 1;
 
-    const result = syscall.suspendEc(self_ec, empty_slot, &.{});
+    const result = syscall.suspendThread(self_thread, empty_slot, &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_BADCAP)) {
         testing.fail(1);

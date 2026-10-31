@@ -9,7 +9,7 @@
 //!     match the DIE's qualified `DW_AT_name` against the entity table
 //!
 //! This is the bridge that lets a downstream tool resolve, e.g.,
-//! `sched.scheduler.core_states[0].current_ec` purely via SQL: variable
+//! `sched.scheduler.core_states[0].current_thread` purely via SQL: variable
 //! address from `bin_symbol`, element stride from the array's element type
 //! `size`, field offset from `type_field.offset`.
 //!

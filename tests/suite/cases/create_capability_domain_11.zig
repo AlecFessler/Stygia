@@ -90,7 +90,7 @@ pub fn main(cap_table_base: u64) void {
         ceilings_inner, // [2]
         ceilings_outer, // [3]
         0, // [4] elf_pf — invalid by design
-        0, // [5] initial_ec_affinity
+        0, // [5] initial_thread_affinity
         &[_]u64{}, // [6+] no passed handles
     );
 
@@ -141,7 +141,7 @@ fn runFaithfulProbe(
         (@as(u64, new_vm_ceiling) << 40);
     const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
-    const result = syscall.createCapabilityDomain(0, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(0, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_thread_affinity
         &[_]u64{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {

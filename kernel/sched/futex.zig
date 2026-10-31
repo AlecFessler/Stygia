@@ -4,11 +4,11 @@
 //! The kernel hashes the watched physical address into one of
 //! `BUCKET_COUNT` buckets, each holding a priority-ordered intrusive
 //! queue of `WaitNode`s. A multi-address wait allocates one `WaitNode`
-//! per watched address out of the EC's own
-//! `futex_wait_nodes_storage[MAX_FUTEX_ADDRS]` array, so the EC
+//! per watched address out of the thread's own
+//! `futex_wait_nodes_storage[MAX_FUTEX_ADDRS]` array, so the thread
 //! simultaneously occupies N independent bucket chains without aliasing
 //! a shared link — the per-bucket queues cannot cross-pollute the way
-//! they would if every bucket reached for the same EC link slot.
+//! they would if every bucket reached for the same thread link slot.
 
 const std = @import("std");
 const stygia = @import("stygia");
@@ -19,9 +19,9 @@ const errors = stygia.syscall.errors;
 const sched = stygia.sched.scheduler;
 const lifecycle = stygia.sched.lifecycle;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const PAddr = stygia.memory.address.PAddr;
-const Priority = stygia.sched.execution_context.Priority;
+const Priority = stygia.sched.thread.Priority;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
 const VAddr = stygia.memory.address.VAddr;
@@ -30,20 +30,20 @@ const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
 pub const MAX_FUTEX_ADDRS = 63;
 
-// Internal sentinel stored in `EC.futex_deadline_ns` by the timer
-// pass to mark "this EC was woken by deadline expiry, not by a peer
+// Internal sentinel stored in `thread.futex_deadline_ns` by the timer
+// pass to mark "this thread was woken by deadline expiry, not by a peer
 // `futex_wake`". `0` is reserved for "no wait active"; any real
 // deadline is the wall clock at the time the wait was entered, so
 // UINT64_MAX is far enough in the future to be unambiguous.
 const FUTEX_TIMEOUT_SENTINEL: u64 = ~@as(u64, 0);
 
-/// Per-(EC, bucket) wait entry. Allocated out of the waiting EC's
+/// Per-(thread, bucket) wait entry. Allocated out of the waiting thread's
 /// `futex_wait_nodes_storage[MAX_FUTEX_ADDRS]` array — one per address
 /// in a multi-address wait — and threaded into bucket queues via its
 /// own `next` field. Each node carries its own link slot so
 /// multi-address waits cannot cross-pollute the chains.
 pub const WaitNode = struct {
-    ec: SlabRef(ExecutionContext),
+    thread: SlabRef(Thread),
     paddr: PAddr,
     next: ?*WaitNode = null,
     priority: Priority,
@@ -74,7 +74,7 @@ const Bucket = struct {
 var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
 
 var timed_lock: SpinLock = .{ .class = "futex.timed_lock" };
-var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext{null} ** MAX_TIMED_WAITERS;
+var timed_waiters: [MAX_TIMED_WAITERS]?*Thread = [_]?*Thread{null} ** MAX_TIMED_WAITERS;
 
 /// Per-core BSS scratch for `expireTimedWaiters` Phase 1 → Phase 2
 /// hand-off. At 64 × 16 = 1 KiB the snapshot used to live on the IRQ
@@ -86,12 +86,12 @@ var timed_waiters: [MAX_TIMED_WAITERS]?*ExecutionContext = [_]?*ExecutionContext
 /// per core is safe: `schedTimerHandler` runs to completion in IRQ
 /// context with IRQs masked, never recurses, and each core has its
 /// own timer.
-const Snapshot = struct { ec: SlabRef(ExecutionContext), deadline: u64 };
+const Snapshot = struct { thread: SlabRef(Thread), deadline: u64 };
 var expire_timed_scratch: [sched.MAX_CORES][MAX_TIMED_WAITERS]Snapshot = undefined;
 
 /// `timed_lock` ordered_group. The wait paths take a bucket.lock first
 /// then call `addTimedWaiter` (which acquires `timed_lock`); the timer
-/// IRQ path takes `timed_lock` then per-EC bucket.locks. Tagging the
+/// IRQ path takes `timed_lock` then per-thread bucket.locks. Tagging the
 /// timed_lock acquisition with a non-zero ordered_group opts out of
 /// pair-edge cycle detection on the (bucket.lock, timed_lock) pair so
 /// the two acquisition orders don't seed a phantom AB-BA cycle. Caller
@@ -104,44 +104,44 @@ fn bucketIdx(paddr: PAddr) usize {
     return @intCast((paddr.addr >> 3) % BUCKET_COUNT);
 }
 
-fn addTimedWaiter(ec: *ExecutionContext) bool {
+fn addTimedWaiter(thread: *Thread) bool {
     const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == null) {
-            slot.* = ec;
+            slot.* = thread;
             return true;
         }
     }
     return false;
 }
 
-fn removeTimedWaiter(ec: *ExecutionContext) void {
+fn removeTimedWaiter(thread: *Thread) void {
     const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
-        if (slot.* == ec) {
+        if (slot.* == thread) {
             slot.* = null;
             return;
         }
     }
 }
 
-/// Cancel any futex wait `ec` is currently parked in: remove every
-/// WaitNode owned by `ec` from its bucket queue(s) and drop the
+/// Cancel any futex wait `thread` is currently parked in: remove every
+/// WaitNode owned by `thread` from its bucket queue(s) and drop the
 /// timed_waiters slot if registered. Called from `terminate` /
-/// `destroyExecutionContextLocked` when the dying EC is in
-/// `.futex_wait` — the WaitNodes live in `ec.futex_wait_nodes_storage`,
-/// and freeing the EC slab later leaves the bucket queues holding
+/// `destroyThreadLocked` when the dying thread is in
+/// `.futex_wait` — the WaitNodes live in `thread.futex_wait_nodes_storage`,
+/// and freeing the thread slab later leaves the bucket queues holding
 /// pointers into a recycled struct, faulting (or worse, mis-waking) the
 /// next `wake()` that walks the bucket.
 ///
-/// Safe to call after `ec.state` is no longer `.futex_wait` — the loop
+/// Safe to call after `thread.state` is no longer `.futex_wait` — the loop
 /// is bounded by `futex_bucket_count` and the per-bucket `pq.remove`
 /// is idempotent on absent nodes.
-pub fn cancelWait(ec: *ExecutionContext) void {
-    const nodes = ec.futex_wait_nodes orelse return;
-    const count: usize = ec.futex_bucket_count;
+pub fn cancelWait(thread: *Thread) void {
+    const nodes = thread.futex_wait_nodes orelse return;
+    const count: usize = thread.futex_bucket_count;
     var i: usize = 0;
     while (i < count) {
         const node = &nodes[i];
@@ -151,33 +151,33 @@ pub fn cancelWait(ec: *ExecutionContext) void {
         bucket.lock.unlockIrqRestore(birq);
         i += 1;
     }
-    if (ec.futex_deadline_ns != 0) removeTimedWaiter(ec);
-    ec.futex_bucket_count = 0;
-    ec.futex_wait_nodes = null;
-    ec.futex_wait_vaddrs = null;
-    ec.futex_deadline_ns = 0;
-    ec.wait.clear();
+    if (thread.futex_deadline_ns != 0) removeTimedWaiter(thread);
+    thread.futex_bucket_count = 0;
+    thread.futex_wait_nodes = null;
+    thread.futex_wait_vaddrs = null;
+    thread.futex_deadline_ns = 0;
+    thread.wait.clear();
 }
 
-pub fn repairPriority(ec: *ExecutionContext) void {
-    const nodes = ec.futex_wait_nodes orelse return;
-    const count: usize = ec.futex_bucket_count;
+pub fn repairPriority(thread: *Thread) void {
+    const nodes = thread.futex_wait_nodes orelse return;
+    const count: usize = thread.futex_bucket_count;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const node = &nodes[i];
         const bucket = &buckets[bucketIdx(node.paddr)];
         const birq = bucket.lock.lockIrqSave(@src());
         if (bucket.pq.remove(node)) {
-            node.priority = ec.priority;
+            node.priority = thread.priority;
             bucket.pq.enqueue(node);
         } else {
-            node.priority = ec.priority;
+            node.priority = thread.priority;
         }
         bucket.lock.unlockIrqRestore(birq);
     }
 }
 
-/// Remove every node owned by `ec` from its bucket(s), without
+/// Remove every node owned by `thread` from its bucket(s), without
 /// touching the bucket whose lock the caller already holds (identified
 /// by `held_idx`; pass an out-of-range value if none is held). Same-
 /// bucket nodes other than `except_node` are removed under the held
@@ -187,13 +187,13 @@ pub fn repairPriority(ec: *ExecutionContext) void {
 /// order to match the global ordering used by `acquireBucketLocks`.
 /// This is required: two concurrent wakes on different paddrs (e.g.
 /// IRQ-driven wakes on two cores) can each hold a different `held_idx`
-/// while reaching across to clean up the same EC's other nodes; a
+/// while reaching across to clean up the same thread's other nodes; a
 /// storage-order traversal would seed a classic AB-BA cycle. The skip
 /// of `held_idx` plus ascending acquisition of the rest keeps the
 /// wake-side acquisition graph identical to the wait-side one.
-fn removeNodesExcept(ec: *ExecutionContext, except_node: *const WaitNode, held_idx: usize) void {
-    const nodes = ec.futex_wait_nodes orelse return;
-    const count: usize = ec.futex_bucket_count;
+fn removeNodesExcept(thread: *Thread, except_node: *const WaitNode, held_idx: usize) void {
+    const nodes = thread.futex_wait_nodes orelse return;
+    const count: usize = thread.futex_bucket_count;
 
     // Insertion-sort the surviving nodes' storage indices by bucket
     // index ascending. `count <= MAX_FUTEX_ADDRS = 63`, so quadratic
@@ -244,12 +244,12 @@ fn removeNodesExcept(ec: *ExecutionContext, except_node: *const WaitNode, held_i
     }
 }
 
-/// Pick the destination core for a wakeup, honoring `ec.affinity`.
+/// Pick the destination core for a wakeup, honoring `thread.affinity`.
 /// `affinity == 0` is the spec-defined "any core" sentinel; we fall
 /// back to the local core in that case to keep cache locality.
-fn pickCoreForEc(ec: *ExecutionContext) u64 {
-    if (ec.affinity == 0) return arch.smp.coreID();
-    return @ctz(ec.affinity);
+fn pickCoreForThread(thread: *Thread) u64 {
+    if (thread.affinity == 0) return arch.smp.coreID();
+    return @ctz(thread.affinity);
 }
 
 fn peekFutexWaiter(bucket: *Bucket) ?*WaitNode {
@@ -270,7 +270,7 @@ fn peekMatchingWaiter(bucket: *Bucket, paddr: PAddr, requeue: *WaitNodePriorityQ
     }
 }
 
-/// `futex_wake` — wake up to `count` ECs blocked on `paddr`.
+/// `futex_wake` — wake up to `count` Threads blocked on `paddr`.
 /// Spec §[futex].futex_wake. Wake order is priority-ordered (highest
 /// first; FIFO within a priority).
 pub fn wake(paddr: PAddr, count: u32) u64 {
@@ -288,75 +288,75 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     while (woken < count) {
         const node = peekMatchingWaiter(bucket, paddr, &requeue) orelse break;
 
-        // stygia-qbx: the EC behind this node can be destroyed by a
+        // stygia-qbx: the thread behind this node can be destroyed by a
         // DOMAIN teardown running on another core at any point in this
         // iteration. The old comment here claimed the node's residence
-        // in our bucket pinned the EC ("cannot have been freed"); that
+        // in our bucket pinned the thread ("cannot have been freed"); that
         // is not true. `cancelWait` unlinks a victim's nodes under this
         // same bucket lock, so while we hold it a concurrent teardown
         // simply BLOCKS — the node stays visible to us — and the gen
         // has typically already been bumped dead by then. The first
-        // acquire below catches an EC that is already dead; the danger
+        // acquire below catches an thread that is already dead; the danger
         // was everything after the old unconditional unlock.
         //
-        // Phase 1 — validate under the EC's gen lock and claim the wait
+        // Phase 1 — validate under the thread's gen lock and claim the wait
         // episode before unlinking it. That keeps the lifecycle state word
         // as the single winner election: a racing timeout or teardown that
         // cannot CAS waiting/parking away knows this wake owns the payload.
-        const wake_lr = node.ec.lockIrqSave(@src()) catch {
+        const wake_lr = node.thread.lockIrqSave(@src()) catch {
             _ = bucket.pq.dequeue();
             continue;
         };
-        const ec = wake_lr.ptr;
-        // wake_index is the offset of this node in the EC's
+        const thread = wake_lr.ptr;
+        // wake_index is the offset of this node in the thread's
         // wait_nodes array — the index of the address in the original
         // multi-address wait that matched.
-        const nodes = ec.futex_wait_nodes orelse {
+        const nodes = thread.futex_wait_nodes orelse {
             // Raced a cancel that already cleared the array; the node is
             // stale. Drop it and move on rather than deref a null.
             _ = bucket.pq.dequeue();
-            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            node.thread.unlockIrqRestore(wake_lr.irq_state);
             continue;
         };
         const node_idx: usize = (@intFromPtr(node) - @intFromPtr(nodes)) / @sizeOf(WaitNode);
-        if (node_idx >= ec.futex_bucket_count or &nodes[node_idx] != node) {
+        if (node_idx >= thread.futex_bucket_count or &nodes[node_idx] != node) {
             _ = bucket.pq.dequeue();
-            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            node.thread.unlockIrqRestore(wake_lr.irq_state);
             continue;
         }
 
-        const claim = lifecycle.beginWaitingClaimPinned(ec);
+        const claim = lifecycle.beginWaitingClaimPinned(thread);
         if (claim == .none) {
             _ = bucket.pq.dequeue();
-            removeNodesExcept(ec, node, wake_idx);
-            node.ec.unlockIrqRestore(wake_lr.irq_state);
+            removeNodesExcept(thread, node, wake_idx);
+            node.thread.unlockIrqRestore(wake_lr.irq_state);
             continue;
         }
         const dequeued = bucket.pq.dequeue() orelse unreachable;
         std.debug.assert(dequeued == node);
-        // Drop this EC's other nodes from every bucket they live in
+        // Drop this thread's other nodes from every bucket they live in
         // (skipping the just-dequeued node and using the held lock
         // for any same-bucket sibling).
-        removeNodesExcept(ec, node, wake_idx);
-        ec.futex_wake_index = @intCast(node_idx);
-        if (ec.futex_deadline_ns != 0) {
-            ec.futex_deadline_ns = 0;
-            removeTimedWaiter(ec);
+        removeNodesExcept(thread, node, wake_idx);
+        thread.futex_wake_index = @intCast(node_idx);
+        if (thread.futex_deadline_ns != 0) {
+            thread.futex_deadline_ns = 0;
+            removeTimedWaiter(thread);
         }
         // Spec §[futex_wait_val] / §[futex_wait_change]: on a wake the
         // syscall returns with vreg 1 set to the user vaddr that was
-        // woken. The waiting EC is parked in user-mode space (its
+        // woken. The waiting thread is parked in user-mode space (its
         // syscall handler frame already returned a placeholder); the
-        // resume path iretq's via `ec.ctx`, so write the real return
+        // resume path iretq's via `thread.ctx`, so write the real return
         // value into ctx.regs.rax (vreg 1) before marking it ready.
-        if (ec.futex_wait_vaddrs) |vaddrs_ptr| {
-            arch_syscall.setSyscallReturn(ec.ctx, vaddrs_ptr[node_idx]);
+        if (thread.futex_wait_vaddrs) |vaddrs_ptr| {
+            arch_syscall.setSyscallReturn(thread.ctx, vaddrs_ptr[node_idx]);
         }
-        ec.futex_bucket_count = 0;
-        ec.futex_wait_nodes = null;
-        ec.futex_wait_vaddrs = null;
-        const dest_core: u8 = @intCast(pickCoreForEc(ec));
-        node.ec.unlockIrqRestore(wake_lr.irq_state);
+        thread.futex_bucket_count = 0;
+        thread.futex_wait_nodes = null;
+        thread.futex_wait_vaddrs = null;
+        const dest_core: u8 = @intCast(pickCoreForThread(thread));
+        node.thread.unlockIrqRestore(wake_lr.irq_state);
 
         // Phase 3 — enqueue OUTSIDE the gen lock. `enqueueOnCore` takes
         // `core_locks[]`, and nesting that under a gen lock is the
@@ -364,11 +364,11 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         // here means this fix adds no new lock-order edge: the only
         // nesting is bucket→gen, which the original code already had.
         switch (claim) {
-            .claimed => sched.enqueueOnCore(dest_core, ec),
-            .pended => lifecycle.publishPendedPayload(ec),
+            .claimed => sched.enqueueOnCore(dest_core, thread),
+            .pended => lifecycle.publishPendedPayload(thread),
             .none => unreachable,
         }
-        lifecycle.releasePin(ec);
+        lifecycle.releasePin(thread);
         woken += 1;
     }
 
@@ -392,7 +392,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 ///                (immediate, no block) or the woken address (after
 ///                blocking).
 ///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
-pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
+pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64, count: usize, timeout_ns: u64, thread: *Thread) i64 {
     var sorted: [MAX_FUTEX_ADDRS]u8 = undefined;
     for (0..count) |i| sorted[i] = @intCast(i);
     sortByBucket(sorted[0..count], addrs);
@@ -416,39 +416,39 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
     const max_timeout: u64 = @bitCast(@as(i64, -1));
     if (timeout_ns != max_timeout) {
         const now_ns = arch.time.getMonotonicClock().now();
-        ec.futex_deadline_ns = now_ns +| timeout_ns;
+        thread.futex_deadline_ns = now_ns +| timeout_ns;
     } else {
-        ec.futex_deadline_ns = 0;
+        thread.futex_deadline_ns = 0;
     }
 
-    // Store WaitNodes and vaddrs in EC-resident storage rather than on
+    // Store WaitNodes and vaddrs in thread-resident storage rather than on
     // the caller's kernel stack: `waitVal` returns a placeholder to
-    // `syscallDispatch` before the EC actually parks, so the stack
+    // `syscallDispatch` before the thread actually parks, so the stack
     // frame is reclaimed before wake/expiry runs. The bucket and
     // wake path both keep `&nodes[i]` / `vaddrs_ptr` references that
     // must remain valid until the wake completes.
-    const nodes = &ec.futex_wait_nodes_storage;
-    const vaddrs_storage = &ec.futex_wait_vaddrs_storage;
-    const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    const nodes = &thread.futex_wait_nodes_storage;
+    const vaddrs_storage = &thread.futex_wait_vaddrs_storage;
+    const thread_ref = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
     for (0..count) |i| {
         nodes[i] = .{
-            .ec = ec_ref,
+            .thread = thread_ref,
             .paddr = addrs[i],
             .next = null,
-            .priority = ec.priority,
+            .priority = thread.priority,
         };
         vaddrs_storage[i] = vaddrs[i];
     }
-    ec.futex_wait_nodes = nodes;
-    ec.futex_wait_vaddrs = vaddrs_storage;
-    ec.futex_bucket_count = @intCast(count);
+    thread.futex_wait_nodes = nodes;
+    thread.futex_wait_vaddrs = vaddrs_storage;
+    thread.futex_bucket_count = @intCast(count);
     const owner_core: u8 = @truncate(arch.smp.coreID());
-    if (!lifecycle.prepareRunningPark(ec, owner_core, .futex)) {
+    if (!lifecycle.prepareRunningPark(thread, owner_core, .futex)) {
         releaseBucketLocks(&lock_state);
-        ec.futex_wait_nodes = null;
-        ec.futex_wait_vaddrs = null;
-        ec.futex_bucket_count = 0;
-        ec.futex_deadline_ns = 0;
+        thread.futex_wait_nodes = null;
+        thread.futex_wait_vaddrs = null;
+        thread.futex_bucket_count = 0;
+        thread.futex_deadline_ns = 0;
         return errors.E_INVAL;
     }
 
@@ -457,36 +457,36 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
         (&buckets[idx]).pq.enqueue(&nodes[i]);
     }
 
-    if (ec.futex_deadline_ns != 0) {
-        if (!addTimedWaiter(ec)) {
+    if (thread.futex_deadline_ns != 0) {
+        if (!addTimedWaiter(thread)) {
             for (0..count) |i| {
                 _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
-            _ = lifecycle.cas(ec, .parking, .running);
-            ec.owner_core = owner_core;
-            ec.wait.clear();
-            ec.futex_wait_nodes = null;
-            ec.futex_wait_vaddrs = null;
-            ec.futex_bucket_count = 0;
-            ec.futex_deadline_ns = 0;
+            _ = lifecycle.cas(thread, .parking, .running);
+            thread.owner_core = owner_core;
+            thread.wait.clear();
+            thread.futex_wait_nodes = null;
+            thread.futex_wait_vaddrs = null;
+            thread.futex_bucket_count = 0;
+            thread.futex_deadline_ns = 0;
             return errors.E_NOMEM;
         }
     }
 
     releaseBucketLocks(&lock_state);
 
-    // Park the EC: drop currency on the local core. The syscall
+    // Park the thread: drop currency on the local core. The syscall
     // dispatcher (`arch.x64.interrupts.syscallDispatch`) sees
-    // `current_ec == null` and routes to `scheduler.hopParkRun()`
-    // instead of iretq'ing back to the now-parked user EC. The
-    // wake/timeout path overwrites this EC's syscall-return slot with
+    // `current_thread == null` and routes to `scheduler.hopParkRun()`
+    // instead of iretq'ing back to the now-parked user thread. The
+    // wake/timeout path overwrites this thread's syscall-return slot with
     // the real return value (vaddr or E_TIMEOUT) before re-marking it
     // ready, so the placeholder returned here only needs to be a value
-    // the parked EC will never observe.
+    // the parked thread will never observe.
     //
     // `on_cpu` is NOT cleared here: this core keeps executing on the
-    // EC's kstack until the park-kstack hop, and the wake side's
+    // thread's kstack until the park-kstack hop, and the wake side's
     // phase-2 spin gates its enqueue on exactly this flag. Stash the
     // release for the hop instead (see PerCore.pending_kstack_release).
     return 0;
@@ -503,7 +503,7 @@ pub fn waitVal(addrs: []const PAddr, vaddrs: []const u64, expected: []const u64,
 ///                (immediate, no block) or the woken address (after
 ///                blocking).
 ///   E_TIMEOUT  if timeout expired, E_NOMEM if no timed waiter slot.
-pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u64, count: usize, timeout_ns: u64, ec: *ExecutionContext) i64 {
+pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u64, count: usize, timeout_ns: u64, thread: *Thread) i64 {
     var sorted: [MAX_FUTEX_ADDRS]u8 = undefined;
     for (0..count) |i| sorted[i] = @intCast(i);
     sortByBucket(sorted[0..count], addrs);
@@ -527,34 +527,34 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
     const max_timeout: u64 = @bitCast(@as(i64, -1));
     if (timeout_ns != max_timeout) {
         const now_ns = arch.time.getMonotonicClock().now();
-        ec.futex_deadline_ns = now_ns +| timeout_ns;
+        thread.futex_deadline_ns = now_ns +| timeout_ns;
     } else {
-        ec.futex_deadline_ns = 0;
+        thread.futex_deadline_ns = 0;
     }
 
-    // Same EC-resident storage discipline as `waitVal`.
-    const nodes = &ec.futex_wait_nodes_storage;
-    const vaddrs_storage = &ec.futex_wait_vaddrs_storage;
-    const ec_ref = SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen());
+    // Same thread-resident storage discipline as `waitVal`.
+    const nodes = &thread.futex_wait_nodes_storage;
+    const vaddrs_storage = &thread.futex_wait_vaddrs_storage;
+    const thread_ref = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
     for (0..count) |i| {
         nodes[i] = .{
-            .ec = ec_ref,
+            .thread = thread_ref,
             .paddr = addrs[i],
             .next = null,
-            .priority = ec.priority,
+            .priority = thread.priority,
         };
         vaddrs_storage[i] = vaddrs[i];
     }
-    ec.futex_wait_nodes = nodes;
-    ec.futex_wait_vaddrs = vaddrs_storage;
-    ec.futex_bucket_count = @intCast(count);
+    thread.futex_wait_nodes = nodes;
+    thread.futex_wait_vaddrs = vaddrs_storage;
+    thread.futex_bucket_count = @intCast(count);
     const owner_core: u8 = @truncate(arch.smp.coreID());
-    if (!lifecycle.prepareRunningPark(ec, owner_core, .futex)) {
+    if (!lifecycle.prepareRunningPark(thread, owner_core, .futex)) {
         releaseBucketLocks(&lock_state);
-        ec.futex_wait_nodes = null;
-        ec.futex_wait_vaddrs = null;
-        ec.futex_bucket_count = 0;
-        ec.futex_deadline_ns = 0;
+        thread.futex_wait_nodes = null;
+        thread.futex_wait_vaddrs = null;
+        thread.futex_bucket_count = 0;
+        thread.futex_deadline_ns = 0;
         return errors.E_INVAL;
     }
 
@@ -562,26 +562,26 @@ pub fn waitChange(addrs: []const PAddr, vaddrs: []const u64, targets: []const u6
         (&buckets[bucketIdx(addrs[i])]).pq.enqueue(&nodes[i]);
     }
 
-    if (ec.futex_deadline_ns != 0) {
-        if (!addTimedWaiter(ec)) {
+    if (thread.futex_deadline_ns != 0) {
+        if (!addTimedWaiter(thread)) {
             for (0..count) |i| {
                 _ = (&buckets[bucketIdx(addrs[i])]).pq.remove(&nodes[i]);
             }
             releaseBucketLocks(&lock_state);
-            _ = lifecycle.cas(ec, .parking, .running);
-            ec.owner_core = owner_core;
-            ec.wait.clear();
-            ec.futex_wait_nodes = null;
-            ec.futex_wait_vaddrs = null;
-            ec.futex_bucket_count = 0;
-            ec.futex_deadline_ns = 0;
+            _ = lifecycle.cas(thread, .parking, .running);
+            thread.owner_core = owner_core;
+            thread.wait.clear();
+            thread.futex_wait_nodes = null;
+            thread.futex_wait_vaddrs = null;
+            thread.futex_bucket_count = 0;
+            thread.futex_deadline_ns = 0;
             return errors.E_NOMEM;
         }
     }
 
     releaseBucketLocks(&lock_state);
 
-    // Park the EC: see `waitVal` for the full rationale, including why
+    // Park the thread: see `waitVal` for the full rationale, including why
     // the `on_cpu` release is stashed for the park-kstack hop rather
     // than performed here.
     return 0;
@@ -642,13 +642,13 @@ fn releaseBucketLocks(lock_state: *const BucketLockState) void {
     }
 }
 
-/// Walk the timed-waiter list, wake each EC whose deadline has passed.
+/// Walk the timed-waiter list, wake each thread whose deadline has passed.
 /// Called from the per-core timer tick.
 pub fn expireTimedWaiters() void {
     const now_ns = arch.time.getMonotonicClock().now();
 
-    // Phase 1: snapshot expired ECs + clear their slots, all under
-    // timed_lock. Capturing the deadline lets phase 2 detect an EC
+    // Phase 1: snapshot expired Threads + clear their slots, all under
+    // timed_lock. Capturing the deadline lets phase 2 detect an thread
     // that was woken and re-registered as a fresh waiter between phases.
     //
     // The split is required by lock-order: wait() and wake() acquire
@@ -661,70 +661,70 @@ pub fn expireTimedWaiters() void {
         const irq = timed_lock.lockIrqSaveOrdered(@src(), FUTEX_TIMED_GROUP);
         defer timed_lock.unlockIrqRestore(irq);
         for (&timed_waiters) |*slot| {
-            const ec = slot.* orelse continue;
-            if (!lifecycle.tryPinLive(ec)) {
+            const thread = slot.* orelse continue;
+            if (!lifecycle.tryPinLive(thread)) {
                 slot.* = null;
                 continue;
             }
-            // Cross-core terminate may have rotated this EC's slab gen to
+            // Cross-core terminate may have rotated this thread's slab gen to
             // even (freed) and left a stale entry here — `terminate` /
-            // `destroyExecutionContextLocked` don't reach into this list.
+            // `destroyThreadLocked` don't reach into this list.
             // Drop dead entries before SlabRef.init's `gen % 2 == 1`
             // assertion fires (the polymorphic source of every smp=4
             // panic in the futex_wait_change_* + futex_wake_* test
             // batch).
-            const gen = ec._gen_lock.currentGen();
+            const gen = thread._gen_lock.currentGen();
             if (gen % 2 == 0) {
-                lifecycle.releasePin(ec);
+                lifecycle.releasePin(thread);
                 slot.* = null;
                 continue;
             }
-            const deadline = ec.futex_deadline_ns;
+            const deadline = thread.futex_deadline_ns;
             if (deadline == 0 or now_ns < deadline) {
-                lifecycle.releasePin(ec);
+                lifecycle.releasePin(thread);
                 continue;
             }
-            // caller-pinned: `ec` is pinned by the `timed_waiters` slot we
+            // caller-pinned: `thread` is pinned by the `timed_waiters` slot we
             // just dequeued; capturing its current gen here gives the
             // phase-2 walk a stale-detector if the slot is freed and
             // reallocated between phases. The deadline re-check after
-            // re-locking still rejects re-registered ECs.
+            // re-locking still rejects re-registered Threads.
             expired[expired_count] = .{
-                .ec = SlabRef(ExecutionContext).init(ec, gen),
+                .thread = SlabRef(Thread).init(thread, gen),
                 .deadline = deadline,
             };
-            lifecycle.releasePin(ec);
+            lifecycle.releasePin(thread);
             expired_count += 1;
             slot.* = null;
         }
     }
 
-    // Phase 2: per-EC, take only bucket.lock (never timed_lock).
+    // Phase 2: per-thread, take only bucket.lock (never timed_lock).
     for (expired[0..expired_count]) |entry| {
-        // caller-pinned: `entry.ec` was captured under timed_lock above
-        // and the EC's slot can only be freed after its bucket waiters
+        // caller-pinned: `entry.thread` was captured under timed_lock above
+        // and the thread's slot can only be freed after its bucket waiters
         // are unwound, which this very phase performs. The gen carried
         // by the SlabRef is the structural staleness backstop; the
         // deadline check below catches the wake/re-wait race.
-        const ec = entry.ec.ptr;
-        if (!lifecycle.tryPinLive(ec)) continue;
-        if (ec._gen_lock.currentGen() != @as(u63, entry.ec.gen)) {
-            lifecycle.releasePin(ec);
+        const thread = entry.thread.ptr;
+        if (!lifecycle.tryPinLive(thread)) continue;
+        if (thread._gen_lock.currentGen() != @as(u63, entry.thread.gen)) {
+            lifecycle.releasePin(thread);
             continue;
         }
         // Re-check deadline. If wake() ran between phases, deadline is
-        // now 0; if the EC was woken and made a new wait, deadline
+        // now 0; if the thread was woken and made a new wait, deadline
         // differs. In both cases this snapshot is stale — skip.
-        if (ec.futex_deadline_ns != entry.deadline) {
-            lifecycle.releasePin(ec);
+        if (thread.futex_deadline_ns != entry.deadline) {
+            lifecycle.releasePin(thread);
             continue;
         }
 
-        const nodes = ec.futex_wait_nodes orelse {
-            lifecycle.releasePin(ec);
+        const nodes = thread.futex_wait_nodes orelse {
+            lifecycle.releasePin(thread);
             continue;
         };
-        const count: usize = ec.futex_bucket_count;
+        const count: usize = thread.futex_bucket_count;
         var removed: bool = false;
         var i: usize = 0;
         while (i < count) {
@@ -737,28 +737,28 @@ pub fn expireTimedWaiters() void {
         }
 
         if (removed) {
-            const claim = lifecycle.beginWaitingClaimPinned(ec);
+            const claim = lifecycle.beginWaitingClaimPinned(thread);
             if (claim == .none) {
-                lifecycle.releasePin(ec);
+                lifecycle.releasePin(thread);
                 continue;
             }
-            ec.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
+            thread.futex_deadline_ns = FUTEX_TIMEOUT_SENTINEL;
             // Spec §[futex_wait_val] [test 06] / §[futex_wait_change]
             // [test 06]: timeout returns E_TIMEOUT in vreg 1. The
-            // waiting EC's syscall handler already returned a
-            // placeholder, so we must overwrite ec.ctx.regs.rax with
-            // the real timeout error before iretq resumes the EC.
-            arch_syscall.setSyscallReturn(ec.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
-            ec.futex_bucket_count = 0;
-            ec.futex_wait_nodes = null;
-            ec.futex_wait_vaddrs = null;
+            // waiting thread's syscall handler already returned a
+            // placeholder, so we must overwrite thread.ctx.regs.rax with
+            // the real timeout error before iretq resumes the thread.
+            arch_syscall.setSyscallReturn(thread.ctx, @bitCast(@as(i64, errors.E_TIMEOUT)));
+            thread.futex_bucket_count = 0;
+            thread.futex_wait_nodes = null;
+            thread.futex_wait_vaddrs = null;
             switch (claim) {
-                .claimed => sched.enqueueOnCore(@intCast(pickCoreForEc(ec)), ec),
-                .pended => lifecycle.publishPendedPayload(ec),
+                .claimed => sched.enqueueOnCore(@intCast(pickCoreForThread(thread)), thread),
+                .pended => lifecycle.publishPendedPayload(thread),
                 .none => unreachable,
             }
-            lifecycle.releasePin(ec);
+            lifecycle.releasePin(thread);
         }
-        lifecycle.releasePin(ec);
+        lifecycle.releasePin(thread);
     }
 }

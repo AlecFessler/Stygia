@@ -159,7 +159,7 @@ pub fn main(cap_table_base: u64) void {
 
     _ = syscall.delete(vmar_handle);
 
-    const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_thread_affinity
         &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {

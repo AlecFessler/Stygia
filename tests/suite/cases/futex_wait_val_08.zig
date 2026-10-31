@@ -1,30 +1,30 @@
 // Spec §[futex_wait_val] — test 08.
 //
-// "[test 08] when another EC calls `futex_wake` on any watched addr,
+// "[test 08] when another thread calls `futex_wake` on any watched addr,
 //  returns with `[1]` set to that addr (caller re-checks the value to
 //  determine whether the condition is actually met or the wake was
 //  spurious)."
 //
 // Strategy
 //   The assertion needs three pieces of state that only fit together
-//   when the test EC and a peer EC live in the same capability domain:
-//     - a shared 8-byte-aligned address whose paddr both ECs key on
+//   when the test thread and a peer thread live in the same capability domain:
+//     - a shared 8-byte-aligned address whose paddr both Threads key on
 //       (a process-global u64 in this ELF's .bss; same address space
 //       because the worker is spawned with `target = 0`),
-//     - a peer EC issuing `futex_wake(addr, count)` so the main EC's
+//     - a peer thread issuing `futex_wake(addr, count)` so the main thread's
 //       `futex_wait_val` has somebody to wake it,
 //     - a coordination shape that doesn't deadlock if the wake races
 //       ahead of the wait or vice versa.
 //
-//   We spawn a worker EC inside this domain with a custom entry
+//   We spawn a worker thread inside this domain with a custom entry
 //   (`workerLoop`) that calls `futex_wake(&shared, 1)` in a tight
 //   loop. The worker's wakes against an empty wait-queue are spec'd
 //   to return 0 woken (§[futex_wake] test 04) and have no other
 //   observable effect, so the worker can hammer wake without any
 //   prior rendezvous; the kernel's preemptive scheduler interleaves
-//   the worker's loop with the main EC's wait.
+//   the worker's loop with the main thread's wait.
 //
-//   The main EC then calls
+//   The main thread then calls
 //     futex_wait_val(timeout = TIMEOUT_NS, pairs = {&shared, *shared})
 //   with `*shared == expected` so the entry-time fast path of test 07
 //   does not fire; the call blocks until either a wake lands (test 08
@@ -40,7 +40,7 @@
 //   passes immediately. If every iteration returns E_TIMEOUT, the
 //   wake never landed despite the worker hammering the address — the
 //   spec assertion under test ("returns with [1] set to that addr"
-//   when another EC calls futex_wake) was never exercised, so we fail
+//   when another thread calls futex_wake) was never exercised, so we fail
 //   with id 4. Any other small (1..15) value in vreg 1 — E_PERM,
 //   E_INVAL, E_BADADDR, etc. other than E_TIMEOUT — means the test's
 //   preconditions are wrong (failing for the wrong reason) and we
@@ -71,9 +71,9 @@
 //       *shared`, so on entry the pair satisfies *addr == expected
 //       and the call must block, not fast-path return.
 //
-//   Neutralize create_execution_context error gates similarly:
+//   Neutralize create_thread error gates similarly:
 //     - test 01 (lacks `crec`): primary grants `crec` to child.
-//     - test 03 (caps ⊄ ec_inner_ceiling): worker_caps fits in the
+//     - test 03 (caps ⊄ thread_inner_ceiling): worker_caps fits in the
 //       low 8 bits and restart_policy = 0; ceiling is 0xFF.
 //     - test 06 (priority > pri ceiling): priority = 0.
 //     - test 08 (stack_pages = 0): stack_pages = 1.
@@ -81,7 +81,7 @@
 //     - test 10 (reserved bits in [1]): all upper bits zeroed.
 //
 // Action
-//   1. create_execution_context(target = 0, caps = {restart_policy=0},
+//   1. create_thread(target = 0, caps = {restart_policy=0},
 //                               entry = &workerLoop,
 //                               stack_pages = 1, affinity = 0)
 //      — must succeed.
@@ -92,7 +92,7 @@
 //      on a non-error vreg 1 that is not &shared.
 //
 // Assertions
-//   1: create_execution_context returned an error word in vreg 1
+//   1: create_thread returned an error word in vreg 1
 //   2: futex_wait_val returned an error code that is not E_TIMEOUT
 //      (preconditions broken, failing for the wrong reason).
 //   3: futex_wait_val returned a non-error vreg 1 that is not the
@@ -108,9 +108,9 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Process-global shared between the test EC and the worker EC. Both
+// Process-global shared between the test thread and the worker thread. Both
 // run in the same capability domain (target = 0 → same address
-// space), so this u64's vaddr is identical in both ECs. u64 globals
+// space), so this u64's vaddr is identical in both Threads. u64 globals
 // in Zig's .bss are 8-byte aligned, so &shared satisfies the
 // futex_wait_val alignment requirement (§[futex_wait_val] test 04).
 var shared: u64 = 0;
@@ -119,9 +119,9 @@ fn workerLoop() callconv(.c) noreturn {
     // Hammer futex_wake on the shared address. Wakes against an
     // empty wait-queue return 0 woken (§[futex_wake] test 04) and
     // have no side effect, so we can spin without any prior
-    // rendezvous with the main EC. When the main EC's
+    // rendezvous with the main thread. When the main thread's
     // futex_wait_val has parked on &shared, the next wake lands and
-    // returns the main EC with [1] = &shared.
+    // returns the main thread with [1] = &shared.
     while (true) {
         _ = syscall.futexWake(@intFromPtr(&shared), 1);
     }
@@ -130,19 +130,19 @@ fn workerLoop() callconv(.c) noreturn {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // §[create_execution_context]: caps word layout — caps in bits
+    // §[create_thread]: caps word layout — caps in bits
     // 0-15, target_caps in 16-31 (ignored for target = self),
-    // priority in 32-33. No EC caps are needed on the worker handle:
-    // the main EC neither suspends, terminates, nor priority-bumps
-    // it. restart_policy = 0 (kill) keeps create_execution_context
+    // priority in 32-33. No thread caps are needed on the worker handle:
+    // the main thread neither suspends, terminates, nor priority-bumps
+    // it. restart_policy = 0 (kill) keeps create_thread
     // off the restart_semantics-test-01 path.
-    const worker_caps = caps.EcCap{ .restart_policy = 0 };
+    const worker_caps = caps.ThreadCap{ .restart_policy = 0 };
     const caps_word: u64 = @as(u64, worker_caps.toU16());
     const entry: u64 = @intFromPtr(&workerLoop);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
-        1, // stack_pages — non-zero (test 08 of create_execution_context)
+        1, // stack_pages — non-zero (test 08 of create_thread)
         0, // target = self → same address space, shared global visible
         0, // affinity = 0 (any core)
     );
@@ -167,7 +167,7 @@ pub fn main(cap_table_base: u64) void {
 
     var attempt: usize = 0;
     while (attempt < MAX_ATTEMPTS) {
-        // Snapshot *shared into `expected`. The main EC writes to
+        // Snapshot *shared into `expected`. The main thread writes to
         // shared exactly nowhere; the worker only calls futex_wake
         // (which does not modify the addr). So *shared == expected
         // on entry — test 07's fast-path is sidestepped and the

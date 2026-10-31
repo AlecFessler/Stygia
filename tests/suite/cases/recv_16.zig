@@ -14,18 +14,18 @@
 //   Producing a sender that observably reports E_ABANDONED requires the
 //   sender to *itself* call `suspend(self, port)` so that there is a
 //   blocked syscall whose return value is the kernel's resolution
-//   verdict. recv_07's pattern (test EC issues `suspend(W, port)` with
+//   verdict. recv_07's pattern (test thread issues `suspend(W, port)` with
 //   [1] != self) queues W as a suspended sender but W never made a
 //   syscall — there is no syscall return for the kernel to resolve, so
 //   E_ABANDONED is not directly observable. recv_16 instead spawns a
-//   worker EC W in the same capability domain, hands W the slot id of
-//   its own EC handle through a shared global, and has W issue
+//   worker thread W in the same capability domain, hands W the slot id of
+//   its own thread handle through a shared global, and has W issue
 //   `suspend(self_slot, port)` from `workerEntry`. That is the syscall
 //   the kernel resumes with E_ABANDONED on delete; W stores the result
 //   in a shared global before halting.
 //
 //   Witness for (a). Yield to the worker so it reaches the blocking
-//   suspend syscall. After recv returns to the test EC, yield to W
+//   suspend syscall. After recv returns to the test thread, yield to W
 //   again and observe `worker_done == 0` — W has not yet returned from
 //   suspend. Per §[capabilities] line 176, the only paths that resolve
 //   the suspended sender are reply on the reply handle and delete on
@@ -38,52 +38,52 @@
 //   waiting, resume them with E_ABANDONED. Release handle"), the
 //   kernel resumes W's `suspend` syscall with E_ABANDONED in vreg 1.
 //   W captures that into `worker_result`, releases `worker_done`, and
-//   halts. The test EC bounded-yield-polls `worker_done`; on
+//   halts. The test thread bounded-yield-polls `worker_done`; on
 //   observation the recorded result must equal E_ABANDONED.
 //
-//   Both ECs run in the same capability domain (target=0 on the
-//   create_execution_context call), so they share the address space —
+//   Both Threads run in the same capability domain (target=0 on the
+//   create_thread call), so they share the address space —
 //   `worker_self_slot`, `worker_port_slot`, `worker_ready`,
 //   `worker_result`, and `worker_done` are process-global side
 //   channels reachable from both ends. The handle table is also shared,
-//   so the slot id the test EC sees for W is the same id W uses on its
+//   so the slot id the test thread sees for W is the same id W uses on its
 //   self-suspend. The ready flag is the release/acquire publication
 //   edge: after parallel scheduling/work stealing, W may run before
-//   create_execution_context returns to the creator.
+//   create_thread returns to the creator.
 //
 //   Pre-call gates the test must clear so no other failure path can
 //   mask the assertion under test:
 //     - §[create_port] tests 01-04: runner self-handle has `crpt`,
 //       caps {bind,recv} ⊆ port_ceiling, no reserved bits set.
-//     - §[create_execution_context] tests 01,03,06,08,09,10: runner
-//       self-handle has `crec`; w_caps ⊆ ec_inner_ceiling; priority 0;
+//     - §[create_thread] tests 01,03,06,08,09,10: runner
+//       self-handle has `crec`; w_caps ⊆ thread_inner_ceiling; priority 0;
 //       stack_pages 1; affinity 0; reserved bits clear.
 //     - §[suspend] tests 01-07 from W's side:
 //         test 01 (E_BADCAP): W reads worker_self_slot, which the
-//           test EC publishes from the createExecutionContext result.
+//           test thread publishes from the createThread result.
 //         test 02 (E_BADCAP for [2]): port slot is the freshly-minted
-//           handle id captured by the test EC.
+//           handle id captured by the test thread.
 //         test 03 (E_PERM no `susp`): w_caps.susp = true.
 //         test 04 (E_PERM no `bind` on port): port_caps.bind = true.
-//         test 05 (reserved bits): syscall.suspendEc zero-fills.
-//         test 06 (vCPU): W is a regular EC.
+//         test 05 (reserved bits): syscall.suspendThread zero-fills.
+//         test 06 (vCPU): W is a regular thread.
 //         test 07 (already suspended): W is freshly created and never
 //           prior-suspended.
-//     - §[recv] tests 01-06 from the test EC's side:
+//     - §[recv] tests 01-06 from the test thread's side:
 //         01 (BADCAP): port_handle is the freshly-minted handle.
 //         02 (no `recv` cap): port_caps.recv = true.
 //         03 (reserved bits): libz wrapper takes u12 and zero-extends.
-//         04 (E_CLOSED no bind/route/queue): the test EC holds the
+//         04 (E_CLOSED no bind/route/queue): the test thread holds the
 //           port handle with the bind cap, and W queues a suspension
-//           event before the test EC recvs.
-//         05 (E_CLOSED on blocked recv when bind drops): the test EC
+//           event before the test thread recvs.
+//         05 (E_CLOSED on blocked recv when bind drops): the test thread
 //           never deletes the port handle.
 //         06 (E_FULL): the test domain has plenty of free slots for
 //           the reply handle and the zero attached handles.
 //
 // Action
 //   1. create_port(caps={bind, recv})            — must succeed
-//   2. create_execution_context(target=self, caps={susp, term, rp=0},
+//   2. create_thread(target=self, caps={susp, term, rp=0},
 //        entry=&workerEntry, stack_pages=1, affinity=0)
 //                                                 — must succeed
 //   3. publish worker_self_slot, worker_port_slot to W; release
@@ -92,7 +92,7 @@
 //      multi-core may run W concurrently; either path resolves to W
 //      blocked on the port by the time recv runs)
 //   4. recv(port)                                — must return OK
-//      (test EC holds the port's bind cap → no E_CLOSED; reply slot
+//      (test thread holds the port's bind cap → no E_CLOSED; reply slot
 //      and zero attached handles fit easily → no E_FULL)
 //   5. yield(W); witness (a) — `worker_done` must still be 0
 //   6. delete(reply_handle)                      — must return OK
@@ -101,7 +101,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: pre-recv yield to the worker did not return OK
 //   4: recv did not return OK
@@ -122,20 +122,20 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Process-global side channels. Both ECs run in the same capability
+// Process-global side channels. Both Threads run in the same capability
 // domain, so they share the address space and the handle table.
-//   - worker_self_slot: the slot id of W's own EC handle, published by
-//     the test EC after createExecutionContext returns. W reads it
+//   - worker_self_slot: the slot id of W's own thread handle, published by
+//     the test thread after createThread returns. W reads it
 //     after observing worker_ready to issue suspend(self, port).
-//   - worker_port_slot: the slot id of the port the test EC mints. W
+//   - worker_port_slot: the slot id of the port the test thread mints. W
 //     uses it as the suspend target port after observing worker_ready.
 //   - worker_ready: release/acquire gate that makes both slot ids
-//     visible before W can call suspendEc.
+//     visible before W can call suspendThread.
 //   - worker_result: the vreg-1 return value of W's suspend syscall.
-//     The test EC reads it after worker_done flips to 1 to verify
+//     The test thread reads it after worker_done flips to 1 to verify
 //     E_ABANDONED.
 //   - worker_done: release-store flag W flips after suspend returns;
-//     the test EC acquire-loads it as the synchronisation edge.
+//     the test thread acquire-loads it as the synchronisation edge.
 var worker_self_slot: u64 = 0;
 var worker_port_slot: u64 = 0;
 var worker_ready: u32 = 0;
@@ -148,10 +148,10 @@ fn workerEntry() callconv(.c) noreturn {
     }
     const self_slot: u12 = @truncate(@atomicLoad(u64, &worker_self_slot, .acquire));
     const port_slot: u12 = @truncate(@atomicLoad(u64, &worker_port_slot, .acquire));
-    // §[suspend] [1] = self_slot suspends the calling EC and blocks the
+    // §[suspend] [1] = self_slot suspends the calling thread and blocks the
     // syscall until the suspension is resolved. With no attachments the
     // libz wrapper is the safe path (it panics on N>0; N=0 here).
-    const sus = syscall.suspendEc(self_slot, port_slot, &.{});
+    const sus = syscall.suspendThread(self_slot, port_slot, &.{});
     @atomicStore(u64, &worker_result, sus.v1, .release);
     @atomicStore(u64, &worker_done, 1, .release);
     while (true) {
@@ -170,7 +170,7 @@ pub fn main(cap_table_base: u64) void {
     @atomicStore(u64, &worker_result, 0, .release);
     @atomicStore(u64, &worker_done, 0, .release);
 
-    // Step 1: mint the port. bind keeps the test EC as a live bind-cap
+    // Step 1: mint the port. bind keeps the test thread as a live bind-cap
     // holder so recv does not return E_CLOSED on the bind path; recv
     // gates the recv call itself. xfer is unused — no handles attached.
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
@@ -186,20 +186,20 @@ pub fn main(cap_table_base: u64) void {
     // line under test names "the dequeued sender" — W is that sender).
     // term is held for symmetry with sibling tests but not exercised.
     // restart_policy = 0 (kill) keeps the request inside the runner
-    // ec_inner_ceiling and prevents any restart fallback after this
+    // thread_inner_ceiling and prevents any restart fallback after this
     // test ends.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target=self), priority in
     // 32-33. priority = 0 stays inside the runner pri ceiling.
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&workerEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1, // stack_pages
         0, // target = self (this domain)
@@ -215,20 +215,20 @@ pub fn main(cap_table_base: u64) void {
     @atomicStore(u32, &worker_ready, 1, .release);
 
     // Step 3: yield to W so it reaches the blocking suspend syscall
-    // before the test EC calls recv. On a uniprocessor this serialises
+    // before the test thread calls recv. On a uniprocessor this serialises
     // the path: W enters suspend → blocks → control returns to the
-    // test EC. On multi-core, W may execute concurrently; either way
+    // test thread. On multi-core, W may execute concurrently; either way
     // the observable behaviour the test asserts (W is queued on the
     // port by the time recv runs) holds because recv blocks on a port
     // with no queued sender, and §[suspend] guarantees W is enqueued
     // by the time its syscall transitions to the blocking state.
-    const y1 = syscall.yieldEc(w_target);
+    const y1 = syscall.yieldThread(w_target);
     if (y1.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
 
-    // Step 4: recv. The test EC holds the port's bind cap (no
+    // Step 4: recv. The test thread holds the port's bind cap (no
     // E_CLOSED) and W is a queued suspended sender, so recv returns
     // immediately with the kernel-allocated reply handle id encoded in
     // the syscall word per §[recv].
@@ -247,7 +247,7 @@ pub fn main(cap_table_base: u64) void {
     // verdict by now and W would have set worker_done. The acquire
     // load pairs with W's release store. A non-zero observation
     // before delete is a violation of the spec line under test.
-    _ = syscall.yieldEc(w_target);
+    _ = syscall.yieldThread(w_target);
     if (@atomicLoad(u64, &worker_done, .acquire) != 0) {
         testing.fail(5);
         return;
@@ -273,7 +273,7 @@ pub fn main(cap_table_base: u64) void {
     const MAX_ATTEMPTS: usize = 256;
     var attempt: usize = 0;
     while (attempt < MAX_ATTEMPTS) {
-        _ = syscall.yieldEc(w_target);
+        _ = syscall.yieldThread(w_target);
         if (@atomicLoad(u64, &worker_done, .acquire) == 1) {
             const result = @atomicLoad(u64, &worker_result, .acquire);
             if (result != @intFromEnum(errors.Error.E_ABANDONED)) {

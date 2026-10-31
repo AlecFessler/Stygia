@@ -10,12 +10,12 @@
 //   way to land an xfer=0 reply handle in the caller's table is to
 //   create the port without the `xfer` cap and then drive a recv.
 //
-//   Pipeline (test EC owns both ends):
+//   Pipeline (test thread owns both ends):
 //     1. mint port with caps = {bind, recv}    — note: NO xfer
-//     2. mint EC W with caps = {susp}          — restart_policy = 0
+//     2. mint thread W with caps = {susp}          — restart_policy = 0
 //        keeps W inside the runner-granted ceiling
 //     3. suspend(W, port)                      — queues W as a
-//        suspended sender; non-blocking on the test EC since
+//        suspended sender; non-blocking on the test thread since
 //        [1] != self per §[suspend]
 //     4. recv(port)                            — returns immediately
 //        and yields a reply handle id in syscall word bits 32-43.
@@ -37,7 +37,7 @@
 //
 // Action
 //   1. create_port(caps = {bind, recv})        — must succeed
-//   2. create_execution_context(target = self,
+//   2. create_thread(target = self,
 //        caps = {susp, restart_policy = 0})    — must succeed
 //   3. suspend(W, port)                        — must return OK
 //   4. recv(port)                              — must return OK
@@ -45,7 +45,7 @@
 //
 // Assertions
 //   1: setup port creation failed
-//   2: setup EC creation failed
+//   2: setup thread creation failed
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
 //   5: reply returned something other than E_PERM
@@ -61,7 +61,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Step 1: mint port without xfer. bind is required for suspend
-    // (§[suspend] [2] cap) and recv works because the test EC holds the
+    // (§[suspend] [2] cap) and recv works because the test thread holds the
     // port handle (no E_CLOSED). Restricting to {bind, recv} guarantees
     // the kernel mints the reply handle at recv time with xfer = 0.
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
@@ -75,14 +75,14 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W. susp lets the test queue W onto the port via
     // suspend. restart_policy = 0 (kill) keeps the call inside the
     // runner-granted ceiling.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -96,7 +96,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 3: queue W as a suspended sender on the port. Since
     // [1] = W != self, the call returns immediately without blocking
-    // the test EC (§[suspend]).
+    // the test thread (§[suspend]).
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_handle,
@@ -106,7 +106,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The port has the test EC as a live bind-cap holder
+    // Step 4: recv. The port has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the reply handle id encoded in the syscall word per §[recv].
     const got = syscall.recv(port_handle, 0);

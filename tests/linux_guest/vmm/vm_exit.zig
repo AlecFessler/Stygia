@@ -309,7 +309,7 @@ pub fn recvVmExit(port: u12, timeout_ns: u64) RecvVmExitResult {
 /// §[reply] entry: reply_handle_id rides in syscall-word bits 20-31.
 /// (recv-return places it at 32-43 instead.) The receiver's vregs
 /// 1..73 are committed back to the vCPU's GuestState (gated by
-/// `originating_write_cap` on the vCPU EC handle). Returns the
+/// `originating_write_cap` on the vCPU thread handle). Returns the
 /// kernel's vreg 1 (`err` per §[error_codes]).
 pub fn replyVmExit(reply_handle_id: u12, state: VmExitState) u64 {
     const word: u64 =

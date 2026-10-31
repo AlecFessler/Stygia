@@ -5,7 +5,7 @@
 // A faithful test wants a device_region handle in this child's cap
 // table whose `irq` cap bit is clear, calls `ack` on it, and expects
 // E_PERM. The runner's child cap_table is populated by
-// create_capability_domain: slot 0 self, slot 1 initial EC, slot 2
+// create_capability_domain: slot 0 self, slot 1 initial thread, slot 2
 // self-IDC, slot 3 the result port. No device_regions are forwarded
 // to test children today (see runner/primary.zig spawnOne — `passed[]`
 // carries only the result port). Without a device_region in scope, the
@@ -66,7 +66,7 @@ pub fn main(cap_table_base: u64) void {
 }
 
 fn findDeviceRegion(cap_table_base: u64) ?caps.HandleId {
-    // Scan the full handle table. Slots 0/1/2 are self / initial EC /
+    // Scan the full handle table. Slots 0/1/2 are self / initial thread /
     // self-IDC for a child capability domain (§[capability_domain]),
     // and passed_handles start at slot 3. Today the runner forwards
     // only the result port at slot 3; no device_regions reach a child.

@@ -5,7 +5,7 @@
 //
 // Strategy
 //   §[handle_attachments] places pair entries at vregs [128-N..127] —
-//   the high end of the vreg space. libz's `suspendEc(.., attachments)`
+//   the high end of the vreg space. libz's `suspendThread(.., attachments)`
 //   panics for N>0 because the bounded stack helpers in libz only cover
 //   vregs 14..29. We bypass libz with an inline-asm syscall that
 //   reserves a 920-byte stack pad (8B for the syscall word at [rsp+0]
@@ -31,7 +31,7 @@
 //
 //   With every prior check cleared, the kernel must reach the
 //   duplicate-source check and reject the suspend with E_INVAL before
-//   the EC actually suspends — a successful suspend would never return
+//   the thread actually suspends — a successful suspend would never return
 //   to userspace via the syscall return path here; it would return only
 //   after the primary's reply, and then with vreg 1 = 0 (the spec
 //   reserves vreg 1 for the resume status; on this synchronous error
@@ -39,7 +39,7 @@
 //
 // Action
 //   Issue `suspend` with:
-//     v1 = SLOT_INITIAL_EC          (the calling EC)
+//     v1 = SLOT_INITIAL_THREAD          (the calling thread)
 //     v2 = SLOT_FIRST_PASSED        (result port; has xfer)
 //     syscall word: pair_count = 2
 //     vreg 126 = PairEntry{ id = src, caps = {move,copy}, move = 0 }
@@ -172,7 +172,7 @@ pub fn main(cap_table_base: u64) void {
     }).toU64();
 
     const v1 = suspendWithDupPair(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         caps.SLOT_FIRST_PASSED,
         entry,
     );

@@ -48,10 +48,10 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
 
     // Refuse a foreign-architecture image. Without this the loader
     // happily maps, say, an x86-64 payload on aarch64 and the spawned
-    // initial EC executes those bytes under the wrong decoder: measured
+    // initial thread executes those bytes under the wrong decoder: measured
     // as an A64 `adr x17, …` / `stxrh w0, w0, [x0]` pair that stores
     // through the child's read-only cap_table_base and dies as a
-    // unhandled `memory_fault`. The EC is unrunnable by construction, so
+    // unhandled `memory_fault`. The thread is unrunnable by construction, so
     // reject at the syscall boundary (callers map parse errors to
     // E_INVAL) rather than spawning a domain that can only fault.
     const want_machine: elf.EM = switch (builtin.cpu.arch) {

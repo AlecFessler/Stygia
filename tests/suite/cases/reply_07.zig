@@ -1,26 +1,26 @@
 // Spec §[reply] reply — test 07.
 //
-// "[test 07] on success, the suspended EC is resumed."
+// "[test 07] on success, the suspended thread is resumed."
 //
 // Strategy
 //   The assertion is a liveness witness: after `reply(reply_handle)`
-//   succeeds, the EC that the reply handle named must transition from
+//   succeeds, the thread that the reply handle named must transition from
 //   "suspended on a port" back to "runnable" and actually execute.
 //
 //   To witness "actually execute" we need an observable side effect
-//   the worker EC performs only after it is resumed. The yield_03 idiom
-//   applies: spawn the worker in the test EC's own capability domain
+//   the worker thread performs only after it is resumed. The yield_03 idiom
+//   applies: spawn the worker in the test thread's own capability domain
 //   (target = 0) so a process-global is shared memory between the two
-//   ECs, and have the worker's entry point store a sentinel into that
-//   global with release ordering. The test EC then loads it with
+//   Threads, and have the worker's entry point store a sentinel into that
+//   global with release ordering. The test thread then loads it with
 //   acquire ordering after `reply` returns.
 //
 //   The recv-side scaffolding is the same shape as terminate_07:
 //     - mint a port with {bind, recv} caps so recv is callable and the
 //       port has a live bind-cap holder for its full lifetime (no
 //       E_CLOSED on the recv path),
-//     - mint a worker EC W with {term, susp} caps, restart_policy = 0,
-//     - suspend(W, port) — non-blocking on the test EC since [1] != self,
+//     - mint a worker thread W with {term, susp} caps, restart_policy = 0,
+//     - suspend(W, port) — non-blocking on the test thread since [1] != self,
 //       queues W on the port,
 //     - recv(port) — returns immediately, handing back the reply handle
 //       id in the syscall word per §[recv],
@@ -32,7 +32,7 @@
 //   The `write` cap is intentionally NOT minted because reply test 06
 //   asserts that without `write`, modifications written between recv
 //   and reply are discarded — and this test makes none, so the absence
-//   of `write` keeps the test EC honest about which spec line it is
+//   of `write` keeps the test thread honest about which spec line it is
 //   asserting (test 07 is about resumption, not state propagation).
 //
 //   Because W has not run yet at the moment of `suspend`, the kernel
@@ -59,7 +59,7 @@
 //
 // Action
 //   1. create_port(caps={bind,recv})        — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        entry=&workerEntry, caps={term,susp}, restart_policy=0)
 //                                            — must succeed
 //   3. suspend(W, port)                      — must return OK
@@ -73,7 +73,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -91,7 +91,7 @@ const testing = lib.testing;
 
 const SENTINEL: u64 = 0xA110_C0DE_5EE5_BEEF;
 
-// Process-global shared between the test EC and the worker EC. Both
+// Process-global shared between the test thread and the worker thread. Both
 // run in the same capability domain (target = self at create time), so
 // this global is the shared-memory witness of W's resumption.
 var observed: u64 = 0;
@@ -110,7 +110,7 @@ fn workerEntry() callconv(.c) noreturn {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Step 1: mint the port with bind + recv. The test EC holds the
+    // Step 1: mint the port with bind + recv. The test thread holds the
     // only bind-cap copy for the test's duration so recv on this port
     // never observes E_CLOSED on the no-binders fallback.
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
@@ -123,18 +123,18 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 2: mint W. susp authorizes the suspend syscall in step 3;
     // term is held for orderly teardown on test exit; restart_policy
-    // = 0 keeps the call inside the runner-granted ec_inner_ceiling
+    // = 0 keeps the call inside the runner-granted thread_inner_ceiling
     // and prevents any restart fallback. `write` is omitted on
     // purpose — see header for why.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&workerEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -147,7 +147,7 @@ pub fn main(cap_table_base: u64) void {
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
     // Step 3: queue W as a suspended sender on the port. Per §[suspend]
-    // when [1] != self, the calling EC is not blocked; the kernel only
+    // when [1] != self, the calling thread is not blocked; the kernel only
     // suspends the target.
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
@@ -158,7 +158,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The test EC holds the port's recv cap and W is
+    // Step 4: recv. The test thread holds the port's recv cap and W is
     // queued, so recv returns immediately. The reply_handle_id is in
     // the syscall word's bits 32-43 per §[recv].
     const got = syscall.recv(port_handle, 0);
@@ -184,7 +184,7 @@ pub fn main(cap_table_base: u64) void {
     const target_word: u64 = @as(u64, w_handle);
     var attempt: usize = 0;
     while (attempt < MAX_ATTEMPTS) {
-        _ = syscall.yieldEc(target_word);
+        _ = syscall.yieldThread(target_word);
         if (@atomicLoad(u64, &observed, .acquire) == SENTINEL) {
             testing.pass();
             return;

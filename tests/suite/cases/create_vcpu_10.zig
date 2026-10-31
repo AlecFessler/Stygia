@@ -1,13 +1,13 @@
 // Spec §[create_vcpu] — test 10.
 //
-// "[test 10] on success, the EC's priority is set to `[1].priority`."
+// "[test 10] on success, the thread's priority is set to `[1].priority`."
 //
 // Spec semantics
-//   §[execution_context] handle ABI: word0 carries cap+id+type, field0
+//   §[thread] handle ABI: word0 carries cap+id+type, field0
 //   bits 0-1 hold the kernel-mutable scheduling priority `pri`.
 //   §[create_vcpu] [1] caps word bits 32-33 carry the requested priority
-//   for the new vCPU EC, "0..3, bounded by caller's priority ceiling".
-//   The kernel must seed the new EC's field0 priority bits with the
+//   for the new vCPU thread, "0..3, bounded by caller's priority ceiling".
+//   The kernel must seed the new thread's field0 priority bits with the
 //   requested value at create time.
 //
 // Strategy
@@ -15,7 +15,7 @@
 //   be defused so create_vcpu actually returns a handle:
 //     - test 01 (E_PERM no `crec`): runner grants `crec` on the test
 //       domain's self-handle (runner/primary.zig).
-//     - test 02 (E_PERM caps not subset of ec_inner_ceiling): caps = 0
+//     - test 02 (E_PERM caps not subset of thread_inner_ceiling): caps = 0
 //       is a subset of any ceiling.
 //     - test 03 (E_PERM priority exceeds caller's ceiling): runner sets
 //       `pri = 3`. We pick priority = 2, well within that ceiling and
@@ -31,11 +31,11 @@
 //     - test 07 (E_INVAL reserved bits in [1]): caps_word's bits 16-31
 //       and 34-63 stay clear.
 //
-//   On success, the kernel writes the authoritative EC handle snapshot
+//   On success, the kernel writes the authoritative thread handle snapshot
 //   into the caller's slot at create time, so we readCap directly out
 //   of the read-only handle table mapped at cap_table_base and check
 //   field0's low 2 bits equal the requested priority. This mirrors
-//   create_execution_context_13's check for the same field on the
+//   create_thread_13's check for the same field on the
 //   non-VM creation path.
 //
 // VM policy buffer
@@ -49,7 +49,7 @@
 //   `create_virtual_machine` returns E_NODEV on platforms without
 //   hardware virtualization (§[create_virtual_machine] test 03). On
 //   such platforms the VM cannot be minted and the spec assertion
-//   under test (priority on the EC handle returned from create_vcpu)
+//   under test (priority on the thread handle returned from create_vcpu)
 //   becomes unreachable. We tolerate that outcome with pass-with-id-0,
 //   mirroring create_vcpu_05's smoke shape — the QEMU/KVM runner
 //   exposes VMX/SVM, so this branch is not expected to fire there but
@@ -64,7 +64,7 @@
 //   5. createPort(caps={bind}) — exit_port for the vCPU.
 //   6. createVcpu(caps_word = priority << 32 with priority = 2,
 //                 vm_handle, affinity = 0, exit_port).
-//   7. readCap(cap_table_base, ec_handle).field0 & 0x3 == 2.
+//   7. readCap(cap_table_base, thread_handle).field0 & 0x3 == 2.
 //
 // Assertions
 //   1: setup — any setup syscall (page frame, var, map_pf, create_port)
@@ -183,13 +183,13 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: HandleId = @truncate(result.v1 & 0xFFF);
+    const thread_handle: HandleId = @truncate(result.v1 & 0xFFF);
 
-    // 7. §[execution_context] field0 bits 0-1 = pri. Read the cap entry
+    // 7. §[thread] field0 bits 0-1 = pri. Read the cap entry
     //    out of the read-only handle table mapped at cap_table_base.
     //    The kernel writes the authoritative snapshot at create time,
     //    so a fresh `sync` is not required for the read to be observable.
-    const cap = caps.readCap(cap_table_base, ec_handle);
+    const cap = caps.readCap(cap_table_base, thread_handle);
     const observed_priority: u64 = cap.field0 & 0x3;
     if (observed_priority != requested_priority) {
         testing.fail(2);

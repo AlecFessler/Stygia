@@ -5,7 +5,7 @@ const stygia = @import("stygia");
 const gdt = stygia.arch.x64.gdt;
 const interrupts = stygia.arch.x64.interrupts;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const VAddr = stygia.memory.address.VAddr;
 
 extern fn scheduler_run_after_park() callconv(.c) noreturn;
@@ -853,14 +853,14 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     @memset(bytes[0..4096], 0);
 }
 
-// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+// ── Spec v3 thread dispatch primitives ────────────────────────────────────
 
-/// Restore `ec.ctx` into the live register file and IRETQ to userspace.
-/// Spec §[execution_context] dispatch.
-pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
-    interrupts.switchTo(ec);
+/// Restore `thread.ctx` into the live register file and IRETQ to userspace.
+/// Spec §[thread] dispatch.
+pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
+    interrupts.switchTo(thread);
     // `switchTo` jmps to interruptStubEpilogue with rsp pointing at
-    // `ec.ctx`, which iretq's into userspace and never returns to this
+    // `thread.ctx`, which iretq's into userspace and never returns to this
     // frame. Mark unreachable for the type system.
     unreachable;
 }
@@ -868,8 +868,8 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
 /// Build a first-dispatch iret frame at the top of `kstack_top` so that
 /// `interrupts.switchTo`'s jmp interruptStubEpilogue → iretq lands at
 /// `entry` in user mode (or kernel mode when `ustack_top` is null).
-/// Spec §[execution_context] first-dispatch.
-pub fn prepareEcContext(
+/// Spec §[thread] first-dispatch.
+pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
     entry: VAddr,
@@ -890,7 +890,7 @@ pub fn prepareEcContext(
 /// shape. Mirrors the user-mode arm of `interrupts.prepareThreadContext`
 /// (sets USER_CODE/USER_DATA selectors, applies the SysV ABI
 /// `rsp%16==8` skew, writes RIP and the first-arg register). Used by
-/// callers that allocate an EC without an attached user stack and wire
+/// callers that allocate an thread without an attached user stack and wire
 /// the stack in afterward.
 pub fn patchUserModeIretFrame(
     ctx: *interrupts.ArchCpuContext,
@@ -913,7 +913,7 @@ pub fn patchUserModeIretFrame(
 }
 
 /// Halt the local core with interrupts enabled until the next IRQ.
-/// Spec §[execution_context] idle EC.
+/// Spec §[thread] idle thread.
 pub fn idle() void {
     asm volatile (
         \\sti
@@ -921,21 +921,21 @@ pub fn idle() void {
     );
 }
 
-/// Update per-core caches to "no EC dispatched" state ahead of an idle
+/// Update per-core caches to "no thread dispatched" state ahead of an idle
 /// park. Sets `kernel_rsp` and `TSS.RSP0` to the supplied per-core park
 /// kstack top so subsequent kernel-mode IRQs / future syscall entries
 /// land on a stack dedicated to this core (rather than on a shared
-/// stale gs:0 pointing at a previously-suspended EC's kstack — see
-/// `sched.scheduler.parkAndAwaitIRQ`). Clears the EC-identity caches
-/// (gs:32 current_ec, gs:176 current_ec_gen, gs:40/48/56 domain ptrs)
+/// stale gs:0 pointing at a previously-suspended thread's kstack — see
+/// `sched.scheduler.parkAndAwaitIRQ`). Clears the thread-identity caches
+/// (gs:32 current_thread, gs:176 current_thread_gen, gs:40/48/56 domain ptrs)
 /// to null so any FP path on this core would bail to slow path; in
 /// practice no FP entry fires while this core is parked because no
 /// userspace runs on it without a `switchTo` first.
 pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
     const sc = &interrupts.per_cpu_scratch[core_id];
     sc.kernel_rsp = park_top;
-    sc.current_ec = 0;
-    sc.current_ec_gen = 0;
+    sc.current_thread = 0;
+    sc.current_thread_gen = 0;
     sc.current_domain = 0;
     sc.current_user_table = 0;
     sc.current_kernel_table = 0;
@@ -961,7 +961,7 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
 /// `entry(arg)`. The store happens AFTER the rsp swap — from that
 /// instruction on, this core provably never reads or writes the old
 /// stack again, so a byte that gates "may another core reuse that
-/// kstack" (an EC's `on_cpu` flag) can be cleared here and nowhere
+/// kstack" (an thread's `on_cpu` flag) can be cleared here and nowhere
 /// earlier. x86-TSO gives the plain `movb` store release semantics
 /// against the `.acquire` loads in the wake-side spins.
 ///

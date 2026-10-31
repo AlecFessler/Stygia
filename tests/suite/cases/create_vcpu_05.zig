@@ -8,7 +8,7 @@
 //   be inert:
 //     - test 01 (caller's self-handle lacks `crec`) — the runner grants
 //       `crec` on the test domain's self-handle (runner/primary.zig).
-//     - test 02 (caps not subset of VM domain's `ec_inner_ceiling`) —
+//     - test 02 (caps not subset of VM domain's `thread_inner_ceiling`) —
 //       pass caps = 0, a subset of any ceiling.
 //     - test 03 (priority exceeds caller's priority ceiling) — pri = 0.
 //     - test 04 (vm_handle not a valid VM handle) — we mint a real VM.
@@ -26,7 +26,7 @@
 //   The test capability domain's table is populated by the kernel at
 //   `create_capability_domain` time:
 //     slot 0 → self
-//     slot 1 → initial EC
+//     slot 1 → initial thread
 //     slot 2 → self-IDC
 //     slot 3 → result port (the only passed_handle from the runner)
 //   Any test-minted handles take subsequent free slots. Slot 4095 — the
@@ -150,7 +150,7 @@ pub fn main(cap_table_base: u64) void {
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
     // 5. Issue create_vcpu with an empty exit_port slot. caps word = 0
-    //    keeps caps {} a subset of any ec_inner_ceiling, priority = 0
+    //    keeps caps {} a subset of any thread_inner_ceiling, priority = 0
     //    a subset of any priority ceiling, and reserved bits clean.
     //    affinity = 0 means "any core" — no bits set, so test 06's
     //    out-of-range mask check cannot fire ahead of test 05.

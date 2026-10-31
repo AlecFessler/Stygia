@@ -33,7 +33,7 @@
 //   domain, with no path to embed and stage a second ELF as a child),
 //   and (b) the cross-domain suspend/recv handle-attachment path
 //   wired through libz (the IDC pair-entry layout lives at high vregs
-//   per §[handle_attachments] and the libz `suspendEc` wrapper still
+//   per §[handle_attachments] and the libz `suspendThread` wrapper still
 //   panics on attachments != 0). Both are tracked elsewhere; the same
 //   gap blocks several create_capability_domain and handle_attachments
 //   tests.

@@ -47,7 +47,7 @@ const build_options = @import("build_options");
 
 const cpu = stygia.arch.aarch64.cpu;
 const device_region = stygia.devices.device_region;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const fpu = stygia.sched.fpu;
 const futex = stygia.sched.futex;
 const gic = stygia.arch.aarch64.gic;
@@ -64,7 +64,7 @@ const watchdog = stygia.arch.aarch64.watchdog;
 const VAddr = stygia.memory.address.VAddr;
 
 const ArchCpuContext = stygia.arch.aarch64.interrupts.ArchCpuContext;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const PageFaultContext = stygia.arch.aarch64.interrupts.PageFaultContext;
 const A64_PF_DIAG_BUDGET: u32 = 4096;
 
@@ -107,9 +107,9 @@ fn isWriteFault(esr: u64) bool {
     return (esr >> 6) & 1 == 1;
 }
 
-fn diagTag(ec: *ExecutionContext) u64 {
-    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
-    return ec.domain.ptr.diag_test_tag;
+fn diagTag(thr: *Thread) u64 {
+    if (thr.diag_test_tag != 0) return thr.diag_test_tag;
+    return thr.domain.ptr.diag_test_tag;
 }
 
 fn logLowerElAbort(
@@ -123,7 +123,7 @@ fn logLowerElAbort(
     if (!build_options.kernel_spawn_diag) return;
     const n = @atomicRmw(u32, &a64_pf_diag_prints, .Add, 1, .monotonic);
     if (n >= A64_PF_DIAG_BUDGET) return;
-    const cur = scheduler.currentEc();
+    const cur = scheduler.currentThread();
     serial.print(
         "[a64pf] kind={s} tag=0x{x} ec=0x{x} esr=0x{x} ec_class=0x{x} fsc=0x{x} far=0x{x} elr=0x{x} w={d} x={d} pan_window={d}\n",
         .{
@@ -474,11 +474,11 @@ fn readFarEl1() u64 {
 /// banner — full I/O port emulation will replace this when a generic
 /// in-kernel I/O bus arrives.
 fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
-    const ec_ptr = scheduler.currentEc() orelse return false;
-    // caller-pinned: `ec_ptr` is the running EC of this core (we are mid-
+    const thread_ptr = scheduler.currentThread() orelse return false;
+    // caller-pinned: `thread_ptr` is the running thread of this core (we are mid-
     // synchronous-trap from it), so its domain SlabRef is live for the
     // duration of this handler. Mirrors arch/x64/interrupts.zig switchTo.
-    const domain = ec_ptr.domain.ptr;
+    const domain = thread_ptr.domain.ptr;
     const fault_va = VAddr.fromInt(readFarEl1());
 
     const v = vmar.findVmarCovering(domain, fault_va) orelse return false;
@@ -558,19 +558,19 @@ fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const esr = readEsrEl1();
     const ec = extractEc(esr);
-    const entry_cur = scheduler.currentEc();
+    const entry_cur = scheduler.currentThread();
 
     switch (ec) {
         // Lazy-FPU trap. CPACR_EL1.FPEN was clamped to 0b01 (trap EL0)
-        // by switchTo when this EC last got dispatched (because it
+        // by switchTo when this thread last got dispatched (because it
         // wasn't the last FPU owner on this core). Userspace's first
         // FP/SIMD instruction trapped here — swap state and return so
         // the instruction re-executes.
         .sve_simd_fp_access => {
-            const ec_ptr = scheduler.currentEc() orelse
-                @panic("FP/SIMD trap with no current EC");
-            fpu.handleTrap(ec_ptr);
-            consumeEntrySuspendDirective(ec_ptr, ctx);
+            const thread_ptr = scheduler.currentThread() orelse
+                @panic("FP/SIMD trap with no current thread");
+            fpu.handleTrap(thread_ptr);
+            consumeEntrySuspendDirective(thread_ptr, ctx);
             return;
         },
 
@@ -610,15 +610,15 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             var ri: usize = 0;
             while (ri < 31) : (ri += 1) args[ri] = regs_ptr[ri];
 
-            const caller = scheduler.currentEc() orelse
-                @panic("syscall with no current EC");
+            const caller = scheduler.currentThread() orelse
+                @panic("syscall with no current thread");
             const dispatch_len: usize = @max(@as(usize, max_vreg), 31);
             const ret = syscall_dispatch.dispatch(caller, syscall_word, args[0..dispatch_len]);
 
             // Only commit the syscall return into the saved frame if the
             // dispatched handler did NOT park `caller`. A handler that
             // suspends (recv / suspend / futex_wait / fault) clears this
-            // core's `current_ec`; from that moment on `caller.ctx.regs.x0`
+            // core's `current_thread`; from that moment on `caller.ctx.regs.x0`
             // is the wake-side delivery slot — `propagateClosedTo*`,
             // `expireTimedRecvWaiters`, etc. running on a remote core
             // write E_CLOSED / E_TIMEOUT there directly. Unconditionally
@@ -637,7 +637,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // space. The synchronous recv path (caller dequeued a
             // queued sender without blocking) returns through this tail
             // still in the caller's TTBR0, so flush here. Spec
-            // §[event_state] vreg 14 = the suspended EC's saved PC; on
+            // §[event_state] vreg 14 = the suspended thread's saved PC; on
             // aarch64 vreg 14 is GPR-backed at x13 — write it into the
             // caller's saved frame so ERET surfaces it. Mirrors
             // arch/x64/interrupts.zig syscallDispatch.
@@ -657,10 +657,10 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
             // Mirrors arch/x64/interrupts.zig syscallDispatch tail. If
             // the dispatched handler suspended `caller` (recv / suspend
-            // / futex_wait), `current_ec` was cleared on this core. The
+            // / futex_wait), `current_thread` was cleared on this core. The
             // exception trampoline would otherwise ERET back to the
-            // now-parked user EC; drive the scheduler instead so the
-            // next ready EC takes over (or we idle). Via the
+            // now-parked user thread; drive the scheduler instead so the
+            // next ready thread takes over (or we idle). Via the
             // park-kstack hop, not `run()` in place: this frame lives
             // on the suspended caller's kstack, which is already
             // claimable by wakers on other cores, and the hop also
@@ -670,14 +670,14 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             }
             // Identity check, not just idle check. x64's syscall asm
             // re-validates the caller before its sysret; this tail only
-            // checked for idle, so a handler that left `current_ec`
-            // naming a DIFFERENT EC fell through to the trampoline
-            // epilogue, which ERETs the CALLER's frame — resuming an EC
+            // checked for idle, so a handler that left `current_thread`
+            // naming a DIFFERENT thread fell through to the trampoline
+            // epilogue, which ERETs the CALLER's frame — resuming an thread
             // the scheduler had handed elsewhere, with SP_EL1 left on
             // the caller's kstack. The next kernel entry from that user
-            // context then runs on a kstack whose EC is concurrently
+            // context then runs on a kstack whose thread is concurrently
             // executing on another core (measured on the Pi 5 rig:
-            // core 0 mid-fault-path on slot 36 with current_ec owning
+            // core 0 mid-fault-path on slot 36 with current_thread owning
             // slot 37). The trampoline eret is only ever correct for
             // `caller`; anything else must go through the scheduler —
             // via the park-kstack hop: this frame IS the caller's
@@ -705,9 +705,9 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 .is_exec = false,
                 .rip = ctx.elr_el1,
                 .user_ctx = ctx,
-                // For the no-current-EC panic path: the doomed context's
+                // For the no-current-thread panic path: the doomed context's
                 // registers are the evidence (a disowned core running a
-                // double-dispatched EC shows the SECOND resume's frame).
+                // double-dispatched thread shows the SECOND resume's frame).
                 .fp = ctx.regs.x29,
                 .lr = ctx.regs.x30,
                 .frame_ctx = ctx,
@@ -756,13 +756,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 
         .software_step_lower_el => {
             // Single-step from userspace: resume silently.
-            if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
+            if (entry_cur) |thread_ptr| consumeEntrySuspendDirective(thread_ptr, ctx);
             return;
         },
 
         .watchpoint_lower_el => {
             // Watchpoint from userspace: resume silently.
-            if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
+            if (entry_cur) |thread_ptr| consumeEntrySuspendDirective(thread_ptr, ctx);
             return;
         },
 
@@ -772,16 +772,16 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // instructions issued at EL0 trap to EL1 with EC=0x01.
             // ARM ARM D13.2.118 (SCTLR_EL1) and D13.2.37 (ESR_EL1).
             //
-            // Park the EC in the .idle_wait state so it stops consuming
+            // Park the thread in the .idle_wait state so it stops consuming
             // CPU but stays alive and suspendable. Treating wfi as a
-            // protection_fault would `parkSelfFaulted` the EC into
-            // `.exited`, breaking any later `suspend(this_ec, port)`
+            // protection_fault would `parkSelfFaulted` the thread into
+            // `.exited`, breaking any later `suspend(this_thread, port)`
             // call (suspend's gate rejects non-{running,ready,idle_wait}
             // targets with E_INVAL — the precise failure that flaked
             // reply_transfer_14 on Pi 5 KVM). Permitting native EL0 wfi
             // (SCTLR.nTWI=1) was the prior attempt; it left dummies
             // executing wfi forever in EL0 and the destroy walk's UAF
-            // race against an actively-executing EC produced a hang
+            // race against an actively-executing thread produced a hang
             // around test ~144 (batch 36..40).
             //
             // The .idle_wait path: advance ELR past the wait instruction
@@ -790,10 +790,10 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // (off every queue, suspendOnPort treats it like .ready),
             // then dispatch whatever else this core has.
             ctx.elr_el1 += 4;
-            const ec_ptr = scheduler.currentEc() orelse
-                @panic("wfi trap with no current EC");
-            stygia.sched.execution_context.parkIdleWait(ec_ptr);
-            // Park-kstack hop, IRQs kept masked: the EC is claimable
+            const thread_ptr = scheduler.currentThread() orelse
+                @panic("wfi trap with no current thread");
+            stygia.sched.thread.parkIdleWait(thread_ptr);
+            // Park-kstack hop, IRQs kept masked: the thread is claimable
             // (`suspend` accepts `.idle_wait`) with its on_cpu release
             // stashed for the hop; running the scheduler loop in place
             // on its kstack raced its re-dispatch, and an IRQ here
@@ -825,7 +825,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             //     testing harness's `currentCoreId()` relies on it
             //     (spec §[affinity] tests 05/06 issue
             //     `mrs x, MPIDR_EL1` to verify the kernel honoured an
-            //     `affinity` syscall by re-pinning the EC).
+            //     `affinity` syscall by re-pinning the thread).
             //
             // Walk: peek the instruction at ELR_EL1, check the
             // `mrs x<rt>, MPIDR_EL1` bit pattern, emulate. Anything else
@@ -860,7 +860,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 );
                 // Report the LOGICAL core id in Aff0 rather than the raw
                 // hardware affinity. The whole point of emulating this
-                // read is to let an EC observe which core it is running
+                // read is to let an thread observe which core it is running
                 // on (see the affinity tests above), and the kernel's
                 // core numbering — affinity masks, run queues, per-core
                 // state — is `gic.coreID()`, an index into the
@@ -884,7 +884,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                     regs_ptr[rt] = mpidr;
                 } // rt == 31 (xzr): result discarded.
                 ctx.elr_el1 += 4; // skip the emulated instruction
-                if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
+                if (entry_cur) |thread_ptr| consumeEntrySuspendDirective(thread_ptr, ctx);
                 return;
             }
             deliverThreadFault(.illegal_instruction, ctx.elr_el1);
@@ -894,20 +894,20 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             deliverThreadFault(.protection_fault, ctx.elr_el1);
         },
     }
-    if (entry_cur) |ec_ptr| consumeEntrySuspendDirective(ec_ptr, ctx);
+    if (entry_cur) |thread_ptr| consumeEntrySuspendDirective(thread_ptr, ctx);
 }
 
-fn consumeEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuContext) void {
+fn consumeEntrySuspendDirective(thread_ptr: *Thread, ctx: *ArchCpuContext) void {
     const core: u8 = @truncate(gic.coreID());
-    if (!scheduler.coreCurrentIsRunning(core, ec_ptr)) return;
-    if (execution_context.consumeSuspendDirective(ec_ptr, ctx)) {
+    if (!scheduler.coreCurrentIsRunning(core, thread_ptr)) return;
+    if (thread_mod.consumeSuspendDirective(thread_ptr, ctx)) {
         scheduler.hopParkRun();
     }
 }
 
-fn consumeIrqEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuContext) void {
+fn consumeIrqEntrySuspendDirective(thread_ptr: *Thread, ctx: *ArchCpuContext) void {
     const core: u8 = @truncate(gic.coreID());
-    if (!scheduler.coreCurrentIsRunning(core, ec_ptr)) return;
+    if (!scheduler.coreCurrentIsRunning(core, thread_ptr)) return;
     // Model/spec assumption: an armed user-mode scheduler tick consumes
     // the suspend directive before the scheduler requeue decision. This
     // runs after EOI, so the acknowledged IRQ is not left active, but
@@ -915,7 +915,7 @@ fn consumeIrqEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuConte
     // `scheduler.preempt()` and never return. Do not hop here: the IRQ
     // body still has to run; the lower-EL tail's identity guard hops
     // after any returning handler.
-    _ = execution_context.consumeSuspendDirective(ec_ptr, ctx);
+    _ = thread_mod.consumeSuspendDirective(thread_ptr, ctx);
 }
 
 /// Handler for IRQ from Lower EL (EL0 userspace).
@@ -947,7 +947,7 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // line stays asserted as long as ISTATUS=1. Issuing EOI without
     // first masking the timer (IMASK=1) causes the GIC to immediately
     // re-mark the interrupt as pending, which then fires the moment the
-    // CPU's I-mask drops on ERET — robbing the next dispatched EC of
+    // CPU's I-mask drops on ERET — robbing the next dispatched thread of
     // its full timeslice. ARM ARM D11.2.4 + D13.8.20/D13.8.11 + IHI
     // 0048B §3.2 (level-sensitive PPI delivery).
     silenceTimerLineIfFiring(intid);
@@ -958,23 +958,23 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // unreachable on a context switch, leaving the interrupt permanently
     // in the active state and masking every subsequent delivery of that
     // same priority (IHI 0069H §4.6: an active interrupt blocks pending).
-    const entry_cur = scheduler.currentEc();
+    const entry_cur = scheduler.currentThread();
     gic.endOfInterrupt(intid);
-    if (entry_cur) |ec_ptr| consumeIrqEntrySuspendDirective(ec_ptr, ctx);
+    if (entry_cur) |thread_ptr| consumeIrqEntrySuspendDirective(thread_ptr, ctx);
     dispatchIrq(intid);
     // Identity guard, same rationale as the svc tail: the trampoline
     // epilogue ERETs the INTERRUPTED frame, which is only correct while
-    // `current_ec` still names the EC that owns it. If dispatchIrq's
+    // `current_thread` still names the thread that owns it. If dispatchIrq's
     // scheduler work rewrote the slot and then RETURNED (switchTo's
     // non-dispatching exits), falling through would resume a frame the
     // scheduler handed elsewhere. Hop, don't run in place: this frame
-    // sits on the interrupted EC's kstack, and an EC no longer current
+    // sits on the interrupted thread's kstack, and an thread no longer current
     // is claimable by other cores.
-    if (entry_cur) |ec_ptr| {
-        if (!scheduler.coreCurrentIsRunning(@truncate(gic.coreID()), ec_ptr)) {
+    if (entry_cur) |thread_ptr| {
+        if (!scheduler.coreCurrentIsRunning(@truncate(gic.coreID()), thread_ptr)) {
             scheduler.hopParkRun();
         }
-    } else if (scheduler.currentEc() != null) {
+    } else if (scheduler.currentThread() != null) {
         scheduler.hopParkRun();
     }
 }
@@ -982,7 +982,7 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Mask CNTP/CNTV at the source if their ISTATUS is asserted. Called
 /// before EOI so the level-sensitive PPI line de-asserts at the GIC
 /// before EOI clears the active bit — preventing an immediate re-pend
-/// that would steal the next EC's timeslice. The matching unmask
+/// that would steal the next thread's timeslice. The matching unmask
 /// (IMASK=0) is performed by `armInterruptTimer` writing CNTV_CTL=0x1
 /// in the dispatch case 27,30 path.
 fn silenceTimerLineIfFiring(intid: u32) void {
@@ -1105,14 +1105,14 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     silenceTimerLineIfFiring(intid);
 
     // EOI before dispatch — see handleIrqLowerEl for rationale.
-    const entry_cur = scheduler.currentEc();
+    const entry_cur = scheduler.currentThread();
     gic.endOfInterrupt(intid);
     dispatchIrq(intid);
     // Identity guard — see handleIrqLowerEl. Kernel-mode frames live on
-    // the current EC's kstack; if the slot changed, that kstack may
+    // the current thread's kstack; if the slot changed, that kstack may
     // already be executing elsewhere — hop off it before entering the
     // scheduler loop.
-    if (scheduler.currentEc() != entry_cur) {
+    if (scheduler.currentThread() != entry_cur) {
         scheduler.hopParkRun();
     }
 }
@@ -1129,7 +1129,7 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 /// Origin of an IRQ entry — names whether the interrupted context was
 /// running at EL0 (user) or EL1 (kernel). Recorded in case the callee
 /// needs to attribute time, but the per-core scheduler tick currently
-/// derives that itself from `current_ec`.
+/// derives that itself from `current_thread`.
 /// Dispatch a GIC interrupt to the appropriate handler.
 /// The INTID namespace (IHI 0069H, Section 2.2):
 ///   0-15:    SGI (Software Generated Interrupts / IPIs)
@@ -1199,17 +1199,17 @@ fn dispatchIrq(intid: u32) void {
             scheduler.preempt();
         },
         // SGI 2 — lazy-FPU cross-core flush. The requesting core wrote
-        // the target EC into this core's mailbox; we save the FPU regs
-        // into the EC's `fpu_state` if we still own them, then ack so
+        // the target thread into this core's mailbox; we save the FPU regs
+        // into the thread's `fpu_state` if we still own them, then ack so
         // the requester unblocks. See `cpu.fpuFlushIpi`.
         2 => {
             const core_idx: u8 = @truncate(gic.coreID());
             const slot = &cpu.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
-                // caller-pinned: the requesting core pins the target EC
+                // caller-pinned: the requesting core pins the target thread
                 // across the IPI and waits for ack before releasing it;
                 // we cannot observe a freed slot here.
-                const target: *ExecutionContext = @ptrCast(@alignCast(opq));
+                const target: *Thread = @ptrCast(@alignCast(opq));
                 fpu.flushIpiHandler(target);
             }
             slot.ackDone();
@@ -1218,18 +1218,18 @@ fn dispatchIrq(intid: u32) void {
         // Intentionally EMPTY. The wake's entire job is to make a parked
         // core's `wfi` retire; `cpu.parkAndAwaitIRQ` then falls through
         // to `b scheduler_run_after_park`, which re-runs `run()` and
-        // picks up the freshly enqueued EC.
+        // picks up the freshly enqueued thread.
         //
         // This handler must RETURN. Do not route the wake to SGI 0 or
         // otherwise call into `scheduler.preempt()` here. `parkAndAwaitIRQ`
         // takes its IRQ inside the single-instruction `msr daifclr, #2`
         // window between the `wfi` and the `b`, and
         // `scheduler_run_after_park` is the ONLY writer that clears the
-        // previously-dispatched EC's `on_cpu` (by then `current_ec` is
+        // previously-dispatched thread's `on_cpu` (by then `current_thread` is
         // already null, so `switchTo`'s prev-clear edge has nothing to
         // clear from — see the `post_park_clear_on_cpu` comment in
         // `sched.scheduler.parkAndAwaitIRQ`). A handler that dispatches
-        // never returns, so the `b` is never reached, and that EC's
+        // never returns, so the `b` is never reached, and that thread's
         // `on_cpu` is stranded `true` forever: `finalizeDestroyMarkedDead`
         // skips on_cpu=true, its zombie is never reaped, `postZombie`
         // spins, and the slab slot leaks. The next park overwrites
@@ -1326,7 +1326,7 @@ fn dispatchIrq(intid: u32) void {
             // the firing INTID to its bound region and delegate to
             // `device_region.onIrq`, which masks the line at the GIC
             // (so a level-sensitive line cannot re-pend before the
-            // handling EC `ack`s) and bumps every domain-local copy
+            // handling thread `ack`s) and bumps every domain-local copy
             // of `field1.irq_count`, futex-waking blocked readers per
             // Spec §[device_irq].
             //
@@ -1369,35 +1369,35 @@ fn dispatchIrq(intid: u32) void {
     }
 }
 
-/// Look up the running EC, fire a `thread_fault` event with `subcode`
+/// Look up the running thread, fire a `thread_fault` event with `subcode`
 /// and `payload`, then yield after the faulting domain is torn down.
 fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
-    const ec = scheduler.currentEc() orelse
-        @panic("user thread fault with no current EC");
-    port.fireThreadFault(ec, @intFromEnum(subcode), payload);
+    const thr = scheduler.currentThread() orelse
+        @panic("user thread fault with no current thread");
+    port.fireThreadFault(thr, @intFromEnum(subcode), payload);
     // Keep IRQs masked through fault teardown and the scheduler hop.
     scheduler.yieldTo(null);
     // `fireThreadFault`'s unhandled-fault path (`parkSelfFaulted`) cleared
-    // this core's `current_ec`; if `yieldTo` couldn't dispatch fresh
+    // this core's `current_thread`; if `yieldTo` couldn't dispatch fresh
     // work, ERET back through `exceptionTrampoline` would surface the
     // now-stale faulting user context, re-fault on the same PC, and
     // re-enter `handleSyncLowerEl` with `currentEc() == null` — hitting
     // the panic above. Hand off via the park-kstack hop (noreturn) —
-    // this frame lives on the suspended EC's claimable kstack, and the
+    // this frame lives on the suspended thread's claimable kstack, and the
     // hop publishes its deferred on_cpu release before the scheduler
     // loop idles/dispatches.
     // Mirrors arch/x64/exceptions.zig user-exception handler tail.
-    if (scheduler.currentEc() == null) scheduler.hopParkRun();
+    if (scheduler.currentThread() == null) scheduler.hopParkRun();
 }
 
 /// Handle a user breakpoint, then yield.
 fn deliverBreakpoint(subcode: BreakpointSubcode) void {
-    const ec = scheduler.currentEc() orelse
-        @panic("user breakpoint with no current EC");
-    port.fireBreakpoint(ec, @intFromEnum(subcode));
+    const thr = scheduler.currentThread() orelse
+        @panic("user breakpoint with no current thread");
+    port.fireBreakpoint(thr, @intFromEnum(subcode));
     // Masked + hop for the same kstack-release reasons as
     // `deliverThreadFault`.
     scheduler.yieldTo(null);
     // Keep the post-yieldTo guard used by the other exception paths.
-    if (scheduler.currentEc() == null) scheduler.hopParkRun();
+    if (scheduler.currentThread() == null) scheduler.hopParkRun();
 }

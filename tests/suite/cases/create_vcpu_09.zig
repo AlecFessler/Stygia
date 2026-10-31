@@ -1,6 +1,6 @@
 // Spec §[create_vcpu] — test 09.
 //
-// "[test 09] on success, `suspend` on the returned EC handle returns
+// "[test 09] on success, `suspend` on the returned thread handle returns
 //  E_INVAL, and after `recv` on [4] consumes the initial vm_exit and
 //  `reply` on its reply handle, a subsequent `recv` on [4] returns a
 //  vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s
@@ -29,7 +29,7 @@
 //   Drive create_vcpu down its success path with the same defusing
 //   prelude as create_vcpu_08 / create_vcpu_10, then exercise the
 //   four observable predicates of test 09 in sequence:
-//     (a) suspend(ec_handle, exit_port) returns E_INVAL.
+//     (a) suspend(thread_handle, exit_port) returns E_INVAL.
 //     (b) recv(exit_port) blocks until the first vCPU dispatch delivers
 //         the initial vm_exit, then yields a reply handle id in
 //         syscall_word bits 32-43.
@@ -67,20 +67,20 @@
 //     E_PERM. All three bits are within the runner's port_ceiling =
 //     0x5C (xfer/recv/bind/suspend; see runner/primary.zig).
 //   - create_vcpu: caps = {susp, read, write}. `susp` lets us call
-//     suspend on the EC handle without firing §[suspend] [test 03]
+//     suspend on the thread handle without firing §[suspend] [test 03]
 //     E_PERM, so the kernel actually reaches the [test 06]
 //     vCPU-target check this test 09 is paired against. `read` +
 //     `write` keep the recv/reply state-transfer path live should
 //     the kernel decide to pre-stage state in the second event;
 //     they don't gate the assertions under test directly. All three
-//     bits (5, 6, 7) are within the runner's ec_inner_ceiling = 0xFF.
+//     bits (5, 6, 7) are within the runner's thread_inner_ceiling = 0xFF.
 //   - priority = 0, affinity = 0, reserved bits clean — same as
 //     create_vcpu_08 / 10 to defuse tests 03 / 06 / 07.
 //
 // Defusing other create_vcpu error paths (same as create_vcpu_08)
 //   - test 01: runner grants `crec` on the test self-handle.
 //   - test 02: caps {susp,read,write} (= bits 5-7) are within the
-//     runner-granted ec_inner_ceiling = 0xFF.
+//     runner-granted thread_inner_ceiling = 0xFF.
 //   - test 03: priority = 0 stays under the runner-granted pri = 3.
 //   - test 04: we mint a real VM via create_virtual_machine.
 //   - test 05: we mint a real port via create_port with `bind`.
@@ -106,7 +106,7 @@
 //      and the destination port for the vCPU-rejection suspend probe.
 //   6. createVcpu(caps={susp,read,write}, vm_handle, affinity=0,
 //      exit_port).
-//   7. suspendEc(ec_handle, exit_port) — must return E_INVAL per
+//   7. suspendThread(thread_handle, exit_port) — must return E_INVAL per
 //      §[suspend] [test 06].
 //   8. recv(exit_port) — blocks until first vCPU dispatch, then must
 //      succeed (no error word) and yield a reply handle id.
@@ -127,7 +127,7 @@
 // Assertions
 //   1: setup — createPageFrame / createVmar / mapPf / createPort /
 //      createVcpu returned an error word.
-//   2: suspend on the vCPU EC handle returned something other than
+//   2: suspend on the vCPU thread handle returned something other than
 //      E_INVAL.
 //   3: first recv on the exit_port returned an error word in vreg 1.
 //   4: replyVmExit on the recv'd reply handle returned non-OK.
@@ -232,8 +232,8 @@ pub fn main(cap_table_base: u64) void {
     //    call below reaches the vCPU-target check (§[suspend] [test
     //    06]) instead of failing earlier with E_PERM. `read` + `write`
     //    keep the state-transfer path live across recv/reply for the
-    //    second exit. Bits 5-7 are within ec_inner_ceiling = 0xFF.
-    const vcpu_caps = caps.EcCap{
+    //    second exit. Bits 5-7 are within thread_inner_ceiling = 0xFF.
+    const vcpu_caps = caps.ThreadCap{
         .susp = true,
         .read = true,
         .write = true,
@@ -249,14 +249,14 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: HandleId = @truncate(cvcpu.v1 & 0xFFF);
+    const thread_handle: HandleId = @truncate(cvcpu.v1 & 0xFFF);
 
-    // 7. §[suspend] [test 06]: suspend on a vCPU EC handle must
-    //    return E_INVAL. The port carries `bind`, the EC handle
+    // 7. §[suspend] [test 06]: suspend on a vCPU thread handle must
+    //    return E_INVAL. The port carries `bind`, the thread handle
     //    carries `susp`, and reserved bits are clean — so the only
     //    spec-defined path to E_INVAL on this call is the vCPU-target
     //    check.
-    const suspend_result = syscall.suspendEc(ec_handle, exit_port, &.{});
+    const suspend_result = syscall.suspendThread(thread_handle, exit_port, &.{});
     if (suspend_result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(2);
         return;

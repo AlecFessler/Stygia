@@ -27,7 +27,7 @@
 //   gate ordering the kernel uses, the only error path that can fire
 //   on this input is E_INVAL.
 //
-//   count = 0 is a valid value for futex_wake ("wake at most 0 ECs"),
+//   count = 0 is a valid value for futex_wake ("wake at most 0 Threads"),
 //   so it does not synthesize a separate failure.
 //
 // Action

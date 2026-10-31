@@ -17,9 +17,9 @@
 //   `move` nor `copy` is required on the suspending port itself; only
 //   on the source handle of an attachment.
 //
-//   We use the initial EC at slot 1 as [1] (target = self). The runner
-//   grants the test domain's `ec_inner_ceiling` 0xFF, so slot 1 carries
-//   `susp` along with all other EC caps, neutralizing §[suspend] test 03
+//   We use the initial thread at slot 1 as [1] (target = self). The runner
+//   grants the test domain's `thread_inner_ceiling` 0xFF, so slot 1 carries
+//   `susp` along with all other thread caps, neutralizing §[suspend] test 03
 //   (lacks `susp`).
 //
 //   With every other §[handle_attachments] gate cleared, only test 05
@@ -40,7 +40,7 @@
 //   `[128-N..127]`. With N=1 the entry sits at vreg 127. Per the v3
 //   syscall ABI (libz/syscall.zig), vreg N for N >= 14 lives at
 //   `[rsp + (N-13)*8]` at syscall time, so vreg 127 is at `[rsp + 912]`
-//   with the syscall word at `[rsp + 0]`. The libz `suspendEc` wrapper
+//   with the syscall word at `[rsp + 0]`. The libz `suspendThread` wrapper
 //   panics on N>0 (its high-vreg path is unwired), so we issue the
 //   syscall directly via inline asm: allocate a 920-byte stack pad, write
 //   the entry at offset 912, write the syscall word at offset 0, load
@@ -64,7 +64,7 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-fn issueSuspendOneAttachmentX64(word: u64, ec_handle: u64, port_handle: u64, entry_word: u64) u64 {
+fn issueSuspendOneAttachmentX64(word: u64, thread_handle: u64, port_handle: u64, entry_word: u64) u64 {
     var rax_out: u64 = undefined;
     asm volatile (
         \\ subq $920, %%rsp
@@ -74,14 +74,14 @@ fn issueSuspendOneAttachmentX64(word: u64, ec_handle: u64, port_handle: u64, ent
         \\ addq $920, %%rsp
         : [rax_out] "={rax}" (rax_out),
         : [word] "{rcx}" (word),
-          [iv1] "{rax}" (ec_handle),
+          [iv1] "{rax}" (thread_handle),
           [iv2] "{rbx}" (port_handle),
           [entry] "r" (entry_word),
         : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
     return rax_out;
 }
 
-fn issueSuspendOneAttachmentArm(word: u64, ec_handle: u64, port_handle: u64, entry_word: u64) u64 {
+fn issueSuspendOneAttachmentArm(word: u64, thread_handle: u64, port_handle: u64, entry_word: u64) u64 {
     var x0_out: u64 = undefined;
     asm volatile (
         \\ sub sp, sp, #784
@@ -91,7 +91,7 @@ fn issueSuspendOneAttachmentArm(word: u64, ec_handle: u64, port_handle: u64, ent
         \\ add sp, sp, #784
         : [x0_out] "={x0}" (x0_out),
         : [word] "r" (word),
-          [iv1] "{x0}" (ec_handle),
+          [iv1] "{x0}" (thread_handle),
           [iv2] "{x1}" (port_handle),
           [entry] "r" (entry_word),
         : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
@@ -115,12 +115,12 @@ pub fn main(cap_table_base: u64) void {
 
     const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(1));
 
-    const ec_handle: u64 = caps.SLOT_INITIAL_EC;
+    const thread_handle: u64 = caps.SLOT_INITIAL_THREAD;
     const port_handle: u64 = caps.SLOT_FIRST_PASSED;
 
     const rax_out: u64 = switch (builtin.cpu.arch) {
-        .x86_64 => issueSuspendOneAttachmentX64(word, ec_handle, port_handle, entry_word),
-        .aarch64 => issueSuspendOneAttachmentArm(word, ec_handle, port_handle, entry_word),
+        .x86_64 => issueSuspendOneAttachmentX64(word, thread_handle, port_handle, entry_word),
+        .aarch64 => issueSuspendOneAttachmentArm(word, thread_handle, port_handle, entry_word),
         else => @compileError("unsupported arch"),
     };
 

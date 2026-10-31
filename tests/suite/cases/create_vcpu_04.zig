@@ -8,7 +8,7 @@
 //     - test 01 (caller's self-handle lacks `crec`) — the runner grants
 //       `crec` on the test domain's self-handle (runner/primary.zig).
 //     - test 02 (caps not a subset of the VM's owning domain's
-//       `ec_inner_ceiling`) — caps = 0 is a subset of any ceiling,
+//       `thread_inner_ceiling`) — caps = 0 is a subset of any ceiling,
 //       and resolving the owning domain's ceiling requires the [2]
 //       handle to first resolve to a VM, so on an empty slot this
 //       check cannot fire ahead of the BADCAP probe in any case.
@@ -27,7 +27,7 @@
 //   The test capability domain's table is populated by the kernel at
 //   `create_capability_domain` time:
 //     slot 0 → self
-//     slot 1 → initial EC
+//     slot 1 → initial thread
 //     slot 2 → self-IDC
 //     slot 3 → result port (the only passed_handle from the runner)
 //   Slot 4095 — the maximum 12-bit handle id — is therefore guaranteed

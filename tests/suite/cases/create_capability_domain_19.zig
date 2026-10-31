@@ -42,8 +42,8 @@
 //
 // SPEC AMBIGUITY: an inline-built minimal ELF has no executable text;
 // the page following the header bytes is zero-filled. The new domain's
-// initial EC will fault on first instruction. The spec lists no
-// success precondition that the EC "execute usefully" — only that the
+// initial thread will fault on first instruction. The spec lists no
+// success precondition that the thread "execute usefully" — only that the
 // caller observe its returned handle's caps. So this test passes as
 // long as `create_capability_domain` itself succeeds and mints the
 // handle correctly. If the kernel decides "ELF parse OK but no
@@ -104,7 +104,7 @@ const EM_AARCH64: u16 = 183;
 
 /// `e_machine` for the arch this test is built for. Hardcoding
 /// EM_X86_64 made the crafted child un-runnable on aarch64: the kernel
-/// mapped it, the initial EC executed the x86 stub bytes as A64
+/// mapped it, the initial thread executed the x86 stub bytes as A64
 /// (`adr x17, …` / `stxrh w0, w0, [x0]`), stored through its read-only
 /// cap_table_base, and died as a unhandled `memory_fault` — one
 /// `[UNHANDLED] subcode=0` per suite run, with the domain torn down by the
@@ -197,9 +197,9 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     //   mov    %rcx, (%rsp)           ; [rsp] = syscall_word
     //   syscall                        ; → kernel deleteAndDetach
     //   hlt                            ; unreachable on success
-    //   jmp    -1                       ; pin the EC if syscall ever returns
+    //   jmp    -1                       ; pin the thread if syscall ever returns
     //
-    // delete(SLOT_SELF) parks the calling EC as faulted and tears the
+    // delete(SLOT_SELF) parks the calling thread as faulted and tears the
     // domain down via destroyPhase1+2. Spec §[delete] table:
     // capability_domain_self → "calling domain is cleaned up; each
     // handle in its table is released with its type-specific delete
@@ -214,7 +214,7 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     //   str  x1, [sp]          ; [sp] = syscall_word
     //   svc  #0                ; → kernel deleteAndDetach
     //   brk  #0                ; unreachable on success
-    //   b    .                 ; pin the EC if the syscall ever returns
+    //   b    .                 ; pin the thread if the syscall ever returns
     const child_stub = switch (@import("builtin").cpu.arch) {
         .x86_64 => [_]u8{
             0x31, 0xC0, // xor %eax, %eax
@@ -344,13 +344,13 @@ pub fn main(cap_table_base: u64) void {
     // ceilings_inner ([2] arg layout): build from the caller's field0
     // (which uses §[capability_domain] Self handle layout — idc_rx at
     // bits 32-39 between cridc and pf). Copy bits 0-31 verbatim
-    // (ec/var/cridc) and shift bits 40-63 (pf/vm/port) down by 8 to
+    // (thread/var/cridc) and shift bits 40-63 (pf/vm/port) down by 8 to
     // place them at [2]-layout bits 32-55.
     const field0_low: u64 = self_cap.field0 & 0x0000_0000_FFFF_FFFF;
     const field0_pf_vm_port: u64 = (self_cap.field0 >> 40) & 0x0000_0000_00FF_FFFF;
     const ceilings_inner: u64 = field0_low | (field0_pf_vm_port << 32);
 
-    // ceilings_outer: ec_outer in bits 0-7, var_outer in bits 8-15,
+    // ceilings_outer: thread_outer in bits 0-7, var_outer in bits 8-15,
     // restart_policy_ceiling in 16-31, fut_wait_max in 32-37 — all
     // straight from the caller's field1 (already a valid bit pattern).
     const ceilings_outer: u64 = self_cap.field1;
@@ -360,7 +360,7 @@ pub fn main(cap_table_base: u64) void {
     //    checks irrelevant to test 19's post-condition.
     const passed: [0]u64 = .{};
 
-    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_thread_affinity
         passed[0..]);
     if (testing.isHandleError(result.v1)) {
         testing.fail(5);

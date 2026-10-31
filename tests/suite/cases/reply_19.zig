@@ -1,39 +1,39 @@
 // Spec §[reply] reply — test 19.
 //
-// "[test 19] on success when `pair_count > 0`, the resumed EC's syscall
+// "[test 19] on success when `pair_count > 0`, the resumed thread's syscall
 //  word carries `pair_count = N` and `tstart = S`; the next N slots
-//  `[S, S+N)` in the resumed EC's domain contain the inserted handles
+//  `[S, S+N)` in the resumed thread's domain contain the inserted handles
 //  per §[handle_attachments] (caps intersected with `idc_rx` for IDC
 //  handles, verbatim otherwise)."
 //
 // Strategy
 //   reply's success path with pair_count > 0 needs (a) a live reply
-//   handle to consume, (b) a suspended EC to resume, and (c) at least
+//   handle to consume, (b) a suspended thread to resume, and (c) at least
 //   one source handle to attach. All three live in the same single-
 //   domain test:
 //
-//     - The test EC mints a port with bind|recv|xfer (xfer is required
+//     - The test thread mints a port with bind|recv|xfer (xfer is required
 //       to mint a reply handle whose `xfer` cap is set, which is in
 //       turn required by reply with pair_count > 0 per §[reply]).
-//     - It pins itself and a sibling EC to the same current core, then
+//     - It pins itself and a sibling thread to the same current core, then
 //       the sibling self-suspends on the port through libz's raw capture
 //       helper so that on resume the kernel populates ITS syscall word
 //       with pair_count and tstart per §[event_state]; an externally-
-//       suspended EC has no syscall pad to write.
-//     - The test EC blocks in recv on the port; the kernel mints a
-//       reply handle in the test EC's table and returns its slot in
+//       suspended thread has no syscall pad to write.
+//     - The test thread blocks in recv on the port; the kernel mints a
+//       reply handle in the test thread's table and returns its slot in
 //       the recv syscall word.
-//     - The test EC issues reply with pair_count=1 and a single pair
+//     - The test thread issues reply with pair_count=1 and a single pair
 //       entry referencing a page frame handle (a non-IDC type so the
 //       caps land verbatim — no idc_rx intersection to disentangle).
 //       The pair entry is in vreg 127 per §[handle_attachments]; the
 //       libz `replyTransfer` wrapper owns that high-vreg layout.
 //
-//   The test EC's domain is the resumed EC's domain (we created the
+//   The test thread's domain is the resumed thread's domain (we created the
 //   sibling with target=self), so the inserted handle slot is visible
 //   to us through the read-only cap table mapping. The sibling, after
 //   resume, writes its observed post-resume syscall word back to a
-//   shared global; the test EC reads it to learn N and S.
+//   shared global; the test thread reads it to learn N and S.
 //
 // Verification
 //   1. reply returns OK in vreg 1.
@@ -44,33 +44,33 @@
 //      cap table whose caps == the entry's caps verbatim (the source
 //      was a page frame, not an IDC handle, so no intersection).
 //
-// SPEC AMBIGUITY: the spec talks about "the resumed EC's syscall word
+// SPEC AMBIGUITY: the spec talks about "the resumed thread's syscall word
 // `pair_count = N` and `tstart = S`" without distinguishing how the
-// resumed EC entered the suspended state. Realistic interpretations
-// require the resumed EC to have been in a syscall (its rsp pointing
+// resumed thread entered the suspended state. Realistic interpretations
+// require the resumed thread to have been in a syscall (its rsp pointing
 // at the syscall pad with vreg 0 at [rsp+0]); otherwise the kernel
 // would clobber whatever return-address word happened to be at the
-// EC's rsp+0. The sibling here self-suspends so we observe the
+// thread's rsp+0. The sibling here self-suspends so we observe the
 // post-resume word through the captured rcx.
 //
 // SPEC AMBIGUITY: spec §[event_state] tabulates the *recv-side*
 // syscall word layout (pair_count at bits 12-19, tstart at bits 20-31,
 // etc.); the resumed sender's post-resume word reuses the same field
 // positions in this test on the assumption that the kernel mirrors the
-// receiver's word into the resumed EC's syscall word. Bit 0-11 of the
+// receiver's word into the resumed thread's syscall word. Bit 0-11 of the
 // resumed word is treated as _reserved per the recv layout.
 //
 // Assertions
 //   1: setup — create_port for the test port returned an error word
 //   2: setup — create_page_frame returned an error word (source handle)
-//   3: setup — create_execution_context for the sibling returned an error
+//   3: setup — create_thread for the sibling returned an error
 //   4: setup — recv on the test port returned an error code in vreg 1
 //   5: setup — recv populated reply_handle_id = 0 (no reply handle minted)
 //   6: reply returned non-OK in vreg 1
 //   7: the reply handle slot still reads as a reply handle after the call
 //      (not consumed)
-//   8: pair_count field of the resumed EC's syscall word != 1
-//   9: tstart field of the resumed EC's syscall word references a slot
+//   8: pair_count field of the resumed thread's syscall word != 1
+//   9: tstart field of the resumed thread's syscall word references a slot
 //      that does NOT contain a page_frame handle, or whose caps differ
 //      from the entry's caps (handle missing or caps did not land
 //      verbatim)
@@ -85,7 +85,7 @@ const testing = lib.testing;
 
 const HandleId = caps.HandleId;
 
-// Cross-EC channel. Sibling and test EC share the same address space
+// Cross-thread channel. Sibling and test thread share the same address space
 // (single domain, same ELF); these globals are an in-process mailbox.
 var g_ready: u32 = 0;
 var g_port_handle_id: u64 = 0;
@@ -99,10 +99,10 @@ var g_sibling_done: u32 = 0;
 const ATTACH_PF_CAPS: caps.PfCap = .{ .move = true, .r = true, .w = true };
 
 fn siblingEntry() callconv(.c) noreturn {
-    // Spin until the test EC has installed our handle ids. The sibling
-    // EC starts running the moment create_execution_context returns,
-    // racing the test EC; the test EC writes the globals AFTER it
-    // captures the returned EC handle.
+    // Spin until the test thread has installed our handle ids. The sibling
+    // thread starts running the moment create_thread returns,
+    // racing the test thread; the test thread writes the globals AFTER it
+    // captures the returned thread handle.
     while (@atomicLoad(u32, &g_ready, .acquire) == 0) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
@@ -112,12 +112,12 @@ fn siblingEntry() callconv(.c) noreturn {
     }
 
     const port_id: u64 = g_port_handle_id;
-    const self_ec_id: u64 = g_sibling_self_handle_id;
+    const self_thread_id: u64 = g_sibling_self_handle_id;
 
     // Raw word 0 selects the no-attachment fast-suspend ABI. Capture the
     // post-resume syscall word so we can read pair_count / tstart.
     const suspended = syscall.issueRawCaptureWord(0, .{
-        .v1 = self_ec_id,
+        .v1 = self_thread_id,
         .v2 = port_id,
     });
     const word_out = suspended.word;
@@ -169,35 +169,35 @@ pub fn main(cap_table_base: u64) void {
     }
     const pf_handle: HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    // 3. Mint the sibling EC bound to this domain with susp+term and
+    // 3. Mint the sibling thread bound to this domain with susp+term and
     //    rp=0. susp is necessary because the sibling self-suspends; we
     //    don't actually use term but it keeps the cap profile minimal.
     //    rp=0 sidesteps any restart_policy ceiling interaction.
     //    Priority = 1 (normal) so the sibling can be dispatched while
-    //    the test EC is also at pri=1 — without this, sibling sits at
-    //    pri=0 (idle) and never preempts the test EC's busy-poll on
+    //    the test thread is also at pri=1 — without this, sibling sits at
+    //    pri=0 (idle) and never preempts the test thread's busy-poll on
     //    g_sibling_done, leaving the result undelivered.
-    const ec_caps = caps.EcCap{
+    const thread_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, ec_caps.toU16()) | (@as(u64, 1) << 32);
+    const thread_caps_word: u64 = @as(u64, thread_caps.toU16()) | (@as(u64, 1) << 32);
     const pinned_core = testing.currentCoreId();
     const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, sibling_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -208,8 +208,8 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         @intFromPtr(&siblingEntry),
         1, // stack_pages
         0, // target = self (this domain)
@@ -219,11 +219,11 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(3);
         return;
     }
-    const sibling_ec: HandleId = @truncate(cec.v1 & 0xFFF);
+    const sibling_thread: HandleId = @truncate(cec.v1 & 0xFFF);
 
     // Hand the sibling its operating handles, then release it.
     @atomicStore(u64, &g_port_handle_id, @as(u64, port_handle), .release);
-    @atomicStore(u64, &g_sibling_self_handle_id, @as(u64, sibling_ec), .release);
+    @atomicStore(u64, &g_sibling_self_handle_id, @as(u64, sibling_thread), .release);
     @atomicStore(u32, &g_ready, 1, .release);
 
     // 4. Block waiting for the sibling's suspension event. The kernel
@@ -267,10 +267,10 @@ pub fn main(cap_table_base: u64) void {
     // 7. Wait for the sibling to resume and report what it observed.
     //    The sibling writes its post-resume syscall word to
     //    g_sibling_observed_word and sets g_sibling_done. Spinning is
-    //    safe — both ECs are bound to this domain on the same scheduler;
+    //    safe — both Threads are bound to this domain on the same scheduler;
     //    the kernel will schedule the sibling.
     while (@atomicLoad(u32, &g_sibling_done, .acquire) == 0) {
-        _ = syscall.yieldEc(@as(u64, sibling_ec));
+        _ = syscall.yieldThread(@as(u64, sibling_thread));
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
             .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
@@ -290,7 +290,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // 8. The next N=1 slots starting at S=tstart in the resumed EC's
+    // 8. The next N=1 slots starting at S=tstart in the resumed thread's
     //    domain (== ours) must hold the inserted handles. For our
     //    page-frame entry, the install caps are the entry's caps
     //    verbatim (no idc_rx intersection because page_frame is not an

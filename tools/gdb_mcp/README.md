@@ -5,7 +5,7 @@ Drives a single long-lived `gdb -interpreter=mi3` subprocess via stdio
 JSON-RPC, with symbol and struct-field resolution backed by the callgraph
 SQLite DB built by `tools/indexer`. The DB is the workaround for gdb's
 fussy handling of fully-qualified Zig namespaces — instead of typing
-`print sched.scheduler.core_states[0].current_ec` and watching gdb fail
+`print sched.scheduler.core_states[0].current_thread` and watching gdb fail
 with `No symbol "sched" in current context`, the MCP looks the symbol up
 by SQL and feeds gdb a raw address.
 
@@ -88,11 +88,11 @@ CLI args:
      name: "sched.scheduler.core_states",
      type: "sched.scheduler.PerCore",
      array_index: 0,
-     field: "current_ec"
+     field: "current_thread"
    }
    ```
    The DB knows `core_states` is at `0xffffffff80317330` (`.bss`),
-   `PerCore` is 144 bytes wide, and `current_ec` is at offset 64. The MCP
+   `PerCore` is 144 bytes wide, and `current_thread` is at offset 64. The MCP
    does the math and issues `-data-read-memory-bytes`.
 
 7. **Done:**

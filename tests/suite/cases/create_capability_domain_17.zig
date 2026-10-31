@@ -47,7 +47,7 @@
 //
 //   Branch C: passed_handle entry with reserved bit 12 set.
 //     Use the result port handle (slot 3) — the only handle the test
-//     domain is guaranteed to have besides self/EC/IDC. Build a
+//     domain is guaranteed to have besides self/thread/IDC. Build a
 //     PassedHandle equivalent encoding manually with bit 12 set.
 //
 // Assertions

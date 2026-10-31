@@ -9,17 +9,17 @@
 //
 //   To isolate the out-of-range check we must make every neighboring
 //   error path miss:
-//     - test 01 (E_BADCAP):   [1] must reference a valid EC handle.
+//     - test 01 (E_BADCAP):   [1] must reference a valid thread handle.
 //     - test 02 (E_PERM):     [1] must carry the `spri` cap.
 //     - test 03 (E_PERM):     [2] must not exceed the caller's
 //                             self-handle `pri`.
 //     - test 05 (E_INVAL):    no reserved bits set in [1].
 //
-//   The runner-spawned domain receives its initial EC at
-//   SLOT_INITIAL_EC (slot 1) with caps = the runner's
-//   `ec_inner_ceiling` (low byte 0xFF, see `runner/primary.zig`'s
+//   The runner-spawned domain receives its initial thread at
+//   SLOT_INITIAL_THREAD (slot 1) with caps = the runner's
+//   `thread_inner_ceiling` (low byte 0xFF, see `runner/primary.zig`'s
 //   `ceilings_inner`). 0xFF includes bit 3 = `spri`, so slot 1 is a
-//   valid EC handle that carries the `spri` cap.
+//   valid thread handle that carries the `spri` cap.
 //
 //   The caller's self-handle `pri` is set to 3 (`runner/primary.zig`
 //   sets `child_self.pri = 3` when minting the test domain), which is
@@ -41,7 +41,7 @@
 //   asserted.
 //
 // Action
-//   priority(SLOT_INITIAL_EC, 4) — must return E_INVAL.
+//   priority(SLOT_INITIAL_THREAD, 4) — must return E_INVAL.
 //
 //   4 is the smallest value strictly greater than the spec maximum
 //   of 3 and fits in any reasonable encoding the kernel might use
@@ -63,7 +63,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     const out_of_range_priority: u64 = 4;
-    const result = syscall.priority(caps.SLOT_INITIAL_EC, out_of_range_priority);
+    const result = syscall.priority(caps.SLOT_INITIAL_THREAD, out_of_range_priority);
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(1);

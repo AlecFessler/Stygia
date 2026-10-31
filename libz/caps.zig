@@ -11,7 +11,7 @@ pub const HandleId = u12;
 pub const HandleType = enum(u4) {
     capability_domain_self = 0,
     capability_domain = 1,
-    execution_context = 2,
+    thread = 2,
     page_frame = 3,
     virtual_memory_address_region = 4,
     device_region = 5,
@@ -152,8 +152,8 @@ pub const IdcCap = packed struct(u16) {
     }
 };
 
-// §[execution_context] EC handle cap bits.
-pub const EcCap = packed struct(u16) {
+// §[thread] thread handle cap bits.
+pub const ThreadCap = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     saff: bool = false,
@@ -165,7 +165,7 @@ pub const EcCap = packed struct(u16) {
     restart_policy: u2 = 0,
     _reserved: u6 = 0,
 
-    pub fn toU16(self: EcCap) u16 {
+    pub fn toU16(self: ThreadCap) u16 {
         return @bitCast(self);
     }
 };
@@ -286,6 +286,6 @@ pub const PairEntry = packed struct(u64) {
 // Conventional slot ids for a freshly-created capability domain
 // (§[capability_domain] / §[create_capability_domain]).
 pub const SLOT_SELF: HandleId = 0;
-pub const SLOT_INITIAL_EC: HandleId = 1;
+pub const SLOT_INITIAL_THREAD: HandleId = 1;
 pub const SLOT_SELF_IDC: HandleId = 2;
 pub const SLOT_FIRST_PASSED: HandleId = 3;

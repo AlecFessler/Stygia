@@ -6,7 +6,7 @@
 // Strategy
 //   Use a port handle so failure mode is unambiguously the bitwise
 //   subset check. Port caps have no field that uses the alternate
-//   numeric semantics (those exist only on EC and VMAR handles, which
+//   numeric semantics (those exist only on thread and VMAR handles, which
 //   tests 03 and 04 cover separately).
 //
 //   Mint a port with `{recv, bind}` (the minimal cap shape that

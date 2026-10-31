@@ -6,7 +6,7 @@
 //     child capability domain, passing the port handle with `bind |
 //     xfer` caps. The kernel scheduler/SMP gives parallelism for free.
 //   - Each child performs its assertion logic and calls the libz
-//     `testing.report` helper, which suspends the initial EC on the
+//     `testing.report` helper, which suspends the initial thread on the
 //     result port with vregs:
 //        v3 = result_code (1 = pass, 0 = fail)
 //        v4 = assertion_id
@@ -17,15 +17,15 @@
 //     results without depending on completion order.
 //
 //   - Tests are pinned round-robin across cores via
-//     `create_capability_domain` `[5] initial_ec_affinity` (see
+//     `create_capability_domain` `[5] initial_thread_affinity` (see
 //     `-Dspread_cores`). Passing 0 there — "kernel picks any core" —
 //     uses local-biased initial placement; x64 can now pull-steal
-//     affinity-0 ready ECs, but deterministic runner placement is still
+//     affinity-0 ready Threads, but deterministic runner placement is still
 //     better for stability triage.
 //
 // Future work (per task brief, deferred for the v3 lockdep cycle and
 // build-budget reasons):
-//   - Per-core *port*, and a per-core runner EC that owns it, so
+//   - Per-core *port*, and a per-core runner thread that owns it, so
 //     result delivery hits the IPC fast path instead of every child
 //     on every core contending for the one shared result port. The
 //     affinity pinning above is half of that design; the port
@@ -68,7 +68,7 @@ const PROBE_SLOW_ROUNDS: usize = 5;
 
 // Tag magic. The build emits each test ELF with `test_tag.TAG =
 // TAG_MAGIC | manifest_index`. Tests that explicitly suspend their
-// initial EC on the runner's result port outside of `testing.report`
+// initial thread on the runner's result port outside of `testing.report`
 // (or whose suspend frame happens to ride rsi=0 / some other small
 // accidental value) would otherwise spoof a real test result and
 // overwrite a genuine entry. The runner enforces the magic on every
@@ -149,8 +149,8 @@ var fixture_plain_handle: caps.HandleId = 0;
 pub fn main(cap_table_base: u64) void {
     serial = serial_mod.init(cap_table_base);
 
-    // Spec §[execution_context].priority — bump self to `.high` (=2)
-    // so the receiver preempts test ECs the moment a result lands. Two
+    // Spec §[thread].priority — bump self to `.high` (=2)
+    // so the receiver preempts test Threads the moment a result lands. Two
     // effects matter for the L4 fast path: (a) when a child suspends,
     // primary is already parked in `recv` and `port.waiter_kind ==
     // .receivers`, so the asm rendezvous matches its predicate and
@@ -160,7 +160,7 @@ pub fn main(cap_table_base: u64) void {
     // children all tie at `.normal` and the round-robin scheduler
     // gives children a chance to suspend before primary parks — the
     // fast path predicate then fails 100% of the time.
-    _ = syscall.priority(caps.SLOT_INITIAL_EC, 2);
+    _ = syscall.priority(caps.SLOT_INITIAL_THREAD, 2);
 
     // §[port] / §[create_port] — mint a single shared result port.
     const port_caps = caps.PortCap{
@@ -207,11 +207,11 @@ pub fn main(cap_table_base: u64) void {
 
     // Phase 1+2 interleaved. Spawn `BATCH` tests, then drain `BATCH`
     // results before spawning the next batch. Bounded in-flight test
-    // count keeps simultaneous EC/CD/PageFrame slab usage well below
+    // count keeps simultaneous thread/CD/PageFrame slab usage well below
     // the per-class capacities and avoids running every test child to
     // peak concurrency in a 4-core scheduler — the kernel's debug
     // accounting (lockdep stacks, IRQ-handler depth tables, slab
-    // randomized-cursor BSS) compounds with per-EC kernel-stack frames
+    // randomized-cursor BSS) compounds with per-thread kernel-stack frames
     // and pushes total stack pressure over the budget on full-475
     // bursts. Spec doesn't forbid batched orchestration; the kernel
     // sees identical per-test syscalls regardless of batching.
@@ -220,12 +220,12 @@ pub fn main(cap_table_base: u64) void {
     // past iter ~432: at 16 the runner wedged in the spawn-loop body
     // before recv ever drained the batch, surfacing as no
     // `spawned 16/16` print after `[runner] batch 416..432` with the
-    // kernel still ticking and the runner EC parked (stygia-utf). The
+    // kernel still ticking and the runner thread parked (stygia-utf). The
     // contention was never pinpointed, and it is independent of the
     // per-domain resource leak fixed by `disarmTimerHandlesInDomain`.
     //
     // Now set by `-Dbatch=N` so the wall can be re-tested without
-    // editing test code. Note "runner EC parked, kernel still ticking"
+    // editing test code. Note "runner thread parked, kernel still ticking"
     // is the exact signature `parkSelfFaulted` leaves behind on an
     // unrouted fault — which `[UNHANDLED]` reporting in sched/port.zig
     // now announces, so a re-run should say directly whether that is
@@ -307,7 +307,7 @@ pub fn main(cap_table_base: u64) void {
 
                 // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
                 // Drop the batch on the floor (its survivors stay `.not_run` =
-                // MISS in summarize). Hung sender ECs are reaped at domain
+                // MISS in summarize). Hung sender Threads are reaped at domain
                 // teardown when the runner returns and drops its self-handle.
                 if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
                     serial.print("[runner] recv timeout after ");
@@ -322,7 +322,7 @@ pub fn main(cap_table_base: u64) void {
                     // MISS anyway, but by then the batch boundary is lost,
                     // and it is the batch shape that discriminates the two
                     // stygia-ojs severities: exactly one outstanding (a
-                    // single EC's result lost) versus the whole batch
+                    // single thread's result lost) versus the whole batch
                     // outstanding (nothing delivered at all, which is not
                     // BATCH independent losses).
                     serial.print("[runner]   outstanding in batch ");
@@ -349,9 +349,9 @@ pub fn main(cap_table_base: u64) void {
                     //     recv cannot have waited for a test to finish, so
                     //     this is a KERNEL bug on the receive side — a lost
                     //     wake or a spurious timeout — not a stuck test.
-                    //   slow=N          The sender ECs were merely late;
+                    //   slow=N          The sender Threads were merely late;
                     //     something starved them past 30 s.
-                    //   both zero       The sender ECs never produced a
+                    //   both zero       The sender Threads never produced a
                     //     result at all (dead, parked, or faulted silently).
                     //
                     // Probed events are deliberately NOT recorded: they stay
@@ -392,7 +392,7 @@ pub fn main(cap_table_base: u64) void {
                         // Freeze so the corpse stays inspectable — see the
                         // -Dhalt_on_miss rationale in build.zig. Spin in
                         // user mode rather than exiting: the kernel keeps
-                        // the lost EC, its port state and the per-core
+                        // the lost thread, its port state and the per-core
                         // scheduler state exactly as they are, and the
                         // qemu gdb stub stays attachable. The harness sees
                         // "no summary" and preserves the VM.
@@ -413,7 +413,7 @@ pub fn main(cap_table_base: u64) void {
                 // Previous code read vreg 1 here, so `reply_handle_id`
                 // came back as 0 and every reply syscall hit
                 // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
-                // sender ECs stayed parked on the result port and their CDs
+                // sender Threads stayed parked on the result port and their CDs
                 // lived indefinitely, preventing the runner from draining
                 // those test batches.
                 //
@@ -436,7 +436,7 @@ pub fn main(cap_table_base: u64) void {
                 // discarded slot, which lets ReleaseSmall strip the entire
                 // chain INCLUDING the inner `asm volatile`. The visible
                 // failure was the runner emitting ~10 of ~420 expected
-                // reply syscalls, every elided reply leaving a test EC
+                // reply syscalls, every elided reply leaving a test thread
                 // parked on the result port and the test's CD live
                 // indefinitely. Accumulated parked children starved the
                 // runner and produced a cascade-MISS tail.
@@ -491,7 +491,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     //                                    (R-only). Tests that re-
     //                                    spawn themselves into a
     //                                    sub-domain (e.g.
-    //                                    create_execution_context_03)
+    //                                    create_thread_03)
     //                                    reach for it via this slot.
     //   slot 5 (SLOT_FIRST_PASSED + 2 = LIBZ_PF_SLOT) — the staged
     //                                    libz.elf page_frame, R+X
@@ -598,7 +598,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     const passed: []const u64 = passed_buf[0..passed_len];
 
     // Spec §[create_capability_domain] [2] ceilings_inner field layout:
-    //   bits  0-7   ec_inner_ceiling   = 0xFF
+    //   bits  0-7   thread_inner_ceiling   = 0xFF
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF
     //   bits 24-31  cridc_ceiling      = 0x27
     //   bits 32-39  pf_ceiling         = 0x1F   (max_rwx | max_sz)
@@ -632,13 +632,13 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     };
     const self_caps: u64 = @as(u64, child_self.toU16());
 
-    // Spec §[create_capability_domain] [5] initial_ec_affinity — a
+    // Spec §[create_capability_domain] [5] initial_thread_affinity — a
     // single-core mask under `-Dspread_cores` (the default), else 1,
     // which pins runner-created test domains to core 0. We keep this
-    // deterministic even though affinity-0 ready ECs can now be
+    // deterministic even though affinity-0 ready Threads can now be
     // pull-stolen on x64.
     //
-    // Worker ECs the tests create for themselves still pass whatever
+    // Worker Threads the tests create for themselves still pass whatever
     // affinity the test requests. Affinity 0 remains local-biased at
     // creation time but is steal-admissible on x64, so tests that need
     // simple local contender placement should pin explicitly.

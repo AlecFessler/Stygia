@@ -10,16 +10,16 @@
 //         `reply_handle_id` (bits 32-43) must hold a handle of type
 //         `reply` (handle-type tag 7 per §[capabilities]).
 //     (b) That reply handle must reference the dequeued sender, i.e.
-//         consuming it via `reply` resumes the EC that the kernel
+//         consuming it via `reply` resumes the thread that the kernel
 //         actually dequeued from the port at recv time.
 //
-//   The cleanest way for one EC to set up both sides of the pipeline
-//   is the same recipe terminate_07 uses: the test EC mints a port
-//   with bind + recv caps, mints a worker EC W with susp + term, and
+//   The cleanest way for one thread to set up both sides of the pipeline
+//   is the same recipe terminate_07 uses: the test thread mints a port
+//   with bind + recv caps, mints a worker thread W with susp + term, and
 //   issues `suspend(W, port)` to queue W as a suspended sender on
 //   the port. Per §[suspend] this is non-blocking when [1] != self,
-//   so the test EC stays runnable. The test EC then calls `recv` on
-//   the port — recv returns immediately because the test EC holds
+//   so the test thread stays runnable. The test thread then calls `recv` on
+//   the port — recv returns immediately because the test thread holds
 //   the port's bind cap (no E_CLOSED) and W is the queued sender.
 //
 //   For (a) we read the reply_handle_id slot out of the cap table
@@ -35,15 +35,15 @@
 //
 // Action
 //   1. create_port(caps={bind, recv})        — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, rp=0})            — must succeed
 //      (entry = dummyEntry; W never executes meaningfully — it is
 //      suspended before scheduling matters)
 //   3. suspend(W, port)                      — must return OK
-//      (non-blocking on the test EC since [1] != self; queues W as
+//      (non-blocking on the test thread since [1] != self; queues W as
 //      a suspended sender on the port)
 //   4. recv(port)                            — must return OK
-//      (test EC holds the port's bind cap, so no E_CLOSED; W is the
+//      (test thread holds the port's bind cap, so no E_CLOSED; W is the
 //      queued sender)
 //   5. readCap(cap_table_base, reply_handle_id)
 //                                            — handleType == reply
@@ -53,7 +53,7 @@
 // Assertions
 //   1: setup port creation failed (createPort returned an error
 //      word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -85,15 +85,15 @@ pub fn main(cap_table_base: u64) void {
     // port) and term (kept symmetric with terminate_07; harmless
     // here). restart_policy = 0 keeps the request inside the
     // runner-granted ceiling.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -117,7 +117,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The test EC holds the port's bind cap (so the
+    // Step 4: recv. The test thread holds the port's bind cap (so the
     // port is not terminally closed) and W is queued, so recv
     // returns immediately with the kernel-allocated reply handle id
     // packed into the syscall word per §[recv].
@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 6: probe the reference half of the assertion. A reply
-    // handle that references the dequeued sender resumes that EC
+    // handle that references the dequeued sender resumes that thread
     // when consumed via `reply`; the call must return OK. A slot
     // pointing at no sender or at a different sender would surface
     // an error here.

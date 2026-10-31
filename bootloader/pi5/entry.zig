@@ -136,7 +136,7 @@ fn sctlrEl2() u64 {
 ///     UNEXPECTED EXCEPTION: ESR=0xbe000011 ELR=0xbef933afb1c FAR=0xffff0000d7000000
 ///     KERNEL PANIC: Unexpected exception vector taken
 ///
-/// `ESR` EC=0x2F is SError, AET=0b000 (uncontainable), and `ELR` is the root EC's
+/// `ESR` EC=0x2F is SError, AET=0b000 (uncontainable), and `ELR` is the root thread's
 /// entry point — i.e. the abort had nothing to do with the code it landed on, which
 /// is precisely what makes it so misleading to debug from the kernel side.
 ///

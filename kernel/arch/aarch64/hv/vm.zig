@@ -10,7 +10,7 @@ const stage2_mod = stygia.arch.aarch64.stage2;
 const vgic_mod = hv.vgic;
 const vm_hw = stygia.arch.aarch64.vm;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
 const PageFrame = stygia.memory.page_frame.PageFrame;
@@ -415,7 +415,7 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
 /// false if the fault must surface to the VMM.
 pub fn tryHandleStage2Mmio(
     vm: *VirtualMachine,
-    vcpu_ec: *ExecutionContext,
+    vcpu_thread: *Thread,
     guest_phys: u64,
     iss_valid: bool,
     is_write: bool,
@@ -424,7 +424,7 @@ pub fn tryHandleStage2Mmio(
     _ = vm;
     if (!iss_valid) return false;
     if (guest_phys < PL011_IPA_BASE or guest_phys >= PL011_IPA_BASE + PL011_IPA_SIZE) return false;
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return false;
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return false;
     const gs = &arch_state.guest_state;
     const offset = guest_phys - PL011_IPA_BASE;
     if (is_write) {

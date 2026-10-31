@@ -22,7 +22,7 @@
 //   For [2] we use slot 4095 — the maximum 12-bit handle id.
 //   The child capability domain's table is populated by the kernel
 //   at create_capability_domain time (slots 0/1/2 are self / initial
-//   EC / self-IDC; passed_handles begin at 3) so slot 4095 is
+//   thread / self-IDC; passed_handles begin at 3) so slot 4095 is
 //   guaranteed empty and therefore invalid as a device_region
 //   handle. The same trick is used by map_pf_01.zig.
 //

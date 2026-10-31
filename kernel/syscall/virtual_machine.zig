@@ -5,7 +5,7 @@ const errors = stygia.syscall.errors;
 const vm_obj = stygia.hv.virtual_machine;
 
 const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const PortCaps = stygia.sched.port.PortCaps;
 const VmCaps = vm_obj.VmCaps;
 const Word0 = capability.Word0;
@@ -79,8 +79,8 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     if (caps & ~CREATE_VM_CAPS_MASK != 0) return errors.E_INVAL;
     if (policy_page_frame & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -104,7 +104,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     // Self handle layout) gates only `policy`; `restart_policy` is gated
     // separately by `restart_policy_ceiling.vm_restart_max` per
     // §[restart_semantics] test 04 — enforced just below in the same
-    // shape as `ec_restart_max` in `kernel/syscall/execution_context.zig`.
+    // shape as `thread_restart_max` in `kernel/syscall/thread.zig`.
     const requested: u16 = @truncate(caps);
     const requested_policy = requested & 0x1;
     const ceiling_policy = vm_ceiling & 0x1;
@@ -113,7 +113,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
     // Spec §[restart_semantics] test 04: returns E_PERM if
     // `caps.restart_policy = 1` and the calling domain's
     // `restart_policy_ceiling.vm_restart_max = 0`. Mirrors the
-    // `ec_restart_max` enforcement at `execution_context.zig` (caller's
+    // `thread_restart_max` enforcement at `thread.zig` (caller's
     // `restart_policy_ceiling` is the authoritative gate regardless of
     // whether the new handle is minted in the caller's own table — VM
     // handles are non-transferable so there is no second domain).
@@ -122,10 +122,10 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 
     if (!pf_resolved) return errors.E_BADCAP;
 
-    return vm_obj.createVirtualMachine(ec, caps, policy_page_frame);
+    return vm_obj.createVirtualMachine(thread, caps, policy_page_frame);
 }
 
-/// Creates a vCPU execution context bound to a VM. The vCPU is created
+/// Creates a vCPU thread bound to a VM. The vCPU is created
 /// suspended on its exit port with zeroed guest state; the creator
 /// installs initial guest state through the same mechanism used to handle
 /// vm exits — recv on the exit port, modify the vregs, reply with a
@@ -136,7 +136,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 ///   syscall_num = 28
 ///
 ///   [1] caps: u64 packed as
-///     bits  0-15: caps       — caps on the EC handle returned to the caller
+///     bits  0-15: caps       — caps on the thread handle returned to the caller
 ///     bits 32-33: priority   — scheduling priority, 0-3, bounded by caller's priority ceiling
 ///     bits 34-63: _reserved
 ///
@@ -149,7 +149,7 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 /// Caps required: caller's self-handle must have `crec`. Holding the VM
 /// handle implies the authority to spawn vCPUs in it.
 ///
-/// The vCPU EC is bound to the capability domain that holds the VM
+/// The vCPU thread is bound to the capability domain that holds the VM
 /// handle. `create_vcpu` binds `exit_port` as the destination for its
 /// vm_exit events and publishes the new vCPU as runnable. On the vCPU's
 /// first dispatch, the kernel delivers a vm_exit-style event on
@@ -164,16 +164,16 @@ pub fn createVirtualMachine(caller: *anyopaque, caps: u64, policy_page_frame: u6
 /// caller's handle table has no free slot.
 ///
 /// [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
-/// [test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
+/// [test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `thread_inner_ceiling`.
 /// [test 03] returns E_PERM if priority exceeds the caller's priority ceiling.
 /// [test 04] returns E_BADCAP if [2] is not a valid VM handle.
 /// [test 05] returns E_BADCAP if [4] is not a valid port handle.
 /// [test 06] returns E_INVAL if [3] affinity has bits set outside the system's core count.
 /// [test 07] returns E_INVAL if any reserved bits are set in [1].
-/// [test 08] on success, the caller receives an EC handle with caps = `[1].caps`.
-/// [test 09] on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
-/// [test 10] on success, the EC's priority is set to `[1].priority`.
-/// [test 11] on success, the EC's affinity is set to `[3]`.
+/// [test 08] on success, the caller receives an thread handle with caps = `[1].caps`.
+/// [test 09] on success, `suspend` on the returned thread handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
+/// [test 10] on success, the thread's priority is set to `[1].priority`.
+/// [test 11] on success, the thread's affinity is set to `[3]`.
 /// [test 12] after creation, the initial vCPU dispatch delivers a vm_exit event on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code; a waiting `recv` observes that delivery before guest entry.
 pub fn createVcpu(
     caller: *anyopaque,
@@ -186,8 +186,8 @@ pub fn createVcpu(
     if (vm_handle & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (exit_port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -217,7 +217,7 @@ pub fn createVcpu(
     if (port_entry == null) return errors.E_BADCAP;
     if (!port_caps.bind) return errors.E_PERM;
 
-    return vm_obj.createVcpu(ec, caps, vm_handle, affinity, exit_port);
+    return vm_obj.createVcpu(thread, caps, vm_handle, affinity, exit_port);
 }
 
 /// Installs page_frames into the VM's guest physical address space.
@@ -248,8 +248,8 @@ pub fn mapGuest(caller: *anyopaque, vm: u64, pairs: []const u64) i64 {
     if (vm & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (pairs.len == 0 or (pairs.len & 1) != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -260,7 +260,7 @@ pub fn mapGuest(caller: *anyopaque, vm: u64, pairs: []const u64) i64 {
 
     if (!vm_resolved) return errors.E_BADCAP;
 
-    return vm_obj.mapGuest(ec, vm, pairs);
+    return vm_obj.mapGuest(thread, vm, pairs);
 }
 
 /// Removes page_frame mappings from a VM's guest physical address space.
@@ -284,8 +284,8 @@ pub fn unmapGuest(caller: *anyopaque, vm: u64, page_frames: []const u64) i64 {
     if (vm & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (page_frames.len == 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -296,7 +296,7 @@ pub fn unmapGuest(caller: *anyopaque, vm: u64, page_frames: []const u64) i64 {
 
     if (!vm_resolved) return errors.E_BADCAP;
 
-    return vm_obj.unmapGuest(ec, vm, page_frames);
+    return vm_obj.unmapGuest(thread, vm, page_frames);
 }
 
 /// Replaces a single VmPolicy table on the VM, atomically. Tables for
@@ -329,8 +329,8 @@ pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []co
     const kind: u8 = @truncate((syscall_word >> 12) & 0x1);
     const count: u8 = @truncate((syscall_word >> 13) & 0xFF);
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -347,7 +347,7 @@ pub fn vmSetPolicy(caller: *anyopaque, syscall_word: u64, vm: u64, entries: []co
     if (vm_entry == null) return errors.E_BADCAP;
     if (!vm_caps.policy) return errors.E_PERM;
 
-    return vm_obj.applyVmPolicyTable(ec, vm, kind, count, entries);
+    return vm_obj.applyVmPolicyTable(thread, vm, kind, count, entries);
 }
 
 /// Asserts or deasserts a virtual IRQ line on the VM's emulated interrupt
@@ -376,8 +376,8 @@ pub fn vmInjectIrq(caller: *anyopaque, vm: u64, irq_num: u64, assert: u64) i64 {
     if (vm & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (assert & ~INJECT_IRQ_ASSERT_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
 
@@ -388,5 +388,5 @@ pub fn vmInjectIrq(caller: *anyopaque, vm: u64, irq_num: u64, assert: u64) i64 {
 
     if (!vm_resolved) return errors.E_BADCAP;
 
-    return vm_obj.vmInjectIrq(ec, vm, irq_num, assert);
+    return vm_obj.vmInjectIrq(thread, vm, irq_num, assert);
 }

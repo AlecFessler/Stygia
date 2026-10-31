@@ -23,7 +23,7 @@
 //   exit state. The wide stack-window protocol (vregs 14..73 at
 //   [user_rsp + 8 .. + 488]) is implemented for synthetic vm_exit
 //   handshakes in libz, and the linux_guest VMM has full guest bringup
-//   machinery, but this single-EC suite runner does not provide a
+//   machinery, but this single-thread suite runner does not provide a
 //   focused harness for staging a tiny guest payload (instruction bytes
 //   + GDT/IDT/segs/CR0/CR3/EFER), starting it, and observing the CPUID
 //   result. create_vcpu_09 / reply_08 / reply_21 stop at the safe

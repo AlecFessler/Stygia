@@ -21,7 +21,7 @@
 //   v0 runner (runner/primary.zig spawnOne) populates a child
 //   capability domain's table via `create_capability_domain`'s
 //   passed_handles, which on this branch carry only the result port
-//   at slot 3. Slots 0/1/2 are kernel-installed as self / initial EC
+//   at slot 3. Slots 0/1/2 are kernel-installed as self / initial thread
 //   / self-IDC. No device_region reaches a test child today.
 //
 //   Without a valid device_region in [2], the kernel rejects the

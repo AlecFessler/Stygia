@@ -3,7 +3,7 @@ const lib = @import("lib");
 
 // Per spec §[create_capability_domain]: "The pointer to the new domain's
 // read-only view of its capability table is passed as the first argument
-// to the initial EC's entry point." On x86-64 SysV that's rdi at entry;
+// to the initial thread's entry point." On x86-64 SysV that's rdi at entry;
 // the linker puts _start in .text._start so the kernel jumps to it as an
 // ordinary function call.
 export fn _start(cap_table_base: u64) noreturn {

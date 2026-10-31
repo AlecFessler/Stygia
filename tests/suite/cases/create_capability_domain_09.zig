@@ -52,7 +52,7 @@ const testing = lib.testing;
 // 32-39 and shifts pf/vm/port up by 8 bits, while ceilings_inner
 // packs pf/vm/port at bits 32-55 with no idc_rx slot. See
 // §[capability_domain] Self handle vs §[create_capability_domain] [2].
-// `ec_inner`, `var_inner`, and `cridc_ceiling` (bits 0-31) are the
+// `thread_inner`, `var_inner`, and `cridc_ceiling` (bits 0-31) are the
 // only sub-fields that share an offset between the two.
 const CRIDC_SHIFT: u6 = 24;
 
@@ -77,13 +77,13 @@ pub fn main(cap_table_base: u64) void {
     // sub-field except `cridc_ceiling`. Without this translation,
     // pf/vm/port sub-fields land at the wrong offsets and trip
     // tests 10/11/12 before the test 09 cridc check fires.
-    const caller_ec_inner: u64 = self_cap.field0 & 0xFF;
+    const caller_thread_inner: u64 = self_cap.field0 & 0xFF;
     const caller_vmar_inner: u64 = (self_cap.field0 >> 8) & 0xFFFF;
     const caller_pf: u64 = (self_cap.field0 >> FIELD0_PF_SHIFT) & 0xFF;
     const caller_vm: u64 = (self_cap.field0 >> FIELD0_VM_SHIFT) & 0xFF;
     const caller_port: u64 = (self_cap.field0 >> FIELD0_PORT_SHIFT) & 0xFF;
     const base_inner: u64 =
-        caller_ec_inner |
+        caller_thread_inner |
         (caller_vmar_inner << 8) |
         (caller_pf << INNER_PF_SHIFT) |
         (caller_vm << INNER_VM_SHIFT) |
@@ -121,7 +121,7 @@ pub fn main(cap_table_base: u64) void {
             ceilings_inner,
             ceilings_outer,
             0, // elf_page_frame: bogus on purpose — irrelevant if E_PERM fires first.
-            0, // initial_ec_affinity
+            0, // initial_thread_affinity
             &.{},
         );
         if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
@@ -145,7 +145,7 @@ pub fn main(cap_table_base: u64) void {
         ceilings_inner,
         ceilings_outer,
         0, // elf_page_frame: bogus on purpose; expect E_BADCAP, not E_PERM.
-        0, // initial_ec_affinity
+        0, // initial_thread_affinity
         &.{},
     );
     if (result.v1 == @intFromEnum(errors.Error.E_PERM)) {

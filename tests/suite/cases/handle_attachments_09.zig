@@ -4,15 +4,15 @@
 //  the sender's table; entries with `move = 0` are not removed."
 //
 // Strategy
-//   Mirrors test 08's single-EC suspend-self-with-recv harness, but
+//   Mirrors test 08's single-thread suspend-self-with-recv harness, but
 //   with TWO attachment entries: one with `move = 1` and one with
-//   `move = 0`. Both source handles are minted in the test EC's own
+//   `move = 0`. Both source handles are minted in the test thread's own
 //   table (single-CD case), so the recv-time source-slot clear runs
 //   inline in `port.deliverEvent` against the receiver's CD lock and
 //   the assertion is observable directly via `readCap` on the test
-//   EC's slot ids.
+//   thread's slot ids.
 //
-//   Source object choice: EC handles. EC handles are non-IDC and
+//   Source object choice: thread handles. thread handles are non-IDC and
 //   their caps install verbatim, matching test 08's choice. We need
 //   two distinct source slots so the move=1 / move=0 polarities can
 //   be inspected independently. Both sources are minted with
@@ -35,25 +35,25 @@
 //   Per the spec, source-slot clear runs at recv time. After recv()
 //   returns, `readCap` on the move=1 source slot must show an empty
 //   slot (handleType == none / 0) and the move=0 source slot must
-//   still hold its EC handle.
+//   still hold its thread handle.
 //
 // Pre-call gates the test must clear so no other error masks the
 // assertion under test:
 //   - the runner-minted self-handle carries `crpt` and `crec`, so
-//     create_port and create_execution_context can run.
-//   - the runner-granted ec_inner_ceiling (0xFF) lets a freshly
-//     minted EC carry move|copy|saff|spri|term|susp|read|write —
+//     create_port and create_thread can run.
+//   - the runner-granted thread_inner_ceiling (0xFF) lets a freshly
+//     minted thread carry move|copy|saff|spri|term|susp|read|write —
 //     this test only uses {move, copy, saff, susp, term} subsets.
-//   - restart_policy = 0 (kill) on every minted EC stays within the
-//     runner's `ec_restart_max = 2` ceiling.
+//   - restart_policy = 0 (kill) on every minted thread stays within the
+//     runner's `thread_restart_max = 2` ceiling.
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer, suspend}) → P.
-//   2. create_execution_context(target=self, caps={term, susp,
+//   2. create_thread(target=self, caps={term, susp,
 //      restart_policy=0}) → W (suspend target).
-//   3. create_execution_context(target=self, caps={move, copy,
+//   3. create_thread(target=self, caps={move, copy,
 //      saff, restart_policy=0}) → C_move (move=1 source).
-//   4. create_execution_context(target=self, caps={move, copy,
+//   4. create_thread(target=self, caps={move, copy,
 //      saff, restart_policy=0}) → C_copy (move=0 source).
 //   5. Build PairEntry{C_move, caps={move, copy, saff}, move=1} and
 //      PairEntry{C_copy, caps={move, copy, saff}, move=0}.
@@ -62,7 +62,7 @@
 //      installed in the receiver's table at [tstart, tstart+1]
 //      and the move=1 source slot cleared.
 //   8. readCap(cap_table, c_move_handle): handleType == none.
-//   9. readCap(cap_table, c_copy_handle): handleType == execution_context.
+//   9. readCap(cap_table, c_copy_handle): handleType == thread.
 //
 // Assertions
 //   1: setup port creation failed.
@@ -214,65 +214,65 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
     // Step 2: W (suspend target).
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
     const entry: u64 = @intFromPtr(&dummyEntry);
-    const cec_w = syscall.createExecutionContext(
+    const created_thread_w = syscall.createThread(
         @as(u64, w_caps.toU16()),
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec_w.v1)) {
+    if (testing.isHandleError(created_thread_w.v1)) {
         testing.fail(2);
         return;
     }
-    const w_handle: u12 = @truncate(cec_w.v1 & 0xFFF);
+    const w_handle: u12 = @truncate(created_thread_w.v1 & 0xFFF);
 
     // Step 3: C_move — source for the move=1 entry. Needs `move` cap
     // (test 04 gate) and `copy` cap on the source for symmetry; the
     // entry's caps are installed verbatim on the receiver.
-    const c_caps = caps.EcCap{
+    const c_caps = caps.ThreadCap{
         .move = true,
         .copy = true,
         .saff = true,
         .restart_policy = 0,
     };
-    const cec_move = syscall.createExecutionContext(
+    const created_thread_move = syscall.createThread(
         @as(u64, c_caps.toU16()),
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec_move.v1)) {
+    if (testing.isHandleError(created_thread_move.v1)) {
         testing.fail(3);
         return;
     }
-    const c_move_handle: u12 = @truncate(cec_move.v1 & 0xFFF);
+    const c_move_handle: u12 = @truncate(created_thread_move.v1 & 0xFFF);
 
     // Step 4: C_copy — source for the move=0 entry.
-    const cec_copy = syscall.createExecutionContext(
+    const created_thread_copy = syscall.createThread(
         @as(u64, c_caps.toU16()),
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec_copy.v1)) {
+    if (testing.isHandleError(created_thread_copy.v1)) {
         testing.fail(4);
         return;
     }
-    const c_copy_handle: u12 = @truncate(cec_copy.v1 & 0xFFF);
+    const c_copy_handle: u12 = @truncate(created_thread_copy.v1 & 0xFFF);
 
     // Step 5: build pair entries. The entry's caps must be a subset
     // of the source's caps (test 03), and move/copy bits on the
     // source must authorize the polarity (tests 04/05).
-    const entry_caps = caps.EcCap{ .move = true, .copy = true, .saff = true };
+    const entry_caps = caps.ThreadCap{ .move = true, .copy = true, .saff = true };
     const pair_move = caps.PairEntry{
         .id = c_move_handle,
         .caps = entry_caps.toU16(),
@@ -328,7 +328,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 8: the move=1 source slot must now be empty in the
-    // sender's (= test EC's, single-CD) table. `clearAndFreeSlot`
+    // sender's (= test thread's, single-CD) table. `clearAndFreeSlot`
     // zeros the entire user_table entry, so word0 == 0 is the
     // post-clear signature. (The HandleType enum has no `none`
     // tag — empty slots decode to type=0/id=0/caps=0, indistinguishable
@@ -340,9 +340,9 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 9: the move=0 source slot must STILL hold its EC handle.
+    // Step 9: the move=0 source slot must STILL hold its thread handle.
     const copy_src_after = caps.readCap(cap_table_base, @as(u32, c_copy_handle));
-    if (copy_src_after.handleType() != .execution_context) {
+    if (copy_src_after.handleType() != .thread) {
         testing.fail(9);
         return;
     }

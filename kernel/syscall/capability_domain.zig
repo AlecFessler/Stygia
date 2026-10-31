@@ -3,10 +3,10 @@ const stygia = @import("stygia");
 const capability = stygia.caps.capability;
 const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
-const ExecutionContext = execution_context.ExecutionContext;
+const Thread = thread_mod.Thread;
 const Word0 = capability.Word0;
 
 /// `caps` argument: self-cap bit 7 is reserved; bits 16-23 carry idc_rx;
@@ -24,7 +24,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// frame. The caller receives back an IDC handle to the new domain.
 ///
 /// ```
-/// create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_ec_affinity, [6+] passed_handles)
+/// create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
 ///   -> [1] idc_handle
 ///   syscall_num = 4
 ///
@@ -34,7 +34,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///     bits 24-63: _reserved
 ///
 ///   [2] ceilings_inner: u64 packed as (matches self-handle field0)
-///     bits  0-7:  ec_inner_ceiling
+///     bits  0-7:  thread_inner_ceiling
 ///     bits  8-23: vmar_inner_ceiling:
 ///                    bit  8:     move
 ///                    bit  9:     copy
@@ -59,10 +59,10 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///     bits 56-63: _reserved
 ///
 ///   [3] ceilings_outer: u64 packed as (matches self-handle field1)
-///     bits  0-7: ec_outer_ceiling
+///     bits  0-7: thread_outer_ceiling
 ///     bits  8-15: vmar_outer_ceiling
 ///     bits 16-31: restart_policy_ceiling:
-///                    bits 16-17: ec_restart_max     (kill / restart_at_entry / persist / _reserved)
+///                    bits 16-17: thread_restart_max     (kill / restart_at_entry / persist / _reserved)
 ///                    bits 18-19: vmar_restart_max    (free / decommit / preserve / snapshot)
 ///                    bit 20:     pf_restart_max     (drop / keep)
 ///                    bit 21:     dr_restart_max     (drop / keep)
@@ -75,8 +75,8 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///
 ///   [4] elf_page_frame: page frame handle containing the ELF image from offset 0
 ///
-///   [5] initial_ec_affinity: u64 core mask for the new domain's initial EC.
-///       Same encoding as `create_execution_context` `[6] affinity`.
+///   [5] initial_thread_affinity: u64 core mask for the new domain's initial thread.
+///       Same encoding as `create_thread` `[6] affinity`.
 ///       0 = any core (kernel chooses).
 ///
 ///   [6+] passed_handles: each entry is a u64 packed as
@@ -91,21 +91,21 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///
 /// The ELF image is read from `elf_page_frame` starting at byte 0. The
 /// pointer to the new domain's read-only view of its capability table is
-/// passed as the first argument to the initial EC's entry point.
+/// passed as the first argument to the initial thread's entry point.
 ///
 /// The caller receives an IDC handle to the new domain with caps = the
 /// caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle
 /// is minted with caps = the `cridc_ceiling` passed in [2]. The new
-/// domain's slot-1 initial-EC handle is minted with caps = the new
-/// domain's `ec_inner_ceiling` from [2].
+/// domain's slot-1 initial-thread handle is minted with caps = the new
+/// domain's `thread_inner_ceiling` from [2].
 ///
 /// Returns E_NOMEM if insufficient kernel memory; returns E_FULL if the
 /// caller's handle table has no free slot for the returned IDC handle.
 ///
 /// [test 01] returns E_PERM if the caller's self-handle lacks `crcd`.
 /// [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
-/// [test 03] returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
-/// [test 04] returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
+/// [test 03] returns E_PERM if `thread_inner_ceiling` is not a subset of the caller's `thread_inner_ceiling`.
+/// [test 04] returns E_PERM if `thread_outer_ceiling` is not a subset of the caller's `thread_outer_ceiling`.
 /// [test 05] returns E_PERM if `vmar_inner_ceiling` is not a subset of the caller's `vmar_inner_ceiling`.
 /// [test 06] returns E_PERM if `vmar_outer_ceiling` is not a subset of the caller's `vmar_outer_ceiling`.
 /// [test 07] returns E_PERM if any field in `restart_policy_ceiling` exceeds the caller's corresponding field.
@@ -122,16 +122,16 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 /// [test 19] on success, the caller receives an IDC handle to the new domain with caps = the caller's `cridc_ceiling`.
 /// [test 20] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
-/// [test 21] on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
+/// [test 21] on success, the new domain's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
 /// [test 22] on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
 /// [test 23] on success, passed handles occupy slots 3+ of the new domain's handle table in the order supplied, each with the caps specified in its entry.
 /// [test 24] a passed handle entry with `move = 1` is removed from the caller's handle table after the call.
 /// [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
-/// [test 26] on success, the new domain's `ec_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
-/// [test 27] on success, the new domain's `ec_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
+/// [test 26] on success, the new domain's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+/// [test 27] on success, the new domain's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 /// [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
-/// [test 29] the initial EC begins executing at the entry point declared in the ELF header.
-/// [test 31] on success, the new domain's initial EC has affinity equal to `[5]`.
+/// [test 29] the initial thread begins executing at the entry point declared in the ELF header.
+/// [test 31] on success, the new domain's initial thread has affinity equal to `[5]`.
 /// [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
 pub fn createCapabilityDomain(
     caller: *anyopaque,
@@ -139,7 +139,7 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf_slot: u64,
-    initial_ec_affinity: u64,
+    initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
@@ -155,8 +155,8 @@ pub fn createCapabilityDomain(
         if (entry & ~PASSED_HANDLE_MASK != 0) return errors.E_INVAL;
     }
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const irq_state = lr.irq_state;
@@ -187,7 +187,7 @@ pub fn createCapabilityDomain(
     // `restart_policy_ceiling` (bits 16-31 of [3]) must be ≤ the
     // caller's corresponding field on its self-handle field1. The
     // sub-field is partitioned per the syscall doc above:
-    //   bits 16-17 ec_restart_max   (2-bit numeric, 0..3)
+    //   bits 16-17 thread_restart_max   (2-bit numeric, 0..3)
     //   bits 18-19 vmar_restart_max  (2-bit numeric, 0..3)
     //   bit 20     pf_restart_max   (bool)
     //   bit 21     dr_restart_max   (bool)
@@ -202,8 +202,8 @@ pub fn createCapabilityDomain(
     const caller_field1 = cd.user_table[SELF_HANDLE_SLOT].field1;
     const caller_rpc: u16 = @truncate((caller_field1 >> 16) & 0xFFFF);
     const requested_rpc: u16 = @truncate((ceilings_outer >> 16) & 0xFFFF);
-    const caller_ec_rmax: u2 = @truncate(caller_rpc & 0x3);
-    const requested_ec_rmax: u2 = @truncate(requested_rpc & 0x3);
+    const caller_thread_rmax: u2 = @truncate(caller_rpc & 0x3);
+    const requested_thread_rmax: u2 = @truncate(requested_rpc & 0x3);
     const caller_vmar_rmax: u2 = @truncate((caller_rpc >> 2) & 0x3);
     const requested_vmar_rmax: u2 = @truncate((requested_rpc >> 2) & 0x3);
     if (requested_rpc & ~@as(u16, 0x01FF) != 0) {
@@ -212,7 +212,7 @@ pub fn createCapabilityDomain(
     }
     const caller_bools: u8 = @truncate((caller_rpc >> 4) & 0x1F);
     const requested_bools: u8 = @truncate((requested_rpc >> 4) & 0x1F);
-    if (requested_ec_rmax > caller_ec_rmax or
+    if (requested_thread_rmax > caller_thread_rmax or
         requested_vmar_rmax > caller_vmar_rmax or
         (requested_bools & ~caller_bools) != 0)
     {
@@ -232,10 +232,10 @@ pub fn createCapabilityDomain(
     // separate from the subset rule.
     const caller_field0 = cd.user_table[SELF_HANDLE_SLOT].field0;
 
-    // [test 03] ec_inner_ceiling: [2] bits 0-7 ⊆ field0 bits 0-7.
-    const caller_ec_inner_ceiling: u8 = @truncate(caller_field0 & 0xFF);
-    const requested_ec_inner_ceiling: u8 = @truncate(ceilings_inner & 0xFF);
-    if (requested_ec_inner_ceiling & ~caller_ec_inner_ceiling != 0) {
+    // [test 03] thread_inner_ceiling: [2] bits 0-7 ⊆ field0 bits 0-7.
+    const caller_thread_inner_ceiling: u8 = @truncate(caller_field0 & 0xFF);
+    const requested_thread_inner_ceiling: u8 = @truncate(ceilings_inner & 0xFF);
+    if (requested_thread_inner_ceiling & ~caller_thread_inner_ceiling != 0) {
         cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
@@ -280,12 +280,12 @@ pub fn createCapabilityDomain(
         return errors.E_PERM;
     }
 
-    // [test 04] ec_outer_ceiling: [3] bits 0-7 ⊆ field1 bits 0-7.
+    // [test 04] thread_outer_ceiling: [3] bits 0-7 ⊆ field1 bits 0-7.
     // [test 06] vmar_outer_ceiling: [3] bits 8-15 ⊆ field1 bits 8-15.
     // [test 08] fut_wait_max: [3] bits 32-37 ≤ field1 bits 32-37 (numeric).
-    const caller_ec_outer_ceiling: u8 = @truncate(caller_field1 & 0xFF);
-    const requested_ec_outer_ceiling: u8 = @truncate(ceilings_outer & 0xFF);
-    if (requested_ec_outer_ceiling & ~caller_ec_outer_ceiling != 0) {
+    const caller_thread_outer_ceiling: u8 = @truncate(caller_field1 & 0xFF);
+    const requested_thread_outer_ceiling: u8 = @truncate(ceilings_outer & 0xFF);
+    if (requested_thread_outer_ceiling & ~caller_thread_outer_ceiling != 0) {
         cd_ref.unlockIrqRestore(irq_state);
         return errors.E_PERM;
     }
@@ -328,12 +328,12 @@ pub fn createCapabilityDomain(
     cd_ref.unlockIrqRestore(irq_state);
 
     return capability_domain.createCapabilityDomain(
-        ec,
+        thread,
         caps,
         ceilings_inner,
         ceilings_outer,
         elf_pf_slot,
-        initial_ec_affinity,
+        initial_thread_affinity,
         passed_handles,
     );
 }

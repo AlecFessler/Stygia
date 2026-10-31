@@ -52,7 +52,7 @@ pub const SyscallNum = enum(u12) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    create_execution_context = 22,
+    create_thread = 22,
     self = 23,
     terminate = 24,
     yield = 25,
@@ -204,10 +204,10 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u12,
-    initial_ec_affinity: u64,
+    initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
-    // Spec §[create_capability_domain]: [5] is the initial EC affinity
+    // Spec §[create_capability_domain]: [5] is the initial thread affinity
     // mask, passed handles start at [6+]. Up to 8 passed handles fit
     // in register vregs 6..13; beyond that issueStack handles spill.
     var in = Regs{
@@ -215,7 +215,7 @@ pub fn createCapabilityDomain(
         .v2 = ceilings_inner,
         .v3 = ceilings_outer,
         .v4 = elf_pf,
-        .v5 = initial_ec_affinity,
+        .v5 = initial_thread_affinity,
     };
     if (passed_handles.len >= 1) in.v6 = passed_handles[0];
     if (passed_handles.len >= 2) in.v7 = passed_handles[1];
@@ -232,17 +232,17 @@ pub fn createCapabilityDomain(
 }
 
 // ---------------------------------------------------------------
-// 7..16: execution-context ops
+// 7..16: thread ops
 // ---------------------------------------------------------------
 
-pub fn createExecutionContext(
+pub fn createThread(
     caps: u64,
     entry: u64,
     stack_pages: u64,
     target: u64,
     affinity_mask: u64,
 ) Regs {
-    return issueReg(.create_execution_context, 0, .{
+    return issueReg(.create_thread, 0, .{
         .v1 = caps,
         .v2 = entry,
         .v3 = stack_pages,
@@ -259,7 +259,7 @@ pub fn terminate(target: u12) Regs {
     return issueReg(.terminate, 0, .{ .v1 = target });
 }
 
-pub fn yieldEc(target: u64) Regs {
+pub fn yieldThread(target: u64) Regs {
     return issueReg(.yield, 0, .{ .v1 = target });
 }
 
@@ -461,7 +461,7 @@ pub fn createPort(caps: u64) Regs {
     return issueReg(.create_port, 0, .{ .v1 = caps });
 }
 
-pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
+pub fn suspendThread(target: u12, port: u12, attachments: []const u64) Regs {
     if (attachments.len == 0) {
         // Fast-suspend wire format (spec §[syscall_abi] L4 IPC fast
         // path): syscall_word = payload_count (0 here). The kernel's

@@ -73,7 +73,7 @@
 //     pull from the port. Both bits are within the runner's
 //     port_ceiling.
 //   - create_vcpu: caps = {susp, read, write}. All three bits
-//     live within ec_inner_ceiling = 0xFF and keep the vCPU's
+//     live within thread_inner_ceiling = 0xFF and keep the vCPU's
 //     state-transfer + suspend paths live without affecting the
 //     vm_inject_irq call surface.
 //   - vm_inject_irq: spec §[vm_inject_irq] requires no cap beyond
@@ -220,11 +220,11 @@ pub fn main(cap_table_base: u64) void {
     const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
 
     // 6. create_vcpu success path. caps {susp, read, write} all
-    //    live within ec_inner_ceiling = 0xFF; affinity = 0 selects
+    //    live within thread_inner_ceiling = 0xFF; affinity = 0 selects
     //    "any core". This registers a vCPU with the VM whose
     //    emulated interrupt controller will be the target of the
     //    inject calls below.
-    const vcpu_caps = caps.EcCap{
+    const vcpu_caps = caps.ThreadCap{
         .susp = true,
         .read = true,
         .write = true,

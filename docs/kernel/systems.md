@@ -1,6 +1,6 @@
-# Stygia systems: the execution-context lifecycle machine
+# Stygia systems: the thread lifecycle machine
 
-Status: **design target, revision 16** (2026-08-02). The TLA+ lifecycle transition relation lives in `docs/kernel/tla/ECLifecycle.tla`; its validation history and remaining parity gaps are recorded in `docs/kernel/tla/README.md`.
+Status: **design target, revision 16** (2026-08-02). The TLA+ lifecycle transition relation lives in `docs/kernel/tla/ThreadLifecycle.tla`; its validation history and remaining parity gaps are recorded in `docs/kernel/tla/README.md`.
 
 Review history: round 1
 (`docs/kernel/systems-review.md`, UNSOUND — mechanisms; closed in rev 2),
@@ -21,7 +21,7 @@ round in which NONE invalidated a mechanism — all five were text or
 apparatus: `dropped` had no clearing rule and made a target permanently
 unsuspendable; `run.sh` could not exit 0 and gated none of the new
 falsifiers; two concurrent `priority` calls desync the word from the
-bucket key; the IRQ state of EC context was never stated while twelve
+bucket key; the IRQ state of thread context was never stated while twelve
 arguments depend on it; and domain restart was absent from the machine
 entirely. Closed here), round 8 (adversarial review of rev 8: THREE CRITICALS — **C-1** mutual
 terminate, a hard two-core deadlock that is LIVE IN THE TREE and that
@@ -39,7 +39,7 @@ the default implementation), and **C2**, a doc statement contradicting
 `specv3.md` §[priority] verbatim; plus majors M-1–M-6 and minors; closed
 here). §13 maps every finding to its fix. This revision is CO-EVOLVED with the
 model: every normative mechanism here is encoded in
-`docs/kernel/tla/ECLifecycle.tla` **except those the README's ledger
+`docs/kernel/tla/ThreadLifecycle.tla` **except those the README's ledger
 names as unmodelled — G9 (`priority` re-bucket), G11 (`dir = "dead"`),
 G13 (`current_queue_core`) and G14 (`idle_parked` + L3's wake-IPI
 rule), and G16 (`teardown_pending` / `TeardownRequest`)** — with no model-invented repair
@@ -77,7 +77,7 @@ by-recall enumeration into a computed one — the pin-lock class (§2.4,
 9.3(7)), the spin inventory (W7–W9, 9.3(6)), the T2 justifications.
 Revision 6 is the model round's closure and is governed by one
 principle: **the machine must be the simplest one that is correct and
-sufficient for the syscall API's EC state changes** — where the model
+sufficient for the syscall API's thread state changes** — where the model
 needed a mechanism the prose merely asserted, the prose acquired the
 mechanism (N4), and where the model showed a construct was not
 load-bearing, it was deleted (retire's separate unwind step; see §13).
@@ -106,7 +106,7 @@ implementation or formal proof.
 
 This is NOT a description of the current tree; it is the machine the code
 should converge on. Where today's code is referenced
-(`kernel/sched/scheduler.zig`, `kernel/sched/execution_context.zig`,
+(`kernel/sched/scheduler.zig`, `kernel/sched/thread.zig`,
 `kernel/sched/port.zig`, `kernel/sched/futex.zig`,
 `kernel/caps/capability_domain.zig`, `kernel/devices/device_region.zig`,
 `kernel/arch/{x64,aarch64}/`), it is as evidence of a constraint or as the
@@ -118,17 +118,17 @@ the target design.
 ## 0. Scope — normative, and read this before anything else
 
 This document exists to solve **one** problem, stated in §1: the kernel
-carries eight overlapping signals for where an execution context is, and
-roughly 90% of recent bug fixes were EC teardown or lost wakes. The
-machine's job is therefore the **EC lifecycle and every state change that
-moves an EC on, off, or between CPU cores.** Nothing else.
+carries eight overlapping signals for where an thread is, and
+roughly 90% of recent bug fixes were thread teardown or lost wakes. The
+machine's job is therefore the **thread lifecycle and every state change that
+moves an thread on, off, or between CPU cores.** Nothing else.
 
 Six review rounds have confirmed the mechanism and churned the boundary.
 This section is normative so the boundary stops moving.
 
 ### 0.1 The test
 
-**Does this affect EC lifecycle or scheduler state — where an EC is,
+**Does this affect thread lifecycle or scheduler state — where an thread is,
 what core it is on, whether it is runnable?** In scope if yes,
 **regardless of which subsystem it lives in**.
 
@@ -141,12 +141,12 @@ applying the test, not the boundary itself.
 **Err toward inclusion.** Over-tightening hides real defects behind a
 boundary, which is worse than carrying a little extra. If a strict
 reading would exclude something that has caused or could cause an
-EC-lifecycle or lost-wake bug, include it.
+thread-lifecycle or lost-wake bug, include it.
 
 **IN, by the test:**
 
 - The **lifecycle word** and its seven states (§2.1).
-- **Every transition that moves an EC on, off, or between cores** —
+- **Every transition that moves an thread on, off, or between cores** —
   dispatch, park, wake, claim, requeue, migration, retire, finalize
   (§5's edge table).
 - The **wait/wake sources that cause those transitions**: timer, futex,
@@ -154,25 +154,25 @@ EC-lifecycle or lost-wake bug, include it.
   device IRQ (§5.1's T1).
 - **Teardown and reclamation ordering**, including the kstack hop
   (§4, §8.2).
-- **The claim protocol** — who owns an EC in transit (§3.5, §5.2's T2).
+- **The claim protocol** — who owns an thread in transit (§3.5, §5.2's T2).
 - **The wakes caused by `revoke`/`restrict`** — a port-refcount cascade
   waking suspended senders with `E_CLOSED` is a wake, so it is in, via
   edge 5a's existing close-propagation trigger. No new edge.
-- ~~**`restart_at_entry`** — it makes an EC runnable.~~ **NO LONGER AN
+- ~~**`restart_at_entry`** — it makes an thread runnable.~~ **NO LONGER AN
   OBLIGATION as of revision 16** (maintainer decision, §[restart_semantics]). It WOULD
-  make an EC runnable, and the machine will route it when restart
+  make an thread runnable, and the machine will route it when restart
   semantics are built — but the tree implements only the policy plumbing,
   so this listed a scope commitment against a feature that does not
   exist. The test is unchanged; what changed is that there is nothing yet
   for the test to apply to.
-- **The invariants that give every EC-lifecycle fact ONE WRITER and ONE
+- **The invariants that give every thread-lifecycle fact ONE WRITER and ONE
   VALIDITY PREDICATE** (§6, §2.6). **This is the deliverable**, and it
   is worth stating precisely rather than as "provably redundant"
   (round-13): the machine **adds** words — `pin_depth`, `mark_state`,
   `payload_done`, `directive_state`, `teardown_pending`,
   and the `pended` state. §2.6 calls that "the honest price" and it is.
   Redundancy is met **literally** for the four signals actually deleted
-  (`on_cpu`, `committed_ec`, `pending_zombie[64]` and its three
+  (`on_cpu`, `committed_thread`, `pending_zombie[64]` and its three
   companions, both timed registries) and **derivationally** for the
   rest — each survivor now has a named writer, a stated width and a
   validity set, so no reader has to reconstruct a fact by correlating
@@ -184,7 +184,7 @@ EC-lifecycle or lost-wake bug, include it.
 Conflating these is how the boundary drifts, so each exclusion names
 which one applies.
 
-**Reason A — SOLVED ELSEWHERE.** Related to EC lifecycle, but a
+**Reason A — SOLVED ELSEWHERE.** Related to thread lifecycle, but a
 different instrument already handles it, and duplicating it here is
 extra complexity this machine must not carry.
 
@@ -192,7 +192,7 @@ extra complexity this machine must not carry.
   same-class nesting, and lockdep's dynamic pair-registry cycle
   detection already handle it. **A global static lock order is extra
   complexity the model must not carry** — not because lock ordering is
-  unrelated to EC lifecycle (it plainly is related), but because
+  unrelated to thread lifecycle (it plainly is related), but because
   another instrument solves it. See §3.5, which retracts the chain
   project revisions 10–12 built and blocked work on.
 - **Analyzer capability.** Enforcement is separate work with its own
@@ -202,12 +202,12 @@ extra complexity this machine must not carry.
 - **Migration sequencing.** §12 is a separate plan; nothing in §§2–8
   depends on its ordering.
 
-**Reason B — GENUINELY DOES NOT TOUCH EC LIFECYCLE OR SCHEDULER STATE.**
+**Reason B — GENUINELY DOES NOT TOUCH thread LIFECYCLE OR SCHEDULER STATE.**
 
 - **Capability-derivation mechanics** — which handles `revoke`/`restrict`
   kill, and the derivation-tree walk. (Their *wakes* are IN, above.)
 - **VMAR contents and handle-table rewriting** — the address-space work
-  itself, as distinct from any EC movement it triggers.
+  itself, as distinct from any thread movement it triggers.
 
 ### 0.3 BORDERLINE, each judged on the test and each stated with which way it lands
 
@@ -232,7 +232,7 @@ extra complexity this machine must not carry.
 
   **The analysis of what the edge would look like is kept, because it is
   the right answer when the feature arrives** — only its status is
-  demoted. It moves an EC to runnable, in **one edge**: claim by the
+  demoted. It moves an thread to runnable, in **one edge**: claim by the
   state's normal route (5a from `waiting`, 5c from `ready`, the directive
   from `running`), **reset the saved frame to the entry point under the
   won claim**, then place via edge 6. The frame reset under a won claim
@@ -241,11 +241,11 @@ extra complexity this machine must not carry.
   transition with an actor and a failure arm and would need the same
   treatment every other edge got.
 - **`persist` — OUT, and this is the closest call in the document.** It
-  does not move the EC: the EC keeps running on its core throughout.
+  does not move the thread: the thread keeps running on its core throughout.
   What makes it borderline is that it rewrites the address space under a
-  live EC, and `active_root`/W6 IS scheduler state. **Landing: OUT by
+  live thread, and `active_root`/W6 IS scheduler state. **Landing: OUT by
   reason B for the rewriting itself, with one obligation retained
-  in-scope** — a `persist`ing EC is a running EC whose root is being
+  in-scope** — a `persist`ing thread is a running thread whose root is being
   republished, which is precisely the configuration
   `awaitDomainQuiesced` (W6) exists to serialize against. So `persist`
   must either take that barrier or state why it is exempt, and **that
@@ -255,7 +255,7 @@ extra complexity this machine must not carry.
 ### 0.4 What an implementer codes against
 
 **§2 (state space), §4 (the hop), §5 (the transition table), §6 (the
-invariants), §7 (the failure classes), and the EC-lifecycle parts of §8**
+invariants), §7 (the failure classes), and the thread-lifecycle parts of §8**
 are the implementable machine. They are delimited in the text by the
 markers `<<< IMPLEMENTABLE SPEC — BEGIN >>>` and `<<< END >>>`.
 Everything outside those markers is context, rationale, review history,
@@ -266,12 +266,12 @@ the machine is shaped this way, and **not** something to code against.
 
 ## 1. The problem being designed away
 
-Today "the state of an EC" is the product of at least eight overlapping
-signals, each answering some version of *is this EC still in use*:
+Today "the state of an thread" is the product of at least eight overlapping
+signals, each answering some version of *is this thread still in use*:
 
 ```
 State enum | on_cpu | slab-gen parity | current_queue_core | last_dispatched_core
-  | referenced-by { PerCore.current_ec, .committed_ec, .pending_zombie[64],
+  | referenced-by { PerCore.current_thread, .committed_thread, .pending_zombie[64],
                     .post_park_clear_on_cpu, .pending_kstack_release,
                     .pending_cross_enqueue }
   | suspend_port | pending_reply_holder
@@ -289,16 +289,16 @@ The design is organized around four principles:
   arbitration is CAS on exactly one word; anything wider is written only
   under CAS-won exclusivity and released with a single-word store.
 - **State implies containment.** The lifecycle state *is* the answer to
-  "which container holds this EC".
+  "which container holds this thread".
 - **Every hand-off is a claim, and every obligation has one named
-  discharger.** Any party that takes an EC out of a claimable state wins a
-  CAS first, owns the EC exclusively while it works, and re-validates with
+  discharger.** Any party that takes an thread out of a claimable state wins a
+  CAS first, owns the thread exclusively while it works, and re-validates with
   a second CAS at placement. A won claim is never orphaned: claim-holding
   frames are pinned against requeue preemption (§3.1 rule 1) and never
   abandoned by entry checks (§3.1 rule 3). The retire matrix (§5.2) names
   the discharger for every (state × continuation) cell.
 - **Exits from `running` complete at the hop**, and interrupt-context
-  wakes against a mid-park EC hand their placement TO that hop (`pended`)
+  wakes against a mid-park thread hand their placement TO that hop (`pended`)
   instead of waiting on it — interrupt context never waits on scheduler
   progress (§3.6).
 
@@ -321,7 +321,7 @@ today's signals.
 > machine to be built.
 >
 > **§3 is included deliberately, and that is a deviation worth naming.**
-> The scope instruction listed §2, §4, §5, §6, §7 and the EC-lifecycle
+> The scope instruction listed §2, §4, §5, §6, §7 and the thread-lifecycle
 > parts of §8. §3 is in anyway because §5's edge table cites it
 > normatively at nearly every row: edge 3 IS §3.2's park sequence, edges
 > 5a/5b/5c are gated on §3.5's R-claim, the requeue arms are gated on
@@ -364,16 +364,16 @@ container membership is implied by the state.
 | State | Containment (implied, exact) | Kstack | Who may take it |
 |---|---|---|---|
 | `ready` | exactly one run queue | quiescent | dispatcher (edge 2), suspender (edge 5c), retire — all under that queue's lock |
-| `running` | `core_states[owner_core].current == ec` | owner core is on it | retire (CAS); a suspend **directive** (§2.5) — never a direct CAS |
+| `running` | `core_states[owner_core].current == thread` | owner core is on it | retire (CAS); a suspend **directive** (§2.5) — never a direct CAS |
 | `parking` | wait episode's containers already linked, or a requeue directive | owner core is on it | claim (edge 5b → `pended`), retire |
 | `waiting` | exactly one wait episode's containers (§2.2) | quiescent | claim (edge 5a → `claimed`), retire |
 | `claimed` | none claimable; held by exactly one named holder | quiescent (origin was `waiting`/`ready`) | retire (CAS; discharge stays with the holder) |
 | `pended` | none claimable; wake recorded, discharge owed to owner core | owner core still on it until its hop | retire (CAS; discharge stays with the owner's hop) |
-| `retired` | wait-container links MAY persist until finalize's leading unwind (§8.2, N4); pop-side skips `stale(ec)` (§9.2) | per §5.2 routing | finalize only |
+| `retired` | wait-container links MAY persist until finalize's leading unwind (§8.2, N4); pop-side skips `stale(thread)` (§9.2) | per §5.2 routing | finalize only |
 
 Today's three wait states collapse into `waiting`; wait flavor is data
-(§2.2). `claimed` is the quiescent-origin hand-off (recv pop, cross-EC
-suspend of ready/idle, wakes of `waiting` ECs); the holder discharges.
+(§2.2). `claimed` is the quiescent-origin hand-off (recv pop, cross-thread
+suspend of ready/idle, wakes of `waiting` Threads); the holder discharges.
 `pended` is the parking-origin hand-off; the **owner core** discharges at
 its hop — placement, finalize-on-retired, and any deferred marking — after
 the claimant's `payload_done` handshake (§2.2). Because the claim CAS
@@ -383,7 +383,7 @@ miss a pend: there is no flag-set-after-hop-passed window and no fence is
 needed beyond the CASes themselves. (This is why the pend fact lives in
 the state word rather than in a descriptor flag.)
 
-`retired` is fused with the slab-gen death mark under the EC's `_gen_lock`
+`retired` is fused with the slab-gen death mark under the thread's `_gen_lock`
 (S5): "`.exited` with an odd gen" — the worst leak in the project's
 history — is unrepresentable.
 
@@ -405,22 +405,22 @@ comparison is `pended` versus a wait or a decline, not `pended` versus
 nothing; cutting it re-opens X2/X3 by construction. Removal was
 considered and rejected in the rev-6 removal sweep (§13).
 
-#### 2.1.1 ~~The per-core idle EC~~ — WITHDRAWN in revision 16
+#### 2.1.1 ~~The per-core idle thread~~ — WITHDRAWN in revision 16
 
-**There is no per-core idle EC, this machine does not introduce one, and
+**There is no per-core idle thread, this machine does not introduce one, and
 the tree's arrangement is better than the one this section described.**
-Revisions up to 15 said: *"the idle EC's permanent containment is its
-core's `idle_ec` slot, which counts as its run queue for S1; a preempt
+Revisions up to 15 said: *"the idle thread's permanent containment is its
+core's `idle_thread` slot, which counts as its run queue for S1; a preempt
 requeues it to the slot. Never retired while the core lives."* That was a
 normative containment rule for a construct nothing builds — found by §12's
 closure check, not by reading, after sixteen revisions.
 
 **What the tree actually does, and why it is not a gap to be filled.**
-DERIVED — `grep -rn idle_ec kernel --include='*.zig'` (quote the glob;
+DERIVED — `grep -rn idle_thread kernel --include='*.zig'` (quote the glob;
 unquoted it is expanded by this project's zsh before `grep` sees it)
 returns exactly three
 sites and **none of them is an assignment**: the declaration at
-`sched/scheduler.zig:184` (`idle_ec: ?SlabRef(ExecutionContext) = null`),
+`sched/scheduler.zig:184` (`idle_thread: ?SlabRef(Thread) = null`),
 one read at `:1521`, and a comment at `:1098`. `perCoreInit`
 (`scheduler.zig:392`) does not allocate one, so the read at `:1521` is
 unreachable and the declaration's own comment — *"Allocated at
@@ -428,41 +428,41 @@ perCoreInit; runs `hlt`/`wfi` when the run queue is empty"* — describes a
 mechanism that does not exist.
 
 The real mechanism is **`parkAndAwaitIRQ`**, and `:1098` states why it
-replaced the idle EC: it *"eliminates the cross-core kstack-sharing bug
+replaced the idle thread: it *"eliminates the cross-core kstack-sharing bug
 where multiple idle cores held stale `gs:0` pointing at the same suspended
-EC's kstack and concurrently pushed IRQ frames onto it from kernel mode,
+thread's kstack and concurrently pushed IRQ frames onto it from kernel mode,
 silently stomping each other's saved state"*. A core with an empty run
 queue swaps `rsp`/`gs:0`/`TSS.RSP0` to its own **dedicated park kstack**
-and `sti`+`hlt`s there. **Building an idle EC to satisfy this section
+and `sti`+`hlt`s there. **Building an idle thread to satisfy this section
 would regress a fixed bug.** So the section is withdrawn rather than
 scheduled, and §12 gains no step.
 
 **S1 is untouched, and this is the part to state explicitly rather than
-leave to inference.** S1 says every EC in a valid state is in exactly one
+leave to inference.** S1 says every thread in a valid state is in exactly one
 container. The withdrawn text made the idle slot a container so that the
-idle EC would have one. With no idle EC there is no such EC to contain:
+idle thread would have one. With no idle thread there is no such thread to contain:
 
-> **A core with an empty run queue holds NO execution context.** It is
+> **A core with an empty run queue holds NO thread.** It is
 > parked on its own park kstack, which is core-owned storage and not an
-> EC container. Idleness is therefore a fact about a CORE, recorded in
-> `PerCore.idle_parked` (`scheduler.zig:347`), **not a state of any EC** —
+> thread container. Idleness is therefore a fact about a CORE, recorded in
+> `PerCore.idle_parked` (`scheduler.zig:347`), **not a state of any thread** —
 > so it raises no containment obligation at all.
 
-The `idle_ec` field, its unreachable read, and its stale declaration
+The `idle_thread` field, its unreachable read, and its stale declaration
 comment are dead code in the tree; retiring them belongs to a cleanup, not
 to this machine, and §12 deliberately does not claim it.
 
-**Not to be confused with the `.idle_wait` EC state or `wait.kind ==
+**Not to be confused with the `.idle_wait` thread state or `wait.kind ==
 .idle`, which are REAL and unaffected** (§2.2; §11.6 "unchanged"). Those
-are what a *user* EC parks in when it executes `wfi`/`hlt` and traps — the
+are what a *user* thread parks in when it executes `wfi`/`hlt` and traps — the
 aarch64 EL0 `wfi` trap at `arch/aarch64/exceptions.zig:737` and the x86-64
 `#GP`-on-`hlt` path at `arch/x64/exceptions.zig:260` — and `suspend`
-accepts such a target (`exceptions.zig:741`, `:759`). That is an EC
-choosing to idle, which is nothing like a core having no EC to run.
+accepts such a target (`exceptions.zig:741`, `:759`). That is an thread
+choosing to idle, which is nothing like a core having no thread to run.
 
 ### 2.2 The wait descriptor
 
-A single struct, `ec.wait`, valid only in `parking`/`waiting`/`claimed`/
+A single struct, `thread.wait`, valid only in `parking`/`waiting`/`claimed`/
 `pended`.
 
 ```zig
@@ -497,24 +497,24 @@ fields, and both deadline fields fold in. `kind == .requeue` covers
 preemption and affinity migration; deletes `pending_cross_enqueue`.
 
 **What is NOT in here** (round 7 M-1, stated because the review read
-§8.1's "descriptor write" as creating a fourth `ec.wait` writer):
-`ec.priority` and `ec.affinity` are **stable per-EC fields, not wait-
+§8.1's "descriptor write" as creating a fourth `thread.wait` writer):
+`thread.priority` and `thread.affinity` are **stable per-thread fields, not wait-
 descriptor fields**. They are meaningful in every state, they survive
-across wait episodes, and a `running` or `ready` EC has both — so they
+across wait episodes, and a `running` or `ready` thread has both — so they
 cannot live in a struct valid only in `parking`/`waiting`/`claimed`/
 `pended`. They get their own §3.4 rows, their own named writer (the
 `priority`/`affinity` syscall), and their own reach-and-validate
 protocol (§8.1). The writer enumeration below is therefore unchanged
-and complete for `ec.wait`, and analyzer 9.3(1)/S2 has a writer to pin
+and complete for `thread.wait`, and analyzer 9.3(1)/S2 has a writer to pin
 for each of the two new words rather than an unattributed store.
 
-**One genuine `ec.wait` writer IS added, and round 9's M-4 is right that
+**One genuine `thread.wait` writer IS added, and round 9's M-4 is right that
 revision 9 hid it.** C-2 routes `parking(wait)` and `waiting` targets to
 a re-bucket that edits the **futex `WaitNode`s the descriptor names** —
-and those nodes are `ec.wait` storage (`futex_nodes`), not separate
+and those nodes are `thread.wait` storage (`futex_nodes`), not separate
 words. So the enumeration below gains a fourth entry rather than staying
 at three: **the `priority` syscall, for the wait descriptor's linkage
-keys only, under the reaching container lock with the EC re-validated
+keys only, under the reaching container lock with the thread re-validated
 inside that hold.** It is narrow and it is disciplined — it writes no
 payload, no port ref, no deadline, only the bucket key of a node it
 found linked — but it is a writer, it belongs in the list, and S2's
@@ -523,12 +523,12 @@ it is listed.
 
 **Writers and the two access rules:**
 
-- Descriptor writers — **four**, not three (round-9 M-4): the EC's own
-  core during the park sequence; the holder of a `claimed` EC; the
-  claimant of a `pended` EC up to its `payload_done` release-store (after
+- Descriptor writers — **four**, not three (round-9 M-4): the thread's own
+  core during the park sequence; the holder of a `claimed` thread; the
+  claimant of a `pended` thread up to its `payload_done` release-store (after
   which the owner core reads it at the hop); and **the `priority`
   syscall, restricted to the linkage keys of the wait nodes the
-  descriptor names, under the reaching container lock with the EC
+  descriptor names, under the reaching container lock with the thread
   re-validated inside that hold** (§8.1's re-bucket — it writes no
   payload, no port ref and no deadline, only the bucket key of a node it
   found linked). **Why the fourth writer does not break S2, stated
@@ -542,7 +542,7 @@ it is listed.
   being separated in time, and 9.3(1)'s writer-set pinning must be
   expressed per FIELD here rather than per struct.
 - **Saved-frame region ban (absolute).** After the wait-park publish,
-  nobody but a claim winner touches the EC's saved frame. The parking
+  nobody but a claim winner touches the thread's saved frame. The parking
   core's own event staging (the §[event_state] GPR snapshot) completes
   *before* the publish (§3.2 step 1).
 - **Descriptor post-publish rule (scoped).** The parking core may access
@@ -554,7 +554,7 @@ it is listed.
   route** — in particular no deadline registration. That holds because
   `suspend` is untimed by spec; a future timed suspend would have to
   register its deadline *after* the pin write, or the deadline tick could
-  claim the EC while the owner is still writing the descriptor.
+  claim the thread while the owner is still writing the descriptor.
 
 A claim winner's payload write into the saved frame is legal while the
 parking core still executes lower on the same kstack — the ban is what
@@ -566,18 +566,18 @@ single-producer/single-consumer, one direction, no SB hazard.
 
 ```zig
 pub const PerCore = struct {
-    run_queue: EcQueue,            // under core_locks[core] as today
-    current: ?*ExecutionContext,   // ONE naturally aligned pointer word
+    run_queue: ThreadQueue,            // under core_locks[core] as today
+    current: ?*Thread,   // ONE naturally aligned pointer word
     active_root: atomic u64,       // publish-after-load, as today
     idle_parked: bool,             // park decision, under core_locks[core].
                                    // THIS is where idleness lives — it is a
                                    // fact about the CORE, not a state of any
-                                   // EC (§2.1.1, revision 16)
+                                   // thread (§2.1.1, revision 16)
     park_stack: Stack,             // the idle core parks HERE, via
                                    // parkAndAwaitIRQ — core-owned storage,
-                                   // NOT an EC container (§2.1.1)
-    // idle_ec: REMOVED in revision 16 with §2.1.1. There is no per-core idle
-    // EC: the field is never assigned at HEAD and its one read is
+                                   // NOT an thread container (§2.1.1)
+    // idle_thread: REMOVED in revision 16 with §2.1.1. There is no per-core idle
+    // thread: the field is never assigned at HEAD and its one read is
     // unreachable, and re-introducing one would regress the cross-core
     // kstack-sharing bug `parkAndAwaitIRQ` fixed (scheduler.zig:1098).
     teardown_pending: ?TeardownRequest, // §8.2; self-produced, self-consumed
@@ -593,12 +593,12 @@ pub const TeardownRequest = struct {
   `core_locks[core]`; the hop, §4 step 1). Single-pointer-word layout
   retained; the Pi-5 tearing autopsy is the permanent justification.
 - `active_root` + `awaitDomainQuiesced`: retained unchanged.
-- `committed_ec`: deleted (slow path: one critical section; fast path
+- `committed_thread`: deleted (slow path: one critical section; fast path
   brought under the core lock, §9.4).
 - `teardown_pending`: carries the self-delete teardown request across the
   hop (the payload cannot ride the hop's single `u64`). Revised per M-A:
   it now carries the **CD ref for the whole teardown** — dead-mark
-  included — not a post-dead-mark snapshot (§8.2). The producing EC stores
+  included — not a post-dead-mark snapshot (§8.2). The producing thread stores
   exactly one `TeardownRequest` before self-retire; the park-stack consumer
   clears it before phase 1 and owns both teardown phases from there.
 - `pending_zombie[64]`, `post_park_clear_on_cpu`, `pending_kstack_release`,
@@ -613,17 +613,17 @@ of those three** (round 6 minor: a claimed-origin retiree has NO valid
 `owner_core` — T2's claimed row forbids reading it, and the validity set
 as previously written contradicted that); written under
 `core_locks[core]` at dispatch commit. The `claimed`/`pended` split makes the validity set exact: a
-`claimed` EC (quiescent origin) has NO valid `owner_core` and no rule may
+`claimed` thread (quiescent origin) has NO valid `owner_core` and no rule may
 read it (round-3 repair — rev 3's retire routing implicitly read it for
-claims from `waiting`); a `pended` EC's `owner_core` is valid by
+claims from `waiting`); a `pended` thread's `owner_core` is valid by
 construction (the state only exists between the claim and that core's
 hop). Debug builds poison it outside the validity set.
 
 **`pin_depth`** (one byte — round 3 X1; membership corrected round 4 F3;
 **membership RE-DERIVED AGAINST HEAD in revision 12, round-11 C-2**):
-a per-EC count of held claims plus held **pin-class locks**, where the
+a per-thread count of held claims plus held **pin-class locks**, where the
 pin class is **computed, not named**: every lock class with at least one
-EC-context acquire site **in which a tick can land** is a pin class
+thread-context acquire site **in which a tick can land** is a pin class
 (analyzer rule 9.3(7)). **"In which a tick can land" is the
 EFFECTIVE-MASK reading and it is normative** — see the blockquote below.
 Revision 16 left this sentence in its old SYNTACTIC form ("an acquire
@@ -656,7 +656,7 @@ wrong (round-14 N-5).
 >
 > **Step 2: the gen-lock classes, and this is where the reading
 > matters.** Under the SYNTACTIC reading the gen-lock classes are
-> in the set, via plain `SlabRef.lock()` at genuine EC-context sites —
+> in the set, via plain `SlabRef.lock()` at genuine thread-context sites —
 > `vm_runloop.zig:73` and neighbours, on both arches. The third clause
 > (§2.4) forbids pin-counting them, because they are IRQ-reachable. **A
 > rule about what the code MUST DO is not a filter that empties the
@@ -666,7 +666,7 @@ wrong (round-14 N-5).
 > **Step 3, and the one that settles it: which reading the computed rule
 > uses — CALL FORM or EFFECTIVE MASK. This is the durable question and
 > revision 14 got it wrong by applying the syntactic one (round-13).** Revision 14 read "non-IRQ-saving
-> EC-context acquire site" **syntactically** — is the call `lock()` or
+> thread-context acquire site" **syntactically** — is the call `lock()` or
 > `lockIrqSave()`? — and concluded that `vm_runloop.zig`'s plain
 > `SlabRef.lock()` puts the gen-lock class in the set, making it a tree
 > defect. **The analyzer applies the EFFECTIVE reading**: can a tick
@@ -687,7 +687,7 @@ wrong (round-14 N-5).
 > not generalise past the one site; a fixpoint does.
 >
 > **Normative: §2.4's computed rule is the EFFECTIVE-MASK reading** — a
-> class is a pin class iff a tick can land in one of its EC-context
+> class is a pin class iff a tick can land in one of its thread-context
 > holds. That is the reading 9.3(7) implements and the one T2's ready×K
 > cell needs, since the cell's question is precisely "can this frame be
 > requeue-preempted mid-hold". Under it the vCPU sites are NOT in the
@@ -704,7 +704,7 @@ failure, and most of the machinery gets STRONGER:**
 - **§5.2's `ready × K` justification is discharged, and under the
   effective-mask reading the masking arm alone does it** (round-13
   restores revision 13's position, which round 12 had overturned on the
-  syntactic reading). Every class either masks at every EC-context
+  syntactic reading). Every class either masks at every thread-context
   acquire or is effectively masked there, so an IRQ-masked section
   cannot span a tick and a requeue-preempted frame holds no lock. The
   two-arm dichotomy remains the normative statement — it is what
@@ -728,8 +728,8 @@ failure, and most of the machinery gets STRONGER:**
   rather than today's membership.
 
 Incremented at claim-win and pin-class
-acquire; decremented at discharge/release. Written only by the EC's own
-core in EC context, read only by that core's tick — same-core, no
+acquire; decremented at discharge/release. Written only by the thread's own
+core in thread context, read only by that core's tick — same-core, no
 atomics. The requeue gate (§3.1 rule 1) requires `pin_depth == 0`.
 Interrupt-context claim bodies do not touch it. Assert: `pin_depth == 0`
 at every hop and at every wait-park publish; debug lockdep bumps and
@@ -747,7 +747,7 @@ discharge/release" and never ordered the bump against the acquire):
 > the decrement follows the placement/discharge.
 
 Why this is not a stylistic preference: **pin-class locks are by
-definition not IRQ-masked at their EC-context acquire sites** — that
+definition not IRQ-masked at their thread-context acquire sites** — that
 property is exactly what puts a class in the set. So `lock();
 pin_depth += 1;`, which is the default thing an engineer writes, leaves
 a live preemption point between the two instructions. A tick landing
@@ -809,7 +809,7 @@ when it completes (§9.2).
 
 ### 2.5 The suspend directive
 
-`running` is unclaimable except by retire. Cross-EC `suspend` of a
+`running` is unclaimable except by retire. Cross-thread `suspend` of a
 running target delegates via the CAS-won-exclusivity pattern:
 
 ```zig
@@ -928,7 +928,7 @@ directive_port: SlabRef(Port),     // written only between claiming and
     `directive_state → dead` and then, *a few steps later in the same
     routine*, `slot zero + freelist`. And `none` MUST be the all-zeroes
     encoding — otherwise a recycled slot reads non-`none`, its
-    `none → claiming` CAS fails forever, and the EC is permanently
+    `none → claiming` CAS fails forever, and the thread is permanently
     unsuspendable, which is round-9 C-1 exactly. **So the zero converts
     `dead` back to `none`.** Trace: A arms B; A is requeue-preempted
     (§2.5 measures this window as a full quantum); B is terminated,
@@ -950,7 +950,7 @@ directive_port: SlabRef(Port),     // written only between claiming and
   invariant. An 8-bit epoch wraps in 256 — and the W5 spinner has **no
   bound at all** (this section terminates by assumption, not by a
   count), so 256 cycles is reachable rather than theoretical. Identity
-  does not wrap: **the suspender is a live EC for exactly as long as it
+  does not wrap: **the suspender is a live thread for exactly as long as it
   is spinning, so its own slab slot cannot be recycled underneath it.**
   The falsifier is `diraba`; `dirabafix` is the same scope with the
   ownership test dialed in.
@@ -977,12 +977,12 @@ directive_port: SlabRef(Port),     // written only between claiming and
   `none` — which §2.5 defines as *consumed* — reports SUCCESS for a
   suspension that was never delivered. Rev 9 added a `dropped` terminal
   and **inherited `dead`'s "never cleared" property without `dead`'s
-  justification**: `dead` is written by finalize on an EC being freed, so
-  never clearing it is correct there; `dropped` sits on a LIVE EC, so a
+  justification**: `dead` is written by finalize on an thread being freed, so
+  never clearing it is correct there; `dropped` sits on a LIVE thread, so a
   single stale-port drop would leave every future suspender's
-  `none → claiming` CAS failing forever and the EC **permanently
+  `none → claiming` CAS failing forever and the thread **permanently
   unsuspendable** — reachable by ordinary means (arm a directive, destroy
-  the port, let the target reach its boundary) and leaving the EC
+  the port, let the target reach its boundary) and leaving the thread
   undebuggable for the rest of its life.
 
   The current protocol keeps `dropped` deleted but no longer collapses
@@ -1023,12 +1023,12 @@ own** word while A's action writes **B's**. Any correct mechanism must
 make a two-word check-and-act indivisible.
 
 Two mechanisms do that. Both are encoded and machine-checked
-(`CYCLE_REJECT` in `docs/kernel/tla/ECLifecycle.tla`); the model's verdicts
+(`CYCLE_REJECT` in `docs/kernel/tla/ThreadLifecycle.tla`); the model's verdicts
 and the reason the second is recommended are in the README.
 
 **(A) Pair-locked rejection** — the round-7 maintainer proposal:
 
-> Acquire **both** EC gen locks, **lowest slot index first**. If the
+> Acquire **both** thread gen locks, **lowest slot index first**. If the
 > target's directive already names the caller, return an E_BUSY-class
 > cycle error. Otherwise arm. **Release both locks. THEN enter the W5
 > wait.**
@@ -1063,18 +1063,18 @@ the other two):
 
 1. `A` suspends `B` while `B` is suspending `A` — the symmetric case
    that produced N1 and N6.
-2. `A` suspends `B` while `B` is suspending some unrelated **third** EC
+2. `A` suspends `B` while `B` is suspending some unrelated **third** thread
    `C` — no cycle exists, and it is still refused.
-3. `A` suspends `B` while some third EC `C` is suspending **`A`** —
+3. `A` suspends `B` while some third thread `C` is suspending **`A`** —
    `A`'s own word is not `none`, so `A`'s self-mark CAS fails.
 
 **Consequence for the E_BUSY rate, which is userspace-visible and must
 not be discovered in production.** Because the mark is held across the
 W5 wait rather than only across the two CASes, **any two overlapping
-cross-EC suspends of running targets can produce an E_BUSY, whether or
+cross-thread suspends of running targets can produce an E_BUSY, whether or
 not a cycle exists.** E_BUSY is therefore an EXPECTED outcome of
 concurrent suspends, not a pathological one: a debugger or supervisor
-that suspends ECs from more than one thread must be written with a retry,
+that suspends Threads from more than one thread must be written with a retry,
 and the retry is a deliberate part of the API contract rather than
 something its author discovers under load. §11.8's proposed spec text
 says so.
@@ -1082,7 +1082,7 @@ says so.
 **The narrower alternative, considered and not taken.** Releasing the
 mark immediately after the target-claim CAS succeeds would make E_BUSY
 vanishingly rare (the window is a few instructions). It also appears to
-remain correct, by a longer argument: a claimed EC cannot self-mark
+remain correct, by a longer argument: a claimed thread cannot self-mark
 (its word is `claiming`/`armed`), and in any cycle every participant is
 claimed, so no participant could have started a suspend. That argument
 is sound as far as it has been checked, but it is a multi-step
@@ -1096,24 +1096,24 @@ before it is adopted, not a paragraph.**
 **Why (B) is recommended over (A) — two findings, both verified:**
 
 1. **(A)'s lock order is an AB-BA against the existing tree.** The x86-64
-   fast-suspend asm path already nests two EC gen locks —
-   `receiver_ec` (`interrupts.zig`, Step 9.5) then `sender_ec` (Step 9.7),
+   fast-suspend asm path already nests two thread gen locks —
+   `receiver_thread` (`interrupts.zig`, Step 9.5) then `sender_thread` (Step 9.7),
    held together until Step 12.5 — and it orders them **by role, not by
    index**. Whenever `slot(sender) < slot(receiver)`, a slot-index rule
    takes the same pair in the opposite order. Today the two sites cannot
    contend (the fast path's receiver is `waiting` when its lock is taken,
-   while BOTH of (A)'s ECs are `running`), so there is no reachable
+   while BOTH of (A)'s Threads are `running`), so there is no reachable
    AB-BA — but that is a recall-closed universal over two code paths,
    which is the exact failure mode this document's own history says to
    distrust. Worse, the tree's comment there claims the site is tagged
-   `ordered_group=2 (EC_NESTED_GROUP)`, **and that constant does not
+   `ordered_group=2 (THREAD_NESTED_GROUP)`, **and that constant does not
    exist anywhere in `kernel/` or `tools/`** — the same
    tool-reality drift round 6's M2 catalogued. (B) takes no second lock,
    so the question does not arise.
 2. **(A) does not close 3-cycles; (B) does — measured, not argued.** The
    check in (A) is pairwise, and a 3-cycle (a suspends b, b suspends c,
    c suspends a) passes every pairwise test individually. At 2 cores × 3
-   ECs the model reaches one in **14 states** with (A) enabled
+   Threads the model reaches one in **14 states** with (A) enabled
    (`InvNoSuspendCycle3` violated: `e1.dsrc = e3, e2.dsrc = e1,
    e3.dsrc = e2`, each suspender requeue-preempted in `dirC` to free its
    core for the next). At the same scope with (B) enabled, both cycle
@@ -1156,7 +1156,7 @@ seconds without the assert. The spin-entry `pin_depth == 0` assert
 **Enforcement, verified against the tree (round 6 M2 — do not re-soften
 this into ambiguity):** what exists TODAY is `check_gen_lock` (its IRQ
 pass repaired; its check 6 enforces the mask-everywhere ARM of the §2.4
-dichotomy) and `check_ec_closure` Rule A / Rule B — and Rule B, which is
+dichotomy) and `check_thread_closure` Rule A / Rule B — and Rule B, which is
 what actually computes the pin-class dichotomy's input, is
 **report-only: it is not wired into precommit** (stage [0c] gates
 `check_gen_lock` alone). Known blind spots of the current tools, named
@@ -1183,7 +1183,7 @@ protecting against — the analyzer was right and the design was about to
 overrule it.
 
 The correct direction is the inverse: rules (c)/(c2) flip from *finding*
-explicit masks to **forbidding unmasked EC-context acquires on any
+explicit masks to **forbidding unmasked thread-context acquires on any
 IRQ-reachable class**, which is §2.4's third clause expressed as a
 check. Under that reading `stack.freelist_lock` is pin-counted only if
 it has no interrupt-context acquire site, and check 6 keeps its teeth
@@ -1191,7 +1191,7 @@ everywhere else.
 
 **Cost, stated rather than implied, because it is real work**: this
 needs (1) `trap_sync` promoted, or masking at fault entry, so the
-analyzer can tell an EC-context acquire from an exception-context one;
+analyzer can tell an thread-context acquire from an exception-context one;
 and (2) an **IF-state model in `asm_analyzer.zig`** — the two hazard
 sites above are raw asm, so a Zig-level acquire-site scan cannot see
 them at all. Neither exists. Until both do, §2.4's third clause is
@@ -1206,16 +1206,16 @@ covers none of it. §11.11 is new and is where the C-A cost lives.]**
 |---|---|
 | `State` enum (6) | seven states (§2.1); wait flavors → descriptor data; `claimed`/`pended` absorb every hand-off |
 | `on_cpu` | **deleted.** Quiescence is structural (S3). The wake-side spins it fed are gone entirely: parking-origin claims (`pended`) hand placement to the owner's hop instead of waiting for it; the only claimant→owner coupling is the one-way `payload_done` handshake, waited on by the **owner in scheduler context**, never by interrupt context (§3.6) |
-| slab gen parity | kept; fused with `retired` under the EC `_gen_lock` (S5) |
+| slab gen parity | kept; fused with `retired` under the thread `_gen_lock` (S5) |
 | `current_queue_core` | **KEPT, and now discharged** (round-12 M-4): it had no §3.4 row through revision 13 — no width, no named writer, no validity set — which is verbatim the argument §2.2 used to DELETE the staged destination. It now has one (§3.4): written under the destination queue lock at edges 1/6/6p/8, cleared under the same lock on every exit from `ready`, valid iff `state == ready`, and safe when stale because every reader re-validates under the lock it points at (§3.5's drop-and-retry). **Kept rather than deleted because deleting it reinstates exactly what this row records as removed** — a 64-core search on every reach-and-validate and every `removeFromQueue`. It is derived-by-search only in the sense that the search is the fallback; the field is the index that makes the fallback unnecessary |
 | `last_dispatched_core` | narrowed to `owner_core` (§2.4) |
-| `PerCore.current_ec` | kept (single word, two writer sites) |
-| `PerCore.committed_ec` | deleted (§2.3, §9.4) |
+| `PerCore.current_thread` | kept (single word, two writer sites) |
+| `PerCore.committed_thread` | deleted (§2.3, §9.4) |
 | `PerCore.pending_zombie[64]`, `.post_park_clear_on_cpu`, `.pending_kstack_release`, `.pending_cross_enqueue` | deleted (upheld three times) |
 | `suspend_port`, `pending_reply_*` | descriptor data with defined ownership handoff |
-| `timed_waiters[64]` + `timed_recv_waiters[256]` | one intrusive per-EC deadline node (§8.4); registration infallible |
+| `timed_waiters[64]` + `timed_recv_waiters[256]` | one intrusive per-thread deadline node (§8.4); registration infallible |
 | — (new) | `pended` state value, `payload_done` bit, `pin_depth` byte, `mark_state` **bit** (§2.4, round 7 M-3 — the deferred-marking fact was previously wordless; collapsed from a tri-state in round 8), `directive_state`+`directive_port`, `teardown_pending`: the honest price of closed hand-offs, remote suspend, and self-delete teardown |
-| `priority`, `affinity` (today: plain fields, edited by a bare store) | kept as stable per-EC words with a named writer and a re-bucket obligation (§3.4, §8.1); the deferred-re-bucket defect (a queued EC keeps its old key until it naturally re-enqueues) is closed |
+| `priority`, `affinity` (today: plain fields, edited by a bare store) | kept as stable per-thread words with a named writer and a re-bucket obligation (§3.4, §8.1); the deferred-re-bucket defect (a queued thread keeps its old key until it naturally re-enqueues) is closed |
 | `leak_tag`, diagnostic counters | deleted; their questions become assertions (§9.2) |
 
 ---
@@ -1224,15 +1224,15 @@ covers none of it. §11.11 is new and is where the C-A cost lives.]**
 
 ### 3.1 Preemption points
 
-Kernel execution is in **EC context** (some EC's kstack) or **scheduler
+Kernel execution is in **thread context** (some thread's kstack) or **scheduler
 context** (the park kstack).
 
 1. **Preemption is claim-gated AND pin-gated.** The preempt tick
-   dispatches away from EC context only if the current EC's
+   dispatches away from thread context only if the current thread's
    `pin_depth == 0` (round 3 X1) and its `running → parking(requeue)` CAS
    wins. The pin gate is what makes S4's holder-persistence true: a frame
    holding a claim (or a non-IRQ-masked lock) is never requeue-preempted,
-   so it can never become a `ready`/`parking(requeue)` EC whose retire
+   so it can never become a `ready`/`parking(requeue)` thread whose retire
    would inline-finalize an in-flight claim — the two X1 windows are
    unreachable (§5.2). Wake bodies are L6-bounded, so the deferral costs
    at most one tick. Directive-waiters and eviction spinners hold no
@@ -1251,16 +1251,16 @@ context** (the park kstack).
    edge-3 row).
 
    `retired` and `directive` do not need the return leg: both are
-   asynchronous by construction — a retired EC is caught by the wake IPI
+   asynchronous by construction — a retired thread is caught by the wake IPI
    the retirer sent, an armed directive by the next entry — and neither
    has a caller waiting on a quiesced address space.
-   Kernel EC frames run to their own hop (where the commit-failure arm
+   Kernel thread frames run to their own hop (where the commit-failure arm
    finds `retired`) or to syscall completion (the next user-boundary
    event finds it — prompt because the retirer's wake IPI pends until IF
    restores). Together with rule 1's pin gate this covers all three
    abandonment vectors round 3 enumerated: entry checks (rule 3), requeue
    preemption (rule 1), and the hop's own retired arm (which only fires
-   for the frame's OWN EC, whose claims were discharged before the hop —
+   for the frame's OWN thread, whose claims were discharged before the hop —
    §2.4 assert).
 
    **Precedence, normative** (round 7 M-5; this IS the N5 fix, which
@@ -1268,7 +1268,7 @@ context** (the park kstack).
    never as a rule): **on any entry from user mode, the entry checks
    precede every other action that entry would take.** A periodic tick
    arriving on a user-mode frame *is* such an entry, so a tick that
-   finds an unpinned, user-mode EC with `directive_state == armed`
+   finds an unpinned, user-mode thread with `directive_state == armed`
    **consumes the directive** (edge 3, park into the port) — it does
    **not** take the requeue arm. §5's edge-3 row lists directive
    consumption and the preempt tick as sibling triggers; where both are
@@ -1291,12 +1291,12 @@ gate — never by an ambient IRQ mask. (Forecloses class 2.)
 1. All fallible work and all saved-frame reads first (event staging into
    the descriptor). `pin_depth == 0` at the publish (§2.4).
 2. **Publish under the reaching locks** (today's futex discipline
-   generalized — `futex.zig:434`; port paths `execution_context.zig:1645`
+   generalized — `futex.zig:434`; port paths `thread.zig:1645`
    / `port.zig:613`): **the `parking` CAS first, then the links, both
    inside the final container-lock critical section** (round 6 M1 —
    intra-section order is unobservable under the held lock, so this
    costs nothing). The CAS's failure arm is thereby specified: a retire
-   that landed since step 1 (edge 9 may hit a `running` EC at any
+   that landed since step 1 (edge 9 may hit a `running` thread at any
    instant) makes the CAS fail on `retired`; the parking core then
    **links nothing**, releases the section, and proceeds as
    outgoing-`retired` — the hop's retired arm finalizes (§4). (Note for
@@ -1309,16 +1309,16 @@ gate — never by an ambient IRQ mask. (Forecloses class 2.)
    (§2.5), the rendezvous publish (§8.3), and creation's edge-1 publish
    analog (§8.5). Container locks are IRQ-masked, so no tick lands
    between publish and links and no container-reached waker can see a
-   linked EC still `running`. Deadline registration follows the links
+   linked thread still `running`. Deadline registration follows the links
    inside the same section.
    **The link precedes the hop; claimability does not** (round 6,
    Phase-3b measurement question, answered from this text): a wait-park
-   EC sits LINKED in its containers, in state `parking`, while the owner
+   thread sits LINKED in its containers, in state `parking`, while the owner
    core is still on its kstack — and that is safe with NO wake-side
    kstack barrier because claimability-for-placement begins only at the
    hop's commit CAS (edge 4, `parking → waiting`, performed by hop step
    2 AFTER step 1 released the kstack). Every claim that reaches the
-   linked EC pre-hop lands as 5b → `pended`, whose placement is
+   linked thread pre-hop lands as 5b → `pended`, whose placement is
    discharged by the owner's own hop (edge 6p) — after release, by
    construction. Edge 4 therefore already carries the same at-the-hop
    requirement edge 8 carries: placement-of-claimability at the hop.
@@ -1352,14 +1352,14 @@ drains teardown requests, rechecks the lifecycle state, and loads the
 selected context. If retire or park wins after the commit, dispatch is
 abandoned and the core returns to `run()`. S7-failure routing
 (round-3 M-A repair; lock order
-corrected round 4 F2): a popped `ready` EC whose domain ref is gen-dead
+corrected round 4 F2): a popped `ready` thread whose domain ref is gen-dead
 is **claimed, not retired in place** — the dispatcher CASes
 `ready → claimed` under the queue lock it already holds (legal per
 R-claim: the queue is the reaching container), releases the queue lock,
-then retires the EC as its holder via T2's `claimed` row (marking +
-finalize inline; the EC is quiescent). Rev 4 retired it under the queue
+then retires the thread as its holder via T2's `claimed` row (marking +
+finalize inline; the thread is quiescent). Rev 4 retired it under the queue
 lock, which nests the S5 gen-flip inside the core lock —
-CoreLock → EcGen, an AB-BA against §3.5's pinned EcGen → CoreLock order
+CoreLock → ThreadGen, an AB-BA against §3.5's pinned ThreadGen → CoreLock order
 with both sides IRQ-masked. Never a silent drop, either way.
 
 **The wake body** (`claim → discharge`), any waker:
@@ -1402,18 +1402,18 @@ with both sides IRQ-masked. Never a silent drop, either way.
 
 | Fact | Width | Writer | Cross-core readers | Discipline |
 |---|---|---|---|---|
-| `ec.state` | 1 byte | chokepoint CAS only | anyone | CAS/acquire; actionable reads re-validated by CAS |
-| `ec.owner_core` | 1 byte | dispatching core under its lock | pended discharge, retirer routing, eviction barrier | valid only per §2.4 |
-| `ec.pin_depth` | 1 byte | the EC's own core, EC context | that core's tick only | same-core; no atomics; **bump precedes the acquire, decrement follows the release** (§2.4, C1) |
-| `ec.mark_state` | **1 bit** | retirer (under the retire CAS's `_gen_lock` exclusivity) SETS or leaves clear; then the §5.2-named discharger CLEARS | terminator's W4 wait; finalize's assert | SPSC hand-off, same shape as `payload_done`: the discharger's clear is a release-store, W4 is the acquire side; writers disjoint in time (the discharger's store is enabled only by observing it SET) (§2.4, M-3) |
-| `ec.priority` | 1 byte | the `priority` syscall, under the target's `_gen_lock` | every link site (`EcQueue.enqueue`, futex `WaitNode` key), under the destination container lock | single-word store, **published before any subsequent link**; links that already exist are repaired by the same syscall's re-bucket (§8.1). A `WaitNode`'s copy of the key has ONE writer context — whoever holds that bucket's lock (the parking core at link time, the syscall thereafter) |
-| `ec.affinity` | 8 bytes | the `affinity` syscall, under the target's `_gen_lock` | every placement's destination computation, under the destination queue lock | as `ec.priority`; a `ready` target whose new mask excludes its current queue core is MOVED by the 5c claim-move, not by a bare store (§8.1) |
-| `ec.directive_port` | 1 word (SlabRef) | the suspender, **written only between its `none → claiming` and `claiming → armed` CASes** — i.e. under the exclusivity the `claiming` state grants | **the owner core only**, at its user-boundary check, to gen-validate and park into | round-10 C-D: rev 10 gave this field no row at all. The suspender never reads it back, so there is no cross-core read discipline to specify — it re-validates the port reference IT holds. That asymmetry is the whole reason the ownership test needs no second word |
-| `ec.directive_state` | **4 bytes: `{ state: u8, owner_slot: u24 }`**, one word, single-word CAS (round-10 C-D) | **writer contexts, enumerated in full (round-9 C-1; rev 9's row named two of them and S2/analyzer 9.3(1) pin writers from THIS row)**: (1) a **suspender** CASing `none → suspending` on its OWN word (§2.5.1 CAS 1 — the only case where an EC writes its own directive word); (2) a **suspender** CASing another EC's `none → claiming` and `claiming → armed`, and `(armed, me) → none` on disarm; (3) the **owner core** CASing `(armed, owner) → none` on successful user-boundary consumption; (4) the **owner core** publishing `directive_result` and CASing `(armed, owner) → (failed, owner)` on stale/bad-port or other consume failure; (5) the **matching waiter** CASing `(failed, me) → none` as the failure ack; (6) **finalize** writing the terminal `dead`; and **(7) the slot zero itself** — finalize's `slot zero + freelist` (§8.2, edge 10) writes the all-zeroes `none` over `dead` a few steps after (6), and creation's publish (edge 1) writes `none` into a recycled slot. **Round-11 C-1: this row claimed "four writer contexts, enumerated in full" and was short by exactly this one — the same failure as round-9 C-1, which was also this row being short.** The zero is not a bookkeeping detail: it is what destroys F6's marker, which is why the break disambiguator cannot rest on `dead` | owner entry check; suspender re-check loop; a suspender's own-word check at CAS 1 | payload under claiming→armed exclusivity; terminal `dead` distinguishes retired from consumed (§2.5, F6) only when observed before slot zero. `armed → none` means delivered consume or waiter disarm; owner-side failures instead publish `directive_result` and go `armed → failed`, then the matching waiter acks `failed → none`. The word carries the **identity of the suspender that placed the current arm**, and the suspender's break test and disarm CAS are both on `(armed, me)`, never on the state value — without that the word is an ABA and a suspender can both report success for an undelivered suspension and disarm a third party's directive. An epoch was tried first and TLC refuted it: a bounded counter is itself an ABA (§2.5). Full state set: `none | suspending | claiming | armed | failed | dead` |
-| `ec.directive_result` | 8 bytes (`i64`) | owner core, release-store before `(armed, owner) → (failed, owner)` | matching suspender after acquire-observing `(failed, me)` | carries the owner-side consume-failure code only while `directive_state` is `failed`. The matching waiter reads it before CASing `failed → none` and returns the error; the ack does not clear the result because that would be a second, non-atomic word update. Outside `failed`, the value may be stale and no success path reads it |
-| `ec.wait.*` | multi-word | per §2.2 | claim/retire winner; owner's hop after `payload_done` | ownership transfers with CAS; reachability-gating sections; `payload_done` release/acquire |
-| `ec.ctx` saved-frame payload | multi-word | claim winner only | the EC after re-dispatch | claim CAS + saved-frame ban + discharge ordering |
-| `ec.current_queue_core` | 1 byte (`u8`; `NOT_IN_RUN_QUEUE` sentinel outside the validity set) | **the party holding the DESTINATION queue lock at the CAS-then-link of edges 1 / 6 / 6p / 8** — i.e. whoever makes the EC `ready` writes it in the same section. Whoever takes it out of `ready` (edge 2's dequeue, a 5c claim, pull-side steal's victim removal, retire's ready row) clears it to the sentinel in the section it already holds. The x86-64 IPC fast path mirrors this in R13's ready-enqueue branches: queue links/tail first, then `current_queue_core = local core`, then unlock | `removeFromQueue`; §8.1's reach-and-validate step 2 (which container am I in); §5.3's run-queue row; pull-side steal's victim scan as a hint only | **valid iff `state == ready`**, poisoned to the sentinel otherwise (debug builds assert it). Single byte, so no tearing; written and cleared only under the queue lock that owns the membership it names, which is the same section the state CAS runs in — so it cannot disagree with `state` at any point a reader can observe both. **A stale read is safe by construction**: the reader re-validates under the lock it was directed to and retries on mismatch (§3.5's drop-and-retry). Steal likewise does not trust this field alone: the victim scan validates actual run-queue membership under the victim lock before claiming/removing |
+| `thread.state` | 1 byte | chokepoint CAS only | anyone | CAS/acquire; actionable reads re-validated by CAS |
+| `thread.owner_core` | 1 byte | dispatching core under its lock | pended discharge, retirer routing, eviction barrier | valid only per §2.4 |
+| `thread.pin_depth` | 1 byte | the thread's own core, thread context | that core's tick only | same-core; no atomics; **bump precedes the acquire, decrement follows the release** (§2.4, C1) |
+| `thread.mark_state` | **1 bit** | retirer (under the retire CAS's `_gen_lock` exclusivity) SETS or leaves clear; then the §5.2-named discharger CLEARS | terminator's W4 wait; finalize's assert | SPSC hand-off, same shape as `payload_done`: the discharger's clear is a release-store, W4 is the acquire side; writers disjoint in time (the discharger's store is enabled only by observing it SET) (§2.4, M-3) |
+| `thread.priority` | 1 byte | the `priority` syscall, under the target's `_gen_lock` | every link site (`ThreadQueue.enqueue`, futex `WaitNode` key), under the destination container lock | single-word store, **published before any subsequent link**; links that already exist are repaired by the same syscall's re-bucket (§8.1). A `WaitNode`'s copy of the key has ONE writer context — whoever holds that bucket's lock (the parking core at link time, the syscall thereafter) |
+| `thread.affinity` | 8 bytes | the `affinity` syscall, under the target's `_gen_lock` | every placement's destination computation, under the destination queue lock | as `thread.priority`; a `ready` target whose new mask excludes its current queue core is MOVED by the 5c claim-move, not by a bare store (§8.1) |
+| `thread.directive_port` | 1 word (SlabRef) | the suspender, **written only between its `none → claiming` and `claiming → armed` CASes** — i.e. under the exclusivity the `claiming` state grants | **the owner core only**, at its user-boundary check, to gen-validate and park into | round-10 C-D: rev 10 gave this field no row at all. The suspender never reads it back, so there is no cross-core read discipline to specify — it re-validates the port reference IT holds. That asymmetry is the whole reason the ownership test needs no second word |
+| `thread.directive_state` | **4 bytes: `{ state: u8, owner_slot: u24 }`**, one word, single-word CAS (round-10 C-D) | **writer contexts, enumerated in full (round-9 C-1; rev 9's row named two of them and S2/analyzer 9.3(1) pin writers from THIS row)**: (1) a **suspender** CASing `none → suspending` on its OWN word (§2.5.1 CAS 1 — the only case where an thread writes its own directive word); (2) a **suspender** CASing another thread's `none → claiming` and `claiming → armed`, and `(armed, me) → none` on disarm; (3) the **owner core** CASing `(armed, owner) → none` on successful user-boundary consumption; (4) the **owner core** publishing `directive_result` and CASing `(armed, owner) → (failed, owner)` on stale/bad-port or other consume failure; (5) the **matching waiter** CASing `(failed, me) → none` as the failure ack; (6) **finalize** writing the terminal `dead`; and **(7) the slot zero itself** — finalize's `slot zero + freelist` (§8.2, edge 10) writes the all-zeroes `none` over `dead` a few steps after (6), and creation's publish (edge 1) writes `none` into a recycled slot. **Round-11 C-1: this row claimed "four writer contexts, enumerated in full" and was short by exactly this one — the same failure as round-9 C-1, which was also this row being short.** The zero is not a bookkeeping detail: it is what destroys F6's marker, which is why the break disambiguator cannot rest on `dead` | owner entry check; suspender re-check loop; a suspender's own-word check at CAS 1 | payload under claiming→armed exclusivity; terminal `dead` distinguishes retired from consumed (§2.5, F6) only when observed before slot zero. `armed → none` means delivered consume or waiter disarm; owner-side failures instead publish `directive_result` and go `armed → failed`, then the matching waiter acks `failed → none`. The word carries the **identity of the suspender that placed the current arm**, and the suspender's break test and disarm CAS are both on `(armed, me)`, never on the state value — without that the word is an ABA and a suspender can both report success for an undelivered suspension and disarm a third party's directive. An epoch was tried first and TLC refuted it: a bounded counter is itself an ABA (§2.5). Full state set: `none | suspending | claiming | armed | failed | dead` |
+| `thread.directive_result` | 8 bytes (`i64`) | owner core, release-store before `(armed, owner) → (failed, owner)` | matching suspender after acquire-observing `(failed, me)` | carries the owner-side consume-failure code only while `directive_state` is `failed`. The matching waiter reads it before CASing `failed → none` and returns the error; the ack does not clear the result because that would be a second, non-atomic word update. Outside `failed`, the value may be stale and no success path reads it |
+| `thread.wait.*` | multi-word | per §2.2 | claim/retire winner; owner's hop after `payload_done` | ownership transfers with CAS; reachability-gating sections; `payload_done` release/acquire |
+| `thread.ctx` saved-frame payload | multi-word | claim winner only | the thread after re-dispatch | claim CAS + saved-frame ban + discharge ordering |
+| `thread.current_queue_core` | 1 byte (`u8`; `NOT_IN_RUN_QUEUE` sentinel outside the validity set) | **the party holding the DESTINATION queue lock at the CAS-then-link of edges 1 / 6 / 6p / 8** — i.e. whoever makes the thread `ready` writes it in the same section. Whoever takes it out of `ready` (edge 2's dequeue, a 5c claim, pull-side steal's victim removal, retire's ready row) clears it to the sentinel in the section it already holds. The x86-64 IPC fast path mirrors this in R13's ready-enqueue branches: queue links/tail first, then `current_queue_core = local core`, then unlock | `removeFromQueue`; §8.1's reach-and-validate step 2 (which container am I in); §5.3's run-queue row; pull-side steal's victim scan as a hint only | **valid iff `state == ready`**, poisoned to the sentinel otherwise (debug builds assert it). Single byte, so no tearing; written and cleared only under the queue lock that owns the membership it names, which is the same section the state CAS runs in — so it cannot disagree with `state` at any point a reader can observe both. **A stale read is safe by construction**: the reader re-validates under the lock it was directed to and retries on mismatch (§3.5's drop-and-retry). Steal likewise does not trust this field alone: the victim scan validates actual run-queue membership under the victim lock before claiming/removing |
 | `PerCore.current` | 8 bytes | owning core (2 sites) | identity compares only | caller-pinned identity rules; bytes intact until finalize |
 | `PerCore.active_root` | 8 bytes | owning core, release-after-load | teardown barrier | as today |
 | `PerCore.idle_parked` | 1 byte | owning core under its lock | enqueuers under same lock | as today |
@@ -1424,23 +1424,23 @@ with both sides IRQ-masked. Never a silent drop, either way.
 A claim (any CAS out of `ready`/`waiting`/`parking`) MUST be attempted
 only:
 
-- **while holding the lock of the container through which the EC was
+- **while holding the lock of the container through which the thread was
   reached** — run-queue lock, port lock, futex bucket lock, deadline-table
   lock or device-region lock (§5.1); or
-- **under the EC's own `_gen_lock` with gen validation** for ref-reached
+- **under the thread's own `_gen_lock` with gen validation** for ref-reached
   holders (reply pin, terminate, teardown walks). Retire's CAS+gen-fuse
   runs under the same `_gen_lock`; the fast path's fused publish lives
   inside this hold (§9.4).
 
 **Lock-order pin** (round-3 repair): retire of a `ready` target holds
-both the EC `_gen_lock` and the run-queue lock; the canonical order is
-**EcGen → CoreLock**. Nothing in the machine takes a core lock and then
-an EC gen lock (dispatch, enqueue, and placement never acquire EC gen
+both the thread `_gen_lock` and the run-queue lock; the canonical order is
+**ThreadGen → CoreLock**. Nothing in the machine takes a core lock and then
+an thread gen lock (dispatch, enqueue, and placement never acquire thread gen
 locks), so the pair-order is registrable with lockdep as a fixed edge.
 
 **Cross-class lock ordering is OUT OF SCOPE (§0.2), and revisions 10–12
 were wrong to make it a project.** Revision 8 asserted a chain
-(`wait-container < EC gen < core locks`); round 8 refuted its left edge
+(`wait-container < thread gen < core locks`); round 8 refuted its left edge
 against the tree; revisions 10–12 then escalated that into a "blocker"
 that gated §8.1, §8.2, §8.5 and six migration steps on a lockdep group
 design nobody had asked for. That escalation was the error. The kernel
@@ -1450,14 +1450,14 @@ not need to invent a total order. Three sentences replace the project:
 1. **Same-class nesting is address-ordered under a named group.** Two
    locks of one class are taken lowest-address-first with the pair
    tagged to a group so lockdep does not fire its same-class overlap
-   check. (The x86-64 fast path's `receiver_ec`/`sender_ec` nesting is
+   check. (The x86-64 fast path's `receiver_thread`/`sender_thread` nesting is
    the live instance, and its comment names a group constant
-   `EC_NESTED_GROUP` that **does not exist in the tree** — bead
+   `THREAD_NESTED_GROUP` that **does not exist in the tree** — bead
    `stygia-d0q`. That must be fixed; it is a one-line defect, not a
    design question.)
 2. **No static cross-class order is asserted.** Lockdep detects cycles
    dynamically from its pair registry. Only one cross-class edge is
-   pinned, because retire needs it: **EcGen → CoreLock** (round-3
+   pinned, because retire needs it: **ThreadGen → CoreLock** (round-3
    repair, re-verified at HEAD with no counterexamples).
 3. **Reach-and-validate is solved by DROP-AND-RETRY, not by ordering.**
    A ref-reached party computes its candidate container, takes that
@@ -1476,7 +1476,7 @@ The FINALIZER's leading container unwind (§8.2, round 5 N4 — retire has
 no unwind step) acquires each relevant container lock before the release
 body and any free; combined with R-claim this flushes any in-flight
 claim attempt before the slot can be reclaimed (the popped-node race
-closure, generalizing today's gen-checked `node.ec.lockIrqSave` in
+closure, generalizing today's gen-checked `node.thread.lockIrqSave` in
 `futex.wake`).
 
 ### 3.6 T3 — the wait-for graph over every retained spin
@@ -1489,14 +1489,14 @@ callgraph (§9.3(6)).
 
 | # | Spin | Waiter context | Waits on | Provider's blockers | Interrupt-frame edges | Why no cycle |
 |---|---|---|---|---|---|---|
-| W1 | container/gen lock acquire | any | current holder's bounded critical section | other bounded lock sections (lockdep DAG) | **REWRITTEN IN REVISION 11 (round-10 C-A).** Rev 10 read "holder is IRQ-masked ⇒ cannot be waiting on this interrupt's return" — which is FALSE for the pin class **by definition**, since a pin-class lock is precisely one that is NOT masked at its EC-context acquire sites. The argument now splits by class: an **IRQ-masking class** keeps the original certificate (the holder cannot be waiting on this interrupt's return, because it cannot have taken this interrupt); a **pin-class** lock is safe only because §2.4's third clause forbids it any interrupt-context acquire site at all, so no interrupt can contend for it and the re-entrancy question does not arise | lock DAG + bounded sections; holders never enter spins W3–W6 while holding (contract, asserted). **The pin-class arm's certificate is the §2.4 prohibition, and it is analyzer-checkable (9.3(7)) rather than argued** |
+| W1 | container/gen lock acquire | any | current holder's bounded critical section | other bounded lock sections (lockdep DAG) | **REWRITTEN IN REVISION 11 (round-10 C-A).** Rev 10 read "holder is IRQ-masked ⇒ cannot be waiting on this interrupt's return" — which is FALSE for the pin class **by definition**, since a pin-class lock is precisely one that is NOT masked at its thread-context acquire sites. The argument now splits by class: an **IRQ-masking class** keeps the original certificate (the holder cannot be waiting on this interrupt's return, because it cannot have taken this interrupt); a **pin-class** lock is safe only because §2.4's third clause forbids it any interrupt-context acquire site at all, so no interrupt can contend for it and the re-entrancy question does not arise | lock DAG + bounded sections; holders never enter spins W3–W6 while holding (contract, asserted). **The pin-class arm's certificate is the §2.4 prohibition, and it is analyzer-checkable (9.3(7)) rather than argued** |
 | W2 | owner-hop `payload_done` wait | **scheduler context** (hop, degenerate hop), no locks held | the pended claimant's straight-line body | W1 only (claimant's body acquires only bounded IRQ-masked locks, all released before payload writes) | claimant may be an interrupt body — but it waits on nothing, and (same-core) it completed before the hop can even run | provider has no outgoing edges to W2–W6; same-core case degenerates to no-spin |
-| W3 | terminate eviction spin | EC context, `pin_depth == 0`, no locks held | target leaving its core's `current` slot | target's kernel sequence completion + one user-boundary event (tick/IPI-bounded) | none — waiter is preemptible; target needs no interrupt of the waiter to return | target's progress is tick-driven, independent of the waiter — **CONDITIONAL on the two exit conditions below (round-8 C-1); without them this column is FALSE and mutual terminate is a hard two-core deadlock, reached by the model in 7 states**. **(i) Self carve-out**: if the target IS the caller, the wait is skipped entirely — a caller cannot wait for its own eviction. The tree already does this (`execution_context.zig:1028`, `if (ec != caller and ...)`); revision 8 had no such carve-out anywhere, so the tree was SAFER than the design. **(ii) Retired-waiter escape**: the spin also exits if the WAITING EC has itself become `retired`. The tree's `ec != caller` does NOT cover mutual terminate — A terminates B and B terminates A, and both cores pass `ec != caller`. Both callers end `retired` in kernel frames, and a `retired` EC in a kernel frame is moved by NOTHING: the requeue CAS fails on `retired` (§3.1 rule 1) and rule 3's entry checks are user-boundary-gated. Sound because a retired terminator never returns to user mode, so L5 has no observer to disappoint; safe because the frame holds no claim (`pin_depth == 0` at spin entry, rule (b)) |
-| W4 | L5 deferred-marking wait (terminate, prior `claimed`/`pended`): **acquire-load of `mark_state` until the owed bit is CLEAR** (§2.4, M-3) | EC context, `pin_depth == 0`, **no locks held**, preemptible | the discharger's bounded body (holder's L6 body, or owner's hop after `payload_done`) — its clearing release-store is the paired write | W1, W2 | none | discharger never waits on the terminator; bound = discharger instructions + scheduling latency, and the acquire/release pairing that bound presumes is now an explicit §3.4 discipline rather than an implicit one |
-| W5 | directive-suspender wait | EC context, `pin_depth == 0`, preemptible | target leaving `running`, OR consuming at a boundary | tick (requeue), its own park, or the **arming wake IPI forcing a user-boundary event → entry-check consumption** | none | round-2 verified for the requeue break; round-6 model addendum (N5): the requeue break ALONE is not total — a target duty-cycling pin-class holds can phase-align so the suspender never observes it off-CPU — and W5's termination then rests on rule 3's MANDATORY boundary consumption: every kernel entry from user mode (each periodic tick included) runs the directive arm, so an armed running target consumes within one unpinned tick; §2.5's wake IPI adds promptness for a target that never faults or syscalls. This is a distinct starvation class from N3 (N3: the SPINNER's recheck; N5: the spun-on EVENT), closed by rule 3, not by a fairness assumption — and rule 3's precedence over the requeue arm is what makes it work, which rev 7 left as a consequence and rev 8 states as a rule (round 7 M-5, §3.1). **This column is NOT a bound**: it is termination under assumptions (1)+(2) below, and the round-7 measurements show assumption (2) is the one the model can barely check (§11.7) |
-| W6 | `awaitDomainQuiesced` | scheduler context, no locks held | cores republishing roots / evicting dying-domain ECs | W3-like per-core progress | none (ack-while-spinning services shootdowns) | per-core progress is tick-driven; barrier holds nothing they need |
-| W7 | retire-from-`pended` `payload_done` pre-wait (edge 9, §8.2) | retire caller: EC-syscall or scheduler context — never interrupt context (asserted) | the pended claimant's straight-line body | W1 only | none | same bounded provider as W2; the wait precedes the retire CAS, so no later observer of `retired` ever waits (F1) |
-| W8 | FPU migrate-flush ack (`fpu.zig:337-414`) | EC/scheduler context, IRQ-masked, **holding `request_lock`** | remote core's flush-IPI handler, or inline service at the remote's spin sites | none unbounded: the handler is lock-free and bounded; a remote spinning IRQ-masked services the flush inline (ack-while-spinning) | provider needs an IRQ delivery OR an inline service — never this core's held lock | rule (b) exception; sound per the ack-while-spinning closure below (F4) |
+| W3 | terminate eviction spin | thread context, `pin_depth == 0`, no locks held | target leaving its core's `current` slot | target's kernel sequence completion + one user-boundary event (tick/IPI-bounded) | none — waiter is preemptible; target needs no interrupt of the waiter to return | target's progress is tick-driven, independent of the waiter — **CONDITIONAL on the two exit conditions below (round-8 C-1); without them this column is FALSE and mutual terminate is a hard two-core deadlock, reached by the model in 7 states**. **(i) Self carve-out**: if the target IS the caller, the wait is skipped entirely — a caller cannot wait for its own eviction. The tree already does this (`thread.zig:1028`, `if (thread != caller and ...)`); revision 8 had no such carve-out anywhere, so the tree was SAFER than the design. **(ii) Retired-waiter escape**: the spin also exits if the WAITING thread has itself become `retired`. The tree's `thread != caller` does NOT cover mutual terminate — A terminates B and B terminates A, and both cores pass `thread != caller`. Both callers end `retired` in kernel frames, and a `retired` thread in a kernel frame is moved by NOTHING: the requeue CAS fails on `retired` (§3.1 rule 1) and rule 3's entry checks are user-boundary-gated. Sound because a retired terminator never returns to user mode, so L5 has no observer to disappoint; safe because the frame holds no claim (`pin_depth == 0` at spin entry, rule (b)) |
+| W4 | L5 deferred-marking wait (terminate, prior `claimed`/`pended`): **acquire-load of `mark_state` until the owed bit is CLEAR** (§2.4, M-3) | thread context, `pin_depth == 0`, **no locks held**, preemptible | the discharger's bounded body (holder's L6 body, or owner's hop after `payload_done`) — its clearing release-store is the paired write | W1, W2 | none | discharger never waits on the terminator; bound = discharger instructions + scheduling latency, and the acquire/release pairing that bound presumes is now an explicit §3.4 discipline rather than an implicit one |
+| W5 | directive-suspender wait | thread context, `pin_depth == 0`, preemptible | target leaving `running`, OR consuming at a boundary | tick (requeue), its own park, or the **arming wake IPI forcing a user-boundary event → entry-check consumption** | none | round-2 verified for the requeue break; round-6 model addendum (N5): the requeue break ALONE is not total — a target duty-cycling pin-class holds can phase-align so the suspender never observes it off-CPU — and W5's termination then rests on rule 3's MANDATORY boundary consumption: every kernel entry from user mode (each periodic tick included) runs the directive arm, so an armed running target consumes within one unpinned tick; §2.5's wake IPI adds promptness for a target that never faults or syscalls. This is a distinct starvation class from N3 (N3: the SPINNER's recheck; N5: the spun-on EVENT), closed by rule 3, not by a fairness assumption — and rule 3's precedence over the requeue arm is what makes it work, which rev 7 left as a consequence and rev 8 states as a rule (round 7 M-5, §3.1). **This column is NOT a bound**: it is termination under assumptions (1)+(2) below, and the round-7 measurements show assumption (2) is the one the model can barely check (§11.7) |
+| W6 | `awaitDomainQuiesced` | scheduler context, no locks held | cores republishing roots / evicting dying-domain Threads | W3-like per-core progress | none (ack-while-spinning services shootdowns) | per-core progress is tick-driven; barrier holds nothing they need |
+| W7 | retire-from-`pended` `payload_done` pre-wait (edge 9, §8.2) | retire caller: thread-syscall or scheduler context — never interrupt context (asserted) | the pended claimant's straight-line body | W1 only | none | same bounded provider as W2; the wait precedes the retire CAS, so no later observer of `retired` ever waits (F1) |
+| W8 | FPU migrate-flush ack (`fpu.zig:337-414`) | thread/scheduler context, IRQ-masked, **holding `request_lock`** | remote core's flush-IPI handler, or inline service at the remote's spin sites | none unbounded: the handler is lock-free and bounded; a remote spinning IRQ-masked services the flush inline (ack-while-spinning) | provider needs an IRQ delivery OR an inline service — never this core's held lock | rule (b) exception; sound per the ack-while-spinning closure below (F4) |
 | W9 | TLB shootdown ack wait (`paging.zig:509`) | any, **holding `shootdown_lock`** | every remote core's shootdown ack (IRQ or inline service) | as W8 | as W8 | as W8 (F4) |
 
 **A real cycle in this table, and the argument that breaks it** (round-9
@@ -1505,7 +1505,7 @@ cycle" columns were each written as if the other row did not exist). A
 terminates B while B suspends A: A sits in **W3** waiting for B to leave
 its core's `current`, and B sits in **W5** waiting for A to leave
 `running` or consume at a boundary. That is a genuine `W3 → W5 → W3`
-wait-for cycle between two EC-context frames, and neither §2.5.1's
+wait-for cycle between two thread-context frames, and neither §2.5.1's
 suspend-cycle rejection nor §3.6 W3's terminate exits touches it — the
 two operations are *different*, so no mutual-X check fires, and neither
 party is `retired`, so the C-1 escape does not apply.
@@ -1513,8 +1513,8 @@ party is `retired`, so the C-1 escape does not apply.
 It terminates for exactly one reason: **both waiters are
 requeue-preemptible**, so the tick evicts A from `current`, which is
 precisely what B's W5 wait is waiting for; B then completes and A's W3
-discharges. **That argument is 100% dependent on §3.3's EC-context
-IRQ-enabled rule** (round-9 C-4). If EC context runs masked — which is
+discharges. **That argument is 100% dependent on §3.3's thread-context
+IRQ-enabled rule** (round-9 C-4). If thread context runs masked — which is
 what the tree does today and what §12 read as prescribing until revision
 10 — the tick never arrives, neither waiter is preemptible, and this is
 a hard two-core deadlock with no falsifier in the battery, because the
@@ -1607,15 +1607,15 @@ would come from "every unpinned continuation, every cross-core
 observation, and every cycle in the who-waits-on-whom graph", and it was
 looking at W5 the whole time. **The fifth class was W3**, it involved no
 suspend at all, and it is not a starvation at all but a hard deadlock —
-because a `retired` EC in a kernel frame is moved by nothing, so the
+because a `retired` thread in a kernel frame is moved by nothing, so the
 mutual case wedges rather than starves. This section's enumeration of
 starvable sites was **RECALL-derived**, and it was wrong about which row
 was dangerous, not merely incomplete within a row.
 
 **Assume the current enumeration is also incomplete.** The concrete
-lesson for revision 9: the shape "two ECs each performing operation X
+lesson for revision 9: the shape "two Threads each performing operation X
 against the other" is now known to break for X = suspend (N1, N6) and
-X = terminate (C-1). Every remaining cross-EC operation in §8.1 —
+X = terminate (C-1). Every remaining cross-thread operation in §8.1 —
 `priority`, `affinity`, `yieldTo` — deserves the same question asked
 explicitly rather than assumed, and each of those answers should be
 marked DERIVED or RECALLED when written.
@@ -1632,7 +1632,7 @@ Canonical order: **release first, then commit**.
 > **Hop contract.** On the park stack immediately after the swap:
 >
 > 1. **Release**: overwrite `PerCore.current` and repoint TSS.RSP0 /
->    gs:0 / SP_EL1. By the time the EC is claimable-as-`waiting`, no
+>    gs:0 / SP_EL1. By the time the thread is claimable-as-`waiting`, no
 >    core's `current` names it.
 > 2. **Commit**: act on `outgoing.state`:
 >    - `parking` → CAS to `waiting`. Success: claimable, SP and `current`
@@ -1641,7 +1641,7 @@ Canonical order: **release first, then commit**.
 >      - `claimed`: (only possible for a rendezvous sender that claimed
 >        its receiver — its own state cannot be `claimed`; this arm is
 >        for completeness: outgoing `claimed` is unreachable, assert.)
->      - `pended`: a waker claimed this parking EC. Acquire-spin
+>      - `pended`: a waker claimed this parking thread. Acquire-spin
 >        `payload_done` (W2 — bounded), then **discharge**: placement
 >        CAS `pended → ready` + link under the destination queue lock,
 >        **computing the destination from the FRESH descriptor inside
@@ -1677,7 +1677,7 @@ Canonical order: **release first, then commit**.
 > x86 EOIs the in-service scheduler vector before parking, as today.
 >
 > **Degenerate hop.** A scheduler-context core whose SP was never on the
-> outgoing EC's kstack executes the same contract, same order, in place
+> outgoing thread's kstack executes the same contract, same order, in place
 > (the vCPU pre-loop's rule, §8.1).
 
 Every scheduler exit path goes through the hop or its degenerate form.
@@ -1706,12 +1706,12 @@ failure arm — never a plain store (the resurrection shape S8 prevents).
 | 4 | `parking` → `waiting` | owner core | the hop (or degenerate) | SP off kstack / never on it; `current` released (hop step 1) | claimable; `owner_core` poisoned (debug) |
 | 5a | `waiting` → `claimed` | any waker/mover (any context) | see T1 (§5.1) + syscall-context sources: the `futex_wake` syscall, recv pop, close propagation, reply via pin, rendezvous pop, suspend of idle-waiter, **`vm_inject_irq` waking a wfi-parked vCPU (round 6 M4; 5b if it races the vCPU's park; no T1 row unless an IRQ-context injection path is ever added, which would require one)** | CAS under R-claim; one winner per episode | holder owns descriptor+frame; unlinks containers incl. deadline node; **holder discharges** (edges 6/7) |
 | 5b | `parking` → `pended` | any waker (any context) | same wake sources racing a not-yet-committed park | CAS under R-claim | claimant: unlink + payload + `payload_done` release-store, then DONE. **Owner core discharges at its hop** (§4): placement, finalize-on-retired, deferred marking |
-| 5c | `ready` → `claimed` | cross-EC suspender; the dispatcher on S7-filter failure (§3.2, F2); the `affinity` claim-move (§8.1) | `suspend` of a `.ready` target; a popped gen-dead-domain EC; **a cross-EC `affinity` edit whose new mask excludes the target's current queue core (round 7 M-6 — rev 7 applied the closure standard to edge 3 and not to this row, so the rev-7 claim-move it had just introduced was missing from its own trigger list)**. NOT a trigger: a `priority` edit — the new bucket is in the SAME container, so it is an in-lock relink with no state change (§8.1) | inside the target's run-queue lock: unlink + CAS | holder discharges (edge 7; or edge 6 for the claim-move; or retire-as-holder for the S7 route) |
+| 5c | `ready` → `claimed` | cross-thread suspender; the dispatcher on S7-filter failure (§3.2, F2); the `affinity` claim-move (§8.1) | `suspend` of a `.ready` target; a popped gen-dead-domain thread; **a cross-thread `affinity` edit whose new mask excludes the target's current queue core (round 7 M-6 — rev 7 applied the closure standard to edge 3 and not to this row, so the rev-7 claim-move it had just introduced was missing from its own trigger list)**. NOT a trigger: a `priority` edit — the new bucket is in the SAME container, so it is an in-lock relink with no state change (§8.1) | inside the target's run-queue lock: unlink + CAS | holder discharges (edge 7; or edge 6 for the claim-move; or retire-as-holder for the S7 route) |
 | 6 | `claimed` → `ready` | the holder | wake placement | payload complete; CAS-then-link inside destination queue-lock section, **destination computed there from the fresh descriptor** (M-2) | failure ⇒ `retired` ⇒ holder performs deferred marking + finalize |
 | 6p | `pended` → `ready` | **owner core, at its hop** | hop `pended` arm | `payload_done` observed; CAS-then-link inside destination queue-lock section, destination from the fresh descriptor (M-2) | failure ⇒ `retired` ⇒ owner performs deferred marking + finalize |
-| 7 | `claimed` → `waiting` | the holder | re-containment: recv pop → reply pin; suspend of ready/idle → port; delivery-failure relink. | descriptor re-targeted; CAS-then-link inside destination wait-container lock section (the link's bucket key reads the fresh `ec.priority`, §3.4) | failure ⇒ `retired` ⇒ holder: deferred marking + finalize + undo partial placement |
+| 7 | `claimed` → `waiting` | the holder | re-containment: recv pop → reply pin; suspend of ready/idle → port; delivery-failure relink. | descriptor re-targeted; CAS-then-link inside destination wait-container lock section (the link's bucket key reads the fresh `thread.priority`, §3.4) | failure ⇒ `retired` ⇒ holder: deferred marking + finalize + undo partial placement |
 | 8 | `parking(requeue)` → `ready` | owner core | the hop | placement CAS inside destination queue-lock section, destination from the fresh descriptor (M-2) | failure ⇒ `retired` ⇒ finalize at hop |
-| 9 | `{ready, waiting, running, parking, claimed, pended}` → `retired` | retirer | retire | CAS fused with gen flip under `ec._gen_lock` (order EcGen → CoreLock when the run-queue lock is also needed, §3.5); **if the observed from-state is `pended`, acquire-wait `payload_done` before the CAS** (W7; the CAS loop re-dispatches on the fresh state if the owner's discharge wins meanwhile — F1) | routing per the retire matrix (§5.2); marking eager only for stable descriptors, else deferred to the discharger, with terminate waiting (L5) |
+| 9 | `{ready, waiting, running, parking, claimed, pended}` → `retired` | retirer | retire | CAS fused with gen flip under `thread._gen_lock` (order ThreadGen → CoreLock when the run-queue lock is also needed, §3.5); **if the observed from-state is `pended`, acquire-wait `payload_done` before the CAS** (W7; the CAS loop re-dispatches on the fresh state if the owner's discharge wins meanwhile — F1) | routing per the retire matrix (§5.2); marking eager only for stable descriptors, else deferred to the discharger, with terminate waiting (L5) |
 | 10 | `retired` → *(freed)* | the designated finalizer (§5.2) | finalize | kstack quiescent per route; pended-origin payload completion guaranteed by edge 9's pre-CAS wait (F1) | **finalize's first act is the idempotent container unwind** (§8.2, N4), then deferred marking, release body (directive → `dead`, F6), kstack unmap (epoch-quarantined), slot zero + freelist |
 
 Not a state edge: remote suspend of a `running` target — directive
@@ -1739,7 +1739,7 @@ defects.
 |---|---|---|---|---|
 | futex deadline expiry | tick → `expireTimedWaiters` | periodic scan over intrusive nodes | 5a → claimant places inline; 5b → `pended`, owner's hop places | loser leaves node; winner unlinks (L4) |
 | recv deadline expiry | tick → `expireTimedRecvWaiters` | periodic scan (same unified table, §8.4) | same | same |
-| device-region IRQ | device IRQ → `device_region.onIrq` (`device_region.zig:552-586`) — masks the line until userspace acks, then `futex.wake` | **one-shot until user ack** — the would-be acker may be the very EC being woken | same: 5a inline or 5b `pended`; the owner's hop places the waiter, which then runs and acks. **No decline path exists**, so the X3 lost-interrupt (wake dropped, acker parked, line masked forever) is unconstructible | as above — level-encoded ack word |
+| device-region IRQ | device IRQ → `device_region.onIrq` (`device_region.zig:552-586`) — masks the line until userspace acks, then `futex.wake` | **one-shot until user ack** — the would-be acker may be the very thread being woken | same: 5a inline or 5b `pended`; the owner's hop places the waiter, which then runs and acks. **No decline path exists**, so the X3 lost-interrupt (wake dropped, acker parked, line masked forever) is unconstructible | as above — level-encoded ack word |
 
 Row template for future sources: name the entry, the persistence class
 (periodic vs one-shot), and the discharge — which after this revision is
@@ -1758,11 +1758,11 @@ two empty cells in this matrix.
 
 | State \ cont. | U | K | K+C |
 |---|---|---|---|
-| `ready` | retirer, inline (EcGen → CoreLock, §3.5) | retirer, inline — safe because the lock dichotomy (§2.4, computed membership) guarantees a requeue-preempted frame holds no lock at all: IRQ-masked sections cannot span a tick, and pin-class holders are never preempted. (Rev 4's "holds nothing whose orphaning matters" rested on a recalled, wrong pin class — F3.) **CONDITIONAL on §2.4's ORDERING rule** (round 7 C1): "pin-class holders are never preempted" is true only if the bump precedes the acquire. Under `lock(); pin_depth += 1;` this cell's justification is FALSE and this row inline-finalizes a frame holding the slab lock — the model reproduces it in four states (`pinord` falsifier, `InvNoPreemptedLockHolder`) | **unreachable**: the pin gate forbids requeue-preempting a pinned frame (X1 cell 1; sound as of F3's computed membership AND C1's ordering rule) |
-| `running` | owner core: wake IPI → user-boundary check → hop+finalize | owner core: frame runs to its hop (commit-failure arm) or syscall completion + boundary. **CONDITIONAL on every in-flight kernel frame being able to COMPLETE (round-8 C-1)**: this cell's whole argument is "the frame runs to its hop or to syscall completion", and a terminator parked in the W3 eviction wait for an EC that will never leave `current` does neither. That is not a hypothetical — it is mutual terminate, and TLC reaches it in 7 states. The §3.6 W3 exits (self carve-out; retired terminator abandons the wait) are what make this column true; without them a `retired` EC sits in a kernel frame forever and L2 is violated permanently | same as K: the frame is the running computation — it completes, discharges its claims (`pin_depth → 0`), then discovery at hop/boundary. Never abandoned (§3.1 rules 1+3), and never STUCK (the W3 exits above) |
+| `ready` | retirer, inline (ThreadGen → CoreLock, §3.5) | retirer, inline — safe because the lock dichotomy (§2.4, computed membership) guarantees a requeue-preempted frame holds no lock at all: IRQ-masked sections cannot span a tick, and pin-class holders are never preempted. (Rev 4's "holds nothing whose orphaning matters" rested on a recalled, wrong pin class — F3.) **CONDITIONAL on §2.4's ORDERING rule** (round 7 C1): "pin-class holders are never preempted" is true only if the bump precedes the acquire. Under `lock(); pin_depth += 1;` this cell's justification is FALSE and this row inline-finalizes a frame holding the slab lock — the model reproduces it in four states (`pinord` falsifier, `InvNoPreemptedLockHolder`) | **unreachable**: the pin gate forbids requeue-preempting a pinned frame (X1 cell 1; sound as of F3's computed membership AND C1's ordering rule) |
+| `running` | owner core: wake IPI → user-boundary check → hop+finalize | owner core: frame runs to its hop (commit-failure arm) or syscall completion + boundary. **CONDITIONAL on every in-flight kernel frame being able to COMPLETE (round-8 C-1)**: this cell's whole argument is "the frame runs to its hop or to syscall completion", and a terminator parked in the W3 eviction wait for an thread that will never leave `current` does neither. That is not a hypothetical — it is mutual terminate, and TLC reaches it in 7 states. The §3.6 W3 exits (self carve-out; retired terminator abandons the wait) are what make this column true; without them a `retired` thread sits in a kernel frame forever and L2 is violated permanently | same as K: the frame is the running computation — it completes, discharges its claims (`pin_depth → 0`), then discovery at hop/boundary. Never abandoned (§3.1 rules 1+3), and never STUCK (the W3 exits above) |
 | `parking` (wait) | n/a (parking is a kernel sequence) | owner's hop commit-failure arm → finalize (whose leading unwind clears the episode's links, §8.2 N4) | reachable — the rendezvous sender holds a claim on its receiver mid-delivery. The sequence is the running computation: it completes delivery (discharging the claim), reaches its hop, hop finds `retired`, finalizes. Routed |
 | `parking` (requeue) | n/a | owner's hop placement-CAS fails → finalize; frame's saved continuation has `pin_depth == 0` (it was preempted under the gate) | **unreachable** (pin gate — X1 cell 2) |
-| `waiting` | retirer, inline (after unwind under container locks) | **n/a — but NOT for the reason rev 9 gave** (round-9 M-7). Rev 9 said "a waiting EC's park sequence completed", which is false as a universal: §8.3's cross-EC suspend of a `.ready` target reaches `waiting` via **5c + edge 7**, with no park sequence anywhere — the EC was claimed out of a run queue and re-contained by its holder. The cell is still n/a, and the correct reason is the one that covers both routes: **whichever party last placed the EC into `waiting` had discharged its claim and left `pin_depth == 0`** — the parking core by the §2.4 publish assert on the park route, the holder by edge 7's discharge on the 5c route. The conclusion survives; the justification did not | unreachable (`pin_depth == 0` on every route into `waiting`, not just the park route) |
+| `waiting` | retirer, inline (after unwind under container locks) | **n/a — but NOT for the reason rev 9 gave** (round-9 M-7). Rev 9 said "a waiting thread's park sequence completed", which is false as a universal: §8.3's cross-thread suspend of a `.ready` target reaches `waiting` via **5c + edge 7**, with no park sequence anywhere — the thread was claimed out of a run queue and re-contained by its holder. The cell is still n/a, and the correct reason is the one that covers both routes: **whichever party last placed the thread into `waiting` had discharged its claim and left `pin_depth == 0`** — the parking core by the §2.4 publish assert on the park route, the holder by edge 7's discharge on the 5c route. The conclusion survives; the justification did not | unreachable (`pin_depth == 0` on every route into `waiting`, not just the park route) |
 | `claimed` | — target's own frame is parked (origin was `waiting`) or a preempted pin-free frame (origin `ready`); either way it holds nothing | same | discharge belongs to the **holder** (another path): holder's placement-CAS fails → deferred marking + finalize. Holder guaranteed alive: its frame is pin-gated and boundary-gated. `owner_core` is NOT read (invalid, §2.4) |
 | `pended` | — | — | discharge belongs to the **owner core's hop**: guaranteed still to come (pended exists only pre-hop-step-2; the park sequence is unpreemptible-away per rule 3.1(1)). Retire itself pre-waits `payload_done` before its CAS (edge 9, W7 — F1), so the hop's retired arm finalizes without waiting. The `claimed` row needs no such pre-wait: its discharger is a live party that learns `retired` from its own failed placement CAS |
 | `retired` | — | — | (finalize only; not a retire source) |
@@ -1778,7 +1778,7 @@ discharger and the terminator hand off through.
 ### 5.3 T4 — pop/scan sites over wait containers (closure table)
 
 Normative (round 6 M3). The retired-but-linked licence (§8.2, N4) — a
-`retired` EC may remain linked in wait containers until its finalize's
+`retired` thread may remain linked in wait containers until its finalize's
 unwind — quantifies over EVERY site that pops, scans, or iterates any
 wait container. Rev 6 asserted that universal by recall; given this
 project's operative lesson (tool-closed T1 survived hostile
@@ -1786,24 +1786,24 @@ re-derivation; recall-closed T2/T3 held all three criticals), that is
 exactly where the next critical lives, so the enumeration is now a
 table. Each row must confirm: deref only under the container's lock (or
 the stated ref-gating), and every actionable read resolved by claim-CAS
-(fails on `retired`) or the `stale(ec)` skip (§9.2). **Derivation
+(fails on `retired`) or the `stale(thread)` skip (§9.2). **Derivation
 column: every row below is RECALL-derived from this document's own
 citations — none is tool-derived yet.** Converting this table to a
 computed one is part of 9.3(6) (future, per §2.5's enforcement status);
 until then, adding a pop site without a row here is a defect by
 definition.
 
-| Container | Pop/scan/iterate sites | Deref discipline | Retired-EC handling | Derivation |
+| Container | Pop/scan/iterate sites | Deref discipline | Retired-thread handling | Derivation |
 |---|---|---|---|---|
-| run queue (per core) | edge-2 dequeue; retire's ready-row unlink; S7 claim route; the `affinity` claim-move (5c) and the **`priority` in-lock re-bucket** (§8.1) | under `core_locks[core]` | edge-2 CAS fails on `retired`; pop-side `stale` skip (§9.2); the re-bucket re-validates state + residency under the lock and does nothing to a non-`ready` EC | recall |
-| ~~per-core idle slot (§2.1.1)~~ | **ROW DELETED IN REVISION 16 — it is not a container, because there is no idle EC to contain.** §2.1.1 is withdrawn: `idle_ec` is declared, read once unreachably, and never assigned, and the tree parks an idle core on its own park kstack via `parkAndAwaitIRQ` precisely to avoid the cross-core kstack sharing an idle EC caused. A core with an empty run queue holds NO EC, so this row's S1 claim ("the slot counts as the queue") had nothing to quantify over. The row was marked `recall` and was wrong — **which is the T4 table's own standing warning working as intended** | — | — | **was `recall`; now retracted** |
-| port queue | recv pop (5a); close propagation; cascade destroys; **`priority` re-bucket** (§8.1 — `Port.waiters` is an `EcQueue` whose `enqueue` keys on `ec.priority` at LINK time and whose `dequeue` never re-reads it, so a bare field store leaves the old selection order standing) | under the port `_gen_lock` | claim CAS fails on `retired`; skip | recall (`port.zig:613`, `sched/priority_queue.zig`) |
-| futex buckets (**plural** — one waiter links into every bucket of its multi-word wait) | `futex.wake`'s bucket pop, **plus the same function's re-enqueue of the non-matching nodes it dequeued** (`futex.zig:249,255,364` — multiple paddrs hash to one bucket, so a dequeued node may not match the wake's address; VERIFIED present, round 7); **`priority` re-bucket** of every node of the wait (§8.1 — the `WaitNode` SNAPSHOTS `ec.priority` at park, `futex.zig:427,530`) | under the bucket lock(s), sorted all-buckets discipline for multi-bucket ops | gen-checked `node.ec.lockIrqSave` generalized to claim-CAS-or-skip (§3.5) | recall (`futex.zig:434`) + the cited line numbers, re-checked against the tree in round 7 |
+| run queue (per core) | edge-2 dequeue; retire's ready-row unlink; S7 claim route; the `affinity` claim-move (5c) and the **`priority` in-lock re-bucket** (§8.1) | under `core_locks[core]` | edge-2 CAS fails on `retired`; pop-side `stale` skip (§9.2); the re-bucket re-validates state + residency under the lock and does nothing to a non-`ready` thread | recall |
+| ~~per-core idle slot (§2.1.1)~~ | **ROW DELETED IN REVISION 16 — it is not a container, because there is no idle thread to contain.** §2.1.1 is withdrawn: `idle_thread` is declared, read once unreachably, and never assigned, and the tree parks an idle core on its own park kstack via `parkAndAwaitIRQ` precisely to avoid the cross-core kstack sharing an idle thread caused. A core with an empty run queue holds NO thread, so this row's S1 claim ("the slot counts as the queue") had nothing to quantify over. The row was marked `recall` and was wrong — **which is the T4 table's own standing warning working as intended** | — | — | **was `recall`; now retracted** |
+| port queue | recv pop (5a); close propagation; cascade destroys; **`priority` re-bucket** (§8.1 — `Port.waiters` is an `ThreadQueue` whose `enqueue` keys on `thread.priority` at LINK time and whose `dequeue` never re-reads it, so a bare field store leaves the old selection order standing) | under the port `_gen_lock` | claim CAS fails on `retired`; skip | recall (`port.zig:613`, `sched/priority_queue.zig`) |
+| futex buckets (**plural** — one waiter links into every bucket of its multi-word wait) | `futex.wake`'s bucket pop, **plus the same function's re-enqueue of the non-matching nodes it dequeued** (`futex.zig:249,255,364` — multiple paddrs hash to one bucket, so a dequeued node may not match the wake's address; VERIFIED present, round 7); **`priority` re-bucket** of every node of the wait (§8.1 — the `WaitNode` SNAPSHOTS `thread.priority` at park, `futex.zig:427,530`) | under the bucket lock(s), sorted all-buckets discipline for multi-bucket ops | gen-checked `node.thread.lockIrqSave` generalized to claim-CAS-or-skip (§3.5) | recall (`futex.zig:434`) + the cited line numbers, re-checked against the tree in round 7 |
 | deadline table | tick scan (`expireTimedWaiters`/`expireTimedRecvWaiters`) | under the table lock | claim CAS fails on `retired`; loser/stale nodes left for the unwind | recall (§8.4) |
 | device-region list | `onIrq` waiter lookup | under the device-region lock | claim CAS fails on `retired`; line stays masked (see G6 note, §8.4) | recall (§5.1) |
-| **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving an EC handle to a `SlabRef` and retiring through it | ref-reached: caller-CD lock, then EC `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
-| **domain teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying domain's ECs and retiring each | ref-reached, scheduler context: CD `_gen_lock` for the walk, EC `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
-| reply-pin handle slot | reply / reply_transfer / delete-E_ABANDONED via the pin | **ref-reached, NOT container-lock-reached**: the pin is a KernelHandle in the HOLDER's domain table; deref under the holder-CD lock with EC `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim CAS fails on `retired`; if the HOLDER domain is itself in teardown, its gen is dead and the handle resolution fails — teardown's handle release owns the slot, and finalize's unwind treats a dead-gen pin as already-unlinked (idempotent skip) | recall (§8.3) |
+| **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving an thread handle to a `SlabRef` and retiring through it | ref-reached: caller-CD lock, then thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
+| **domain teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying domain's Threads and retiring each | ref-reached, scheduler context: CD `_gen_lock` for the walk, thread `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
+| reply-pin handle slot | reply / reply_transfer / delete-E_ABANDONED via the pin | **ref-reached, NOT container-lock-reached**: the pin is a KernelHandle in the HOLDER's domain table; deref under the holder-CD lock with thread `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim CAS fails on `retired`; if the HOLDER domain is itself in teardown, its gen is dead and the handle resolution fails — teardown's handle release owns the slot, and finalize's unwind treats a dead-gen pin as already-unlinked (idempotent skip) | recall (§8.3) |
 
 Two memberships the "under each container's lock" phrasing glosses,
 now explicit: a **timed waiter is linked in two container kinds at
@@ -1811,8 +1811,8 @@ once** (its wait container and the deadline table) and a **futex waiter
 in as many buckets as its wait spans** — finalize's unwind (§8.2) MUST
 visit every container the descriptor names, in the container-lock
 discipline of each, and the claim winner's unlink (edge 5a/5b) already
-does. The reply pin's unwind order is holder-CD lock, then the EC gen
-validation inside it — never the reverse (no EC-gen → CD edge exists;
+does. The reply pin's unwind order is holder-CD lock, then the thread gen
+validation inside it — never the reverse (no thread-gen → CD edge exists;
 §3.5's pinned order stays acyclic).
 
 ---
@@ -1826,8 +1826,8 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   exclusive holder/retirer/owner-discharger. *(Forecloses 6, 7.)*
 - **S2 (single writer).** Every §3.4 fact written only by its named
   writer context; descriptor per §2.2. *(Forecloses 3, 5.)*
-- **S3 (kstack quiescence).** SP of any core in `ec.kernel_stack` ⇒ that
-  core is `ec.owner_core` and `ec.state ∈ {running, parking, pended}` or
+- **S3 (kstack quiescence).** SP of any core in `thread.kernel_stack` ⇒ that
+  core is `thread.owner_core` and `thread.state ∈ {running, parking, pended}` or
   `retired` pending that core's hop. `ready`, `waiting`, `claimed`, and
   every finalize-eligible configuration imply no core on the kstack.
   *(Forecloses 8's dispatch half; with §5.2 routing, all of 8.)*
@@ -1841,26 +1841,26 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   which the frame holds a claim at `pin_depth == 0` and the tick may
   preempt it, which is X1 again) — the user-boundary
   gate (rule 3) forbids entry checks abandoning it, and the hop's retired
-  arm applies only to the frame's own EC after its claims are discharged
+  arm applies only to the frame's own thread after its claims are discharged
   (§2.4 assert). *(Forecloses 7, X1.)*
 - **S5 (retire fusion).** `gen even ⇔ retired ∨ freed`; one operation
   under `_gen_lock`. *(Forecloses 1.)*
 - **S6 (word granularity).** Nothing cross-core-readable wider than a
   word outside CAS-won-exclusivity publication. *(Forecloses 3.)*
 - **S7 (dispatch filter + routing).** Edge 2 commits only
-  gen-live-domain `ready` ECs; a filter failure claims the popped EC
+  gen-live-domain `ready` Threads; a filter failure claims the popped thread
   (`ready → claimed` under the queue lock) and retires it as holder
   after the lock drops — never a silent drop, and never a
-  CoreLock → EcGen inversion (F2). *(M-A residue.)*
+  CoreLock → ThreadGen inversion (F2). *(M-A residue.)*
 - **S8 (placement gate).** Transitions into `ready` are exactly edges 1,
   6, 6p, 8, all CAS-then-link under the destination lock;
   placement failure always routes to the cell's finalizer. Fused
   publishes preserve this. *(Forecloses 6, 7, resurrection.)*
   Not a transition, and therefore not an S8 or S1 event: the `priority`
-  in-lock re-bucket (§8.1) unlinks and relinks a `ready` EC **within
+  in-lock re-bucket (§8.1) unlinks and relinks a `ready` thread **within
   the same run queue, inside that queue's lock section** — the state
   word is not touched and container membership does not change, only
-  intra-container position. Every edit that *does* move an EC between
+  intra-container position. Every edit that *does* move an thread between
   containers is a claim-move and appears above (round 7 C2/M-6).
 
 ### 6.2 Liveness
@@ -1891,7 +1891,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   has itself become `retired`. Neither weakens the property as an
   observable: L5 constrains what a terminate *returns* to user mode, and
   in both exits the caller either never waited on itself or is dying and
-  will never return at all. Without the second exit, two ECs terminating
+  will never return at all. Without the second exit, two Threads terminating
   each other deadlock both cores permanently and L2 is violated forever
   — which is the shape L2's "the matrix is total" argument does not
   reach, because the matrix quantifies over the retire TARGET and this
@@ -1905,7 +1905,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   obligation is for a suspender whose own frame remains executable. If a
   later lifecycle operation claims, parks or retires the suspender itself
   while it is requeue-preempted in the W5 loop, the syscall is externally
-  blocked or dying; L3/L6/L2 cover that transition, and the EC-lifecycle
+  blocked or dying; L3/L6/L2 cover that transition, and the thread-lifecycle
   machine does not force a user-level resume request.
 
 ---
@@ -1926,7 +1926,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
    `payload_done` are consumed at a hop that unconditionally runs.
 5. **Predicate drift / missing per-arch writer.** One chokepoint, one
    stale predicate, writer-set pinning, paired-arch analyzer.
-6. **Ownerless EC.** Edge 1 (publish = containment, domain-gated);
+6. **Ownerless thread.** Edge 1 (publish = containment, domain-gated);
    S7-failure routing retires rather than drops.
 7. **Lost wake / lost enqueue / double enqueue.** S4 + S8 + L3 + L4 +
    T1's no-decline closure; publish-under-lock (container-reached) and
@@ -1949,7 +1949,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   contract including the `pended` arm — a VMM reply racing the loop lands
   as 5b and the pre-loop's degenerate hop discharges it after
   `payload_done`. There is no separate `exit_port` wait kind.
-- `lifecycle.wake(ec, payload)` = claim + payload + (5a/5c) placement or
+- `lifecycle.wake(thread, payload)` = claim + payload + (5a/5c) placement or
   (5b) pend. `markReady`'s `.running` arm and every wake-side spin are
   subsumed.
 - **`yieldTo`, target side (round 7 M-4)** — rev 7 gave edge 2 the
@@ -1966,7 +1966,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   (`scheduler.zig:900` checks state + `domainRefAlive` + local-queue
   residency but not the mask) and it is mandatory: dispatching a target
   whose mask excludes this core defeats `affinity` outright. **Spec
-  narrowing, named not hidden**: §[yield]'s Description says "that EC is
+  narrowing, named not hidden**: §[yield]'s Description says "that thread is
   scheduled next", which local-only does not deliver for a target
   queued on another core; §[yield] [test 03] — the observable side
   effect is visible before the caller's next syscall returns — IS
@@ -1974,7 +1974,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   maintainer call in §11.12 rather than resolved here.
 
 - **API sufficiency (round 6 M4, corrected in round 7)** — two syscalls
-  edit facts the machine had no rows for. Both edit **stable per-EC
+  edit facts the machine had no rows for. Both edit **stable per-thread
   words, not wait-descriptor fields** (§2.2/§3.4), and both share one
   reach-and-validate protocol:
 
@@ -2004,51 +2004,51 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
   >    in the sorted order §5.3 already requires.
   >    Re-validate gen, state, and linkage inside the innermost hold
   >    before touching anything. **The repaired key is a FRESH READ of
-  >    `ec.priority` taken inside that innermost hold — never the value
+  >    `thread.priority` taken inside that innermost hold — never the value
   >    this call wrote** (round-9 C-3). The natural Zig is wrong:
   >    `n.key = new_priority`, using the syscall argument, desyncs the
   >    word from the key permanently whenever two `priority` calls race
   >    one target. A writes 1, B writes 3, both release the gen lock,
   >    then B repairs the link to 3 and A repairs it to 1 — leaving
-  >    `ec.priority == 3` with the linked key at 1, forever, because
+  >    `thread.priority == 3` with the linked key at 1, forever, because
   >    `dequeue` never re-reads and a parked waiter has no next link.
   >    That is round-8's C-2 defect in its concurrent form, and it is
   >    SILENT: [test 08] reports field0 = 3 while selection uses 1.
   >    Neither caller is doing anything unusual — no cycle, no mutual
   >    relationship, both need only `spri`. **Mirror this for
   >    `affinity`**: the claim-move's destination is computed from a
-  >    fresh read of `ec.affinity` under the destination queue lock, not
+  >    fresh read of `thread.affinity` under the destination queue lock, not
   >    from the mask this call passed — which is the same rule M-2
   >    already gave every placement ("computes from the fresh
   >    descriptor"), now stated for the repair path too. **The accepted states for a
   >    wait-container repair are `{parking(wait), waiting}`, not
-  >    `waiting` alone** (round-8 C-2): a `parking(wait)` EC is already
+  >    `waiting` alone** (round-8 C-2): a `parking(wait)` thread is already
   >    linked, and an edit arriving while its owner core is still
   >    walking to the hop must repair the link it finds — deferring to
   >    a relink that never happens is exactly the C-2 hole.
   > 4. On re-validation failure the target moved, and **there is no
   >    retry**. The word is already written, and every link created
-  >    *after* that write reads it fresh (`EcQueue.enqueue` keys on
-  >    `ec.priority` at link time; a claimant's placement computes from
+  >    *after* that write reads it fresh (`ThreadQueue.enqueue` keys on
+  >    `thread.priority` at link time; a claimant's placement computes from
   >    the fresh descriptor, M-2). **Residual, stated exactly rather
   >    than waved at**: a placement that began *before* the write can
   >    create one link carrying the pre-edit key. That requires a wake
   >    racing the edit — so the target is not in the state §[priority]'s
   >    immediacy clause quantifies over — and the exposure is bounded to
   >    that single link: for a run-queue link, one scheduling round,
-  >    after which the EC is dispatched and its next enqueue uses the
+  >    after which the thread is dispatched and its next enqueue uses the
   >    new key. A single re-dispatch on the fresh state would close even
   >    that, and is a legal strengthening; it is not taken because it
   >    buys a race window nothing observes and costs a second lock
   >    round-trip on every call. Either way: no new spin, no new T3 row.
 
-  - **`affinity` (cross-EC, any target state; kernel bead
+  - **`affinity` (cross-thread, any target state; kernel bead
     `stygia-me9`)**: consumed at every placement's destination
     computation (edges 1/6/6p/8). State-routed: `ready` **and the new
     mask excludes its queue core** → claim-move (5c under that queue's
     lock, then edge 6 to a satisfying destination); `ready` and the
     mask still admits its queue core → nothing further to do;
-    `waiting` → the word alone (a waiting EC has no queue residency to
+    `waiting` → the word alone (a waiting thread has no queue residency to
     repair); `running` → the word alone, honored at the owner core's
     next requeue (tick-bounded, edge 8); `parking`/`pended`/`claimed` →
     the word alone, honored by the in-flight discharger's placement
@@ -2066,7 +2066,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
     ordering; [test 07] tests effect at the next port event delivery /
     futex wake — i.e. at **selection**, before any placement. Selection
     is bucket-position-determined, not a live field read
-    (`EcQueue.enqueue` keys on `ec.priority` at link time and `dequeue`
+    (`ThreadQueue.enqueue` keys on `thread.priority` at link time and `dequeue`
     never re-reads it; futex waiters snapshot `.priority` into the
     `WaitNode` at park, `futex.zig:427,530`), so "at its next
     placement" is not merely late — for a waiting target it is
@@ -2080,11 +2080,11 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
       **`parking(wait)` belongs HERE, not with the word-alone states**
       (round-8 C-2; rev 8 put it there and re-opened the defect for the
       one state that matters most). §2.1's containment table is explicit
-      that a `parking` EC's "wait episode's containers [are] already
+      that a `parking` thread's "wait episode's containers [are] already
       linked" — §3.2 step 2 puts the links inside the publish section —
       so its bucket key is ALREADY computed and stale. And there is no
       "next link" to fix it: edge 4 (`parking → waiting`) is a state CAS
-      that relinks nothing, so the EC arrives in `waiting` still carrying
+      that relinks nothing, so the thread arrives in `waiting` still carrying
       the pre-edit key and keeps it for the whole episode. §2.1 calls
       this window one that is "traversed thousands of times per boot".
     - `ready` → **in-lock re-bucket of the same run queue**: unlink +
@@ -2096,7 +2096,7 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
       dispatch holds, so it cannot race dispatch at all; it changes no
       state (S1 untouched: same container) and performs no transition
       into `ready` (S8 untouched); and it needs no discharger, unlike
-      the claim route, which parks the EC in `claimed` where it is not
+      the claim route, which parks the thread in `claimed` where it is not
       dispatchable until someone places it. The general rule this is
       an instance of: **same container ⇒ in-lock relink; different
       container ⇒ claim-move.** Affinity crosses containers, so it
@@ -2111,18 +2111,18 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
       the claim winner** (edges 5a/5b), so their next link — edge 6/6p/7
       — is a genuine relink that reads the fresh word.
     Never a bare field store without the link repair — that store *is*
-    the defect (a queued EC keeps its old key until it naturally
-    re-enqueues, which for a CPU-bound `ready` EC or a parked waiter
+    the defect (a queued thread keeps its old key until it naturally
+    re-enqueues, which for a CPU-bound `ready` thread or a parked waiter
     may be never).
 
 ### 8.2 Retire, finalize, and teardown
 
-`lifecycle.retire(ec)`:
+`lifecycle.retire(thread)`:
 
 1. If the observed state is `pended`: acquire-wait `payload_done` first
    (W7 — bounded by the claimant's L6 body; legal because no retire
    caller is interrupt context, asserted). Then CAS to `retired` fused
-   with the gen flip under `ec._gen_lock` (EcGen → CoreLock when the
+   with the gen flip under `thread._gen_lock` (ThreadGen → CoreLock when the
    ready-row queue lock is also required); the CAS loop re-dispatches on
    the fresh state if the owner's discharge won meanwhile
    (`pended → ready`). This pre-CAS wait is what lets every later
@@ -2141,19 +2141,19 @@ validation inside it — never the reverse (no EC-gen → CD edge exists;
 the routed finalizers (the hop's retired arm above all) deliberately
 wait-free — and named no mechanism ordering the two: the model exhibits,
 in seven states, a retire CAS landing between hop-release and
-hop-commit, the hop finalizing immediately, and the EC freed while still
+hop-commit, the hop finalizing immediately, and the thread freed while still
 linked in its wait containers with the retirer's unwind yet to run — an
-unwind that would then walk EC-resident nodes in a zeroed, reusable
+unwind that would then walk thread-resident nodes in a zeroed, reusable
 slot. Two idempotent unwinders (retirer + finalizer) do not fix this:
-the second unwinder must still read the EC's descriptor to discover it
+the second unwinder must still read the thread's descriptor to discover it
 has nothing to do, against a slot the first-to-free may already have
 zeroed. The mechanism is therefore single-owner: **`finalize`'s first
 act is the idempotent container unwind, under each container's lock
 (no-op where the claim winner already unlinked), before the release
 body and any free.** Between retire's CAS and its routed finalize, a
-`retired` EC MAY remain linked in wait containers; that is legal — the
-pop side skips `stale(ec)` (§9.2), a consumed one-shot pop against a
-`retired` EC is moot (its wake is level-encoded and the EC is dying),
+`retired` thread MAY remain linked in wait containers; that is legal — the
+pop side skips `stale(thread)` (§9.2), a consumed one-shot pop against a
+`retired` thread is moot (its wake is level-encoded and the thread is dying),
 and bytes stay intact until finalize's zero.
 
 `finalize` runs, in order: the idempotent container unwind (above);
@@ -2162,7 +2162,7 @@ exit_port unlink, vCPU arch state, FPU-owner clear,
 `directive_state → dead` — the terminal value that lets a waiting
 suspender distinguish a retired target from a delivered suspension, F6);
 kstack unmap (epoch-quarantined); slot zero + freelist. Finalize runs in
-EC-syscall or scheduler context only — never interrupt context
+thread-syscall or scheduler context only — never interrupt context
 (asserted) — and every lock its body takes is IRQ-saving per the
 `check_gen_lock` class rule. Grace rules unchanged: bytes intact until
 the zero; identity-compare-only for stale bare pointers; payload writers
@@ -2175,17 +2175,17 @@ CD lock, releases it, then self-retires (edge 9) and stashes the **CD
 ref** in `PerCore.teardown_pending` — the dead-mark has NOT yet happened.
 The hop finalizes the caller; the park-stack code consumes the slot and
 runs the ENTIRE teardown in scheduler context: **phase 1 (dead-mark,
-under the CD `_gen_lock`) and phase 2** (retire every matching EC —
+under the CD `_gen_lock`) and phase 2** (retire every matching thread —
 quiescent victims inline, owned victims via IPI — `awaitDomainQuiesced`,
 VMAR teardown, handle release, `freeUserAddrSpace`, table blocks, ASID,
-`destroyAlreadyMarked`). Rationale: rev 3 dead-marked in EC context
+`destroyAlreadyMarked`). Rationale: rev 3 dead-marked in thread context
 before the self-retire, so a tick in between could requeue-preempt the
-caller into a `ready` EC of a dead-marked domain — S7-filtered, never
+caller into a `ready` thread of a dead-marked domain — S7-filtered, never
 dispatched, phase 2 never run (class 2 at the exact place the design
 claimed deletion). With the dead-mark moved behind the hop, the caller
 is preemptible-and-resumable right up to its self-retire, after which
 rules 3.1(1)/(3) walk it to the hop; and S7's inline-retire routing
-(§3.2) is defense in depth for any dying-domain EC that still lands
+(§3.2) is defense in depth for any dying-domain thread that still lands
 `ready`. The domain stays live marginally longer; nothing observable
 depends on the dead-mark preceding the caller's park.
 
@@ -2222,7 +2222,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
 - **reply / reply_transfer / delete-E_ABANDONED / E_CLOSED / expiries /
   deadline expiries**: all `lifecycle.wake` under R-claim; 5a or 5b
   per the target's state; T1 governs the interrupt-context rows.
-- **Cross-EC suspend**: `.ready` → 5c + 7; `.idle_wait` → 5a + 7
+- **Cross-thread suspend**: `.ready` → 5c + 7; `.idle_wait` → 5a + 7
   (ending `waiting(port)`); `.running` → directive (§2.5, terminal
   re-check/disarm loop); a target observed in `parking`/`pended` is a
   transient — the suspender re-reads until it settles (L1-bounded) and
@@ -2241,7 +2241,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
   unlinks siblings + deadline node → payload → discharge (5a place /
   5b pend).
 - **deadline table**: one structure replacing both registries; intrusive
-  per-EC node; registration infallible. The tick claims under the table
+  per-thread node; registration infallible. The tick claims under the table
   lock, drops it, then discharges (5a place or 5b pend) — **no decline
   rule, no same-core carve-out** (deleted with the release-wait). Loser
   ticks leave the node; winners unlink (L4).
@@ -2249,7 +2249,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
   one-shot that made X3 critical. Claim + discharge as above; the parked
   acker is placed by its own core's hop; the line unmasks when it runs
   and acks. **G6 (model round), stated rather than implied**: if the
-  not-yet-acked acker is cross-EC suspended (5c) while `ready`, the line
+  not-yet-acked acker is cross-thread suspended (5c) while `ready`, the line
   stays masked until it is resumed and runs; if it is retired, the line
   stays masked until device-region teardown releases it. Both are by
   design — the lifecycle machine never re-arms a line on behalf of a
@@ -2286,7 +2286,7 @@ no fallible arm follows a visible mint.
 
 `kernel/sched/lifecycle.zig` exports `publish`, `dispatchCommit`, `park`,
 `hopComplete`, `claim`, `pend`, `place`, `retire`, `finalize`,
-`postDirective` — sole writer of `ec.state` (pinned asm excepted); a
+`postDirective` — sole writer of `thread.state` (pinned asm excepted); a
 comptime table mirrors §5.
 
 ### 9.2 Debug-build assertions
@@ -2296,13 +2296,13 @@ comptime table mirrors §5.
   the requeue claim site asserts the gate; pin-class lock sites bump and
   check `pin_depth` (lockdep integration); retire and finalize assert
   non-interrupt context; retire-from-`pended` asserts `payload_done`
-  before its CAS; **every EC-context spin entry (W3/W4/W5) asserts
+  before its CAS; **every thread-context spin entry (W3/W4/W5) asserts
   `pin_depth == 0`** (T3 rule (b), N1 — W5's deadlock-freedom is
   conditional on it); finalize asserts its container unwind completed
   before the release body runs (N4); **every §3.2 publish asserts
   CAS-before-links within its section, and its failure arm links
   nothing** (M1).
-- **EC-context IRQ state (round-9 C-4, §3.3)**: every EC-context spin
+- **thread-context IRQ state (round-9 C-4, §3.3)**: every thread-context spin
   entry (W3/W4/W5) asserts **IRQs ENABLED** as well as
   `pin_depth == 0` — the two together are what "preemptible" means, and
   rev 9 asserted only the second half. Every §3.2 publish and every
@@ -2318,7 +2318,7 @@ comptime table mirrors §5.
   `pin_depth -= 1; unlock();` orders. Lockdep carries the same check
   dynamically. Every claim site asserts the bump executed **inside** the
   reaching-lock section (same section as the CAS). Companion invariant,
-  machine-checked: no `ready` or requeue-`parking` EC holds a pin-class
+  machine-checked: no `ready` or requeue-`parking` thread holds a pin-class
   lock.
 - **Entry-check precedence (round 7 M-5, §3.1 rule 3)**: the requeue
   claim site asserts that it is not reached from a user-mode entry with
@@ -2329,7 +2329,7 @@ comptime table mirrors §5.
 
 ### 9.3 Static analysis (the existing grain)
 
-1. **Writer-set pinning**: stores to `ec.state`/`PerCore.current` =
+1. **Writer-set pinning**: stores to `thread.state`/`PerCore.current` =
    {lifecycle fns} ∪ {listed asm}; symbol-anchored (SAS-style).
 2. **Sequence certification**: publish→hop and claim→discharge contain
    no unbounded loops and no remote waits (the release-wait no longer
@@ -2341,7 +2341,7 @@ comptime table mirrors §5.
    arch-neutral ID reachable from both arch entry sets; fused sites are
    x64-only until an aarch64 FP exists.
 4. **Container-lock coupling**: R-claim and link/unlink callers hold the
-   matching class; lockdep dynamic backstop; the EcGen → CoreLock edge
+   matching class; lockdep dynamic backstop; the ThreadGen → CoreLock edge
    registered (§3.5).
 5. **Bare-pointer invariant**: unchanged.
 6. **Closure-table maintenance** (round 3; STATUS round 6 M2: entirely
@@ -2357,11 +2357,11 @@ comptime table mirrors §5.
    recall-closed tables held all three criticals), but the CI checks
    themselves are unimplemented.
 7. **Pin-class computation** (round 4 F3; STATUS round 6 M2: partially
-   real — `check_ec_closure` Rule B computes the dichotomy's input but
+   real — `check_thread_closure` Rule B computes the dichotomy's input but
    is report-only and not in precommit, with the §2.5 blind spots;
    `check_gen_lock` check 6 gates only the mask-everywhere arm): the
    analyzer derives the pin-class lock set — every class with a
-   EC-context acquire site **in which a tick can land** (the
+   thread-context acquire site **in which a tick can land** (the
    EFFECTIVE-MASK reading, normative per §2.4 — NOT the syntactic "is the
    call `lockIrqSave`?" test, which is what revision 14 applied and got
    wrong) — from the same scan as the
@@ -2369,11 +2369,11 @@ comptime table mirrors §5.
    `pin_depth` bump (or converted to an IRQ-saving acquire).
    **Revision 11 adds the third-clause check (round-10 C-A): a class
    with ANY interrupt-context acquire site may not be pin-counted —
-   it must mask at every EC-context site.** Deriving that requires an
+   it must mask at every thread-context site.** Deriving that requires an
    IF-state model in `asm_analyzer.zig` (both known hazard sites are raw
    asm and invisible to a Zig-level scan) and `trap_sync` promoted or
    fault entry masked, so exception-context acquires are distinguishable
-   from EC-context ones. Neither exists today; this is FUTURE work of
+   from thread-context ones. Neither exists today; this is FUTURE work of
    the same class as 9.3(6), and §2.4's third clause is meanwhile
    enforced by review. Any class
    list written in this document is
@@ -2386,7 +2386,7 @@ C-A).** Both fused shapes take locks that are IRQ-reachable — the
 suspend FP spins on `port.timed_recv_lock` (`interrupts.zig:1379-1385`),
 which `expireTimedRecvWaiters` takes from the tick, and the reply FP
 takes `core_locks[i]`, which `enqueueOnCore` takes from IRQ. Under
-§3.3's EC-context-IRQ-enabled rule these are self-deadlockable unless
+§3.3's thread-context-IRQ-enabled rule these are self-deadlockable unless
 the fast path masks across them. The reply path already does
 (`:2247`); **the suspend path does not, and must**.
 
@@ -2394,7 +2394,7 @@ Cost, stated: an added `cli`/`sti` pair on the suspend fast path — the
 one path whose entire justification is cycle count — plus the same
 window on aarch64. That is a real regression against the measured 485
 placements/boot, and it is the honest price of §3.3. The alternative is
-to make both classes mask at every EC-context site (§2.4's third clause
+to make both classes mask at every thread-context site (§2.4's third clause
 applied to them), which costs the same masking without the asm carrying
 it explicitly. Either way the cost is paid; **§11.11** is where it gets decided.
 
@@ -2415,7 +2415,7 @@ trace builds must hoist hooks or disable the FP — the `:1441`/`:2585`
 violations are real); mid-asm rsp retarget remains the fallback.
 
 **Measured accounting** (round 6, reverted Phase-3 instrumentation; bead
-`stygia-qde`): x86 showed exactly 485 EC placements per boot performed by
+`stygia-qde`): x86 showed exactly 485 thread placements per boot performed by
 no Zig site, zero on aarch64 (which has no FP), arithmetic closing
 exactly — that is this section's inventory executing in asm, and the
 count closing is the expected signature of fused edges preserving every
@@ -2433,7 +2433,7 @@ ideal composition is exactly this section's decision list plus
 - **The wake-claim CAS** — the only arbitration mechanism, everywhere.
 - **Translation quiescence** (`active_root` + barrier + lock-sweep).
 - **Slab gen parity + bytes-intact-until-finalize** + R-claim closure.
-- **EC-resident wait storage** (nodes, staging, deadline node).
+- **thread-resident wait storage** (nodes, staging, deadline node).
 - **The park-kstack hop**, its degenerate form, release-before-commit.
 - **The locked park decision** and the parked-core heartbeat.
 - **The spin inventory is §3.6 (T3), normatively closed**: W1 locks, W2
@@ -2530,28 +2530,28 @@ ideal composition is exactly this section's decision list plus
    > the Description, not only in Errors, because it changes how the
    > syscall must be CALLED):
    >
-   > When `[1]` is **not** the calling execution context and names a
-   > *running* execution context, the call reserves the calling
-   > execution context for its duration: while it is in flight the
+   > When `[1]` is **not** the calling thread and names a
+   > *running* thread, the call reserves the calling
+   > thread for its duration: while it is in flight the
    > caller cannot itself be suspended, and it cannot suspend a target
    > that is itself performing such a `suspend`. **Concurrent `suspend`
    > calls therefore contend, and E_BUSY is an expected outcome whenever
    > two suspensions overlap in time — not a rare or pathological one,
    > and not limited to the case where the two calls name each other.
    > BOTH of two racing calls may return E_BUSY.** A caller that issues
-   > `suspend` from more than one execution context must retry, **and
+   > `suspend` from more than one thread must retry, **and
    > must not retry in a tight loop**: two callers retrying in lockstep
    > can fail each other indefinitely, so a retry must introduce delay
    > or ordering (backoff, or a caller-side lock) rather than spin.
    >
    > Self-suspend is unaffected: `[1]` referencing the calling execution
    > context is delivered directly and reserves nothing (see above —
-   > "the syscall returns after the calling EC is resumed").
+   > "the syscall returns after the calling thread is resumed").
    >
    > **Proposed addition to §[suspend] → Errors:**
    >
    > **E_BUSY** — `[1]` is itself performing an in-flight `suspend` of
-   > another execution context, or the calling execution context is
+   > another thread, or the calling thread is
    > itself the target of an in-flight `suspend`. See Description: this
    > is an expected outcome of concurrent `suspend` calls. The
    > restriction is what makes a cycle of mutually-suspending execution
@@ -2569,7 +2569,7 @@ ideal composition is exactly this section's decision list plus
    >
    > **Proposed addition to §[suspend] → Tests:**
    >
-   > [test 13] when two execution contexts each hold a `susp` handle to
+   > [test 13] when two threads each hold a `susp` handle to
    > the other and each issues `suspend` targeting the other, the two
    > calls never both return success. Any other outcome is a pass:
    > one succeeds and one returns E_BUSY; **both return E_BUSY**; or the
@@ -2596,8 +2596,8 @@ ideal composition is exactly this section's decision list plus
    **What is NOT deterministically testable from userspace, and why
    that is acceptable.** The mechanism rejects three cases (§2.5.1):
    the symmetric one, a target that is itself mid-suspend of a third
-   EC, and a caller that is itself someone's target. Only the first has
-   a clean userspace setup. The other two require holding an EC *inside*
+   thread, and a caller that is itself someone's target. Only the first has
+   a clean userspace setup. The other two require holding an thread *inside*
    a `suspend` call at a chosen instant, and the machine deliberately
    makes that window short — a running target consumes its directive
    within one unpinned tick (§3.1 rule 3). So the division of labour is:
@@ -2623,29 +2623,29 @@ ideal composition is exactly this section's decision list plus
    DECIDED IN REVISION 16 — see the resolution at the end of this item;
    the analysis below is kept because it is what the follow-on will use.**
    `grep -ni restart systems.md` returned **zero** before revision 10.
-   `specv3.md` §[restart_semantics] is normative and per-EC — when a
+   `specv3.md` §[restart_semantics] is normative and per-thread — when a
    domain holding `restart` on its self-handle exits (voluntary, fault
-   or kill), each EC handle is processed by its `restart_policy`:
+   or kill), each thread handle is processed by its `restart_policy`:
    **0 = kill / 1 = restart_at_entry / 2 = persist**.
 
    - `kill` is edge 9 and is covered.
-   - **`restart_at_entry` has NO edge.** An EC in *any* state must be
+   - **`restart_at_entry` has NO edge.** An thread in *any* state must be
      forced runnable with its saved frame reset to its original entry
-     point. That is not edge 6 (placement of a claimed EC preserves its
+     point. That is not edge 6 (placement of a claimed thread preserves its
      frame), not edge 7, and not a claim-move. The closest existing
      thing is edge 1, which establishes an entry frame — but only on a
-     fresh slab slot. Sketch of what it needs: claim the EC by its
+     fresh slab slot. Sketch of what it needs: claim the thread by its
      state's normal route (5a from `waiting` with the episode's
      containers unwound, 5c from `ready`, the directive shape from
      `running`), reset the frame under that claim, then place via
      edge 6. The claim/reset/place skeleton exists; the **frame reset
      under a won claim** is the genuinely new step, and it needs a T2
      row of its own because a restart racing a retire must lose.
-   - **`persist` is the harder half**: it keeps an EC *running* while
+   - **`persist` is the harder half**: it keeps an thread *running* while
      its domain's VMARs are freed and its handle table rewritten.
      Neither §8.2 nor §8.5 addresses an address-space change under a
-     live EC, and it interacts directly with `active_root` and
-     translation quiescence (§10, W6) — a running EC on a root that is
+     live thread, and it interacts directly with `active_root` and
+     translation quiescence (§10, W6) — a running thread on a root that is
      being rewritten is exactly what `awaitDomainQuiesced` exists to
      prevent, so `persist` either needs the barrier or needs to state
      why it is exempt.
@@ -2653,7 +2653,7 @@ ideal composition is exactly this section's decision list plus
    ~~**Recommendation: do NOT scope it out.**~~ **RESOLVED IN REVISION 16
    — the maintainer scoped `restart_at_entry` OUT, and the recommendation
    above is superseded.** The argument for keeping it in was that the
-   machine "claims to be sufficient for the syscall API's EC state
+   machine "claims to be sufficient for the syscall API's thread state
    changes", and that claim is about state changes the API can actually
    cause. It cannot cause this one: the kernel implements only the policy
    PLUMBING (`caps/capability.zig:346`/`:581`/`:591`/`:604` —
@@ -2685,8 +2685,8 @@ ideal composition is exactly this section's decision list plus
    > - **Unhandled faults**: the kernel initiates domain teardown
    >   **from exception context**, i.e. a
    >   DIFFERENT ACTOR than T2's terminator, and T2 names actors.
-   > - **`delete` of an EC handle** is mapped to edge 9 here, while the
-   >   spec says ECs are not destroyed by handle drops.
+   > - **`delete` of an thread handle** is mapped to edge 9 here, while the
+   >   spec says Threads are not destroyed by handle drops.
    >
    > The correct standing statement: **the section walk is a better
    > derivation than the syscall walk and is still not closed.** Treat
@@ -2700,7 +2700,7 @@ ideal composition is exactly this section's decision list plus
     nesting under a named group plus lockdep's dynamic cycle detection,
     and §8.1's repair uses drop-and-retry so it never holds two classes
     at once. Nothing is blocked. The one real item that came out of this
-    is a **one-line tree defect**: `EC_NESTED_GROUP` is named in a
+    is a **one-line tree defect**: `THREAD_NESTED_GROUP` is named in a
     comment and defined nowhere (bead `stygia-d0q`).
 
 11. **The C-A masking cost, and the analyzer inversion's real price
@@ -2714,7 +2714,7 @@ ideal composition is exactly this section's decision list plus
     `port.timed_recv_lock` unmasked; the reply path already `cli`s.
     Either the suspend path gains a `cli`/`sti` pair — on the one path
     whose entire justification is cycle count — or both classes mask at
-    every EC-context site. The cost is paid either way.
+    every thread-context site. The cost is paid either way.
 
     **(b) The (c)/(c2) inversion does NOT catch the hazard, and revision
     11 implied it would (M-1).** Both hazard sites are ALREADY
@@ -2753,12 +2753,12 @@ ideal composition is exactly this section's decision list plus
    there, and there is no affinity check on `t` at all — the four
    `affinity` mentions nearby (`:852-863`) are the CALLER's own
    `cur.affinity` local-allowed test, a different rule about a different
-   EC. §13's own M-4 entry has said "the mask check is new; the tree
+   thread. §13's own M-4 entry has said "the mask check is new; the tree
    lacks it" since revision 8, so this sentence contradicted the
    changelog. It also had **no §12 step**, which is now fixed at step 4.
    The model encodes and which keeps edge 2 inside a single `core_locks[core]`
-   section. §[yield]'s Description says "that EC is scheduled next",
-   and a `ready` EC on another core's queue is runnable, so local-only
+   section. §[yield]'s Description says "that thread is scheduled next",
+   and a `ready` thread on another core's queue is runnable, so local-only
    under-delivers that sentence; §[yield] [test 03] (the target's
    observable side effect is visible before the caller's next syscall
    returns) IS satisfied, because the target's own core dispatches it.
@@ -2769,14 +2769,14 @@ ideal composition is exactly this section's decision list plus
    direction.
 
     **What the tree does.** The final step of dispatch flushes staged
-    event state into the resumed EC's USER memory, after the address-space
+    event state into the resumed thread's USER memory, after the address-space
     swap and before the return to user mode, with SMAP/PAN cleared for the
     access:
 
     - `arch/x64/interrupts.zig:3003` (`switchTo`) —
-      `writeUserSyscallWord(ec.ctx, ec.pending_event_word)` into
+      `writeUserSyscallWord(thread.ctx, thread.pending_event_word)` into
       `[user_rsp + 0]`, then `writeUserVreg14` into `[user_rsp + 8]`.
-    - `arch/aarch64/cpu.zig:555` (`loadEcContextAndReturn`) — the same
+    - `arch/aarch64/cpu.zig:555` (`loadThreadContextAndReturn`) — the same
       `writeUserSyscallWord` into `[sp_el0 + 0]`; aarch64's vreg 14 is
       GPR-backed at x13 so only the first write leaves the kernel stack.
 
@@ -2808,7 +2808,7 @@ second names what is deliberately NOT here.
 
 **PRECONDITION OF STEPS 1 AND 9 — not the implementer's call.** Both
 steps promote an analyzer into gating CI. `tests/precommit.sh:563-564`
-says in as many words that gating the `[0d]` EC-closure stage is **a
+says in as many words that gating the `[0d]` thread-closure stage is **a
 pending maintainer decision** and must not be promoted without one. So a
 triage pass over that stage's current findings plus **maintainer sign-off
 on promotion** is a precondition of step 1, and again of step 9 for
@@ -2820,9 +2820,9 @@ on promotion** is a precondition of step 1, and again of step 9 for
    replaced that with a hand-written bead enumeration, and the
    enumeration was both incomplete and self-contradictory (round-14
    sufficiency B-3). What goes at step 1 is exactly **§0.1's own test**:
-   an instrument that reports EC-lifecycle or scheduler state. That is
-   `leak_tag` (`sched/execution_context.zig:341`, writers `:779`/`:919`/
-   `:2100`) and the EC-state diagnostic writers. Everything whose subject
+   an instrument that reports thread-lifecycle or scheduler state. That is
+   `leak_tag` (`sched/thread.zig:341`, writers `:779`/`:919`/
+   `:2100`) and the thread-state diagnostic writers. Everything whose subject
    is memory or handle tables stays, because §0.1's test excludes
    it — but **do not take that list from this paragraph**; derive it:
    `grep -rn 'stygia-2u0\|stygia-afo\|stygia-9zr' kernel --include='*.zig'`.
@@ -2839,10 +2839,10 @@ on promotion** is a precondition of step 1, and again of step 9 for
 
    | census reads | at | step that moves it |
    |---|---|---|
-   | `ec.on_cpu` | `:239`, `:251` | **step 5** (reap side; see 4a) |
-   | `ec.suspend_port` | `:240` | step 3 (folds into `ec.wait.port`) |
-   | `ec.pending_reply_holder` | `:256` | step 3 (`ec.wait.reply_holder`) |
-   | `ec.leak_tag` | `:253` | step 1 (above) |
+   | `thread.on_cpu` | `:239`, `:251` | **step 5** (reap side; see 4a) |
+   | `thread.suspend_port` | `:240` | step 3 (folds into `thread.wait.port`) |
+   | `thread.pending_reply_holder` | `:256` | step 3 (`thread.wait.reply_holder`) |
+   | `thread.leak_tag` | `:253` | step 1 (above) |
 
    **So: every step that deletes or renames a field the census reads
    updates the census IN THE SAME STEP.** The counters themselves retire
@@ -2867,7 +2867,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    depends on — are `p2_enter`/`p2_after_reap`/`p2_walk_done`/`p2_residue`
    (`caps/capability_domain.zig:1314-1339`), `in_phase2` +
    `noteFrameAbandoned` (`:1343-1366`), and
-   `slow_post_*`/`inline_finalize_*` (`sched/execution_context.zig:105-143`).
+   `slow_post_*`/`inline_finalize_*` (`sched/thread.zig:105-143`).
    Those, plus a census kept honest by the port obligation above, are
    what make 4b's constraint checkable; they retire at step 6.
 2. **Retire fusion** (+ the §5.2 matrix as the routing table; the
@@ -2881,7 +2881,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    release/acquire pairing and W4/L5's terminator wait with a writer that
    never fires. The N=100 pass therefore exercises **only the eager arm**;
    it does not validate the split.
-3. **Claimed/pended hand-offs.** Introduce **`ec.wait`, the §2.2 wait
+3. **Claimed/pended hand-offs.** Introduce **`thread.wait`, the §2.2 wait
    descriptor, by name** — this is the machine's second-largest new
    construct and revisions up to 15 introduced it only by implication,
    via `payload_done` — together with `claimed`, `pended`, R-claim,
@@ -2890,8 +2890,8 @@ on promotion** is a precondition of step 1, and again of step 9 for
    **The descriptor FOLD lands here too, and it is fast-path asm work,
    not a struct rename**: `suspend_port` (34 refs / 5 files, **15 of them
    in `arch/x64/interrupts.zig`**) and `pending_reply_holder`/`_domain`/
-   `_slot` (**48** refs / 5 files — 21 is `pending_reply_holder` alone) become `ec.wait.{port, reply_holder}`.
-   They are written by hand through `@offsetOf(ExecutionContext, …)` at
+   `_slot` (**48** refs / 5 files — 21 is `pending_reply_holder` alone) become `thread.wait.{port, reply_holder}`.
+   They are written by hand through `@offsetOf(Thread, …)` at
    `arch/x64/interrupts.zig:1267-1271`, `:1330-1332`, `:1408`,
    `:2120-2123`, `:2560-2565`, behind a layout-drift `@compileError` at
    `:319`, so nesting them one struct deeper re-derives every one of
@@ -2906,7 +2906,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    at `:289`, `:336`, and the inline `removeTimedRecvWaiter` at
    `:1378-1402` — an `xchgl` spin on `timed_recv_lock` plus a linear scan
    comptime-bounded by `MAX_TIMED_RECV_WAITERS`). §8.4's single intrusive
-   per-EC node deletes both the array the asm indexes and the bound it
+   per-thread node deletes both the array the asm indexes and the bound it
    formats. **`timed_recv_waiters` therefore moves to step 8**, with the
    rest of the fast-path asm — which also keeps step 8's own back-
    constraint true: the `xchgl` spin step 8 says must be masked no later
@@ -2934,7 +2934,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    **three** of §2.3/§2.6's four named PerCore companions
    (`post_park_clear_on_cpu`, `pending_kstack_release`,
    `pending_cross_enqueue`) plus their stash/consume machinery, the
-   scattered `clearCurrentEc` sites, and the disowned-current escapes.
+   scattered `clearCurrentThread` sites, and the disowned-current escapes.
 
    **`on_cpu` DOES NOT go here, and neither does the fourth companion.
    Scheduling both correctly is what stops 4a from shipping a
@@ -2948,7 +2948,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    - **Reap side — LIVE UNTIL STEP 5**, because it gates
      `pending_zombie[64]`, and the tree states the consequence in as many
      words at `arch/x64/interrupts.zig:2892-2898`: *"reaping an `on_cpu`
-     EC unmaps the kstack mapped via TSS.RSP0 and triple-faults the next
+     thread unmaps the kstack mapped via TSS.RSP0 and triple-faults the next
      ring transition."* The gate sites are `sched/scheduler.zig:2016-2018`
      and `:2078` and `:552`, `arch/x64/interrupts.zig:2899`,
      `arch/aarch64/cpu.zig:468`.
@@ -2975,11 +2975,11 @@ on promotion** is a precondition of step 1, and again of step 9 for
    run", which is the mask and nothing else; and `destroyPhase2`
    carries an in-tree measurement of what happens when that assumption
    breaks — **1354 of 6228 phase-2 destroys (22%) never reached the end
-   of the caller-EC reap, orphaning 192 ECs by pass ~14**. **That
+   of the caller-thread reap, orphaning 192 Threads by pass ~14**. **That
    measurement is HISTORICAL: it is already closed at HEAD** by the
    two-stage `stygia-afo` fix (`caps/capability_domain.zig:1420-1436`
    records `p2_enter == p2_after_reap` over 10428 destroys;
-   `sched/execution_context.zig:2210-2216` closed the walk). It is
+   `sched/thread.zig:2210-2216` closed the walk). It is
    retained because it is the evidence for the ordering, not because the
    defect is live.
    **(4b) the ad-hoc enable must go before the enable arrives.**
@@ -2987,11 +2987,11 @@ on promotion** is a precondition of step 1, and again of step 9 for
    no-op**: the "temporary explicit mask over `destroyPhase2`" it
    proposed already exists at `caps/capability_domain.zig:1381-1382`, and
    thirteen lines later `:1394` states why that mask is not sufficient on
-   its own. The real hole is `destroyExecutionContextLocked` re-enabling
+   its own. The real hole is `destroyThreadLocked` re-enabling
    interrupts around its `postZombie` fallback at
-   `sched/execution_context.zig:2224-2225`. **So 4b IS a deliverable, not
+   `sched/thread.zig:2224-2225`. **So 4b IS a deliverable, not
    a choice between escape hatches: the ad-hoc `enableInterrupts()` at
-   `execution_context.zig:2225` and the `pending_zombie` cross-core
+   `thread.zig:2225` and the `pending_zombie` cross-core
    fallback it guards are HOISTED OUT OF STEP 5 INTO 4b.** They are
    listed in step 5's Deletes clause as their design home; their landing
    order is here, before 4c, and step 5 notes them as already gone. (The
@@ -3016,7 +3016,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    with §3.1 rule 3's precedence.**
    **ADDS the arch entry-path
    IRQ enable (§3.3, round-9 C-4) — in THIS step, not a later one:** the
-   pin gate is a filter on preemption, and shipping it while EC context
+   pin gate is a filter on preemption, and shipping it while thread context
    still runs IRQ-masked ships a gate with nothing to gate, silently
    voiding rule 1, the C1 ordering rule, T2's ready×K cell and all three
    preemptible-spin columns. Requeue via `parking(requeue)` gated on
@@ -3042,7 +3042,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    not implement.** §3.4 requires it cleared under the same lock **on
    every exit from `ready`**. At HEAD it is cleared at
    `sched/scheduler.zig:914`, `:1434`, `:1691`, `:1705` and
-   `sched/execution_context.zig:1876` — and `:1691`/`:1705` are
+   `sched/thread.zig:1876` — and `:1691`/`:1705` are
    **reader-side self-repair inside the search fallback**, not exits from
    `ready`. Revision 14 gave the field a §3.4 row and no step landed it;
    this is that step for the Zig sites. (Its x64-asm half goes with step
@@ -3052,11 +3052,11 @@ on promotion** is a precondition of step 1, and again of step 9 for
    Deletes (all of 4a's, restated as the step's net effect): THREE of the
    four PerCore companions (`post_park_clear_on_cpu`,
    `pending_kstack_release`, `pending_cross_enqueue`) and their
-   stash/consume machinery, scattered `clearCurrentEc` sites,
+   stash/consume machinery, scattered `clearCurrentThread` sites,
    disowned-current escapes. **NOT `on_cpu` and NOT `pending_zombie[64]`
    — both at step 5, see 4a.**
-5. **State-word retire handoff + directive.** Introduces **`ec.directive_state`
-   and `ec.directive_port` by name** (§2.5, §3.4) — revision 16 shipped this
+5. **State-word retire handoff + directive.** Introduces **`thread.directive_state`
+   and `thread.directive_port` by name** (§2.5, §3.4) — revision 16 shipped this
    step saying only "the directive", and the closure check flags a field
    named in a §3.4 row and in no step (round-14 N-8). — **this step also lands
    §2.5's ARM OWNERSHIP (`{ state: u8, owner_slot: u24 }`) and the
@@ -3086,7 +3086,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    `ZOMBIE_WAKE_RETRY_SPINS`, the last **ad-hoc** `enableInterrupts()`
    outside `arch/` (the one inside a must-complete sequence — NOT the
    entry-path enable step 4 adds, §3.3; exactly one site,
-   `sched/execution_context.zig:2225`, which correctly excludes the
+   `sched/thread.zig:2225`, which correctly excludes the
    aarch64 EL0 `wfi` trap's enable noted at `sched/scheduler.zig:1264`),
    `last_dispatched_core` (→ `owner_core`), today's
    remote-suspend state flip.
@@ -3097,9 +3097,9 @@ on promotion** is a precondition of step 1, and again of step 9 for
    drain/post/claim functions. See step 4b for why the order is forced.
    **And one thing `pending_zombie` is currently the ONLY mechanism for,
    which must route somewhere before it goes**: deferring the CALLER
-   EC's finalize off its own kstack during phase 2.
-   `caps/capability_domain.zig:1497-1503` reaps the caller EC while the
-   frame is standing on that EC's stack, and `claimOwnZombieInline`
+   thread's finalize off its own kstack during phase 2.
+   `caps/capability_domain.zig:1497-1503` reaps the caller thread while the
+   frame is standing on that thread's stack, and `claimOwnZombieInline`
    (`sched/scheduler.zig:2055-2079`) exists solely for that
    configuration. After this step the finalize routes to the frame's own
    later hop, which works — but §5.2's matrix has no cell for **a frame
@@ -3111,9 +3111,9 @@ on promotion** is a precondition of step 1, and again of step 9 for
    self-produced/self-consumed request that carries the self-delete
    teardown and its pre-teardown CD ref across the hop). §2.6 lists it
    among the words the machine ADDS as "the honest price", and no step
-   named it before revision 16 — the same closure gap `committed_ec` had.
+   named it before revision 16 — the same closure gap `committed_thread` had.
    Deletes the phase-2 IRQ-mask fragility, `keep_ref`, the
-   EC-context dead-mark window, and — now that the structural fix is in —
+   thread-context dead-mark window, and — now that the structural fix is in —
    the `stygia-afo` counters step 1 held back.
 7. **Publish-last creation with the CD-locked liveness gate.**
 8. **Fast-path conformance** (core lock; in-lock CAS publish;
@@ -3130,13 +3130,13 @@ on promotion** is a precondition of step 1, and again of step 9 for
    any of them with a single-core self-deadlock live is exactly the
    class of error step 4's internal ordering was rewritten to prevent.
    **This step also lands `timed_recv_waiters`' unification into §8.4's
-   single intrusive per-EC node** — deferred here from step 3 because it
+   single intrusive per-thread node** — deferred here from step 3 because it
    is an asm rewrite, not a re-offset: `SyscallScratch`'s
    `timed_recv_waiters_ptr`/`timed_recv_lock_ptr` and their
    `@compileError` drift guards (`arch/x64/interrupts.zig:201`, `:260`,
    `:289`, `:336`) and the inline `removeTimedRecvWaiter` scan at
    `:1378-1402` all go, the scan becoming an intrusive-node unlink.
-   **Deletes: `committed_ec`** (17 refs / 3 files; decl
+   **Deletes: `committed_thread`** (17 refs / 3 files; decl
    `sched/scheduler.zig:180`, writes `:916`/`:1517`/`:1525`, clears
    `:1289`, `arch/aarch64/cpu.zig:541`, `arch/x64/interrupts.zig:2961`,
    readers `scheduler.zig:1838` `awaitDomainQuiesced` and `:2067`
@@ -3144,7 +3144,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    which redundancy is met literally, and no step named it until now.
    §2.3 halves the deletion — the slow path goes at step 4's "`current`
    written only at commit/hop", the fast path here — so the field can
-   only actually go at this step. A surviving `committed_ec` is
+   only actually go at this step. A surviving `committed_thread` is
    conservative (the barrier waits longer), which is why this is the last
    step rather than an earlier one, but leaving it in falsifies §0.1's
    stated deliverable.
@@ -3194,7 +3194,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
     writer and the reach-and-validate protocol; the `ready` in-lock
     relink and the `waiting` all-container re-bucket replace today's
     bare field stores. Deletes the silently-deferred-re-bucket defect
-    (a queued EC keeping its old key until it naturally re-enqueues —
+    (a queued thread keeping its old key until it naturally re-enqueues —
     for a parked futex waiter, never). This step is **spec-visible**:
     §[priority] [test 06] and [test 07] pass only after it lands, and
     they are the only instruments that check it — the TLA+ battery is
@@ -3215,22 +3215,22 @@ against revision 16's own §12 turned up two mechanisms named nowhere.
 `PerCore.teardown_pending` had an unambiguous home and is now at step 6.
 The other was resolved by the maintainer in the other direction:
 
-- **§2.1.1's per-core idle EC — WITHDRAWN, and deliberately given NO
+- **§2.1.1's per-core idle thread — WITHDRAWN, and deliberately given NO
   step.** The section was normative and defined S1's containment answer
-  for an EC that does not exist: `idle_ec` is declared at
+  for an thread that does not exist: `idle_thread` is declared at
   `sched/scheduler.zig:184`, read once unreachably at `:1521`, and
   **never assigned**. Building one to satisfy the paragraph would
   **regress a fixed bug** — `:1098` records that `parkAndAwaitIRQ`
-  replaced the idle EC precisely to kill the cross-core kstack sharing it
+  replaced the idle thread precisely to kill the cross-core kstack sharing it
   caused, where several idle cores held stale `gs:0` into one suspended
-  EC's kstack. So §2.1.1 is withdrawn, its §5.3 T4 container row is
+  thread's kstack. So §2.1.1 is withdrawn, its §5.3 T4 container row is
   deleted, and **S1 is restated where it mattered: a core with an empty
-  run queue holds NO EC — idleness is a fact about a CORE
-  (`PerCore.idle_parked`), not a state of any EC, and raises no
+  run queue holds NO thread — idleness is a fact about a CORE
+  (`PerCore.idle_parked`), not a state of any thread, and raises no
   containment obligation.** The dead field and its stale declaration
   comment are a cleanup, not this machine's business.
 
-**The idle EC and `restart_at_entry` remain outside this migration.** The idle EC was superseded by the current per-core idle path; restart semantics require a separate design pass.
+**The idle thread and `restart_at_entry` remain outside this migration.** The idle thread was superseded by the current per-core idle path; restart semantics require a separate design pass.
 
 Everything else that §§0–9 states normatively has a step above. That
 closure is the property to re-check after any edit to §§0–9.
@@ -3242,9 +3242,9 @@ their author" is information an implementer needs and nothing else in this
 document carries it. Confirmed clean:
 
 - **Step 5's "exactly one ad-hoc `enableInterrupts()` outside `arch/`"** —
-  the site is `sched/execution_context.zig:2225`, and the exclusion of the
+  the site is `sched/thread.zig:2225`, and the exclusion of the
   aarch64 EL0 `wfi` trap's enable is correct.
-- **Step 8's `committed_ec` enumeration** — decl, three writes, three
+- **Step 8's `committed_thread` enumeration** — decl, three writes, three
   clears, two readers; exact, and §2.3's argument that the field can only
   go at step 8 holds.
 - **`current_queue_core`'s five clear sites**, including the finding that
@@ -3263,10 +3263,10 @@ ways. Two are fixable mechanically; the third is not, and pretending
 otherwise is how the check earns trust it has not got.
 
 1. **Multiple spellings — FIXED by deriving the spelling, not typing
-   it.** The idle EC survived a withdrawal in five places because the
+   it.** The idle thread survived a withdrawal in five places because the
    sweep grepped `'idle slot\|idle_slot'`, a spelling set written from
-   memory, while the document also uses `idle-slot` (hyphen), `idle_ec`
-   and `idle EC`. **Take the identifier verbatim from the doc's own code
+   memory, while the document also uses `idle-slot` (hyphen), `idle_thread`
+   and `idle thread`. **Take the identifier verbatim from the doc's own code
    blocks and table cells; never retype it.** For a field, that is the
    §2.3 struct text and the §3.4 row's first column.
 2. **Never enumerated — FIXED by deriving the mechanism LIST from the
@@ -3317,21 +3317,21 @@ standing lesson arriving again.
   survived at §2.1's lifecycle word and containment table, §3.2's
   dispatch sequence, §5's edge-2 trigger and §6.1's S8. Consequences,
   each independent: §6.1's S1 is defined as *"As §2.1's table"*, so S1
-  itself still said a `ready` EC may live in the idle slot; §5.3's T4 had
+  itself still said a `ready` thread may live in the idle slot; §5.3's T4 had
   a hole it calls "a defect by definition", because two rows named a pop
   site whose row was deleted; and S8 named a route into `ready` with no
   edge number, actor or trigger — an un-routed transition inside the
   closure invariant. All five fixed. **Why the closure check missed it is
   the more useful half**: the sweep grepped `'idle slot\|idle_slot'`, a
   spelling set written FROM MEMORY, while the document also uses
-  `idle-slot`, `idle_ec` and `idle EC`. The check reproduced the exact
+  `idle-slot`, `idle_thread` and `idle thread`. The check reproduced the exact
   failure mode it exists to prevent, one level up. §12 now states the
   three ways a name grep fails and what replaces it.
 - **B-2 — §12 step 4a scheduled a TRIPLE-FAULT.** 4a deleted `on_cpu`
   while step 5 kept `pending_zombie[64]`, leaving the zombie column live
   across 4a/4b/4c **with its gate removed** — and the tree states the
   consequence at `arch/x64/interrupts.zig:2892-2898`: *"reaping an
-  `on_cpu` EC unmaps the kstack mapped via TSS.RSP0 and triple-faults the
+  `on_cpu` thread unmaps the kstack mapped via TSS.RSP0 and triple-faults the
   next ring transition."* `on_cpu`'s two consumer families split by step
   (wake side at 3, reap side at 5); the flag and the column are ONE
   mechanism and now die together at step 5. **The miscount that hid it
@@ -3389,26 +3389,26 @@ standing lesson arriving again.
   recalled: every word is either in a numbered step or in the explicit
   exclusion list. It caught `directive_port`, `directive_state` and
   `timed_waiters[64]` (all now named in steps) and flagged
-  `PerCore.active_root`, `PerCore.idle_parked` and `PerCore.current_ec`
+  `PerCore.active_root`, `PerCore.idle_parked` and `PerCore.current_thread`
   as unchanged-or-renamed, which are now stated exclusions.
 
 **Revision 15 (2026-08-02)** — closes round 13's single blocker.
 
 **Revision 14 (2026-08-02)** — closes round 12's blocking set. **The
-boundary is now a TEST, not an enumeration** — *does this affect EC
-lifecycle or scheduler state: where an EC is, what core it is on,
+boundary is now a TEST, not an enumeration** — *does this affect thread
+lifecycle or scheduler state: where an thread is, what core it is on,
 whether it is runnable?* — because an enumeration is exactly what
 drifted: revision 13 wrote one and it contradicted itself eight lines
 apart. Exclusions now name WHICH of two reasons applies: **solved
 elsewhere** (lock ordering, analyzer capability, migration sequencing —
-related to EC lifecycle, but another instrument already handles them and
+related to thread lifecycle, but another instrument already handles them and
 duplicating it here is complexity this machine must not carry) or
-**genuinely does not touch EC state**.
+**genuinely does not touch thread state**.
 
 **Revision 13 (2026-08-02)** — **SCOPE CORRECTION.** The mechanism has
 been stable for six rounds; what churned was the boundary. §0 is new,
-normative, and at the top: the machine owns the EC lifecycle and every
-state change that moves an EC on, off, or between cores, and the
+normative, and at the top: the machine owns the thread lifecycle and every
+state change that moves an thread on, off, or between cores, and the
 deliverable is §6's invariants making §2.6's eight legacy signals
 provably redundant. Everything else is named OUT with a reason so it
 cannot be re-opened as an omission.
@@ -3420,14 +3420,14 @@ cannot be re-opened as an omission.
   ordering is out of scope: the kernel uses **address-ordered
   same-class nesting under a named group**, **no static cross-class
   order** (lockdep detects cycles dynamically from its pair registry,
-  with `EcGen → CoreLock` the one pinned edge retire needs), and
+  with `ThreadGen → CoreLock` the one pinned edge retire needs), and
   **drop-and-retry** for reach-and-validate — compute, lock,
   re-validate, retry — which never holds two classes at once and was
   therefore never blocked. The residual risk is stated honestly:
   dynamic detection is strictly weaker than a proven order and finds a
   cycle only when an execution traverses one. **That is the risk the
   kernel already runs on every lock it has.** One real item survives as
-  a tree defect, not a design question: `EC_NESTED_GROUP` is named in a
+  a tree defect, not a design question: `THREAD_NESTED_GROUP` is named in a
   comment and defined nowhere (bead `stygia-d0q`).
 - **§0.4 + `<<< IMPLEMENTABLE SPEC >>>` markers** delimit what an
   implementer codes against (§2–§8) from what is context (§0, §1, §9's
@@ -3488,7 +3488,7 @@ PARITY DIFF, and it is the diff that would have caught C-1.**
   creation's publish into a recycled slot) — the same row was short in
   round 9 for the same reason.
   **Why the model missed it, which is the finding that matters:** the
-  model kept `dir = "dead"` on freed ECs forever, so a suspender always
+  model kept `dir = "dead"` on freed Threads forever, so a suspender always
   read `dead` → E_TERM — **the model was strictly SAFER than the design
   at exactly the point the design was wrong**, and revision 11's ledger
   entry ("not model-checkable — no port") did not cover it because the
@@ -3555,7 +3555,7 @@ PARITY DIFF, and it is the diff that would have caught C-1.**
   the ARM in the doc and at the CLAIM in the model; separate field
   rather than packed, so the u24 narrowing is unmodelled).
 - **M-9**: a **three-class lock cycle** assembles from three normative
-  edges (`CDGen → EcGen`, `EcGen → CoreLock`, `CoreLock → CDGen`) while
+  edges (`CDGen → ThreadGen`, `ThreadGen → CoreLock`, `CoreLock → CDGen`) while
   §5.3 certifies acyclicity over a class set §3.5 calls MISSING
   ENTIRELY. §8.5, §8.2 and migration step 7 join the blocked list.
 - Minors: §9.2 said "directive cleared" where edge 10 says `→ dead` (an
@@ -3571,7 +3571,7 @@ decision; nothing is scoped out.
   locks self-deadlockable)**: §2.4's dichotomy is a *preemption* rule —
   `pin_depth` stops the tick dispatching away and does nothing to stop
   the interrupt running on this stack and taking the same lock. That
-  distinction did not exist while EC context was ambiently masked; §3.3
+  distinction did not exist while thread context was ambiently masked; §3.3
   created it and revision 10 constrained it nowhere. Verified in the
   tree: `port.timed_recv_lock` is spun on by raw asm on the suspend fast
   path (`interrupts.zig:1379-1385`) with **no `cli` on that path** — the
@@ -3588,7 +3588,7 @@ decision; nothing is scoped out.
   **§2.5's "check 6 must learn the pin-counted arm" is WITHDRAWN** — it
   told the one analyzer that demands a mask to stand down in the very
   revision that created the hazard. Rules (c)/(c2) flip to *forbidding*
-  unmasked EC-context acquires on IRQ-reachable classes, which needs
+  unmasked thread-context acquires on IRQ-reachable classes, which needs
   `trap_sync` promoted (or fault entry masked) and an IF-state model in
   `asm_analyzer.zig`, since both hazard sites are raw asm. Stated as
   real work, not implied.
@@ -3596,7 +3596,7 @@ decision; nothing is scoped out.
   else)**: two things need the entry mask for CORRECTNESS —
   `pending_kstack_release`'s single-producer assert, and `destroyPhase2`,
   whose in-tree measurement records **1354 of 6228 phase-2 destroys
-  (22%) never reaching the end of the caller-EC reap, orphaning 192 ECs
+  (22%) never reaching the end of the caller-thread reap, orphaning 192 Threads
   by pass ~14**, with the structural fix at step 6. Step 4 now has a
   normative internal order: deletions first, then either the teardown
   move is pulled ahead of the enable or step 4 carries a temporary mask
@@ -3630,7 +3630,7 @@ decision; nothing is scoped out.
   and it did not).
 - **M-C**: §11.10's blocker was under-scoped to §8.1. It also governs
   finalize's leading unwind (steps 2–3), retire of a `waiting` target —
-  whose `EcGen → Container` nesting is a **live AB-BA against
+  whose `ThreadGen → Container` nesting is a **live AB-BA against
   `priority`** — and the suspender's disarm re-dispatch.
 - **M-D**: added `ProbeNoTermSuspendCycle`. `t1full`'s LiveTerm PASS was
   billed as machine-checking the W3→W5→W3 cycle and would have been
@@ -3653,7 +3653,7 @@ decision; nothing is scoped out.
 **The first revision that changes NO mechanism**: all five criticals were
 text or apparatus, and the one that looked like a machine change —
 deleting the directive word's `dropped` value — turned out to be doc-only,
-because `dropped` was never modelled. `ECLifecycle.tla` is unchanged, so
+because `dropped` was never modelled. `ThreadLifecycle.tla` is unchanged, so
 no model verdict went stale and the revision-9 battery carries over
 intact. That is a first for this artifact and worth naming: the
 mechanisms have stopped moving, and what was still wrong was what the
@@ -3661,10 +3661,10 @@ document SAID and what its tooling actually RAN.
 
 - **C-1 (`dropped` had no clearing rule; fixed by DELETION)**: rev 9's
   fourth directive terminal was modelled on `dead`, but `dead` is written
-  by finalize on an EC being freed, so "never cleared" is correct there
-  and was inherited without its justification. On a live EC one
+  by finalize on an thread being freed, so "never cleared" is correct there
+  and was inherited without its justification. On a live thread one
   stale-port drop left every future suspender's `none → claiming` CAS
-  failing forever — the EC **permanently unsuspendable**, hence
+  failing forever — the thread **permanently unsuspendable**, hence
   permanently undebuggable, by ordinary means (arm, destroy the port,
   let the target reach its boundary). §2.5 now has the owner CAS
   `armed → none` exactly as in the consumed case, with the **suspender
@@ -3689,17 +3689,17 @@ document SAID and what its tooling actually RAN.
 - **C-3 (two concurrent `priority` calls desync the word from the bucket
   key, permanently and silently)**: no cycle, no mutual relationship,
   both callers need only `spri`. A writes 1, B writes 3, both drop the
-  gen lock, B repairs the link to 3, A repairs it to 1 — `ec.priority`
+  gen lock, B repairs the link to 3, A repairs it to 1 — `thread.priority`
   is 3 and the linked key is 1, forever, because `dequeue` never
   re-reads and a parked waiter has no next link; [test 08] reports 3
   while selection uses 1. Round-8 C-2's defect in its concurrent form.
   Fixed with one clause M-2 had already written for the other word: the
-  repaired key is a **fresh read of `ec.priority` taken inside the
+  repaired key is a **fresh read of `thread.priority` taken inside the
   innermost hold**, never the value this call wrote; mirrored for
   `affinity`'s claim-move destination.
-- **C-4 (the IRQ state of EC context was never stated, and §12 removed
+- **C-4 (the IRQ state of thread context was never stated, and §12 removed
   the only place it was established)** — the deepest. Twelve normative
-  arguments need EC-context frames to be tick-preemptible; the doc
+  arguments need thread-context frames to be tick-preemptible; the doc
   stated an IRQ state for scheduler context only, and what it did say
   pointed the other way (§3.3's "no kernel code outside `arch/` enables
   interrupts", §12 step 5 deleting the last enable with no step adding
@@ -3716,9 +3716,9 @@ document SAID and what its tooling actually RAN.
   gate.
 - **C-5 (domain restart absent, and the DERIVATION METHOD is why)**:
   `grep -ni restart` returned zero while §[restart_semantics] is
-  normative and per-EC. `restart_at_entry` has no edge — forcing an EC
+  normative and per-thread. `restart_at_entry` has no edge — forcing an thread
   runnable with its frame reset to the entry point is not edge 6, not 7,
-  not a claim-move — and `persist` keeps an EC running while its
+  not a claim-move — and `persist` keeps an thread running while its
   domain's VMARs are freed, colliding with `active_root`/W6. The
   instructive half is the method: the sufficiency table was derived by
   walking the spec's SYSCALL list, and §[restart_semantics] is not a
@@ -3731,7 +3731,7 @@ document SAID and what its tooling actually RAN.
   dependent on C-4, and is the worked example of why an unstated premise
   is not a certificate; M-3, the header now says C-2 is DEFERRED behind
   §11.10, not closed; M-4, §2.2's writer list goes to **four** (the
-  `priority` re-bucket does write `ec.wait`'s futex nodes); M-7, T2's
+  `priority` re-bucket does write `thread.wait`'s futex nodes); M-7, T2's
   `waiting`×K reason is corrected (§8.3's `.ready` → 5c+7 route reaches
   `waiting` with no park sequence, so the right reason is that every
   route into `waiting` leaves `pin_depth == 0`); M-8/M-9, the
@@ -3753,11 +3753,11 @@ enumeration in this revision now carries an explicit
 - **C-1 (CRITICAL — mutual terminate deadlocks two cores; live in the
   tree, bead `stygia-noi`)**: A and B each hold a `term` handle to the
   other and both are running. A retires B, B retires A, and both enter
-  the W3 eviction wait for the other. A `retired` EC in a kernel frame
+  the W3 eviction wait for the other. A `retired` thread in a kernel frame
   is moved by NOTHING — the requeue CAS fails on `retired` and rule 3's
   entry checks are user-boundary-gated. **TLC reports a plain deadlock
   in 7 states**, not merely an L2/L5 violation. The tree guards
-  `if (ec != caller ...)` (`execution_context.zig:1028`) which covers
+  `if (thread != caller ...)` (`thread.zig:1028`) which covers
   SELF-terminate only; both cores pass it. Revision 8 had no carve-out
   anywhere in W3/L5/T2, so **the tree was safer than the design**.
   Rev 9 adds both exits to §3.6 W3 and §6.2 L5: the self carve-out, and
@@ -3779,10 +3779,10 @@ enumeration in this revision now carries an explicit
   the reason each remaining state is safe is now written per state
   rather than asserted collectively.
 - **C-3 (CRITICAL — §3.5's lock chain is refuted)**: rev 8 asserted
-  `wait-container < EC gen < core locks` as derived fact. The right edge
+  `wait-container < thread gen < core locks` as derived fact. The right edge
   is sound; the LEFT edge is false — `port.zig:463-465` states the
-  tree's canonical order as **EC → Port**, and `futex.wake` traverses
-  the EC/bucket pair in both directions, made safe by an ascending-index
+  tree's canonical order as **thread → Port**, and `futex.wake` traverses
+  the thread/bucket pair in both directions, made safe by an ascending-index
   discipline and a group opt-out rather than by any chain. The CD
   gen-lock class was missing entirely and §8.5 contradicts the chain's
   shape. §3.5 now retracts the claim in place, keeps only the verified
@@ -3809,7 +3809,7 @@ enumeration in this revision now carries an explicit
   suspender forever, clearing it to `none` reports SUCCESS for a
   suspension that never happened. Rev 9 added a `dropped` terminal;
   **revision 10 deletes it again** (round-9 C-1) — see below.
-- Simplicity: the staged destination is deleted from `ec.wait` outright
+- Simplicity: the staged destination is deleted from `thread.wait` outright
   (M-2 removed its only authoritative consumer, leaving a
   cross-core-readable field with no §3.4 row); `mark_state` collapses
   from a tri-state to **one bit**; seven dead `c1*`/`"pair"`-liveness
@@ -3826,7 +3826,7 @@ safety state spaces 39–87%.
   finding this project has produced (N1's deadlock, N6's livelock) is
   the same shape — symmetric suspend. Rather than surviving it by
   assumption, revision 8 makes it unreachable. Two mechanisms are
-  modelled: **(A)** the maintainer's pair-locked check (both EC gen
+  modelled: **(A)** the maintainer's pair-locked check (both thread gen
   locks, lowest slot first, reject if the target is already suspending
   the caller) and **(B)** the recommended self-mark (the suspender CASes
   its OWN word `none → suspending` before claiming the target's; a
@@ -3835,7 +3835,7 @@ safety state spaces 39–87%.
   the alignment premise, and the same rung that took 2min03s under the
   premise takes 13–18s without it. (B) is recommended on two measured
   grounds: (A)'s slot-index order is an AB-BA against the x86-64
-  fast-suspend path's existing role-ordered EC-gen-lock nesting (which
+  fast-suspend path's existing role-ordered thread-gen-lock nesting (which
   additionally claims a lockdep group constant that **does not exist**),
   and (A) is pairwise so it does not close 3-cycles — the model reaches
   one in 14 states, where (B) holds across **6,179,060** (`cr3self`,
@@ -3850,7 +3850,7 @@ safety state spaces 39–87%.
   or discharge — plus the §9.2 bracket asserts. Rev 7's sentence
   ("incremented at claim-win and pin-class acquire") permitted
   `lock(); pin_depth += 1;`, and pin-class locks are by definition
-  *not* IRQ-masked at their EC-context acquire sites, so a tick lands
+  *not* IRQ-masked at their thread-context acquire sites, so a tick lands
   in the gap, reads `pin_depth == 0`, and requeue-preempts a
   slab-lock-holding frame — after which other allocators spin
   IRQ-masked on a lock whose holder sits `ready`, and T2's ready×K row
@@ -3865,24 +3865,24 @@ safety state spaces 39–87%.
   next placement"; §[priority] says the opposite verbatim for a target
   suspended on a port or waiting on a futex, and [test 06]/[test 07]
   test it at *selection*. Since selection is bucket-position-determined
-  (`EcQueue.enqueue` keys at link time, `dequeue` never re-reads;
+  (`ThreadQueue.enqueue` keys at link time, `dequeue` never re-reads;
   futex `WaitNode`s snapshot at park), "next placement" was not late
   but never. §8.1 now mandates re-bucketing every linked wait node
   under its container lock, with the sorted all-buckets discipline for
   multi-bucket futex waits. The doc was the bug; the spec was not
   touched.
 - **M-1 (the "fourth descriptor writer")**: resolved by DELETION, not
-  machinery — `priority`/`affinity` are stable per-EC words, not
-  `ec.wait` fields (a `running` EC has both), so §2.2's writer
+  machinery — `priority`/`affinity` are stable per-thread words, not
+  `thread.wait` fields (a `running` thread has both), so §2.2's writer
   enumeration was already complete. They get §3.4 rows with named
   writers (so 9.3(1)/S2 has something to pin) and one shared
   reach-and-validate protocol with an explicit no-retry rule.
   Writing that protocol surfaced a second, latent gap: rev 7 named only
-  the EcGen → CoreLock pair, which is not enough to say how a
+  the ThreadGen → CoreLock pair, which is not enough to say how a
   ref-reached party reaches a *wait* container — and the obvious
   reading (gen lock, then bucket lock) is an AB-BA against
-  `futex.wake`'s Bucket → EcGen (`futex.zig`, verified). §3.5 now
-  states the full chain **wait-container locks < EC `_gen_lock` < core
+  `futex.wake`'s Bucket → ThreadGen (`futex.zig`, verified). §3.5 now
+  states the full chain **wait-container locks < thread `_gen_lock` < core
   locks**, from which both previously-named edges fall out, plus the
   two consequences it forces: the reach takes container-then-gen for a
   wait container and gen-then-queue for the run queue (not an
@@ -3905,7 +3905,7 @@ safety state spaces 39–87%.
 - **M-5 (the N5 fix existed only as a consequence)**: §3.1 rule 3 and
   §5's edge-3 row now state the precedence as a RULE — on any entry
   from user mode the entry checks run first, so a tick on an unpinned
-  user-mode armed EC consumes rather than requeues — with a §9.2
+  user-mode armed thread consumes rather than requeues — with a §9.2
   assert at the requeue claim site, because an implementer who wires
   the checks into syscall entry only reintroduces N5 with the battery
   still green.
@@ -3939,7 +3939,7 @@ over except where the README schedules re-runs.
 - **M2 (enforcement text was partly fictional)**: §2.5's
   enforcement-honesty paragraph rewritten to verified tree reality —
   what exists (check_gen_lock with repaired IRQ pass and check 6's
-  mask-everywhere arm; check_ec_closure Rule A/Rule B, REPORT-ONLY, not
+  mask-everywhere arm; check_thread_closure Rule A/Rule B, REPORT-ONLY, not
   in precommit) with four named blind spots (no spin-inventory detection
   anywhere; Rule B's GenLock/SlabRef UNRESOLVED; `[unreachable]`
   contexts unproven; `tlbShootdownHandler` unresolved in both tools so
@@ -3952,7 +3952,7 @@ over except where the README schedules re-runs.
   wait container kind, each row confirming lock-held deref +
   claim-CAS-or-skip, every row marked RECALL-derived (the marking is
   the finding; tool derivation is 9.3(6) future work). Reply pin
-  specified as ref-reached (holder-CD lock + EC gen validation;
+  specified as ref-reached (holder-CD lock + thread gen validation;
   dead-gen holder domain ⇒ teardown owns the slot, unwind skips
   idempotently); idle slot given its row; dual membership (timed
   waiter: container + deadline table; futex waiter: multiple buckets)
@@ -4026,9 +4026,9 @@ API — this revision REMOVES a step (below) as well as adding text.
   DELETED; the idempotent container unwind is finalize's first act**
   (§8.2, edge 10, §3.5, §2.1 retired row). One unwinder, owned by
   whoever frees; the wait-free retired arm (F1) is preserved; a
-  `retired` EC may legally remain linked until its finalize (pop-side
+  `retired` thread may legally remain linked until its finalize (pop-side
   `stale` skip covers it). The dual-unwinder alternative was rejected
-  because the second unwinder must read the EC's descriptor to discover
+  because the second unwinder must read the thread's descriptor to discover
   it has nothing to do — against a possibly-zeroed slot.
 - **N1 (W5's deadlock-freedom is conditional on rule (b))**: §2.5's
   mutual-suspend break holds only for UNPINNED spinners; F3's computed
@@ -4084,12 +4084,12 @@ this revision.
   `retired` proceeds without waiting (§4). The `claimed` row needs no
   pre-wait — its discharger learns `retired` from its own failed
   placement CAS (noted in T2).
-- **F2 (S7 inline retire inverted the pinned EcGen → CoreLock order)**:
+- **F2 (S7 inline retire inverted the pinned ThreadGen → CoreLock order)**:
   the dispatcher now CASes `ready → claimed` under the queue lock it
   holds (R-claim-legal), drops the lock, and retires as holder via T2's
   `claimed` row (§3.2, S7, edge 5c).
 - **F3 (pin class wrong in both directions)**: membership is computed,
-  not named — every lock class with a non-IRQ-saving EC-context acquire
+  not named — every lock class with a non-IRQ-saving thread-context acquire
   site is a pin class (analyzer 9.3(7)); `tree_mutex` is out (IRQ-masked
   at every acquire), `SlabAllocator.lock` and the kstack `freelist_lock`
   are in; the normative dichotomy (mask everywhere or pin-count) is what
@@ -4143,11 +4143,11 @@ M-A–M-C, text repairs), and adopts its method finding:
   path exists — one-shot sources in T1 are consumed exactly once, X3).
   The syscall-context release-wait is deleted too — 5b is uniform.
   `device_region.onIrq` is the enumerated T1 row.
-- **M-A (dead-mark in EC context / S7 silent drop)**: the self-delete
+- **M-A (dead-mark in thread context / S7 silent drop)**: the self-delete
   dead-mark moves behind the hop into scheduler context —
   `teardown_pending` now carries the pre-teardown CD ref and the park
   stack runs phase 1 + phase 2 (§8.2); S7 filter failures retire the
-  popped EC inline under the queue lock instead of silently dropping it
+  popped thread inline under the queue lock instead of silently dropping it
   (§3.2, S7).
 - **M-B (indefinitely pending directive)**: decided — the suspender
   re-checks after arming and disarms-with-redispatch/error (§2.5,
@@ -4156,7 +4156,7 @@ M-A–M-C, text repairs), and adopts its method finding:
   lock-free, preemptible, ack-while-spinning, bounded by discharger
   instructions + scheduling (§L5).
 - **Text repairs**: §3.2's false no-cycle certificate replaced by the
-  bounded-work rule + T3's global argument; EcGen → CoreLock pinned for
+  bounded-work rule + T3's global argument; ThreadGen → CoreLock pinned for
   edge 9 (§3.5); the untimed-rendezvous-sender assumption stated (§2.2,
   §8.3); §10's spin inventory is now T3 by reference; retire routing for
   `claimed` no longer reads `owner_core` (invalid there — §2.4, T2).
@@ -4179,4 +4179,4 @@ lock/bound contract (F11 — deleted in rev 4).
 publish-under-lock park sequence; `claimed` holdership + placement CAS +
 R-claim; suspend edges + directive protocol; degenerate hop; recv pop as
 claim; publish-last creation + `teardown_pending`; FP core lock; idle
-slot, boundedness scoping, heartbeat wording, per-EC deadline capacity.
+slot, boundedness scoping, heartbeat wording, per-thread deadline capacity.

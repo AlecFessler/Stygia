@@ -1,25 +1,25 @@
 // Spec §[create_capability_domain] create_capability_domain — test 31.
 //
-// "[test 31] on success, the new domain's initial EC has affinity
+// "[test 31] on success, the new domain's initial thread has affinity
 //  equal to `[5]` (any-core when 0)."
 //
 // Strategy
-//   §[execution_context] field layout: an EC handle's field1 bits 0-63
-//   carry the EC's current 64-bit affinity mask. Per §[capabilities],
+//   §[thread] field layout: an thread handle's field1 bits 0-63
+//   carry the thread's current 64-bit affinity mask. Per §[capabilities],
 //   the field1 snapshot is refreshed from kernel-authoritative state
 //   by an explicit `sync` call (or as a side effect of any syscall
 //   taking the handle).
 //
-//   The kernel mints the new domain's slot-1 initial-EC handle with
+//   The kernel mints the new domain's slot-1 initial-thread handle with
 //   field1 = 0 (zero-init at mint time); a fresh `sync` is required
 //   to read the authoritative current value. This is the spec's
-//   blessed observation channel for the child's initial-EC affinity.
+//   blessed observation channel for the child's initial-thread affinity.
 //
-//   The parent cannot read the child EC's field1 across the domain
+//   The parent cannot read the child thread's field1 across the domain
 //   boundary, so the assertion is made inside the child via its own
-//   SLOT_INITIAL_EC handle (slot 1).
+//   SLOT_INITIAL_THREAD handle (slot 1).
 //
-//   Pattern (mirrors create_execution_context_03):
+//   Pattern (mirrors create_thread_03):
 //     - The runner stages this ELF and passes its page frame at
 //       SLOT_TEST_ELF_PF. The parent path spawns a sub-domain from
 //       the same ELF with `[5] = TARGET_AFFINITY`. Parent and child
@@ -27,9 +27,9 @@
 //       results by tag, so whichever side reports first records the
 //       outcome.
 //     - The child path is selected by reading its own self-handle
-//       `ec_inner_ceiling`: bit 7 cleared marks the child (the
-//       parent constructs the sub-domain with ec_inner_ceiling =
-//       0x7F). The child syncs SLOT_INITIAL_EC and asserts that the
+//       `thread_inner_ceiling`: bit 7 cleared marks the child (the
+//       parent constructs the sub-domain with thread_inner_ceiling =
+//       0x7F). The child syncs SLOT_INITIAL_THREAD and asserts that the
 //       refreshed field1 equals TARGET_AFFINITY. Only the child
 //       reports; the parent returns silently after spawning.
 //
@@ -44,19 +44,19 @@
 //
 // Action
 //   parent path:
-//     1. createCapabilityDomain(... ec_inner_ceiling = 0x7F,
+//     1. createCapabilityDomain(... thread_inner_ceiling = 0x7F,
 //        [5] = TARGET_AFFINITY)                              — must succeed
 //     2. return — child reports
 //   child path:
-//     1. sync(SLOT_INITIAL_EC)                               — must succeed
-//     2. readCap(SLOT_INITIAL_EC).field1 == TARGET_AFFINITY  — the assertion
+//     1. sync(SLOT_INITIAL_THREAD)                               — must succeed
+//     2. readCap(SLOT_INITIAL_THREAD).field1 == TARGET_AFFINITY  — the assertion
 //
 // Assertions
 //   parent path:
 //     1: createCapabilityDomain returned an error word
 //   child path:
-//     2: sync(SLOT_INITIAL_EC) returned non-OK
-//     3: child SLOT_INITIAL_EC's field1 != TARGET_AFFINITY  ← THE SPEC ASSERTION
+//     2: sync(SLOT_INITIAL_THREAD) returned non-OK
+//     3: child SLOT_INITIAL_THREAD's field1 != TARGET_AFFINITY  ← THE SPEC ASSERTION
 
 const lib = @import("lib");
 
@@ -78,28 +78,28 @@ const TARGET_AFFINITY: u64 = 0b0010;
 
 pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
-    const ec_inner_ceiling: u8 = @truncate(self_cap.field0 & 0xFF);
+    const thread_inner_ceiling: u8 = @truncate(self_cap.field0 & 0xFF);
 
-    // bit 7 of ec_inner_ceiling distinguishes the parent (runner-spawned,
+    // bit 7 of thread_inner_ceiling distinguishes the parent (runner-spawned,
     // ceiling = 0xFF) from the child (parent-spawned, ceiling = 0x7F).
-    if ((ec_inner_ceiling & 0x80) == 0) {
+    if ((thread_inner_ceiling & 0x80) == 0) {
         // ── Child path ──────────────────────────────────────────────
-        // The kernel mints SLOT_INITIAL_EC's field1 = 0 at create-time
+        // The kernel mints SLOT_INITIAL_THREAD's field1 = 0 at create-time
         // (see kernel/caps/capability_domain.zig: child_cd.user_table[1]
         // .field1 = 0). The authoritative current affinity must be
         // refreshed via a sync syscall before reading.
-        const sync_result = syscall.sync(caps.SLOT_INITIAL_EC);
+        const sync_result = syscall.sync(caps.SLOT_INITIAL_THREAD);
         if (sync_result.v1 != @intFromEnum(errors.Error.OK)) {
             testing.fail(2);
             return;
         }
 
-        // §[execution_context] field layout: field1 bits 0-63 = current
+        // §[thread] field layout: field1 bits 0-63 = current
         // affinity mask. Per §[create_capability_domain] test 31 the
-        // initial EC's affinity must equal [5] = TARGET_AFFINITY (which
+        // initial thread's affinity must equal [5] = TARGET_AFFINITY (which
         // the parent passed at spawn time below).
-        const ec_cap = caps.readCap(cap_table_base, caps.SLOT_INITIAL_EC);
-        if (ec_cap.field1 != TARGET_AFFINITY) {
+        const thread_cap = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
+        if (thread_cap.field1 != TARGET_AFFINITY) {
             testing.fail(3);
             return;
         }
@@ -110,8 +110,8 @@ pub fn main(cap_table_base: u64) void {
 
     // ── Parent path ─────────────────────────────────────────────────
     // Spawn a sub-domain that re-enters this same ELF with
-    // ec_inner_ceiling = 0x7F (bit 7 cleared). The sub-domain takes
-    // the child branch above, syncs its SLOT_INITIAL_EC, and asserts
+    // thread_inner_ceiling = 0x7F (bit 7 cleared). The sub-domain takes
+    // the child branch above, syncs its SLOT_INITIAL_THREAD, and asserts
     // field1 == TARGET_AFFINITY.
     //
     // Mirror runner/primary.zig's child_self caps so the spawned
@@ -126,7 +126,7 @@ pub fn main(cap_table_base: u64) void {
     };
 
     // §[create_capability_domain] [2] ceilings_inner sub-fields:
-    //   bits  0-7   ec_inner_ceiling   = 0x7F (bit 7 cleared)
+    //   bits  0-7   thread_inner_ceiling   = 0x7F (bit 7 cleared)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
     //   bits 24-31  cridc_ceiling      = 0x27  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)

@@ -1,36 +1,36 @@
-// Spec §[execution_context] terminate — test 07.
+// Spec §[thread] terminate — test 07.
 //
 // "[test 07] on success, reply handles whose suspended sender was the
-//  terminated EC return E_ABANDONED on subsequent operations."
+//  terminated thread return E_ABANDONED on subsequent operations."
 //
 // Strategy
 //   The assertion needs a witness pair:
 //     (a) A reply handle in the caller's table whose recorded suspended
-//         sender is some EC W.
+//         sender is some thread W.
 //     (b) After terminate(W) succeeds, a "subsequent operation" on the
 //         reply handle must return E_ABANDONED rather than its normal
 //         success path.
 //
 //   Producing (a) requires both the suspend side (W queues a suspension
-//   event on a port) and the recv side (the test EC dequeues that event
-//   and is given the reply handle id in the syscall word). The test EC
+//   event on a port) and the recv side (the test thread dequeues that event
+//   and is given the reply handle id in the syscall word). The test thread
 //   itself owns both sides of the pipeline: it mints a port with bind +
 //   recv caps, mints W, then calls `suspend(W, port)`. Per §[suspend],
-//   "[1] may reference the calling EC; the syscall returns after the
-//   calling EC is resumed" — when [1] is *not* the calling EC the call
+//   "[1] may reference the calling thread; the syscall returns after the
+//   calling thread is resumed" — when [1] is *not* the calling thread the call
 //   simply suspends the target without blocking the caller. So the test
-//   EC stays runnable, and W is queued as a suspended sender on the
+//   thread stays runnable, and W is queued as a suspended sender on the
 //   port.
 //
 //   A `recv(port)` then returns immediately (no E_CLOSED, since the
-//   test EC still holds the port handle with its `bind` cap; no E_FULL,
+//   test thread still holds the port handle with its `bind` cap; no E_FULL,
 //   since the test's domain has plenty of free slots). The kernel hands
 //   back the reply handle id in the recv syscall word; that id is the
 //   handle the spec line under test refers to.
 //
 //   `terminate(W)` then destroys W. Per §[terminate]: "Termination also
 //   marks any reply handles whose suspended sender was the terminated
-//   EC such that subsequent operations on those reply handles return
+//   thread such that subsequent operations on those reply handles return
 //   `E_ABANDONED`." With W destroyed, the reply handle is now in the
 //   marked state.
 //
@@ -40,7 +40,7 @@
 //   demands E_ABANDONED.
 //
 //   SPEC AMBIGUITY: §[reply] [test 03] separately asserts that
-//   `reply` returns E_TERM (not E_ABANDONED) when "the suspended EC
+//   `reply` returns E_TERM (not E_ABANDONED) when "the suspended thread
 //   was terminated before reply could deliver". The two spec lines
 //   read in tension: terminate test 07 names E_ABANDONED for any
 //   subsequent operation on the marked reply handle, while reply test
@@ -53,24 +53,24 @@
 //
 // Action
 //   1. create_port(caps={bind, recv})        — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, rp=0})            — must succeed
 //      (entry = dummyEntry; W never executes meaningfully — it is
 //      suspended and then terminated before scheduling matters)
 //   3. suspend(W, port)                      — must return OK
-//      (non-blocking on the test EC since [1] != self; queues W as a
+//      (non-blocking on the test thread since [1] != self; queues W as a
 //      suspended sender on the port)
 //   4. recv(port)                            — must return OK and
 //      yield a reply_handle_id in the syscall word
-//      (the test EC holds the port's bind cap, so no E_CLOSED)
+//      (the test thread holds the port's bind cap, so no E_CLOSED)
 //   5. terminate(W)                          — must return OK
-//      (W's EC handle has the term cap minted in step 2)
+//      (W's thread handle has the term cap minted in step 2)
 //   6. reply(reply_handle_id)                — must return E_ABANDONED
 //      (the spec line under test)
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -104,18 +104,18 @@ pub fn main(cap_table_base: u64) void {
     // = 0 (kill) keeps the call inside the runner-granted ceiling and
     // prevents any restart fallback from re-resurrecting W after the
     // terminate.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target = self), priority in
     // 32-33. priority = 0 stays inside the runner pri ceiling.
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -137,7 +137,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The port has the test EC as a live bind-cap holder
+    // Step 4: recv. The port has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the reply handle id encoded in the syscall word per §[recv].
     const got = syscall.recv(port_handle, 0);

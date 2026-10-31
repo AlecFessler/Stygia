@@ -49,7 +49,7 @@ const is_runner = @hasDecl(app, "RUNNER_STATIC");
 //
 // Per §[create_capability_domain]: "The pointer to the new domain's
 // read-only view of its capability table is passed as the first
-// argument to the initial EC's entry point." On x86-64 SysV that's
+// argument to the initial thread's entry point." On x86-64 SysV that's
 // rdi at entry; on AAPCS64 that's x0 at entry. The kernel ELF loader
 // jumps to e_entry + slide as an ordinary function call after
 // applying R_*_RELATIVE relocs.

@@ -486,7 +486,7 @@ const State = struct {
 /// skipped: the query requires at least one `string_literal`.
 ///
 /// `++`-joined literals are rendered with `…` between the parts, matching
-/// tools/check_ec_closure. That merges every instantiation of a generic
+/// tools/check_thread_closure. That merges every instantiation of a generic
 /// into one class — an over-approximation that costs false positives, not
 /// false negatives.
 fn loadLockClasses(db: *sqlite.Db, st: *State) !void {
@@ -1039,7 +1039,7 @@ fn collectSlabFieldNames(db: *sqlite.Db, st: *State) !void {
     }
     // Seed common KernelObject variant names known to be SlabRef-typed.
     const variants = [_][]const u8{
-        "execution_context", "capability_domain", "vmar",
+        "thread", "capability_domain", "vmar",
         "page_frame",        "device_region",     "virtual_machine",
         "vcpu",              "port",              "timer",
     };
@@ -1164,7 +1164,7 @@ const TrackedIdent = struct {
 
 const UnionVariantEntry = struct { variant: []const u8, ty: []const u8 };
 const UNION_VARIANTS = [_]UnionVariantEntry{
-    .{ .variant = "execution_context", .ty = "ExecutionContext" },
+    .{ .variant = "thread", .ty = "Thread" },
     .{ .variant = "capability_domain", .ty = "CapabilityDomain" },
     .{ .variant = "var_range", .ty = "VAR" },
     .{ .variant = "page_frame", .ty = "PageFrame" },
@@ -1181,14 +1181,14 @@ const DefaultFieldChainEntry = struct {
     ty: []const u8,
 };
 const DEFAULT_FIELD_CHAINS = [_]DefaultFieldChainEntry{
-    // ExecutionContext.
-    .{ .owner = "ExecutionContext", .field = "domain", .ty = "CapabilityDomain" },
-    .{ .owner = "ExecutionContext", .field = "next", .ty = "ExecutionContext" },
-    .{ .owner = "ExecutionContext", .field = "prev", .ty = "ExecutionContext" },
-    .{ .owner = "ExecutionContext", .field = "suspend_port", .ty = "Port" },
-    .{ .owner = "ExecutionContext", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
-    .{ .owner = "ExecutionContext", .field = "vm", .ty = "VirtualMachine" },
-    .{ .owner = "ExecutionContext", .field = "exit_port", .ty = "Port" },
+    // Thread.
+    .{ .owner = "Thread", .field = "domain", .ty = "CapabilityDomain" },
+    .{ .owner = "Thread", .field = "next", .ty = "Thread" },
+    .{ .owner = "Thread", .field = "prev", .ty = "Thread" },
+    .{ .owner = "Thread", .field = "suspend_port", .ty = "Port" },
+    .{ .owner = "Thread", .field = "pending_reply_domain", .ty = "CapabilityDomain" },
+    .{ .owner = "Thread", .field = "vm", .ty = "VirtualMachine" },
+    .{ .owner = "Thread", .field = "exit_port", .ty = "Port" },
     // VAR.
     .{ .owner = "VAR", .field = "domain", .ty = "CapabilityDomain" },
     .{ .owner = "VAR", .field = "pf", .ty = "PageFrame" },

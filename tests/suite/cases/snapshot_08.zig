@@ -17,23 +17,23 @@
 //        deletion (the binding is internal kernel state — there is no
 //        v3 syscall that reads "the source bound to this target").
 //     3. Cause the calling capability domain to restart (e.g., fault
-//        every EC, or kill the self-handle with `restart` cap set).
+//        every thread, or kill the self-handle with `restart` cap set).
 //        The kernel walks the target VMAR's `restart_policy = snapshot`,
 //        looks up its bound source, finds none, and per the spec line
 //        TERMINATES the domain rather than restarting it.
 //     4. From outside, observe that the domain did not restart.
 //
 //   None of these post-action observations is reachable from inside the
-//   test EC's own capability domain:
+//   test thread's own capability domain:
 //
 //     - Step (2)'s side effect — "the binding is cleared" — is not
 //       directly observable: there is no `get_snapshot_source` syscall
 //       and `sync` on the target VMAR refreshes only `cur_rwx`, `map`,
 //       `device` (per §[var] field1), not the bound-source identity.
 //     - Step (3) requires triggering a restart of *this same domain*,
-//       which destroys the EC running the test. Even if we could trip
+//       which destroys the thread running the test. Even if we could trip
 //       the restart, the spec-mandated outcome (TERMINATION instead of
-//       restart) means the test EC does not get a chance to call
+//       restart) means the test thread does not get a chance to call
 //       `pass`/`fail` — the result port reply path is gone with the
 //       domain. Confirming "domain was terminated, not restarted" is a
 //       parent-runner observation, and the runner currently spawns
@@ -43,7 +43,7 @@
 //   Reaching the faithful observation would require either:
 //     - the runner gaining a per-test "restart-and-observe" harness:
 //       hold a self-IDC handle to the test domain plus a watch on its
-//       lifecycle, fault one of its ECs, and report whether the domain
+//       lifecycle, fault one of its Threads, and report whether the domain
 //       reappears; or
 //     - this test spawning a sub-sub-domain, embedding an inner ELF
 //       that performs the snapshot/delete/fault sequence, and reading
@@ -91,13 +91,13 @@
 //   No assertion is checked — passes with assertion id 0 because the
 //   spec-mandated observable (domain terminates, not restarts, when
 //   the bound source is gone at restart time) sits behind a domain
-//   restart we cannot trigger or witness from inside the test EC.
+//   restart we cannot trigger or witness from inside the test thread.
 //
 // Faithful-test note
 //   Faithful test deferred pending a runner-side restart-observability
 //   harness: a parent that holds a self-IDC handle to the test domain,
 //   triggers the test domain's restart (e.g., by faulting one of its
-//   ECs whose self-handle has the `restart` cap), and reports back
+//   Threads whose self-handle has the `restart` cap), and reports back
 //   whether the domain restarted or was terminated. With that, the
 //   action becomes:
 //

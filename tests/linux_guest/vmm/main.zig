@@ -163,7 +163,7 @@ pub fn main(cap_table_base: u64) void {
     // exit_port.
     //   caps: rwx + read + write (gating event-state vreg read/write
     //   on recv/reply). Priority defaults to 0.
-    const vcpu_caps_word: u64 = 0; // no special caps for vcpu EC handle
+    const vcpu_caps_word: u64 = 0; // no special caps for vcpu thread handle
     const vcpu_r = syscall.createVcpu(vcpu_caps_word, vm_handle, 0, exit_port);
     if (vcpu_r.v1 < 16) {
         log.print("createVcpu failed: ");

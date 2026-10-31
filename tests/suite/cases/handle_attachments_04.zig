@@ -7,18 +7,18 @@
 //   §[handle_attachments] places pair entries in the high vregs
 //   `[128-N..127]`. With N=1 the lone entry occupies vreg 127, which
 //   per §[syscall_abi] lives at `[rsp + (127-13)*8] = [rsp + 912]`
-//   when the syscall executes. libz's `suspendEc` `@panic`s on N>0
+//   when the syscall executes. libz's `suspendThread` `@panic`s on N>0
 //   because its general stack-arg dispatcher isn't wired through; we
 //   open-code the syscall here with a fixed 920-byte stack pad that
 //   lands the entry at the right offset (matching the pattern in
 //   handle_attachments_02 and 03).
 //
-//   For the source handle we use the test child's initial EC at
-//   slot 1. Per §[create_capability_domain] test 21 the initial EC's
-//   caps equal the runner's `ec_inner_ceiling`, which the runner sets
-//   to 0xFF — bits 0-7 of `EcCap`: {move, copy, saff, spri, term,
+//   For the source handle we use the test child's initial thread at
+//   slot 1. Per §[create_capability_domain] test 21 the initial thread's
+//   caps equal the runner's `thread_inner_ceiling`, which the runner sets
+//   to 0xFF — bits 0-7 of `ThreadCap`: {move, copy, saff, spri, term,
 //   susp, read, write}. To set up the precondition for test 04 we
-//   first `restrict` the initial-EC handle to clear the `move` bit
+//   first `restrict` the initial-thread handle to clear the `move` bit
 //   (bit 0). The handle keeps `copy` and the rest of bits 1-7.
 //
 //   With move cleared from the source, an entry with `move = 1`
@@ -37,15 +37,15 @@
 //   E_PERM via test 04 is therefore the unique remaining outcome.
 //
 // Action
-//   1. restrict(SLOT_INITIAL_EC, ec_caps & ~move) — must succeed.
+//   1. restrict(SLOT_INITIAL_THREAD, thread_caps & ~move) — must succeed.
 //      Confirm via cap-table read that `move` is now clear.
-//   2. Construct a PairEntry with id=SLOT_INITIAL_EC, caps=0, move=1.
-//   3. Issue suspend(target=SLOT_INITIAL_EC, port=SLOT_FIRST_PASSED)
+//   2. Construct a PairEntry with id=SLOT_INITIAL_THREAD, caps=0, move=1.
+//   3. Issue suspend(target=SLOT_INITIAL_THREAD, port=SLOT_FIRST_PASSED)
 //      with the entry placed at vreg 127.
 //   4. Verify the returned vreg 1 equals E_PERM.
 //
 // Assertions
-//   1: restrict on the initial EC handle did not return success.
+//   1: restrict on the initial thread handle did not return success.
 //   2: the cap table still reports `move` set after restrict (the
 //      precondition for test 04 was not actually established).
 //   3: suspend with a move=1 entry referencing a source lacking
@@ -190,18 +190,18 @@ fn suspendWithOnePairAtV127(target: u12, port: u12, entry: u64) syscall.Regs {
 }
 
 pub fn main(cap_table_base: u64) void {
-    // Read the initial EC's current caps and clear the `move` bit
+    // Read the initial thread's current caps and clear the `move` bit
     // via restrict. Per §[capabilities]/restrict test 02 a strict
     // subset always succeeds when the handle is valid and reserved
     // bits are clean.
-    const ec_before = caps.readCap(cap_table_base, caps.SLOT_INITIAL_EC);
-    const ec_caps_before: u16 = ec_before.caps();
+    const thread_before = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
+    const thread_caps_before: u16 = thread_before.caps();
 
-    const move_bit: u16 = (caps.EcCap{ .move = true }).toU16();
-    const reduced_caps: u16 = ec_caps_before & ~move_bit;
+    const move_bit: u16 = (caps.ThreadCap{ .move = true }).toU16();
+    const reduced_caps: u16 = thread_caps_before & ~move_bit;
 
     const restrict_result = syscall.restrict(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         @as(u64, reduced_caps),
     );
     if (restrict_result.v1 != @intFromEnum(errors.Error.OK)) {
@@ -209,24 +209,24 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const ec_after = caps.readCap(cap_table_base, caps.SLOT_INITIAL_EC);
-    if ((ec_after.caps() & move_bit) != 0) {
+    const thread_after = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
+    if ((thread_after.caps() & move_bit) != 0) {
         testing.fail(2);
         return;
     }
 
-    // Single pair entry referencing the initial EC with move=1. The
+    // Single pair entry referencing the initial thread with move=1. The
     // source now lacks `move`, so test 04 (E_PERM) is the unique
     // applicable check; entry.caps=0 is a subset of any source caps,
     // and move=1 sidesteps the move=0/copy check (test 05).
     const entry = (caps.PairEntry{
-        .id = caps.SLOT_INITIAL_EC,
+        .id = caps.SLOT_INITIAL_THREAD,
         .caps = 0,
         .move = true,
     }).toU64();
 
     const result = suspendWithOnePairAtV127(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         caps.SLOT_FIRST_PASSED,
         entry,
     );

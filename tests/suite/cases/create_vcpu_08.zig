@@ -1,12 +1,12 @@
 // Spec §[create_vcpu] — test 08.
 //
-// "[test 08] on success, the caller receives an EC handle with caps =
+// "[test 08] on success, the caller receives an thread handle with caps =
 //  `[1].caps`."
 //
 // Strategy
 //   Drive create_vcpu down its success path with the same defusing
 //   prelude as create_vcpu_07, but instead of provoking E_INVAL, we
-//   request a non-trivial caps word and verify the returned EC handle
+//   request a non-trivial caps word and verify the returned thread handle
 //   carries exactly that caps field.
 //
 //   The caps field of a handle lives in word0 bits 48-63 of the cap
@@ -18,13 +18,13 @@
 //   Use multi-bit caps {read, write} so the assertion exercises a
 //   non-trivial bit pattern and is sensitive to either bit being
 //   dropped or any stray bit being set on the way through the kernel.
-//   Bits 6-7 of EcCap are well within the runner-granted
-//   ec_inner_ceiling = 0xFF (bits 0-7).
+//   Bits 6-7 of ThreadCap are well within the runner-granted
+//   thread_inner_ceiling = 0xFF (bits 0-7).
 //
 // Defusing other create_vcpu error paths
 //   - test 01 (E_PERM no `crec`): runner spawns child with `crec`.
-//   - test 02 (E_PERM caps not subset of ec_inner_ceiling): runner
-//     grants ec_inner_ceiling = 0xFF; {read, write} = bits 6-7 stays
+//   - test 02 (E_PERM caps not subset of thread_inner_ceiling): runner
+//     grants thread_inner_ceiling = 0xFF; {read, write} = bits 6-7 stays
 //     within that subset.
 //   - test 03 (E_PERM priority exceeds ceiling): priority = 0, well
 //     under the runner-granted pri = 3.
@@ -34,7 +34,7 @@
 //     via create_port with `bind`.
 //   - test 06 (E_INVAL affinity outside core count): affinity = 0
 //     selects "any core".
-//   - test 07 (E_INVAL reserved bits in [1]): EcCap packed struct
+//   - test 07 (E_INVAL reserved bits in [1]): ThreadCap packed struct
 //     keeps reserved bits 16-31, 34-63 clean and priority = 0 keeps
 //     bits 32-33 clean.
 //
@@ -62,7 +62,7 @@
 // Assertions
 //   1: setup — any of createPageFrame / createVmar / mapPf /
 //      createPort failed, or createVcpu returned an error word.
-//   2: returned EC handle's caps field does not equal requested caps.
+//   2: returned thread handle's caps field does not equal requested caps.
 
 const lib = @import("lib");
 
@@ -158,10 +158,10 @@ pub fn main(cap_table_base: u64) void {
     const exit_port: HandleId = @truncate(cport.v1 & 0xFFF);
 
     // 6. Issue create_vcpu on the success path. caps={read,write} are
-    //    EcCap bits 6-7, within the ec_inner_ceiling = 0xFF subset.
+    //    ThreadCap bits 6-7, within the thread_inner_ceiling = 0xFF subset.
     //    priority = 0 stays under the runner-granted pri = 3, affinity
     //    = 0 selects "any core", and reserved bits stay clean.
-    const requested = caps.EcCap{ .read = true, .write = true };
+    const requested = caps.ThreadCap{ .read = true, .write = true };
     const cvcpu = syscall.createVcpu(
         @as(u64, requested.toU16()),
         vm_handle,
@@ -172,11 +172,11 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: u12 = @truncate(cvcpu.v1 & 0xFFF);
+    const thread_handle: u12 = @truncate(cvcpu.v1 & 0xFFF);
 
-    // 7. Read the freshly-minted EC handle and verify caps ==
+    // 7. Read the freshly-minted thread handle and verify caps ==
     //    requested.
-    const cap = caps.readCap(cap_table_base, ec_handle);
+    const cap = caps.readCap(cap_table_base, thread_handle);
     if (cap.caps() != requested.toU16()) {
         testing.fail(2);
         return;

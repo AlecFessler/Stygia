@@ -1,13 +1,13 @@
-# TLA+ model of the EC-lifecycle machine (model rev 17 / `systems.md` rev 17)
+# TLA+ model of the thread-lifecycle machine (model rev 17 / `systems.md` rev 17)
 
-TLC-checked model of the execution-context lifecycle state machine
+TLC-checked model of the thread lifecycle state machine
 specified in `docs/kernel/systems.md`. Revision 17 adds the focused
 stygia-8xl vCPU cancellation surface without adding VM instruction
-semantics: `VCPU_ECS` marks ECs that enter guest mode after dispatch,
+semantics: `VCPU_THREADS` marks Threads that enter guest mode after dispatch,
 remote retire of a guest-current vCPU must publish `VCPU_CANCEL`, and
 `VcpuCancelExit` is the owner-side VM-exit acknowledgement that returns
-the EC to the ordinary retired-current boundary/hop/finalize path. The
-default historical configs set `VCPU_ECS = {}` so their old scope remains
+the thread to the ordinary retired-current boundary/hop/finalize path. The
+default historical configs set `VCPU_THREADS = {}` so their old scope remains
 unchanged; `vcpu_cancel` and `vcpu_nocancel` are the new load-bearing
 focused pair.
 
@@ -94,16 +94,16 @@ constraints TLC was asked to track. Dropping `FairSpinDir` and
 
 **The limit of the technique, equally standing.** It does not rescue the
 2c×3e scope for any property that genuinely needs `FairDisp`, because
-that family is `SF(DispatchOrS7(c,e))` and scales as |Cores| × |ECs| — 6
-instances at 3 ECs against 4 at 2. `q7` is the demonstration: `LiveTerm`
-under its minimal set, at 3 ECs, still did not converge. When a property
-needs `FairDisp`, ladder the EC count down rather than the timeout up.
+that family is `SF(DispatchOrS7(c,e))` and scales as |Cores| × |Threads| — 6
+instances at 3 Threads against 4 at 2. `q7` is the demonstration: `LiveTerm`
+under its minimal set, at 3 Threads, still did not converge. When a property
+needs `FairDisp`, ladder the thread count down rather than the timeout up.
 
 **Standing line, earned three times over: in this protocol, any identity
 that can be reconstructed by reuse is not an identity.** Round 10's epoch
 (a bounded counter wraps, so a `drop → claim → arm` cycle restores a
 suspender's snapshot); round 12's `gen` (one bit, flipped at finalize and
-RESET by `CreateEC`, so a recycled slot returned the snapshot value); and
+RESET by `CreateThread`, so a recycled slot returned the snapshot value); and
 round 12's `DirArm` guard (below), which is the same lesson in the GUARD
 rather than in the value. Any new field that a suspender snapshots and
 later compares must be checked against reuse before it is trusted.
@@ -152,7 +152,7 @@ checked.**
 **Parity-diff discipline (new in revision 12, and the round-11 lesson).**
 Round 11's C-1 was a doc mechanism the model did not have — and worse, the
 model was **strictly safer than the design at exactly the point the design
-was wrong** (it kept `dead` on freed ECs forever, so the false-SUCCESS arm
+was wrong** (it kept `dead` on freed Threads forever, so the false-SUCCESS arm
 was unreachable). A green battery over a safer-than-the-design model is
 the most dangerous shape this artifact can take, because every gate still
 fires. The rule now: **after any doc change to a mechanism, diff the
@@ -173,12 +173,12 @@ derived, and refuted. **Read every RECALLED marker as a defect that has
 not been found yet** — that has been the outcome four rounds running.
 
 **SCOPE (revision 13, normative — `systems.md` §0).** This model checks
-the **EC lifecycle and every state change that moves an EC on, off, or
+the **thread lifecycle and every state change that moves an thread on, off, or
 between CPU cores**, and nothing else. Out of scope, with reasons in
 §0.2: kernel-wide lock ordering (the kernel uses address-ordered
 same-class nesting plus lockdep's dynamic cycle detection; the chain
 project revisions 10–12 built is retracted), analyzer capability,
-migration sequencing, and anything that does not move an EC between
+migration sequencing, and anything that does not move an thread between
 cores — VMAR work, handle-table rewriting, capability cascades. **Do
 not read a green battery here as a statement about any of those.**
 Several rounds' findings were about them; they are recorded
@@ -190,7 +190,7 @@ design explicitly forecloses (`systems.md` §2.1: the pend fact lives in the
 state word, not a descriptor flag) — and returned green on a revision that
 does not work. The operative rule since: **when the spec is ambiguous or
 wrong, encode the literal reading and flag it; never encode what you think
-it meant.** Every action in `ECLifecycle.tla` cites the spec text it
+it meant.** Every action in `ThreadLifecycle.tla` cites the spec text it
 implements; the parity table below maps every modelled mechanism to its
 section; every divergence and ambiguity is a numbered ledger entry (U*/G*),
 and every model-exposed result a finding (N*). Any edit to the module or to
@@ -213,7 +213,7 @@ RUN_SLOW=1   ./run.sh               # + measured t1full, full t1d, cr1fullself, 
 RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # all 37; hours, launch it detached
 ```
 
-The former full `medium` aggregate (`ECLifecycle_medium.cfg`) is no
+The former full `medium` aggregate (`ThreadLifecycle_medium.cfg`) is no
 longer in the default battery. After dpin/dres it was stopped on
 2026-08-03 after more than an hour at roughly **598M generated / 133.6M
 distinct / 11.9M queued** states. It remains on disk as an extended
@@ -276,8 +276,8 @@ ones, and that no `VIEW` is used. That is deliberate:
 
 - **All eight temporal properties ARE formula-symmetric.** `LiveParking`,
   `LiveRetired`, `LiveReady`, `LiveWake`, `LiveMark`, `LiveClaim`,
-  `LiveSuspender`, `LiveTerm` are each `\A e \in ECs: P(e) ~> Q(e)`, with
-  no named EC, no named core, and no predicate that distinguishes cores.
+  `LiveSuspender`, `LiveTerm` are each `\A e \in Threads: P(e) ~> Q(e)`, with
+  no named thread, no named core, and no predicate that distinguishes cores.
   So the *property* side of the soundness condition is satisfied for every
   one of them.
 - **TLC's implementation is nonetheless unsound here, and says so.**
@@ -341,44 +341,44 @@ gitignored; keep all generated output under them.
 
 | File | Purpose |
 |---|---|
-| `ECLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
+| `ThreadLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
 | `ECProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
 | `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
-| `ECLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
-| `ECLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
-| `ECLifecycle_medium.cfg` | extended/manual 2c × 3e full directive aggregate, symmetry. **Oversized after dpin/dres; not default evidence.** Two documented scope cuts in-file: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
-| `ECLifecycle_large.cfg` | 3c × 3e, core + rendezvous, symmetry |
-| `ECLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
-| `ECLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 ECs. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
-| `ECLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
-| `ECLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
-| `ECLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
-| `ECLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
-| `ECLifecycle_t1{min,s,r,d_min,d,full}.cfg` | **`LiveTerm` ladder under `SpecTrm`**, its minimal fairness set; `t1d_min` is the default directive-bearing replacement rung, while full `t1d` and `t1full` are extended/manual measured-unconverged rows |
-| `ECLifecycle_cr1minself.cfg` | focused `LiveSuspender` under `SpecSus` (neither N6 assumption), paired with `crfals` |
-| `ECLifecycle_cr1fullself.cfg` | extended `LiveSuspender` under `SpecFairN3` (neither N6 assumption), `RUN_SLOW=1` only |
-| `ECLifecycle_liveness_{a,b}.cfg` | L1/L2/L6 and L3/L4/L5 at 2×2 under `SpecFairCore` |
-| `ECLifecycle_mtermfix.cfg` | the round-8 C-1 repair at the mutual-terminate scope |
+| `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
+| `ThreadLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
+| `ThreadLifecycle_medium.cfg` | extended/manual 2c × 3e full directive aggregate, symmetry. **Oversized after dpin/dres; not default evidence.** Two documented scope cuts in-file: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
+| `ThreadLifecycle_large.cfg` | 3c × 3e, core + rendezvous, symmetry |
+| `ThreadLifecycle_xlarge.cfg` | 3c × 4e, core only, symmetry (`RUN_XLARGE=1`) |
+| `ThreadLifecycle_cr3self.cfg` | 2c × 3e cycle invariants — the 3-cycle question at 3 Threads. **Documented scope cut in-file**: `DIR_DROP = FALSE`, `CR_BUDGET = 0` |
+| `ThreadLifecycle_dirf6{,fix}.cfg` | round-11 C-1's false-SUCCESS arm: `dirf6` is now an expected-clean stale-gate closure under dpin; `dirf6fix` is the target-gen repair check |
+| `ThreadLifecycle_vcpu_cancel.cfg` | focused stygia-8xl pass row: one vCPU enters guest, remote retire publishes arch cancel, owner acknowledges VM exit, `LiveRetired` and `LiveVcpuCancel` pass |
+| `ThreadLifecycle_vcpu_nocancel.cfg` | focused stygia-8xl falsifier: the same remote retire with `VCPU_CANCEL = FALSE` violates `InvRetiredVcpuCancelled` |
+| `ThreadLifecycle_pr{4,4d,4d_min,5}.cfg` | the round-10/11/16 probes (`ProbeNoTermSuspendCycle`, `ProbeNoDisarm`); full `pr4d` is extended/manual evidence paired with full `t1d` |
+| `ThreadLifecycle_t1{min,s,r,d_min,d,full}.cfg` | **`LiveTerm` ladder under `SpecTrm`**, its minimal fairness set; `t1d_min` is the default directive-bearing replacement rung, while full `t1d` and `t1full` are extended/manual measured-unconverged rows |
+| `ThreadLifecycle_cr1minself.cfg` | focused `LiveSuspender` under `SpecSus` (neither N6 assumption), paired with `crfals` |
+| `ThreadLifecycle_cr1fullself.cfg` | extended `LiveSuspender` under `SpecFairN3` (neither N6 assumption), `RUN_SLOW=1` only |
+| `ThreadLifecycle_liveness_{a,b}.cfg` | L1/L2/L6 and L3/L4/L5 at 2×2 under `SpecFairCore` |
+| `ThreadLifecycle_mtermfix.cfg` | the round-8 C-1 repair at the mutual-terminate scope |
 | **falsifiers** | |
-| `ECLifecycle_rev3_x{1,2,3}.cfg` | rev 3: expect `InvS4Holder` / deadlock / `InvNoLostOneShot` |
-| `ECLifecycle_rev4_f1{a,b}.cfg` | rev 4 F1's two readings: `f1a` is now clean under target claim pins; `f1b` still expects deadlock |
-| `ECLifecycle_n4.cfg` | rev-5 literal unwind ordering: expects `InvS1` |
-| `ECLifecycle_e4.cfg` | publish-claimable-before-hop: expects `InvS3` |
-| `ECLifecycle_pinord.cfg` | round-7 C1 `lock(); pin_depth += 1;`: expects `InvNoPreemptedLockHolder` |
-| `ECLifecycle_crcyc.cfg` | round-7 C3, no rejection: expects `InvNoSuspendCycle2` |
-| `ECLifecycle_cr3.cfg` | round-7 C3, `"pair"` at 3 ECs: expects `InvNoSuspendCycle3` |
-| `ECLifecycle_crfals.cfg` | round-7 C3, no rejection + no N6 assumptions at the focused no-drop `SpecSus` scope: expects a temporal violation |
-| `ECLifecycle_mterm.cfg` | **round-8 C-1, no retired-terminator escape: expects a DEADLOCK** |
-| `ECLifecycle_pr{1,2,3}.cfg` | the reachability probes (violation = pass) |
+| `ThreadLifecycle_rev3_x{1,2,3}.cfg` | rev 3: expect `InvS4Holder` / deadlock / `InvNoLostOneShot` |
+| `ThreadLifecycle_rev4_f1{a,b}.cfg` | rev 4 F1's two readings: `f1a` is now clean under target claim pins; `f1b` still expects deadlock |
+| `ThreadLifecycle_n4.cfg` | rev-5 literal unwind ordering: expects `InvS1` |
+| `ThreadLifecycle_e4.cfg` | publish-claimable-before-hop: expects `InvS3` |
+| `ThreadLifecycle_pinord.cfg` | round-7 C1 `lock(); pin_depth += 1;`: expects `InvNoPreemptedLockHolder` |
+| `ThreadLifecycle_crcyc.cfg` | round-7 C3, no rejection: expects `InvNoSuspendCycle2` |
+| `ThreadLifecycle_cr3.cfg` | round-7 C3, `"pair"` at 3 Threads: expects `InvNoSuspendCycle3` |
+| `ThreadLifecycle_crfals.cfg` | round-7 C3, no rejection + no N6 assumptions at the focused no-drop `SpecSus` scope: expects a temporal violation |
+| `ThreadLifecycle_mterm.cfg` | **round-8 C-1, no retired-terminator escape: expects a DEADLOCK** |
+| `ThreadLifecycle_pr{1,2,3}.cfg` | the reachability probes (violation = pass) |
 | **not in `run.sh`** | |
-| `ECLifecycle_q{1..7}.cfg`, `q7d` | per-property liveness at 2c × 3e. `q7` did not converge in 90 min; kept because the scope question is open, NOT because they pass |
-| `ECLifecycle_dirabafix.cfg` | round-10 C-D identity-gated repair config; kept on disk but not run because the clean invariant is analytically vacuous under `DIR_OWNED = TRUE` |
-| `ECLifecycle_medium.cfg` | extended/manual full directive 2c × 3e aggregate; stopped after dpin/dres and not default evidence |
-| `ECLifecycle_pr4d.cfg` | extended/manual full-scope non-vacuity probe paired with full `t1d`; kept on disk but not in the default battery |
+| `ThreadLifecycle_q{1..7}.cfg`, `q7d` | per-property liveness at 2c × 3e. `q7` did not converge in 90 min; kept because the scope question is open, NOT because they pass |
+| `ThreadLifecycle_dirabafix.cfg` | round-10 C-D identity-gated repair config; kept on disk but not run because the clean invariant is analytically vacuous under `DIR_OWNED = TRUE` |
+| `ThreadLifecycle_medium.cfg` | extended/manual full directive 2c × 3e aggregate; stopped after dpin/dres and not default evidence |
+| `ThreadLifecycle_pr4d.cfg` | extended/manual full-scope non-vacuity probe paired with full `t1d`; kept on disk but not in the default battery |
 
 
 **Config taxonomy** (which machine each family describes). DERIVED from
-`ls ECLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
+`ls ThreadLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
 9–11 and the taxonomy kept describing them. There are **52 `.cfg` files**
@@ -408,7 +408,7 @@ machine, a falsifier — round-7 C3), and **`TERM_ESCAPE`** (TRUE = the
 round-8 C-1 repair, a retired terminator abandons the W3/W4 wait; FALSE =
 revision 8, where mutual terminate deadlocks two cores — gated by
 `mterm`, which round-9 C-2 found was in NO runnable script),
-**`VCPU_ECS`** (the vCPU subset; empty in the historical aggregate
+**`VCPU_THREADS`** (the vCPU subset; empty in the historical aggregate
 configs), and **`VCPU_CANCEL`** (TRUE = remote retire publishes the arch
 cancel/kick and the owner acknowledges a VM exit; FALSE = the stygia-8xl
 falsifier).
@@ -443,14 +443,14 @@ here.
 
 | Spec | Model | Notes |
 |---|---|---|
-| §2.1 lifecycle word, 7 states | `ecs[e].st`, CAS = guarded atomic actions | + `"freed"` as the post-edge-10 pseudo-state |
-| ~~§2.1.1 idle EC~~ | **nothing to model — §2.1.1 WITHDRAWN in doc rev 16** | **G7 CLOSED by the doc retracting.** There is no per-core idle EC (`idle_ec` never assigned; `parkAndAwaitIRQ` is the real mechanism and replaced it to fix a cross-core kstack-sharing bug). A core with an empty run queue holds no EC, so the model having none is faithful, not a gap. Unaffected: the `.idle_wait` EC state / `wait.kind == .idle`, which are a USER EC choosing to idle |
+| §2.1 lifecycle word, 7 states | `threads[e].st`, CAS = guarded atomic actions | + `"freed"` as the post-edge-10 pseudo-state |
+| ~~§2.1.1 idle thread~~ | **nothing to model — §2.1.1 WITHDRAWN in doc rev 16** | **G7 CLOSED by the doc retracting.** There is no per-core idle thread (`idle_thread` never assigned; `parkAndAwaitIRQ` is the real mechanism and replaced it to fix a cross-core kstack-sharing bug). A core with an empty run queue holds no thread, so the model having none is faithful, not a gap. Unaffected: the `.idle_wait` thread state / `wait.kind == .idle`, which are a USER thread choosing to idle |
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
-| §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-EC words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
-| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` distinguishes `dispatchLoad` from `ecrun`; `committed_ec` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
+| §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-thread words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
+| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` distinguishes `dispatchLoad` from `ecrun`; `committed_thread` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
 | §2.4 `owner_core` | `own`, NULL outside validity set | poison = NULL |
-| §2.4 `pin_depth` + pin class (F3) | `pin`; wake/suspend claim actions pin the protected target EC, pin-class locks pin the executing EC via `PinAcq`/`PinRel`; `dpin` is the running-target remote-directive lifetime pin | "computed membership" is the analyzer's job; model has one representative class. `RetireEnabled` gates on target `pin = 0` and `dpin = FALSE`; `InvPinCells` permits transient ready publish pins because containment is still the run queue. `dpin` is deliberately separate because Zig's directive waiter pin blocks retire/finalize but must not block the target owner's tick/boundary directive consumption |
+| §2.4 `pin_depth` + pin class (F3) | `pin`; wake/suspend claim actions pin the protected target thread, pin-class locks pin the executing thread via `PinAcq`/`PinRel`; `dpin` is the running-target remote-directive lifetime pin | "computed membership" is the analyzer's job; model has one representative class. `RetireEnabled` gates on target `pin = 0` and `dpin = FALSE`; `InvPinCells` permits transient ready publish pins because containment is still the run queue. `dpin` is deliberately separate because Zig's directive waiter pin blocks retire/finalize but must not block the target owner's tick/boundary directive consumption |
 | §2.4 `pin_depth` ORDER (C1) | `PIN_BUMP_FIRST` + `plk \in {none,held,preB,postD}` + `PinBump`/`PinUnlock` + `InvNoPreemptedLockHolder` | **pin-class half CHECKED** (the `pinord` falsifier); **claim half BELOW GRANULARITY and not checked** — see finding C1 |
 | §2.4 `mark_state` (M-3) | `mo` (one BIT) | rev 7's private `mo`/`mk` pair collapsed into the doc's one word, then to one BIT in round 8 — the variable is `mo`, not `mst`; `TermWait`'s W4 guard is the acquire side |
 | §2.5 directive | `dir` word; abstract `dres` result; `dpin` target pin; `DirClaim/DirArm/DirLoop/DirConsume/DirFail/DirDrop`; finalize -> `"dead"` (F6) | F5 loop literal; G-D1/G-D2/G-D3 closed in rev 6; N1. `DirClaim` takes the running target `dpin` and every `DirLoop`/arm-abort exit releases it. `DirFail` and `DirDrop` are owner-consume-failure terminals: owner publishes result then `armed -> failed`; only the matching waiter reads `dres` while failed and acks `failed -> none`, so failure cannot be reported as suspend success. `dres` may be stale outside `failed` |
@@ -466,24 +466,24 @@ here.
 | §8.1 `affinity` (ready target, mask excludes) | `AffMove` (5c + edge 6, discharging via `WakePlace`) | |
 | §8.1 `affinity` (other states) | collapsed into the nondeterministic placement destination | over-approximates every mask |
 | §8.1 `priority` | **no model action, and rev 8 says why precisely** | the `waiting` and `ready` arms are LINK REPAIRS: no state change, no containment change, same container. At this model's granularity (queues are sets; there is no intra-container position) they are the identity transition. What C2 changed is doc-normative and test-visible, not state-machine-visible |
-| §8.1 `yieldTo` target side (M-4) | `DispatchEC(c,e)` requires `e \in cores[c].q` — local-only by construction | the S7 filter is `~ecs[e].dd`; the affinity-mask check is below granularity (masks unmodelled) |
+| §8.1 `yieldTo` target side (M-4) | `DispatchThread(c,e)` requires `e \in cores[c].q` — local-only by construction | the S7 filter is `~threads[e].dd`; the affinity-mask check is below granularity (masks unmodelled) |
 | §9.4 both fused shapes | `FastPath` (suspend FP), `ReplyFP` (reply FP main) | asm conformance out of boundary (`stygia-qde`) |
 | §3.2 edge-4 claimability-at-the-hop | `E4_AT_HOP` switch + the e4 falsifier | the Phase-3b barrier-zero question, answered with teeth |
-| §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchEC` (selected/current commit) -> `DispatchLoad` (final context load), with `DispatchAbort` for lifecycle loss after commit; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary |
-| stygia-8xl vCPU guest-current retire/cancel | `VCPU_ECS`, `ecs[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitDomainQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
+| §3.2 dispatch sequence + S7 (F2), including park-stack tail | `DispatchThread` (selected/current commit) -> `DispatchLoad` (final context load), with `DispatchAbort` for lifecycle loss after commit; `S7Claim` -> `S7Retire` | lock-order half of F2 outside boundary |
+| stygia-8xl vCPU guest-current retire/cancel | `VCPU_THREADS`, `threads[e].vm`, `VCPU_CANCEL`, `VcpuCancelExit`, `InvVcpuModeCoherent`, `InvRetiredVcpuCancelled`, `LiveVcpuCancel`, focused `vcpu_cancel`/`vcpu_nocancel` configs | Modelled only at lifecycle granularity: guest mode has no instruction semantics. A scheduler interrupt is not encoded as a sufficient guest-exit mechanism. Remote retire of a guest-current vCPU enters `vm = "cancel"` only when `VCPU_CANCEL = TRUE`; the owner-side acknowledgement returns to `vm = "host"`, after which `BoundaryRetired` and the hop finalize normally. `awaitDomainQuiesced` is represented by the existing obligation that `retired` reaches `freed`; the full root object remains outside the model |
 | §3.2 wake body | `WakeStart` (5a/5b) + `WakePlace`/`WakePendDone`; `FireAt` + irq frame bodies | |
 | §3.3 IRQ discipline | masked sections = atomic actions; handler-active = masked (no nesting) | sync-exception rule outside boundary |
 | §3.5 R-claim | claims only inside container-atomic actions (pop+claim fused) or retire | gen-lock half abstracted (no gen) |
 | §3.6 T3 spins (**9 rows**) | W1 = atomicity; W2 = `HopCommitPended` pd guard; W3/W4 = `TermWait`; W5 = `DirLoop`; W6's guest-current vCPU cancellation sub-obligation = `VcpuCancelExit`; W7 = `RetireEnabled` pd guard | Full W6 root teardown, W8 and W9 are not modelled |
 | §3.6 assumption (3), no interrupt storm | `SF_vars(BaseStep)` (STRONG, not weak) | rev 7 claimed the set was complete at two; this is the third, and it was always encoded — just not counted |
 | §4 hop | `HopRelease` (release first) -> `HopCommit{Wait,Requeue,Pended,Retired,Claimed}` | retired arm waits for NOTHING (F1); **rev 8: every commit arm that places picks its destination at placement time (M-2)** |
-| §5 edges 1..10 | 1 = Init + `CreateEC`; 2 = `DispatchEC` + `StealDispatch`, followed by the dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireEC`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
+| §5 edges 1..10 | 1 = Init + `CreateThread`; 2 = `DispatchThread` + `StealDispatch`, followed by the dispatch tail; 3 = `UserPark`/`VcpuGuestExit`/`TickPreempt`/`DirConsume`/`RvStart`; 4/6p/8/10 = hop arms; 5a/5b = `WakeStart`/`FireAt`/`RvStart`; 5c = `SuspendStart`/`S7Claim`/`AffMove` + `StealClaim`'s ready claim/removal; 6 = `WakePlace`/`RvDeliver`/`IrqWakePlace` + live-domain `StealAbandon`; 7 = `SuspendPlace`; 9 = `RetireThread`/`Terminate` + `StealDropDead` for DomDie-after-steal-claim | every edge has >= 1 action |
 | §5.1 T1 sources | one generic one-shot (`shot`) = deadline/device rows; rendezvous row = `RvStart` | periodic-scan loser protocol below granularity |
-| §5.2 T2 matrix | `RetireEcsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
+| §5.2 T2 matrix | `RetireThreadsAfter` rows + routed discovery actions; marking column = `mo` (one bit) | ready x K+C / requeue x K+C unreachability = `InvPinCells` + `InvNoPreemptedLockHolder` |
 | §8.2 retire + finalize | W7 guard; target `pin = 0` and `dpin = FALSE` drain gates in `RetireEnabled`; running vCPU guest retire sets cancel state when `VCPU_CANCEL`; NO retire unwind step — finalize's first act is the idempotent unwind (`FIN_UNWIND`) | mirrors `markRetiring` -> `waitPinsDrained` -> retire/dead-gen bump, including the directive waiter's running-target pin and the stygia-8xl arch-cancel requirement |
 | §8.3 rendezvous | `RvStart` + `RvDeliver` | G-RV1 |
-| §8.5 creation | `CreateEC` (publish-last) | CD-lock liveness gate not modelled |
-| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another EC. |
+| §8.5 creation | `CreateThread` (publish-last) | CD-lock liveness gate not modelled |
+| §9.2 asserts | invariants: `InvHopUnpinned`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, **`InvNoPreemptedLockHolder`**; publish/wait pin=0 guards | `InvHopUnpinned` checks the outgoing frame's pin-class lock state, not external target pins or preemptible claim continuations held by another thread. |
 | S1/S3/S4/S8 | `InvS1`, `InvS3`, `InvS4Holder`+`InvS4Pended`; S8 by construction | S2/S5/S6 and S7's lock half outside boundary |
 | L1-L6, W3/W4/W5 | `LiveParking/Retired/Ready/Wake/Mark/Claim/Term/Suspender` | L3 states DISPATCH, not merely "leaves ready" |
 | §3.4 `current_queue_core` | **no model field** | **G13** — MP. Run-queue membership IS `cores[c].q`; the field is a cache of a fact the model computes, so a coherent field would add no reachability. What is still lost is generic CACHE INCOHERENCE, which needs two words and the model has one; the prior x64 asm writer gap is closed by the R13 ready-enqueue metadata repair |
@@ -496,7 +496,7 @@ for bug-finding, may show unreal traces), **LP** = model less permissive
 incomparable/reconstruction.
 
 - **U3 (fixed)** — was LP, removed. `UserPark` once guarded untimed parks
-  on another EC being lively; no spec counterpart.
+  on another thread being lively; no spec counterpart.
 - **U4** — compression, stated: retire of `ready`/`waiting` is retire +
   inline finalize in ONE action (T2 "retirer, inline" — same caller,
   sequential, no other named party); the parking/claimed/pended rows are
@@ -521,23 +521,23 @@ incomparable/reconstruction.
 - **G5 (resolved)** — T2's "pin-writing `parking`" marking deferral is
   encoded literally.
 - **G6** — doc soft spot (stands, now stated doc-side): a device-woken,
-  not-yet-acked EC can be suspended (5c) or retired while `ready`; the
+  not-yet-acked thread can be suspended (5c) or retired while `ready`; the
   line stays masked. §8.4 states it; userspace owns the consequence.
 - **~~G7~~ (CLOSED in rev 16 — by DELETING THE DOC SIDE, not by
-  modelling).** Was: "LP. The per-core idle EC (§2.1.1) is unmodelled; an
+  modelling).** Was: "LP. The per-core idle thread (§2.1.1) is unmodelled; an
   idle-slot-specific containment race would be invisible here."
-  **§2.1.1 is withdrawn**: there is no per-core idle EC. `idle_ec` is
+  **§2.1.1 is withdrawn**: there is no per-core idle thread. `idle_thread` is
   declared at `sched/scheduler.zig:184`, read once unreachably at
   `:1521`, and **never assigned**; the tree parks an idle core on its own
   park kstack via `parkAndAwaitIRQ`, and `:1098` records that this
-  replaced the idle EC specifically to kill a cross-core kstack-sharing
+  replaced the idle thread specifically to kill a cross-core kstack-sharing
   bug. So there is no idle slot, no idle-slot containment race, and
   nothing for the model to be missing. **The model was right and the doc
   was wrong** — which is the opposite of this ledger's usual direction
   and worth recording as such: a gap entry can close because the design
   retracts, not only because the model catches up. (Same shape as the
   round-9 `dropped` row in the parity table.) A core with an empty run
-  queue holds no EC at all, so the model's absence of an idle EC is now
+  queue holds no thread at all, so the model's absence of an idle thread is now
   FAITHFUL rather than an over-simplification.
 - **G8 (closed in rev 6)** — `payload_done` is cleared by the discharger.
 - **G-D1/G-D2/G-D3 (closed in rev 6)** — the arm CAS, the reset atomic
@@ -575,13 +575,13 @@ incomparable/reconstruction.
   stands: the model's actions are guarded on current state, so
   "re-validate after acquiring the lock" is true by construction.
   **What does NOT stand is the lock chain rev 8 derived while writing
-  it.** Rev 8 asserted `wait-container < EC gen < core locks` as derived
+  it.** Rev 8 asserted `wait-container < thread gen < core locks` as derived
   fact. Round 8 checked it against the tree: the RIGHT edge
-  (`EcGen → CoreLock`) is sound with no counterexamples, but the LEFT
+  (`ThreadGen → CoreLock`) is sound with no counterexamples, but the LEFT
   edge is false — `port.zig:463-465` states the tree's canonical order
-  as **`EC → Port`** in as many words, and `futex.wake`, the function
-  the edge was derived FROM, traverses the EC/bucket pair in *both*
-  directions (bucket then `node.ec` at `futex.zig:273`; then from inside
+  as **`thread → Port`** in as many words, and `futex.wake`, the function
+  the edge was derived FROM, traverses the thread/bucket pair in *both*
+  directions (bucket then `node.thread` at `futex.zig:273`; then from inside
   that hold, `removeNodesExcept` → a further bucket acquire at
   `futex.zig:219`), made safe by an ascending-index discipline and a
   `FUTEX_BUCKET_GROUP` opt-out rather than by any chain. A fourth class
@@ -599,7 +599,7 @@ incomparable/reconstruction.
   same-class nesting under a named group plus lockdep's dynamic cycle
   detection, and §8.1's repair uses drop-and-retry so it never holds two
   classes at once. **Nothing is blocked.** What survives from §11.10 is
-  a one-line tree defect about `EC_NESTED_GROUP`, not a design gate.
+  a one-line tree defect about `THREAD_NESTED_GROUP`, not a design gate.
   Cross-class lock ordering is OUT of scope by §0.2, and the correct
   reading of this ledger entry is now the sentence above it: the model
   is silent here, and it was a reviewer reading `port.zig` — not a
@@ -694,9 +694,9 @@ incomparable/reconstruction.
   refactor depends on**, and unnamed narrowings are exactly what this
   ledger exists to stop being unnamed.
 
-  **Note the shape, because it is the same one that killed the idle EC
+  **Note the shape, because it is the same one that killed the idle thread
   (G7): a fact that cannot be stated because the state space has one slot
-  where the design has two.** There the missing second slot was an EC per
+  where the design has two.** There the missing second slot was an thread per
   core; here it is a core per kstack. Any invariant whose prose quantifies
   over a PAIR should be checked against the model's arity before it is
   believed to be encoded.
@@ -704,14 +704,14 @@ incomparable/reconstruction.
   LEDGERED, not modelled).** **`PerCore.teardown_pending` and
   `TeardownRequest` are normative in §2.3/§8.2 but have no TLA+ field.**
   The model represents the lifecycle consequence of teardown with
-  `DomDie` (dead-domain marking) plus `RetireEC`; it does not represent
+  `DomDie` (dead-domain marking) plus `RetireThread`; it does not represent
   the per-core park-stack handoff that carries the CD ref across the
   self-delete hop.
 
   **What is lost:** the model cannot check that the request is produced
   before self-retire, consumed exactly once on the park stack, or that the
   same CD ref is held across dead-mark and phase 2. Those are
-  implementation-ordering facts below the current per-EC lifecycle graph.
+  implementation-ordering facts below the current per-thread lifecycle graph.
   The marked spec now defines the payload shape directly:
   `{ kind: self_delete | unhandled_fault, cd: SlabRef(CapabilityDomain) }`.
 
@@ -720,7 +720,7 @@ incomparable/reconstruction.
   phase-2 ownership). A standalone Boolean would be a ledger-silencing
   token: it would not prove ref identity, exactly-once consumption, or
   dead-mark ordering. This gap needs a dedicated model revision, not
-  as a fake projection in the EC-only model.
+  as a fake projection in the thread-only model.
 
 ## Validation gates — results
 
@@ -731,12 +731,12 @@ incomparable/reconstruction.
   the claim held, retire's ready row inline-finalizes it. e1 orphaned in
   `claimed` forever, its holder freed.
 - **X2** — hard deadlock: both cores mid-park in the pre-hop window; each
-  core's tick claims the EC parked on the OTHER core and release-waits on
+  core's tick claims the thread parked on the OTHER core and release-waits on
   its kstack release; each needed hop-release is the base continuation
   BENEATH the other core's live interrupt frame.
 - **X3** — `InvNoLostOneShot` violated: a same-core interrupt fire on a
-  mid-park EC declines after atomically consuming the one-shot pop; no
-  retry party exists; the EC commits to `waiting` forever, line masked.
+  mid-park thread declines after atomically consuming the one-shot pop; no
+  retry party exists; the thread commits to `waiting` forever, line masked.
 
 ### Round 4 F1 (rev-4 machine: `F1_MODE` readings)
 
@@ -751,7 +751,7 @@ fails:
   no wait. With target claim pins, the claimant pins the target until
   `payload_done`/holder discharge and `RetireEnabled` waits `pin = 0`, so
   the stale gate is now expected clean.
-- **f1b, always-wait** — deadlock: retire of a plain `parking` EC (no
+- **f1b, always-wait** — deadlock: retire of a plain `parking` thread (no
   claimant ever existed); the hop's retired arm waits on a `payload_done`
   with no writer; the owner core wedges.
 
@@ -761,15 +761,15 @@ fails:
   dispatch e1; `PinAcq` takes the pin-class lock with the `pin_depth`
   bump not yet executed (`plk = "preB"`, `pin = 0`); `TickPreempt` reads
   `pin_depth == 0`, passes the §3.1 rule-1 gate, and wins the
-  `running → parking(requeue)` CAS. The EC is now a requeue-preempted
+  `running → parking(requeue)` CAS. The thread is now a requeue-preempted
   frame **holding a pin-class lock** — which is precisely the
   configuration T2's ready×K cell declares unreachable and retires
   inline on that basis. This is the resolution proof for §2.4's ordering
   rule.
 
-### Round 7 C3 (`CYCLE_REJECT = "none"`, and `"pair"` at 3 ECs)
+### Round 7 C3 (`CYCLE_REJECT = "none"`, and `"pair"` at 3 Threads)
 
-- **crcyc** — `InvNoSuspendCycle2` violated: with no rejection, two ECs
+- **crcyc** — `InvNoSuspendCycle2` violated: with no rejection, two Threads
   are mutually suspending. The rev-7 machine's shape, reached in a
   handful of states.
 - **crfals** — `LiveSuspender` violated, under `SpecSus` with NEITHER N6
@@ -780,10 +780,10 @@ fails:
   `SpecFairN3` row is stale after dpin+dres: it reaches final temporal
   checking and does not converge under the runner cap.
 - **cr3** — `InvNoSuspendCycle3` violated in **14 states** with the
-  `"pair"` mechanism ENABLED, at 2 cores × 3 ECs:
-  `DispatchEC, DispatchEC, DirClaim, TickPreempt, HopRelease,
-  HopCommitRequeue, DispatchEC, DirClaim, TickPreempt, HopRelease,
-  HopCommitRequeue, DispatchEC, DirClaim` → `e1.dsrc = e3,
+  `"pair"` mechanism ENABLED, at 2 cores × 3 Threads:
+  `DispatchThread, DispatchThread, DirClaim, TickPreempt, HopRelease,
+  HopCommitRequeue, DispatchThread, DirClaim, TickPreempt, HopRelease,
+  HopCommitRequeue, DispatchThread, DirClaim` → `e1.dsrc = e3,
   e2.dsrc = e1, e3.dsrc = e2`. Each suspender is requeue-preempted in
   `dirC`, freeing its core for the next — no exotic timing, just the
   preempt-requeue-dispatch cycle this machine runs constantly. The
@@ -798,7 +798,7 @@ fails:
 acquire; decremented at discharge/release" and never ordered the bump
 against the acquire. `lock(); pin_depth += 1;` is the default an engineer
 writes. Pin-class locks are *by definition* not IRQ-masked at their
-EC-context acquire sites — that property is what puts a class in the set
+thread-context acquire sites — that property is what puts a class in the set
 — so the gap between the two instructions is a live preemption point.
 
 **Why the rev-7 battery could not see it.** `WakeStart` and `PinAcq`
@@ -863,10 +863,10 @@ what its tooling actually RAN.
 
 - **C-1 — `dropped` had no clearing rule.** Round-8's M-3 added a fourth
   directive terminal and modelled it on `dead` — but `dead` is written by
-  finalize on an EC being freed, so "never cleared" is correct THERE and
-  was inherited without its justification. On a live EC it meant one
+  finalize on an thread being freed, so "never cleared" is correct THERE and
+  was inherited without its justification. On a live thread it meant one
   stale-port drop left every future suspender's `none → claiming` CAS
-  failing forever: the EC becomes **permanently unsuspendable**, i.e.
+  failing forever: the thread becomes **permanently unsuspendable**, i.e.
   permanently undebuggable, by ordinary means. The historical fix deleted
   `dropped`; the current implementation/model do **not** encode stale
   owner-side consume failure as success-like `armed -> none`. They publish
@@ -884,17 +884,17 @@ what its tooling actually RAN.
 - **C-3 — two concurrent `priority` calls permanently desync the word
   from the bucket key.** No cycle, no mutual relationship, both callers
   need only `spri`: A writes 1, B writes 3, both drop the gen lock, B
-  repairs the link to 3, A repairs it to 1. Final state `ec.priority == 3`
+  repairs the link to 3, A repairs it to 1. Final state `thread.priority == 3`
   with the linked key at 1, forever, because `dequeue` never re-reads and
   a parked waiter has no next link — and SILENT, since [test 08] reports
   field0 = 3 while selection uses 1. Round-8's C-2 defect in its
   concurrent form. Fixed with one clause that M-2 had already written for
-  the other word: **the repaired key is a fresh read of `ec.priority`
+  the other word: **the repaired key is a fresh read of `thread.priority`
   taken inside the innermost hold, never the value this call wrote**,
   mirrored for `affinity`'s claim-move destination.
-- **C-4 — the IRQ state of EC context was never stated, and §12 removed
+- **C-4 — the IRQ state of thread context was never stated, and §12 removed
   the only place it was established.** The deepest one. Twelve normative
-  arguments depend on EC-context frames being tick-preemptible — §3.1
+  arguments depend on thread-context frames being tick-preemptible — §3.1
   rule 1's existence, §2.4's C1 ordering rule (whose whole argument is
   "a live preemption point between the two instructions"), T2's ready×K
   row, §2.5's mutual-remote-suspend break, W3/W4/W5's "preemptible"
@@ -904,18 +904,18 @@ what its tooling actually RAN.
   and aarch64's only `daifclr` sites are `enableInterrupts` and the park
   primitives, so **syscall bodies run masked today** and §12 step 5
   deleted the last enable with no step adding one. **A green battery
-  cannot catch this**: `TickPreempt` fires on any unpinned `running` EC
+  cannot catch this**: `TickPreempt` fires on any unpinned `running` thread
   regardless of frame state, so the premise is exactly what the model's
   atomicity grants for free. Fixed with a normative §3.3 rule, a §9.2
   spin-entry assert (IRQs enabled, not just `pin_depth == 0`), and a §12
   step-4 that ADDS the entry-path enable alongside the pin gate.
 - **C-5 — domain restart is absent from the machine, and the DERIVATION
   METHOD is why.** `grep -ni restart systems.md` → zero, while
-  `specv3.md` §[restart_semantics] is normative and per-EC
+  `specv3.md` §[restart_semantics] is normative and per-thread
   (`0=kill / 1=restart_at_entry / 2=persist`). `restart_at_entry` has no
-  edge — an EC in any state must be forced runnable with its frame reset
+  edge — an thread in any state must be forced runnable with its frame reset
   to the entry point, which is not edge 6, not 7, not a claim-move — and
-  `persist` keeps an EC running while its domain's VMARs are freed. **The
+  `persist` keeps an thread running while its domain's VMARs are freed. **The
   instructive part is the method**: this README's sufficiency table was
   derived by walking the spec's SYSCALL list, and `§[restart_semantics]`
   is not a syscall section. **STATUS as of rev 16: `restart_at_entry` is
@@ -931,7 +931,7 @@ what its tooling actually RAN.
 
 **The shape.** A and B each hold a `term` handle to the other, both
 running. A retires B — B's kernel frame keeps running. B retires A. Both
-enter the W3 eviction wait for the other. **A `retired` EC in a kernel
+enter the W3 eviction wait for the other. **A `retired` thread in a kernel
 frame is moved by nothing**: the requeue CAS fails on `retired` (§3.1
 rule 1) and rule 3's entry checks are user-boundary-gated only. Neither
 ever leaves its core's `current` slot, so neither wait ever discharges.
@@ -950,15 +950,15 @@ succeed and belongs in the model.
 `st \in {running, retired}`), and self-terminate is now modelled.
 Confirmed as predicted: **TLC reports a plain `Deadlock reached`, not
 merely a `LiveTerm` violation, in 7 states** —
-`DispatchEC, TermStart, DispatchEC, TermStart, TermRetire, TermRetire`,
-ending with both ECs `retired`, both `pc = "termW"`, each naming the
+`DispatchThread, TermStart, DispatchThread, TermStart, TermRetire, TermRetire`,
+ending with both Threads `retired`, both `pc = "termW"`, each naming the
 other, each still `current` on its own core, and nothing enabled
 anywhere. `mterm` is now a permanent falsifier; `mtermfix` is the same
 scope with the repair dialed in (clean, 9,585 states).
 
 **What the repair is.** Two exit conditions on the W3/W4 wait: the
 **self carve-out** (target IS the caller — which the tree already has at
-`execution_context.zig:1028`, and which revision 8's doc lacked
+`thread.zig:1028`, and which revision 8's doc lacked
 entirely, making the tree safer than the design), and the
 **retired-waiter escape** (a terminator that has itself been retired
 abandons the wait). The escape is sound because a retired terminator
@@ -1006,8 +1006,8 @@ dominate the temporal phase:
 **Result 2 — but `"pair"` closes the SHAPE, not the CLASS.** The check is
 pairwise, and a 3-cycle (a suspends b, b suspends c, c suspends a) passes
 every pairwise test individually. `cr3` reaches one in **14 states** at
-2 cores × 3 ECs with the mechanism enabled: `DispatchEC, DispatchEC,
-DirClaim, TickPreempt, HopRelease, HopCommitRequeue, DispatchEC, DirClaim,
+2 cores × 3 Threads with the mechanism enabled: `DispatchThread, DispatchThread,
+DirClaim, TickPreempt, HopRelease, HopCommitRequeue, DispatchThread, DirClaim,
 …` — each suspender requeue-preempted in `dirC`, freeing its core for the
 next. Final state `e1.dsrc = e3, e2.dsrc = e1, e3.dsrc = e2`.
 `InvNoSuspendCycle3` is that probe; it exists precisely because the
@@ -1016,16 +1016,16 @@ first one found. It is the first one found.
 
 **Result 3 — `"pair"`'s lock order is an AB-BA against the existing
 tree.** Audited rather than assumed, because no analyzer covers lock
-order. Exactly one nested EC-gen-lock ↔ EC-gen-lock site exists in the
-kernel: the x86-64 fast-suspend asm path, which takes `receiver_ec` then
-`sender_ec` and holds both across the reply-handle mint. **It orders them
+order. Exactly one nested thread-gen-lock ↔ thread-gen-lock site exists in the
+kernel: the x86-64 fast-suspend asm path, which takes `receiver_thread` then
+`sender_thread` and holds both across the reply-handle mint. **It orders them
 by ROLE, not by slot index** — so whenever `slot(sender) < slot(receiver)`
 a slot-index rule takes the same pair in the opposite order. Today the two
 sites cannot contend, because the fast path's receiver is `waiting` when
-its lock is taken while both of `"pair"`'s ECs are `running` — but that is
+its lock is taken while both of `"pair"`'s Threads are `running` — but that is
 a recall-closed universal over two code paths, which is this project's
 documented failure mode. Compounding it: the asm comment claims the site
-is tagged `ordered_group=2 (EC_NESTED_GROUP)`, and **`EC_NESTED_GROUP` is
+is tagged `ordered_group=2 (THREAD_NESTED_GROUP)`, and **`THREAD_NESTED_GROUP` is
 defined nowhere in `kernel/` or `tools/`** — round-6 M2's tool-reality
 drift, still live.
 
@@ -1040,9 +1040,9 @@ same probes.** Same scopes, same invariants, mechanism swapped:
 
 **The refinement, and why it is recommended.** `"self"`: the suspender
 first CASes **its own** word `none → suspending`, then the target's
-`none → claiming`. A `suspending` word is not claimable, so no EC is ever
+`none → claiming`. A `suspending` word is not claimable, so no thread is ever
 both a suspender and a suspend target — and every cycle, of every length,
-is composed entirely of ECs that are both. One extra enum value, two
+is composed entirely of Threads that are both. One extra enum value, two
 single-word CASes on words already in the protocol, **no second lock and
 no lock order at all**, so Result 3 evaporates and Result 2 is closed by
 construction. Modelled UNFUSED (two CASes on different words with no lock
@@ -1055,7 +1055,7 @@ E_BUSY rate.** `DirSelfMark` sets it; `DirClaim` and `DirArm`'s success
 arm do NOT clear it; it is cleared only where the syscall RETURNS —
 `DirSelfAbort` (CAS-2 failed), `DirArm`'s E_TERM arm, and both `DirLoop`
 exits. So the mark spans the **whole syscall including the W5 wait**, and
-the consequence is userspace-visible: **any two overlapping cross-EC
+the consequence is userspace-visible: **any two overlapping cross-thread
 suspends can produce E_BUSY, cycle or not.** E_BUSY is an expected
 outcome of concurrent suspends, not a pathological one — §11.8's proposed
 spec text says so in normative language rather than in a note, because
@@ -1064,10 +1064,10 @@ discovers one in production.
 
 Cost, stated: `"self"` rejects three cases where `"pair"` rejects one —
 (1) the symmetric case, (2) a target that is mid-suspend of an unrelated
-third EC, (3) a caller that is itself someone's suspend target. An
+third thread, (3) a caller that is itself someone's suspend target. An
 early-release variant (clear the mark right after the target-claim CAS)
 would make E_BUSY rare and appears to remain correct by a longer
-argument — a claimed EC cannot self-mark, and every participant in a
+argument — a claimed thread cannot self-mark, and every participant in a
 cycle is claimed — but that is a multi-step reachability claim, where
 held-for-the-whole-syscall is the one-sentence invariant the model
 actually checks. Recorded in §2.5.1 as the optimisation to evaluate IF
@@ -1107,11 +1107,11 @@ corrected in place in the doc rather than quietly edited out.
 §8.2 (rev 5) ordered the container unwind INSIDE retire and listed
 "container unwind complete" as a finalize precondition — with no mechanism
 making the hop's deliberately wait-free retired arm wait for it. TLC, 6
-states: the EC is FREED while still linked in its wait containers.
+states: the thread is FREED while still linked in its wait containers.
 **Rev 6: CLOSED with a mechanism simpler than either review candidate** —
 retire's unwind step is DELETED; the idempotent unwind is finalize's first
 act. The dual-unwinder candidate was rejected: the second unwinder must
-read the EC's descriptor to discover it has nothing to do, against a slot
+read the thread's descriptor to discover it has nothing to do, against a slot
 the first-to-free may already have zeroed.
 
 ### N5 — the disarm path alone cannot carry W5's termination
@@ -1135,7 +1135,7 @@ requeue-first reintroduces N5 with the battery still green.
 
 ### N6 — mutual suspend, half-armed: two more starvation faces
 
-Post-N5, a NEW lasso on the full space: both ECs suspend each other; one
+Post-N5, a NEW lasso on the full space: both Threads suspend each other; one
 arms and enters `dirW`; the other's `DirArm` — the `claiming -> armed`
 continuation of an already-started suspend syscall — is starved because
 every dispatch is tick-preempted before the store executes. Its `dirC`
@@ -1236,7 +1236,7 @@ adds the named `AlignmentAssumption`.
   continuation (rev-5-literal machine only).
 - **No fairness** on `UserPark`, `WakeStart`, `SuspendStart`, `RecvPop`,
   `FastPath`, `ReplyFP`, `RvStart`, `DirClaim`, `DirConsume`, `PinAcq`,
-  `CreateEC`, `Terminate`, `RetireEC`, `AffMove`, `DomDie`: new requests,
+  `CreateThread`, `Terminate`, `RetireThread`, `AffMove`, `DomDie`: new requests,
   and forcing them could mask liveness bugs. N5's lesson lives elsewhere:
   directive consumption's EVENTUALITY is carried by `TickPreempt`'s rule-3
   arm under the existing `SF(TickPreempt)`, never by forcing
@@ -1290,7 +1290,7 @@ formula is *placement*: `Spec /\ Assumption => Live` and
 `Spec => (Assumption => Live)` are the same formula but not the same job
 for TLC (spec-side raw `[]<>` conjunct versus implied-temporal
 antecedent). `LiveSuspenderAligned == AlignmentAssumption => LiveSuspender`
-and `ECLifecycle_c1tp.cfg` exist to measure exactly that against `c1t`.
+and `ThreadLifecycle_c1tp.cfg` exist to measure exactly that against `c1t`.
 The result is in the coverage table; whichever way it lands it is a
 measurement, not a weakening — the assumption is still named, still
 stated in full, and still one hop from the config.
@@ -1391,12 +1391,12 @@ side of the revision-18 split are each covered.
 | `vcpu_nocancel` | `InvRetiredVcpuCancelled` violated | **FIRED** | 29 before the violation, depth 8 |
 | `t1s` | clean, `LiveTerm` under `SpecTrm` | `No error has been found` | 82,070 (recorded 82,070) |
 
-`sany` clean on both `ECLifecycle.tla` and `ECProbes.tla`. The three
+`sany` clean on both `ThreadLifecycle.tla` and `ECProbes.tla`. The three
 recorded counts reproduce **exactly**, which is the evidence that the
 port carried the model across without perturbing the transition relation.
 
 The `vcpu_nocancel` counterexample is the shape of the real defect: after
-`RetireEC` the state is `ecs[e1].st = "retired"` with `ecs[e1].vm =
+`RetireThread` the state is `threads[e1].st = "retired"` with `threads[e1].vm =
 "guest"` and `cores[c1].cur = e1` — a retired vCPU still current on its
 owner core and still in guest mode, with no arch cancel published. That
 is the hang `a9885b326` fixed.
@@ -1425,7 +1425,7 @@ further configs live in `run.sh` behind `RUN_XLARGE=1` / `RUN_SLOW=1` —
 `xlarge`, `t1full`, full `t1d`, `cr1fullself`, `liveness_a`,
 `liveness_b`. `t1full` and full `t1d` are measured-unconverged rows, not
 green liveness verdicts. The remaining revision-11 figures are **STALE**:
-they have not been re-run since the model gained six per-EC fields in
+they have not been re-run since the model gained six per-thread fields in
 revisions 11–13 (`gen`, `dgen`, `dlv`, `pok`, `dfs`, `dbad`). Treat each
 stale row as having NO verdict on the current machine until the extended
 battery lands here. `crfals` is the calibration point for how large that
@@ -1460,7 +1460,7 @@ was stopped after more than an hour at ~598M generated / ~133.6M distinct
 
 **Revision-16 `t1d_min` / `pr4d_min` recovery verdict.** The default
 directive-bearing `LiveTerm` rung is now the bounded pair
-`ECLifecycle_t1d_min.cfg` / `ECLifecycle_pr4d_min.cfg`: 2 cores x 2 ECs,
+`ThreadLifecycle_t1d_min.cfg` / `ThreadLifecycle_pr4d_min.cfg`: 2 cores x 2 Threads,
 `TERM_BUDGET = 2`, `DIR_ON = TRUE`, `DIR_OWNED = TRUE`,
 `DIR_GENCHK = TRUE`, dpin/dres/failed semantics intact, and unrelated
 multipliers off (`SUSPEND_ON = FALSE`, no fast path, rendezvous,
@@ -1475,8 +1475,8 @@ non-vacuous over the W3 -> W5 -> W3 shape it exists to cover. This is a
 targeted verdict, not a full default-battery transcript; a fresh
 `./run.sh` exit-0 is still the durable battery gate.
 
-**What moved and what was lost.** Full `ECLifecycle_t1d.cfg` remains on
-disk, with full `ECLifecycle_pr4d.cfg` as its exact mirrored probe, but
+**What moved and what was lost.** Full `ThreadLifecycle_t1d.cfg` remains on
+disk, with full `ThreadLifecycle_pr4d.cfg` as its exact mirrored probe, but
 it is not a default gate and must not be cited as a PASS. The current
 full row reached final temporal checking at **1,548,068 distinct /
 3,096,136 product states** and then timed out. The bounded default pair
@@ -1495,7 +1495,7 @@ target can be finalized. The runner now treats `dirf6` as an expected
 stale-gate closure. A fresh full `TLC_HEAP=3g TLC_WORKERS=2 ./run.sh`
 exit-0 is still the durable battery gate.
 
-**Revision-16 medium split verdict.** `ECLifecycle_medium_nodir.cfg`
+**Revision-16 medium split verdict.** `ThreadLifecycle_medium_nodir.cfg`
 keeps the old 2c × 3e / `TERM_BUDGET = 2` aggregate shape with
 `RV_ON`, `PINLOCK_ON`, `S7_ON`, `FASTPATH` and `SUSPEND_ON` enabled, but
 sets `DIR_ON = FALSE`. A targeted low-worker run
@@ -1517,13 +1517,13 @@ would not restore the lost aggregate fact below.
 `LiveSuspender == pc = "dirW" ~> pc # "dirW"` property fails at full 2x2
 on the current graph. The counterexample is not a missing W5 discharge:
 the suspender enters `dirW`, is tick-preempted and requeued, then another
-EC suspends it into `waiting` while the original target retires/frees.
+thread suspends it into `waiting` while the original target retires/frees.
 At that point the saved continuation is still `dirW`, but the suspender
 is no longer executing and no modelled rule promises a future user resume
 request. The revised property treats `waiting`/`claimed`/`pended` and
 `retired`/`freed` as legitimate external exits, matching the scoping
 style of `LiveReady`'s claim/retire exits rather than assuming progress
-for an EC another lifecycle operation has parked or killed. This is a
+for an thread another lifecycle operation has parked or killed. This is a
 model/spec correction, not a lifecycle bug mask; a fresh full
 `cr1fullself` verdict for the widened property is still an extended-run
 claim and must be recorded separately when run.
@@ -1533,11 +1533,11 @@ claim and must be recorded separately when run.
 `dirabafix` alone and reported the rest as unqualified PASS, and "PASS"
 reads as coverage. **DERIVED, not hand-written**: for each config, the
 `INVARIANT` lines are read from its `.cfg` and each is matched against the
-switch its predicate's fields depend on, taken from `ECLifecycle.tla`.
+switch its predicate's fields depend on, taken from `ThreadLifecycle.tla`.
 
 | config | invariants | dead | why |
 |---|---|---|---|
-| `small` | 17 | **2** | `InvNoSuspendCycle3` (a 3-cycle needs 3 ECs; has 2) · `InvNoForeignDisarm` (M-3: under `DIR_OWNED = TRUE` the disarm guard forces `dsrc = u`, so the update term is identically FALSE) |
+| `small` | 17 | **2** | `InvNoSuspendCycle3` (a 3-cycle needs 3 Threads; has 2) · `InvNoForeignDisarm` (M-3: under `DIR_OWNED = TRUE` the disarm guard forces `dsrc = u`, so the update term is identically FALSE) |
 | `medium_nodir` | 14 | 0 | directive invariants are deliberately absent, not counted as covered |
 | full `medium` | 17 | **1** | extended/manual only; `InvNoForeignDisarm`, same M-3 argument |
 | `large` | 14 | **3** | `DIR_ON = FALSE` kills `InvNoArmedFreed` and `InvNoFalseSuspendSuccess` · `PINLOCK_ON = FALSE` kills `InvNoPreemptedLockHolder` |
@@ -1553,14 +1553,14 @@ replacement is now a split rather than one aggregate pass:
 |---|---|
 | `TypeOK`, `InvS1`, `InvS3`, `InvS4Holder`, `InvS4Pended`, `InvPinCells`, `InvHopUnpinned`, `InvNoLostOneShot`, `InvHopNoClaimedOutgoing`, `InvRetiredPdOrdered`, `InvNoUAF` | `medium_nodir` at the same 2c × 3e / term-2 aggregate scope |
 | `InvNoPreemptedLockHolder` | `medium_nodir` keeps `PINLOCK_ON = TRUE`; `pinord` is the load-bearing falsifier |
-| `InvNoSuspendCycle2`, `InvNoSuspendCycle3` | `medium_nodir` keeps suspend enabled at 3 ECs; `crcyc`/`cr3` are the load-bearing falsifiers and `cr3self` keeps the focused 3-cycle row |
-| `InvNoArmedFreed` | `small` remains the default all-feature clean row; there is no current default 3-EC aggregate directive pass |
+| `InvNoSuspendCycle2`, `InvNoSuspendCycle3` | `medium_nodir` keeps suspend enabled at 3 Threads; `crcyc`/`cr3` are the load-bearing falsifiers and `cr3self` keeps the focused 3-cycle row |
+| `InvNoArmedFreed` | `small` remains the default all-feature clean row; there is no current default 3-thread aggregate directive pass |
 | `InvNoFalseSuspendSuccess` | `dirf6`/`dirf6fix` carry the targeted false-success closure and repair check; `small` remains the all-feature clean row |
 
-**Lost fact, stated plainly:** no default config is now "3 EC, all
+**Lost fact, stated plainly:** no default config is now "3 thread, all
 features, one aggregate pass." The default evidence is deliberately split
-between `medium_nodir` for the 3-EC non-directive aggregate, `small` for
-the all-feature aggregate at 2 ECs, and the directive-specific rows.
+between `medium_nodir` for the 3-thread non-directive aggregate, `small` for
+the all-feature aggregate at 2 Threads, and the directive-specific rows.
 
 **None of this is wrong and every dead line has its falsifier elsewhere**
 — `InvNoSuspendCycle3` fires in `cr3`, `InvNoForeignDisarm` in `diraba`,
@@ -1573,7 +1573,7 @@ results table that prints "PASS 2,957,560" invites the opposite reading.
 **`cr3self` needs the argument the script cannot make.** Switch analysis
 finds nothing dead, but its two cycle invariants hold **by construction**
 under `CYCLE_REJECT = "self"` — the mechanism is what makes them true, so
-the clean run establishes `TypeOK` and deadlock-freedom at 3 ECs and is
+the clean run establishes `TypeOK` and deadlock-freedom at 3 Threads and is
 not independent evidence about cycles. `crcyc` and `cr3` carry that
 content. This is the same shape as M-3's argument and it is
 mechanism-analytic rather than switch-analytic, which is exactly the class
@@ -1606,9 +1606,9 @@ the `.cfg` file, not only here.** `cr3self` and full `medium` set
 `DIR_DROP = FALSE`; `medium_nodir`, full `medium` and `xlarge` set
 `CR_BUDGET = 0`. What is
 LOST, stated as the discipline requires: with `DIR_DROP = FALSE` the
-stale/bad-port owner failure path is not exercised **at 3 ECs** — it is
+stale/bad-port owner failure path is not exercised **at 3 Threads** — it is
 covered at 2 by `dirf6`/`dirf6fix`, so a defect in that path that needs a
-third EC to construct would not be found; with `CR_BUDGET = 0` there is **no slab
+third thread to construct would not be found; with `CR_BUDGET = 0` there is **no slab
 reuse at all** in those runs, so every ABA shape that depends on a
 recycled slot is unreachable there — which is precisely the family
 `gen`/`dgen` exist to guard, and it is covered only at the smaller
@@ -1637,7 +1637,7 @@ statement about the current machine.**
 stale at the time.** Round 9's five criticals were text and apparatus: the one that
 looked like a machine change — deleting the directive word's `dropped`
 value (C-1) — turned out to be doc-only, because `dropped` was never
-modelled in the first place (see the parity-gap row above). `ECLifecycle.tla`
+modelled in the first place (see the parity-gap row above). `ThreadLifecycle.tla`
 is byte-identical to the module the revision-9 battery ran against, and
 every figure below is from that battery. This is the first revision in
 this artifact's history where that is true. The machine the battery blesses is
@@ -1665,7 +1665,7 @@ closures under target claim pins and dpin respectively.**
 | `e4` | publish-claimable-before-hop | `InvS3` | FIRED (20) |
 | `pinord` | `lock(); pin_depth += 1;` (round-7 C1) | `InvNoPreemptedLockHolder` | FIRED (82) |
 | `crcyc` | no cycle rejection (round-7 C3) | `InvNoSuspendCycle2` | FIRED (884) |
-| `cr3` | `"pair"` rejection at 3 ECs (round-7 C3) | `InvNoSuspendCycle3` | FIRED (40,498) |
+| `cr3` | `"pair"` rejection at 3 Threads (round-7 C3) | `InvNoSuspendCycle3` | FIRED (40,498) |
 | `crfals` | no cycle rejection, N6 assumptions absent | temporal (`LiveSuspender`) | FIRED (1,768) |
 | **`mterm`** | **no retired-waiter escape (round-8 C-1)** | **deadlock** | **FIRED (2,678) — 7 states** |
 | `dirf6` | round-11 C-1 false-SUCCESS shape under dpin | clean stale-gate closure | PASS (524,888) |
@@ -1700,7 +1700,7 @@ on).
 | `q7` | `LiveTerm`, 2c × 3e, **directive OFF** | `SpecTrm` | **UNCONVERGED (5,400s cap)** — 300,120 states generated in seconds, then 90 min of pure temporal checking on 900,360 product nodes with no verdict |
 | `cr1fullself` | `LiveSuspender`, full 2×2 | `SpecFairN3` | not re-run on the rev-9 graph — the slot went to `LiveTerm`, which had never been verified at all. Rev-8 verdict (PASS, 2,225s) stands for the rev-8 machine only |
 | **`t1min`** | **`LiveTerm` (W3/W4), 2c × 2e, terminate only** | `SpecTrm` | **PASS (10s, 9,585)** |
-| **`t1s`** | `LiveTerm` + cross-EC suspend / recv-pop | `SpecTrm` | **PASS (11s, 10,237)** |
+| **`t1s`** | `LiveTerm` + cross-thread suspend / recv-pop | `SpecTrm` | **PASS (11s, 10,237)** |
 | **`t1r`** | `LiveTerm` + rendezvous + pin-class locks | `SpecTrm` | **PASS (13s, 11,969)** |
 | **`t1full`** | **`LiveTerm`, FULL 2×2, ALL features** | `SpecTrm` | **PASS (2,487s, 477,468 states)** — and this is the config that settles round-9 M-1, see below |
 
@@ -1710,11 +1710,11 @@ where.** A terminates B while B suspends A: A waits in W3 for B to leave
 suspend-cycle rejection nor round-8 C-1's terminate exits touches it —
 the operations differ, so no mutual-X check fires, and neither party is
 `retired`. `t1full` has `SUSPEND_ON`, `DIR_ON` and `TERM_BUDGET = 2` at
-2 cores × 2 ECs, so the shape is constructible, and `LiveTerm` **PASSES**
+2 cores × 2 Threads, so the shape is constructible, and `LiveTerm` **PASSES**
 across all 477,468 states. The verdict's dependency is explicit and is
 the point: `SpecTrm` includes `FairTick`, and `FairTick` is the model's
 stand-in for "the periodic tick arrives" — which is true in the model by
-construction and true in the kernel only under §3.3's EC-context
+construction and true in the kernel only under §3.3's thread-context
 IRQ-enabled rule (round-9 C-4). **So the cycle's acyclicity certificate
 is machine-checked GIVEN a premise the model cannot check.** That is the
 cleanest illustration in the artifact of where this instrument stops.
@@ -1727,8 +1727,8 @@ a scope that does.)
 rev 9's `q7` did not converge at 2c × 3e. The thing that worked was not a
 bigger timeout: it was **laddering the scope while using the
 per-property MINIMAL fairness set**, exactly the discipline that
-LiveSuspender needed. `LiveTerm` holds at 2 cores × 2 ECs across three
-rungs — terminate-only, +cross-EC suspend/recv, +rendezvous/pin-locks —
+LiveSuspender needed. `LiveTerm` holds at 2 cores × 2 Threads across three
+rungs — terminate-only, +cross-thread suspend/recv, +rendezvous/pin-locks —
 in **10, 11 and 13 seconds**, against 73 minutes of non-convergence for
 the same property under full `SpecFair` at the same core count. The
 verdict rests on exactly `FairCPU`, `FairUnwind`, `FairDisp`, `FairTick`
@@ -1748,19 +1748,19 @@ because the mutual shape was inexpressible. Under revision 8's single-action
 inexpressible — which is exactly why round 8 found C-1 by READING and not
 by running: the probe written to catch this class was structurally blind
 to it. With the split in, the shape is now reachable at `q7`'s scope (2
-cores × 3 ECs, `DIR_ON = FALSE`, `TERM_BUDGET = 2`) — but the run does
+cores × 3 Threads, `DIR_ON = FALSE`, `TERM_BUDGET = 2`) — but the run does
 not converge, so **`LiveTerm` remains unverified at every scope, for the
 third revision running.** What C-1 changed is that the shape is no longer
 merely unchecked: its worst case is now checked by a SAFETY gate
 (`mterm`, 7 states, and `mtermfix` clean), which is the right instrument
 for a wedge anyway. What stays open is whether some *other*
-terminate-side liveness failure exists at 3 ECs.
+terminate-side liveness failure exists at 3 Threads.
 
 **The per-property minimal fairness sets, and what each verdict now
 rests on** (round-7 follow-up, delivered). `FairCPU` = SF(BaseStep) +
 WF(IrqStep); `FairUnwind` = WF(RetireUnwind); `FairTick` =
 SF(TickPreempt); `FairDisp` = SF(DispatchOrS7) — the family that scales
-as |Cores| × |ECs|; `FairFire` = SF(FireAny); `FairSpinTerm` /
+as |Cores| × |Threads|; `FairFire` = SF(FireAny); `FairSpinTerm` /
 `FairSpinDir` = N3's two per-spin SFs.
 
 | Property | Minimal set (`SpecX`) | Notably does NOT need |
@@ -1776,29 +1776,29 @@ The `LiveTerm` row is the one that paid off immediately: dropping
 `FairSpinDir` and `FairFire` from the set TLC must track is what turned
 73 minutes of non-convergence into 10 seconds.
 
-**Why the 3-EC liveness runs will not converge, restated with a third
+**Why the 3-thread liveness runs will not converge, restated with a third
 data point.** `cr3live` (28 min), `cr3liveself` (20 min) and now `q7`
 (90 min) all died in the temporal phase after generating their state
 spaces in seconds. The driver is the FAIRNESS-CONSTRAINT COUNT, not
-graph size: at 2 cores × 3 ECs the `DispatchOrS7` family alone is 6
+graph size: at 2 cores × 3 Threads the `DispatchOrS7` family alone is 6
 instances and the total is 22, against 14 at 2×2. `q7` was the test of
 the round-7 remedy — split by fairness constraint, giving `LiveTerm`
 only the constraints it needs (`SpecTrm`: FairCPU, FairUnwind,
 FairDisp, FairTick, FairSpinTerm) — and **the remedy was not enough**.
-`FairDisp` is the family that scales with |Cores| × |ECs| and
+`FairDisp` is the family that scales with |Cores| × |Threads| and
 `LiveTerm` genuinely needs it, so the minimal set is not much smaller
 than the full one. The next thing to try is not a bigger timeout: it is
-dropping to 2 ECs where `LiveTerm` is checkable, and accepting that the
-3-EC scope is out of reach for any property carrying `FairDisp`.
+dropping to 2 Threads where `LiveTerm` is checkable, and accepting that the
+3-thread scope is out of reach for any property carrying `FairDisp`.
 
 ## Sufficiency for the syscall API (acceptance condition 3)
 
-Every EC state change the API can cause, mapped to a named edge with a
+Every thread state change the API can cause, mapped to a named edge with a
 named actor, or explicitly out of scope with a reason.
 
 **DERIVATION: the spec's SECTION list, top to bottom (round-9 C-5).** The
 round-7 version of this table walked the spec's SYSCALL list, which is a
-strict subset — `§[restart_semantics]` is normative, per-EC, and not a
+strict subset — `§[restart_semantics]` is normative, per-thread, and not a
 syscall section, so it was structurally invisible to that walk. The
 missing rows were the symptom; the method was the defect. **Re-walking the section list is a BETTER derivation than the syscall
 walk and is still NOT CLOSED (round-11 M-5).** Revision 10 claimed here
@@ -1810,44 +1810,44 @@ it could still stop a reader looking. It was false: an independent walk
 found further gaps, including `restrict`'s port-refcount cascade waking suspended senders with E_CLOSED, `revoke`
 (zero mentions in `systems.md`), unhandled faults'
 kernel-initiated domain teardown from EXCEPTION context (a different actor
-than T2's terminator), `delete` of an EC handle mapped to edge 9 against
-a spec that says ECs are not destroyed by handle drops.
+than T2's terminator), `delete` of an thread handle mapped to edge 9 against
+a spec that says Threads are not destroyed by handle drops.
 Treat this table as incomplete until it is tool-derived. The sections
 below are confirmed only in the sense that the walk reached them:
 `§[Lifetimes]` is covered by
 retire/finalize, `§[device_irq]` is a T1 row, `§[event_state]` is §2.2's
 snapshot, `§[vm_policy]`, `§[event_type]`,
 `§[handle_attachments]`, `§[vm_exit_state]`, and `§[time]`
-cause no EC state change. Rows that cannot change a
+cause no thread state change. Rows that cannot change a
 lifecycle word are still listed, because "omitted" and "cannot" are the
 distinction a closure table exists to make.
 
 | API surface | Machine (systems.md) | Model | Actor |
 |---|---|---|---|
-| blocking waits: `futex_wait_val`, `futex_wait_change`, `recv` (no sender), `suspend` (self), wfi/hlt trap | edge 3 (wait) | `UserPark` (+`DirConsume` for directive parks; `DirFail`/`DirDrop` for owner-side directive failure with no park) | the EC's own core |
+| blocking waits: `futex_wait_val`, `futex_wait_change`, `recv` (no sender), `suspend` (self), wfi/hlt trap | edge 3 (wait) | `UserPark` (+`DirConsume` for directive parks; `DirFail`/`DirDrop` for owner-side directive failure with no park) | the thread's own core |
 | `futex_wake`, `reply`, `recv` pop, close propagation (port destroy), deadline expiries, device-IRQ delivery | edges 5a/5b + T1 | `WakeStart`, `FireAt` | any waker; 5a claimant discharges, 5b claimant pends |
 | `vm_inject_irq` waking a wfi-parked vCPU | edge 5a source list (M4) | collapsed into `WakeStart`/`FireAt` | injector |
 | `recv` re-containment, reply-pin | edges 5a+7 | `RecvPop` -> `SuspendPlace` | the holder |
-| cross-EC `suspend`: ready / idle-wait / running | 5c+7 / 5a+7 / directive §2.5 | `SuspendStart`->`SuspendPlace`, `RecvPop` path, `DirClaim/DirArm/DirLoop/DirConsume/DirFail/DirDrop` | suspender; owner core consumes or publishes failure |
-| **cross-EC `suspend` that would close a suspend CYCLE (C3)** | §2.5.1: refused with an E_BUSY-class error — **not a state change at all**, which is the point: the pathological caller is charged and the machine's normal path is untouched | `DirSelfMark`'s guard (`"self"`) or `DirClaim`'s (`"pair"`); `InvNoSuspendCycle2`/`3` | the caller, which returns the error |
+| cross-thread `suspend`: ready / idle-wait / running | 5c+7 / 5a+7 / directive §2.5 | `SuspendStart`->`SuspendPlace`, `RecvPop` path, `DirClaim/DirArm/DirLoop/DirConsume/DirFail/DirDrop` | suspender; owner core consumes or publishes failure |
+| **cross-thread `suspend` that would close a suspend CYCLE (C3)** | §2.5.1: refused with an E_BUSY-class error — **not a state change at all**, which is the point: the pathological caller is charged and the machine's normal path is untouched | `DirSelfMark`'s guard (`"self"`) or `DirClaim`'s (`"pair"`); `InvNoSuspendCycle2`/`3` | the caller, which returns the error |
 | `yield` (caller side), `yieldTo` caller requeue | edge 3 trigger list (M4) | collapsed into `TickPreempt`'s transition | owner core |
-| **`yieldTo` target side (M-4, NEW in rev 8)** | edge 2, restricted: `ready` **on this core's queue** + S7 filter + affinity mask; else degenerate to plain `yield` | `DispatchEC(c,e)` — local-only by construction (`e \in cores[c].q`) | the calling core |
+| **`yieldTo` target side (M-4, NEW in rev 8)** | edge 2, restricted: `ready` **on this core's queue** + S7 filter + affinity mask; else degenerate to plain `yield` | `DispatchThread(c,e)` — local-only by construction (`e \in cores[c].q`) | the calling core |
 | preemption, affinity-migration requeue | edges 3(requeue)+8 | `TickPreempt` + `HopCommitRequeue` | owner core's tick |
-| **tick landing on an armed, unpinned, user-mode EC (M-5)** | edge 3 (wait) — consumption BEATS requeue, §3.1 rule 3 precedence | `TickPreempt`'s rule-3 arm | owner core's tick |
-| `affinity`, ready target whose new mask excludes its queue core | §8.1: 5c claim-move + edge 6 | `AffMove` (discharges via `WakePlace`) | the editing EC, as holder |
+| **tick landing on an armed, unpinned, user-mode thread (M-5)** | edge 3 (wait) — consumption BEATS requeue, §3.1 rule 3 precedence | `TickPreempt`'s rule-3 arm | owner core's tick |
+| `affinity`, ready target whose new mask excludes its queue core | §8.1: 5c claim-move + edge 6 | `AffMove` (discharges via `WakePlace`) | the editing thread, as holder |
 | `affinity`, all other states | §8.1: the word alone; honored at the next placement's destination computation | collapsed: placement destinations are nondeterministic, which over-approximates every mask | the in-flight discharger |
-| **`priority`, waiting target (C2 — rev 7 had this WRONG)** | §8.1: re-bucket every linked wait node under its container lock (port lock; sorted all-buckets for futex) | **no action — the identity transition here** (no state change, no containment change; queues are sets, so intra-container position does not exist). Ledger G9 | the editing EC, under the reaching container lock |
-| **`priority`, ready target** | §8.1: in-lock relink within the SAME run queue — no claim, no state change | as above, no action | the editing EC, under that queue's lock |
+| **`priority`, waiting target (C2 — rev 7 had this WRONG)** | §8.1: re-bucket every linked wait node under its container lock (port lock; sorted all-buckets for futex) | **no action — the identity transition here** (no state change, no containment change; queues are sets, so intra-container position does not exist). Ledger G9 | the editing thread, under the reaching container lock |
+| **`priority`, ready target** | §8.1: in-lock relink within the SAME run queue — no claim, no state change | as above, no action | the editing thread, under that queue's lock |
 | `priority`, other states | §8.1: the word alone; the next link reads it fresh | as above | the next linker |
-| unhandled memory/thread fault, including invalid port-I/O access | edge 9 through domain teardown | `DomDie` + `RetireEC` | faulting core / teardown worker |
-| `terminate`; `delete`/`revoke` of an EC handle; cascade destroys | edge 9 + W3/W4 + L5 | `Terminate`/`TermWait` (+ env `RetireEC` for teardown walks) | terminator; §5.2 names the finalizer |
-| `create_execution_context`, `create_vcpu` | edge 1 | Init + `CreateEC` (`ready`; vCPU initial `vm_exit` is synthesized by first dispatch and normal wait publication) | creator |
+| unhandled memory/thread fault, including invalid port-I/O access | edge 9 through domain teardown | `DomDie` + `RetireThread` | faulting core / teardown worker |
+| `terminate`; `delete`/`revoke` of an thread handle; cascade destroys | edge 9 + W3/W4 + L5 | `Terminate`/`TermWait` (+ env `RetireThread` for teardown walks) | terminator; §5.2 names the finalizer |
+| `create_thread`, `create_vcpu` | edge 1 | Init + `CreateThread` (`ready`; vCPU initial `vm_exit` is synthesized by first dispatch and normal wait publication) | creator |
 | `delete(SLOT_SELF)` domain teardown; vCPU pre-loop | §8.2 / §8.1 | OUT OF SCOPE, stated: scheduler-context teardown phases and the degenerate-hop loop | park-stack code |
 | IPC fast paths | §9.4 fused compositions | `FastPath`, `ReplyFP` as ideal atomic compositions | pinned asm sites |
-| **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireEC` / `Terminate` | the exiting domain's teardown |
-| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an EC in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
-| **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an EC *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live EC, and it collides directly with `active_root` / translation quiescence (W6): a running EC on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
-| `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
+| **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireThread` / `Terminate` | the exiting domain's teardown |
+| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an thread in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an thread *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live thread, and it collides directly with `active_root` / translation quiescence (W6): a running thread on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
+| `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any thread's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
 Two rows in that table are the round-7 additions that closed acceptance
 condition 3's gaps: `yieldTo`'s target side had no rule at all, and the
@@ -1861,12 +1861,12 @@ codegen, field-level atomicity, assembly ordering, cache coherence, or
 memory-model subtleties — a model at this level would have blessed the
 real 24-byte torn read this project hit on aarch64. Specifically outside
 the boundary: W1 lock internals and **lock ordering** — the one verified
-edge (EcGen → CoreLock), the chain round 8 REFUTED and retracted (C-3),
+edge (ThreadGen → CoreLock), the chain round 8 REFUTED and retracted (C-3),
 and F2's lock-order half: all lockdep's domain, none of it checkable
 here, and round 8 is the demonstration that a wrong claim in this area
 survives a fully green battery; slab gen / S5 fusion
 and every stale-handle race; S2/S6 writer- and width-discipline; domains
-beyond a per-EC dead flag; W6/W8/W9; the §9.4 fast path's asm conformance;
+beyond a per-thread dead flag; W6/W8/W9; the §9.4 fast path's asm conformance;
 §3.3's sync-exception rule; **descriptor-write windows and
 instruction orders below action granularity — including C1's claim-side
 bump**; queue
@@ -1879,7 +1879,7 @@ campaign.
 
 *(Verdict tables follow this section; read them together.)*
 
-What the green battery establishes: at 2–3 ECs and 2–3 cores (the 4-EC
+What the green battery establishes: at 2–3 Threads and 2–3 cores (the 4-thread
 rung is `xlarge`, which has no rev-15 verdict yet), the rev-15
 protocol — the seven-state CAS word, both hand-off shapes, the pended
 split with W7's pre-CAS wait, the wait-free retired arm, the
@@ -1953,7 +1953,7 @@ literal text.
    refinement closes cycles of every length by construction and needs no
    second lock — which also removes an AB-BA the `"pair"` form would have
    created against the x86-64 fast-suspend path's existing, role-ordered
-   EC-gen-lock nesting. Until the maintainer rules on §11.8, the machine
+   thread-gen-lock nesting. Until the maintainer rules on §11.8, the machine
    the battery blesses is the one with `CYCLE_REJECT` enabled; the rev-7
    machine (`"none"`) is retained only as the falsifier that shows the
    mechanism is load-bearing. **And the meta-lesson stands: N3 → N5 → N6

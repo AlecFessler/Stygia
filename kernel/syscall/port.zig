@@ -6,8 +6,8 @@ const errors = stygia.syscall.errors;
 const port_obj = stygia.sched.port;
 
 const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
-const EcCaps = stygia.sched.execution_context.EcCaps;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const ThreadCaps = stygia.sched.thread.ThreadCaps;
+const Thread = stygia.sched.thread.Thread;
 const PortCaps = port_obj.PortCaps;
 const Word0 = capability.Word0;
 
@@ -55,8 +55,8 @@ const CREATE_PORT_CAPS_MASK: u64 = 0xFFFF;
 pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     if (caps & ~CREATE_PORT_CAPS_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const self_caps_word = Word0.caps(cd.user_table[0].word0);
@@ -74,45 +74,45 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     const requested_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
     if (!requested_caps.recv) return errors.E_PERM;
 
-    return port_obj.createPort(ec, caps);
+    return port_obj.createPort(thread, caps);
 }
 
-/// Suspends the target execution context and delivers a suspension event
-/// to a port. The event exposes the EC's state per §[event_state]; the
+/// Suspends the target thread and delivers a suspension event
+/// to a port. The event exposes the thread's state per §[event_state]; the
 /// receiver may modify state and reply through the included reply
-/// capability to resume the EC.
+/// capability to resume the thread.
 ///
 /// ```
 /// suspend([1] target, [2] port) -> void
 ///   syscall_num = 34
 ///
-///   [1] target: EC handle
+///   [1] target: thread handle
 ///   [2] port: port handle (suspension event delivery target)
 /// ```
 ///
-/// EC cap required on [1]: `susp`. Visibility and writability of the
+/// thread cap required on [1]: `susp`. Visibility and writability of the
 /// target's state in the suspension event are gated by [1]'s `read` and
 /// `write` caps.
 /// Port cap required on [2]: `suspend`. Additionally `xfer` if any handles
 /// are attached in the syscall word's `pair_count`.
 ///
-/// `[1]` may reference the calling EC; the syscall returns after the
-/// calling EC is resumed.
+/// `[1]` may reference the calling thread; the syscall returns after the
+/// calling thread is resumed.
 ///
 /// Handle attachments in the suspension event payload follow
 /// §[handle_attachments].
 ///
-/// [test 01] returns E_BADCAP if [1] is not a valid EC handle.
+/// [test 01] returns E_BADCAP if [1] is not a valid thread handle.
 /// [test 02] returns E_BADCAP if [2] is not a valid port handle.
 /// [test 03] returns E_PERM if [1] does not have the `susp` cap.
 /// [test 04] returns E_PERM if [2] does not have the `suspend` cap.
 /// [test 05] returns E_INVAL if any reserved bits are set.
 /// [test 06] returns E_INVAL if [1] references a vCPU.
 /// [test 07] returns E_INVAL if [1] is already suspended.
-/// [test 08] on success, the target EC stops executing.
+/// [test 08] on success, the target thread stops executing.
 /// [test 09] on success, a suspension event is delivered on [2].
-/// [test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
-/// [test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
+/// [test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's thread state per §[event_state]; otherwise the state in the payload is zeroed.
+/// [test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's thread state on reply; otherwise modifications are discarded.
 /// [test 12] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i64 {
     if (target & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
@@ -124,8 +124,8 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // structural violation of the attachment ABI.
     if (pair_count > MAX_PAIR_COUNT) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const irq_state = lr.irq_state;
@@ -136,7 +136,7 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
     // invalid target with a valid port returned E_PERM (port lacks
     // bind) instead of E_BADCAP.
     const target_slot: u12 = @truncate(target);
-    if (capability.resolveHandleOnDomain(cd, target_slot, .execution_context) == null) {
+    if (capability.resolveHandleOnDomain(cd, target_slot, .thread) == null) {
         cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
@@ -146,41 +146,41 @@ pub fn @"suspend"(caller: *anyopaque, target: u64, port: u64, pair_count: u8) i6
         cd_ref.unlockIrqRestore(irq_state);
         return errors.E_BADCAP;
     }
-    const ec_caps: EcCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
+    const thread_caps: ThreadCaps = @bitCast(Word0.caps(cd.user_table[target_slot].word0));
     const port_caps: PortCaps = @bitCast(Word0.caps(cd.user_table[port_slot].word0));
 
     cd_ref.unlockIrqRestore(irq_state);
 
-    if (!ec_caps.susp) return errors.E_PERM;
+    if (!thread_caps.susp) return errors.E_PERM;
     if (!port_caps.@"suspend") return errors.E_PERM;
 
-    // Spec §[handle_attachments] test 01: when the suspending EC
+    // Spec §[handle_attachments] test 01: when the suspending thread
     // attaches handles (pair_count > 0), [2] must carry the `xfer`
     // cap. This gate runs after the §[suspend] prelude tests so a
     // failure here is unambiguously the handle-attachment policy
     // rather than a §[suspend] cap miss.
     if (pair_count > 0 and !port_caps.xfer) return errors.E_PERM;
 
-    port_obj.releasePendingPairEntries(ec);
+    port_obj.releasePendingPairEntries(thread);
     if (pair_count > 0) {
-        if (validatePairEntries(ec, pair_count)) |err| return err;
+        if (validatePairEntries(thread, pair_count)) |err| return err;
     }
 
-    const ret = port_obj.suspendEc(ec, target, port);
+    const ret = port_obj.suspendThread(thread, target, port);
     if (ret != errors.OK) {
-        port_obj.releasePendingPairEntries(ec);
+        port_obj.releasePendingPairEntries(thread);
     }
     return ret;
 }
 
-/// Reads `pair_count` pair entries from the suspending EC's user
+/// Reads `pair_count` pair entries from the suspending thread's user
 /// stack at vregs `[128-N..127]` per §[syscall_abi] / §[handle_attachments]
 /// and runs the per-entry validation gates: reserved-bit check
 /// (test 06), intra-batch source-id duplicate check (test 07),
 /// per-entry source-id resolution (test 02), per-entry caps subset
 /// (test 03), and per-entry move/copy cap (tests 04/05). Returns
 /// `null` when every entry passes; otherwise the error code that fires.
-fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
+fn validatePairEntries(thread: *Thread, pair_count: u8) ?i64 {
     var entries: [PAIR_BUF_LEN]u64 = undefined;
     const n: usize = pair_count;
 
@@ -188,7 +188,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     // lives at `[user_sp + (N - firstStackVreg() + 1) * 8]` when the
     // syscall executes. With pair_count = N, entries occupy vregs
     // `[128-N..127]` per §[handle_attachments]. SMAP/PAN gates the load.
-    const user_rsp = cpu.userStackPointer(ec.ctx);
+    const user_rsp = cpu.userStackPointer(thread.ctx);
     const first_stack_vreg = cpu.firstStackVreg();
     const first_vreg: u64 = 128 - @as(u64, n);
     const first_off: u64 = (first_vreg - first_stack_vreg + 1) * 8;
@@ -226,11 +226,11 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     }
 
     // Tests 02, 03, 04, 05: per-entry source-handle resolution under
-    // the suspending EC's domain lock. Each entry is checked in turn
+    // the suspending thread's domain lock. Each entry is checked in turn
     // and the first failure short-circuits — spec does not pin
     // intra-list ordering, only that 02 fires on any invalid id, 03
     // on any cap-subset violation, etc.
-    const cd_ref = ec.domain;
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     defer cd_ref.unlockIrqRestore(lr.irq_state);
@@ -246,8 +246,8 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         const move_flag: bool = (entries[i] & PAIR_MOVE_BIT) != 0;
 
         const handle = capability.resolveHandleOnDomain(cd, slot, null) orelse {
-            ec.pending_pair_count = @intCast(i);
-            port_obj.releasePendingPairEntries(ec);
+            thread.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
 
@@ -256,37 +256,37 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         // Test 03: requested caps must be a subset of the source
         // handle's current caps. Bitwise subset suffices for every
         // cap type that ships through pair entries today (port,
-        // execution_context, page_frame, var, device_region, timer,
+        // thread, page_frame, var, device_region, timer,
         // capability_domain IDC) — none of them carry the 2-bit
         // restart_policy enum that `restrict` special-cases.
         if (entry_caps & ~src_caps != 0) {
-            ec.pending_pair_count = @intCast(i);
-            port_obj.releasePendingPairEntries(ec);
+            thread.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(thread);
             return errors.E_PERM;
         }
 
         // Tests 04/05: move/copy authority. Bit 0 = `move`, bit 1 =
         // `copy` in the cap layout shared by transferable handle
-        // types. EC handles place those bits at the same indices, so
+        // types. thread handles place those bits at the same indices, so
         // this check is type-agnostic for the handle types that can
         // ride a pair entry.
         const has_move = (src_caps & 0x1) != 0;
         const has_copy = (src_caps & 0x2) != 0;
         if (move_flag) {
             if (!has_move) {
-                ec.pending_pair_count = @intCast(i);
-                port_obj.releasePendingPairEntries(ec);
+                thread.pending_pair_count = @intCast(i);
+                port_obj.releasePendingPairEntries(thread);
                 return errors.E_PERM;
             }
         } else {
             if (!has_copy) {
-                ec.pending_pair_count = @intCast(i);
-                port_obj.releasePendingPairEntries(ec);
+                thread.pending_pair_count = @intCast(i);
+                port_obj.releasePendingPairEntries(thread);
                 return errors.E_PERM;
             }
         }
 
-        // Stash the decoded entry on the suspending EC. The kernel
+        // Stash the decoded entry on the suspending thread. The kernel
         // ref captures the source object at its current gen so the
         // recv side can mint a handle with a known-live ref. The
         // sender's source handle keeps the underlying object alive
@@ -295,7 +295,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
         // domain with the entry's caps verbatim (or intersected with
         // idc_rx for IDC handles, when that path is wired).
         const obj_type = Word0.typeTag(cd.user_table[slot].word0);
-        ec.pending_pair_entries[i] = .{
+        thread.pending_pair_entries[i] = .{
             .obj_ref = handle.ref,
             .source_domain = source_domain,
             .source_instance = handle.instance,
@@ -306,10 +306,10 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
             .move = move_flag,
             .src_slot = slot,
         };
-        ec.pending_pair_entries[i].pending_ref_caps = port_obj.pendingRefCapsForEntry(ec.pending_pair_entries[i]);
-        port_obj.acquirePendingPairEntryRef(ec.pending_pair_entries[i]) catch {
-            ec.pending_pair_count = @intCast(i);
-            port_obj.releasePendingPairEntries(ec);
+        thread.pending_pair_entries[i].pending_ref_caps = port_obj.pendingRefCapsForEntry(thread.pending_pair_entries[i]);
+        port_obj.acquirePendingPairEntryRef(thread.pending_pair_entries[i]) catch {
+            thread.pending_pair_count = @intCast(i);
+            port_obj.releasePendingPairEntries(thread);
             return errors.E_BADCAP;
         };
 
@@ -319,7 +319,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
     // Publish the count last so a partial validation failure leaves
     // `pending_pair_count == 0` and the recv path doesn't try to
     // install half-decoded entries.
-    ec.pending_pair_count = pair_count;
+    thread.pending_pair_count = pair_count;
 
     return null;
 }
@@ -327,7 +327,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
 /// Blocks waiting for an event on a port. On return, the kernel has
 /// dequeued one suspended sender, allocated a reply handle for it in the
 /// caller's table, allocated slots for any handles the sender attached,
-/// written the suspended EC's state to the caller's vregs per
+/// written the suspended thread's state to the caller's vregs per
 /// §[event_state] (and §[vm_exit_state] for vm_exits), and populated the
 /// syscall word with the reply handle id, event_type, pair_count, and
 /// tstart.
@@ -371,15 +371,15 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
 /// [test 08] on success, the syscall word's event_type equals the event_type that triggered delivery.
 /// [test 09] on success when the sender attached N handles, the syscall word's pair_count = N and the next N table slots [tstart, tstart+N) contain the inserted handles per §[handle_attachments].
 /// [test 10] on success when the sender attached no handles, pair_count = 0.
-/// [test 11] on success when the suspending EC handle had the `read` cap, the receiver's vregs reflect the suspended EC's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
-/// [test 12] on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
+/// [test 11] on success when the suspending thread handle had the `read` cap, the receiver's vregs reflect the suspended thread's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
+/// [test 12] on success when the suspending thread handle did not have the `read` cap, all event-state vregs are zeroed.
 /// [test 13] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 /// [test 14] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 pub fn recv(caller: *anyopaque, port: u64, timeout_ns: u64) i64 {
     if (port & ~capability.HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const irq_state = lr.irq_state;
@@ -395,5 +395,5 @@ pub fn recv(caller: *anyopaque, port: u64, timeout_ns: u64) i64 {
 
     if (!port_caps.recv) return errors.E_PERM;
 
-    return port_obj.recv(ec, port, timeout_ns);
+    return port_obj.recv(thread, port, timeout_ns);
 }

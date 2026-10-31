@@ -14,7 +14,7 @@
 //   cycles from a child capability domain — only an integration harness
 //   driving the kernel's IOMMU under hardware (or a QEMU-backed
 //   fixture) can observe those clauses faithfully. Both clauses stay
-//   out of reach of any test running entirely inside a userspace EC.
+//   out of reach of any test running entirely inside a userspace thread.
 //
 // What this test exercises
 //   The kernel-observable structural invariant the hardware-traffic

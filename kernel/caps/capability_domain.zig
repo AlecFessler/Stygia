@@ -1,4 +1,4 @@
-//! Capability domain — set of capabilities usable by execution contexts
+//! Capability domain — set of capabilities usable by threads
 //! bound to the domain. See docs/kernel/specv3.md §[capability_domain].
 //!
 //! Owns:
@@ -7,14 +7,14 @@
 //!   - Flat list of bound VARs
 //!   - Optional bound VM
 //!
-//! All per-domain ceilings (ec_inner/outer, var_inner/outer, cridc, idc_rx,
+//! All per-domain ceilings (thread_inner/outer, var_inner/outer, cridc, idc_rx,
 //! pf, vm, port, restart_policy, fut_wait_max) live in the self-handle at
 //! slot 0 of the handle table — kernel reads them from `user_table[0]`
 //! like anyone else, no duplication on the struct.
 //!
-//! ECs bound to this domain are reachable through the handle table (walk
-//! looking for type = execution_context) and through whatever pins them
-//! (run queue, port wait queue, etc.). No separate ECs array.
+//! Threads bound to this domain are reachable through the handle table (walk
+//! looking for type = thread) and through whatever pins them
+//! (run queue, port wait queue, etc.). No separate Threads array.
 //!
 //! STUB. Forward refs to VMAR and VirtualMachine point at intended future
 //! paths.
@@ -26,7 +26,7 @@ const build_options = @import("build_options");
 const arch = stygia.arch.dispatch;
 const elf_util = stygia.utils.elf;
 const errors = stygia.syscall.errors;
-const execution_context_mod = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const pmm = stygia.memory.pmm;
 const scheduler = stygia.sched.scheduler;
 const userspace_init = stygia.boot.userspace_init;
@@ -34,7 +34,7 @@ const userspace_init = stygia.boot.userspace_init;
 const Capability = stygia.caps.capability.Capability;
 const CapabilityType = stygia.caps.capability.CapabilityType;
 const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const KernelHandle = stygia.caps.capability.KernelHandle;
 const PAddr = stygia.memory.address.PAddr;
@@ -116,7 +116,7 @@ pub const CapabilityDomain = struct {
     //                  userspace can read cap word + field0/field1 of
     //                  any handle without a syscall. Kernel writes
     //                  field0/field1 to refresh kernel-mutable
-    //                  snapshots (EC priority/affinity, VMAR cur_rwx,
+    //                  snapshots (thread priority/affinity, VMAR cur_rwx,
     //                  device IRQ counters, etc.) directly through
     //                  the kernel R/W view of the same physical pages.
     //
@@ -226,31 +226,31 @@ pub fn initSlab(
 ///      reused — the child gets the ELF segments mapped at their
 ///      p_vaddr, a fresh user stack at ROOT_USER_STACK_TOP, and a
 ///      read-only view of the cap table at ROOT_USER_TABLE_BASE.
-///   5. allocExecutionContext for the initial EC; patch its iret frame
+///   5. allocThread for the initial thread; patch its iret frame
 ///      so RDI = ROOT_USER_TABLE_BASE (per spec — the entry point's
 ///      first arg is a pointer to the read-only cap-table view).
 ///   6. For each entry in passed_handles[0..], derive into child slot
 ///      3+ via mintHandle. `move = 1` releases the source handle.
 ///   7. Mint the IDC handle into the caller's domain pointing at the
 ///      new child; return its slot in vreg 1 / via i64.
-///   8. Enqueue the initial EC for dispatch.
+///   8. Enqueue the initial thread for dispatch.
 ///
 /// Spec validation tests 01-18 are NOT exhaustively enforced yet —
 /// reserved-bit and ceiling-subset checks are coarse. The runner exercises
 /// the success path; the per-test E_INVAL/E_PERM coverage lands once the
 /// boot loop demonstrably runs assertions.
 pub fn createCapabilityDomain(
-    caller: *ExecutionContext,
+    caller: *Thread,
     caps: u64,
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u64,
-    initial_ec_affinity: u64,
+    initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
     if (elf_pf & ~@as(u64, 0xFFF) != 0) return errors.E_INVAL;
 
-    const caller_dom = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
+    const caller_dom = caller.domain.ptr; // caller-pinned: caller is the running thread; its domain stays alive across this syscall
 
     // Resolve the ELF page frame in the caller's table. Spec §[14].
     const pf_slot: u12 = @truncate(elf_pf & 0xFFF);
@@ -323,9 +323,9 @@ pub fn createCapabilityDomain(
     // for the field0 layout.
     const self_caps: u16 = @truncate(caps & 0xFFFF);
     const idc_rx: u64 = (caps >> 16) & 0xFF;
-    const ec_var_cridc: u64 = ceilings_inner & 0x0000_0000_FFFF_FFFF;
+    const thread_var_cridc: u64 = ceilings_inner & 0x0000_0000_FFFF_FFFF;
     const pf_vm_port: u64 = (ceilings_inner >> 32) & 0x0000_0000_00FF_FFFF;
-    const self_field0: u64 = ec_var_cridc | (idc_rx << 32) | (pf_vm_port << 40);
+    const self_field0: u64 = thread_var_cridc | (idc_rx << 32) | (pf_vm_port << 40);
     const child_cd = allocCapabilityDomain(
         self_caps,
         self_field0,
@@ -347,10 +347,10 @@ pub fn createCapabilityDomain(
     // Past this point, every error must tear `child_cd` down. The CD's
     // gen-lock is published-live (alloc returned successfully), so a
     // bare `return errors.E_NOMEM` without cleanup leaks the
-    // user_table / kernel_table PMM blocks plus any ECs that were
+    // user_table / kernel_table PMM blocks plus any Threads that were
     // allocated before the failing step. Spec-test runs that exercise
     // the failure paths in `loadElfSegments` / `mapUserStack` /
-    // `allocExecutionContext` / `mintHandle` accumulated ~5 leaked CDs
+    // `allocThread` / `mintHandle` accumulated ~5 leaked CDs
     // per rep before this teardown was added — slabs filled and the
     // 11th rep wedged at a later test batch once handle-table /
     // PCID exhaustion gated the next createPort.
@@ -369,14 +369,14 @@ pub fn createCapabilityDomain(
         return errors.E_NOMEM;
     };
 
-    // Allocate the initial EC bound to the child domain. Entry =
+    // Allocate the initial thread bound to the child domain. Entry =
     // slid_entry; affinity from spec §[create_capability_domain] [5];
     // priority = normal.
-    const child_ec = execution_context_mod.allocExecutionContext(
+    const child_thread = thread_mod.allocThread(
         child_cd,
         slid_entry,
         16, // user stack pages — same as boot's root stack reservation
-        initial_ec_affinity,
+        initial_thread_affinity,
         .normal,
         null,
         null,
@@ -384,26 +384,26 @@ pub fn createCapabilityDomain(
         cleanupPartiallyCreatedCd(child_cd, null);
         return errors.E_NOMEM;
     };
-    child_ec.diag_test_tag = diag_test_tag;
-    child_ec.diag_report_entered = false;
+    child_thread.diag_test_tag = diag_test_tag;
+    child_thread.diag_report_entered = false;
 
-    // Patch the initial EC's iret frame for user-mode dispatch.
+    // Patch the initial thread's iret frame for user-mode dispatch.
     stygia.arch.dispatch.cpu.patchUserModeIretFrame(
-        child_ec.ctx,
+        child_thread.ctx,
         slid_entry,
         VAddr.fromInt(layout.stack_top),
         layout.table_base,
     );
 
-    // Mint slot-1 EC handle in the child for the initial EC. Caps =
-    // ec_inner_ceiling from ceilings_inner bits 0-7 per spec §[20].
-    const ec_inner: u16 = @truncate(ceilings_inner & 0xFF);
-    child_cd.user_table[1].word0 = Word0.pack(1, .execution_context, ec_inner);
+    // Mint slot-1 thread handle in the child for the initial thread. Caps =
+    // thread_inner_ceiling from ceilings_inner bits 0-7 per spec §[20].
+    const thread_inner: u16 = @truncate(ceilings_inner & 0xFF);
+    child_cd.user_table[1].word0 = Word0.pack(1, .thread, thread_inner);
     child_cd.user_table[1].field0 = 0;
     child_cd.user_table[1].field1 = 0;
     child_cd.kernel_table[1].ref = .{
-        .ptr = child_ec,
-        .gen = @intCast(child_ec._gen_lock.currentGen()),
+        .ptr = child_thread,
+        .gen = @intCast(child_thread._gen_lock.currentGen()),
     };
     child_cd.kernel_table[1].parent = .{};
     child_cd.kernel_table[1].first_child = .{};
@@ -445,7 +445,7 @@ pub fn createCapabilityDomain(
         .gen = @intCast(child_cd._gen_lock.currentGen()),
     };
     const caller_lr = caller_dom_ref.lockIrqSave(@src()) catch {
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        cleanupPartiallyCreatedCd(child_cd, child_thread);
         return errors.E_BADCAP;
     };
     const caller_irq_state = caller_lr.irq_state;
@@ -462,7 +462,7 @@ pub fn createCapabilityDomain(
             null,
         ) orelse {
             caller_dom_ref.unlockIrqRestore(caller_irq_state);
-            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            cleanupPartiallyCreatedCd(child_cd, child_thread);
             return errors.E_BADCAP;
         };
 
@@ -484,7 +484,7 @@ pub fn createCapabilityDomain(
             src_user.field1,
         ) catch {
             caller_dom_ref.unlockIrqRestore(caller_irq_state);
-            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            cleanupPartiallyCreatedCd(child_cd, child_thread);
             return errors.E_FULL;
         };
 
@@ -553,12 +553,12 @@ pub fn createCapabilityDomain(
     // Reserve the caller's returned IDC slot before deleting moved
     // sources. Because moved source slots are still occupied here, the
     // returned IDC cannot reuse one. Because the slot remains unpublished
-    // until after move cleanup, another EC in the caller's domain cannot
+    // until after move cleanup, another thread in the caller's domain cannot
     // observe both the moved source and the new child IDC alias.
     const caller_cridc: u16 = @truncate((readSelfField0(caller_dom) >> 24) & 0xFF);
     const idc_slot = reserveHandleSlot(caller_dom) catch {
         caller_dom_ref.unlockIrqRestore(caller_irq_state);
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        cleanupPartiallyCreatedCd(child_cd, child_thread);
         return errors.E_FULL;
     };
     caller_dom_ref.unlockIrqRestore(caller_irq_state);
@@ -581,7 +581,7 @@ pub fn createCapabilityDomain(
                 releaseReservedHandleSlot(lr.ptr, idc_slot);
                 caller_dom_ref.unlockIrqRestore(lr.irq_state);
             }
-            cleanupPartiallyCreatedCd(child_cd, child_ec);
+            cleanupPartiallyCreatedCd(child_cd, child_thread);
             return errors.E_BADCAP;
         }
     }
@@ -605,7 +605,7 @@ pub fn createCapabilityDomain(
             releaseReservedHandleSlot(lr.ptr, idc_slot);
             caller_dom_ref.unlockIrqRestore(lr.irq_state);
         }
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        cleanupPartiallyCreatedCd(child_cd, child_thread);
         return delete_result;
     }
 
@@ -613,12 +613,12 @@ pub fn createCapabilityDomain(
     // all moved source handles have been deleted. Per spec §[19]: caps =
     // caller's cridc_ceiling.
     const publish_lr = caller_dom_ref.lockIrqSave(@src()) catch {
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        cleanupPartiallyCreatedCd(child_cd, child_thread);
         return errors.E_BADCAP;
     };
     if (!stygia.caps.capability.isReservedHandleSlot(&publish_lr.ptr.kernel_table[idc_slot])) {
         caller_dom_ref.unlockIrqRestore(publish_lr.irq_state);
-        cleanupPartiallyCreatedCd(child_cd, child_ec);
+        cleanupPartiallyCreatedCd(child_cd, child_thread);
         return errors.E_BADCAP;
     }
     mintHandleAt(
@@ -634,20 +634,20 @@ pub fn createCapabilityDomain(
         0,
     );
     caller_dom_ref.unlockIrqRestore(publish_lr.irq_state);
-    maybePrintSpawnChild(child_cd, child_ec);
+    maybePrintSpawnChild(child_cd, child_thread);
 
-    // Enqueue the initial EC on a core that satisfies its affinity
+    // Enqueue the initial thread on a core that satisfies its affinity
     // mask. With affinity = 0 (any core) or a mask containing the
     // calling core, prefer the calling core; otherwise use the lowest
     // bit set in the mask. Spec §[create_capability_domain] [5].
     //
     // NOTE: this is only initial placement. `affinity == 0` remains
     // local-biased here and on ordinary re-enqueue, but x64's scheduler
-    // pull path may later steal the ready EC to any core. aarch64 keeps
-    // stealing disabled until EC migration has FP-state parity.
+    // pull path may later steal the ready thread to any core. aarch64 keeps
+    // stealing disabled until thread migration has FP-state parity.
     //
     // That matters most for a single spawner: the test runner creates
-    // every test domain from one EC with affinity 0, so the entire suite
+    // every test domain from one thread with affinity 0, so the entire suite
     // executes on one core while the rest idle. See stygia-yxj and
     // docs/kernel/open-design-questions.md.
     //
@@ -655,13 +655,13 @@ pub fn createCapabilityDomain(
     // path can still migrate it later". No such path exists.)
     const calling_core: u64 = arch.smp.coreID();
     const enqueue_core: u64 = blk: {
-        if (initial_ec_affinity == 0) break :blk calling_core;
-        if ((initial_ec_affinity >> @intCast(calling_core)) & 1 != 0) {
+        if (initial_thread_affinity == 0) break :blk calling_core;
+        if ((initial_thread_affinity >> @intCast(calling_core)) & 1 != 0) {
             break :blk calling_core;
         }
-        break :blk @ctz(initial_ec_affinity);
+        break :blk @ctz(initial_thread_affinity);
     };
-    scheduler.enqueueOnCore(@intCast(enqueue_core), child_ec);
+    scheduler.enqueueOnCore(@intCast(enqueue_core), child_thread);
 
     // Spec §[error_codes] / §[capabilities]: success returns the
     // packed Word0 (id | type<<12 | caps<<48) so the type tag in bits
@@ -751,22 +751,22 @@ inline fn readLeU32(bytes: []const u8, i: usize) u32 {
         (@as(u32, bytes[i + 3]) << 24);
 }
 
-fn maybePrintSpawnChild(cd: *CapabilityDomain, ec: *ExecutionContext) void {
+fn maybePrintSpawnChild(cd: *CapabilityDomain, thread: *Thread) void {
     if (!build_options.kernel_spawn_diag) return;
     if (cd.diag_test_tag == 0) return;
 
-    execution_context_mod.recordSpawnTrace(ec, cd, .spawn_child, 0);
+    thread_mod.recordSpawnTrace(thread, cd, .spawn_child, 0);
 
     const n = @atomicRmw(u32, &spawn_child_prints, .Add, 1, .monotonic);
     if (n >= SPAWN_CHILD_PRINT_BUDGET) return;
 
     arch.boot.print(
-        "[spawn-child] tag=0x{x} index={x} cd=0x{x} ec=0x{x} elf_slot={x} elf_pf=0x{x}\n",
+        "[spawn-child] tag=0x{x} index={x} cd=0x{x} thread=0x{x} elf_slot={x} elf_pf=0x{x}\n",
         .{
             cd.diag_test_tag,
             cd.diag_test_tag - DIAG_TEST_TAG_MAGIC,
             @intFromPtr(cd),
-            @intFromPtr(ec),
+            @intFromPtr(thread),
             cd.diag_elf_pf_slot,
             cd.diag_elf_pf_ptr,
         },
@@ -777,18 +777,18 @@ fn maybePrintSpawnChild(cd: *CapabilityDomain, ec: *ExecutionContext) void {
 /// hit a post-`allocCapabilityDomain` error. The CD is published-live
 /// at this point (gen-lock is odd / unlocked), so the destroy follows
 /// the standard `destroyPhase1` → `destroyPhase2` path. The optional
-/// `partial_ec` is the initial EC that was alloc'd before the failing
+/// `partial_thread` is the initial thread that was alloc'd before the failing
 /// step but never published into a handle (slot 1 of the child's table
-/// may or may not have been written). Phase 2's `destroyEcsInDomain`
-/// walks the EC slab matching `(cd, gen)` and reaps every EC bound to
+/// may or may not have been written). Phase 2's `destroyThreadsInDomain`
+/// walks the thread slab matching `(cd, gen)` and reaps every thread bound to
 /// this CD — so even the still-`.ready`-but-not-yet-enqueued initial
-/// EC is reaped here. Spec §[create_capability_domain] failure paths
+/// thread is reaped here. Spec §[create_capability_domain] failure paths
 /// must not leak the freshly-allocated CD; without this cleanup the
 /// kernel slab class fills after ~10 reps of the test runner and any
 /// subsequent `createPort` returns E_NOMEM.
-fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionContext) void {
-    execution_context_mod.printPreReportTerminal(partial_ec, cd, "partial_create_cleanup");
-    // `partial_ec` itself is covered by destroyEcsInDomain's slab-walk match.
+fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_thread: ?*Thread) void {
+    thread_mod.printPreReportTerminal(partial_thread, cd, "partial_create_cleanup");
+    // `partial_thread` itself is covered by destroyThreadsInDomain's slab-walk match.
     const cd_gen = cd._gen_lock.currentGen();
     const cd_ref: SlabRef(CapabilityDomain) = .{ .ptr = cd, .gen = @intCast(cd_gen) };
 
@@ -837,7 +837,7 @@ const KERNEL_TABLE_BYTES: u64 = handleTableBlockBytes(KernelHandle);
 
 /// Allocate a new CapabilityDomain — slab slot, handle tables from PMM,
 /// address-space root, slot-0 self-handle, slot-1 placeholder for the
-/// initial EC handle (filled by caller via `mintHandle`), slot-2 self-IDC.
+/// initial thread handle (filled by caller via `mintHandle`), slot-2 self-IDC.
 /// Spec §[capability_domain].
 pub fn allocCapabilityDomain(
     self_caps: u16,
@@ -907,7 +907,7 @@ pub fn allocCapabilityDomain(
         .gen = @intCast(cd_gen),
     };
 
-    // Slot 1 — placeholder for the initial EC handle; populated by the
+    // Slot 1 — placeholder for the initial thread handle; populated by the
     // caller (root bringup or `create_capability_domain`).
     user_table[1] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     kernel_table[1].ref = .{};
@@ -931,14 +931,14 @@ pub fn allocCapabilityDomain(
 /// address space, frees the table pages, frees slab.
 ///
 /// Step 10 minimal teardown. SLOT_SELF and unhandled-fault teardown callers
-/// invoke this AFTER the calling EC has been retired via
-/// `parkSelfFaulted` (it is the bound initial EC by spec —
-/// `delete(SLOT_SELF)` from inside the child runs on this very EC). At
-/// entry the EC is no longer the current_ec on its core; its kernel stack
+/// invoke this AFTER the calling thread has been retired via
+/// `parkSelfFaulted` (it is the bound initial thread by spec —
+/// `delete(SLOT_SELF)` from inside the child runs on this very thread). At
+/// entry the thread is no longer the current_thread on its core; its kernel stack
 /// frame is the one we are currently executing on, so we MUST not free
 /// the kernel stack pages here. The scheduler's noreturn dispatch will
 /// iretq off this stack once we return; the next preemption tick observes
-/// the EC as `terminated` and reaps it via the slab generation flip.
+/// the thread as `terminated` and reaps it via the slab generation flip.
 ///
 /// What this does free now: the user/kernel handle-table PMM blocks,
 /// the address-space PCID, and the CD slab slot itself. What is
@@ -951,15 +951,15 @@ pub fn allocCapabilityDomain(
 /// Snapshot the destroy state captured under the CD's `_gen_lock` for
 /// later sibling-slab tear-down. Carrying this between `destroyPhase1`
 /// and `destroyPhase2` lets the caller release outer locks (CD's
-/// `_gen_lock`, `tree_mutex`) before the EC / VM destroys lock their
+/// `_gen_lock`, `tree_mutex`) before the thread / VM destroys lock their
 /// own slab classes — without it, lockdep records `tree_mutex →
-/// EC._gen_lock` and `CD._gen_lock → EC._gen_lock` edges and any
+/// thread._gen_lock` and `CD._gen_lock → thread._gen_lock` edges and any
 /// inverse path closes an AB-BA cycle.
 pub const DestroyDeferred = struct {
     /// CD identity captured under cd._gen_lock at phase-1 entry. The gen
-    /// is the live odd value at capture; phase-2's EC walk uses
+    /// is the live odd value at capture; phase-2's thread walk uses
     /// `cd_ref.ptr` / `cd_ref.gen` for identity-only comparison against
-    /// `ec.domain` (no deref of the freed CD).
+    /// `thread.domain` (no deref of the freed CD).
     cd_ref: SlabRef(CapabilityDomain),
     cd_addr_space_root: PAddr,
     vm_ref: ?SlabRef(VirtualMachine),
@@ -977,11 +977,11 @@ pub const DestroyDeferred = struct {
     /// range). 0/0 means the stack wasn't allocated for this CD.
     user_stack_phys: u64,
     user_stack_bytes: u64,
-    /// Caller-running EC (the one that invoked `delete(SLOT_SELF)`).
-    /// Skipped by phase-2's EC walk because its kernel stack is in
+    /// Caller-running thread (the one that invoked `delete(SLOT_SELF)`).
+    /// Skipped by phase-2's thread walk because its kernel stack is in
     /// active use. The gen is captured before `parkSelfFaulted`; the
     /// walk only uses it for pointer-identity comparison.
-    caller_ec: ?SlabRef(ExecutionContext),
+    caller_thread: ?SlabRef(Thread),
 };
 
 /// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller
@@ -998,7 +998,7 @@ pub const DestroyDeferred = struct {
 /// `detachDyingDomainFromTree`'s cross-domain CD acquires inside
 /// `lockEntrySkip` (also `TREE_DOMAIN_GROUP`) trip lockdep's
 /// same-class overlap check.
-pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext)) DestroyDeferred {
+pub fn destroyPhase1(cd: *CapabilityDomain, caller_thread: ?SlabRef(Thread)) DestroyDeferred {
     // Spec §[capabilities].revoke / Lifetimes: every live handle in
     // the dying domain may sit on the cross-domain copy-derivation
     // tree (parent in another domain, children in another domain,
@@ -1014,14 +1014,14 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext
     // run here. It moved to `destroyPhase2`, immediately after
     // `awaitDomainQuiesced`. Unmapping in phase 1 was unsound: phase 1
     // only dead-marks the CD, and this function's callers hold locks
-    // that forbid the quiesce barrier, so at this point a still-live EC
+    // that forbid the quiesce barrier, so at this point a still-live thread
     // of this domain can be executing on ANOTHER core — typically
     // sitting in the kernel mid-syscall, about to `sysretq` back to
     // user. Clearing its leaf PTEs here pulls the user text out from
     // under it, and the moment it returns to user mode it takes an
     // instruction-fetch fault on an address with no VMAR. The resulting
     // `memory_fault` is then unroutable (this CD's gen is already even,
-    // so the fault port cannot be resolved) and the EC is parked with
+    // so the fault port cannot be resolved) and the thread is parked with
     // `[UNHANDLED] ... why=unbound`.
     //
     // Observed on x86-64 with the suite spread across 4 cores: the
@@ -1049,23 +1049,23 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext
         .var_count = cd.var_count,
         .user_stack_phys = cd.user_stack_phys,
         .user_stack_bytes = cd.user_stack_bytes,
-        .caller_ec = caller_ec,
+        .caller_thread = caller_thread,
     };
 
     // Dead-mark ONLY (gen → even, bytes intact, off the freelist).
     // The actual zero + freelist push runs at the END of destroyPhase2
-    // (`destroyAlreadyMarked`), after every EC of this domain has been
+    // (`destroyAlreadyMarked`), after every thread of this domain has been
     // gen-bumped and evicted. Freeing (and zeroing) here opened the
     // phase1→phase2 gap that killed CPU0 in the stygia-rs6 corpses:
-    // the domain's ECs are still gen-live and dispatchable in this
-    // window, and `switchTo` derefs `ec.domain.ptr.addr_space_root`
+    // the domain's Threads are still gen-live and dispatchable in this
+    // window, and `switchTo` derefs `thread.domain.ptr.addr_space_root`
     // raw — a dispatch racing this window read the zeroed root and
     // loaded CR3 = 0 (KVM vCPU preemption stretches the gap to
     // milliseconds). With bump-only, that read returns the REAL root
     // (bytes intact), so an in-gap dispatch runs correctly and the
     // phase-2 translation barrier sees its true `active_root`; the
     // even gen simultaneously makes handle resolution fail fast and
-    // lets the dispatch filter drop dying-domain ECs by domain-gen
+    // lets the dispatch filter drop dying-domain Threads by domain-gen
     // mismatch before their own gens are bumped.
     slab_instance.bumpDeadGenLocked(cd, cd_gen);
 
@@ -1073,19 +1073,19 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext
 }
 
 /// Phase-2 destroy: runs with NO outer locks held. Tears down every
-/// EC bound to the destroyed domain, the optional per-domain VM, and
+/// thread bound to the destroyed domain, the optional per-domain VM, and
 /// releases the table-backing PMM blocks and the address-space ID.
-/// The visitor matches ECs by `ec.domain.ptr == cd && gen == cd_gen`;
+/// The visitor matches Threads by `thread.domain.ptr == cd && gen == cd_gen`;
 /// the gen check rejects any new CD that lands on the freed slab slot
 /// between phase 1 and phase 2.
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frame-abandonment discriminator.
-/// The standing hypothesis is that `destroyEcsInDomain` re-enables IRQs
-/// (via `destroyExecutionContextLocked`'s postZombie spin), a preempt
+/// The standing hypothesis is that `destroyThreadsInDomain` re-enables IRQs
+/// (via `destroyThreadLocked`'s postZombie spin), a preempt
 /// lands, the phase-2 frame is abandoned mid-walk, and every not-yet-
-/// visited EC of the already-dead-marked domain is stranded forever.
+/// visited thread of the already-dead-marked domain is stranded forever.
 /// If that is true, `p2_enter` must exceed `p2_walk_done`. If the three
 /// counters stay equal the whole premise is dead regardless of how many
-/// ECs leak. `p2_residue` counts ECs that STILL match the dying CD after
+/// Threads leak. `p2_residue` counts Threads that STILL match the dying CD after
 /// the walk returned — a completed-but-incomplete walk, a different bug.
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). ATOMIC, deliberately: the first
 /// version of these were plain `+= 1` and four cores raced them, which
@@ -1095,7 +1095,7 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext
 /// abandoned" from "the increment evaporated", so the whole 22%-gap
 /// reading rested on nothing. Monotonic RMW makes the gap real evidence.
 pub var p2_enter: u64 = 0;
-/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Reached only if the caller-EC
+/// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Reached only if the caller-thread
 /// reap returned. `p2_enter - p2_after_reap` isolates the abandonment to
 /// that reap; `p2_after_reap - p2_walk_done` isolates it to the walk.
 pub var p2_after_reap: u64 = 0;
@@ -1110,15 +1110,15 @@ fn bump(counter: *u64, n: u64) void { // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Per-core "this core's C stack is
 /// currently inside `destroyPhase2`". Set on entry, cleared on the normal
 /// exit path. `scheduler.yieldTo` consults it at the ONE point where a
-/// frame is provably lost — `current_ec == null` and we `switchTo` some
-/// other EC, which never returns — so an abandonment is COUNTED at the
+/// frame is provably lost — `current_thread == null` and we `switchTo` some
+/// other thread, which never returns — so an abandonment is COUNTED at the
 /// moment it happens rather than inferred from a gap between two
 /// counters. Plain bools: each entry is written only by its own core.
 pub var in_phase2: [stygia.sched.scheduler.MAX_CORES]bool =
     [_]bool{false} ** stygia.sched.scheduler.MAX_CORES;
 /// TEMP DIAGNOSTIC (stygia-afo, REMOVE). Frames abandoned while inside
 /// phase 2, and frames abandoned outside it (those are harmless: the
-/// disowned frames of a parking EC, which has nothing left to run).
+/// disowned frames of a parking thread, which has nothing left to run).
 pub var abandoned_in_p2: u64 = 0;
 pub var abandoned_other: u64 = 0;
 
@@ -1138,11 +1138,11 @@ pub fn noteFrameAbandoned() void {
 
 pub fn destroyPhase2(deferred: DestroyDeferred) void {
     bump(&p2_enter, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
-    // Mask IRQs across the whole of phase 2. With the deferred caller_ec
+    // Mask IRQs across the whole of phase 2. With the deferred caller_thread
     // reap, freeUserAddrSpace, and per-handle release walk, the
     // post-Phase1 work is no longer trivially short — a preempt landing
-    // mid-phase-2 would enter yieldTo, find current_ec=null (from the
-    // earlier parkSelfFaulted), dequeue a runnable EC, and switchTo
+    // mid-phase-2 would enter yieldTo, find current_thread=null (from the
+    // earlier parkSelfFaulted), dequeue a runnable thread, and switchTo
     // away. The destroyPhase2 frame is abandoned, so the rest of the
     // cleanup never runs and resources accumulate across reps.
     const irq = arch.cpu.saveAndDisableInterrupts();
@@ -1161,12 +1161,12 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 
     // The mask above is NOT sufficient on its own, and the reason is
     // worth stating precisely because the obvious repair does not work.
-    // `destroyPhase2` calls `destroyExecutionContextLocked` — once for
-    // the caller EC just below, then once per victim inside
-    // `destroyEcsInDomain` — and that helper used to re-enable
+    // `destroyPhase2` calls `destroyThreadLocked` — once for
+    // the caller thread just below, then once per victim inside
+    // `destroyThreadsInDomain` — and that helper used to re-enable
     // interrupts UNCONDITIONALLY around its `postZombie` spin. Each such
     // window is a chance for a preempt tick to land on a frame whose
-    // `current_ec` was already cleared by `parkSelfFaulted`, at which
+    // `current_thread` was already cleared by `parkSelfFaulted`, at which
     // point `yieldTo` dispatches something else and hops to the park
     // kstack — this frame's remaining teardown never runs, and because
     // the CD is already dead-marked, nothing ever walks it again.
@@ -1176,7 +1176,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // deadlocks the machine inside the FIRST suite pass. Blocking the
     // switch also blocks the two protocols that are *implemented by*
     // switching: `PerCore.pending_kstack_release` is consumed only by
-    // the park-kstack hop, so a stashed EC keeps `on_cpu == true`
+    // the park-kstack hop, so a stashed thread keeps `on_cpu == true`
     // forever and every peer in `markReady`'s kstack barrier spins
     // without bound; and a core only publishes `active_root = 0` on its
     // way through `run()`, so a peer in `awaitNoActiveRoot` waits on a
@@ -1184,18 +1184,18 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // 1, batch 16..32, no output thereafter.
     //
     // The window is closed at its source instead — see the two escapes in
-    // `destroyExecutionContextLocked`. Stage one (stygia-afo cycle 1): try
+    // `destroyThreadLocked`. Stage one (stygia-afo cycle 1): try
     // `postZombie` ONCE under the caller's mask, and only pay for the
-    // IRQ-enabling spin when that fails. That closed the caller-EC reap
+    // IRQ-enabling spin when that fails. That closed the caller-thread reap
     // completely (`p2_enter == p2_after_reap` over 10428 destroys, against
     // 1354/6228 abandoned before) but left the walk leaking.
     //
     // Stage two (cycle 2) is what closed the walk, and the measurement is
     // the interesting part: the failing posts were not contention at all.
     // Phase 2 pins THIS core's own `pending_zombie` slot with the caller
-    // EC it reaps at the top, and this frame stands on that EC's kstack
+    // thread it reaps at the top, and this frame stands on that thread's kstack
     // until it returns, so the drain can never evict it. Every same-core
-    // victim post from `destroyEcsInDomain` then spun on a condition that
+    // victim post from `destroyThreadsInDomain` then spun on a condition that
     // could not change: over 25 aarch64 TCG passes, 1176 of 1176 failing
     // posts were same-core and 0 of 1176 ever completed. Each one hung
     // until a preempt abandoned this frame. `claimOwnZombieInline` skips
@@ -1207,7 +1207,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // has never once been observed to execute; if it ever does, the frame
     // it runs on is abandonable and the teardown below is skippable again.
 
-    // Self-destroy hazard (stygia-rs6 layer 2): when the caller EC is
+    // Self-destroy hazard (stygia-rs6 layer 2): when the caller thread is
     // destroying its OWN domain, this core is still executing with the
     // dying domain's translation root active (x86-64 CR3 covers both
     // halves). Everything below — and `freeUserAddrSpace` especially —
@@ -1231,71 +1231,71 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
 
     const pmm_mgr = if (pmm.global_pmm) |*p| p else return;
 
-    // Reap the caller EC FIRST, before anything that can drop the IRQ
+    // Reap the caller thread FIRST, before anything that can drop the IRQ
     // mask (stygia-2u0).
     //
     // The mask taken above is what keeps this frame alive — its own
     // comment warns that an abandoned frame means "the rest of the
     // cleanup never runs and resources accumulate across reps". But
-    // `destroyEcsInDomain` below reaches `destroyExecutionContextLocked`,
+    // `destroyThreadsInDomain` below reaches `destroyThreadLocked`,
     // which deliberately RE-ENABLES interrupts around its `postZombie`
     // spin (otherwise a cross-core spin here would block the very IPIs
     // it is waiting on). That reopens the preempt window mid-phase-2:
-    // `yieldTo` sees `current_ec == null` — cleared by the earlier
+    // `yieldTo` sees `current_thread == null` — cleared by the earlier
     // `parkSelfFaulted` — dequeues something else and switches away, and
     // this frame never resumes. Everything below the abandonment point
     // is silently skipped.
     //
-    // The caller EC used to be reaped at the END of phase 2, so it was
+    // The caller thread used to be reaped at the END of phase 2, so it was
     // the most likely casualty: left exactly as `parkSelfFaulted` made
     // it (state `.exited`, gen still ODD, never posted as a zombie), it
     // is then invisible to every reap path forever. Measured at ~8
-    // orphaned ECs per suite pass — a per-writer tag showed 100% of the
+    // orphaned Threads per suite pass — a per-writer tag showed 100% of the
     // leaked population came from `parkSelfFaulted` — accumulating until
     // the run stops delivering results around pass 11.
     //
     // Doing it here costs nothing and cannot be skipped: the reap only
     // dead-marks and posts a zombie (the finalize is deferred to a core
-    // that is provably off the kstack), and the `destroyEcsInDomain`
-    // walk below then skips this EC on its now-even gen rather than via
+    // that is provably off the kstack), and the `destroyThreadsInDomain`
+    // walk below then skips this thread on its now-even gen rather than via
     // `keep_ref`.
-    if (deferred.caller_ec) |caller_ref| {
+    if (deferred.caller_thread) |caller_ref| {
         // caller-pinned: `deferred.cd_ref.ptr` is an identity-only key
         // for the pending-reply comparison inside the destroy helper;
         // the CD slot is dead-marked but bytes-intact and is never
         // dereferenced through here.
-        stygia.sched.execution_context.destroyExecutionContextRefLocked(
+        stygia.sched.thread.destroyThreadRefLocked(
             caller_ref,
             deferred.cd_ref.ptr, // caller-pinned: identity-only key, never dereferenced
         );
     }
     bump(&p2_after_reap, 1); // TEMP DIAGNOSTIC (stygia-afo, REMOVE)
 
-    stygia.sched.execution_context.destroyEcsInDomain(
+    stygia.sched.thread.destroyThreadsInDomain(
         deferred.cd_ref,
         deferred.cd_addr_space_root,
-        deferred.caller_ec,
+        deferred.caller_thread,
     );
     // TEMP DIAGNOSTIC (stygia-afo, REMOVE).
     bump(&p2_walk_done, 1);
-    bump(&p2_residue, stygia.sched.execution_context.countEcsInDomain(deferred.cd_ref));
+    bump(&p2_residue, stygia.sched.thread.countThreadsInDomain(deferred.cd_ref));
 
-    // Translation barrier (stygia-rs6): the EC walk above only POSTS
+    // Translation barrier (stygia-rs6): the thread walk above only POSTS
     // zombies + wake IPIs for victims still executing on remote cores.
     // Everything after this point tears down state those victims'
     // cores may still be translating through — `freeUserAddrSpace`
     // most lethally (a core whose CR3/TTBR0 names the dying root dies
     // on its first cold walk once the tables are recycled; reproduced
     // as silent triple faults). Wait until no core has the dying root
-    // LOADED (published active_root) nor a dying-domain EC COMMITTED
-    // in its dispatch slot (current_ec — set before the root load, so
+    // LOADED (published active_root) nor a dying-domain thread COMMITTED
+    // in its dispatch slot (current_thread — set before the root load, so
     // it covers in-flight dispatches the publish can't see yet).
     // Victim cores converge within one IRQ delivery: the wake IPI
     // drives them through yieldTo's disowned-current escape into
-    // `run()`, which publishes either the next EC's root or 0 (park /
+    // `run()`, which publishes either the next thread's root or 0 (park /
     // kernel root) strictly AFTER the hardware load. Self cannot
     // deadlock this: the detach above published 0 for the self-destroy
-    // case, the caller EC is not part of the current_ec clause's
+    // case, the caller thread is not part of the current_thread clause's
     // domain membership (its slot was cleared by parkSelfFaulted or
     // names the caller which IS expected to keep running), and a
     // cross-domain destroyer publishes its own (non-dying) root.
@@ -1314,7 +1314,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // decrements `pf.mapcnt` for every still-installed page_frame, but
     // skips the per-page TLB shootdown. That skip is sound precisely
     // BECAUSE the barrier above has already run: no core has the dying
-    // CD's root loaded and no core holds a dying-domain EC in its
+    // CD's root loaded and no core holds a dying-domain thread in its
     // dispatch slot, so there is no live translation left to shoot
     // down. Running it before the barrier is what produced the
     // spurious user instruction-fetch faults this ordering fixes.
@@ -1322,7 +1322,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // Phase 1 captured `vars[]`, `var_count`, and `addr_space_root` before
     // dead-marking the CD. Walk only that snapshot here: after
     // `bumpDeadGenLocked`, the CD pointer may be used as an identity token
-    // for EC/barrier comparisons, but phase 2 must not dereference it to
+    // for thread/barrier comparisons, but phase 2 must not dereference it to
     // rediscover teardown work.
     var var_idx = deferred.var_count;
     while (var_idx > 0) {
@@ -1331,12 +1331,12 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
         stygia.memory.vmar.destroyVmarDuringDomainTeardown(v_ref, deferred.cd_addr_space_root);
     }
 
-    // NOTE (stygia-2u0): the caller-EC reap used to live HERE, at the end
+    // NOTE (stygia-2u0): the caller-thread reap used to live HERE, at the end
     // of phase 2. It moved to the top of this function — see the long
     // comment there. Anything below the first point that drops the IRQ
     // mask can be skipped entirely by a preempt abandoning this frame,
-    // and this reap was the casualty that leaked ~8 ECs per suite pass.
-    // `destroyExecutionContextLocked` early-returns on an already-even
+    // and this reap was the casualty that leaked ~8 Threads per suite pass.
+    // `destroyThreadLocked` early-returns on an already-even
     // gen, so the move is safe even if some path reaches both.
 
     if (deferred.vm_ref) |vm_slab_ref| {
@@ -1349,7 +1349,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     // `incHandleRef`/`onHandleAcquire` in passed_handles processing,
     // every such handle is a real lifetime contributor and must be
     // released here. VMARs are owned by destroyPhase2's `cd.vars[]`
-    // walk; capability_domain / execution_context / reply / vm are
+    // walk; capability_domain / thread / reply / vm are
     // domain-or-system-lifetime and have nothing to release here.
     //
     // The gen-validate-under-lock dance: destroyPhase2 runs after
@@ -1435,8 +1435,8 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     if (deferred.addr_space_id != 0) arch.paging.freeAddrSpaceId(deferred.addr_space_id);
 
     // Finish the CD slot destroy deferred from phase 1 (bumpDeadGenLocked):
-    // zero the bytes and return the slot to the freelist. Every EC of the
-    // domain is gen-dead and evicted (destroyEcsInDomain + the translation
+    // zero the bytes and return the slot to the freelist. Every thread of the
+    // domain is gen-dead and evicted (destroyThreadsInDomain + the translation
     // barrier above), so no dispatch or handle path can deref the slot's
     // fields anymore — identity-compare users (`cd_for_identity`, the
     // barrier's clause 2) only ever used the raw pointer value.

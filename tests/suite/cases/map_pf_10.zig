@@ -17,17 +17,17 @@
 //     slot 3 — no device_region is forwarded. The same `findCom1`-
 //     style scan that runner/serial.zig uses to bootstrap the
 //     primary's serial VMAR cannot succeed inside a test child,
-//     because the child's table holds self / initial_ec / self_idc /
+//     because the child's table holds self / initial_thread / self_idc /
 //     port and nothing else.
 //
 //   map = 3 (demand): per §[var] (line 877) a regular VMAR transitions
 //     to `map = 3` on the first faulted access — the kernel allocates
 //     a zero-filled page_frame, installs it at the faulting offset,
-//     and bumps `map` to 3. From a test EC the only way to fault on
+//     and bumps `map` to 3. From a test thread the only way to fault on
 //     a VMAR's range is to dereference a pointer at `VMAR.base + 0`,
 //     which (a) requires the test to actually issue a load/store at
 //     a kernel-chosen base, and (b) leaves no clean recovery path —
-//     once the demand fault installs a page, the EC continues
+//     once the demand fault installs a page, the thread continues
 //     executing at whatever its prior context was, but the VMAR is
 //     now permanently in `map = 3` *for the remaining test*. Even
 //     if the fault completes cleanly, there is no syscall in the v3
@@ -107,7 +107,7 @@
 //   For the `map = 3` arm — the test must drive the VMAR into demand
 //   mode. The cleanest path is a runner-side helper that issues a
 //   read at `VMAR.base` from a controlled trampoline, returns into
-//   the test EC with no register clobber on the test's side, then
+//   the test thread with no register clobber on the test's side, then
 //   calls map_pf on the now-`map = 3` VMAR. The action becomes:
 //     create_vmar(...) -> regular VMAR, map = 0
 //     <load from VMAR.base>            -> kernel demand-faults a page,

@@ -1,6 +1,6 @@
 // Spec §[create_capability_domain] create_capability_domain — test 29.
 //
-// "[test 29] the initial EC begins executing at the entry point
+// "[test 29] the initial thread begins executing at the entry point
 //  declared in the ELF header."
 //
 // Strategy
@@ -10,7 +10,7 @@
 //   embeds that ELF into the runner's manifest, stages it into a page
 //   frame at `create_capability_domain` time, and the kernel is
 //   expected to honor the ELF header's `e_entry` when binding the
-//   initial EC. `libz/start.zig` defines `_start` as the only exported
+//   initial thread. `libz/start.zig` defines `_start` as the only exported
 //   symbol — it dispatches into `app.main(cap_table_base)`, which is
 //   this file's `main`.
 //
@@ -25,7 +25,7 @@
 //   also assert that the kernel passed a non-zero `cap_table_base`
 //   into vreg/rdi at entry. Per §[create_capability_domain]: "The
 //   pointer to the new domain's read-only view of its capability
-//   table is passed as the first argument to the initial EC's entry
+//   table is passed as the first argument to the initial thread's entry
 //   point." A zero base would mean the kernel either skipped the
 //   ELF-prescribed entry path or invoked it without the documented
 //   argument convention; either deviation contradicts test 29.

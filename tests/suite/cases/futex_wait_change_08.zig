@@ -1,14 +1,14 @@
 // Spec §[futex_wait_change] — test 08.
 //
-// "[test 08] when another EC calls `futex_wake` on any watched addr,
+// "[test 08] when another thread calls `futex_wake` on any watched addr,
 //  returns with `[1]` set to that addr (caller re-checks the value to
 //  determine whether the condition is actually met or the wake was
 //  spurious)."
 //
 // Strategy
-//   The full assertion compares two ECs: one blocked in
-//   `futex_wait_change` on a watched addr, and a second EC that
-//   issues `futex_wake` on that addr. The blocked EC must return
+//   The full assertion compares two Threads: one blocked in
+//   `futex_wait_change` on a watched addr, and a second thread that
+//   issues `futex_wake` on that addr. The blocked thread must return
 //   with vreg 1 = the watched addr regardless of whether the wake
 //   actually changed the underlying value (the spec note about
 //   spurious wakes).
@@ -16,26 +16,26 @@
 //   The runner mints each test child capability domain with
 //   `fut_wake = true` on the self-handle (runner/primary.zig line
 //   184) and `fut_wait_max = 63` (line 167); the self-handle is
-//   shared across every EC in the domain, so any EC the test spawns
+//   shared across every thread in the domain, so any thread the test spawns
 //   inherits both rights for free. Same-domain spawn (target = 0 on
-//   create_execution_context) keeps the child in this address space
-//   so a process-global is shared memory between the two ECs — same
+//   create_thread) keeps the child in this address space
+//   so a process-global is shared memory between the two Threads — same
 //   shape `yield_03` uses to verify visibility of a child write.
 //
 //   The blocking-then-wake handshake follows naturally from the
-//   scheduler invariant: when the test EC blocks in
-//   `futex_wait_change`, the kernel runs the next runnable EC; on a
+//   scheduler invariant: when the test thread blocks in
+//   `futex_wait_change`, the kernel runs the next runnable thread; on a
 //   single-core test host that is the just-created child. The child
 //   calls `futex_wake(&watched, 1)` and halts. The kernel's
-//   `futex_wake` implementation must wake any EC blocked in either
+//   `futex_wake` implementation must wake any thread blocked in either
 //   `futex_wait_val` or `futex_wait_change` keyed on that addr per
 //   §[futex_wake]; the wake delivers vreg 1 = watched_addr to the
-//   blocked test EC per the spec line under test.
+//   blocked test thread per the spec line under test.
 //
 //   Sentinel placement: `watched` lives in .bss (zero-initialised).
 //   We pass `target = 1` so `*addr == target` is false on entry and
 //   the entry-time fast path of test 07 does not fire — the kernel
-//   has to actually park the EC and wait for the wake. The child
+//   has to actually park the thread and wait for the wake. The child
 //   never writes `watched`; the wake is by definition spurious in
 //   the spec sense (the value condition was not met). The spec
 //   under test is explicit that a spurious wake also returns the
@@ -58,9 +58,9 @@
 //   cleanly rather than hanging the runner. Any return that is
 //   neither an error nor `&watched` also fails the test.
 //
-//   Other failure paths neutralised on `create_execution_context`:
+//   Other failure paths neutralised on `create_thread`:
 //     - test 01 (lacks `crec`): runner grants `crec`.
-//     - test 03 (caps ⊄ ec_inner_ceiling): caps = 0 (no bits set).
+//     - test 03 (caps ⊄ thread_inner_ceiling): caps = 0 (no bits set).
 //     - test 06 (priority > pri ceiling): priority = 0.
 //     - test 08 (stack_pages = 0): stack_pages = 1.
 //     - test 09 (affinity out of range): affinity = 0 (any core).
@@ -68,7 +68,7 @@
 //     - tests 04/05/07 (target nonzero paths): target = 0.
 //
 // Action
-//   1. create_execution_context(caps=0, &childEntry, 1, 0, 0)
+//   1. create_thread(caps=0, &childEntry, 1, 0, 0)
 //      — must succeed; child runs `futexWake(&watched, 1)` then
 //      halts.
 //   2. futex_wait_change(timeout = 1 s,
@@ -77,13 +77,13 @@
 //      test mandates vreg 1 = `&watched`.
 //
 // Assertions
-//   1: create_execution_context returned an error word (no child
-//      EC was created, so the spec assertion under test cannot be
+//   1: create_thread returned an error word (no child
+//      thread was created, so the spec assertion under test cannot be
 //      exercised).
 //   2: futex_wait_change returned an error in vreg 1 — the kernel
 //      must surface the watched addr on a wake-leg return, not an
 //      error code (E_TIMEOUT here would mean the child's
-//      `futex_wake` never woke the test EC).
+//      `futex_wake` never woke the test thread).
 //   3: vreg 1 != &watched — the returned addr must equal the
 //      watched address the wake fired on.
 
@@ -94,15 +94,15 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Process-global watched word, shared between the test EC and the
-// child EC because both run in the same capability domain. Stays at
+// Process-global watched word, shared between the test thread and the
+// child thread because both run in the same capability domain. Stays at
 // 0 throughout the test — the child never writes it; only its
 // futex_wake call reaches the parent. .bss alignment for u64
 // guarantees 8-byte alignment per test 04.
 var watched: u64 = 0;
 
 fn childEntry() callconv(.c) noreturn {
-    // §[futex_wake]: wake up to `count` ECs blocked in
+    // §[futex_wake]: wake up to `count` Threads blocked in
     // futex_wait_val or futex_wait_change on the given address. The
     // self-handle carries `fut_wake` (runner/primary.zig line 184),
     // so test 01 cannot fire; `&watched` is 8-byte aligned (test
@@ -111,7 +111,7 @@ fn childEntry() callconv(.c) noreturn {
     // parks on the futex bucket, an early single-shot wake misses
     // and the parent times out. The continuous loop guarantees a
     // wake fires AFTER the parent's enqueue, regardless of which
-    // EC the scheduler runs first. §[futex_wake] test 04 specifies
+    // thread the scheduler runs first. §[futex_wake] test 04 specifies
     // wakes against an empty wait-queue return 0 and have no other
     // side effect, so spinning here is safe.
     while (true) {
@@ -124,13 +124,13 @@ pub fn main(cap_table_base: u64) void {
 
     // Same-domain spawn: caps = 0 (the child needs no per-handle
     // caps for `futex_wake` — that gate lives on the self-handle,
-    // shared across every EC in the domain). `restart_policy = 0`
+    // shared across every thread in the domain). `restart_policy = 0`
     // dodges restart_semantics test 01.
-    const ec_caps = caps.EcCap{ .restart_policy = 0 };
-    const caps_word: u64 = @as(u64, ec_caps.toU16());
+    const thread_caps = caps.ThreadCap{ .restart_policy = 0 };
+    const caps_word: u64 = @as(u64, thread_caps.toU16());
     const entry: u64 = @intFromPtr(&childEntry);
 
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -144,7 +144,7 @@ pub fn main(cap_table_base: u64) void {
 
     // §[futex_wait_change]: target = 1 ≠ *watched (0), so the
     // entry-time fast path of test 07 does not fire and the kernel
-    // must park the EC. We retry with a short per-call timeout —
+    // must park the thread. We retry with a short per-call timeout —
     // the child hammer-wakes, but the worker may take a few attempts
     // to interleave with the parent's enqueue on the futex bucket
     // depending on scheduler ordering. Any single attempt's strict

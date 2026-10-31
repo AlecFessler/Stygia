@@ -178,7 +178,7 @@ pub fn main(cap_table_base: u64) void {
     // 5. Mint the exit port. `bind` is required for the port to be
     //    usable as the destination of create_vcpu's vm_exit deliveries
     //    (the §[create_vcpu] [4] handle-cap check). `recv` lets the
-    //    test EC observe the scheduler-delivered initial vm_exit on
+    //    test thread observe the scheduler-delivered initial vm_exit on
     //    the port.
     const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp = syscall.createPort(@as(u64, exit_port_caps.toU16()));

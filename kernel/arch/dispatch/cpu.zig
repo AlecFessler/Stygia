@@ -6,7 +6,7 @@ const aarch64 = stygia.arch.aarch64;
 const x64 = stygia.arch.x64;
 
 const BootInfo = stygia.boot.protocol.BootInfo;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const VAddr = stygia.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
@@ -17,7 +17,7 @@ pub const ArchCpuContext = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Byte offset within the EC's saved-context buffer of the program
+/// Byte offset within the thread's saved-context buffer of the program
 /// counter slot (x86 `rip`, aarch64 `elr_el1`). Used by debug
 /// instrumentation that snapshots a fault-time PC without dereferencing
 /// the typed struct (lets `kernel/utils/` stay arch-agnostic).
@@ -27,7 +27,7 @@ pub const ctx_pc_offset: usize = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Byte offset within the EC's saved-context buffer of the user stack
+/// Byte offset within the thread's saved-context buffer of the user stack
 /// pointer slot (x86 `rsp`, aarch64 `sp_el0`).
 pub const ctx_sp_offset: usize = switch (builtin.cpu.arch) {
     .x86_64 => @offsetOf(x64.cpu.Context, "rsp"),
@@ -35,7 +35,7 @@ pub const ctx_sp_offset: usize = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Byte offset within the EC's saved-context buffer of the code segment
+/// Byte offset within the thread's saved-context buffer of the code segment
 /// selector slot (x86 `cs`). aarch64 has no per-frame CS — return 0.
 pub const ctx_cs_offset: usize = switch (builtin.cpu.arch) {
     .x86_64 => @offsetOf(x64.cpu.Context, "cs"),
@@ -43,7 +43,7 @@ pub const ctx_cs_offset: usize = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Byte offset within the EC's saved-context buffer of the flags
+/// Byte offset within the thread's saved-context buffer of the flags
 /// register slot (x86 `rflags`, aarch64 `spsr_el1`).
 pub const ctx_flags_offset: usize = switch (builtin.cpu.arch) {
     .x86_64 => @offsetOf(x64.cpu.Context, "rflags"),
@@ -51,7 +51,7 @@ pub const ctx_flags_offset: usize = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Byte offset within the EC's saved-context buffer of the stack
+/// Byte offset within the thread's saved-context buffer of the stack
 /// segment selector slot (x86 `ss`). aarch64 has no per-frame SS.
 pub const ctx_ss_offset: usize = switch (builtin.cpu.arch) {
     .x86_64 => @offsetOf(x64.cpu.Context, "ss"),
@@ -188,7 +188,7 @@ pub inline fn cpuRelax() void {
 
 /// Read the current stack pointer. Used by the deferred-destroy reaper
 /// in scheduler.takeOwnPendingZombie / arch.switchTo to test whether
-/// the running rsp is still inside a zombie EC's kernel stack — if it
+/// the running rsp is still inside a zombie thread's kernel stack — if it
 /// is, finalize must defer to a later switch.
 pub inline fn currentSp() u64 {
     return switch (builtin.cpu.arch) {
@@ -227,7 +227,7 @@ pub fn parkAndAwaitIRQ(park_top: u64) noreturn {
 /// at which this core provably no longer touches the old stack;
 /// store-release pairing with the wake-side `on_cpu` `.acquire` spins),
 /// then tail-call `entry(arg)`, which must never return. Used by the
-/// scheduler to leave a claimable EC's kstack before publishing that
+/// scheduler to leave a claimable thread's kstack before publishing that
 /// its kstack is reusable — see `sched.scheduler` kstack-release
 /// protocol (`PerCore.pending_kstack_release`).
 pub fn hopToStackAndCall(
@@ -522,7 +522,7 @@ pub inline fn fpuFlushMailbox(core: u8) *FpuFlushMailbox {
 /// IDT vector `IntVecs.fpu_flush` via the LAPIC; aarch64 raises SGI 2
 /// via the GIC (see `subsystems/fpu/SYSTEMS.md` "Cross-core migration:
 /// flush IPI protocol"). Both wire to the in-IRQ-context handler that
-/// reads the EC pointer from `fpuFlushMailbox(core)` and calls
+/// reads the thread pointer from `fpuFlushMailbox(core)` and calls
 /// `fpu.flushIpiHandler`.
 pub inline fn sendFpuFlushIpi(core: u8) void {
     switch (builtin.cpu.arch) {
@@ -572,45 +572,45 @@ pub fn initZeroPageFeatures() void {
     }
 }
 
-// ── Spec v3 EC dispatch primitives ───────────────────────────────────
+// ── Spec v3 thread dispatch primitives ───────────────────────────────────
 // FPU-trap arming, register-bank load, and TLS-base accessors used by
-// the ExecutionContext dispatch path. Spec §[execution_context].
+// the Thread dispatch path. Spec §[thread].
 
-/// Restore `ec.ctx` into the live register file and return to userspace
+/// Restore `thread.ctx` into the live register file and return to userspace
 /// via iretq / eret. Never returns to the caller. Used by the scheduler
 /// `switchTo` path after lazy-FPU bookkeeping.
-pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.loadEcContextAndReturn(ec),
-        .aarch64 => aarch64.cpu.loadEcContextAndReturn(ec),
+        .x86_64 => x64.cpu.loadThreadContextAndReturn(thread),
+        .aarch64 => aarch64.cpu.loadThreadContextAndReturn(thread),
         else => unreachable,
     }
 }
 
-/// Build the first-dispatch iret frame at the top of an EC's kernel
+/// Build the first-dispatch iret frame at the top of an thread's kernel
 /// stack. Returns the *ArchCpuContext pointer that scheduler.switchTo
-/// will pass to loadEcContextAndReturn. `entry` is the user-mode RIP;
-/// `ustack_top` is the user RSP (or null for kernel-mode init ECs);
+/// will pass to loadThreadContextAndReturn. `entry` is the user-mode RIP;
+/// `ustack_top` is the user RSP (or null for kernel-mode init Threads);
 /// `arg` is loaded into the first argument register (vreg 1 / rdi on
 /// x86-64) so create_capability_domain can pass `cap_table_base`.
-pub fn prepareEcContext(
+pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
     entry: VAddr,
     arg: u64,
 ) *ArchCpuContext {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
-        .aarch64 => aarch64.cpu.prepareEcContext(kstack_top, ustack_top, entry, arg),
+        .x86_64 => x64.cpu.prepareThreadContext(kstack_top, ustack_top, entry, arg),
+        .aarch64 => aarch64.cpu.prepareThreadContext(kstack_top, ustack_top, entry, arg),
         else => unreachable,
     };
 }
 
 /// Re-patch a previously-built iret frame from kernel-mode shape to
-/// user-mode shape. Used when an EC was allocated without a user stack
-/// (so `prepareEcContext` left the frame in kernel mode) and the
+/// user-mode shape. Used when an thread was allocated without a user stack
+/// (so `prepareThreadContext` left the frame in kernel mode) and the
 /// caller is wiring in the user stack and entry afterward — the root
-/// service's primordial EC and freshly-spawned domain ECs both follow
+/// service's primordial thread and freshly-spawned domain Threads both follow
 /// this pattern. Writes user code/data selectors, the user stack
 /// pointer (with the SysV `rsp%16==8` skew baked in), the entry RIP,
 /// and the first-arg register.
@@ -628,7 +628,7 @@ pub fn patchUserModeIretFrame(
 }
 
 /// Read the user-mode stack pointer captured on syscall entry from a
-/// saved EC context. x86_64 stashes it in `ctx.rsp`; aarch64 stashes
+/// saved thread context. x86_64 stashes it in `ctx.rsp`; aarch64 stashes
 /// it in `ctx.sp_el0` (the user SP banked register). Used by syscall
 /// paths that need to re-read vreg overflow entries off the user stack
 /// per spec §[syscall_abi].
@@ -658,7 +658,7 @@ pub fn firstStackVreg() u64 {
 
 /// Halt the local core in an interrupts-enabled state until the next
 /// interrupt (HLT with IF=1 on x86-64, WFI with DAIF cleared on
-/// aarch64). Used by the per-core idle EC.
+/// aarch64). Used by the per-core idle thread.
 pub fn idle() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.idle(),
@@ -668,7 +668,7 @@ pub fn idle() void {
 }
 
 /// Update per-core caches (per-CPU scratch + TSS.RSP0 equivalent) to
-/// "no EC dispatched" / park-state. Called by the scheduler before
+/// "no thread dispatched" / park-state. Called by the scheduler before
 /// swapping rsp to the per-core park kstack and idling. See arch impls
 /// for what fields get cleared / pointed at the park kstack top.
 pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {

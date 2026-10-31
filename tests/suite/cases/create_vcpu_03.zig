@@ -6,7 +6,7 @@
 // Spec semantics
 //   §[capability_domain] places the priority ceiling in the SelfCap
 //   `pri` field (bits 14-15 of the SelfCap word). §[create_vcpu] caps
-//   word bits 32-33 carry the requested priority for the new vCPU EC,
+//   word bits 32-33 carry the requested priority for the new vCPU thread,
 //   "0-3, bounded by caller's priority ceiling". The kernel must
 //   short-circuit to E_PERM when the requested priority exceeds the
 //   caller's ceiling.
@@ -30,8 +30,8 @@
 //     - [4] exit_port: a freshly minted port with `bind` cap. Defuses
 //       test 05 (E_BADCAP).
 //     - [3] affinity = 0: spec-defined "any core". Defuses test 06.
-//     - [1] caps low bits = 0 (no caps requested on the EC handle); the
-//       runner grants `ec_inner_ceiling = 0xFF`, so 0 is a subset.
+//     - [1] caps low bits = 0 (no caps requested on the thread handle); the
+//       runner grants `thread_inner_ceiling = 0xFF`, so 0 is a subset.
 //       Defuses test 02. Reserved bits 34-63 = 0 defuses test 07.
 //     - [1] priority = 2, encoded in bits 32-33. priority = 2 (numeric)
 //       exceeds ceiling = 1 — the spec text says "exceeds", a numeric

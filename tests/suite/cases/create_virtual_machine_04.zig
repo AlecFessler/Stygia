@@ -19,7 +19,7 @@
 //   The test capability domain's table is populated by the kernel at
 //   `create_capability_domain` time:
 //     slot 0 → self
-//     slot 1 → initial EC
+//     slot 1 → initial thread
 //     slot 2 → self-IDC
 //     slot 3 → result port (the only passed_handle from the runner)
 //   Slot 4095 — the maximum 12-bit handle id — is therefore guaranteed

@@ -1,19 +1,19 @@
 // Spec §[handle_attachments] — test 02.
 //
 // "[test 02] returns E_BADCAP if any entry's source handle id is not
-// valid in the suspending EC's domain."
+// valid in the suspending thread's domain."
 //
 // Strategy
 //   The child capability domain's table at spawn time contains:
 //     slot 0  → self
-//     slot 1  → initial EC
+//     slot 1  → initial thread
 //     slot 2  → self-IDC
 //     slot 3  → result port (granted with `bind | xfer` by the runner)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid,
 //   matching the shape used by restrict_01.
 //
-//   The test issues `suspend([1] = SLOT_INITIAL_EC, [2] = port)` with
+//   The test issues `suspend([1] = SLOT_INITIAL_THREAD, [2] = port)` with
 //   `pair_count = 1` and a single entry placed at vreg 127 per
 //   §[handle_attachments]. The entry's source `id = 4095` (an empty
 //   slot); other entry fields are zero (caps = 0, move = 0, no
@@ -21,14 +21,14 @@
 //   (test 06) and E_INVAL-duplicate (test 07) checks cannot fire and
 //   E_PERM-on-port-xfer (test 01) cannot fire because the port was
 //   granted with `xfer`. The kernel validates entries at suspend time
-//   per the §[handle_attachments] prose, so the suspending EC sees
+//   per the §[handle_attachments] prose, so the suspending thread sees
 //   E_BADCAP returned in vreg 1 without actually suspending.
 //
 // Action
 //   Build the syscall frame manually: reserve 920 bytes on the stack
 //   so vreg 127 lands at `[rsp + (127-13)*8] = [rsp + 912]` and the
 //   syscall word lands at `[rsp + 0]` per the v3 vreg ABI in
-//   `libz/syscall.zig`. libz's `suspendEc` panics on a non-empty
+//   `libz/syscall.zig`. libz's `suspendThread` panics on a non-empty
 //   attachments slice ("high-vreg layout not yet wired"), so the test
 //   issues the syscall directly via inline asm.
 //
@@ -188,7 +188,7 @@ pub fn main(cap_table_base: u64) void {
     }).toU64();
 
     const result = suspendWithOnePairAtV127(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         caps.SLOT_FIRST_PASSED,
         entry,
     );

@@ -1,12 +1,12 @@
 // Spec §[create_vcpu] — test 11.
 //
-// "[test 11] on success, the EC's affinity is set to `[3]`."
+// "[test 11] on success, the thread's affinity is set to `[3]`."
 //
 // Spec semantics
-//   §[execution_context] handle ABI: affinity lives in field1 bits 0-63
-//   as the current 64-bit core affinity mask (bit N = 1 means the EC may
+//   §[thread] handle ABI: affinity lives in field1 bits 0-63
+//   as the current 64-bit core affinity mask (bit N = 1 means the thread may
 //   run on core N). §[create_vcpu] [3] is the same 64-bit core mask
-//   passed at creation time; the kernel must seed the new vCPU EC's
+//   passed at creation time; the kernel must seed the new vCPU thread's
 //   field1 affinity from that argument.
 //
 // Strategy
@@ -14,7 +14,7 @@
 //   be defused so create_vcpu actually returns a handle:
 //     - test 01 (E_PERM no `crec`): runner grants `crec` on the test
 //       domain's self-handle (runner/primary.zig).
-//     - test 02 (E_PERM caps not subset of ec_inner_ceiling): caps = 0
+//     - test 02 (E_PERM caps not subset of thread_inner_ceiling): caps = 0
 //       is a subset of any ceiling.
 //     - test 03 (E_PERM priority exceeds caller's ceiling): priority = 2
 //       stays within the runner-granted ceiling = 3 and is non-zero so
@@ -31,7 +31,7 @@
 //     - test 07 (E_INVAL reserved bits in [1]): caps_word's bits 16-31
 //       and 34-63 stay clear.
 //
-//   On success, the kernel writes the authoritative EC handle snapshot
+//   On success, the kernel writes the authoritative thread handle snapshot
 //   into the caller's slot at create time, so we readCap directly out
 //   of the read-only handle table mapped at cap_table_base and check
 //   field1 equals the requested affinity mask. This mirrors
@@ -48,7 +48,7 @@
 //   `create_virtual_machine` returns E_NODEV on platforms without
 //   hardware virtualization (§[create_virtual_machine] test 03). On
 //   such platforms the VM cannot be minted and the spec assertion
-//   under test (affinity on the EC handle returned from create_vcpu)
+//   under test (affinity on the thread handle returned from create_vcpu)
 //   becomes unreachable. We tolerate that outcome with pass-with-id-0,
 //   mirroring create_vcpu_10's smoke shape — the QEMU/KVM runner
 //   exposes VMX/SVM, so this branch is not expected to fire there but
@@ -63,7 +63,7 @@
 //   5. createPort(caps={bind}) — exit_port for the vCPU.
 //   6. createVcpu(caps_word = priority << 32 with priority = 2,
 //                 vm_handle, affinity = 0b0010, exit_port).
-//   7. readCap(cap_table_base, ec_handle).field1 == 0b0010.
+//   7. readCap(cap_table_base, thread_handle).field1 == 0b0010.
 //
 // Assertions
 //   1: setup — any setup syscall (page frame, var, map_pf, create_port)
@@ -184,13 +184,13 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: HandleId = @truncate(result.v1 & 0xFFF);
+    const thread_handle: HandleId = @truncate(result.v1 & 0xFFF);
 
-    // 7. §[execution_context] field1 bits 0-63 = affinity. Read the cap
+    // 7. §[thread] field1 bits 0-63 = affinity. Read the cap
     //    entry out of the read-only handle table mapped at cap_table_base.
     //    The kernel writes the authoritative snapshot at create time,
     //    so a fresh `sync` is not required for the read to be observable.
-    const cap = caps.readCap(cap_table_base, ec_handle);
+    const cap = caps.readCap(cap_table_base, thread_handle);
     if (cap.field1 != requested_affinity) {
         testing.fail(2);
         return;

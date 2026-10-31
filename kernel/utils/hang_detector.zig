@@ -5,7 +5,7 @@
 //! `now - last_progress_ns` against `HANG_THRESHOLD_NS`; on overshoot,
 //! calls `dump()` exactly once).
 //!
-//! `dump()` walks every initialized core_states[i] and emits the ec/state/
+//! `dump()` walks every initialized core_states[i] and emits the thread/state/
 //! on_cpu/run-queue snapshot for each, plus the runner's likely result-port
 //! wait queue if it can be inferred. Output is unlocked `printRaw` (same
 //! discipline as panic) so it can run mid-spinlock without deadlocking.
@@ -39,22 +39,22 @@ const stygia = @import("stygia");
 const build_options = @import("build_options");
 
 const arch = stygia.arch.dispatch;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const capability_domain = stygia.caps.capability_domain;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 const spin_diag = stygia.utils.spin_diag;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
-const EventType = stygia.sched.execution_context.EventType;
-const State = stygia.sched.execution_context.State;
-const WaitKind = stygia.sched.execution_context.WaitKind;
+const Thread = stygia.sched.thread.Thread;
+const EventType = stygia.sched.thread.EventType;
+const State = stygia.sched.thread.State;
+const WaitKind = stygia.sched.thread.WaitKind;
 
 /// 4s of no-newline-progress = hang. Used as a backstop only — the
 /// primary detector on this branch is `allCoresIdle()` driven from the
 /// HPET-NMI watchdog, which fires within ~30 ms of every core entering
-/// the user-mode idle hlt loop with current_ec=null (the smp=4 reply-FP
+/// the user-mode idle hlt loop with current_thread=null (the smp=4 reply-FP
 /// signature). The 4s threshold catches the slow-tail variants where
-/// userspace IS still running but a single EC is wedged in a fault
+/// userspace IS still running but a single thread is wedged in a fault
 /// loop.
 pub const HANG_THRESHOLD_NS: u64 = 4_000_000_000;
 
@@ -240,12 +240,12 @@ fn dump(elapsed_ns: u64) void {
     dumpLifecycleCounters();
     dumpSpawnTraceSamples();
 
-    // Walk every alive EC slab slot and emit its state. Catches
+    // Walk every alive thread slab slot and emit its state. Catches
     // orphaned waiters parked in port wait queues that don't show up
-    // in any per-core current_ec / run_queue. Bounded by the slab
+    // in any per-core current_thread / run_queue. Bounded by the slab
     // total — typically <100 in a smp=4 test run, so this is cheap.
-    rawWrite("[HANG] live ECs:\n");
-    execution_context.slab_instance.forEachAlive(@as(*u8, @ptrCast(&dump_visit_dummy)), dumpAliveEc);
+    rawWrite("[HANG] live Threads:\n");
+    thread_mod.slab_instance.forEachAlive(@as(*u8, @ptrCast(&dump_visit_dummy)), dumpAliveThread);
 
     rawWrite("[HANG] (end)\n");
 }
@@ -328,21 +328,21 @@ fn dumpLifecycleCounters() void {
     rawWrite(" abandoned_other=");
     printDecimal(loadCounter(&capability_domain.abandoned_other));
     rawWrite(" walk=");
-    printDecimal(loadCounter(&execution_context.walk_visit_enter));
+    printDecimal(loadCounter(&thread_mod.walk_visit_enter));
     rawWrite("/");
-    printDecimal(loadCounter(&execution_context.walk_visit_done));
+    printDecimal(loadCounter(&thread_mod.walk_visit_done));
     rawWrite(" slow_post=");
-    printDecimal(loadCounter(&execution_context.slow_post_spins));
+    printDecimal(loadCounter(&thread_mod.slow_post_spins));
     rawWrite("/");
-    printDecimal(loadCounter(&execution_context.slow_post_done));
+    printDecimal(loadCounter(&thread_mod.slow_post_done));
     rawWrite(" slow_self=");
-    printDecimal(loadCounter(&execution_context.slow_post_self));
+    printDecimal(loadCounter(&thread_mod.slow_post_self));
     rawWrite(" inline=");
-    printDecimal(loadCounter(&execution_context.inline_finalize_ok));
+    printDecimal(loadCounter(&thread_mod.inline_finalize_ok));
     rawWrite("/");
-    printDecimal(loadCounter(&execution_context.inline_finalize_no));
+    printDecimal(loadCounter(&thread_mod.inline_finalize_no));
     rawWrite(" park=");
-    printDecimal(loadCounter(&execution_context.park_calls));
+    printDecimal(loadCounter(&thread_mod.park_calls));
     rawWrite("\n");
 
     dumpPreReportTerminalSamples();
@@ -354,24 +354,24 @@ fn loadCounter(counter: *u64) u64 {
 
 fn dumpPreReportTerminalSamples() void {
     if (!build_options.kernel_spawn_diag) return;
-    const max_seq = @atomicLoad(u64, &execution_context.pre_report_terminal_seq, .monotonic);
+    const max_seq = @atomicLoad(u64, &thread_mod.pre_report_terminal_seq, .monotonic);
     rawWrite("[HANG] pre-report terminal samples: seq=");
     printDecimal(max_seq);
     rawWrite("\n");
     if (max_seq == 0) return;
 
-    const ring_len = execution_context.PRE_REPORT_TERMINAL_RING_LEN;
+    const ring_len = thread_mod.PRE_REPORT_TERMINAL_RING_LEN;
     const first_seq = if (max_seq > ring_len) max_seq - ring_len + 1 else 1;
     var seq = first_seq;
     while (seq <= max_seq) : (seq += 1) {
         const idx: usize = @intCast(seq % ring_len);
-        const slot = &execution_context.pre_report_terminal_ring[idx];
+        const slot = &thread_mod.pre_report_terminal_ring[idx];
         const before = slot.publish_seq.load(.acquire);
         if (before != seq) continue;
         const sample_seq = slot.seq;
         const tag = slot.tag;
         const cd = slot.cd;
-        const ec = slot.ec;
+        const thread = slot.thread;
         const reason = slot.reason;
         const after = slot.publish_seq.load(.acquire);
         if (after != before or sample_seq != seq) continue;
@@ -384,8 +384,8 @@ fn dumpPreReportTerminalSamples() void {
         printDecimal(tag - 0x8000);
         rawWrite(" cd=");
         printHex(@as(u64, cd));
-        rawWrite(" ec=");
-        printHex(@as(u64, ec));
+        rawWrite(" thread=");
+        printHex(@as(u64, thread));
         rawWrite(" reason=");
         rawWrite(reason);
         rawWrite("\n");
@@ -394,25 +394,25 @@ fn dumpPreReportTerminalSamples() void {
 
 fn dumpSpawnTraceSamples() void {
     if (!build_options.kernel_spawn_diag) return;
-    const max_seq = @atomicLoad(u64, &execution_context.spawn_trace_seq, .monotonic);
+    const max_seq = @atomicLoad(u64, &thread_mod.spawn_trace_seq, .monotonic);
     rawWrite("[HANG] spawn trace samples: seq=");
     printDecimal(max_seq);
     rawWrite("\n");
     if (max_seq == 0) return;
 
-    const ring_len = execution_context.SPAWN_TRACE_RING_LEN;
+    const ring_len = thread_mod.SPAWN_TRACE_RING_LEN;
     const first_seq = if (max_seq > ring_len) max_seq - ring_len + 1 else 1;
     var seq = first_seq;
     while (seq <= max_seq) : (seq += 1) {
         const idx: usize = @intCast(seq % ring_len);
-        const slot = &execution_context.spawn_trace_ring[idx];
+        const slot = &thread_mod.spawn_trace_ring[idx];
         const before = slot.publish_seq.load(.acquire);
         if (before != seq) continue;
         const sample_seq = slot.seq;
         const event = slot.event;
         const tag = slot.tag;
         const core = slot.core;
-        const ec = slot.ec;
+        const thread = slot.thread;
         const cd = slot.cd;
         const gen = slot.gen;
         const state = slot.state;
@@ -432,8 +432,8 @@ fn dumpSpawnTraceSamples() void {
         printDecimal(tag - 0x8000);
         rawWrite(" core=");
         printDecimal(core);
-        rawWrite(" ec=");
-        printHex(@as(u64, ec));
+        rawWrite(" thread=");
+        printHex(@as(u64, thread));
         rawWrite(" cd=");
         printHex(@as(u64, cd));
         rawWrite(" gen=");
@@ -450,7 +450,7 @@ fn dumpSpawnTraceSamples() void {
     }
 }
 
-fn printSpawnTraceEvent(event: execution_context.SpawnTraceEvent) void {
+fn printSpawnTraceEvent(event: thread_mod.SpawnTraceEvent) void {
     rawWrite(switch (event) {
         .spawn_child => "spawn",
         .enqueue_attempt => "enq-attempt",
@@ -486,26 +486,26 @@ var dump_visit_dummy: u8 = 0;
 var before_spin: [scheduler.MAX_CORES]u64 = [_]u64{0} ** scheduler.MAX_CORES;
 var before_ent: [scheduler.MAX_CORES]u64 = [_]u64{0} ** scheduler.MAX_CORES;
 
-fn dumpAliveEc(_: *u8, ec: *ExecutionContext, gen: u63) bool {
+fn dumpAliveThread(_: *u8, thread: *Thread, gen: u63) bool {
     @setRuntimeSafety(false);
-    rawWrite("[HANG]   ec=");
-    printHex(@intFromPtr(ec));
+    rawWrite("[HANG]   thread=");
+    printHex(@intFromPtr(thread));
     rawWrite(" gen=");
     printHex(@as(u64, gen));
     rawWrite(" state=");
-    printState(lifecycle.load(ec));
+    printState(lifecycle.load(thread));
     rawWrite(" owner=");
-    printDecimal(@as(u64, ec.owner_core));
+    printDecimal(@as(u64, thread.owner_core));
     rawWrite(" q=");
-    printQueueCore(ec);
+    printQueueCore(thread);
     rawWrite(" pin=");
-    printDecimal(@as(u64, ec.pin_depth.load(.acquire)));
+    printDecimal(@as(u64, thread.pin_depth.load(.acquire)));
     rawWrite(" mark=");
-    printHex(@as(u64, ec.mark_state.load(.acquire)));
+    printHex(@as(u64, thread.mark_state.load(.acquire)));
     rawWrite(" dir=");
-    printDirective(ec);
+    printDirective(thread);
     rawWrite(" wait=");
-    printWaitSummary(ec);
+    printWaitSummary(thread);
     rawWrite("\n");
     return true;
 }
@@ -516,29 +516,29 @@ fn dumpCore(core_id: u8) void {
 
     const pc = &scheduler.core_states[core_id];
 
-    if (pc.current_ec) |ec| {
-        rawWrite(" current_ec=");
-        printHex(@intFromPtr(ec));
+    if (pc.current_thread) |thread| {
+        rawWrite(" current_thread=");
+        printHex(@intFromPtr(thread));
         rawWrite(" ref_gen=");
-        printHex(@as(u64, pc.current_ec_gen));
+        printHex(@as(u64, pc.current_thread_gen));
         rawWrite(" slot_gen=");
-        printHex(@as(u64, ec._gen_lock.currentGen()));
+        printHex(@as(u64, thread._gen_lock.currentGen()));
         rawWrite(" state=");
-        printState(lifecycle.load(ec));
+        printState(lifecycle.load(thread));
         rawWrite(" owner=");
-        printDecimal(@as(u64, ec.owner_core));
+        printDecimal(@as(u64, thread.owner_core));
         rawWrite(" q=");
-        printQueueCore(ec);
+        printQueueCore(thread);
         rawWrite(" pin=");
-        printDecimal(@as(u64, ec.pin_depth.load(.acquire)));
+        printDecimal(@as(u64, thread.pin_depth.load(.acquire)));
         rawWrite(" mark=");
-        printHex(@as(u64, ec.mark_state.load(.acquire)));
+        printHex(@as(u64, thread.mark_state.load(.acquire)));
         rawWrite(" dir=");
-        printDirective(ec);
+        printDirective(thread);
         rawWrite(" wait=");
-        printWaitSummary(ec);
+        printWaitSummary(thread);
     } else {
-        rawWrite(" current_ec=null");
+        rawWrite(" current_thread=null");
     }
 
     if (pc.teardown_pending != null) rawWrite(" teardown_pending=1");
@@ -565,8 +565,8 @@ fn dumpCore(core_id: u8) void {
     var any_q = false;
     var lvl: usize = 0;
     while (lvl < pc.run_queue.levels.len) {
-        const head_ec: ?*ExecutionContext = pc.run_queue.levels[lvl].head;
-        if (head_ec) |e| {
+        const head_thread: ?*Thread = pc.run_queue.levels[lvl].head;
+        if (head_thread) |e| {
             if (!any_q) {
                 rawWrite("[HANG]   run_queue:");
                 any_q = true;
@@ -592,106 +592,106 @@ fn dumpCore(core_id: u8) void {
     }
 }
 
-fn countQueueLevelBounded(head: *ExecutionContext) u64 {
+fn countQueueLevelBounded(head: *Thread) u64 {
     var count: u64 = 0;
-    var cur: ?*ExecutionContext = head;
-    while (cur) |ec| {
+    var cur: ?*Thread = head;
+    while (cur) |thread| {
         count += 1;
         if (count == 8) {
-            if (ec.next != null) return 9; // 9 means "8+"
+            if (thread.next != null) return 9; // 9 means "8+"
             return count;
         }
-        cur = ec.next;
+        cur = thread.next;
     }
     return count;
 }
 
-fn printWaitSummary(ec: *ExecutionContext) void {
-    printWaitKind(ec.wait.kind);
+fn printWaitSummary(thread: *Thread) void {
+    printWaitKind(thread.wait.kind);
     rawWrite("(");
-    printDecimal(@as(u64, @intFromEnum(ec.wait.kind)));
+    printDecimal(@as(u64, @intFromEnum(thread.wait.kind)));
     rawWrite(")");
     rawWrite(" payload_done=");
-    printBool(ec.wait.payload_done.load(.acquire));
+    printBool(thread.wait.payload_done.load(.acquire));
 
-    if (ec.wait.port) |p| {
+    if (thread.wait.port) |p| {
         rawWrite(" wait_port=");
         printHex(@intFromPtr(p.ptr));
         rawWrite("/g=");
         printHex(@as(u64, p.gen));
     }
-    if (ec.wait.deadline_ns != 0) {
+    if (thread.wait.deadline_ns != 0) {
         rawWrite(" wait_due=");
-        printDeadlineDelta(ec.wait.deadline_ns, arch.time.currentMonotonicNs());
+        printDeadlineDelta(thread.wait.deadline_ns, arch.time.currentMonotonicNs());
     }
-    if (ec.recv_deadline_ns != 0) {
+    if (thread.recv_deadline_ns != 0) {
         rawWrite(" recv_due=");
-        printDeadlineDelta(ec.recv_deadline_ns, arch.time.currentMonotonicNs());
+        printDeadlineDelta(thread.recv_deadline_ns, arch.time.currentMonotonicNs());
     }
-    if (ec.futex_deadline_ns != 0) {
+    if (thread.futex_deadline_ns != 0) {
         rawWrite(" futex_due=");
-        printDeadlineDelta(ec.futex_deadline_ns, arch.time.currentMonotonicNs());
+        printDeadlineDelta(thread.futex_deadline_ns, arch.time.currentMonotonicNs());
     }
-    if (ec.futex_bucket_count != 0) {
+    if (thread.futex_bucket_count != 0) {
         rawWrite(" futex_n=");
-        printDecimal(@as(u64, ec.futex_bucket_count));
+        printDecimal(@as(u64, thread.futex_bucket_count));
         rawWrite(" wake_idx=");
-        printDecimal(@as(u64, ec.futex_wake_index));
+        printDecimal(@as(u64, thread.futex_wake_index));
     }
-    if (ec.suspend_port) |sp| {
+    if (thread.suspend_port) |sp| {
         rawWrite(" susp_port=");
         printHex(@intFromPtr(sp.ptr));
         rawWrite("/g=");
         printHex(@as(u64, sp.gen));
     }
-    if (ec.pending_pair_count != 0) {
+    if (thread.pending_pair_count != 0) {
         rawWrite(" pairs=");
-        printDecimal(@as(u64, ec.pending_pair_count));
+        printDecimal(@as(u64, thread.pending_pair_count));
     }
-    if (ec.pending_reply_holder) |holder| {
+    if (thread.pending_reply_holder) |holder| {
         rawWrite(" reply_holder=");
         printHex(@intFromPtr(holder));
-        if (ec.pending_reply_domain) |prd| {
+        if (thread.pending_reply_domain) |prd| {
             rawWrite(" reply_cd=");
             printHex(@intFromPtr(prd.ptr));
             rawWrite("/slot=");
-            printDecimal(@as(u64, ec.pending_reply_slot));
+            printDecimal(@as(u64, thread.pending_reply_slot));
         }
     }
-    if (ec.pending_event_word_valid) rawWrite(" event_word_pending");
-    if (ec.pending_event_rip_valid) rawWrite(" event_rip_pending");
-    if (ec.event_type != .none) {
+    if (thread.pending_event_word_valid) rawWrite(" event_word_pending");
+    if (thread.pending_event_rip_valid) rawWrite(" event_rip_pending");
+    if (thread.event_type != .none) {
         rawWrite(" event=");
-        printEventType(ec.event_type);
+        printEventType(thread.event_type);
         rawWrite("/");
-        printDecimal(@as(u64, ec.event_subcode));
+        printDecimal(@as(u64, thread.event_subcode));
         rawWrite(" addr=");
-        printHex(ec.event_addr);
+        printHex(thread.event_addr);
     }
 }
 
-fn printQueueCore(ec: *ExecutionContext) void {
-    const q = ec.current_queue_core.load(.acquire);
-    if (q == stygia.sched.execution_context.NOT_IN_RUN_QUEUE) {
+fn printQueueCore(thread: *Thread) void {
+    const q = thread.current_queue_core.load(.acquire);
+    if (q == stygia.sched.thread.NOT_IN_RUN_QUEUE) {
         rawWrite("none");
     } else {
         printDecimal(@as(u64, q));
     }
 }
 
-fn printDirective(ec: *ExecutionContext) void {
-    const word = ec.directive_state.load(.acquire);
+fn printDirective(thread: *Thread) void {
+    const word = thread.directive_state.load(.acquire);
     printDirectiveTag(lifecycle.directiveTag(word));
     const slot = lifecycle.directiveOwnerSlot(word);
     if (slot != 0) {
         rawWrite("/slot=");
         printDecimal(@as(u64, slot));
     }
-    if (ec.directive_port) |p| {
+    if (thread.directive_port) |p| {
         rawWrite("/port=");
         printHex(@intFromPtr(p.ptr));
     }
-    if (ec.directive_owner) |owner| {
+    if (thread.directive_owner) |owner| {
         rawWrite("/owner=");
         printHex(@intFromPtr(owner));
     }

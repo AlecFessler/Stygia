@@ -19,11 +19,11 @@
 //        handle with `xfer` set (per §[reply] handle-ABI prose), which
 //        reply test 09 says is required to consume it with
 //        pair_count > 0 at all.
-//     2. Mint a sibling EC W with `susp | term`, restart_policy = 0.
+//     2. Mint a sibling thread W with `susp | term`, restart_policy = 0.
 //        susp lets us queue W on the port; term + rp=0 keeps W's
 //        cleanup contained inside this test domain (no restart
 //        fallback can re-resurrect W and surprise the recv path).
-//     3. suspend(W, port) — non-blocking on the test EC because [1] !=
+//     3. suspend(W, port) — non-blocking on the test thread because [1] !=
 //        self per §[suspend]; queues W as a suspended sender on the
 //        port.
 //     4. recv(port) — returns immediately with W as the dequeued
@@ -31,7 +31,7 @@
 //        (bits 32-43) is the handle we feed to reply.
 //
 //   For the source pair entries we use freshly-minted ports as donors.
-//   Ports are the cheapest non-EC handle the test domain has rights
+//   Ports are the cheapest non-thread handle the test domain has rights
 //   to mint (the runner grants `crpt`), and they let us craft the
 //   exact source-cap shape each `move` polarity needs:
 //
@@ -64,7 +64,7 @@
 //   plain `reply()`. The validation in `kernel/syscall/reply.zig`
 //   does enforce reserved-bit / xfer / dup-source checks, but the
 //   actual pair-entry transfer (slot moves from the caller's table to
-//   the resumed EC's table) is unimplemented. On the v0 kernel the
+//   the resumed thread's table) is unimplemented. On the v0 kernel the
 //   move=1 source slot will NOT be released, so assertion id 6 will
 //   fire with the donor still resolvable. The faithful body is left
 //   in place so that when the kernel's pair-attachment transfer lands
@@ -73,7 +73,7 @@
 //
 // Action
 //   1. create_port(caps={move, copy, xfer, recv, bind})  — recv-side port
-//   2. create_execution_context(caps={susp, term, rp=0}) — sibling EC W
+//   2. create_thread(caps={susp, term, rp=0}) — sibling thread W
 //   3. suspend(W, port)                                  — must return OK
 //   4. recv(port)                                        — must return OK
 //   5. create_port(caps={move, copy, xfer, bind})        — donor M
@@ -87,7 +87,7 @@
 //
 // Assertion ids
 //   1: setup port creation (recv side) failed
-//   2: sibling EC creation failed
+//   2: sibling thread creation failed
 //   3: suspend(W, port) did not return OK
 //   4: recv did not return OK
 //   5: donor port creation failed (either M or C)
@@ -141,19 +141,19 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp_recv.v1 & 0xFFF);
 
-    // Step 2: sibling EC W. susp queues it on the port; term keeps
+    // Step 2: sibling thread W. susp queues it on the port; term keeps
     // cleanup contained; restart_policy = 0 (kill) so the runner-
-    // granted ec_restart_max (=2) ceiling is trivially satisfied and
+    // granted thread_restart_max (=2) ceiling is trivially satisfied and
     // no restart fallback re-resurrects W.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -176,7 +176,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 4: recv. Returns immediately because W is already queued
-    // and the test EC holds the port's bind cap (no E_CLOSED) and the
+    // and the test thread holds the port's bind cap (no E_CLOSED) and the
     // domain has plenty of free slots (no E_FULL).
     const got = syscall.recv(port_handle, 0);
     if (got.regs.v1 != @intFromEnum(errors.Error.OK)) {

@@ -15,7 +15,7 @@ const port = stygia.sched.port;
 const sched = stygia.sched.scheduler;
 const timers = stygia.arch.x64.timers;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GateType = stygia.arch.x64.idt.GateType;
 const PrivilegeLevel = stygia.arch.x64.cpu.PrivilegeLevel;
 const SpinLock = stygia.utils.sync.SpinLock;
@@ -117,10 +117,10 @@ pub fn init() void {
     );
 
     // Lazy-FPU cross-core flush IPI vector. Sent by `cpu.fpuFlushIpi`
-    // when the scheduler migrates an EC whose FP regs still live on
+    // when the scheduler migrates an thread whose FP regs still live on
     // a remote core's hardware. Receiver runs `fpuFlushIpiHandler` to
-    // FXSAVE the requested EC's state from this core's regs into
-    // the EC's `fpu_state` buffer, then acks the mailbox.
+    // FXSAVE the requested thread's state from this core's regs into
+    // the thread's `fpu_state` buffer, then acks the mailbox.
     const fpu_flush_vec = @intFromEnum(interrupts.IntVecs.fpu_flush);
     idt.openInterruptGate(
         fpu_flush_vec,
@@ -200,7 +200,7 @@ fn spuriousHandler(ctx: *cpu.Context) void {
 }
 
 /// IPI handler for the lazy-FPU cross-core flush. Reads the requested
-/// EC from this core's mailbox, calls into the generic FPU module
+/// thread from this core's mailbox, calls into the generic FPU module
 /// (which checks if this core is still the owner and FXSAVEs if so),
 /// then acks the mailbox so the requester unblocks.
 fn fpuFlushIpiHandler(_: *cpu.Context) void {
@@ -210,12 +210,12 @@ fn fpuFlushIpiHandler(_: *cpu.Context) void {
         slot.ackDone();
         return;
     };
-    const ec: *ExecutionContext = @ptrCast(@alignCast(opaque_ptr));
-    fpu.flushIpiHandler(ec);
+    const thread: *Thread = @ptrCast(@alignCast(opaque_ptr));
+    fpu.flushIpiHandler(thread);
     slot.ackDone();
 }
 
-/// LAPIC-timer preemption tick. The scheduler reads the current EC and
+/// LAPIC-timer preemption tick. The scheduler reads the current thread and
 /// per-core state from `core_states[apic.coreID()]` directly, so the
 /// vector handler just delegates.
 ///
@@ -242,7 +242,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // making this in-band hook the only reliable trigger. Cheap fast
     // path: 1 atomic load + 1 TSC read + 1 compare when nothing is
     // wrong. NB: the all-cores-idle path is intentionally not reached
-    // from here (current_ec != null inside any tick).
+    // from here (current_thread != null inside any tick).
     stygia.utils.hang_detector.tickCheck();
 
     // No periodic debug print here. The runner emits its own per-batch

@@ -1,8 +1,8 @@
 // Scheduler balance -- pull-side work stealing smoke.
 //
 // This is not a specv3 syscall assertion. It is a scheduler regression
-// test for affinity-0 ECs: create a batch of runnable workers with
-// affinity = 0 from one test EC, then prove the workers execute on more
+// test for affinity-0 Threads: create a batch of runnable workers with
+// affinity = 0 from one test thread, then prove the workers execute on more
 // than one core. It remains meaningful when the suite runner is invoked
 // with -Dspread_cores=false because the workers are created inside this
 // test domain and explicitly use the affinity-0 sentinel.
@@ -43,7 +43,7 @@ fn workerEntry() callconv(.c) noreturn {
             _ = @atomicRmw(u64, &observed_mask, .Or, @as(u64, 1) << @truncate(core), .acq_rel);
         }
         _ = @atomicRmw(u32, &worker_samples, .Add, 1, .acq_rel);
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldThread(0);
     }
 
     while (true) {
@@ -72,18 +72,18 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const ec_caps = caps.EcCap{
+    const thread_caps = caps.ThreadCap{
         .term = true,
         .restart_policy = 0,
     };
     const priority_normal: u64 = 1;
-    const caps_word: u64 = @as(u64, ec_caps.toU16()) | (priority_normal << 32);
+    const caps_word: u64 = @as(u64, thread_caps.toU16()) | (priority_normal << 32);
     const entry: u64 = @intFromPtr(&workerEntry);
 
     var workers: [WORKERS]u12 = undefined;
     var made: usize = 0;
     while (made < WORKERS) : (made += 1) {
-        const cec = syscall.createExecutionContext(
+        const cec = syscall.createThread(
             caps_word,
             entry,
             1,
@@ -109,7 +109,7 @@ pub fn main(cap_table_base: u64) void {
             testing.pass();
             return;
         }
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldThread(0);
     }
 
     @atomicStore(u32, &stop, 1, .release);

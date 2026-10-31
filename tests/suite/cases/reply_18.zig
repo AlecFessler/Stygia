@@ -1,25 +1,25 @@
 // Spec §[reply] reply — test 18.
 //
-// "[test 18] returns E_FULL if `pair_count > 0` and the resumed EC's
+// "[test 18] returns E_FULL if `pair_count > 0` and the resumed thread's
 //  domain handle table cannot accommodate N contiguous slots; the
 //  reply handle is NOT consumed and the caller's table is unchanged."
 //
 // Strategy
-//   Materialize a reply handle inside the test EC, then trigger the
+//   Materialize a reply handle inside the test thread, then trigger the
 //   E_FULL path by saturating the handle table before the call.
 //
-//   The test EC owns both sides of the suspend/recv pipeline:
+//   The test thread owns both sides of the suspend/recv pipeline:
 //     1. Mint a port with `bind | recv | xfer`. The xfer cap on the
 //        recv'ing port is what the kernel uses (per §[reply]) to mint
 //        the reply handle's own xfer cap, which reply with
 //        pair_count > 0 requires.
-//     2. Mint a sibling EC W with `term | susp` and restart_policy = 0
-//        (kill). The test EC is in the same capability domain as W, so
-//        "the resumed EC's domain handle table" in the spec line under
-//        test is the same physical table the test EC writes to.
-//     3. suspend(W, port) — non-blocking on the test EC since [1] != self.
+//     2. Mint a sibling thread W with `term | susp` and restart_policy = 0
+//        (kill). The test thread is in the same capability domain as W, so
+//        "the resumed thread's domain handle table" in the spec line under
+//        test is the same physical table the test thread writes to.
+//     3. suspend(W, port) — non-blocking on the test thread since [1] != self.
 //        Queues W as a suspended sender on the port.
-//     4. recv(port) — returns immediately (the test EC still holds the
+//     4. recv(port) — returns immediately (the test thread still holds the
 //        port's bind cap; an event is queued). The syscall word's
 //        reply_handle_id field carries the reply slot id; per §[reply]
 //        the reply handle is minted with `xfer = 1` because the recv'ing
@@ -27,8 +27,8 @@
 //
 //   For the attachment we need a single source handle (N = 1) whose
 //   caps satisfy the pair-entry validation. The runner-imposed
-//   ec_inner_ceiling allows the move/copy bits on EC handles, so
-//   create_execution_context can mint a witness EC S with caps =
+//   thread_inner_ceiling allows the move/copy bits on thread handles, so
+//   create_thread can mint a witness thread S with caps =
 //   {copy = 1}. The pair entry references S with `caps = 0, move = 0`
 //   — caps = 0 is trivially a subset of S's caps, and move = 0 needs
 //   the source to have the `copy` cap, which S does. (The runner's
@@ -73,12 +73,12 @@
 //
 // Action
 //   1. create_port({bind, recv, xfer})              — must succeed
-//   2. create_execution_context(W,
+//   2. create_thread(W,
 //        caps={term, susp, rp=0}, target=self)      — must succeed
 //   3. suspend(W, port)                             — must return OK
 //   4. recv(port)                                   — must return OK,
 //      yielding reply_handle_id in the syscall word
-//   5. create_execution_context(S,
+//   5. create_thread(S,
 //        caps={copy}, target=self)                  — must succeed
 //   6. saturate the table via create_port({}) loop  — must observe
 //      E_FULL within HANDLE_TABLE_MAX iterations
@@ -203,27 +203,27 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W. term lets the test eventually destroy W on
     // teardown if needed; susp lets the test queue W onto the port via
     // suspend. restart_policy = 0 keeps the call inside the runner-
-    // granted ec_outer_ceiling.restart_max and prevents any restart
+    // granted thread_outer_ceiling.restart_max and prevents any restart
     // fallback from re-running W.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
     const w_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec_w = syscall.createExecutionContext(
+    const created_thread_w = syscall.createThread(
         w_caps_word,
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec_w.v1)) {
+    if (testing.isHandleError(created_thread_w.v1)) {
         testing.fail(2);
         return;
     }
-    const w_handle: u12 = @truncate(cec_w.v1 & 0xFFF);
+    const w_handle: u12 = @truncate(created_thread_w.v1 & 0xFFF);
 
     // Step 3: queue W on the port as a suspended sender.
     const sus = syscall.issueReg(.@"suspend", 0, .{
@@ -235,7 +235,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The port has the test EC as a live bind-cap holder
+    // Step 4: recv. The port has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the reply handle id encoded in the syscall word per §[recv].
     const got = syscall.recv(port_handle, 0);
@@ -251,23 +251,23 @@ pub fn main(cap_table_base: u64) void {
     // pair entry reference S with move = 0. We don't need to do
     // anything else with S; it just sits in the table as a valid
     // handle id whose caps include the copy bit.
-    const s_caps = caps.EcCap{
+    const s_caps = caps.ThreadCap{
         .copy = true,
         .restart_policy = 0,
     };
     const s_caps_word: u64 = @as(u64, s_caps.toU16());
-    const cec_s = syscall.createExecutionContext(
+    const created_thread_s = syscall.createThread(
         s_caps_word,
         entry,
         1,
         0,
         0,
     );
-    if (testing.isHandleError(cec_s.v1)) {
+    if (testing.isHandleError(created_thread_s.v1)) {
         testing.fail(5);
         return;
     }
-    const s_handle: u12 = @truncate(cec_s.v1 & 0xFFF);
+    const s_handle: u12 = @truncate(created_thread_s.v1 & 0xFFF);
 
     // Step 6: saturate the handle table. create_port mints a port that
     // takes a slot — the cheapest filler that satisfies create_port's

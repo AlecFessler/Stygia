@@ -1,6 +1,6 @@
 //! Aarch64 VCpu dispatch backing.
 //!
-//! Per-vCPU arch state lives in a single 4 KiB PMM page hung off the EC's
+//! Per-vCPU arch state lives in a single 4 KiB PMM page hung off the thread's
 //! `vcpu_arch_state` slot. Mirrors `kernel/arch/x64/hv/vcpu.zig` field-for-
 //! field where x86 has FXSAVE/last_exit/payload/started; aarch64 swaps in
 //! GuestState (vm.zig) + FPSIMD area + ArchScratch (hyp.zig) for the
@@ -16,7 +16,7 @@ const pmm = stygia.memory.pmm;
 const vgic = stygia.arch.aarch64.hv.vgic;
 const vm_hw = stygia.arch.aarch64.vm;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const FxsaveArea = vm_hw.FxsaveArea;
 const GuestState = vm_hw.GuestState;
 const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
@@ -40,7 +40,7 @@ pub const VcpuArchState = struct {
     /// 3-vreg payload (§[vm_exit_state] vregs 118..120) for the most-
     /// recent vm_exit; staged here by the run loop so `port.deliverEvent`
     /// can write it into the receiver's vregs without re-decoding the
-    /// exit reason. Sub-code rides on `ec.event_subcode`.
+    /// exit reason. Sub-code rides on `thread.event_subcode`.
     last_exit_payload: [3]u64 = .{ 0, 0, 0 },
     /// Monotonic-clock timestamp (ns) at the most recent pre-vmResume
     /// timer tick. Reserved for the upcoming vGIC virtual-timer auto-
@@ -75,14 +75,14 @@ comptime {
     std.debug.assert(@alignOf(VcpuArchState) == paging.PAGE4K);
 }
 
-/// Allocate per-vCPU arch state and pin it on `vcpu_ec.vcpu_arch_state`.
+/// Allocate per-vCPU arch state and pin it on `vcpu_thread.vcpu_arch_state`.
 /// Spec §[create_vcpu]: caller is `hv.virtual_machine.allocVcpu`, which
-/// already knows the EC is a fresh vCPU bound to `vm`.
+/// already knows the thread is a fresh vCPU bound to `vm`.
 ///
 /// On platforms without EL2/stage-2 reachable from the kernel,
 /// allocation still succeeds — `enterGuest` short-circuits via
 /// `vm_hw.vmSupported()` before any world-switch attempt.
-pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
+pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_thread: *Thread) !void {
     _ = vm;
 
     // Allocate one 4 KiB PMM page and place VcpuArchState at offset 0.
@@ -91,22 +91,22 @@ pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void
     const page = pmm.global_pmm.?.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
     const cell: *VcpuArchState = @ptrCast(@alignCast(page));
     cell.* = .{};
-    vcpu_ec.vcpu_arch_state = @ptrCast(cell);
+    vcpu_thread.vcpu_arch_state = @ptrCast(cell);
 }
 
-/// Free per-vCPU arch state pinned on `vcpu_ec.vcpu_arch_state`. Caller
+/// Free per-vCPU arch state pinned on `vcpu_thread.vcpu_arch_state`. Caller
 /// has already torn down any references to the vCPU; safe to free the
 /// page back to the PMM.
-pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
-    const erased = vcpu_ec.vcpu_arch_state orelse return;
+pub fn freeVcpuArchState(vcpu_thread: *Thread) void {
+    const erased = vcpu_thread.vcpu_arch_state orelse return;
     const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(erased));
     pmm.global_pmm.?.destroy(page);
-    vcpu_ec.vcpu_arch_state = null;
+    vcpu_thread.vcpu_arch_state = null;
 }
 
-/// Resolve the per-vCPU arch state pinned on `vcpu_ec`, or `null` if the
-/// EC is not a vCPU (or `allocVcpuArchState` has not yet run).
-pub fn archStateOf(vcpu_ec: *ExecutionContext) ?*VcpuArchState {
-    const erased = vcpu_ec.vcpu_arch_state orelse return null;
+/// Resolve the per-vCPU arch state pinned on `vcpu_thread`, or `null` if the
+/// thread is not a vCPU (or `allocVcpuArchState` has not yet run).
+pub fn archStateOf(vcpu_thread: *Thread) ?*VcpuArchState {
+    const erased = vcpu_thread.vcpu_arch_state orelse return null;
     return @ptrCast(@alignCast(erased));
 }

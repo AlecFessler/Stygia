@@ -7,18 +7,18 @@ const arch = stygia.arch.dispatch;
 const capability = stygia.caps.capability;
 const capdom = stygia.caps.capability_domain;
 const elf_util = stygia.utils.elf;
-const execution_context = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const paging_consts = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 const sched = stygia.sched.scheduler;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
-const EcCaps = stygia.sched.execution_context.EcCaps;
+const ThreadCaps = stygia.sched.thread.ThreadCaps;
 const ErasedSlabRef = stygia.caps.capability.ErasedSlabRef;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const PAddr = stygia.memory.address.PAddr;
 const ParsedElf = stygia.utils.elf.ParsedElf;
-const Priority = stygia.sched.execution_context.Priority;
+const Priority = stygia.sched.thread.Priority;
 const VAddr = stygia.memory.address.VAddr;
 
 // Identity of the boot root, used only by the test-profile exit hook.
@@ -41,10 +41,10 @@ const ROOT_SELF_CAPS = capdom.CapabilityDomainCaps{
     .pri = @intFromEnum(Priority.realtime),
 };
 
-/// Cap word minted on the root EC's slot-1 handle. Spec §[execution_context]
-/// cap layout — full local-EC privileges so the root service can manage its
+/// Cap word minted on the root thread's slot-1 handle. Spec §[thread]
+/// cap layout — full local-thread privileges so the root service can manage its
 /// own thread.
-const ROOT_EC_CAPS = EcCaps{
+const ROOT_THREAD_CAPS = ThreadCaps{
     .move = true,
     .copy = true,
     .saff = true,
@@ -56,7 +56,7 @@ const ROOT_EC_CAPS = EcCaps{
     .restart_policy = 1,
 };
 
-/// Pages reserved for the per-EC user stack created by
+/// Pages reserved for the per-thread user stack created by
 /// create_capability_domain. 16 pages (64 KiB) is the spec default
 /// and the right size for nearly every userspace task. The in-Stygia
 /// self-hosted Zig compiler's recursive AstGen / Sema descent for
@@ -205,7 +205,7 @@ pub fn init(root_service_elf: []const u8) !void {
     // E_PERM against zero ceilings before the first test ever runs.
     //
     // Self-handle field0 layout per §[capability_domain] Self handle:
-    //   bits  0-7   ec_inner_ceiling          = 0xFF
+    //   bits  0-7   thread_inner_ceiling          = 0xFF
     //   bits  8-23  vmar_inner_ceiling         = 0xFFFF
     //   bits 24-31  cridc_ceiling             = 0x27
     //   bits 32-39  idc_rx                    = 0x27
@@ -221,7 +221,7 @@ pub fn init(root_service_elf: []const u8) !void {
         (@as(u64, 0x01) << 48) |
         (@as(u64, 0x5C) << 56);
     // ceilings_outer (field1):
-    //   bits  0-7   ec_outer_ceiling           = 0xFF
+    //   bits  0-7   thread_outer_ceiling           = 0xFF
     //   bits  8-15  vmar_outer_ceiling          = 0xFF
     //   bits 16-31  restart_policy_ceiling     = 0x01FF
     //   bits 32-37  fut_wait_max               = 63
@@ -244,8 +244,8 @@ pub fn init(root_service_elf: []const u8) !void {
     // Re-mirror kernel-half PML4 entries from the kernel root into the
     // new domain's PML4. Fresh L3/L2/L1 paging structures created
     // between allocCapabilityDomain (which copies entries 256..511 once
-    // up front) and now — most notably the EC's kernel stack PTEs
-    // installed in allocExecutionContext — only landed in the kernel
+    // up front) and now — most notably the thread's kernel stack PTEs
+    // installed in allocThread — only landed in the kernel
     // address space root. Without this re-copy, swapAddrSpace into the
     // new domain leaves the kernel-stack VAs unmapped and the iret
     // epilogue's stack pop / writethrough faults.
@@ -256,7 +256,7 @@ pub fn init(root_service_elf: []const u8) !void {
     try mapUserStack(root_cd, layout.stack_top);
     try mapUserTableView(root_cd, layout.table_base);
 
-    const root_ec = try resolveOrSpawnRootEc(root_cd, slid_entry, layout);
+    const root_thread = try resolveOrSpawnRootThread(root_cd, slid_entry, layout);
 
     grantDevices(root_cd);
 
@@ -265,9 +265,9 @@ pub fn init(root_service_elf: []const u8) !void {
     // not touch. They went into root_cd's PML4 directly via mapPage.
     arch.paging.copyKernelMappings(root_virt);
 
-    arch.boot.print("[boot] root EC ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
+    arch.boot.print("[boot] root thread ready: entry=0x{x} stack_top=0x{x} ut=0x{x}\n", .{ slid_entry.addr, layout.stack_top, layout.table_base });
 
-    sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_ec);
+    sched.enqueueOnCore(@intCast(arch.smp.coreID()), root_thread);
 }
 
 /// Walk PT_LOAD headers in `elf_bytes`, allocate user pages from PMM,
@@ -506,8 +506,8 @@ fn syncExecutableElfPages(
 }
 
 /// Allocate USER_STACK_BYTES of user pages and map them ending at
-/// `stack_top`. The EC's iret frame uses `stack_top` as the initial
-/// RSP. Spec §[create_execution_context] / §[create_capability_domain]
+/// `stack_top`. The thread's iret frame uses `stack_top` as the initial
+/// RSP. Spec §[create_thread] / §[create_capability_domain]
 /// — stack lives at a kernel-chosen randomized base in the ASLR zone.
 pub fn mapUserStack(root_cd: *CapabilityDomain, stack_top: u64) !void {
     const base: u64 = stack_top - USER_STACK_BYTES;
@@ -548,15 +548,15 @@ pub fn mapUserTableView(root_cd: *CapabilityDomain, table_base: u64) !void {
     }
 }
 
-fn resolveOrSpawnRootEc(
+fn resolveOrSpawnRootThread(
     root_cd: *CapabilityDomain,
     entry: VAddr,
     layout: DomainLayout,
-) !*ExecutionContext {
-    const existing = capability.typedRef(ExecutionContext, root_cd.kernel_table[1]);
+) !*Thread {
+    const existing = capability.typedRef(Thread, root_cd.kernel_table[1]);
     if (existing) |ref| return ref.ptr;
 
-    const ec = try execution_context.allocExecutionContext(
+    const thread = try thread_mod.allocThread(
         root_cd,
         entry,
         1,
@@ -566,37 +566,37 @@ fn resolveOrSpawnRootEc(
         null,
     );
 
-    // allocExecutionContext built an iret frame in kernel-mode (no user
+    // allocThread built an iret frame in kernel-mode (no user
     // stack was wired through allocVmar yet). Patch it for user mode.
     arch.cpu.patchUserModeIretFrame(
-        ec.ctx,
+        thread.ctx,
         entry,
         VAddr.fromInt(layout.stack_top),
         layout.table_base,
     );
 
     const obj_ref: ErasedSlabRef = .{
-        .ptr = ec,
-        .gen = @intCast(ec._gen_lock.currentGen()),
+        .ptr = thread,
+        .gen = @intCast(thread._gen_lock.currentGen()),
     };
-    // Pin the root EC to slot 1 (= caps.SLOT_INITIAL_EC). Child CDs
-    // get their initial EC at slot 1 via the explicit `user_table[1] =
+    // Pin the root thread to slot 1 (= caps.SLOT_INITIAL_THREAD). Child CDs
+    // get their initial thread at slot 1 via the explicit `user_table[1] =
     // ...` block in create_capability_domain; the root CD's existing
     // path used `mintHandle` (which pops `free_head` starting at 3),
-    // so the root EC silently landed at slot 3 and the root service's
-    // `priority(SLOT_INITIAL_EC, ...)` syscall returned E_BADCAP. Slots
+    // so the root thread silently landed at slot 3 and the root service's
+    // `priority(SLOT_INITIAL_THREAD, ...)` syscall returned E_BADCAP. Slots
     // 0, 1, 2 are reserved (not on the free list), so `mintHandleAt`
     // can drop a handle there without unlinking.
     capdom.mintHandleAt(
         root_cd,
         1,
         obj_ref,
-        .execution_context,
-        @bitCast(ROOT_EC_CAPS),
+        .thread,
+        @bitCast(ROOT_THREAD_CAPS),
         0,
         0,
     );
-    return ec;
+    return thread;
 }
 
 fn grantDevices(root_cd: *CapabilityDomain) void {
@@ -802,7 +802,7 @@ fn grantCom1(root_cd: *CapabilityDomain) void {
     // primary tries to emit is dropped on the floor. Spec §[device_region]
     // does not pin where boot mints the early platform device handles;
     // we put COM1 here so it's available before sched.run() picks up
-    // the root EC.
+    // the root thread.
     //
     // Spec §[device_region] field0 layout (port_io):
     //   bits  0-3  dev_type (1 = port_io)

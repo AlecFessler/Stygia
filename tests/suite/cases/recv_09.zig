@@ -5,20 +5,20 @@
 //  contain the inserted handles per §[handle_attachments]."
 //
 // Strategy
-//   The shape mirrors terminate_07: this test EC owns both ends of the
+//   The shape mirrors terminate_07: this test thread owns both ends of the
 //   pipeline. It mints a port P with {bind, recv, xfer} (xfer is
 //   required because the suspend will attach a handle — §[suspend]:
 //   "Additionally `xfer` if any handles are attached in the syscall
-//   word's `pair_count`"). It mints a worker EC W with the `susp` cap
+//   word's `pair_count`"). It mints a worker thread W with the `susp` cap
 //   (target = self-domain), and a source handle S that will be the
 //   attachment target. Then the test calls `suspend(W, P)` with
 //   pair_count = 1 and a single pair entry encoding S in vreg 127.
 //
 //   `suspend` with [1] != self is non-blocking on the caller per
-//   §[suspend] ("[1] may reference the calling EC; the syscall returns
-//   after the calling EC is resumed" — when [1] is *not* the caller,
+//   §[suspend] ("[1] may reference the calling thread; the syscall returns
+//   after the calling thread is resumed" — when [1] is *not* the caller,
 //   the call simply queues W as a suspended sender on P and returns
-//   immediately to this test EC). With W queued and the test EC still
+//   immediately to this test thread). With W queued and the test thread still
 //   holding P's bind cap, recv on P returns immediately with a syscall
 //   word whose pair_count, tstart, and reply_handle_id are populated.
 //
@@ -36,26 +36,26 @@
 //     - §[create_port] test 01: runner self-handle has `crpt`.
 //     - §[create_port] test 02: caps {bind,recv,xfer} = 0x1C ⊆
 //       runner port_ceiling 0x1C.
-//     - §[create_execution_context] test 01: runner self-handle has
-//       `crec`. test 03/06/08/09/10: caps subset of ec_inner_ceiling,
+//     - §[create_thread] test 01: runner self-handle has
+//       `crec`. test 03/06/08/09/10: caps subset of thread_inner_ceiling,
 //       priority 0, stack_pages 1, affinity 0, reserved bits clear.
 //     - §[recv] test 01: P is valid. test 02: P has `recv`. test 03:
 //       reserved bits clear in [1]. test 04: P has live bind-cap
-//       holders (this test EC) and a queued event. test 06: the
+//       holders (this test thread) and a queued event. test 06: the
 //       caller's table has plenty of free slots (the runner-spawned
 //       child gets a fresh table with effectively the full 4096-slot
 //       range available; one reply + one attachment is well under the
 //       limit).
 //     - §[handle_attachments] tests 01-07 (suspend-time gates): the
 //       port has `xfer`, the source handle id is valid in the
-//       suspending EC's domain (W's domain == this test's domain since
+//       suspending thread's domain (W's domain == this test's domain since
 //       W was created with target = self), entry.caps ⊆ source caps,
 //       move=0 with source `copy` set, no reserved bits, only one
 //       entry so no duplicate-source case.
 //
 //   Custom-suspend asm: §[handle_attachments] places pair entries at
 //   vregs [128-N..127] — the *high* end of the vreg space. libz's
-//   `suspendEc` panics on the attachments path; this test inlines the
+//   `suspendThread` panics on the attachments path; this test inlines the
 //   syscall sequence to populate vreg 127. Per §[syscall_abi]:
 //     vreg 0   = [rsp + 0]            (syscall word)
 //     vreg N   = [rsp + (N-13)*8]     for 14 <= N <= 127
@@ -80,7 +80,7 @@
 // Action
 //   1. create_port(caps={bind, recv, xfer})        — must succeed
 //   2. create_port(caps={copy, recv})              — source S, must succeed
-//   3. create_execution_context(target=self,
+//   3. create_thread(target=self,
 //        caps={susp, restart_policy=0})            — worker W, must succeed
 //      (entry = dummyEntry; W never executes meaningfully — it is
 //      suspended before scheduling matters)
@@ -96,7 +96,7 @@
 // Assertions
 //   1: setup port P creation failed (createPort returned an error word)
 //   2: setup port S creation failed (createPort returned an error word)
-//   3: setup EC W creation failed (createExecutionContext returned an
+//   3: setup thread W creation failed (createThread returned an
 //      error word)
 //   4: suspend itself did not return OK
 //   5: recv did not return OK
@@ -235,18 +235,18 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_s: u12 = @truncate(cp_s.v1 & 0xFFF);
 
-    // Step 3: mint the worker EC W. susp lets us queue W onto the port
+    // Step 3: mint the worker thread W. susp lets us queue W onto the port
     // via suspend; restart_policy = 0 (kill) keeps the call inside the
     // runner-granted ceiling and prevents any restart fallback from
     // resurrecting W.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const w_entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         w_entry,
         1, // stack_pages
         0, // target = self (W's domain == this test's domain)
@@ -277,7 +277,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 5: recv on P. P has the test EC as a live bind-cap holder
+    // Step 5: recv on P. P has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the syscall word populated per §[recv].
     const got = syscall.recv(port_p, 0);

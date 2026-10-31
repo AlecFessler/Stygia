@@ -112,7 +112,7 @@ pub fn main(cap_table_base: u64) void {
     // ceilings = 0 trivially satisfy the subset checks; reserved bits
     // are clean; the page frame handle is valid; only the duplicate
     // source id remains as a spec violation.
-    const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(0, 0, 0, pf_handle, 0, // initial_thread_affinity
         passed[0..]);
 
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {

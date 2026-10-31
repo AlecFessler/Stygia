@@ -63,10 +63,10 @@ NON_SPEC_TEST_FILES = {
 # test-review issue Stygia-o4a.6.4. Keep the spec assertion; reject any
 # unlisted gap or stale entry here.
 KNOWN_MISSING_TESTS = {
-    # Lower target-domain EC ceiling is unavailable in the current fixture.
-    "create_execution_context_04.zig": "lower ec_outer_ceiling fixture",
-    "create_execution_context_05.zig": "lower ec_inner_ceiling fixture",
-    "create_vcpu_02.zig": "lower VM-owner ec_inner_ceiling fixture",
+    # Lower target-domain thread ceiling is unavailable in the current fixture.
+    "create_thread_04.zig": "lower thread_outer_ceiling fixture",
+    "create_thread_05.zig": "lower thread_inner_ceiling fixture",
+    "create_vcpu_02.zig": "lower VM-owner thread_inner_ceiling fixture",
     # These observations require a runner-side reporting fixture.
     "map_pf_12.zig": "permission-fault teardown observation fixture",
     "self_01.zig": "self-handle result reporting fixture",

@@ -1,10 +1,10 @@
 //! Virtual Machine — guest execution environment with its own guest
-//! physical address space. Execution contexts enter guest mode within
+//! physical address space. Threads enter guest mode within
 //! a VM to run. See spec §[virtual_machine].
 //!
 //! Capability-domain lifetime; the VM handle is non-transferable so
 //! exactly one user-visible handle exists (held by the binding
-//! capability domain). vCPU ECs back-reference the VM through their
+//! capability domain). vCPU Threads back-reference the VM through their
 //! `vm` field. UAF protection on those back-refs comes from
 //! `_gen_lock`.
 
@@ -15,7 +15,7 @@ const arch = stygia.arch.dispatch;
 const arch_smp = stygia.arch.dispatch.smp;
 const capability = stygia.caps.capability;
 const cd_mod = stygia.caps.capability_domain;
-const ec_mod = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const errors = stygia.syscall.errors;
 const lifecycle = stygia.sched.lifecycle;
 const page_frame_mod = stygia.memory.page_frame;
@@ -25,7 +25,7 @@ const vm_dispatch = stygia.arch.dispatch.vm;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
 const CapabilityType = stygia.caps.capability.CapabilityType;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GenLock = stygia.memory.allocators.secure_slab.GenLock;
 const KernelHandle = stygia.caps.capability.KernelHandle;
 const MemoryPerms = stygia.memory.address.MemoryPerms;
@@ -33,7 +33,7 @@ const PAddr = stygia.memory.address.PAddr;
 const PageFrame = stygia.memory.page_frame.PageFrame;
 const PageFrameCaps = stygia.memory.page_frame.PageFrameCaps;
 const Port = stygia.sched.port.Port;
-const Priority = stygia.sched.execution_context.Priority;
+const Priority = stygia.sched.thread.Priority;
 const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const VAddr = stygia.memory.address.VAddr;
@@ -149,7 +149,7 @@ pub fn releaseHandleAfterDomainDestroyed(vm: *VirtualMachine) void {
 // ── External API ─────────────────────────────────────────────────────
 
 /// `create_virtual_machine` syscall handler. Spec §[virtual_machine].
-pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64) i64 {
+pub fn createVirtualMachine(caller: *Thread, caps: u64, policy_pf: u64) i64 {
     if (caps >> 16 != 0) return errors.E_INVAL;
     if (policy_pf >> 12 != 0) return errors.E_INVAL;
 
@@ -222,7 +222,7 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
 
 /// `create_vcpu` syscall handler. Spec §[virtual_machine].create_vcpu.
 pub fn createVcpu(
-    caller: *ExecutionContext,
+    caller: *Thread,
     caps: u64,
     vm_handle: u64,
     affinity: u64,
@@ -245,8 +245,8 @@ pub fn createVcpu(
         if (!self_caps_struct.crec) return errors.E_PERM;
         if (@intFromEnum(requested_priority) > self_caps_struct.pri) return errors.E_PERM;
 
-        const ec_inner_ceiling: u8 = @truncate(readSelfField0(domain));
-        if ((requested_caps & ec_inner_ceiling) != requested_caps) return errors.E_PERM;
+        const thread_inner_ceiling: u8 = @truncate(readSelfField0(domain));
+        if ((requested_caps & thread_inner_ceiling) != requested_caps) return errors.E_PERM;
 
         if (affinity != 0) {
             const cores = arch_smp.coreCount();
@@ -267,60 +267,60 @@ pub fn createVcpu(
         // bind_refcount for as long as the vCPU exists (vm_exit events
         // fire spontaneously on the bound port — same lifetime class as
         // bind-cap holders). The matching dec runs in
-        // `destroyExecutionContextLocked`. observed_zero is structurally
+        // `destroyThreadLocked`. observed_zero is structurally
         // impossible — `lookupPort` resolved against the caller's CD
         // whose handle pins the port.
-        const vcpu_ec = allocVcpu(vm, domain, affinity, port) catch
+        const vcpu_thread = allocVcpu(vm, domain, affinity, port) catch
             return errors.E_NOMEM;
-        vcpu_ec.priority = requested_priority;
+        vcpu_thread.priority = requested_priority;
 
         // Take the vCPU's private exit-port pin before minting the
         // handle, but do not publish it on port.vcpu_list_head yet:
         // recv-side teardown cascades are allowed to destroy every
-        // listed vCPU, and an EC without a minted handle is still
+        // listed vCPU, and an thread without a minted handle is still
         // private to this syscall.
         {
-            const port_ref = vcpu_ec.exit_port orelse unreachable;
+            const port_ref = vcpu_thread.exit_port orelse unreachable;
             const port_lr = port_ref.lockIrqSave(@src()) catch {
-                vcpu_ec.exit_port = null;
-                ec_mod.destroyExecutionContextLocked(vcpu_ec, domain);
+                vcpu_thread.exit_port = null;
+                thread_mod.destroyThreadLocked(vcpu_thread, domain);
                 return errors.E_BADCAP;
             };
             port_mod.incBindRef(port_lr.ptr) catch unreachable;
             port_ref.unlockIrqRestore(port_lr.irq_state);
         }
 
-        const ec_gen = vcpu_ec._gen_lock.currentGen();
+        const thread_gen = vcpu_thread._gen_lock.currentGen();
         const erased = capability.ErasedSlabRef{
-            .ptr = @ptrCast(vcpu_ec),
-            .gen = @intCast(ec_gen),
+            .ptr = @ptrCast(vcpu_thread),
+            .gen = @intCast(thread_gen),
         };
 
         const slot = cd_mod.mintHandle(
             domain,
             erased,
-            .execution_context,
+            .thread,
             requested_caps,
             @intFromEnum(requested_priority),
             affinity,
         ) catch {
-            rollbackPrivateVcpu(vcpu_ec, domain);
+            rollbackPrivateVcpu(vcpu_thread, domain);
             return errors.E_FULL;
         };
         // Hold a lifecycle pin across port-list publication and scheduler
         // enqueue. The handle is minted before the pin can make the vCPU
         // externally visible; the pin then blocks cross-domain port cascade
-        // teardown from retiring/finalizing this EC after it sees the list
+        // teardown from retiring/finalizing this thread after it sees the list
         // node but before enqueue has linked it into a run queue.
-        if (!lifecycle.tryPinLive(vcpu_ec)) {
+        if (!lifecycle.tryPinLive(vcpu_thread)) {
             capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
-            rollbackPrivateVcpu(vcpu_ec, domain);
+            rollbackPrivateVcpu(vcpu_thread, domain);
             return errors.E_BADCAP;
         }
-        publishMintedVcpuAndEnqueue(vcpu_ec) catch {
-            lifecycle.releasePin(vcpu_ec);
+        publishMintedVcpuAndEnqueue(vcpu_thread) catch {
+            lifecycle.releasePin(vcpu_thread);
             capability.clearAndFreeSlot(domain, slot, &domain.kernel_table[slot]);
-            rollbackPrivateVcpu(vcpu_ec, domain);
+            rollbackPrivateVcpu(vcpu_thread, domain);
             return errors.E_BADCAP;
         };
 
@@ -332,51 +332,51 @@ pub fn createVcpu(
         //
         // Its first dispatch emits the initial vm_exit via the same
         // running->parking lifecycle used for later exits; calling
-        // `fireVmExit` here would attempt to claim a private ready EC
+        // `fireVmExit` here would attempt to claim a private ready thread
         // that is not in any run queue.
-        lifecycle.releasePin(vcpu_ec);
+        lifecycle.releasePin(vcpu_thread);
         break :blk slot;
     };
 
     // Spec §[error_codes] / §[capabilities]: pack Word0 so the type
     // tag in bits 12..15 disambiguates a real handle word from the
     // small-positive error range 1..15.
-    return @intCast(capability.Word0.pack(created_slot, .execution_context, requested_caps));
+    return @intCast(capability.Word0.pack(created_slot, .thread, requested_caps));
 }
 
 fn rollbackPrivateVcpu(
-    vcpu_ec: *ExecutionContext,
+    vcpu_thread: *Thread,
     domain: *CapabilityDomain,
 ) void {
-    if (vcpu_ec.exit_port) |port_ref| {
+    if (vcpu_thread.exit_port) |port_ref| {
         const port_lr = port_ref.lockIrqSave(@src()) catch null;
         if (port_lr) |plr| {
             port_mod.decBindRef(plr.ptr);
             port_ref.unlockIrqRestore(plr.irq_state);
         }
-        vcpu_ec.exit_port = null;
+        vcpu_thread.exit_port = null;
     }
-    vcpu_ec.vcpu_list_next = null;
-    ec_mod.destroyExecutionContextLocked(vcpu_ec, domain);
+    vcpu_thread.vcpu_list_next = null;
+    thread_mod.destroyThreadLocked(vcpu_thread, domain);
 }
 
 fn publishMintedVcpuAndEnqueue(
-    vcpu_ec: *ExecutionContext,
+    vcpu_thread: *Thread,
 ) error{StaleHandle}!void {
-    const port_ref = vcpu_ec.exit_port orelse return error.StaleHandle;
+    const port_ref = vcpu_thread.exit_port orelse return error.StaleHandle;
     const port_lr = port_ref.lockIrqSave(@src()) catch {
         return error.StaleHandle;
     };
     const port = port_lr.ptr;
-    const vcpu_ref = SlabRef(ExecutionContext).init(vcpu_ec, vcpu_ec._gen_lock.currentGen());
-    vcpu_ec.vcpu_list_next = port.vcpu_list_head;
+    const vcpu_ref = SlabRef(Thread).init(vcpu_thread, vcpu_thread._gen_lock.currentGen());
+    vcpu_thread.vcpu_list_next = port.vcpu_list_head;
     port.vcpu_list_head = vcpu_ref;
-    scheduler.enqueue(vcpu_ec);
+    scheduler.enqueue(vcpu_thread);
     port_ref.unlockIrqRestore(port_lr.irq_state);
 }
 
 /// `map_guest` syscall handler. Spec §[virtual_machine].map_guest.
-pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i64 {
+pub fn mapGuest(caller: *Thread, vm_handle: u64, pairs: []const u64) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (pairs.len == 0 or pairs.len % 2 != 0) return errors.E_INVAL;
 
@@ -437,7 +437,7 @@ pub fn mapGuest(caller: *ExecutionContext, vm_handle: u64, pairs: []const u64) i
 }
 
 /// `unmap_guest` syscall handler. Spec §[virtual_machine].unmap_guest.
-pub fn unmapGuest(caller: *ExecutionContext, vm_handle: u64, page_frames: []const u64) i64 {
+pub fn unmapGuest(caller: *Thread, vm_handle: u64, page_frames: []const u64) i64 {
     if (vm_handle >> 12 != 0) return errors.E_INVAL;
     if (page_frames.len == 0) return errors.E_INVAL;
 
@@ -464,7 +464,7 @@ pub fn unmapGuest(caller: *ExecutionContext, vm_handle: u64, page_frames: []cons
 /// has already validated the VM handle and stripped the `assert` flag's
 /// reserved bits.
 pub fn vmInjectIrq(
-    caller: *ExecutionContext,
+    caller: *Thread,
     vm_handle: u64,
     irq_num: u64,
     assert: u64,
@@ -495,7 +495,7 @@ pub fn vmInjectIrq(
 /// MAX_* and validates the entries slice carries the right number of
 /// vregs.
 pub fn applyVmPolicyTable(
-    caller: *ExecutionContext,
+    caller: *Thread,
     vm_handle: u64,
     kind: u8,
     count: u8,
@@ -659,8 +659,8 @@ fn uninstallPageFrame(vm: *VirtualMachine, pf: *PageFrame) i64 {
     return 0;
 }
 
-/// Allocate a vCPU EC bound to this VM with `exit_port` set. The
-/// vCPU EC is bound to the capability domain that holds the VM
+/// Allocate a vCPU thread bound to this VM with `exit_port` set. The
+/// vCPU thread is bound to the capability domain that holds the VM
 /// handle (per spec); on a multi-domain handoff the holder is the
 /// VM's owning domain.
 fn allocVcpu(
@@ -668,12 +668,12 @@ fn allocVcpu(
     creator_domain: *CapabilityDomain,
     affinity: u64,
     exit_port: *Port,
-) !*ExecutionContext {
+) !*Thread {
     _ = creator_domain;
 
     // caller-pinned: VM's domain owns the VM and outlives it (destroyVm
     // runs ahead of any domain teardown).
-    const vcpu_ec = try ec_mod.allocExecutionContext(
+    const vcpu_thread = try thread_mod.allocThread(
         vm.domain.ptr, // caller-pinned
         VAddr.fromInt(0),
         0,
@@ -683,9 +683,9 @@ fn allocVcpu(
         exit_port,
     );
 
-    try vm_dispatch.allocVcpuArchState(vm, vcpu_ec);
+    try vm_dispatch.allocVcpuArchState(vm, vcpu_thread);
 
-    return vcpu_ec;
+    return vcpu_thread;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

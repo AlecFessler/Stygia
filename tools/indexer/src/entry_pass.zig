@@ -351,7 +351,7 @@ fn resolveFn(
     // real IDT registration in kernel/arch/x64/irq.zig, which fell through
     // to `if (exact_n > 1) return null` and dropped the W9 TLB-shootdown IPI
     // handler from `entry_point` entirely — logged only as a one-line
-    // "did not resolve" warning. Both check_gen_lock and check_ec_closure
+    // "did not resolve" warning. Both check_gen_lock and check_thread_closure
     // seed from `entry_point`, so the shootdown path was a seed in NEITHER,
     // and any lock class reachable only from it was invisible to both. A
     // false NEGATIVE, unlike the rest of those tools' imprecision.

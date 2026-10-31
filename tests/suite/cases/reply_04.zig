@@ -9,7 +9,7 @@
 //
 //   Producing a valid reply handle requires the same suspend/recv
 //   pipeline used in terminate_07: mint a port with bind + recv,
-//   mint a worker EC W with the `susp` cap, then `suspend(W, port)`.
+//   mint a worker thread W with the `susp` cap, then `suspend(W, port)`.
 //   Per §[suspend], when [1] != self the call simply queues the
 //   target on the port without blocking the caller. A `recv(port)`
 //   then returns immediately with the freshly-minted reply handle id
@@ -27,7 +27,7 @@
 //   on the post-reply call is E_BADCAP — exactly the post-condition
 //   the spec line names.
 //
-//   W's `restart_policy = 0` (kill) keeps the EC creation cap word
+//   W's `restart_policy = 0` (kill) keeps the thread creation cap word
 //   inside the runner-granted ceiling. W's entry is a user-mode busy
 //   loop rather than `testing.dummyEntry`: on x86-64 the shared helper
 //   executes `hlt`, which is privileged at CPL3 and can put W through
@@ -37,13 +37,13 @@
 //
 // Action
 //   1. create_port(caps={bind, recv})        — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={susp, rp=0})                  — must succeed
 //      (entry = workerEntry; W is suspended via suspend before it
 //      executes meaningfully; if it wins an early timeslice, it does
 //      not fault)
 //   3. suspend(W, port)                      — must return OK
-//      (non-blocking on the test EC since [1] != self)
+//      (non-blocking on the test thread since [1] != self)
 //   4. recv(port)                            — must return OK and
 //      yield a reply_handle_id in the syscall word
 //   5. reply(reply_handle_id)                — must return OK
@@ -52,7 +52,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -89,14 +89,14 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&workerEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,

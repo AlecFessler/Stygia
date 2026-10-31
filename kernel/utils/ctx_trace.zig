@@ -1,20 +1,20 @@
-//! Per-EC kstack-corruption snapshot ring with dump-on-panic.
+//! Per-thread kstack-corruption snapshot ring with dump-on-panic.
 //!
 //! Build-gated debug instrumentation for the smp=4 iret-frame race
-//! that corrupts `ec.ctx.cs` (offset 144 in `cpu.Context`) with
+//! that corrupts `thread.ctx.cs` (offset 144 in `cpu.Context`) with
 //! kernel-pointer fragments, surfacing as `#GP at iretq` with
 //! `err=0xcca0`-class error codes. After 14+ rounds of static
 //! agent investigation we still don't know what writes the
 //! corruption — this tool gives the next round a causal chain.
 //!
 //! Each `mark` site captures rdtsc + the four iret-frame slots from
-//! `ec.ctx` (cs / ss / rsp / rip) plus the calling core id and an
-//! event tag, into a 32-entry per-EC ring. Ring index is keyed by
-//! EC slab index (`SecureSlab.indexOf`) so the ring storage is a
-//! single 256-slot side array; no field added to `ExecutionContext`
+//! `thread.ctx` (cs / ss / rsp / rip) plus the calling core id and an
+//! event tag, into a 32-entry per-thread ring. Ring index is keyed by
+//! thread slab index (`SecureSlab.indexOf`) so the ring storage is a
+//! single 256-slot side array; no field added to `Thread`
 //! itself, no per-allocation overhead.
 //!
-//! The panic path walks every live EC slot (gen-lock odd) and emits
+//! The panic path walks every live thread slot (gen-lock odd) and emits
 //! the ring contents over serial via `arch.boot.printRaw`. Caller
 //! must hold the panic gate (`panic.claimPanic`) — the dump is not
 //! locked and not safe to invoke concurrently.
@@ -52,17 +52,17 @@ const build_options = @import("build_options");
 const arch = stygia.arch.dispatch;
 const builtin = @import("builtin");
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 
 pub const enabled: bool = build_options.kernel_ctx_trace;
 
 /// Power-of-two so `cursor & (RING_LEN - 1)` is a single AND.
 pub const RING_LEN: u8 = 32;
 
-/// Maximum live EC slots (must match `ExecutionContext.Allocator`'s
+/// Maximum live thread slots (must match `Thread.Allocator`'s
 /// walk_bound). Keeping this constant in sync is enforced at comptime
 /// in `init` below.
-pub const MAX_ECS: u32 = 256;
+pub const MAX_THREADS: u32 = 256;
 
 pub const Event = enum(u8) {
     /// Slow-path `syscallEntry` finished writing all 21 ctx slots
@@ -72,26 +72,26 @@ pub const Event = enum(u8) {
     /// observed at the bottom of `syscallDispatch`.
     slowpath_epilogue = 2,
     /// Suspend FP step 12 just wrote `ctx.rip / rflags / rsp` into
-    /// the sender's `ec.ctx` (interrupts.zig step 12.5 entry).
+    /// the sender's `thread.ctx` (interrupts.zig step 12.5 entry).
     fp_suspend_step12 = 3,
     /// Reply FP R11 just wrote `ctx.cs = 0x23` / `ctx.ss = 0x1b` /
     /// `ctx.rip / rflags / rsp / regs.rax = 0` into the receiver's
-    /// `ec.ctx` (interrupts.zig step R11 exit, before R12 cli).
+    /// `thread.ctx` (interrupts.zig step R11 exit, before R12 cli).
     fp_reply_r11 = 4,
     /// Slow-path `switchTo` is about to set `TSS.RSP0` and the
     /// per-core scratch identity slots.
     switchto_entry = 5,
     /// `switchTo` is about to execute its asm trampoline that swaps
-    /// `rsp = ec.ctx` then `jmp interruptStubEpilogue` → iretq.
+    /// `rsp = thread.ctx` then `jmp interruptStubEpilogue` → iretq.
     /// This is the LAST snapshot before the `cs` value travels into
     /// the iret machinery.
     switchto_resume = 6,
     /// Reply FP atomic-recv-park branch — caller is about to park
     /// on the named recv port instead of going on the run queue.
     recv_park = 7,
-    /// Page-fault handler entry. Logs the EC that was on this core
-    /// at fault time so a fault on an active EC's kstack surfaces
-    /// in that EC's ring.
+    /// Page-fault handler entry. Logs the thread that was on this core
+    /// at fault time so a fault on an active thread's kstack surfaces
+    /// in that thread's ring.
     pf_handler = 8,
 };
 
@@ -116,15 +116,15 @@ pub const Ring = extern struct {
     slots: [RING_LEN]Record align(64) = [_]Record{.{}} ** RING_LEN,
 };
 
-/// Single side-array sized to the EC slab. Lives in BSS (zero-init);
+/// Single side-array sized to the thread slab. Lives in BSS (zero-init);
 /// only allocated when `enabled` is true. Each ring is ~1.34 KiB; at
-/// 256 ECs the total backing is ~340 KiB.
-var rings_storage: [if (enabled) MAX_ECS else 0]Ring = if (enabled)
-    [_]Ring{.{}} ** MAX_ECS
+/// 256 Threads the total backing is ~340 KiB.
+var rings_storage: [if (enabled) MAX_THREADS else 0]Ring = if (enabled)
+    [_]Ring{.{}} ** MAX_THREADS
 else
     [_]Ring{};
 
-// `mark` reads `ec.ctx + ctx_pc_offset / cs / flags / sp / ss` for the
+// `mark` reads `thread.ctx + ctx_pc_offset / cs / flags / sp / ss` for the
 // iret frame. Offsets resolve at comptime through `arch.dispatch.cpu`
 // so this file stays arch-agnostic. aarch64 has no per-frame
 // CS/SS slots; the dispatch returns 0 there.
@@ -167,7 +167,7 @@ inline fn coreId() u8 {
     return @truncate(arch.smp.coreID());
 }
 
-/// Snapshot `ec.ctx`'s iret-frame slots into the next ring slot.
+/// Snapshot `thread.ctx`'s iret-frame slots into the next ring slot.
 ///
 /// Hot path; ~30-50 cycles when `enabled` is true. Reduces to a
 /// pair of `_ = arg` discards when off, which the optimizer (and
@@ -178,20 +178,20 @@ inline fn coreId() u8 {
 /// `@setRuntimeSafety(false)` because this runs from IRQ-disabled
 /// fast paths and a Debug-mode null-check is both pure overhead
 /// and a panic source.
-pub inline fn mark(ec: *ExecutionContext, event: Event) void {
+pub inline fn mark(thread: *Thread, event: Event) void {
     if (comptime !enabled) return;
-    markImpl(ec, event);
+    markImpl(thread, event);
 }
 
-fn markImpl(ec: *ExecutionContext, event: Event) void {
+fn markImpl(thread: *Thread, event: Event) void {
     @setRuntimeSafety(false);
 
-    const idx = ringIndexOf(ec) orelse return;
+    const idx = ringIndexOf(thread) orelse return;
     const ring = &rings_storage[idx];
     const seq = ring.cursor.fetchAdd(1, .monotonic);
     const slot = &ring.slots[seq & (RING_LEN - 1)];
 
-    const ctx_addr = @intFromPtr(ec.ctx);
+    const ctx_addr = @intFromPtr(thread.ctx);
     const rip_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_pc_offset);
     const cs_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_cs_offset);
     const rsp_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_sp_offset);
@@ -206,28 +206,28 @@ fn markImpl(ec: *ExecutionContext, event: Event) void {
     slot.event = @intFromEnum(event);
 }
 
-fn ringIndexOf(ec: *ExecutionContext) ?u32 {
-    const slab = &stygia.sched.execution_context.slab_instance;
+fn ringIndexOf(thread: *Thread) ?u32 {
+    const slab = &stygia.sched.thread.slab_instance;
     const data_base = slab.data_base;
-    const ec_addr = @intFromPtr(ec);
-    if (ec_addr < data_base) return null;
-    const stride = @sizeOf(ExecutionContext);
-    const offset = ec_addr - data_base;
+    const thread_addr = @intFromPtr(thread);
+    if (thread_addr < data_base) return null;
+    const stride = @sizeOf(Thread);
+    const offset = thread_addr - data_base;
     if (offset % stride != 0) return null;
     const idx = offset / stride;
-    if (idx >= MAX_ECS) return null;
+    if (idx >= MAX_THREADS) return null;
     return @intCast(idx);
 }
 
 /// C-callconv alias for `mark` so the asm trampolines can `call` it
-/// with rdi = ec, sil = event id. Only emitted when `enabled` is true;
+/// with rdi = thread, sil = event id. Only emitted when `enabled` is true;
 /// the asm trampolines themselves are also gated on `enabled`, and the
 /// in-asm `call ctxTraceMarkFromAsm_*` is comptime-elided in
 /// `interrupts.zig`, so a flag-off build has no reference to this
 /// symbol from anywhere.
 const ctxTraceMarkCImpl = struct {
-    fn impl(ec: *ExecutionContext, event: u8) callconv(.c) void {
-        mark(ec, @enumFromInt(event));
+    fn impl(thread: *Thread, event: u8) callconv(.c) void {
+        mark(thread, @enumFromInt(event));
     }
 };
 
@@ -243,8 +243,8 @@ comptime {
 /// Generate a naked trampoline that:
 ///   1. preserves all 15 GPRs + rflags
 ///   2. realigns rsp to 16
-///   3. loads `ec` from `gs:32` (PerCpuScratch.current_ec)
-///   4. calls `ctxTraceMarkC(ec, event_id)`
+///   3. loads `thread` from `gs:32` (PerCpuScratch.current_thread)
+///   4. calls `ctxTraceMarkC(thread, event_id)`
 ///   5. restores rsp, regs, rflags, returns
 ///
 /// Each event id gets its own export so the asm caller's only cost
@@ -369,7 +369,7 @@ fn eventName(e: u8) []const u8 {
     };
 }
 
-fn dumpRing(ec: *ExecutionContext, idx: u32) void {
+fn dumpRing(thread: *Thread, idx: u32) void {
     const ring = &rings_storage[idx];
     const cursor_now = ring.cursor.load(.monotonic);
     if (cursor_now == 0) return;
@@ -377,8 +377,8 @@ fn dumpRing(ec: *ExecutionContext, idx: u32) void {
     var hex: [16]u8 = undefined;
     var dec: [20]u8 = undefined;
 
-    arch.boot.printRaw("[ctx_trace] EC=0x");
-    fmtHex(@intFromPtr(ec), &hex);
+    arch.boot.printRaw("[ctx_trace] thread=0x");
+    fmtHex(@intFromPtr(thread), &hex);
     arch.boot.printRaw(&hex);
     arch.boot.printRaw(" idx=");
     arch.boot.printRaw(fmtDec(idx, &dec));
@@ -423,7 +423,7 @@ fn dumpRing(ec: *ExecutionContext, idx: u32) void {
     }
 }
 
-/// Walk every slot in the EC slab (gen-lock odd = live) and dump
+/// Walk every slot in the thread slab (gen-lock odd = live) and dump
 /// its ring buffer over serial. Caller must have claimed the panic
 /// gate (no concurrent panickers) — the dump itself takes no locks.
 pub inline fn dumpAllRingsToSerial() void {
@@ -434,20 +434,20 @@ pub inline fn dumpAllRingsToSerial() void {
 fn dumpAllRingsToSerialImpl() void {
     @setRuntimeSafety(false);
 
-    arch.boot.printRaw("\n===== ctx_trace ring dump (all live ECs) =====\n");
+    arch.boot.printRaw("\n===== ctx_trace ring dump (all live Threads) =====\n");
 
-    const slab = &stygia.sched.execution_context.slab_instance;
+    const slab = &stygia.sched.thread.slab_instance;
     const total = @atomicLoad(u32, &slab.count_total, .acquire);
     var i: u32 = 0;
     while (i < total) {
-        const ec = slab.ptrAt(i);
-        const gen = ec._gen_lock.currentGen();
+        const thread = slab.ptrAt(i);
+        const gen = thread._gen_lock.currentGen();
         // Live = gen odd. We skip freed slots so we don't dump
-        // stale rings that belong to a since-recycled EC's prior
+        // stale rings that belong to a since-recycled thread's prior
         // life — the rings are keyed by slot, not by gen, and the
-        // bug we are hunting only matters for currently-live ECs.
+        // bug we are hunting only matters for currently-live Threads.
         if (gen != 0 and (gen % 2) == 1) {
-            dumpRing(ec, i);
+            dumpRing(thread, i);
         }
         i += 1;
     }

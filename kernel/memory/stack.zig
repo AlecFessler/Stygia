@@ -26,17 +26,17 @@ var freelist_top: usize = 0;
 ///
 /// This lock is reachable from an ASYNCHRONOUS interrupt: the timer
 /// entry `arch.x64.irq.schedTimerHandler` → `scheduler.preempt` →
-/// `scheduler.yieldTo` → `execution_context.finalizeDestroyMarkedDead`
+/// `scheduler.yieldTo` → `thread.finalizeDestroyMarkedDead`
 /// → `destroyKernel`, which calls `quarantineSlot`/`recycleSlot` below.
-/// It is also taken from EC-context teardown and from `allocSlot` on the
+/// It is also taken from thread-context teardown and from `allocSlot` on the
 /// creation path. If a tick lands on a core that is already inside one
 /// of those critical sections with IRQs enabled, the handler spins on a
 /// lock its own core holds — an unbreakable single-core self-deadlock
 /// (and `debug.checkIrqModeOn`'s `panic_irq_mode_mix`).
 ///
-/// Every EC-context caller is *believed* to already run IRQs-masked, but
-/// nothing enforces it — notably `destroyExecutionContextLocked`'s
-/// `else { finalizeDestroyMarkedDead(ec); }` arm sits outside that
+/// Every thread-context caller is *believed* to already run IRQs-masked, but
+/// nothing enforces it — notably `destroyThreadLocked`'s
+/// `else { finalizeDestroyMarkedDead(thread); }` arm sits outside that
 /// function's `saveAndDisableInterrupts`/`restoreInterrupts` bracket.
 /// Masking here makes the requirement local and self-enforcing instead
 /// of caller-dependent and unchecked. The critical sections are a few
@@ -275,8 +275,8 @@ pub fn createKernel() !Stack {
 /// missed invalidation does not age out on the next context switch — it
 /// persists until something explicitly flushes it. Meanwhile the frames
 /// went straight back to the PMM, and `recycleSlot` handed the same VA
-/// range to the next EC. A core still holding those stale global
-/// translations then ran the new EC on a kernel stack that physically
+/// range to the next thread. A core still holding those stale global
+/// translations then ran the new thread on a kernel stack that physically
 /// aliased whatever the PMM had since allocated over it: silent
 /// cross-core kernel-stack corruption, no fault, no diagnostic.
 ///
@@ -292,7 +292,7 @@ pub fn createKernel() !Stack {
 ///
 /// The reclaim is DEFERRED, not waited on. This function is reachable
 /// with object gen-locks held and IRQs masked (`terminate` and
-/// `destroyExecutionContextLocked` both call it under the dying
+/// `destroyThreadLocked` both call it under the dying
 /// domain's lock), and blocking for shootdown acks there deadlocks
 /// against the IPC fast path: its gen-lock CAS spins are hand-written
 /// assembly that runs IRQs-off and services no TLB arms, so a core
@@ -306,11 +306,11 @@ pub fn createKernel() !Stack {
 /// Deliberately takes NO address-space root: kernel stacks are mapped
 /// into `memory_init.kernel_addr_space_root` and nowhere else, so that
 /// is the only root it can ever be correct to unmap them from. The
-/// previous signature let callers pass a root, and the EC teardown path
+/// previous signature let callers pass a root, and the thread teardown path
 /// passed the owning domain's — correct on x86-64, where the kernel
 /// half is mirrored into every domain PML4, but wrong on aarch64, where
 /// the domain root is the TTBR0 (user-only) tree: `unmapPage` walked
-/// USER tables with indices derived from the kernel VA, so every EC
+/// USER tables with indices derived from the kernel VA, so every thread
 /// destroy either silently leaked the kstack (walk found nothing) or
 /// unmapped and freed an unrelated LIVE USER PAGE at the aliased low VA
 /// — a page whose physical frame the domain's wholesale teardown then

@@ -55,7 +55,7 @@ Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success
 | 1 | E_ABANDONED | the peer that would resolve a pending suspension was destroyed before it could do so |
 | 2 | E_BADADDR | a user address argument is not a valid mapped address in the caller's domain |
 | 3 | E_BADCAP | handle id is not a valid handle of the expected type in the caller's table |
-| 4 | E_BUSY | target object is in a state that disallows the operation (e.g., target EC is running and not suspended) |
+| 4 | E_BUSY | target object is in a state that disallows the operation (e.g., target thread is running and not suspended) |
 | 5 | E_CLOSED | port has no remaining endpoints to make progress against the call |
 | 6 | E_FULL | a fixed-capacity table cannot accommodate the requested allocation (caller's handle table or target's handle table) |
 | 7 | E_INVAL | argument violates a structural constraint (reserved bits set, value out of range, alignment, size, etc.) |
@@ -65,7 +65,7 @@ Error codes are returned in vreg 1 by syscalls that fail. Zero indicates success
 | 11 | E_NOSPC | insufficient address space for the requested range |
 | 12 | E_PERM | required cap is missing on the handle (or self-handle), or argument exceeds a ceiling |
 | 13 | E_REFUSED | a pending IDC call was rejected by policy before a reply could be produced |
-| 14 | E_TERM | handle references an execution context that was terminated; the stale handle is removed from the caller's table on the same call |
+| 14 | E_TERM | handle references an thread that was terminated; the stale handle is removed from the caller's table on the same call |
 | 15 | E_TIMEOUT | a wait expired before its wakeup condition was met |
 
 ## §[capabilities] Capabilities
@@ -107,7 +107,7 @@ Syscall arguments that take a handle carry only the 12-bit handle id — the cal
 
 A capability domain's handle table contains at most one handle referencing any given kernel object. Operations that would mint a duplicate handle into a table already containing one referencing the same object instead coalesce: the existing handle's caps are upgraded to the union of its prior caps and the incoming caps (bounded by any receive-time filters such as `idc_rx`), and its slot id is unchanged.
 
-Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an EC handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
+Some handles carry kernel-mutable snapshots in their field0/field1 (e.g., an thread handle's priority and affinity, a VMAR handle's `cur_rwx`/`map`/`device`). The kernel cannot keep these snapshots atomically synchronized across all handle copies at once. Any syscall that takes such a handle implicitly refreshes that handle's snapshot from the authoritative kernel state as a side effect; an explicit `sync` syscall is also provided when the caller wants a fresh snapshot without performing any other operation.
 
 Handle types a capability domain can hold:
 
@@ -115,7 +115,7 @@ Handle types a capability domain can hold:
 |---|---|
 | capability_domain_self | inherent (slot 0 at capability domain creation) |
 | capability_domain (IDC handle) | `create_capability_domain`; received via suspend/reply transfer |
-| execution_context | `create_execution_context`; received via suspend/reply transfer |
+| thread | `create_thread`; received via suspend/reply transfer |
 | page_frame | `create_page_frame`; received via suspend/reply transfer |
 | virtual_memory_address_region | `create_vmar`; received via suspend/reply transfer |
 | device_region | kernel-issued at boot to root service; received via suspend/reply transfer |
@@ -129,8 +129,8 @@ Kernel objects are grouped by the **ceiling** of their lifetime — the longest 
 
 - **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
 - **Refcount lifetime** — Port, Page Frame. Bounded by the distributed set of handles referencing them.
-- **Capability domain lifetime** — Execution Context, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
-- **Execution context lifetime** — Reply. Replies cannot outlive the execution context they are bound to.
+- **Capability domain lifetime** — Thread, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
+- **Thread lifetime** — Reply. Replies cannot outlive the thread they are bound to.
 
 ### restrict
 
@@ -152,7 +152,7 @@ restrict([1] handle, [2] caps) -> void
 
 #### Description
 
-Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on EC handles (bits 8-9) and VMAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
+Most cap fields use bitwise subset semantics: a bit set in `[2].caps` must also be set in the handle's current caps. The `restart_policy` field on thread handles (bits 8-9) and VMAR handles (bits 9-10) is a 2-bit enum ordered by privilege (lowest privilege = numeric 0); for these fields "reducing" means the new numeric value is less than or equal to the current value, not bitwise subset.
 
 #### Capabilities
 
@@ -162,7 +162,7 @@ None — reducing authority never requires authority.
 
 **E_BADCAP** — `[1]` is not a valid handle.
 
-**E_PERM** — `[2].caps` is not a subset of the handle's current caps (bitwise for most fields; numeric ≤ for `restart_policy` on EC/VMAR handles).
+**E_PERM** — `[2].caps` is not a subset of the handle's current caps (bitwise for most fields; numeric ≤ for `restart_policy` on thread/VMAR handles).
 
 **E_INVAL** — reserved bits set in `[1]` or `[2]`.
 
@@ -172,7 +172,7 @@ None — reducing authority never requires authority.
 
 [test 02] returns E_PERM if any cap field in [2].caps using bitwise semantics has a bit set that is not set in the handle's current caps.
 
-[test 03] returns E_PERM if the handle is an EC handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
+[test 03] returns E_PERM if the handle is an thread handle and [2].caps' `restart_policy` (bits 8-9) numeric value exceeds the handle's current `restart_policy`.
 
 [test 04] returns E_PERM if the handle is a VMAR handle and [2].caps' `restart_policy` (bits 9-10) numeric value exceeds the handle's current `restart_policy`.
 
@@ -208,13 +208,13 @@ Per-type observable behavior:
 |---|---|
 | `capability_domain_self` | The calling domain is cleaned up; each handle in its table is released with its type-specific delete behavior applied |
 | `capability_domain` (IDC) | Release handle. Domain has system lifetime; it does not terminate when IDC handles drop |
-| `execution_context` | Release handle. ECs have capability-domain lifetime; they are not destroyed by handle drops |
+| `thread` | Release handle. Threads have capability-domain lifetime; they are not destroyed by handle drops |
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
 | `port` | Decrement the bind-side refcount if this handle has `bind`; decrement the recv-side refcount if this handle has `recv`. The `suspend` cap does not contribute to either refcount. When the recv-side refcount hits zero, suspended senders resume with `E_CLOSED` and the port slab is destroyed. When the bind-side refcount hits zero and no vCPU `exit_port` pins remain, receivers suspended on the port resume with `E_CLOSED`; the port slab itself stays alive while any recv-cap holder remains. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
-| `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
+| `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU Threads terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
 
 #### Capabilities
 
@@ -317,7 +317,7 @@ None.
 
 ## §[capability_domain] Capability Domain
 
-A capability domain is a set of capabilities usable by execution contexts bound to the domain.
+A capability domain is a set of capabilities usable by threads bound to the domain.
 
 ### Self handle
 
@@ -333,14 +333,14 @@ word 0:
 word 1 (field0):
  63    56 55     48 47     40 39     32 31     24 23                  8 7         0
 ┌────────┬─────────┬─────────┬─────────┬─────────┬──────────────────────┬───────────┐
-│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   vmar_inner_clg     │ec_inner_clg│
+│port_clg│vm_clg   │ pf_clg  │ idc_rx  │cridc_clg│   vmar_inner_clg     │thread_inner_clg│
 │  (8)   │  (8)    │   (8)   │   (8)   │   (8)   │       (16)           │    (8)    │
 └────────┴─────────┴─────────┴─────────┴─────────┴──────────────────────┴───────────┘
 
 word 2 (field1):
  63              38 37        32 31              16 15         8 7         0
 ┌──────────────────┬────────────┬──────────────────┬──────────────┬───────────┐
-│ _reserved (26)   │fut_wait_max│restart_policy_clg│vmar_outer_clg│ec_outer_clg│
+│ _reserved (26)   │fut_wait_max│restart_policy_clg│vmar_outer_clg│thread_outer_clg│
 │                  │    (6)     │      (16)        │     (8)      │    (8)    │
 └──────────────────┴────────────┴──────────────────┴──────────────┴───────────┘
 ```
@@ -358,7 +358,7 @@ cap (word 0, bits 48-63):
 | Bit(s) | Name | Gates |
 |---|---|---|
 | 0 | `crcd` — create capability domain | `create_capability_domain` syscall |
-| 1 | `crec` — create execution context | `create_execution_context` syscall (target = self) |
+| 1 | `crec` — create thread | `create_thread` syscall (target = self) |
 | 2 | `crvr` — create virtual memory address region | `create_vmar` syscall |
 | 3 | `crpf` — create page frame | `create_page_frame` syscall |
 | 4 | `crvm` — create virtual machine | `create_virtual_machine` syscall |
@@ -366,17 +366,17 @@ cap (word 0, bits 48-63):
 | 6 | _reserved | — |
 | 7 | _reserved | — |
 | 8 | _reserved | — |
-| 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
+| 9 | `restart` — domain restart on thread exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
 | 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
 | 11 | `fut_wake` — futex wake | `futex_wake` syscall |
 | 12-13 | _reserved | — |
-| 14-15 | `pri` — priority ceiling (0-3) | max priority any EC in this domain may be created with or raised to |
+| 14-15 | `pri` — priority ceiling (0-3) | max priority any thread in this domain may be created with or raised to |
 
 field0:
 
 | field | bits | meaning |
 |---|---|---|
-| ec_inner_ceiling | 0-7 | max caps on EC handles held by this domain itself referencing its own ECs |
+| thread_inner_ceiling | 0-7 | max caps on thread handles held by this domain itself referencing its own Threads |
 | vmar_inner_ceiling | 8-23 | max caps on VMAR handles held by this domain itself referencing its own VMARs (16 bits to fit all VMAR caps) |
 | cridc_ceiling | 24-31 | see §[cridc_ceiling] |
 | idc_rx | 32-39 | mask intersected with sent caps when this domain receives an IDC handle |
@@ -388,7 +388,7 @@ field1:
 
 | field | bits | meaning |
 |---|---|---|
-| ec_outer_ceiling | 0-7 | max caps on EC handles held by other domains referencing ECs in this domain |
+| thread_outer_ceiling | 0-7 | max caps on thread handles held by other domains referencing Threads in this domain |
 | vmar_outer_ceiling | 8-15 | max caps on VMAR handles held by other domains referencing VMARs in this domain |
 | restart_policy_ceiling | 16-31 | max `restart_policy` value per handle type allowed at create time in this domain (see §[restart_semantics]); semantically inner, lives in field1 because field0 is full |
 | fut_wait_max | 32-37 | max number of addresses the domain may pass to `futex_wait_val` or `futex_wait_change` per call (0..63); 0 disables futex wait entirely |
@@ -449,7 +449,7 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `crec` — create execution context in referenced domain | `create_execution_context` with this handle as `target` |
+| 2 | `crec` — create thread in referenced domain | `create_thread` with this handle as `target` |
 | 5 | `restart_policy` | IDC handle behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_capability_domain
@@ -461,7 +461,7 @@ Creates a new capability domain from an ELF image carried in a page frame. The c
 #### Declaration
 
 ```
-create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_ec_affinity, [6+] passed_handles)
+create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_frame, [5] initial_thread_affinity, [6+] passed_handles)
   -> [1] idc_handle
   syscall_num = 19
 
@@ -471,7 +471,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
     bits 24-63: _reserved
 
   [2] ceilings_inner: u64 packed as (matches self-handle field0)
-    bits  0-7:  ec_inner_ceiling
+    bits  0-7:  thread_inner_ceiling
     bits  8-23: vmar_inner_ceiling:
                    bit  8:     move
                    bit  9:     copy
@@ -496,10 +496,10 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
     bits 56-63: _reserved
 
   [3] ceilings_outer: u64 packed as (matches self-handle field1)
-    bits  0-7: ec_outer_ceiling
+    bits  0-7: thread_outer_ceiling
     bits  8-15: vmar_outer_ceiling
     bits 16-31: restart_policy_ceiling:
-                   bits 16-17: ec_restart_max     (kill / restart_at_entry / persist / _reserved)
+                   bits 16-17: thread_restart_max     (kill / restart_at_entry / persist / _reserved)
                    bits 18-19: vmar_restart_max    (free / decommit / preserve / snapshot)
                    bit 20:     pf_restart_max     (drop / keep)
                    bit 21:     dr_restart_max     (drop / keep)
@@ -512,9 +512,9 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
   [4] elf_page_frame: page frame handle containing the ELF image from offset 0
 
-  [5] initial_ec_affinity: u64 core mask applied to the new domain's
-      initial EC. Bit N = 1 allows the EC to run on core N. 0 = any
-      core (kernel chooses). Same encoding as `create_execution_context`'s
+  [5] initial_thread_affinity: u64 core mask applied to the new domain's
+      initial thread. Bit N = 1 allows the thread to run on core N. 0 = any
+      core (kernel chooses). Same encoding as `create_thread`'s
       `[6] affinity`.
 
   [6+] passed_handles: each entry is a u64 packed as
@@ -527,21 +527,21 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
 
 #### Description
 
-The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial EC's entry point.
+The ELF image is read from `elf_page_frame` starting at byte 0. The image must be position-independent; the kernel loads its segments at a randomized base in the ASLR zone (see §[address_space]). The pointer to the new domain's read-only view of its capability table is passed as the first argument to the initial thread's entry point.
 
-The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-EC handle is minted with caps = the new domain's `ec_inner_ceiling` from [2].
+The caller receives an IDC handle to the new domain with caps = the caller's own `cridc_ceiling`. The new domain's slot-2 self-IDC handle is minted with caps = the `cridc_ceiling` passed in [2]. The new domain's slot-1 initial-thread handle is minted with caps = the new domain's `thread_inner_ceiling` from [2].
 
 #### Capabilities
 
 - Self-handle: `crcd`
 - `[1].self_caps` ⊆ caller's self-handle caps
-- `[2].ec_inner_ceiling` ⊆ caller's `ec_inner_ceiling`
+- `[2].thread_inner_ceiling` ⊆ caller's `thread_inner_ceiling`
 - `[2].vmar_inner_ceiling` ⊆ caller's `vmar_inner_ceiling`
 - `[2].cridc_ceiling` ⊆ caller's `cridc_ceiling`
 - `[2].pf_ceiling` ⊆ caller's `pf_ceiling`
 - `[2].vm_ceiling` ⊆ caller's `vm_ceiling`
 - `[2].port_ceiling` ⊆ caller's `port_ceiling`
-- `[3].ec_outer_ceiling` ⊆ caller's `ec_outer_ceiling`
+- `[3].thread_outer_ceiling` ⊆ caller's `thread_outer_ceiling`
 - `[3].vmar_outer_ceiling` ⊆ caller's `vmar_outer_ceiling`
 - `[3].restart_policy_ceiling.*` ≤ caller's corresponding fields
 - `[3].fut_wait_max` ≤ caller's `fut_wait_max`
@@ -568,9 +568,9 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 [test 02] returns E_PERM if `self_caps` is not a subset of the caller's self-handle caps.
 
-[test 03] returns E_PERM if `ec_inner_ceiling` is not a subset of the caller's `ec_inner_ceiling`.
+[test 03] returns E_PERM if `thread_inner_ceiling` is not a subset of the caller's `thread_inner_ceiling`.
 
-[test 04] returns E_PERM if `ec_outer_ceiling` is not a subset of the caller's `ec_outer_ceiling`.
+[test 04] returns E_PERM if `thread_outer_ceiling` is not a subset of the caller's `thread_outer_ceiling`.
 
 [test 05] returns E_PERM if `vmar_inner_ceiling` is not a subset of the caller's `vmar_inner_ceiling`.
 
@@ -606,7 +606,7 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 [test 20] on success, the new domain's handle table contains the self-handle at slot 0 with caps = `self_caps`.
 
-[test 21] on success, the new domain's handle table contains the initial EC at slot 1 with caps = the `ec_inner_ceiling` supplied in [2].
+[test 21] on success, the new domain's handle table contains the initial thread at slot 1 with caps = the `thread_inner_ceiling` supplied in [2].
 
 [test 22] on success, the new domain's handle table contains an IDC handle to itself at slot 2 with caps = the passed `cridc_ceiling`.
 
@@ -616,31 +616,31 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 
 [test 25] a passed handle entry with `move = 0` remains in the caller's handle table after the call.
 
-[test 26] on success, the new domain's `ec_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
+[test 26] on success, the new domain's `thread_inner_ceiling`, `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`, `vm_ceiling`, and `port_ceiling` in field0 are set to the values supplied in [2] and [1].
 
-[test 27] on success, the new domain's `ec_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
+[test 27] on success, the new domain's `thread_outer_ceiling` and `vmar_outer_ceiling` in field1 are set to the values supplied in [3].
 
 [test 28] on success, the new domain's `idc_rx` in field0 is set to the value supplied in [1].
 
-[test 29] the initial EC begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
+[test 29] the initial thread begins executing at the entry point declared in the ELF header (after the kernel-applied randomized ASLR offset).
 
 [test 30] on success, two successive `create_capability_domain` calls with the same ELF image place the image at different randomized base addresses with high probability (ASLR jitter test — see §[address_space]).
 
-[test 31] on success, the new domain's initial EC has affinity equal to `[5]` (any-core when 0).
+[test 31] on success, the new domain's initial thread has affinity equal to `[5]` (any-core when 0).
 
 [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
 
 
 ### §[restart_semantics] Restart Semantics
 
-When a capability domain holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the domain rather than tearing it down. ECs re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting domain are governed by the domain-wide `reply_policy` bit on the self-handle.
+When a capability domain holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the domain rather than tearing it down. Threads re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting domain are governed by the domain-wide `reply_policy` bit on the self-handle.
 
 Per-handle policies are ordered least-to-most privileged. The `restart_policy` cap field is monotonic-reducing along this ordering: a holder may reduce its handle's policy to any value at or below the current setting. (For 2-bit policies, "reducing" is numeric reduction along the privilege ordering, not bitwise subset.)
 
 | Handle type | Policies (low → high privilege) | Notes |
 |---|---|---|
 | `capability_domain_self` | always preserved | the restart target itself |
-| `execution_context` | 0=kill / 1=restart_at_entry / 2=persist | `persist` keeps the EC running through the restart, including its stack pages; otherwise the EC re-enters at its original entry point (1) or is killed (0) |
+| `thread` | 0=kill / 1=restart_at_entry / 2=persist | `persist` keeps the thread running through the restart, including its stack pages; otherwise the thread re-enters at its original entry point (1) or is killed (0) |
 | `virtual_memory_address_region` | 0=free / 1=decommit / 2=preserve / 3=snapshot | `snapshot` requires a bound source VMAR via the `snapshot` syscall; `preserve` keeps contents; `decommit` keeps the reservation but releases pages; `free` releases everything. A VMAR lives in exactly one domain's address space; the owning domain's handle's `restart_policy` determines what happens to the VMAR. Cross-domain handles to the same VMAR carry their own `restart_policy` for whether the foreign handle survives the foreign domain's restart |
 | `page_frame` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `device_region` | 0=drop / 1=keep | |
@@ -651,7 +651,7 @@ Per-handle policies are ordered least-to-most privileged. The `restart_policy` c
 
 Each handle's `restart_policy` value is bounded at create time (and at copy time) by the domain's `restart_policy_ceiling` corresponding field on its self-handle.
 
-[test 01] returns E_PERM if `create_execution_context` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.ec_restart_max`.
+[test 01] returns E_PERM if `create_thread` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.thread_restart_max`.
 
 [test 02] returns E_PERM if `create_vmar` is called with `caps.restart_policy` exceeding the calling domain's `restart_policy_ceiling.vmar_restart_max`.
 
@@ -667,9 +667,9 @@ Each handle's `restart_policy` value is bounded at create time (and at copy time
 
 
 
-## §[execution_context] Execution Context
+## §[thread] Thread
 
-An execution context is a schedulable unit of executable state bound to a capability domain.
+An thread is a schedulable unit of executable state bound to a capability domain.
 
 Handle ABI:
 
@@ -698,8 +698,8 @@ Field layout:
 
 | field | location | meaning |
 |---|---|---|
-| pri | field0 bits 0-1 | current scheduling priority (0-3); reflects the EC's runtime state |
-| affinity | field1 bits 0-63 | current 64-bit core affinity mask; bit N = 1 means the EC may run on core N |
+| pri | field0 bits 0-1 | current scheduling priority (0-3); reflects the thread's runtime state |
+| affinity | field1 bits 0-63 | current 64-bit core affinity mask; bit N = 1 means the thread may run on core N |
 
 Both fields are kernel-mutable: `priority` and `affinity` syscalls update them, and the snapshot in any caller's handle is refreshed by the implicit-sync side effect of any syscall that takes the handle (or by an explicit `sync` call).
 
@@ -717,57 +717,57 @@ cap (word 0, bits 48-63):
 |---|---|---|
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `saff` — set affinity | `affinity` syscall on this EC |
-| 3 | `spri` — set priority | `priority` syscall on this EC |
-| 4 | `term` — terminate | `terminate` syscall on this EC |
-| 5 | `susp` — suspend | `suspend` syscall on this EC |
-| 6 | `read` | exposing this EC's state in event payloads during event delivery (§[event_state]); when absent, state in the payload is zeroed |
-| 7 | `write` | applying modifications written to the event payload back to this EC's state on reply; when absent, modifications are discarded |
-| 8-9 | `restart_policy` | EC behavior on domain restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
+| 2 | `saff` — set affinity | `affinity` syscall on this thread |
+| 3 | `spri` — set priority | `priority` syscall on this thread |
+| 4 | `term` — terminate | `terminate` syscall on this thread |
+| 5 | `susp` — suspend | `suspend` syscall on this thread |
+| 6 | `read` | exposing this thread's state in event payloads during event delivery (§[event_state]); when absent, state in the payload is zeroed |
+| 7 | `write` | applying modifications written to the event payload back to this thread's state on reply; when absent, modifications are discarded |
+| 8-9 | `restart_policy` | thread behavior on domain restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
 
-### create_execution_context
+### create_thread
 
 #### Summary
 
-Creates a new execution context either in the caller's own domain or in a target domain referenced by an IDC handle.
+Creates a new thread either in the caller's own domain or in a target domain referenced by an IDC handle.
 
 #### Declaration
 
 ```
-create_execution_context([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [6] affinity)
+create_thread([1] caps, [2] entry, [3] stack_pages, [4] target, [5] vm_handle, [6] affinity)
   -> [1] handle
   syscall_num = 22
 
   [1] caps: u64 packed as
-    bits  0-15: caps          — caps on the EC handle returned to the caller
-    bits 16-31: target_caps   — caps on the EC handle inserted into target's table
+    bits  0-15: caps          — caps on the thread handle returned to the caller
+    bits 16-31: target_caps   — caps on the thread handle inserted into target's table
                                 (ignored when target = self)
     bits 32-33: priority      — scheduling priority, 0-3, bounded by caller's priority ceiling
     bits 34-63: _reserved
 
-  [2] entry:        instruction pointer where the EC begins execution
+  [2] entry:        instruction pointer where the thread begins execution
   [3] stack_pages:  number of stack pages the kernel allocates in the target's address space;
                     kernel installs unmapped guard pages above and below the stack
   [4] target:       0 = self, else IDC handle with crec cap to the target domain
-  [5] affinity:     64-bit core mask; bit N = 1 allows the EC to run on core N.
+  [5] affinity:     64-bit core mask; bit N = 1 allows the thread to run on core N.
                     0 = any core (kernel chooses)
 ```
 
 #### Description
 
-The kernel allocates `[3]` pages of stack in the target's address space at a kernel-chosen randomized base in the ASLR zone (see §[address_space]), with unmapped guard pages above and below to catch overflow and underflow. The EC begins executing at `[2] entry` with the stack pointer set to the top of the allocated stack.
+The kernel allocates `[3]` pages of stack in the target's address space at a kernel-chosen randomized base in the ASLR zone (see §[address_space]), with unmapped guard pages above and below to catch overflow and underflow. The thread begins executing at `[2] entry` with the stack pointer set to the top of the allocated stack.
 
 #### Capabilities
 
 - Self-handle: `crec`
 - IDC handle `[4]` (when nonzero): `crec`
-- `[1].caps` ⊆ self's `ec_inner_ceiling` (when `[4] = 0`) or target domain's `ec_outer_ceiling` (when `[4] != 0`)
-- `[1].target_caps` ⊆ target domain's `ec_inner_ceiling` (when `[4] != 0`)
+- `[1].caps` ⊆ self's `thread_inner_ceiling` (when `[4] = 0`) or target domain's `thread_outer_ceiling` (when `[4] != 0`)
+- `[1].target_caps` ⊆ target domain's `thread_inner_ceiling` (when `[4] != 0`)
 - `[1].priority` ≤ caller's priority ceiling
 
 #### Return value
 
-`[1]`: EC handle with caps = `[1].caps`.
+`[1]`: thread handle with caps = `[1].caps`.
 
 #### Errors
 
@@ -789,11 +789,11 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 [test 02] returns E_PERM if [4] is nonzero and [4] lacks `crec`.
 
-[test 03] returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `ec_inner_ceiling`.
+[test 03] returns E_PERM if [4] is 0 (target = self) and caps is not a subset of self's `thread_inner_ceiling`.
 
-[test 04] returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `ec_outer_ceiling`.
+[test 04] returns E_PERM if [4] is nonzero and caps is not a subset of the target domain's `thread_outer_ceiling`.
 
-[test 05] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `ec_inner_ceiling`.
+[test 05] returns E_PERM if [4] is nonzero and target_caps is not a subset of the target domain's `thread_inner_ceiling`.
 
 [test 06] returns E_PERM if priority exceeds the caller's priority ceiling.
 
@@ -805,22 +805,22 @@ The kernel allocates `[3]` pages of stack in the target's address space at a ker
 
 [test 10] returns E_INVAL if any reserved bits are set in [1].
 
-[test 11] on success, the caller receives an EC handle with caps = `[1].caps`.
+[test 11] on success, the caller receives an thread handle with caps = `[1].caps`.
 
 [test 12] on success, when [4] is nonzero, the target domain also receives a handle with caps = `[1].target_caps`.
 
-[test 13] on success, the EC's priority is set to `[1].priority`.
+[test 13] on success, the thread's priority is set to `[1].priority`.
 
-[test 14] on success, the EC's affinity is set to `[5]`.
+[test 14] on success, the thread's affinity is set to `[5]`.
 
-[test 15] on success, the EC's stack base lies within the ASLR zone (see §[address_space]).
+[test 15] on success, the thread's stack base lies within the ASLR zone (see §[address_space]).
 
 
 ### self
 
 #### Summary
 
-Returns the handle in the caller's table that references the calling execution context. Pure lookup — no handle is inserted, minted, or modified, and no authority is granted. By the at-most-one invariant, there is at most one such handle.
+Returns the handle in the caller's table that references the calling thread. Pure lookup — no handle is inserted, minted, or modified, and no authority is granted. By the at-most-one invariant, there is at most one such handle.
 
 #### Declaration
 
@@ -835,24 +835,24 @@ None.
 
 #### Return value
 
-`[1]`: handle in the caller's table whose resolved capability references the calling EC.
+`[1]`: handle in the caller's table whose resolved capability references the calling thread.
 
 #### Errors
 
-**E_NOENT** — no handle in the caller's table references the calling EC.
+**E_NOENT** — no handle in the caller's table references the calling thread.
 
 #### Tests
 
-[test 01] returns E_NOENT if no handle in the caller's table references the calling execution context.
+[test 01] returns E_NOENT if no handle in the caller's table references the calling thread.
 
-[test 02] on success, [1] is a handle in the caller's table whose resolved capability references the calling execution context.
+[test 02] on success, [1] is a handle in the caller's table whose resolved capability references the calling thread.
 
 
 ### terminate
 
 #### Summary
 
-Terminates the target execution context.
+Terminates the target thread.
 
 #### Declaration
 
@@ -860,22 +860,22 @@ Terminates the target execution context.
 terminate([1] target) -> void
   syscall_num = 24
 
-  [1] target: EC handle
+  [1] target: thread handle
 ```
 
 #### Description
 
-Termination atomically destroys the EC. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
+Termination atomically destroys the thread. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
 
-Termination marks any reply handles whose suspended sender was the terminated EC such that subsequent operations on those reply handles return `E_ABANDONED`.
+Termination marks any reply handles whose suspended sender was the terminated thread such that subsequent operations on those reply handles return `E_ABANDONED`.
 
 #### Capabilities
 
-- EC handle `[1]`: `term`
+- thread handle `[1]`: `term`
 
 #### Errors
 
-**E_BADCAP** — `[1]` is not a valid EC handle.
+**E_BADCAP** — `[1]` is not a valid thread handle.
 
 **E_PERM** — `[1]` does not have the `term` cap.
 
@@ -883,18 +883,18 @@ Termination marks any reply handles whose suspended sender was the terminated EC
 
 #### Tests
 
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
+[test 01] returns E_BADCAP if [1] is not a valid thread handle.
 
 [test 02] returns E_PERM if [1] does not have the `term` cap.
 
 [test 03] returns E_INVAL if any reserved bits are set in [1].
 
-[test 04] on success, the target EC stops executing.
+[test 04] on success, the target thread stops executing.
 
-[test 05] on success, syscalls invoked with any handle to the terminated EC return E_TERM and remove that handle from the caller's table on the same call.
+[test 05] on success, syscalls invoked with any handle to the terminated thread return E_TERM and remove that handle from the caller's table on the same call.
 
 
-[test 07] on success, reply handles whose suspended sender was the terminated EC return E_ABANDONED on subsequent operations.
+[test 07] on success, reply handles whose suspended sender was the terminated thread return E_ABANDONED on subsequent operations.
 
 [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -903,7 +903,7 @@ Termination marks any reply handles whose suspended sender was the terminated EC
 
 #### Summary
 
-Yields the calling EC's timeslice. With `[1] = 0`, the scheduler selects the next EC to run. With `[1]` a valid handle to a runnable EC, that EC is scheduled next; if it is not runnable, the scheduler selects.
+Yields the calling thread's timeslice. With `[1] = 0`, the scheduler selects the next thread to run. With `[1]` a valid handle to a runnable thread, that thread is scheduled next; if it is not runnable, the scheduler selects.
 
 #### Declaration
 
@@ -911,7 +911,7 @@ Yields the calling EC's timeslice. With `[1] = 0`, the scheduler selects the nex
 yield([1] target) -> void
   syscall_num = 25
 
-  [1] target: 0 = yield to scheduler; else an EC handle to yield to
+  [1] target: 0 = yield to scheduler; else an thread handle to yield to
 ```
 
 #### Capabilities
@@ -920,17 +920,17 @@ None.
 
 #### Errors
 
-**E_BADCAP** — `[1]` is nonzero and not a valid EC handle.
+**E_BADCAP** — `[1]` is nonzero and not a valid thread handle.
 
 **E_INVAL** — reserved bits set in `[1]`.
 
 #### Tests
 
-[test 01] returns E_BADCAP if [1] is nonzero and not a valid EC handle.
+[test 01] returns E_BADCAP if [1] is nonzero and not a valid thread handle.
 
 [test 02] returns E_INVAL if any reserved bits are set in [1].
 
-[test 03] on success, when [1] is a valid handle to a runnable EC, an observable side effect performed by the target EC (e.g., a write to shared memory) is visible to the caller before the caller's next syscall returns.
+[test 03] on success, when [1] is a valid handle to a runnable thread, an observable side effect performed by the target thread (e.g., a write to shared memory) is visible to the caller before the caller's next syscall returns.
 
 [test 04] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -939,7 +939,7 @@ None.
 
 #### Summary
 
-Sets the target execution context's priority.
+Sets the target thread's priority.
 
 #### Declaration
 
@@ -947,7 +947,7 @@ Sets the target execution context's priority.
 priority([1] target, [2] new_priority) -> void
   syscall_num = 26
 
-  [1] target: EC handle
+  [1] target: thread handle
   [2] new_priority: 0..3
 ```
 
@@ -957,12 +957,12 @@ The new priority applies to subsequent scheduling, port event delivery, and fute
 
 #### Capabilities
 
-- EC handle `[1]`: `spri`
+- thread handle `[1]`: `spri`
 - `[2]` ≤ caller's self-handle `pri`
 
 #### Errors
 
-**E_BADCAP** — `[1]` is not a valid EC handle.
+**E_BADCAP** — `[1]` is not a valid thread handle.
 
 **E_PERM** — `[1]` does not have the `spri` cap; `[2]` exceeds the caller's self-handle `pri`.
 
@@ -970,7 +970,7 @@ The new priority applies to subsequent scheduling, port event delivery, and fute
 
 #### Tests
 
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
+[test 01] returns E_BADCAP if [1] is not a valid thread handle.
 
 [test 02] returns E_PERM if [1] does not have the `spri` cap.
 
@@ -980,7 +980,7 @@ The new priority applies to subsequent scheduling, port event delivery, and fute
 
 [test 05] returns E_INVAL if any reserved bits are set in [1].
 
-[test 06] on success, when two ECs are blocked in `futex_wait_val` on the same address and a `futex_wake` is issued, the EC whose priority was last set higher via `priority` is woken first; the same ordering applies to `recv` selection when the two ECs are both queued senders on the same port.
+[test 06] on success, when two Threads are blocked in `futex_wait_val` on the same address and a `futex_wake` is issued, the thread whose priority was last set higher via `priority` is woken first; the same ordering applies to `recv` selection when the two Threads are both queued senders on the same port.
 
 [test 07] on success, when the target is suspended on a port or waiting on a futex, [2] takes effect on the target's next port event delivery and futex wake.
 
@@ -991,7 +991,7 @@ The new priority applies to subsequent scheduling, port event delivery, and fute
 
 #### Summary
 
-Sets the target execution context's CPU affinity mask.
+Sets the target thread's CPU affinity mask.
 
 #### Declaration
 
@@ -999,19 +999,19 @@ Sets the target execution context's CPU affinity mask.
 affinity([1] target, [2] new_affinity) -> void
   syscall_num = 27
 
-  [1] target: EC handle
+  [1] target: thread handle
   [2] new_affinity: 64-bit core mask. 0 = kernel picks any core.
-                    Otherwise, bit N = 1 allows the target EC to run on core N;
+                    Otherwise, bit N = 1 allows the target thread to run on core N;
                     bit N must only be set for cores the system actually has.
 ```
 
 #### Capabilities
 
-- EC handle `[1]`: `saff`
+- thread handle `[1]`: `saff`
 
 #### Errors
 
-**E_BADCAP** — `[1]` is not a valid EC handle.
+**E_BADCAP** — `[1]` is not a valid thread handle.
 
 **E_PERM** — `[1]` does not have the `saff` cap.
 
@@ -1019,7 +1019,7 @@ affinity([1] target, [2] new_affinity) -> void
 
 #### Tests
 
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
+[test 01] returns E_BADCAP if [1] is not a valid thread handle.
 
 [test 02] returns E_PERM if [1] does not have the `saff` cap.
 
@@ -1027,7 +1027,7 @@ affinity([1] target, [2] new_affinity) -> void
 
 [test 04] returns E_INVAL if any reserved bits are set in [1].
 
-[test 05] on success, the target EC's affinity is set to [2].
+[test 05] on success, the target thread's affinity is set to [2].
 
 [test 06] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -1039,7 +1039,7 @@ Each capability domain owns a per-domain virtual address space. The user half is
 | Zone | Placement |
 |---|---|
 | NULL guard | unmapped; any access faults |
-| ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, EC stacks, and `create_vmar` with `preferred_base = 0` |
+| ASLR zone | kernel-chosen base, randomized at placement time. Used for ELF segments, thread stacks, and `create_vmar` with `preferred_base = 0` |
 | Static zone | userspace-chosen base via `create_vmar` with `preferred_base != 0`. Placement is deterministic |
 
 ELF images loaded by `create_capability_domain` must be position-independent; the kernel relocates them to a randomized base in the ASLR zone. The first faulted page in the NULL guard always faults regardless of any other mapping.
@@ -1650,7 +1650,7 @@ create_page_frame([1] caps, [2] props, [3] pages) -> [1] handle
 
 ## §[device_region] Device Region
 
-A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual memory address region makes the device directly accessible to execution contexts in that capability domain.
+A device region is a reference to a physical device's MMIO region or x86-64 I/O port range. Installing it into a virtual memory address region makes the device directly accessible to threads in that capability domain.
 
 Handle ABI:
 
@@ -1750,7 +1750,7 @@ Userspace pairs the counter with `futex_wait_val(addr=&handle.field1, expected=l
 
 [test 02] when the device fires a second IRQ before `ack` is called, [1].field1.irq_count is not incremented a second time; only after `ack` does a subsequent IRQ from the device increment it again.
 
-[test 03] when the device fires an IRQ, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
+[test 03] when the device fires an IRQ, every thread blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field1 returns from the call with [1] = the corresponding domain-local vaddr of field1.
 
 [test 04] when the device has no IRQ delivery configured, [1].field1.irq_count remains 0.
 
@@ -1800,14 +1800,14 @@ ack([1] device_region) -> [1] prior_count
 
 [test 06] on success, the calling domain's copy of [1] has `field1.irq_count = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
 
-[test 07] on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an EC blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
+[test 07] on success, after a subsequent IRQ from the device, every domain-local copy's `field1.irq_count` reaches the new value within a bounded delay and an thread blocked in `futex_wait_val` on each copy's `field1` paddr is woken.
 
 [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 
 ## §[virtual_machine] Virtual Machine
 
-A virtual machine is a guest execution environment with its own guest physical address space. Execution contexts enter guest mode within a VM to run.
+A virtual machine is a guest execution environment with its own guest physical address space. Threads enter guest mode within a VM to run.
 
 Handle ABI:
 
@@ -2004,7 +2004,7 @@ Semantics:
 
 #### Summary
 
-Creates a vCPU execution context bound to a VM. The vCPU is created suspended on its exit port with zeroed guest state; the creator installs initial guest state through the same mechanism used to handle vm exits — recv on the exit port, modify the vregs, reply with a resume action.
+Creates a vCPU thread bound to a VM. The vCPU is created suspended on its exit port with zeroed guest state; the creator installs initial guest state through the same mechanism used to handle vm exits — recv on the exit port, modify the vregs, reply with a resume action.
 
 #### Declaration
 
@@ -2013,7 +2013,7 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
   syscall_num = 43
 
   [1] caps: u64 packed as
-    bits  0-15: caps       — caps on the EC handle returned to the caller
+    bits  0-15: caps       — caps on the thread handle returned to the caller
     bits 32-33: priority   — scheduling priority, 0-3, bounded by caller's priority ceiling
     bits 34-63: _reserved
 
@@ -2025,21 +2025,21 @@ create_vcpu([1] caps, [2] vm_handle, [3] affinity, [4] exit_port) -> [1] handle
 
 #### Description
 
-The vCPU EC is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events and publishes the new vCPU as runnable. On the vCPU's first dispatch, the kernel delivers a vm_exit-style event on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
+The vCPU thread is bound to the capability domain that holds the VM handle. `create_vcpu` binds `exit_port` as the destination for its vm_exit events and publishes the new vCPU as runnable. On the vCPU's first dispatch, the kernel delivers a vm_exit-style event on `exit_port` representing the initial "not yet started" condition: the reply cap is valid, all guest-state vregs are zero, and the exit sub-code is the `initial_state` sub-code. The creator recvs this event, writes the real initial guest state into the vregs, and replies with a resume action to enter guest mode. All subsequent guest exits flow through the same port and the same reply-cap lifecycle.
 
 #### Capabilities
 
 - Self-handle: `crec`. Holding the VM handle implies the authority to spawn vCPUs in it.
-- `[1].caps` ⊆ VM's owning domain's `ec_inner_ceiling`
+- `[1].caps` ⊆ VM's owning domain's `thread_inner_ceiling`
 - `[1].priority` ≤ caller's priority ceiling
 
 #### Return value
 
-`[1]`: EC handle with caps = `[1].caps`.
+`[1]`: thread handle with caps = `[1].caps`.
 
 #### Errors
 
-**E_PERM** — self-handle lacks `crec`; `caps` not a subset of the VM's owning domain's `ec_inner_ceiling`; `priority` exceeds the caller's priority ceiling.
+**E_PERM** — self-handle lacks `crec`; `caps` not a subset of the VM's owning domain's `thread_inner_ceiling`; `priority` exceeds the caller's priority ceiling.
 
 **E_BADCAP** — `[2]` is not a valid VM handle; `[4]` is not a valid port handle.
 
@@ -2053,7 +2053,7 @@ The vCPU EC is bound to the capability domain that holds the VM handle. `create_
 
 [test 01] returns E_PERM if the caller's self-handle lacks `crec`.
 
-[test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `ec_inner_ceiling`.
+[test 02] returns E_PERM if caps is not a subset of the VM's owning domain's `thread_inner_ceiling`.
 
 [test 03] returns E_PERM if priority exceeds the caller's priority ceiling.
 
@@ -2065,13 +2065,13 @@ The vCPU EC is bound to the capability domain that holds the VM handle. `create_
 
 [test 07] returns E_INVAL if any reserved bits are set in [1].
 
-[test 08] on success, the caller receives an EC handle with caps = `[1].caps`.
+[test 08] on success, the caller receives an thread handle with caps = `[1].caps`.
 
-[test 09] on success, `suspend` on the returned EC handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
+[test 09] on success, `suspend` on the returned thread handle returns E_INVAL, and after `recv` on [4] consumes the initial vm_exit and `reply` on its reply handle, a subsequent `recv` on [4] returns a vm_exit whose vreg layout matches §[vm_exit_state] for VM [2]'s architecture.
 
-[test 10] on success, the EC's priority is set to `[1].priority`.
+[test 10] on success, the thread's priority is set to `[1].priority`.
 
-[test 11] on success, the EC's affinity is set to `[3]`.
+[test 11] on success, the thread's affinity is set to `[3]`.
 
 [test 12] after creation, the initial vCPU dispatch delivers a vm_exit event on `[4] exit_port` with zeroed guest state in the vregs and the `initial_state` sub-code; a waiting `recv` observes that delivery before guest entry.
 
@@ -2284,7 +2284,7 @@ None beyond holding `[1]`.
 
 ## §[port] Port
 
-A port is a rendezvous point between a calling execution context and a receiving execution context, used for IDC, transfer of capabilities, and execution context event delivery.
+A port is a rendezvous point between a calling thread and a receiving thread, used for IDC, transfer of capabilities, and thread event delivery.
 
 Handle ABI:
 
@@ -2379,7 +2379,7 @@ create_port([1] caps) -> [1] handle
 
 #### Summary
 
-Suspends the target execution context and delivers a suspension event to a port.
+Suspends the target thread and delivers a suspension event to a port.
 
 #### Declaration
 
@@ -2395,7 +2395,7 @@ suspend([1] target, [2] port) -> void
     bits  0- 3: syscall_op
     bits  4-63: _reserved (must be zero)
 
-  [1] target: EC handle
+  [1] target: thread handle
   [2] port: port handle (suspension event delivery target)
 ```
 
@@ -2411,15 +2411,15 @@ suspend([1] target, [2] port) -> void
     bits 20-26: payload_count        — count of GPR-backed vregs (1..payload_count) the sender delivers as event-state payload (0..127)
     bits 27-63: _reserved
 
-  [1] target: EC handle
+  [1] target: thread handle
   [2] port: port handle (suspension event delivery target)
 ```
 
 #### Description
 
-The event exposes the EC's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the EC.
+The event exposes the thread's state per §[event_state]; the receiver may modify state and reply through the included reply capability to resume the thread.
 
-`[1]` may reference the calling EC; the syscall returns after the calling EC is resumed.
+`[1]` may reference the calling thread; the syscall returns after the calling thread is resumed.
 
 Handle attachments in the suspension event payload follow §[handle_attachments].
 
@@ -2427,12 +2427,12 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 #### Capabilities
 
-- EC handle `[1]`: `susp`. Visibility and writability of the target's state in the suspension event are gated by `[1]`'s `read` and `write` caps.
+- thread handle `[1]`: `susp`. Visibility and writability of the target's state in the suspension event are gated by `[1]`'s `read` and `write` caps.
 - Port handle `[2]`: `suspend`. Additionally `xfer` if any handles are attached.
 
 #### Errors
 
-**E_BADCAP** — `[1]` is not a valid EC handle; `[2]` is not a valid port handle.
+**E_BADCAP** — `[1]` is not a valid thread handle; `[2]` is not a valid port handle.
 
 **E_PERM** — `[1]` lacks `susp`; `[2]` lacks `suspend`.
 
@@ -2440,7 +2440,7 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 #### Tests
 
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
+[test 01] returns E_BADCAP if [1] is not a valid thread handle.
 
 [test 02] returns E_BADCAP if [2] is not a valid port handle.
 
@@ -2454,13 +2454,13 @@ The receiver only reads vregs 1..payload_count as event-state payload; vregs abo
 
 [test 07] returns E_INVAL if [1] is already suspended.
 
-[test 08] on success, the target EC stops executing.
+[test 08] on success, the target thread stops executing.
 
 [test 09] on success, a suspension event is delivered on [2].
 
-[test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's EC state per §[event_state]; otherwise the state in the payload is zeroed.
+[test 10] on success, when [1] has the `read` cap, the suspension event payload exposes the target's thread state per §[event_state]; otherwise the state in the payload is zeroed.
 
-[test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
+[test 11] on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's thread state on reply; otherwise modifications are discarded.
 
 [test 12] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
@@ -2493,7 +2493,7 @@ recv([1] port, [2] timeout_ns) -> void
 
 #### Description
 
-On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended EC's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
+On return, the kernel has dequeued one suspended sender, allocated a reply handle for it in the caller's table, allocated slots for any handles the sender attached, written the suspended thread's state to the caller's vregs per §[event_state] (and §[vm_exit_state] for vm_exits), and populated the syscall word with the reply handle id, event_type, pair_count, and tstart.
 
 When multiple senders are queued on the port, the kernel selects the highest-priority sender; ties resolve FIFO. The chosen sender remains suspended until the reply handle is consumed: `reply` resumes them, `delete` on the reply handle resolves them with `E_ABANDONED`.
 
@@ -2537,9 +2537,9 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 [test 10] on success when the sender attached no handles, pair_count = 0.
 
-[test 11] on success when the suspending EC handle had the `read` cap, the receiver's vregs reflect the suspended EC's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
+[test 11] on success when the suspending thread handle had the `read` cap, the receiver's vregs reflect the suspended thread's state per §[event_state] (or §[vm_exit_state] when event_type = vm_exit).
 
-[test 12] on success when the suspending EC handle did not have the `read` cap, all event-state vregs are zeroed.
+[test 12] on success when the suspending thread handle did not have the `read` cap, all event-state vregs are zeroed.
 
 [test 13] when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 
@@ -2564,7 +2564,7 @@ Event type identifies whether a received event came from an explicit suspension 
 | 1 | _reserved | |
 | 2 | _reserved | |
 | 3 | _reserved | |
-| 4 | suspension | EC suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended EC's state per §[event_state] gated by the `read`/`write` caps on the EC handle the suspender used) |
+| 4 | suspension | thread suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended thread's state per §[event_state] gated by the `read`/`write` caps on the thread handle the suspender used) |
 | 5 | vm_exit | vCPU exited guest mode |
 | 6 | _reserved | |
 | 7..31 | _reserved | |
@@ -2573,7 +2573,7 @@ Sub-codes within `vm_exit` are carried in the event payload rather than as separ
 
 ### §[event_state] Event State
 
-When the EC handle that triggered the event held the `read` and/or `write` cap, the kernel exposes the suspended EC's state through the vreg layout at recv time and consumes modifications on reply. GPRs are 1:1 with hardware registers during handler execution — the handler reads or modifies EC state by directly reading or writing the hardware register. Non-GPR state lives on the stack at fixed offsets. The reply handle id is returned in the receiver's syscall word, not a vreg, so receivers handling small events do not need to allocate stack to reach a high vreg slot. VM exit events expose additional state — see §[vm_exit_state]. Handle attachments ride in pair vregs at the top of the vreg range — see §[handle_attachments].
+When the thread handle that triggered the event held the `read` and/or `write` cap, the kernel exposes the suspended thread's state through the vreg layout at recv time and consumes modifications on reply. GPRs are 1:1 with hardware registers during handler execution — the handler reads or modifies thread state by directly reading or writing the hardware register. Non-GPR state lives on the stack at fixed offsets. The reply handle id is returned in the receiver's syscall word, not a vreg, so receivers handling small events do not need to allocate stack to reach a high vreg slot. VM exit events expose additional state — see §[vm_exit_state]. Handle attachments ride in pair vregs at the top of the vreg range — see §[handle_attachments].
 
 The receiver's syscall word on recv return carries:
 
@@ -2593,7 +2593,7 @@ The receiver only sees vregs 1..payload_count as the valid event-state window; v
 
 | vreg | location | content |
 |---|---|---|
-| 1..13 | GPRs | EC's rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15 |
+| 1..13 | GPRs | thread's rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15 |
 | 14 | `[rsp + 8]` | RIP |
 | 15 | `[rsp + 16]` | RFLAGS |
 | 16 | `[rsp + 24]` | RSP |
@@ -2605,7 +2605,7 @@ The receiver only sees vregs 1..payload_count as the valid event-state window; v
 
 | vreg | location | content |
 |---|---|---|
-| 1..31 | x0..x30 | EC's x0..x30 |
+| 1..31 | x0..x30 | thread's x0..x30 |
 | 32 | `[sp + 8]` | PC |
 | 33 | `[sp + 16]` | PSTATE |
 | 34 | `[sp + 24]` | SP_EL0 |
@@ -2619,12 +2619,12 @@ FPU, SIMD, and other extended state (XSAVE area on x86-64, SVE/NEON state on aar
 
 ### §[handle_attachments] Handle Attachments
 
-A suspending EC may attach handles to the event by encoding them as pair entries in the high vregs and writing the count into the syscall word.
+A suspending thread may attach handles to the event by encoding them as pair entries in the high vregs and writing the count into the syscall word.
 
 The syscall word at suspend time carries `pair_count` `N` in bits 12-19 (0..255). When `N > 0`, the entries occupy vregs `[128-N..127]`. Each entry is a u64 packed as:
 
 ```
-bits  0-11: source handle id (in the suspending EC's domain)
+bits  0-11: source handle id (in the suspending thread's domain)
 bits 12-15: _reserved
 bits 16-31: caps to install on the handle in the receiver's domain
 bit     32: move (1 = remove from sender's table; 0 = copy)
@@ -2633,11 +2633,11 @@ bits 33-63: _reserved
 
 The kernel validates the entries at suspend time. The actual move/copy is performed at recv time — if the suspend resumes with `E_CLOSED` before any recv, no attachment is moved or copied and the sender's table is unchanged.
 
-At recv time the kernel inserts the `N` handles into the receiving EC's table at contiguous slots `[S, S+N)` with `S` chosen by the kernel, and sets the receiver's syscall word with `pair_count = N`, `tstart = S`, `reply_handle_id` (slot id of the inserted reply handle), and `event_type` per the layout in §[event_state]. Each installed handle's caps are the entry's `caps` intersected with the receiver's `idc_rx` for IDC handles, or the entry's `caps` verbatim for other handle types.
+At recv time the kernel inserts the `N` handles into the receiving thread's table at contiguous slots `[S, S+N)` with `S` chosen by the kernel, and sets the receiver's syscall word with `pair_count = N`, `tstart = S`, `reply_handle_id` (slot id of the inserted reply handle), and `event_type` per the layout in §[event_state]. Each installed handle's caps are the entry's `caps` intersected with the receiver's `idc_rx` for IDC handles, or the entry's `caps` verbatim for other handle types.
 
 [test 01] returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
 
-[test 02] returns E_BADCAP if any entry's source handle id is not valid in the suspending EC's domain.
+[test 02] returns E_BADCAP if any entry's source handle id is not valid in the suspending thread's domain.
 
 [test 03] returns E_PERM if any entry's caps are not a subset of the source handle's current caps.
 
@@ -2735,7 +2735,7 @@ Exit sub-codes:
 | 2 | smc | secure monitor call |
 | 3 | sysreg | trapped system register access |
 | 4 | wfi_wfe | guest executed WFI or WFE |
-| 5 | unknown_ec | unrecognized exception class |
+| 5 | unknown_thread | unrecognized exception class |
 | 6 | sync_el1 | synchronous EL1 exception |
 | 7 | halt | guest requested halt |
 | 8 | shutdown | guest triggered shutdown |
@@ -2771,7 +2771,7 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 | smc | `{imm u16}` | _reserved | _reserved |
 | sysreg | `{iss u32, op0 u2, op1 u3, crn u4, crm u4, op2 u3, rt u5, is_read u1}` packed | _reserved | _reserved |
 | wfi_wfe | `{is_wfe u1}` | _reserved | _reserved |
-| unknown_ec | raw EC value | _reserved | _reserved |
+| unknown_thread | raw thread value | _reserved | _reserved |
 | sync_el1 | ESR_EL2 | _reserved | _reserved |
 | halt, shutdown | _reserved | _reserved | _reserved |
 | unknown | raw ESR_EL2 | _reserved | _reserved |
@@ -2779,7 +2779,7 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 
 ## §[reply] Reply
 
-A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply` or `delete`) is the only way to free the suspended sender.
+A reply is a one-shot capability referencing a suspended thread that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply` or `delete`) is the only way to free the suspended sender.
 
 Handle ABI:
 
@@ -2825,7 +2825,7 @@ The kernel mints the reply handle at recv time with `move = 1`, `copy = 0`, and 
 
 #### Summary
 
-Consumes a reply handle and resumes the suspended EC. Optionally attaches up to 63 handles to the resumption (when `pair_count > 0`) and/or atomically blocks the caller on a port for the next event (when `recv_port_handle_id != 0`).
+Consumes a reply handle and resumes the suspended thread. Optionally attaches up to 63 handles to the resumption (when `pair_count > 0`) and/or atomically blocks the caller on a port for the next event (when `recv_port_handle_id != 0`).
 
 #### Declaration
 
@@ -2844,20 +2844,20 @@ reply([128-N..127] pair_entries when pair_count > 0) -> void
 
 #### Description
 
-State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend or the vCPU EC handle for vm_exit).
+State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended thread's state on resume, gated by the `write` cap on the thread handle that originated the binding (the suspending thread handle for explicit suspend or the vCPU thread handle for vm_exit).
 
 The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
 
 The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
 
 - For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
-- For `suspension` replies, the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
+- For `suspension` replies, the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended thread at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
 
 The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
 
-When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed EC's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed EC's domain).
+When `pair_count > 0`, the caller attaches `pair_count` pair entries packed in vregs `[128-pair_count..127]` per §[handle_attachments]. The resumed thread's syscall word carries `pair_count = N` and `tstart = S` (slot id of the first attached handle in the resumed thread's domain).
 
-When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another EC to interleave a syscall on the caller in between. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended EC was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
+When `recv_port_handle_id != 0`, the caller atomically completes the reply and then parks on the named port for the next event, with no chance for another thread to interleave a syscall on the caller in between. On error before the caller would park (E_BADCAP / E_PERM on the recv arm), the caller does not park and the reply handle is unaffected. On `E_TERM` (suspended thread was terminated before reply could deliver), the reply handle is consumed but the caller still does NOT park.
 
 #### Capabilities
 
@@ -2874,9 +2874,9 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 **E_INVAL** — reserved bits set in the syscall word; `pair_count > 63`; reserved bits set in any pair entry; two pair entries reference the same source.
 
-**E_TERM** — suspended EC was terminated before reply could deliver; the reply handle is consumed; on `pair_count > 0` no handle transfer occurs; on `recv_port_handle_id != 0` the caller does NOT park.
+**E_TERM** — suspended thread was terminated before reply could deliver; the reply handle is consumed; on `pair_count > 0` no handle transfer occurs; on `recv_port_handle_id != 0` the caller does NOT park.
 
-**E_FULL** — `pair_count > 0` and the resumed EC's domain handle table cannot accommodate N contiguous slots (reply handle NOT consumed; caller's table unchanged).
+**E_FULL** — `pair_count > 0` and the resumed thread's domain handle table cannot accommodate N contiguous slots (reply handle NOT consumed; caller's table unchanged).
 
 #### Tests
 
@@ -2884,15 +2884,15 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 02] returns E_INVAL if any reserved bits are set in the syscall word.
 
-[test 03] returns E_TERM if the suspended EC was terminated before reply could deliver and `pair_count = 0`; the reply handle is consumed.
+[test 03] returns E_TERM if the suspended thread was terminated before reply could deliver and `pair_count = 0`; the reply handle is consumed.
 
 [test 04] on success when `pair_count = 0` and `recv_port_handle_id = 0`, the reply handle is consumed (removed from the caller's table).
 
-[test 05] on success when the originating EC handle had the `write` cap, the resumed EC's state reflects modifications written to the receiver's event-state vregs between recv and reply.
+[test 05] on success when the originating thread handle had the `write` cap, the resumed thread's state reflects modifications written to the receiver's event-state vregs between recv and reply.
 
-[test 06] on success when the originating EC handle did not have the `write` cap, the resumed EC's state matches its pre-suspension state, ignoring any modifications made by the receiver.
+[test 06] on success when the originating thread handle did not have the `write` cap, the resumed thread's state matches its pre-suspension state, ignoring any modifications made by the receiver.
 
-[test 07] on success, the suspended EC is resumed.
+[test 07] on success, the suspended thread is resumed.
 
 [test 08] on success when the reply is typed `vm_exit` and the receiver wrote the `initial_state` sub-code into the reply (vreg 70 on x86-64, vreg 117 on aarch64), the kernel re-delivers an initial vm_exit on the vCPU's exit_port without entering guest mode; a subsequent `recv` on the exit_port returns a vm_exit whose sub-code is `initial_state`.
 
@@ -2912,11 +2912,11 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 16] returns E_INVAL if two pair entries reference the same source handle.
 
-[test 17] returns E_TERM if the suspended EC was terminated before reply could deliver and `pair_count > 0`; the reply handle is consumed and no handle transfer occurs.
+[test 17] returns E_TERM if the suspended thread was terminated before reply could deliver and `pair_count > 0`; the reply handle is consumed and no handle transfer occurs.
 
-[test 18] returns E_FULL if `pair_count > 0` and the resumed EC's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
+[test 18] returns E_FULL if `pair_count > 0` and the resumed thread's domain handle table cannot accommodate N contiguous slots; the reply handle is NOT consumed and the caller's table is unchanged.
 
-[test 19] on success when `pair_count > 0`, the resumed EC's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed EC's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
+[test 19] on success when `pair_count > 0`, the resumed thread's syscall word carries `pair_count = N` and `tstart = S`; the next N slots `[S, S+N)` in the resumed thread's domain contain the inserted handles per §[handle_attachments] (caps intersected with `idc_rx` for IDC handles, verbatim otherwise).
 
 [test 20] on success when `pair_count > 0`, source pair entries with `move = 1` are removed from the caller's table; entries with `move = 0` are not removed.
 
@@ -2926,11 +2926,11 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 
 [test 23] returns E_PERM when `recv_port_handle_id != 0` and the named port handle does not have the `recv` cap; the reply handle is NOT consumed and the caller does not park.
 
-[test 24] on success when `recv_port_handle_id != 0`, after the suspended EC is resumed the caller is parked on the named port and a subsequent event delivered on that port wakes the caller with the standard recv return.
+[test 24] on success when `recv_port_handle_id != 0`, after the suspended thread is resumed the caller is parked on the named port and a subsequent event delivered on that port wakes the caller with the standard recv return.
 
-[test 25] returns E_TERM when `recv_port_handle_id != 0` and the suspended EC was terminated before reply could deliver; the reply handle is consumed and the caller does NOT park on the recv port.
+[test 25] returns E_TERM when `recv_port_handle_id != 0` and the suspended thread was terminated before reply could deliver; the reply handle is consumed and the caller does NOT park on the recv port.
 
-[test 26] on success when both `pair_count > 0` and `recv_port_handle_id != 0`, both effects are applied atomically: the resumed EC receives the attached handles, then the caller parks on the named port.
+[test 26] on success when both `pair_count > 0` and `recv_port_handle_id != 0`, both effects are applied atomically: the resumed thread receives the attached handles, then the caller parks on the named port.
 
 
 ## §[futex] Futex
@@ -2998,7 +2998,7 @@ futex_wait_val([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] expected) -> [1] addr
 
 [test 07] on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
 
-[test 08] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+[test 08] when another thread calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
 
 
 ### futex_wait_change
@@ -3056,14 +3056,14 @@ futex_wait_change([1] timeout_ns, [2 + 2i] addr, [2 + 2i + 1] target) -> [1] add
 
 [test 07] on entry, when any pair's current `*addr == target`, returns immediately with `[1]` set to that addr.
 
-[test 08] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
+[test 08] when another thread calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
 
 
 ### futex_wake
 
 #### Summary
 
-Wakes up to `count` ECs blocked in `futex_wait_val` or `futex_wait_change` on the given address. Wake order is priority-ordered.
+Wakes up to `count` Threads blocked in `futex_wait_val` or `futex_wait_change` on the given address. Wake order is priority-ordered.
 
 #### Declaration
 
@@ -3072,7 +3072,7 @@ futex_wake([1] addr, [2] count) -> [1] woken
   syscall_num = 59
 
   [1] addr: 8-byte-aligned user address in the caller's domain
-  [2] count: maximum number of ECs to wake
+  [2] count: maximum number of Threads to wake
 ```
 
 #### Capabilities
@@ -3081,7 +3081,7 @@ futex_wake([1] addr, [2] count) -> [1] woken
 
 #### Return value
 
-`[1]`: number of ECs actually woken (0..count).
+`[1]`: number of Threads actually woken (0..count).
 
 #### Errors
 
@@ -3099,7 +3099,7 @@ futex_wake([1] addr, [2] count) -> [1] woken
 
 [test 03] returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
 
-[test 04] on success, [1] is the number of ECs actually woken (0..count).
+[test 04] on success, [1] is the number of Threads actually woken (0..count).
 
 
 ## §[system_services] System Services

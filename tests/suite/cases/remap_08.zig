@@ -11,11 +11,11 @@
 //   bearing half of the assertion: if remap silently kept the old
 //   PTEs, an "after-remap" write to a page whose effective `w` bit was
 //   cleared would still succeed and the regression would slip past a
-//   pure happy-path probe. Catching that requires the test EC to
+//   pure happy-path probe. Catching that requires the test thread to
 //   attempt a now-disallowed access and observe a CPU page fault that
 //   is delivered back to the test domain through some exception-
 //   handler hook. The v0 runner has no such hook (see map_pf_12 for
-//   the same constraint): a #PF on the test EC is handled by the
+//   the same constraint): a #PF on the test thread is handled by the
 //   kernel default, which terminates or restarts the child rather
 //   than surfacing a "permission denied" signal.
 //
@@ -85,7 +85,7 @@
 //       and verify the byte written before the remap survived (the
 //       remap must not invalidate page contents);
 //     - for "denied" access types, install a CPU exception handler
-//       on the test EC that catches #PF, advances RIP past the
+//       on the test thread that catches #PF, advances RIP past the
 //       offending instruction, and records the fault; verify the
 //       handler fired exactly the expected number of times.
 //   The map=3 arm would mint demand-paged VARs (no page_frame

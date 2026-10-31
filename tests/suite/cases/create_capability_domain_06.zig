@@ -101,7 +101,7 @@ pub fn main(cap_table_base: u64) void {
 
     // [3] ceilings_outer: start from the runner template, then clear
     // and rewrite vmar_outer_ceiling with the superset value.
-    //   bits  0-7   ec_outer_ceiling          = 0xFF
+    //   bits  0-7   thread_outer_ceiling          = 0xFF
     //   bits  8-15  vmar_outer_ceiling         = caller | extra_bit
     //   bits 16-31  restart_policy_ceiling    = 0x01FE
     //   bits 32-37  fut_wait_max              = 0x3F (63)
@@ -111,7 +111,7 @@ pub fn main(cap_table_base: u64) void {
         (template_outer & ~(@as(u64, 0xFF) << 8)) |
         (@as(u64, new_vmar_outer) << 8);
 
-    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_thread_affinity
         &[_]u64{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {

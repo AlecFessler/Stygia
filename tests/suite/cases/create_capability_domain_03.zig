@@ -1,19 +1,19 @@
 // Spec §[create_capability_domain] — test 03.
 //
-// "[test 03] returns E_PERM if `ec_inner_ceiling` is not a subset of
-//  the caller's `ec_inner_ceiling`."
+// "[test 03] returns E_PERM if `thread_inner_ceiling` is not a subset of
+//  the caller's `thread_inner_ceiling`."
 //
 // Strategy
 //   The faithful test mints a capability domain whose `ceilings_inner`
-//   sets a bit in the low byte (ec_inner_ceiling, bits 0-7) that the
-//   caller does not have set in its own `ec_inner_ceiling`. The kernel
+//   sets a bit in the low byte (thread_inner_ceiling, bits 0-7) that the
+//   caller does not have set in its own `thread_inner_ceiling`. The kernel
 //   must reject the call with E_PERM before any kernel state mutates.
 //
 //   The runner (runner/primary.zig) constructs each test domain with
 //   `ceilings_inner = 0x001C_011F_2701_FFFF`, so the test's
-//   ec_inner_ceiling is 0xFF — every bit set. With a fully-saturated
+//   thread_inner_ceiling is 0xFF — every bit set. With a fully-saturated
 //   caller ceiling, every 8-bit value the test could legally place in
-//   bits 0-7 is a subset, and no test-controlled `ec_inner_ceiling`
+//   bits 0-7 is a subset, and no test-controlled `thread_inner_ceiling`
 //   word (within reserved-bit constraints, which would route to
 //   test 17 instead) can trigger the spec's subset violation.
 //
@@ -26,14 +26,14 @@
 //   primary with fixed ceilings.
 //
 // Degraded variant landed here
-//   Read the caller's actual `ec_inner_ceiling` from slot 0 of the
+//   Read the caller's actual `thread_inner_ceiling` from slot 0 of the
 //   capability table (the self-handle's field0 bits 0-7). Construct
 //   `ceilings_inner` with that exact value in bits 0-7 and the
 //   remaining ceiling fields cloned from the runner-supplied baseline.
 //   Issue create_capability_domain with that word. The call must NOT
 //   return E_PERM for the test 03 reason: the proposed value is, by
 //   construction, equal to (and hence a subset of) the caller's
-//   ec_inner_ceiling.
+//   thread_inner_ceiling.
 //
 //   This pins one half of the rule — that an exact-match value never
 //   trips E_PERM — without requiring the lower-privilege caller path.
@@ -48,8 +48,8 @@
 //   should surface E_BADCAP from test 13's check rather than E_PERM.
 //
 // Action
-//   1. read self-handle field0 (slot 0) → caller_ec_inner_ceiling
-//   2. compose ceilings_inner with bits 0-7 = caller_ec_inner_ceiling
+//   1. read self-handle field0 (slot 0) → caller_thread_inner_ceiling
+//   2. compose ceilings_inner with bits 0-7 = caller_thread_inner_ceiling
 //      and the remaining fields cloned from the runner baseline
 //   3. issue create_capability_domain with that word and elf_pf = 0
 //
@@ -65,18 +65,18 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Runner-supplied baseline for the non-ec_inner_ceiling fields. Mirrors
+// Runner-supplied baseline for the non-thread_inner_ceiling fields. Mirrors
 // runner/primary.zig's ceilings_inner; we substitute bits 0-7 with the
-// caller's actual ec_inner_ceiling read from slot 0.
-const RUNNER_CEILINGS_INNER_NON_EC: u64 = 0x001C_011F_2701_FF00;
+// caller's actual thread_inner_ceiling read from slot 0.
+const RUNNER_CEILINGS_INNER_NON_THREAD: u64 = 0x001C_011F_2701_FF00;
 const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_01FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
-    const caller_ec_inner_ceiling: u64 = self_cap.field0 & 0xFF;
+    const caller_thread_inner_ceiling: u64 = self_cap.field0 & 0xFF;
 
     const ceilings_inner: u64 =
-        RUNNER_CEILINGS_INNER_NON_EC | caller_ec_inner_ceiling;
+        RUNNER_CEILINGS_INNER_NON_THREAD | caller_thread_inner_ceiling;
 
     // Compose the [1] caps word: self_caps in bits 0-15, idc_rx in
     // 16-23. Use the runner's cridc/idc_rx-friendly defaults with all
@@ -87,7 +87,7 @@ pub fn main(cap_table_base: u64) void {
     // elf_pf = 0 deliberately. Test 13 flags E_BADCAP for an invalid
     // page frame handle. Whatever order the kernel checks ceilings vs.
     // the page frame handle, the only outcome we forbid is E_PERM
-    // attributable to the ec_inner_ceiling subset rule, which cannot
+    // attributable to the thread_inner_ceiling subset rule, which cannot
     // fire on an exact-match value.
     const result = syscall.issueReg(.create_capability_domain, 0, .{
         .v1 = self_caps_word,

@@ -1,12 +1,12 @@
 // Spec §[create_capability_domain] create_capability_domain — test 26.
 //
-// "[test 26] on success, the new domain's `ec_inner_ceiling`,
+// "[test 26] on success, the new domain's `thread_inner_ceiling`,
 //  `vmar_inner_ceiling`, `cridc_ceiling`, `idc_rx`, `pf_ceiling`,
 //  `vm_ceiling`, and `port_ceiling` in field0 are set to the values
 //  supplied in [2] and [1]."
 //
 // Spec §[capability_domain] Self handle field0 layout:
-//   bits  0-7   ec_inner_ceiling   <- from [2] ceilings_inner bits  0-7
+//   bits  0-7   thread_inner_ceiling   <- from [2] ceilings_inner bits  0-7
 //   bits  8-23  vmar_inner_ceiling  <- from [2] ceilings_inner bits  8-23
 //   bits 24-31  cridc_ceiling      <- from [2] ceilings_inner bits 24-31
 //   bits 32-39  idc_rx             <- from [1] caps           bits 16-23
@@ -54,7 +54,7 @@
 //   parent path:
 //     1: createCapabilityDomain returned an error word
 //   child path:
-//     2: ec_inner_ceiling sub-field mismatch
+//     2: thread_inner_ceiling sub-field mismatch
 //     3: vmar_inner_ceiling sub-field mismatch
 //     4: cridc_ceiling sub-field mismatch
 //     5: idc_rx sub-field mismatch
@@ -78,14 +78,14 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // pattern so a kernel that mis-laid-out field0 would visibly fail
 // against at least one assertion.
 //
-// CHILD_EC_INNER must include `susp` (bit 5), `read` (bit 6), and
+// CHILD_THREAD_INNER must include `susp` (bit 5), `read` (bit 6), and
 // `write` (bit 7): the runner's testing.report path suspends the
-// child's SLOT_INITIAL_EC on the result port, which §[suspend]
-// gates on `susp` on the target EC handle, and the kernel's L4
+// child's SLOT_INITIAL_THREAD on the result port, which §[suspend]
+// gates on `susp` on the target thread handle, and the kernel's L4
 // fast-suspend predicate additionally requires read+write set so
 // recv-time §[event_state] vregs 1..13 carry the assertion id /
-// result code back to the runner. The child mints SLOT_INITIAL_EC
-// with caps = ec_inner_ceiling per spec §[create_capability_domain]
+// result code back to the runner. The child mints SLOT_INITIAL_THREAD
+// with caps = thread_inner_ceiling per spec §[create_capability_domain]
 // [test 21] — without these bits the child silently returns from
 // `testing.report` with E_PERM and the runner times out (MISS).
 //
@@ -96,7 +96,7 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // §[create_vmar] [test 02] gates the requested r/w/x against the
 // caller's `vmar_inner_ceiling`, so a ceiling without r+x makes
 // the child halt immediately at startup (MISS).
-const CHILD_EC_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of EC inner caps (susp+read+write set)
+const CHILD_THREAD_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of thread inner caps (susp+read+write set)
 const CHILD_VMAR_INNER: u16 = 0x00BE; // strict subset of runner 0x01FF (copy|r|w|x|mmio|max_sz=2)
 const CHILD_CRIDC: u8 = 0x05; // strict subset of runner 0x27 (move|crec)
 const CHILD_IDC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
@@ -115,7 +115,7 @@ pub fn main(cap_table_base: u64) void {
         // verify each field0 sub-field landed at the expected bit
         // position with the expected value.
         const f0 = self_cap.field0;
-        const got_ec_inner: u8 = @truncate(f0 & 0xFF);
+        const got_thread_inner: u8 = @truncate(f0 & 0xFF);
         const got_vmar_inner: u16 = @truncate((f0 >> 8) & 0xFFFF);
         const got_cridc: u8 = @truncate((f0 >> 24) & 0xFF);
         const got_idc_rx: u8 = @truncate((f0 >> 32) & 0xFF);
@@ -123,7 +123,7 @@ pub fn main(cap_table_base: u64) void {
         const got_vm_clg: u8 = @truncate((f0 >> 48) & 0xFF);
         const got_port_clg: u8 = @truncate((f0 >> 56) & 0xFF);
 
-        if (got_ec_inner != CHILD_EC_INNER) {
+        if (got_thread_inner != CHILD_THREAD_INNER) {
             testing.fail(2);
             return;
         }
@@ -160,7 +160,7 @@ pub fn main(cap_table_base: u64) void {
     // Spawn a sub-domain with the chosen ceiling/idc_rx mix. Self caps
     // must include `crec`/`crvr` so libz bootstrap and downstream
     // syscalls work. The runner-installed self caps are wider than
-    // CHILD_EC_INNER and friends; what matters here is that the
+    // CHILD_THREAD_INNER and friends; what matters here is that the
     // ceilings_inner [2] sub-fields each fit inside the runner's
     // installed ceilings.
     const child_self = caps.SelfCap{
@@ -177,14 +177,14 @@ pub fn main(cap_table_base: u64) void {
     // §[create_capability_domain] [2] ceilings_inner — packed per
     // syscall ABI (NB: pf/vm/port_ceiling shift to field0 bits 40-63
     // in the new domain to make room for idc_rx at field0 bits 32-39):
-    //   bits  0-7   ec_inner_ceiling   = CHILD_EC_INNER
+    //   bits  0-7   thread_inner_ceiling   = CHILD_THREAD_INNER
     //   bits  8-23  vmar_inner_ceiling  = CHILD_VMAR_INNER
     //   bits 24-31  cridc_ceiling      = CHILD_CRIDC
     //   bits 32-39  pf_ceiling         = CHILD_PF_CLG
     //   bits 40-47  vm_ceiling         = CHILD_VM_CLG
     //   bits 48-55  port_ceiling       = CHILD_PORT_CLG
     const ceilings_inner: u64 =
-        @as(u64, CHILD_EC_INNER) |
+        @as(u64, CHILD_THREAD_INNER) |
         (@as(u64, CHILD_VMAR_INNER) << 8) |
         (@as(u64, CHILD_CRIDC) << 24) |
         (@as(u64, CHILD_PF_CLG) << 32) |
@@ -234,7 +234,7 @@ pub fn main(cap_table_base: u64) void {
         ceilings_inner,
         ceilings_outer,
         SLOT_TEST_ELF_PF,
-        0, // initial_ec_affinity = any core
+        0, // initial_thread_affinity = any core
         passed[0..],
     );
     if (testing.isHandleError(r.v1)) {

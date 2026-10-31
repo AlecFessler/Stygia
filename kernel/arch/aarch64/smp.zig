@@ -454,7 +454,7 @@ fn smpInitFull() !void {
             // Worth a line rather than a silent skip: `gic.coreCount()` is
             // NOT reduced when a core fails to start, so userspace can still
             // set an affinity mask naming it (the syscall gate is
-            // `core_id < coreCount()`). An EC pinned to a core that never
+            // `core_id < coreCount()`). An thread pinned to a core that never
             // came up is simply never dispatched, which surfaces as a test
             // MISS with no other evidence anywhere. DEN0022D Table 10:
             // -1 NOT_SUPPORTED, -2 INVALID_PARAMETERS, -4 ALREADY_ON,
@@ -604,10 +604,10 @@ fn secondaryEntry() align(4096) callconv(.naked) noreturn {
         // `gic.coreID()` is MPIDR-derived, so that garbage becomes the
         // core's logical index: `sched.perCoreInit` installs this core's
         // park kstack at `core_states[garbage]`, and every later
-        // `currentEc()` / per-core lookup consults a slot no dispatch ever
+        // `currentThread()` / per-core lookup consults a slot no dispatch ever
         // wrote. The observable failures are a "user page fault with no
-        // current EC" panic (a fault arrives from EL0 on a core whose
-        // current_ec slot is not the one dispatch used) and wild pointers
+        // current thread" panic (a fault arrives from EL0 on a core whose
+        // current_thread slot is not the one dispatch used) and wild pointers
         // out of neighbouring per-core state.
         //
         // The loader already does exactly this for the BSP, and its own
@@ -786,7 +786,7 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     // trampoline for how that read returns garbage if EL2 was not set up.
     // A mismatch means `perCoreInit` would install this core's park kstack
     // and timer under someone else's index, and every subsequent
-    // `currentEc()` on this core would consult a slot no dispatch wrote.
+    // `currentThread()` on this core would consult a slot no dispatch wrote.
     //
     // Halting is the right response rather than continuing with a warning:
     // the damage is to state SHARED with cores that are working, so a
@@ -818,12 +818,12 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     sched.perCoreInit();
 
     // Drop into the scheduler loop. APs start with empty run queues and
-    // no per-core idle EC, so `sched.run` will fall through to
+    // no per-core idle thread, so `sched.run` will fall through to
     // `parkAndAwaitIRQ` (WFI on the per-core park kstack) and wait for a
     // cross-core wake / preempt IPI from `enqueueOnCore`. `sched.run` is
-    // `noreturn`. Mirrors arch/x64/smp.zig's AP entry. Without this, ECs
+    // `noreturn`. Mirrors arch/x64/smp.zig's AP entry. Without this, Threads
     // enqueued on a secondary core (e.g. via affinity-targeted spawns)
     // never run because the IRQ-driven preempt path on a halt() loop has
-    // no outer scheduler to dispatch the woken EC into.
+    // no outer scheduler to dispatch the woken thread into.
     sched.run();
 }

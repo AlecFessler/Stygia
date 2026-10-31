@@ -22,13 +22,13 @@
 //   `xfer | recv | bind` (caps bits 2-4), so the test mints the port
 //   with all three.
 //
-//   Pipeline: mint a port with {bind, recv, xfer}; mint EC W with
+//   Pipeline: mint a port with {bind, recv, xfer}; mint thread W with
 //   {term, susp, restart_policy=0}; suspend(W, port) to queue W as a
 //   suspended sender; recv(port) to dequeue the suspension and pull
 //   back the reply handle id in the recv syscall word's bits 32-43;
 //   call reply with pair_count=1 and a single pair entry whose source
-//   id is `0xFFF` (slot 4095 — well above any handle the test EC has
-//   ever allocated; the test EC's used slots are all clustered near
+//   id is `0xFFF` (slot 4095 — well above any handle the test thread has
+//   ever allocated; the test thread's used slots are all clustered near
 //   the bottom of the table).
 //
 //   The pair entry's `caps` field is set to a single bit (`move = 1`
@@ -53,10 +53,10 @@
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer})    — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, rp=0})              — must succeed
 //   3. suspend(W, port)                        — must return OK
-//      (non-blocking on the test EC since [1] != self)
+//      (non-blocking on the test thread since [1] != self)
 //   4. recv(port)                              — must return OK and
 //      yield a reply_handle_id in the syscall word
 //   5. reply(reply_handle_id, pair_count=1,
@@ -65,7 +65,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
@@ -81,7 +81,7 @@ const testing = lib.testing;
 
 // Local halt-forever entry. libz `testing.dummyEntry` uses bare `hlt`,
 // which only assembles on x86. Mirror it here with arch dispatch so
-// the test EC compiles on aarch64 too.
+// the test thread compiles on aarch64 too.
 fn localDummyEntry() noreturn {
     while (true) {
         switch (builtin.cpu.arch) {
@@ -164,15 +164,15 @@ pub fn main(cap_table_base: u64) void {
     // the sender controllable; restart_policy=0 keeps W inside the
     // runner-granted ceiling and prevents domain-restart from masking
     // the test's lifetime guarantees.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -185,7 +185,7 @@ pub fn main(cap_table_base: u64) void {
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
     // Step 3: queue W as a suspended sender on the port. [1] != self so
-    // the call returns immediately rather than blocking the test EC.
+    // the call returns immediately rather than blocking the test thread.
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_handle,
@@ -195,7 +195,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. Port has the test EC as a live bind-cap holder and
+    // Step 4: recv. Port has the test thread as a live bind-cap holder and
     // W queued as a suspension event, so recv returns immediately with
     // the reply handle id encoded in the syscall word's bits 32-43.
     const got = syscall.recv(port_handle, 0);
@@ -206,7 +206,7 @@ pub fn main(cap_table_base: u64) void {
     const reply_handle_id: u12 = @truncate((got.word >> 32) & 0xFFF);
 
     // Step 5: reply with one pair entry whose source id is 4095 — far
-    // outside the test EC's used handle range. Per §[reply] test 12,
+    // outside the test thread's used handle range. Per §[reply] test 12,
     // this must surface E_BADCAP.
     //
     // Pair entry encoding (§[handle_attachments]):

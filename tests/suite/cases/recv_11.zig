@@ -1,31 +1,31 @@
 // Spec §[recv] recv — test 11.
 //
-// "[test 11] on success when the suspending EC handle had the `read`
-//  cap, the receiver's vregs reflect the suspended EC's state per
+// "[test 11] on success when the suspending thread handle had the `read`
+//  cap, the receiver's vregs reflect the suspended thread's state per
 //  §[event_state] (or §[vm_exit_state] when event_type = vm_exit)."
 //
 // Strategy
 //   The assertion needs a witness that the receiver-side vregs really
-//   carry the suspended EC's architectural state, gated on the `read`
-//   cap of the EC handle used at suspend. Per §[suspend] [test 10],
+//   carry the suspended thread's architectural state, gated on the `read`
+//   cap of the thread handle used at suspend. Per §[suspend] [test 10],
 //   "when [1] has the `read` cap, the suspension event payload exposes
-//   the target's EC state per §[event_state]" — so the suspending side
-//   only needs to hold `read` on the EC handle for the receiver to see
+//   the target's thread state per §[event_state]" — so the suspending side
+//   only needs to hold `read` on the thread handle for the receiver to see
 //   live state.
 //
 //   Witness pick: vreg 14 is RIP per §[event_state] x86-64 layout
 //   (vreg 1..13 = GPRs in the receiver's hardware registers; vreg 14 =
 //   `[rsp + 8]` during syscall execution, i.e., on the receiver's
-//   user stack). For a freshly-created EC W that has never executed —
+//   user stack). For a freshly-created thread W that has never executed —
 //   entry = `&dummyEntry`, suspended via `suspend(W, port)` immediately
-//   after creation — §[create_execution_context] guarantees the EC
+//   after creation — §[create_thread] guarantees the thread
 //   "begins executing at `[2] entry` with the stack pointer set to the
 //   top of the allocated stack." The kernel must therefore have
 //   recorded W's saved RIP as the entry pointer we passed in. Reading
 //   vreg 14 == &dummyEntry is a strong, deterministic witness that:
 //     (a) the kernel populated the receiver's vreg layout from W's
 //         saved state, and
-//     (b) the data really is W's RIP and not zero or the calling EC's.
+//     (b) the data really is W's RIP and not zero or the calling thread's.
 //   The `read=false` companion case is the subject of recv test 12;
 //   this file establishes only the positive direction.
 //
@@ -36,27 +36,27 @@
 //   `[rsp + 8]` (relative to the syscall-time rsp) and read it back
 //   after the kernel writes it.
 //
-//   Setup parallels terminate_07.zig with one SMP guard: the test EC
+//   Setup parallels terminate_07.zig with one SMP guard: the test thread
 //   first pins itself to its current core and creates W with that same
-//   one-core affinity. W is lower priority than the running test EC, so
+//   one-core affinity. W is lower priority than the running test thread, so
 //   it cannot be stolen onto a sibling core and execute `hlt` before the
-//   suspend snapshot. The test EC owns both ends — it mints the port (so
+//   suspend snapshot. The test thread owns both ends — it mints the port (so
 //   `bind` cap stays live and recv won't return E_CLOSED), mints W with
 //   `susp` + `read` (the susp cap to enqueue it, `read` to satisfy the
 //   gate the spec line names), suspends W onto the port, and recvs. `[1]`
-//   may reference a non-self EC and the call returns immediately without
-//   blocking the caller per §[suspend], so the test EC stays runnable
+//   may reference a non-self thread and the call returns immediately without
+//   blocking the caller per §[suspend], so the test thread stays runnable
 //   through recv.
 //
 // Action
 //   1. create_port(caps={bind, recv})         — must succeed
-//   2. pin self and create_execution_context(target=self,
+//   2. pin self and create_thread(target=self,
 //        caps={susp, read, term, rp=0})       — must succeed
 //      (entry = dummyEntry; W never executes — suspend fires before
 //      it would be scheduled. term lets the test clean up if needed
 //      but isn't required for the assertion.)
 //   3. suspend(W, port)                       — must return OK
-//      (non-blocking on the test EC since [1] != self)
+//      (non-blocking on the test thread since [1] != self)
 //   4. recv_with_rip(port)                    — must return OK; the
 //      syscall word carries reply_handle_id and event_type, vregs
 //      1..13 carry W's GPRs, and the captured stack slot carries
@@ -65,14 +65,14 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: suspend itself did not return OK
 //   4: recv did not return OK in vreg 1
 //   5: vreg 14 (RIP) does not equal the entry point we passed —
 //      either the kernel zeroed the state vregs (the test 12 path,
 //      indicating `read` was not honored) or the kernel wrote the
-//      wrong EC's state.
+//      wrong thread's state.
 //   6: setup affinity pin failed, so W could run before suspension.
 
 const builtin = @import("builtin");
@@ -150,7 +150,7 @@ fn recvCaptureRipX64(port: u12) RecvRip {
 // aarch64 ABI per spec §[syscall_abi]:
 //   vreg 0     = [sp + 0]            (syscall word)
 //   vreg 1..31 = x0..x30             (vreg 1 = x0; vreg 14 = x13)
-// Per §[event_state] the kernel writes the suspended EC's saved RIP into
+// Per §[event_state] the kernel writes the suspended thread's saved RIP into
 // vreg 14, which on aarch64 is register-backed at x13. We reserve 16
 // bytes (16-byte aligned) for the syscall word slot only and read x13
 // directly out of the asm.
@@ -202,25 +202,25 @@ pub fn main(cap_table_base: u64) void {
 
     // Keep W non-dispatched until the suspend syscall snapshots it.
     // With affinity=0, x86 work stealing may dispatch W on a sibling
-    // core between create_execution_context and suspend; W then executes
+    // core between create_thread and suspend; W then executes
     // the first `hlt`, and the HLT trap advances saved RIP by one byte.
     // That is legal scheduler behavior but violates this test's "fresh
-    // EC has entry RIP" witness precondition.
+    // thread has entry RIP" witness precondition.
     const pinned_core = testing.currentCoreId();
     const helper_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, helper_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, helper_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(6);
         return;
@@ -235,22 +235,22 @@ pub fn main(cap_table_base: u64) void {
     // the kernel exposes W's state to the receiver per the spec line
     // under test. term is held for completeness but not exercised
     // here. restart_policy = 0 (kill) avoids any restart-fallback
-    // interference. EcCap bits 0-7 cover {move,copy,saff,spri,term,
-    // susp,read,write} — all within the runner's ec_inner_ceiling =
+    // interference. ThreadCap bits 0-7 cover {move,copy,saff,spri,term,
+    // susp,read,write} — all within the runner's thread_inner_ceiling =
     // 0xFF, so caps_subset checks pass.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .read = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target = self), priority in
     // 32-33. priority = 0 stays inside the runner pri ceiling.
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -263,21 +263,21 @@ pub fn main(cap_table_base: u64) void {
     const w_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
     // Step 3: queue W as a suspended sender on the port. Per
-    // §[suspend], `[1]` may reference a non-self EC; the call returns
+    // §[suspend], `[1]` may reference a non-self thread; the call returns
     // immediately without blocking the caller. The kernel records W's
-    // saved state, gated on this EC handle's `read`/`write` for what
+    // saved state, gated on this thread handle's `read`/`write` for what
     // the receiver may see/write.
-    const sus = syscall.suspendEc(w_handle, port_handle, &.{});
+    const sus = syscall.suspendThread(w_handle, port_handle, &.{});
     if (sus.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
 
     // Step 4: recv with stack-slot capture for vreg 14. The port has
-    // the test EC as a live bind-cap holder and W queued as a
+    // the test thread as a live bind-cap holder and W queued as a
     // suspension event, so recv returns immediately (no E_CLOSED, no
     // E_FULL — the test domain has plenty of free slots for the reply
-    // handle). With `read` set on the EC handle used at suspend, the
+    // handle). With `read` set on the thread handle used at suspend, the
     // kernel writes W's saved register state into the vreg layout in
     // §[event_state]; vreg 14 = `[rsp + 8]` is W's RIP.
     const got = recvCaptureRip(port_handle);
@@ -287,7 +287,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 5: probe vreg 14. W never executed past creation; per
-    // §[create_execution_context] the kernel sets RIP to the entry we
+    // §[create_thread] the kernel sets RIP to the entry we
     // passed. Any other value — most notably zero (the test 12
     // read-not-set path) — fails the assertion under test.
     if (got.rip != entry) {

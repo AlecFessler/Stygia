@@ -228,7 +228,7 @@ pub const VmExitInfo = union(enum) {
 
     /// EC=0x00 (unknown reason). Typically a signal that the trap config
     /// is wrong; surfaced to VMM for debugging.
-    unknown_ec: u8,
+    unknown_thread: u8,
 
     /// Guest-side synchronous exception that the VMM asked to see.
     /// Payload is the raw ESR_EL2 value.
@@ -774,7 +774,7 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
                 .flags = flags,
             } };
         },
-        0x00 => .{ .unknown_ec = 0 },
+        0x00 => .{ .unknown_thread = 0 },
         else => .{ .unknown = esr },
     };
 }

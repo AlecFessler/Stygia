@@ -55,7 +55,7 @@
 #     (PageEntry). Hardware layout fidelity; flags like dirty/contiguous etc.
 #     are read by the MMU even if the kernel never asserts them today.
 #   * arch/aarch64/exceptions.zig (ExceptionClass),
-#     arch/aarch64/hv/regs.zig (EC),
+#     arch/aarch64/hv/regs.zig (thread),
 #     arch/aarch64/gic.zig                             — ARM ESR_EL1 / ESR_EL2
 #     ExceptionClass / GICD register enum value spaces.
 #   * arch/aarch64/interrupts.zig — register-block /
@@ -80,7 +80,7 @@
 #     padding for AArch64-EL2 placeholder slot.
 #   * memory/address.zig (UserVA, null_guard)          — VA-space landmark
 #     constants kept for the systems.md reference.
-#   * sched/execution_context.zig (Priority.high)      — third tier of the
+#   * sched/thread.zig (Priority.high)      — third tier of the
 #     fixed-size priority enum; kept so .high is reachable when bring-up
 #     wires it.
 #   * syscall/errors.zig (E_REFUSED) — spec error code 13 reserved
@@ -198,31 +198,31 @@ entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.ESR_EL2_EC_SHIFT    sha256
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.ESR_EL2_EC_MASK    sha256:977c83a610ffe53d69ff4d304cece599f82dfda40ac5b932f35939229648ff94
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.ESR_EL2_IL    sha256:47270a3db044e575490d5b2d76678b30e6311728806a8de05f2b7ee49824aae4
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.ESR_EL2_ISS_MASK    sha256:244b418365fb1a7705e94457ed86ef8d2f1a589de5ac906c919317d31b75657e
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC    sha256:b3db8d00d0a65b2d00a530e3a914072bbef4ea85c96c306b3d4f06179739cbb4
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.wfi_wfe    sha256:c6cc1fc3f1a61374508f685d99ca2e5c9beaae1f0d8f18de6288f8681ae8fe5e
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.cp15_32    sha256:686efbb0557f8ab435097d1d775d24f2639324b8382417c53782dcff9ec8d7a6
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.cp15_64    sha256:db35a101be9db8ff90419f85729004a5bda2dd689c78551ff60c1044ac09d61f
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.cp14_32    sha256:22bd63c8723918a377d957037bfdf4b1c67bee1f9e05f3339ef5a93b38a1f496
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.ldc_stc    sha256:b90c0caaabad1528b6ca5647d56911f08acf364e40a3be17ce64749939bfe799
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.fpsimd_sve    sha256:1992628e345995acc1717c3d069f84cdff27f3e444b71725df44ce3ec138aba5
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.hvc32    sha256:5d804b7d1bb304a5c5a70eb5b9a299451e4c4b41086c7f34dabd7dfc5d8063d4
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.smc32    sha256:27bd12327e67ba52cfcb7a0aeaadf0a4721880d47c89a5bfb66398714ff7dca9
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.hvc64    sha256:1e92403dafddfc2f93f96799fb361e8032f8c62d7548e358faf3ba6aa9656732
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.smc64    sha256:c27651383a2f3ed74fa7204fb326129bc9bcfec7b051ea5008cf363ebfe7637f
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.sysreg    sha256:6ae0168c4ee732de15505a23eeea54229c12ee6ccd1b6c70df336368c6d5aaa6
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.ptr_auth    sha256:f3950c7349aac405ca7cd6b88146ecd4a733708638b8291866f80ea0fc166727
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.iabt_lower    sha256:5b4f4b633a571b6878300481ec057d77138d6c883c28f555d0b03814b8ad7c59
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.iabt_same    sha256:51d3af54dd8170911c3d51a87b7d665a222836c7a2e1f53e17f424831d8862c6
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.pc_align    sha256:817c3be5a1cc4432e5588f03479a5ce9538fbf6462d049db9f2f53ed539b05a4
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.dabt_lower    sha256:4907f51b09df173bbb89b7024d8f7687e16e1b16014d9351432b0a1accb52f20
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.dabt_same    sha256:98ea8ac704fa5b015aeaf933f7158008f2714a00311c470ebd463c3cd5cd4081
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.sp_align    sha256:af5bff04b8bc22c0bc7c62b90cdaaed041ba45b123532c3b3d6d9f8f8e657276
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.fp_exc    sha256:027d6351ef56044b8b870ae1daba18ecfad3e3a3ac29a7bc40a96771c8c17613
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.serror    sha256:198983ee82dd2c5588230944b10b1f0df12ac05d62110a8f5f8df4fd0d16e4ea
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.bp_lower    sha256:f7cfd523e46c50ba4dc8a21cbe3d686a4395df8b6a2aa1429c03ff9fc2ad0b8a
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.sstep_lower    sha256:a7d79d3bd68bc3fed845ed641198b6385f39262eadea1e422660dfc3d857ee69
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.wp_lower    sha256:abbf43cc48067ba0fef73189d4141cbfc55550269e58dc5e15230ae15c449993
-entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.EC.brk    sha256:b4598debe25f1c011874fae04668acf2eb223b853d9dcb8910bb52978a27e885
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread    sha256:b3db8d00d0a65b2d00a530e3a914072bbef4ea85c96c306b3d4f06179739cbb4
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.wfi_wfe    sha256:c6cc1fc3f1a61374508f685d99ca2e5c9beaae1f0d8f18de6288f8681ae8fe5e
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.cp15_32    sha256:686efbb0557f8ab435097d1d775d24f2639324b8382417c53782dcff9ec8d7a6
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.cp15_64    sha256:db35a101be9db8ff90419f85729004a5bda2dd689c78551ff60c1044ac09d61f
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.cp14_32    sha256:22bd63c8723918a377d957037bfdf4b1c67bee1f9e05f3339ef5a93b38a1f496
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.ldc_stc    sha256:b90c0caaabad1528b6ca5647d56911f08acf364e40a3be17ce64749939bfe799
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.fpsimd_sve    sha256:1992628e345995acc1717c3d069f84cdff27f3e444b71725df44ce3ec138aba5
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.hvc32    sha256:5d804b7d1bb304a5c5a70eb5b9a299451e4c4b41086c7f34dabd7dfc5d8063d4
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.smc32    sha256:27bd12327e67ba52cfcb7a0aeaadf0a4721880d47c89a5bfb66398714ff7dca9
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.hvc64    sha256:1e92403dafddfc2f93f96799fb361e8032f8c62d7548e358faf3ba6aa9656732
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.smc64    sha256:c27651383a2f3ed74fa7204fb326129bc9bcfec7b051ea5008cf363ebfe7637f
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.sysreg    sha256:6ae0168c4ee732de15505a23eeea54229c12ee6ccd1b6c70df336368c6d5aaa6
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.ptr_auth    sha256:f3950c7349aac405ca7cd6b88146ecd4a733708638b8291866f80ea0fc166727
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.iabt_lower    sha256:5b4f4b633a571b6878300481ec057d77138d6c883c28f555d0b03814b8ad7c59
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.iabt_same    sha256:51d3af54dd8170911c3d51a87b7d665a222836c7a2e1f53e17f424831d8862c6
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.pc_align    sha256:817c3be5a1cc4432e5588f03479a5ce9538fbf6462d049db9f2f53ed539b05a4
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.dabt_lower    sha256:4907f51b09df173bbb89b7024d8f7687e16e1b16014d9351432b0a1accb52f20
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.dabt_same    sha256:98ea8ac704fa5b015aeaf933f7158008f2714a00311c470ebd463c3cd5cd4081
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.sp_align    sha256:af5bff04b8bc22c0bc7c62b90cdaaed041ba45b123532c3b3d6d9f8f8e657276
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.fp_exc    sha256:027d6351ef56044b8b870ae1daba18ecfad3e3a3ac29a7bc40a96771c8c17613
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.serror    sha256:198983ee82dd2c5588230944b10b1f0df12ac05d62110a8f5f8df4fd0d16e4ea
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.bp_lower    sha256:f7cfd523e46c50ba4dc8a21cbe3d686a4395df8b6a2aa1429c03ff9fc2ad0b8a
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.sstep_lower    sha256:a7d79d3bd68bc3fed845ed641198b6385f39262eadea1e422660dfc3d857ee69
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.wp_lower    sha256:abbf43cc48067ba0fef73189d4141cbfc55550269e58dc5e15230ae15c449993
+entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.thread.brk    sha256:b4598debe25f1c011874fae04668acf2eb223b853d9dcb8910bb52978a27e885
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.DABT_ISS_ISV    sha256:8c816f5828a0ea29d77671d29250a25a3e556a0c42c9f9f0d18b4b2cd175d353
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.DABT_ISS_SAS_SHIFT    sha256:004428c8270cbc54402975fe25c6645fbfeaa0851772d6cfd596625f8a6a9534
 entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.DABT_ISS_SAS_MASK    sha256:19731ba491566c2ee59dc9222af297d969027ffb3f2d1419e13b02d135485819
@@ -517,12 +517,12 @@ entity:arch/x64/timers.zig::arch.x64.timers.Hpet.GenIntStatus._res    sha256:0ea
 entity:boot/protocol.zig::boot.protocol.BootInfo._pad_ael2    sha256:36f5420cd441e13b1e0e69c71460e65293e49f80a5acabae3681340a6d330d05
 entity:memory/address.zig::memory.address.UserVA    sha256:77ab4446c7f28af772d3a19c9ffdc48ec0265366afe279967554c4cfc1311ecb
 entity:memory/address.zig::memory.address.UserVA.null_guard    sha256:f5fb2f825ccda353c9ec67b29a6da2c6c8d9ff2b400bf9ae6b4503f60400efad
-entity:sched/execution_context.zig::sched.execution_context.Priority.high    sha256:c8266f105e63d18ef3fe4626a8c0bbd1232b2232e5dc6e737852e27768bf6218
+entity:sched/thread.zig::sched.thread.Priority.high    sha256:c8266f105e63d18ef3fe4626a8c0bbd1232b2232e5dc6e737852e27768bf6218
 entity:sched/priority_queue.zig::sched.priority_queue.enqueueFront    sha256:cb0fddd7bfa7588eda73f92c3ac8ba58b672a4073122e0cdc5353b5bb1474621
 
 # ── Recovery merge (c94aea42) additions ──────────────────────────────────
 #   * arch/aarch64/exceptions.zig (ExceptionClass.{serror,*_same_el}, ThreadFaultSubcode.stack_overflow)
-#     — ARM ESR_EL1 EC + thread-fault sub-code catalogs; spec-mandated value space.
+#     — ARM ESR_EL1 thread + thread-fault sub-code catalogs; spec-mandated value space.
 #   * arch/aarch64/hyp.zig (WorldSwitchCtx.host_*, HostFpState.*)
 #     — host-context save/restore slots written and read only by the EL2 world-switch asm.
 #   * arch/aarch64/stage2.zig (Stage2Entry.* bit fields)

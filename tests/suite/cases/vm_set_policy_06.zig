@@ -19,7 +19,7 @@
 //   accesses match against this table per §[vm_policy]" — requires a
 //   vCPU executing guest code that performs a CR read or write so the
 //   kernel's CR-exit handler can match against the freshly installed
-//   table. The single-EC test child cannot author and load guest code
+//   table. The single-thread test child cannot author and load guest code
 //   into the VM's guest physical address space; create_vcpu_09 hits
 //   the same wall and stops at the initial_state reply.
 //

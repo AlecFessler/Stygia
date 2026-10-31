@@ -1,15 +1,15 @@
-// Spec §[execution_context] priority — test 02.
+// Spec §[thread] priority — test 02.
 //
 // "[test 02] returns E_PERM if [1] does not have the `spri` cap."
 //
 // Strategy
-//   Mint a fresh EC handle whose caps explicitly omit `spri`. Caps are
-//   mintable a la carte at create time, so producing an spri-less EC
+//   Mint a fresh thread handle whose caps explicitly omit `spri`. Caps are
+//   mintable a la carte at create time, so producing an spri-less thread
 //   handle is direct. Then call `priority` on it.
 //
 //   Failure-path neutralization:
 //     - E_BADCAP (test 01) — handle id comes from a successful
-//       create_execution_context, so it's valid.
+//       create_thread, so it's valid.
 //     - E_PERM via priority-ceiling (test 03) — `[2] new_priority = 0`
 //       cannot exceed any priority ceiling (the runner grants
 //       `pri = 3`); the cap check therefore precedes/isolates from
@@ -21,18 +21,18 @@
 //   The cap check is therefore the only spec-mandated failure path
 //   that applies, isolating E_PERM.
 //
-//   The new EC begins executing immediately at `dummyEntry`, which
+//   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever (`hlt`). No synchronization is needed because the
 //   `spri` cap check happens against the handle's caps field in our
-//   domain's handle table; the running EC's state is irrelevant.
+//   domain's handle table; the running thread's state is irrelevant.
 //
 // Action
-//   1. create_execution_context(target=self, caps={susp, spri=false})
+//   1. create_thread(target=self, caps={susp, spri=false})
 //                                                    — must succeed
-//   2. priority(ec, 0)                               — must return E_PERM
+//   2. priority(thread, 0)                               — must return E_PERM
 //
 // Assertions
-//   1: setup syscall failed (create_execution_context returned an error)
+//   1: setup syscall failed (create_thread returned an error)
 //   2: priority returned something other than E_PERM
 
 const lib = @import("lib");
@@ -45,21 +45,21 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // EcCap with no `spri` bit set. `susp` is included so the caps
+    // ThreadCap with no `spri` bit set. `susp` is included so the caps
     // word is non-zero — purely a defensive choice; nothing in the
-    // spec requires a non-empty caps word and a fully-empty caps EC
+    // spec requires a non-empty caps word and a fully-empty caps thread
     // would also be valid for this test.
-    const initial = caps.EcCap{
+    const initial = caps.ThreadCap{
         .susp = true,
         .spri = false,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target=self), priority in
     // 32-33. priority=0 keeps the call within the child's pri ceiling.
     const caps_word: u64 = @as(u64, initial.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1,
@@ -70,9 +70,9 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const thread_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    const result = syscall.priority(ec_handle, 0);
+    const result = syscall.priority(thread_handle, 0);
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(2);

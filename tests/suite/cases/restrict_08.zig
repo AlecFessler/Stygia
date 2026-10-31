@@ -40,7 +40,7 @@
 //
 //   Failure-path neutralization is identical to recv test 18 (the
 //   negative half of this assertion). The runner's port_ceiling
-//   covers `{xfer, recv, bind, suspend}` and the test EC has plenty
+//   covers `{xfer, recv, bind, suspend}` and the test thread has plenty
 //   of free slots for any reply mint that would never happen on the
 //   timeout path.
 //

@@ -86,22 +86,22 @@ pub fn build(b: *std.Build) void {
     const kernel_fastpath = b.option(bool, "kernel_fastpath", "L4 IPC fast-path classifier (default: on)") orelse true;
     const kernel_fastpath_suspend = b.option(bool, "kernel_fastpath_suspend", "L4 fast-path suspend arm (default: kernel_fastpath)") orelse kernel_fastpath;
     const kernel_fastpath_reply = b.option(bool, "kernel_fastpath_reply", "L4 fast-path reply arm (default: kernel_fastpath)") orelse kernel_fastpath;
-    // Per-EC kstack-corruption snapshot ring with dump-on-panic. Off by
+    // Per-thread kstack-corruption snapshot ring with dump-on-panic. Off by
     // default; CI runs with the flag absent. Each `mark` site captures
-    // tsc + ec.ctx {cs, ss, rsp, rip} into a 32-entry ring keyed by EC
-    // slab index; the panic path walks every EC ring and dumps the
+    // tsc + thread.ctx {cs, ss, rsp, rip} into a 32-entry ring keyed by thread
+    // slab index; the panic path walks every thread ring and dumps the
     // contents over serial. Used to debug the smp=4 iret-frame
     // corruption that surfaces as #GP at iretq with kernel-pointer
     // fragments in ctx.cs (offset 144 in cpu.Context).
-    const kernel_ctx_trace = b.option(bool, "ctx_trace", "Enable per-EC ctx-snapshot ring + dump-on-panic (default: off)") orelse false;
-    // Per-core current_ec transition log + dump-on-panic. Records every
-    // setCurrentEc / clearCurrentEc and every IPC fast-path Step 14 / R14
+    const kernel_ctx_trace = b.option(bool, "ctx_trace", "Enable per-thread ctx-snapshot ring + dump-on-panic (default: off)") orelse false;
+    // Per-core current_thread transition log + dump-on-panic. Records every
+    // setCurrentThread / clearCurrentThread and every IPC fast-path Step 14 / R14
     // gs:32 write; panic-handler dumps each core's ring over serial. Used
     // to debug the smp=4 race that surfaces as "kernel page fault on user
-    // VA with no current EC" in memory/fault.zig — distinguishes a
+    // VA with no current thread" in memory/fault.zig — distinguishes a
     // missing-set-after-clear from a kernel-mode fault masquerading as
     // user-mode.
-    const kernel_ec_log = b.option(bool, "ec_log", "Enable per-core current_ec transition log + dump-on-panic (default: off)") orelse false;
+    const kernel_thread_log = b.option(bool, "thread_log", "Enable per-core current_thread transition log + dump-on-panic (default: off)") orelse false;
     // Per-PF-handler outcome ring with dump-on-panic. Off by default.
     // Records ENTER + decision-branch outcome + RESUME for every page
     // fault; the panic path dumps the global 256-entry ring over serial.
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
     // `hang_detector.tickCheck()` so the dump still fires when the LAPIC
     // scheduler tick + every other periodic kernel-side IRQ source has
     // stalled (the smp=4 lost-wakeup signature: all cores idle hlt with
-    // current_ec=null and run-queues empty).
+    // current_thread=null and run-queues empty).
     const kernel_hang_watchdog = b.option(bool, "kernel_hang_watchdog", "Enable HPET-NMI hang watchdog (default: off)") orelse false;
     const kernel_spawn_diag = b.option(
         bool,
@@ -189,7 +189,7 @@ pub fn build(b: *std.Build) void {
             // codegen hygiene. With these features present, LLVM lowers
             // 16-byte struct copies to `ldr q0`/`str q0` throughout the
             // kernel (666 Debug-mode functions measured, including
-            // allocExecutionContext / destroyExecutionContextLocked /
+            // allocThread / destroyThreadLocked /
             // detachForDelete), and ReleaseSafe vectorizes whole loops
             // (main.zig's exported memset became `dup v0.16b` +
             // `stp q0,q0`). The lazy-FPU design gives kernel V-regs NO
@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
     build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
     build_opts.addOption(bool, "kernel_ctx_trace", kernel_ctx_trace);
-    build_opts.addOption(bool, "kernel_ec_log", kernel_ec_log);
+    build_opts.addOption(bool, "kernel_thread_log", kernel_thread_log);
     build_opts.addOption(bool, "kernel_pf_log", kernel_pf_log);
     build_opts.addOption(bool, "kernel_hang_watchdog", kernel_hang_watchdog);
     build_opts.addOption(bool, "kernel_spawn_diag", kernel_spawn_diag);
@@ -400,7 +400,7 @@ pub fn build(b: *std.Build) void {
             // LLVM compiles 16-byte struct copies (`dtb.Range` is two u64s) into
             // `ldr q0` / `str q0`. Those are 16-byte accesses, but Range has only
             // 8-byte alignment, so against an 8-byte-aligned array element they
-            // are UNALIGNED Device accesses and fault as EC=0x25 / DFSC=0x21.
+            // are UNALIGNED Device accesses and fault as thread=0x25 / DFSC=0x21.
             // Measured: 4 such instructions survived in the image, two of them in
             // normalizeReservations' insertion sort.
             //
@@ -610,7 +610,7 @@ pub fn build(b: *std.Build) void {
     // foreign ELF and jumps to its "entry", which lands in a zeroed page;
     // on x86 the leading 00 00 decodes as `add %al,(%rax)` with rax = 0,
     // producing a boot-time USR-PF write to address 0 followed by a
-    // single-live-EC [HANG] — a signature indistinguishable from a
+    // single-live-thread [HANG] — a signature indistinguishable from a
     // scheduler regression, and the leading explanation for stygia-gms.
     // Verify it at configure time instead. See also
     // `zig-out` staleness below.
@@ -824,7 +824,7 @@ fn verifyRootServiceArch(path: []const u8, arch: std.Target.Cpu.Arch) void {
         \\  cd - && rm -rf zig-out && zig build -Dprofile=test{s}
         \\
         \\Booting the mismatched pair would jump into a zeroed page and produce a
-        \\boot-time USR-PF write to address 0 plus a single-live-EC [HANG], which
+        \\boot-time USR-PF write to address 0 plus a single-live-thread [HANG], which
         \\looks exactly like a scheduler regression and is not one (stygia-gms).
         \\
     , .{

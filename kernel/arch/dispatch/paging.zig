@@ -83,7 +83,7 @@ pub const user_null_guard: Range = .{
 };
 
 /// ASLR zone — kernel-chosen base, randomized at placement time. Used
-/// for ELF segments, EC stacks, and `create_vmar(preferred_base = 0)`.
+/// for ELF segments, thread stacks, and `create_vmar(preferred_base = 0)`.
 /// Spec §[address_space].
 pub const user_aslr: Range = switch (builtin.cpu.arch) {
     .x86_64 => .{
@@ -228,7 +228,7 @@ pub fn dropIdentityMapping() void {
 }
 
 /// Detach this core from a dying user address space before its
-/// translation tables are freed. An EC destroying its OWN domain
+/// translation tables are freed. An thread destroying its OWN domain
 /// executes destroyPhase2 while the dying domain's root is still the
 /// active translation base on x86-64 (CR3 covers both halves), so
 /// `freeUserAddrSpace` would recycle the very tables the executing

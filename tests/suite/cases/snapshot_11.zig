@@ -34,7 +34,7 @@
 //   provisioned:
 //
 //   (a) Same restart-boundary problem as snapshot_09: a domain cannot
-//       trigger its own restart and continue executing as the same EC,
+//       trigger its own restart and continue executing as the same thread,
 //       and the runner does not retain a snapshot/restart fixture for
 //       the child. Observing the *terminated* outcome additionally
 //       requires the parent to see the absence of a successor — i.e.,
@@ -66,7 +66,7 @@
 //
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in a
-//   single test EC: mint S as a preserve-policy VMAR with `cur_rwx.w = 1`,
+//   single test thread: mint S as a preserve-policy VMAR with `cur_rwx.w = 1`,
 //   mint T as a snapshot-policy VMAR, call `snapshot(T, S)`. The actual
 //   stability check (line 1117) and the resulting domain termination are
 //   not observable here because we cannot cross the restart boundary

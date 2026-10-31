@@ -140,21 +140,21 @@ pub const KernelVA = struct {
             .start = capability_domain_slab_ptrs.end,
             .end = capability_domain_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const execution_context_slab: Range = .{
+        pub const managed_thread_slab: Range = .{
             .start = capability_domain_slab_links.end,
             .end = capability_domain_slab_links.end + SLAB_RESERVATION,
         };
-        pub const execution_context_slab_ptrs: Range = .{
-            .start = execution_context_slab.end,
-            .end = execution_context_slab.end + SLAB_RESERVATION,
+        pub const managed_thread_slab_ptrs: Range = .{
+            .start = managed_thread_slab.end,
+            .end = managed_thread_slab.end + SLAB_RESERVATION,
         };
-        pub const execution_context_slab_links: Range = .{
-            .start = execution_context_slab_ptrs.end,
-            .end = execution_context_slab_ptrs.end + SLAB_RESERVATION,
+        pub const managed_thread_slab_links: Range = .{
+            .start = managed_thread_slab_ptrs.end,
+            .end = managed_thread_slab_ptrs.end + SLAB_RESERVATION,
         };
         pub const vmar_slab: Range = .{
-            .start = execution_context_slab_links.end,
-            .end = execution_context_slab_links.end + SLAB_RESERVATION,
+            .start = managed_thread_slab_links.end,
+            .end = managed_thread_slab_links.end + SLAB_RESERVATION,
         };
         pub const vmar_slab_ptrs: Range = .{
             .start = vmar_slab.end,

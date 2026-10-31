@@ -79,7 +79,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Single passed handle entry whose id is the maximum 12-bit slot.
     // The freshly-spawned test domain's handle table only populates
-    // slots 0..3 (self, initial EC, self-IDC, result port), so slot
+    // slots 0..3 (self, initial thread, self-IDC, result port), so slot
     // HANDLE_TABLE_MAX - 1 = 4095 is empty by construction.
     const invalid_slot: caps.HandleId = @intCast(caps.HANDLE_TABLE_MAX - 1);
     const passed: [1]u64 = .{
@@ -95,7 +95,7 @@ pub fn main(cap_table_base: u64) void {
         0, // [2] ceilings_inner: all fields 0
         0, // [3] ceilings_outer: all fields 0 (incl. restart_policy_ceiling, fut_wait_max)
         elf_pf_handle,
-        0, // [5] initial_ec_affinity: any-core
+        0, // [5] initial_thread_affinity: any-core
         passed[0..],
     );
 

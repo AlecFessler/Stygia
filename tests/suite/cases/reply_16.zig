@@ -16,11 +16,11 @@
 //        the kernel to mint reply handles on this port with `xfer`
 //        set (§[reply] cap minting rule), satisfying test 09's
 //        requirement that the reply has `xfer` when pair_count > 0.
-//     2. Mint a sibling EC with `susp|term` caps and restart_policy=0.
+//     2. Mint a sibling thread with `susp|term` caps and restart_policy=0.
 //        Its entry point is `dummyEntry` (halt-forever); execution
-//        body is irrelevant — the EC only needs to exist and be
+//        body is irrelevant — the thread only needs to exist and be
 //        suspendable. restart_policy=0 keeps the create call within
-//        the child domain's `restart_policy_ceiling.ec_restart_max`.
+//        the child domain's `restart_policy_ceiling.thread_restart_max`.
 //     3. `suspend(sibling, port)` — sibling is dequeued onto the port's
 //        suspended-sender queue. We do not attach handles, so the port
 //        only needs `bind` for this step (§[suspend] test 04); xfer is
@@ -40,14 +40,14 @@
 //     - test 11 (E_INVAL on reserved bits in any pair entry): pair
 //       entries packed via caps.PairEntry whose reserved fields
 //       default to zero.
-//     - test 12 (E_BADCAP if source invalid): we use SLOT_INITIAL_EC,
+//     - test 12 (E_BADCAP if source invalid): we use SLOT_INITIAL_THREAD,
 //       which is always valid in a freshly-spawned child per
 //       §[create_capability_domain] test 21.
 //     - test 13 (E_PERM if entry caps not subset of source caps):
 //       entry caps = 0 (empty set), trivially a subset.
 //     - test 14 (E_PERM if move=1 source lacks move): move=false.
-//     - test 15 (E_PERM if move=0 source lacks copy): SLOT_INITIAL_EC
-//       has caps = ec_inner_ceiling = 0xFF (see runner/primary.zig),
+//     - test 15 (E_PERM if move=0 source lacks copy): SLOT_INITIAL_THREAD
+//       has caps = thread_inner_ceiling = 0xFF (see runner/primary.zig),
 //       which sets bit 1 (`copy`).
 //
 //   reply's high-vreg pair layout sits at vregs 126-127 for N=2, far
@@ -62,7 +62,7 @@
 //
 // Action
 //   1. create_port(caps={bind,recv,xfer,move,copy})       — must succeed
-//   2. create_execution_context(caps={susp,term},
+//   2. create_thread(caps={susp,term},
 //                               entry=&dummyEntry,
 //                               stack_pages=1, target=self,
 //                               affinity=0)                — must succeed
@@ -74,7 +74,7 @@
 //
 // Assertions
 //   1: create_port returned an error word.
-//   2: create_execution_context returned an error word.
+//   2: create_thread returned an error word.
 //   3: suspend returned non-OK.
 //   4: recv returned non-OK or reply_handle_id == 0 (slot 0 is the
 //      self handle, never used for replies).
@@ -166,7 +166,7 @@ fn issueReplyDup(reply_id: u12, entry: u64) u64 {
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // §[port] create_port: mint a port with bind+recv+xfer so this EC
+    // §[port] create_port: mint a port with bind+recv+xfer so this thread
     // can suspend a sibling on it (bind), pull the suspension event
     // out (recv), and have replies minted with the `xfer` cap (xfer).
     // move/copy are included to keep the caps word non-trivial; they
@@ -186,18 +186,18 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    // §[create_execution_context]: sibling EC with susp+term so we can
+    // §[create_thread]: sibling thread with susp+term so we can
     // suspend it on the port. restart_policy=0 keeps the create within
-    // the child domain's restart_policy_ceiling.ec_restart_max=2.
-    // priority=0 keeps the EC within the child's pri ceiling of 3.
-    const ec_caps = caps.EcCap{
+    // the child domain's restart_policy_ceiling.thread_restart_max=2.
+    // priority=0 keeps the thread within the child's pri ceiling of 3.
+    const thread_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    const caps_word: u64 = @as(u64, ec_caps.toU16());
+    const caps_word: u64 = @as(u64, thread_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -233,12 +233,12 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // §[reply] test 16: two pair entries naming the same source handle
-    // id. SLOT_INITIAL_EC (slot 1) is always present in a freshly-
-    // spawned child with caps = ec_inner_ceiling = 0xFF, so it has both
+    // id. SLOT_INITIAL_THREAD (slot 1) is always present in a freshly-
+    // spawned child with caps = thread_inner_ceiling = 0xFF, so it has both
     // copy and move bits set — neutralizing tests 14/15. entry caps = 0
     // (empty subset) neutralizes test 13.
     const dup = caps.PairEntry{
-        .id = caps.SLOT_INITIAL_EC,
+        .id = caps.SLOT_INITIAL_THREAD,
         .caps = 0,
         .move = false,
     };

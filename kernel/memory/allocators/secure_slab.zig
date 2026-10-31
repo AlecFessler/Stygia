@@ -404,7 +404,7 @@ pub fn SecureSlab(
         ///
         /// This is a MIXED-MODE class: it is taken from process context
         /// with IRQs enabled (every `alloc*` / `destroy*` entry point —
-        /// `allocExecutionContext`, `allocPort`,
+        /// `allocThread`, `allocPort`,
         /// `destroyVmar`, … — none of which runs inside
         /// an IRQ-mask bracket) AND from asynchronous interrupt context.
         /// One concrete async chain, established from the IR call
@@ -613,7 +613,7 @@ pub fn SecureSlab(
         /// Bump the gen-lock from a held `expected_gen` to `expected_gen + 1`
         /// (even = freed) without zeroing the slot or returning it to the
         /// freelist. Used by deferred-destroy paths (cross-core terminate
-        /// of a still-running EC) that need handle resolution to start
+        /// of a still-running thread) that need handle resolution to start
         /// failing immediately while leaving the slot's bytes intact for
         /// the running core to keep dereferencing until its next dispatch.
         ///
@@ -657,7 +657,7 @@ pub fn SecureSlab(
 
             // IRQ-masked: mixed-mode class — see the `lock` field doc.
             // Reached from process context by
-            // `destroyExecutionContextLocked`'s self-help drain (in
+            // `destroyThreadLocked`'s self-help drain (in
             // `terminate` / domain-destroy, IRQs enabled) and from IRQ
             // context by the preempt → `yieldTo` → `switchTo` →
             // `finalizeDestroyMarkedDead` reaper. This is the site whose

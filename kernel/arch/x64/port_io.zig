@@ -6,7 +6,7 @@
 //! access page-faults; `vmar.handlePageFault`'s `.mmio` branch routes
 //! the fault here. We:
 //!
-//!   1. Fetch the faulting MOV at user RIP through the EC's page
+//!   1. Fetch the faulting MOV at user RIP through the thread's page
 //!      tables.
 //!   2. Decode the MOV via `mmio_decode.decodeBytes` (Intel SDM Vol 2A
 //!      §2.1, opcodes 0x88/0x89/0x8A/0x8B/0xC6/0xC7).
@@ -21,7 +21,7 @@
 //!      or commit the source value (stores).
 //!   7. Advance `ctx.rip` past the MOV.
 //!
-//! Spec-mandated rejections fired inline (after which the EC has
+//! Spec-mandated rejections fired inline (after which the thread has
 //! yielded and this function never returns to its caller):
 //!   * `thread_fault.protection` — unsupported MOV (LOCK prefix,
 //!     8-byte width, IN/OUT/INS/OUTS, undecodable bytes, or RIP not
@@ -46,7 +46,7 @@ const port = stygia.sched.port;
 const scheduler = stygia.sched.scheduler;
 
 const DeviceRegion = stygia.devices.device_region.DeviceRegion;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const VAddr = stygia.memory.address.VAddr;
 
 /// `thread_fault` sub-code for unsupported MOV forms (LOCK, 8-byte,
@@ -65,34 +65,34 @@ const memory_fault_invalid_write: u8 = 2;
 /// `var_base` is a pre-snapshot copy of the VMAR's `base_vaddr.addr`
 /// taken under (and released by) the VMAR gen-lock by the caller.
 /// Caller must release the VMAR lock before invoking this — we may
-/// fire `thread_fault` / `memory_fault` inline and yield the EC, in
+/// fire `thread_fault` / `memory_fault` inline and yield the thread, in
 /// which case this function does not return and the caller's defer
 /// chain never executes (a still-held lock would strand the gen).
 ///
 /// Spec §[port_io_virtualization] tests 04-11.
 pub fn emulatePortIoFault(
-    ec: *ExecutionContext,
+    thread: *Thread,
     fault_vaddr: VAddr,
     var_base: u64,
     dev: *DeviceRegion,
 ) i64 {
-    const ctx = ec.ctx;
+    const ctx = thread.ctx;
     const rip = ctx.rip;
 
-    // Fetch up to 15 instruction bytes at user RIP through the EC's
+    // Fetch up to 15 instruction bytes at user RIP through the thread's
     // page tables. x86-64 instructions are at most 15 bytes
     // (Intel SDM Vol 2A §2.3.11) and may straddle a 4 KiB page
-    // boundary. caller-pinned: ec is the running EC so its bound
+    // boundary. caller-pinned: thread is the running thread so its bound
     // domain is alive across this PF service path; `addr_space_root`
     // is immutable for the domain's lifetime.
-    const domain = ec.domain.ptr;
+    const domain = thread.domain.ptr;
     const page_off = rip & 0xFFF;
     const first_page_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     var buf: [15]u8 = undefined;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
-        return failProtection(ec, rip);
+        return failProtection(thread, rip);
     };
     const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
     const insn_ptr: [*]const u8 = @ptrFromInt(physmap_base);
@@ -124,7 +124,7 @@ pub fn emulatePortIoFault(
     // behavior. 8-byte (REX.W) and named IN/OUT mnemonics surface
     // here as `UnsupportedInstruction` and route to thread_fault.
     const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
-        return failProtection(ec, rip);
+        return failProtection(thread, rip);
     };
 
     // Bounds-check port offset against port_count. Out of range
@@ -135,21 +135,21 @@ pub fn emulatePortIoFault(
             memory_fault_invalid_write
         else
             memory_fault_invalid_read;
-        port.fireMemoryFault(ec, subcode, fault_vaddr.addr);
+        port.fireMemoryFault(thread, subcode, fault_vaddr.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
-        // event may have suspended the EC with its kstack release
+        // event may have suspended the thread with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // `fireMemoryFault` teardown (`parkSelfFaulted`)
-        // clears the local core's `current_ec`. If the run queue is
+        // clears the local core's `current_thread`. If the run queue is
         // empty after yieldTo, returning would iretq back onto the
         // now-stale faulting user RIP. Hand off to `scheduler.run()`
         // (noreturn) — it idles until an IRQ delivers more work, at
-        // which point dispatch via `loadEcContextAndReturn` resets
+        // which point dispatch via `loadThreadContextAndReturn` resets
         // `rsp` and abandons this kernel-stack frame.
-        if (scheduler.currentEc() == null) scheduler.hopParkRun();
+        if (scheduler.currentThread() == null) scheduler.hopParkRun();
         return 0;
     }
 
@@ -164,14 +164,14 @@ pub fn emulatePortIoFault(
             1 => cpu.outb(@truncate(value), io_port),
             2 => cpu.outw(@truncate(value), io_port),
             4 => cpu.outd(value, io_port),
-            else => return failProtection(ec, rip),
+            else => return failProtection(thread, rip),
         }
     } else {
         const result: u32 = switch (op.size) {
             1 => @as(u32, cpu.inb(io_port)),
             2 => @as(u32, cpu.inw(io_port)),
             4 => cpu.ind(io_port),
-            else => return failProtection(ec, rip),
+            else => return failProtection(thread, rip),
         };
         writeContextGpr(ctx, op.reg, op.size, result);
     }
@@ -181,17 +181,17 @@ pub fn emulatePortIoFault(
 }
 
 /// Fire `thread_fault.protection` for an unsupported MOV / decode
-/// failure / unresolvable RIP, yield the EC, and never return.
+/// failure / unresolvable RIP, yield the thread, and never return.
 /// Spec §[port_io_virtualization] tests 09-11.
-fn failProtection(ec: *ExecutionContext, rip: u64) i64 {
-    port.fireThreadFault(ec, thread_fault_protection, rip);
+fn failProtection(thread: *Thread, rip: u64) i64 {
+    port.fireThreadFault(thread, thread_fault_protection, rip);
     // IRQs stay MASKED through the dispatch attempt: the fired
-    // event may have suspended the EC with its kstack release
+    // event may have suspended the thread with its kstack release
     // stashed on this core; an IRQ handler here could spin on
     // that very release (markReady's kstack barrier) — a
     // self-deadlock on our own pending stash.
     scheduler.yieldTo(null);
-    if (scheduler.currentEc() == null) scheduler.hopParkRun();
+    if (scheduler.currentThread() == null) scheduler.hopParkRun();
     return 0;
 }
 

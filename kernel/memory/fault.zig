@@ -25,14 +25,14 @@ const DbgArchCpuContext = stygia.arch.dispatch.cpu.ArchCpuContext;
 const PF_DIAG_BUDGET: u32 = 4096;
 var pf_diag_prints: u32 = 0;
 
-fn diagTag(ec: *const stygia.sched.execution_context.ExecutionContext) u64 {
-    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
-    return ec.domain.ptr.diag_test_tag;
+fn diagTag(thread: *const stygia.sched.thread.Thread) u64 {
+    if (thread.diag_test_tag != 0) return thread.diag_test_tag;
+    return thread.domain.ptr.diag_test_tag;
 }
 
 fn logPfDiag(
     site: []const u8,
-    ec: ?*const stygia.sched.execution_context.ExecutionContext,
+    thread: ?*const stygia.sched.thread.Thread,
     fault: *const PageFaultContext,
     rc: i64,
     subcode: u8,
@@ -40,13 +40,13 @@ fn logPfDiag(
     if (!build_options.kernel_spawn_diag) return;
     const n = @atomicRmw(u32, &pf_diag_prints, .Add, 1, .monotonic);
     if (n >= PF_DIAG_BUDGET) return;
-    const tag: u64 = if (ec) |e| diagTag(e) else 0;
+    const tag: u64 = if (thread) |e| diagTag(e) else 0;
     arch.boot.print(
-        "[pfdiag] site={s} tag=0x{x} ec=0x{x} far=0x{x} rip=0x{x} kpriv={d} w={d} x={d} uaccess={d} rc={d} sub={d}\n",
+        "[pfdiag] site={s} tag=0x{x} thread=0x{x} far=0x{x} rip=0x{x} kpriv={d} w={d} x={d} uaccess={d} rc={d} sub={d}\n",
         .{
             site,
             tag,
-            if (ec) |e| @intFromPtr(e) else 0,
+            if (thread) |e| @intFromPtr(e) else 0,
             fault.faulting_address,
             fault.rip,
             @intFromBool(fault.is_kernel_privilege),
@@ -62,21 +62,21 @@ fn logPfDiag(
 // TEMP DIAGNOSTIC (stygia-idc, REMOVE).
 //
 // The bare-metal cap is a recurring unhandled `memory_fault subcode=0`.
-// Cycle 4's reporter dumped `ec.ctx` and produced a frame that is
+// Cycle 4's reporter dumped `thread.ctx` and produced a frame that is
 // INTERNALLY INCONSISTENT: `elr` named `bfxil x9, x0, #0, #12` (a
 // register-only instruction that cannot take a data abort) while every
 // GPR in the same frame held its value from four instructions EARLIER,
 // and the fault address (0x20) matches neither. All three readings
 // cannot describe one event, so at most one of them is the fault.
 //
-// `ec.ctx` is assigned exactly once, at EC creation, and both
+// `thread.ctx` is assigned exactly once, at thread creation, and both
 // `exceptionTrampoline` and `restoreContextAndEret` are built so the
 // frame always lands at `kstack.top - 288`. That is an ASSUMPTION about
 // where SP_EL1 was at entry, not a measurement. This stash records the
 // LIVE fault context — the frame pointer the arch handler was actually
 // handed, its `rip`, and the hardware fault address — so the reporter
-// can print the real frame next to `ec.ctx` and say which (if either)
-// is the fault. `live_ctx != ec.ctx` refutes the whole cycle-3/4 line
+// can print the real frame next to `thread.ctx` and say which (if either)
+// is the fault. `live_ctx != thread.ctx` refutes the whole cycle-3/4 line
 // of inference in one comparison.
 const DbgFaultStash = struct {
     valid: bool = false,
@@ -277,7 +277,7 @@ fn dumpStackRaw(base: u64, len: u64) void {
     }
 }
 
-/// One line per online core: park-stack range, current EC and its
+/// One line per online core: park-stack range, current thread and its
 /// kstack range, on_cpu, pending-zombie count. Racy cross-core reads,
 /// printRaw only — this exists so a corruption report shows which
 /// contexts could legally be writing near the victim address, instead
@@ -293,7 +293,7 @@ fn dumpCoreStatesRaw() void {
         panic_mod.printHex(cs.park_stack.base.addr);
         arch.boot.printRaw("..0x");
         panic_mod.printHex(cs.park_stack.top.addr);
-        if (cs.current_ec) |cur| {
+        if (cs.current_thread) |cur| {
             arch.boot.printRaw(" cur=0x");
             panic_mod.printHex(@intFromPtr(cur));
             arch.boot.printRaw(" kstk=0x");
@@ -399,7 +399,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // handling:
         //
         //   * accessor fault  — userspace supplied a pointer the kernel
-        //     was asked to touch; deliver `memory_fault` to the EC.
+        //     was asked to touch; deliver `memory_fault` to the thread.
         //   * wild pointer    — a kernel bug (corrupted stack slot,
         //     freed object, torn ref). Delivering `memory_fault` for it
         //     is actively harmful: the arm below abandons the faulting
@@ -407,7 +407,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         //     it, so every lock that frame holds stays locked in memory
         //     forever. `fireMemoryFault`'s unhandled-fault path then takes
         //     `caps.derivation.tree_mutex` and blocking-acquires the
-        //     EC's capability-domain gen-lock — which, on the demand-
+        //     thread's capability-domain gen-lock — which, on the demand-
         //     paging path, is exactly one of the locks just leaked
         //     (fault.zig's own user arm took it, and vmar.handlePageFault
         //     took the VMAR's). The result is an unkillable spin holding
@@ -436,21 +436,21 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         }
 
         // Kernel touched a user VA via a syscall accessor — surface as a
-        // memory_fault on the EC whose syscall triggered the access.
-        const ec = scheduler.currentEc() orelse {
+        // memory_fault on the thread whose syscall triggered the access.
+        const thread = scheduler.currentThread() orelse {
             if (comptime pf_log.enabled) {
-                pf_log.mark(null, .KERNEL_NO_EC, faulting_virt.addr, 0);
+                pf_log.mark(null, .KERNEL_NO_THREAD, faulting_virt.addr, 0);
             }
             // This panic is one of the downstream shapes of the bare-metal
             // 4-core corruption (stygia-723); report the full frame so it
             // stops being a one-line dead end.
-            reportKernelFaultFatal(fault, "kernel page fault on user VA with no current EC");
+            reportKernelFaultFatal(fault, "kernel page fault on user VA with no current thread");
         };
         if (comptime pf_log.enabled) {
-            pf_log.mark(ec, .KERNEL_ON_USER_VA, faulting_virt.addr, 0);
+            pf_log.mark(thread, .KERNEL_ON_USER_VA, faulting_virt.addr, 0);
         }
         // Drain the per-core lockdep held-stack: the original syscall
-        // (e.g. `reply` holds the sender EC's gen-lock across
+        // (e.g. `reply` holds the sender thread's gen-lock across
         // `applyReplyStateToVcpu`'s SMAP-bracketed user-stack reads)
         // has its kernel frame abandoned by the yieldTo below, so the
         // defer-driven `unlockIrqRestore` never runs. Stale acquire
@@ -461,29 +461,29 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         sync_debug.dropAllHeldOnAbandonedStack();
         dbgStashFault(fault, 3); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         const subcode: u8 = @intFromEnum(accessSubcode(is_write, is_exec));
-        logPfDiag("kernel_user_accessor", ec, fault, errors.E_BADADDR, subcode);
-        port.fireMemoryFault(ec, subcode, faulting_virt.addr);
+        logPfDiag("kernel_user_accessor", thread, fault, errors.E_BADADDR, subcode);
+        port.fireMemoryFault(thread, subcode, faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
-        // fault event may have suspended the EC with its kstack
+        // fault event may have suspended the thread with its kstack
         // release stashed on this core; an IRQ handler here could
         // spin on that very release (markReady's kstack barrier) —
         // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        // `fireMemoryFault`'s unhandled-fault path terminates `ec` and
-        // clears `current_ec`; if the run queue is empty, returning
+        // `fireMemoryFault`'s unhandled-fault path terminates `thread` and
+        // clears `current_thread`; if the run queue is empty, returning
         // would iretq back into the now-stale faulting frame and re-
-        // enter exception handling with `currentEc() == null`. Hand
+        // enter exception handling with `currentThread() == null`. Hand
         // control to `scheduler.run()` — it idles until an IRQ delivers
         // more work, at which point dispatch via
-        // `loadEcContextAndReturn` resets `rsp` and abandons this
+        // `loadThreadContextAndReturn` resets `rsp` and abandons this
         // kernel-stack frame.
         // Identity, not just null: the wake/destroy machinery can leave
-        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an EC the
-        // scheduler may be running elsewhere. Only `ec` itself may be
+        // `current_thread` naming a DIFFERENT thread. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
-        const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
+        const cur_after = scheduler.currentThread();
+        if (cur_after == null or cur_after.? != thread) scheduler.hopParkRun();
         return;
     }
 
@@ -491,14 +491,14 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         switch (stack_mod.isKernelStackPage(faulting_virt)) {
             .usable => {
                 if (comptime pf_log.enabled) {
-                    pf_log.mark(scheduler.currentEc(), .KERNEL_DEMAND, faulting_virt.addr, 0);
+                    pf_log.mark(scheduler.currentThread(), .KERNEL_DEMAND, faulting_virt.addr, 0);
                 }
                 demandPageKernel(faulting_virt);
                 return;
             },
             .guard => {
                 if (comptime pf_log.enabled) {
-                    pf_log.mark(scheduler.currentEc(), .KERNEL_STACK_OVERFLOW, faulting_virt.addr, 0);
+                    pf_log.mark(scheduler.currentThread(), .KERNEL_STACK_OVERFLOW, faulting_virt.addr, 0);
                 }
                 // Report before panicking. The panic backtrace is useless
                 // for this particular fault: `StackIterator` cannot walk
@@ -519,28 +519,28 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         const ka = address.KernelVA.KernelAllocators.range;
         if (faulting_virt.addr >= ka.start and faulting_virt.addr < ka.end) {
             if (comptime pf_log.enabled) {
-                pf_log.mark(scheduler.currentEc(), .KERNEL_DEMAND, faulting_virt.addr, 0);
+                pf_log.mark(scheduler.currentThread(), .KERNEL_DEMAND, faulting_virt.addr, 0);
             }
             demandPageKernel(faulting_virt);
             return;
         }
 
         if (comptime pf_log.enabled) {
-            pf_log.mark(scheduler.currentEc(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
+            pf_log.mark(scheduler.currentThread(), .KERNEL_VA_INVALID, faulting_virt.addr, 0);
         }
         reportKernelFaultFatal(fault, "unexpected kernel page fault");
     }
 
-    const ec = scheduler.currentEc() orelse {
+    const thread = scheduler.currentThread() orelse {
         if (comptime pf_log.enabled) {
-            pf_log.mark(null, .USER_NO_EC, faulting_virt.addr, 0);
+            pf_log.mark(null, .USER_NO_THREAD, faulting_virt.addr, 0);
         }
-        // Same rationale as the kernel-on-user-VA no-EC arm: this panic
+        // Same rationale as the kernel-on-user-VA no-thread arm: this panic
         // is a recurring downstream shape of SMP corruption, and the
         // core + register frame are what make it attributable. The fp
         // here is a user fp, so the chain walk stops at the first
         // unresolvable (user) address — the header is still worth it.
-        reportKernelFaultFatal(fault, "user page fault with no current EC");
+        reportKernelFaultFatal(fault, "user page fault with no current thread");
     };
 
     // Per-PF debug print intentionally elided. Every demand-page
@@ -552,33 +552,33 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // hard enough to mask real errors. If userland PF tracing is
     // wanted, gate it on a runtime flag rather than a default-on log.
 
-    const dom_ref = ec.domain;
+    const dom_ref = thread.domain;
     const dom_lr = dom_ref.lockIrqSave(@src()) catch {
         // Domain torn down between exception entry and here — fire
-        // memory_fault so the unhandled-fault path retires the EC.
+        // memory_fault so the unhandled-fault path retires the thread.
         if (comptime pf_log.enabled) {
-            pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
+            pf_log.mark(thread, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
         dbgStashFault(fault, 2); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
         const subcode: u8 = @intFromEnum(MemoryFaultSubcode.unmapped);
-        logPfDiag("user_domain_gone", ec, fault, errors.E_BADCAP, subcode);
-        port.fireMemoryFault(ec, subcode, faulting_virt.addr);
+        logPfDiag("user_domain_gone", thread, fault, errors.E_BADCAP, subcode);
+        port.fireMemoryFault(thread, subcode, faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
-        // fault event may have suspended the EC with its kstack
+        // fault event may have suspended the thread with its kstack
         // release stashed on this core; an IRQ handler here could
         // spin on that very release (markReady's kstack barrier) —
         // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // See the kernel-on-user-VA branch above: the unhandled-fault path
-        // drains `current_ec`; if no other EC is ready we MUST not iretq
+        // drains `current_thread`; if no other thread is ready we MUST not iretq
         // back to the stale faulting frame.
         // Identity, not just null: the wake/destroy machinery can leave
-        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an EC the
-        // scheduler may be running elsewhere. Only `ec` itself may be
+        // `current_thread` naming a DIFFERENT thread. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
-        const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
+        const cur_after = scheduler.currentThread();
+        if (cur_after == null or cur_after.? != thread) scheduler.hopParkRun();
         return;
     };
     const dom = dom_lr.ptr;
@@ -590,12 +590,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero
     // return — E_BADADDR (no covering VMAR), E_PERM (rights mismatch),
     // E_NOMEM (demand alloc exhausted) — tears down the faulting domain.
-    // Yield the CPU after firing because this EC is no longer runnable.
+    // Yield the CPU after firing because this thread is no longer runnable.
     if (comptime pf_log.enabled) {
         if (rc == 0) {
-            pf_log.mark(ec, .USER_RESOLVED, faulting_virt.addr, 0);
+            pf_log.mark(thread, .USER_RESOLVED, faulting_virt.addr, 0);
         } else {
-            pf_log.mark(ec, .USER_INVALID, faulting_virt.addr, @bitCast(@as(i32, @truncate(rc))));
+            pf_log.mark(thread, .USER_INVALID, faulting_virt.addr, @bitCast(@as(i32, @truncate(rc))));
         }
     }
     if (rc != 0) {
@@ -604,21 +604,21 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         else
             accessSubcode(is_write, is_exec);
         dbgStashFault(fault, 1); // TEMP DIAGNOSTIC (stygia-idc, REMOVE)
-        logPfDiag("user_invalid", ec, fault, rc, @intFromEnum(subcode));
-        port.fireMemoryFault(ec, @intFromEnum(subcode), faulting_virt.addr);
+        logPfDiag("user_invalid", thread, fault, rc, @intFromEnum(subcode));
+        port.fireMemoryFault(thread, @intFromEnum(subcode), faulting_virt.addr);
         // IRQs stay MASKED through the dispatch attempt: the fired
-        // fault event may have suspended the EC with its kstack
+        // fault event may have suspended the thread with its kstack
         // release stashed on this core; an IRQ handler here could
         // spin on that very release (markReady's kstack barrier) —
         // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // Same rationale as the kernel-on-user-VA branch.
         // Identity, not just null: the wake/destroy machinery can leave
-        // `current_ec` naming a DIFFERENT EC. Returning would ERET into
-        // the ORIGINAL faulter's frame on its kstack — an EC the
-        // scheduler may be running elsewhere. Only `ec` itself may be
+        // `current_thread` naming a DIFFERENT thread. Returning would ERET into
+        // the ORIGINAL faulter's frame on its kstack — an thread the
+        // scheduler may be running elsewhere. Only `thread` itself may be
         // resumed through this frame.
-        const cur_after = scheduler.currentEc();
-        if (cur_after == null or cur_after.? != ec) scheduler.hopParkRun();
+        const cur_after = scheduler.currentThread();
+        if (cur_after == null or cur_after.? != thread) scheduler.hopParkRun();
     }
 }

@@ -40,7 +40,7 @@ const SLOT_NAMES = [16][]const u8{
 };
 
 /// Decode the ESR exception class. Only the classes this loader can plausibly
-/// hit are named; anything else prints raw. EC is ESR bits [31:26].
+/// hit are named; anything else prints raw. thread is ESR bits [31:26].
 fn describeEc(ec: u64) []const u8 {
     return switch (ec) {
         0x00 => "unknown reason",
@@ -59,7 +59,7 @@ fn describeEc(ec: u64) []const u8 {
         0x25 => "data abort, same EL",
         0x26 => "SP alignment fault",
         0x2F => "SError",
-        else => "see ARM ARM D13.2.37 for EC",
+        else => "see ARM ARM D13.2.37 for thread",
     };
 }
 

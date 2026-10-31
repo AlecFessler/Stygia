@@ -8,7 +8,7 @@
 //   by a real capability prior to delete. Port creation only
 //   requires the self-handle's `crpt` cap (which the runner grants
 //   to spawned tests) and the resulting slot is independent of the
-//   four conventional kernel-installed slots (self, initial EC,
+//   four conventional kernel-installed slots (self, initial thread,
 //   self-IDC, first-passed). Caps {bind, recv} pin the handle as a
 //   port without any side-effecting interactions on delete that
 //   would matter for this test — release just decrements both the

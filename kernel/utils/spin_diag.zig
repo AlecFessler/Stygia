@@ -1,7 +1,7 @@
 //! Per-core "what is this core waiting on" breadcrumbs (stygia-8xl).
 //!
 //! The terminal photograph for the surviving repeat-mode hang is a core
-//! that still names a RETIRED, gen-dead EC in `current_ec` while every
+//! that still names a RETIRED, gen-dead thread in `current_thread` while every
 //! other core has gone quiet. The per-core dump in `hang_detector` can
 //! say WHAT that core holds but not WHERE that core is, and the whole
 //! family of failed candidate fixes so far was built on guesses about
@@ -49,8 +49,8 @@ pub const MAX_CORES: usize = 64;
 /// as by name so an old log stays readable.
 pub const Site = enum(u16) {
     none = 0,
-    /// `execution_context.routeRetiredFinalize` — terminator waiting for
-    /// the retired EC's owner core to drop it from `current_ec`.
+    /// `thread.routeRetiredFinalize` — terminator waiting for
+    /// the retired thread's owner core to drop it from `current_thread`.
     route_retired_wait = 1,
     /// `scheduler.awaitDomainQuiesced` — phase-2 translation barrier.
     await_quiesced = 2,

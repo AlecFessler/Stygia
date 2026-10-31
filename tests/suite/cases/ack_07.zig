@@ -2,7 +2,7 @@
 //
 // "[test 07] on success, after a subsequent IRQ from the device, every
 //  domain-local copy's `field1.irq_count` reaches the new value within
-//  a bounded delay and an EC blocked in `futex_wait_val` on each copy's
+//  a bounded delay and an thread blocked in `futex_wait_val` on each copy's
 //  `field1` paddr is woken."
 //
 // Faithful path
@@ -13,7 +13,7 @@
 //     2. handle_list_head wired by the caps mint/alias path so
 //        propagateIrqAndWake walks every domain-local copy and bumps
 //        field1.irq_count saturating + futex.wake on its paddr.
-//     3. A worker EC parked in `futex_wait_val(addr=&copy.field1,
+//     3. A worker thread parked in `futex_wait_val(addr=&copy.field1,
 //        expected=copy.field1.irq_count)` ahead of the second IRQ so
 //        the wake side of the assertion has someone to deliver to.
 //     4. A bounded-delay timing primitive (time_monotonic or a timer
@@ -54,15 +54,15 @@
 //      handle — neither success nor E_INVAL.
 //
 // Faithful-test note (deferred half)
-//   Once IRQ injection + handle-list propagation + a worker-EC harness
+//   Once IRQ injection + handle-list propagation + a worker-thread harness
 //   land, the test body extends to:
 //     - mint and ack to set baseline;
-//     - spawn a worker EC parked in futex_wait_val(addr=&field1,
+//     - spawn a worker thread parked in futex_wait_val(addr=&field1,
 //       expected=current_count);
 //     - inject IRQ;
-//     - test EC reads field1 == current_count + 1 (id 2);
+//     - test thread reads field1 == current_count + 1 (id 2);
 //     - worker side-channels its observed [1] (the field1 vaddr) back
-//       to the test EC; assert it equals the expected vaddr (id 3);
+//       to the test thread; assert it equals the expected vaddr (id 3);
 //     - bounded-delay primitive guards both observations.
 
 const lib = @import("lib");

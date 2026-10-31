@@ -4,7 +4,7 @@
 //
 // Spec semantics
 //   §[reply]: the syscall optionally attaches N pair entries to the
-//   resumed EC. The syscall word's bits 12-19 carry pair_count, which
+//   resumed thread. The syscall word's bits 12-19 carry pair_count, which
 //   must satisfy 0 <= pair_count <= 63 per the spec ABI; pair_count = 0
 //   is the bare-reply path (no attachments) and pair_count > 63 is
 //   rejected with E_INVAL.

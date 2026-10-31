@@ -52,7 +52,7 @@
 //   None of this is reachable from a single child capability domain
 //   via the v0 test child surface (same gaps as snapshot_09 plus one
 //   more: the v0 child cannot observe its own termination — by
-//   definition a terminated EC cannot run a `pass()` afterward, so
+//   definition a terminated thread cannot run a `pass()` afterward, so
 //   the assertion has to come from a parent driver).
 //
 //   (a) A child cannot trigger its own restart; the restart entry
@@ -92,7 +92,7 @@
 //
 // Strategy (smoke prelude)
 //   We exercise the *pre-restart* portion of the faithful sequence in
-//   a single test EC, mirroring snapshot_09's smoke shape: mint S as a
+//   a single test thread, mirroring snapshot_09's smoke shape: mint S as a
 //   preserve-policy VMAR, mint T as a snapshot-policy VMAR, call
 //   `snapshot(T, S)` and verify the binding-establishment dispatch
 //   does not error out. We do *not* attempt to stage the stability

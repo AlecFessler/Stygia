@@ -5,7 +5,7 @@
 //
 // Strategy
 //   The success-on-entry contract is fully exercisable from a single
-//   test EC: the test owns its own user-mode stack (mapped r/w into
+//   test thread: the test owns its own user-mode stack (mapped r/w into
 //   its capability domain by the runner via §[create_capability_domain]
 //   stack provisioning), so a stack-local `u64` is a valid 8-byte-
 //   aligned user address whose initial value the test controls
@@ -28,7 +28,7 @@
 //     - it returned the addr that actually mismatched (rules out
 //       returning a stale or zero value),
 //     - it took the on-entry short-circuit path rather than blocking
-//       (the test EC has no other thread to wake it; if the kernel
+//       (the test thread has no other thread to wake it; if the kernel
 //       blocked we would never reach the post-call check).
 //
 //   Failure-path neutralization for the futex_wait_val call itself:
@@ -40,7 +40,7 @@
 //       `&u64` stack locals which are naturally 8-byte aligned on
 //       x86-64.
 //     - test 05 (E_BADADDR: addr not in caller's domain): both addrs
-//       point into the EC's own stack — definitionally valid user
+//       point into the thread's own stack — definitionally valid user
 //       addresses in the calling domain.
 //     - test 06 (E_TIMEOUT): even though we pass a finite small
 //       timeout (100ms) as a deadlock guard, test 07's on-entry

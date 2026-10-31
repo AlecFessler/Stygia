@@ -122,7 +122,7 @@ fn kMain(boot_info: *BootInfo) !void {
     try arch.smp.smpInit();
     stygia.utils.sync.debug.markSmpReady();
     sched.perCoreInit();
-    // Spec v3: BSP enters the scheduler loop. Root EC was enqueued by
+    // Spec v3: BSP enters the scheduler loop. Root thread was enqueued by
     // userspace_init.init; sched.run picks it up and dispatches.
     sched.run();
 }

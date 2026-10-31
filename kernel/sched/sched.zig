@@ -1,4 +1,4 @@
-pub const execution_context = @import("execution_context.zig");
+pub const thread = @import("thread.zig");
 pub const fpu = @import("fpu.zig");
 pub const futex = @import("futex.zig");
 pub const lifecycle = @import("lifecycle.zig");

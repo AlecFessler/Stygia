@@ -45,7 +45,7 @@ const errors = stygia.syscall.errors;
 const CapabilityDomain = capability_domain.CapabilityDomain;
 const CapabilityType = capability.CapabilityType;
 const ErasedSlabRef = capability.ErasedSlabRef;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const HandleLink = capability.HandleLink;
 const KernelHandle = capability.KernelHandle;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
@@ -79,7 +79,7 @@ const MAX_DEPTH: u32 = 1 << 20;
 /// was tree-vs-CD, and it deadlocked live: `replyTransfer` on one core
 /// holding the sender's CD and spinning on `tree_mutex`,
 /// `detachDyingDomainFromTree` on another holding `tree_mutex` and
-/// spinning on that same CD, both IRQ-masked, READY ECs (including the
+/// spinning on that same CD, both IRQ-masked, READY Threads (including the
 /// test runner) stranded in a deaf core's run queue. Mint sites now
 /// defer their `derive` calls until after their CD locks drop; the
 /// ordered tag remains only to keep the tree-walk's structured
@@ -174,7 +174,7 @@ pub fn revoke(caller_domain: ErasedSlabRef, handle: u64) i64 {
 /// `replyTransfer` holding the sender's CD and spinning on
 /// `tree_mutex`, the other in `detachDyingDomainFromTree` holding
 /// `tree_mutex` and spinning on that exact CD gen-lock. Both spun with
-/// IRQs masked; the machine wedged with READY ECs (including the test
+/// IRQs masked; the machine wedged with READY Threads (including the test
 /// runner) stranded in a deaf core's run queue. Mint-then-derive
 /// callers now run their derive loops AFTER dropping their CD locks.
 ///
@@ -418,12 +418,12 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     // SLOT_SELF (CD self-destruct) takes neither `tree_mutex` nor the
     // CD lock across phase 2 of the destroy. Phase 1 still runs under
     // both locks (the CD gen-lock is the destroy gate); the locks are
-    // dropped before the EC and VM tear-downs lock their own slab classes.
-    // Otherwise the (CD._gen_lock → EC._gen_lock) and
-    // (tree_mutex → EC._gen_lock)
+    // dropped before the thread and VM tear-downs lock their own slab classes.
+    // Otherwise the (CD._gen_lock → thread._gen_lock) and
+    // (tree_mutex → thread._gen_lock)
     // edges registered by the in-line destroys close an AB-BA cycle
     // against any concurrent `port.recv` (CD → ...) or other delete /
-    // revoke path that takes `tree_mutex` after touching an EC.
+    // revoke path that takes `tree_mutex` after touching an thread.
     if (slot == 0) {
         const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
 
@@ -439,22 +439,22 @@ pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
         const cd = cd_lr.ptr;
 
         const cd_ref = SlabRef(CapabilityDomain).init(cd, cd._gen_lock.currentGen());
-        const caller_ec = stygia.sched.scheduler.currentEc();
+        const caller_thread = stygia.sched.scheduler.currentThread();
         caller_domain.unlockTypedIrqRestore(CapabilityDomain, cd_lr.irq_state);
         tree_mutex.unlockIrqRestore(tree_irq);
 
-        stygia.sched.execution_context.printPreReportTerminal(caller_ec, cd, "delete_slot_self");
+        stygia.sched.thread.printPreReportTerminal(caller_thread, cd, "delete_slot_self");
 
         stygia.sched.scheduler.queueCurrentTeardown(.{
             .kind = .self_delete,
             .cd = cd_ref,
-            .caller_ec = if (caller_ec) |ec|
-                SlabRef(ExecutionContext).init(ec, ec._gen_lock.currentGen())
+            .caller_thread = if (caller_thread) |thread|
+                SlabRef(Thread).init(thread, thread._gen_lock.currentGen())
             else
                 null,
         });
-        if (caller_ec) |ec| {
-            stygia.sched.execution_context.parkSelfFaulted(ec);
+        if (caller_thread) |thread| {
+            stygia.sched.thread.parkSelfFaulted(thread);
         }
         stygia.sched.scheduler.hopParkRun();
     }

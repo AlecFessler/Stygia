@@ -1,7 +1,7 @@
 //! Global page-fault outcome ring with dump-on-panic.
 //!
 //! Build-gated debug instrumentation for the smp=4 page-fault loop:
-//! an EC traps, the PF handler claims to resolve it, but the user
+//! an thread traps, the PF handler claims to resolve it, but the user
 //! resumes at the same RIP and faults again. The handler MUST be
 //! returning success on each fire, otherwise the kernel would panic
 //! immediately on an unrecoverable fault. This tool records what each
@@ -9,14 +9,14 @@
 //! + resume — so the lie shows up in the dump.
 //!
 //! Companion to `ctx_trace.zig` which records ctx-slot snapshots at
-//! PF_HANDLER entry. `ctx_trace` answers "what ctx did the EC have at
+//! PF_HANDLER entry. `ctx_trace` answers "what ctx did the thread have at
 //! fault time?". `pf_log` answers "what did the handler do with that
 //! fault?".
 //!
 //! ## Design
 //!
-//! 256-entry global ring (~10 KiB). Each record carries the EC pointer
-//! so no per-EC side array is needed. The ring is single-producer per
+//! 256-entry global ring (~10 KiB). Each record carries the thread pointer
+//! so no per-thread side array is needed. The ring is single-producer per
 //! invocation and shared across cores via an atomic-RMW cursor — the
 //! sequence number gives a total order across cores.
 //!
@@ -35,7 +35,7 @@ const build_options = @import("build_options");
 const arch = stygia.arch.dispatch;
 const builtin = @import("builtin");
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 
 pub const enabled: bool = build_options.kernel_pf_log;
 
@@ -45,7 +45,7 @@ pub const RING_LEN: u32 = 256;
 pub const Outcome = enum(u8) {
     /// PF entry: just trapped, before any decision.
     ENTER = 1,
-    /// Handler returning, ec.ctx.rip unchanged (the suspected liar
+    /// Handler returning, thread.ctx.rip unchanged (the suspected liar
     /// in the smp=4 fault-loop bug).
     RESUME = 2,
     /// Reserved-bits violation in the page tables → panic.
@@ -54,7 +54,7 @@ pub const Outcome = enum(u8) {
     /// MOV decode + IN/OUT and advanced RIP.
     USER_PORT_IO = 4,
     /// Kernel privilege touched a user VA — surfaced as memory_fault,
-    /// EC suspended/terminated via fireMemoryFault.
+    /// thread suspended/terminated via fireMemoryFault.
     KERNEL_ON_USER_VA = 5,
     /// Kernel privilege, kstack-usable or kalloc range — demand-paged.
     KERNEL_DEMAND = 6,
@@ -62,10 +62,10 @@ pub const Outcome = enum(u8) {
     KERNEL_STACK_OVERFLOW = 7,
     /// Kernel privilege, fault outside any handled range → panic.
     KERNEL_VA_INVALID = 8,
-    /// `current_ec` was null on a kernel-on-user-VA fault → panic.
-    KERNEL_NO_EC = 9,
-    /// `current_ec` was null on a user fault → panic.
-    USER_NO_EC = 10,
+    /// `current_thread` was null on a kernel-on-user-VA fault → panic.
+    KERNEL_NO_THREAD = 9,
+    /// `current_thread` was null on a user fault → panic.
+    USER_NO_THREAD = 10,
     /// Domain gen-lock failed (domain torn down between trap entry
     /// and dispatch); fired memory_fault.
     USER_DOMAIN_GONE = 11,
@@ -81,7 +81,7 @@ pub const Outcome = enum(u8) {
 /// natural alignment for racy concurrent reads from the dumper.
 pub const Record = extern struct {
     tsc: u64 = 0,
-    ec_ptr: u64 = 0,
+    thread_ptr: u64 = 0,
     fault_va: u64 = 0,
     ctx_rip: u64 = 0,
     ctx_rsp: u64 = 0,
@@ -100,7 +100,7 @@ else
     [_]Record{};
 
 /// `mark` reads the program counter and user stack pointer from
-/// `ec.ctx + ctx_pc_offset / + ctx_sp_offset`. Offsets resolve at
+/// `thread.ctx + ctx_pc_offset / + ctx_sp_offset`. Offsets resolve at
 /// comptime through `arch.dispatch.cpu` so this file stays arch-agnostic.
 
 inline fn rdtsc() u64 {
@@ -125,7 +125,7 @@ inline fn coreId() u8 {
 /// Append a record to the global ring.
 ///
 /// Hot path; ~50 cycles when `enabled` is true (rdtsc + atomic-RMW
-/// cursor + four u64 reads from `ec.ctx` + 6 u64/u32/u8 stores).
+/// cursor + four u64 reads from `thread.ctx` + 6 u64/u32/u8 stores).
 /// Reduces to a no-op when off — the inline body returns immediately
 /// on the comptime gate and the optimizer drops the call site.
 ///
@@ -133,17 +133,17 @@ inline fn coreId() u8 {
 /// fault handler with interrupts disabled and Debug-mode null-checks
 /// would both add overhead and turn a recoverable PF into a panic.
 pub inline fn mark(
-    ec: ?*ExecutionContext,
+    thread: ?*Thread,
     outcome: Outcome,
     fault_va: u64,
     err_code: u32,
 ) void {
     if (comptime !enabled) return;
-    markImpl(ec, outcome, fault_va, err_code);
+    markImpl(thread, outcome, fault_va, err_code);
 }
 
 fn markImpl(
-    ec: ?*ExecutionContext,
+    thread: ?*Thread,
     outcome: Outcome,
     fault_va: u64,
     err_code: u32,
@@ -155,8 +155,8 @@ fn markImpl(
 
     var rip: u64 = 0;
     var rsp: u64 = 0;
-    if (ec) |ec_p| {
-        const ctx_addr = @intFromPtr(ec_p.ctx);
+    if (thread) |thread_p| {
+        const ctx_addr = @intFromPtr(thread_p.ctx);
         const rip_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_pc_offset);
         const rsp_p: *const u64 = @ptrFromInt(ctx_addr + arch.cpu.ctx_sp_offset);
         rip = @atomicLoad(u64, rip_p, .monotonic);
@@ -164,7 +164,7 @@ fn markImpl(
     }
 
     slot.tsc = rdtsc();
-    slot.ec_ptr = if (ec) |e| @intFromPtr(e) else 0;
+    slot.thread_ptr = if (thread) |e| @intFromPtr(e) else 0;
     slot.fault_va = fault_va;
     slot.ctx_rip = rip;
     slot.ctx_rsp = rsp;
@@ -211,8 +211,8 @@ fn outcomeName(o: u8) []const u8 {
         @intFromEnum(Outcome.KERNEL_DEMAND) => "KERNEL_DEMAND",
         @intFromEnum(Outcome.KERNEL_STACK_OVERFLOW) => "KERNEL_STACK_OVERFLOW",
         @intFromEnum(Outcome.KERNEL_VA_INVALID) => "KERNEL_VA_INVALID",
-        @intFromEnum(Outcome.KERNEL_NO_EC) => "KERNEL_NO_EC",
-        @intFromEnum(Outcome.USER_NO_EC) => "USER_NO_EC",
+        @intFromEnum(Outcome.KERNEL_NO_THREAD) => "KERNEL_NO_THREAD",
+        @intFromEnum(Outcome.USER_NO_THREAD) => "USER_NO_THREAD",
         @intFromEnum(Outcome.USER_DOMAIN_GONE) => "USER_DOMAIN_GONE",
         @intFromEnum(Outcome.USER_RESOLVED) => "USER_RESOLVED",
         @intFromEnum(Outcome.USER_INVALID) => "USER_INVALID",
@@ -262,8 +262,8 @@ fn dumpAllRingsToSerialImpl() void {
         arch.boot.printRaw(&hex);
         arch.boot.printRaw(" core=");
         arch.boot.printRaw(fmtDec(slot.core_id, &dec));
-        arch.boot.printRaw(" ec=0x");
-        fmtHex(slot.ec_ptr, &hex);
+        arch.boot.printRaw(" thread=0x");
+        fmtHex(slot.thread_ptr, &hex);
         arch.boot.printRaw(&hex);
         arch.boot.printRaw(" outcome=");
         arch.boot.printRaw(outcomeName(slot.outcome));

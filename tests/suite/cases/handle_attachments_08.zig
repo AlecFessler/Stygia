@@ -13,28 +13,28 @@
 //   and `tstart = S`, and the receiver's cap table at slots [S, S+N)
 //   must hold the inserted handles with the correct caps.
 //
-//   The simplest single-EC witness uses the same shape as
-//   `terminate_07`: the test EC is both sender and receiver. It mints
-//   a port P with bind+recv+xfer, an EC W as the suspend target (so
-//   the suspending EC = the test EC itself, the syscall caller, per
+//   The simplest single-thread witness uses the same shape as
+//   `terminate_07`: the test thread is both sender and receiver. It mints
+//   a port P with bind+recv+xfer, an thread W as the suspend target (so
+//   the suspending thread = the test thread itself, the syscall caller, per
 //   §[handle_attachments] entry-id-validation wording), and a
-//   "carry" EC C used solely as the attachment source. It then issues
+//   "carry" thread C used solely as the attachment source. It then issues
 //   `suspend(W, P, [pair_entry{C, caps=copy|saff, move=0}])`, which
 //   queues W on P with the attachment metadata bound to the
-//   suspending EC's pair vregs, and follows with `recv(P)`.
+//   suspending thread's pair vregs, and follows with `recv(P)`.
 //
-//   Per §[suspend] "[1] may reference the calling EC; the syscall
-//   returns after the calling EC is resumed" — when [1] != self, the
+//   Per §[suspend] "[1] may reference the calling thread; the syscall
+//   returns after the calling thread is resumed" — when [1] != self, the
 //   call simply queues the target without blocking the caller. So the
-//   test EC stays runnable, recv returns immediately, and the kernel
+//   test thread stays runnable, recv returns immediately, and the kernel
 //   has time to insert the attachment into the receiver's table at a
 //   contiguous slot range.
 //
-//   Choice of attachment type: an EC handle, not an IDC handle. The
+//   Choice of attachment type: an thread handle, not an IDC handle. The
 //   spec line under test gives two formulations — IDC handles install
 //   with caps intersected with idc_rx, "or entry.caps verbatim for
 //   other handle types." The verbatim arm is the tighter assertion
-//   (an exact equality, no intersection sieve), and EC handles
+//   (an exact equality, no intersection sieve), and thread handles
 //   trivially fall on that arm. C is minted with caps {copy=1,
 //   saff=1} so the entry's caps={copy=1, saff=1} is trivially a
 //   subset of the source's current caps (test 03 gate) and the
@@ -43,7 +43,7 @@
 //   Choice of port caps on P: bind+recv+xfer. xfer is mandatory by
 //   test 01 ("returns E_PERM if `N > 0` and the port handle does
 //   not have the `xfer` cap"). bind lets `suspend` queue W on P;
-//   recv lets the test EC dequeue. The test EC remains a live
+//   recv lets the test thread dequeue. The test thread remains a live
 //   bind-cap holder so recv does not return E_CLOSED.
 //
 //   The vreg layout for an attached handle on suspend lives in the
@@ -51,7 +51,7 @@
 //   occupy vregs `[128-N..127]`." With N=1, the entry occupies vreg
 //   127 alone. Per §[syscall_abi]'s vreg-ABI (libz/syscall.zig
 //   header), vreg 127 lives at `[rsp + (127-13)*8] = [rsp + 912]` at
-//   syscall time. libz's `suspendEc` panics on N > 0 (the high-vreg
+//   syscall time. libz's `suspendThread` panics on N > 0 (the high-vreg
 //   stack pad is not yet wired through the generic helper), so this
 //   test issues the syscall via a hand-written inline asm sequence:
 //   reserve 912 bytes for vregs 14..127, write the pair entry at
@@ -63,58 +63,58 @@
 //   20-31, reply_handle_id in bits 32-43, event_type in bits 44-48.
 //   The test reads those fields off the recv's returned word, then
 //   reads the cap table at slot tstart and verifies (a) the slot
-//   carries an EC handle and (b) its caps field equals the
+//   carries an thread handle and (b) its caps field equals the
 //   verbatim entry caps.
 //
 // Pre-call gates the test must clear so no other error can mask the
 // assertion under test:
 //   - the runner-minted self-handle carries `crpt` and `crec` (see
 //     runner/primary.zig: `child_self.crpt`, `crec` = true), so
-//     create_port and create_execution_context can run.
+//     create_port and create_thread can run.
 //   - the runner-granted port_ceiling (0x1C = xfer|recv|bind) lets
 //     the new port carry all three caps the suspend / recv / xfer
 //     pre-checks need.
-//   - the runner-granted ec_inner_ceiling (0xFF) lets a freshly
-//     minted EC carry move|copy|saff|spri|term|susp|read|write —
+//   - the runner-granted thread_inner_ceiling (0xFF) lets a freshly
+//     minted thread carry move|copy|saff|spri|term|susp|read|write —
 //     the test only uses {copy, saff, susp, term} subsets.
-//   - restart_policy = 0 (kill) on every minted EC keeps creation
-//     inside the runner-granted `ec_restart_max = 2` ceiling and
+//   - restart_policy = 0 (kill) on every minted thread keeps creation
+//     inside the runner-granted `thread_restart_max = 2` ceiling and
 //     prevents any restart_semantics fallback from masking failure.
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer}) → P.
-//   2. Pin the test EC to its current core; create W and C with the
+//   2. Pin the test thread to its current core; create W and C with the
 //      same affinity so work-stealing cannot run them concurrently
 //      before the suspend-side validation.
-//   3. create_execution_context(target=self, caps={term, susp,
+//   3. create_thread(target=self, caps={term, susp,
 //      restart_policy=0}) → W (the suspend target; never executes
 //      meaningfully — entry = dummyEntry).
-//   4. create_execution_context(target=self, caps={copy, saff,
+//   4. create_thread(target=self, caps={copy, saff,
 //      restart_policy=0}) → C (the attachment source; never
 //      executes meaningfully — entry = dummyEntry).
-//   5. Build a PairEntry{ id=C, caps=EcCap{.copy=1, .saff=1}.toU16(),
+//   5. Build a PairEntry{ id=C, caps=ThreadCap{.copy=1, .saff=1}.toU16(),
 //      move=0 } and stage it for vreg 127.
 //   6. Issue `suspend(W, P)` with pair_count=1 in the syscall word
 //      and the entry at vreg 127 via inline asm.
 //   7. recv(P), capture the return word, decode pair_count, tstart,
 //      reply_handle_id.
 //   8. Verify pair_count == 1.
-//   9. Read cap_table[tstart], verify handleType == execution_context
+//   9. Read cap_table[tstart], verify handleType == thread
 //      and caps == 0x06 (copy + saff).
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word).
-//   2: setup W creation failed (createExecutionContext returned an
+//   2: setup W creation failed (createThread returned an
 //      error word).
-//   3: setup C creation failed (createExecutionContext returned an
+//   3: setup C creation failed (createThread returned an
 //      error word).
 //   4: suspend with N=1 attachment did not return OK in v1.
 //   5: recv did not return OK.
 //   6: receiver syscall word's pair_count != 1.
-//   7: inserted slot's handle type is not execution_context.
+//   7: inserted slot's handle type is not thread.
 //   8: inserted slot's caps != entry.caps verbatim (0x06).
 //   9: invoking saff on the delivered handle did not return OK —
-//      proves the handle resolves to a live EC and the receiver
+//      proves the handle resolves to a live thread and the receiver
 //      is the new owner (not just a stale ref). Spec
 //      §[handle_attachments] requires the delivered handle to be a
 //      fully usable copy, so an op authorized by the entry's caps
@@ -131,7 +131,7 @@ const testing = lib.testing;
 
 fn dummyEntry() callconv(.c) noreturn {
     while (true) {
-        _ = syscall.yieldEc(0);
+        _ = syscall.yieldThread(0);
     }
 }
 
@@ -191,16 +191,16 @@ pub fn main(cap_table_base: u64) void {
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, helper_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, helper_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
@@ -214,54 +214,54 @@ pub fn main(cap_table_base: u64) void {
     // Step 3: mint W (the suspend target). term + susp let the test
     // queue/destroy W; restart_policy = 0 keeps the call inside the
     // runner-granted ceiling.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
     const w_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&dummyEntry);
-    const cec_w = syscall.createExecutionContext(
+    const created_thread_w = syscall.createThread(
         w_caps_word,
         entry,
         1,
         0,
         helper_affinity,
     );
-    if (testing.isHandleError(cec_w.v1)) {
+    if (testing.isHandleError(created_thread_w.v1)) {
         testing.fail(2);
         return;
     }
-    const w_handle: u12 = @truncate(cec_w.v1 & 0xFFF);
+    const w_handle: u12 = @truncate(created_thread_w.v1 & 0xFFF);
 
     // Step 4: mint C (the carry/attachment source). copy + saff are
     // the caps we will request to be installed verbatim on the
     // receiver side; copy is required as the source-side gate per
     // §[handle_attachments] test 05 (move=0 path).
-    const c_caps = caps.EcCap{
+    const c_caps = caps.ThreadCap{
         .copy = true,
         .saff = true,
         .restart_policy = 0,
     };
     const c_caps_word: u64 = @as(u64, c_caps.toU16());
-    const cec_c = syscall.createExecutionContext(
+    const created_thread_c = syscall.createThread(
         c_caps_word,
         entry,
         1,
         0,
         helper_affinity,
     );
-    if (testing.isHandleError(cec_c.v1)) {
+    if (testing.isHandleError(created_thread_c.v1)) {
         testing.fail(3);
         return;
     }
-    const c_handle: u12 = @truncate(cec_c.v1 & 0xFFF);
+    const c_handle: u12 = @truncate(created_thread_c.v1 & 0xFFF);
 
     // Step 5: build the pair entry. The entry's caps field carries
     // the caps the kernel will install verbatim on the receiver-side
-    // handle (EC, non-IDC). bits 0-11 = id, bits 16-31 = caps,
+    // handle (thread, non-IDC). bits 0-11 = id, bits 16-31 = caps,
     // bit 32 = move, all others reserved (= 0).
-    const entry_caps = caps.EcCap{ .copy = true, .saff = true };
+    const entry_caps = caps.ThreadCap{ .copy = true, .saff = true };
     const pair = caps.PairEntry{
         .id = c_handle,
         .caps = entry_caps.toU16(),
@@ -271,7 +271,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 6: issue suspend(W, P) with pair_count=1 in the syscall
     // word and the pair entry at vreg 127. Hand-rolled because
-    // libz's suspendEc panics on N>0 (high-vreg stack pad not yet
+    // libz's suspendThread panics on N>0 (high-vreg stack pad not yet
     // wired). Layout details:
     //
     //   - vreg 0 (syscall word) lives at [rsp + 0] at syscall time.
@@ -297,7 +297,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 7: recv(P). The port has the test EC as a live bind-cap
+    // Step 7: recv(P). The port has the test thread as a live bind-cap
     // holder and W queued as a suspended sender, so recv returns
     // immediately. The kernel has had its chance to perform the
     // attachment move/copy at recv time per §[handle_attachments].
@@ -319,11 +319,11 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 9: read the inserted handle and verify type + caps. EC
+    // Step 9: read the inserted handle and verify type + caps. thread
     // is a non-IDC handle so caps install verbatim per the spec line
     // under test.
     const inserted = caps.readCap(cap_table_base, @as(u32, @intCast(tstart)));
-    if (inserted.handleType() != .execution_context) {
+    if (inserted.handleType() != .thread) {
         testing.fail(7);
         return;
     }
@@ -334,10 +334,10 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 10: liveness probe. Without an op against the delivered
     // handle, the assertions above only inspect cap_table fields —
-    // a kernel that didn't actually bump the source EC's refcount
+    // a kernel that didn't actually bump the source thread's refcount
     // would still pass. Invoke `affinity` (authorized by the entry's
     // `saff` cap) on the delivered slot. The call should return OK,
-    // proving the handle resolves to a live EC and the receiver-side
+    // proving the handle resolves to a live thread and the receiver-side
     // refcount took.
     const inserted_slot: u12 = @intCast(tstart);
     // affinity_mask = 1 (single-core, smallest valid mask).

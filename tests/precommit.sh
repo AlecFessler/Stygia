@@ -5,7 +5,7 @@
 #   0. arch layering lint           (arch-specific / generic boundaries)
 #   0b. dead-code report             (skip-list checked into the tree)
 #   0c. gen-lock analyzer            (fat-pointer + bracketing invariants)
-#   0d. EC-closure analyzer          (REPORT-ONLY — never affects exit status)
+#   0d. thread-closure analyzer          (REPORT-ONLY — never affects exit status)
 #   0e. spec ↔ test coverage         (verify_coverage.py)
 #   1. x86_64 kernel test suite      (KVM on this dev PC, 3 reps)
 #   2. aarch64 kernel test suite     (Pi 5 bare-metal tryboot @ .107; QEMU/KVM fallback on .106/.104)
@@ -379,7 +379,7 @@ ensure_callgraph_db() {
     # entity/ast_node/token rows (read straight from the working tree by
     # the indexer) are current. Internally inconsistent, and completely
     # silent: every analyzer that joins entity→ir_call — check_gen_lock's
-    # bracketing, dead_code_zig's alive-set, check_ec_closure's Rule B —
+    # bracketing, dead_code_zig's alive-set, check_thread_closure's Rule B —
     # reasons over a mixture of two source states and reports findings
     # that are neither tree's truth.
     #
@@ -574,18 +574,18 @@ stage_gen_lock_analyzer() {
     return $genlock_rc
 }
 
-# ── [0d] EC-lifecycle closure analyzer — REPORT-ONLY, NOT GATING ──────
+# ── [0d] thread-lifecycle closure analyzer — REPORT-ONLY, NOT GATING ──────
 #
 # GATING IS A PENDING MAINTAINER DECISION. Do not "promote" this stage to
 # gating without them saying so.
 #
-# Rationale for report-only: `check_ec_closure` mechanizes two enumerations
+# Rationale for report-only: `check_thread_closure` mechanizes two enumerations
 # that docs/kernel/systems.md otherwise maintains by hand, and its Rule B
 # is what the design doc's enforcement story leans on — but neither rule
 # has been through a full triage pass against the real tree yet. Rule A's
 # call graph deliberately over-approximates (a syntactic overlay on top of
 # `ir_call`, so calls through monomorphized generics and address-taken
-# callbacks are not silently missing), and Rule B's `ec` / `async-irq`
+# callbacks are not silently missing), and Rule B's `thread` / `async-irq`
 # context labels inherit that over-approximation. Both biases cost false
 # positives, which is the right bias for a "did we miss one" tool and the
 # wrong bias for a gate. Turning it red would block every commit on
@@ -599,26 +599,26 @@ stage_gen_lock_analyzer() {
 # the full manual gauntlet and is skipped by the commit hook, which is
 # what "informational" should mean here.
 #
-# One `check_ec_closure` invocation covers both arches. Note the SHAPE
+# One `check_thread_closure` invocation covers both arches. Note the SHAPE
 # DIFFERS from stage [0c]: check_gen_lock's `--db` is single-valued
 # (`args.db_path = v`), so a repeated flag silently overwrites and it must
-# be invoked twice. check_ec_closure's `--db` is genuinely repeatable — it
+# be invoked twice. check_thread_closure's `--db` is genuinely repeatable — it
 # appends to a list (`try dbs.append(a, …)`) and loops over every DB,
 # printing a banner and a `Summary[<arch>]:` line per DB. Verified by
 # reading the arg parser, not assumed from [0c]'s shape.
-stage_ec_closure_report() {
+stage_thread_closure_report() {
     echo ""
     echo "=================================================="
-    echo "[0d] EC-lifecycle closure analyzer (REPORT-ONLY — does not gate)"
+    echo "[0d] thread-lifecycle closure analyzer (REPORT-ONLY — does not gate)"
     echo "=================================================="
-    if ! (cd "$STYGIA_ROOT/tools/check_ec_closure" && zig build 2>&1); then
+    if ! (cd "$STYGIA_ROOT/tools/check_thread_closure" && zig build 2>&1); then
         echo "[0d] analyzer build failed — skipping report (stage does not gate)"
         return 0
     fi
     # Self-tests first: a regression in the analyzer silently weakens every
     # finding below. Report-only, so a failure is loud but not fatal.
-    if ! bash "$STYGIA_ROOT/tools/check_ec_closure/tests/run_tests.sh"; then
-        echo "[0d] WARNING: check_ec_closure fixture suite FAILED — findings below are untrustworthy"
+    if ! bash "$STYGIA_ROOT/tools/check_thread_closure/tests/run_tests.sh"; then
+        echo "[0d] WARNING: check_thread_closure fixture suite FAILED — findings below are untrustworthy"
     fi
     # Deliberately does NOT call ensure_callgraph_db. That helper appends
     # to $FAILURES on error, which would let a report-only stage turn the
@@ -631,9 +631,9 @@ stage_ec_closure_report() {
         echo "[0d] callgraph DBs not present — skipping report (stage does not gate)"
         return 0
     fi
-    # No --target flag: check_ec_closure's arg parser rejects unknown flags
+    # No --target flag: check_thread_closure's arg parser rejects unknown flags
     # with exit 2. Its kernel-scope filter is built in (`inKernelScope`).
-    local analyzer="$STYGIA_ROOT/tools/check_ec_closure/zig-out/bin/check_ec_closure"
+    local analyzer="$STYGIA_ROOT/tools/check_thread_closure/zig-out/bin/check_thread_closure"
     (cd "$STYGIA_ROOT" && "$analyzer" \
         --db "$CALLGRAPH_DB" \
         --db "$CALLGRAPH_DB_AARCH64") || true
@@ -678,7 +678,7 @@ clean_nvvars() {
 #
 #   [USR-PF] rip=0x...901 addr=0x0 err=0x6 w=true x=false no-vmar
 #   [USR-PF] insn=00 00 00 00 ...
-#   [HANG] core=0 ... state=RUN on_cpu=1 ; all run_queues empty, ONE live EC
+#   [HANG] core=0 ... state=RUN on_cpu=1 ; all run_queues empty, ONE live thread
 #
 # That is the signature filed as stygia-gms ("pristine main wedges at boot
 # under concurrent-gauntlet contention"), which this check would have
@@ -721,9 +721,9 @@ verify_image_arch() {
 #
 # This closes a real hole in the gate. The suite verdict was taken purely
 # from `[runner] N total / … / 0 fail / 0 miss`, but that line is printed by
-# the runner EC, which keeps going when *another* core dies. A run was
+# the runner thread, which keeps going when *another* core dies. A run was
 # observed reporting "485 total / 469 pass / 0 fail / 16 miss" with a
-# `KERNEL PANIC: kernel page fault on user VA with no current EC` sitting in
+# `KERNEL PANIC: kernel page fault on user VA with no current thread` sitting in
 # the middle of the log — and because 16 MISS was the only visible symptom,
 # the panic went unnoticed. A run that panics on one core and still reports a
 # clean summary used to PASS this gate outright.
@@ -731,7 +731,7 @@ verify_image_arch() {
 # Marker choice is measured against a known-clean x86 run (485/485):
 #   KERNEL PANIC  0   Zig `panic:`  0   [UNHANDLED]  0
 #   [USR-PF]    102  <-- NOT a marker; the map_pf tests fault on purpose.
-# `[UNHANDLED]` means an event fired with no bound route and the EC parked
+# `[UNHANDLED]` means an event fired with no bound route and the thread parked
 # forever, so a result that should exist never will — abnormal by
 # construction, and zero in healthy runs.
 #
@@ -1626,7 +1626,7 @@ ensure_suite_root_service_elf || true
 run_stage arch_layering_lint
 run_stage dead_code_report
 run_stage gen_lock_analyzer
-run_stage ec_closure_report
+run_stage thread_closure_report
 run_stage verify_coverage
 run_stage x86_kernel_tests
 run_stage aarch64_kernel_tests_pi

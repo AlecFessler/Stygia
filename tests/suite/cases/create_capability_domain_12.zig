@@ -89,7 +89,7 @@ pub fn main(cap_table_base: u64) void {
     //
     // All other sub-fields of ceilings_inner echo the caller's
     // values to remain subsets:
-    //   bits  0-7  ec_inner_ceiling   = 0xFF
+    //   bits  0-7  thread_inner_ceiling   = 0xFF
     //   bits  8-23 vmar_inner_ceiling  = 0x01FF
     //   bits 24-31 cridc_ceiling      = 0x27
     //   bits 32-39 pf_ceiling         = 0x1F
@@ -114,7 +114,7 @@ pub fn main(cap_table_base: u64) void {
     // No passed handles.
     const passed_handles: [0]u64 = .{};
 
-    const result = syscall.createCapabilityDomain(v1_caps, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(v1_caps, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_thread_affinity
         passed_handles[0..]);
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {

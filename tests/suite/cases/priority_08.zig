@@ -5,7 +5,7 @@
 //  regardless of whether the call returns success or another error code."
 //
 // Spec semantics
-//   §[execution_context] places kernel-mutable snapshots in the EC
+//   §[thread] places kernel-mutable snapshots in the thread
 //   handle's field0 (bits 0-1 = current scheduling priority) and
 //   field1 (bits 0-63 = current core affinity mask). §[capabilities]:
 //   "Any syscall that takes such a handle implicitly refreshes that
@@ -16,18 +16,18 @@
 //   The strong-form spec assertion needs two distinguishing snapshots:
 //   one taken before the implicit refresh and one taken after, with
 //   the kernel's authoritative state having drifted in between. In
-//   practice that requires two cap-table slots aliasing the same EC
+//   practice that requires two cap-table slots aliasing the same thread
 //   (so an operation on slot A leaves slot B stale until something
 //   touches B), which requires a second alias handle. The current test infrastructure
 //   spawns each test as a single-domain child with no sibling, so the
 //   alias-slot path is not yet wired.
 //
 // Degraded variant (this file)
-//   With only one slot per EC, the strongest property we can pin
+//   With only one slot per thread, the strongest property we can pin
 //   locally is that the implicit-sync side effect on the failure path
 //   does not corrupt or zero field0/field1 — i.e. after a `priority`
 //   call that returns E_INVAL, the slot still reflects the kernel's
-//   authoritative state for that EC. We exercise both fields:
+//   authoritative state for that thread. We exercise both fields:
 //
 //     1. Create EC1 with priority = 2, affinity = 1 (core 0 only).
 //        At return, the kernel writes the authoritative snapshot into
@@ -46,14 +46,14 @@
 //   pri-bound check fails), which is the most likely failure mode.
 //
 // Action
-//   1. create_execution_context(caps={susp,term} | (priority=2 << 32),
+//   1. create_thread(caps={susp,term} | (priority=2 << 32),
 //                               entry, stack_pages=1, target=0,
 //                               affinity=1)                  — must succeed
-//   2. priority(ec, 99)                                       — must return E_INVAL
-//   3. readCap(ec).field0 & 0x3 == 2 and readCap(ec).field1 == 1
+//   2. priority(thread, 99)                                       — must return E_INVAL
+//   3. readCap(thread).field0 & 0x3 == 2 and readCap(thread).field1 == 1
 //
 // Assertions
-//   1: create_execution_context returned an error word in vreg 1
+//   1: create_thread returned an error word in vreg 1
 //   2: priority with out-of-range new_priority did not return E_INVAL
 //   3: handle's field0 priority bits do not equal authoritative 2
 //   4: handle's field1 affinity mask does not equal authoritative 1
@@ -66,17 +66,17 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub fn main(cap_table_base: u64) void {
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target=self), priority in
     // 32-33. priority = 2 is non-zero so an implementation that
     // zeroes field0 on the E_INVAL path would be observably wrong.
-    const ec_caps = caps.EcCap{
+    const thread_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
     };
     const seeded_priority: u64 = 2;
     const caps_word: u64 =
-        @as(u64, ec_caps.toU16()) |
+        @as(u64, thread_caps.toU16()) |
         (seeded_priority << 32);
 
     // affinity = 1 → bit 0 set, runnable on core 0 only. Single-bit
@@ -84,7 +84,7 @@ pub fn main(cap_table_base: u64) void {
     const seeded_affinity: u64 = 1;
 
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -95,7 +95,7 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(1);
         return;
     }
-    const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const thread_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
     // §[priority] test 04: new_priority > 3 → E_INVAL. Pick a value
     // well outside the 0..3 range so a kernel that masked low bits
@@ -105,19 +105,19 @@ pub fn main(cap_table_base: u64) void {
     // cap was granted at creation (test 02 OK), the caller's
     // self-handle pri ceiling = 3 in the runner so test 03 doesn't
     // fire either, and [1] has clean reserved bits (test 05 OK).
-    const result = syscall.priority(ec_handle, 99);
+    const result = syscall.priority(thread_handle, 99);
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {
         testing.fail(2);
         return;
     }
 
-    // §[execution_context] field layout: field0 bits 0-1 = pri,
+    // §[thread] field layout: field0 bits 0-1 = pri,
     // field1 bits 0-63 = affinity mask. Read the cap entry directly
     // out of the read-only-mapped handle table. The implicit-sync
     // side effect is required by the spec to have run during the
     // E_INVAL call above, so this read sees the kernel's
     // authoritative state regardless of the failure return.
-    const cap = caps.readCap(cap_table_base, ec_handle);
+    const cap = caps.readCap(cap_table_base, thread_handle);
     if ((cap.field0 & 0x3) != seeded_priority) {
         testing.fail(3);
         return;

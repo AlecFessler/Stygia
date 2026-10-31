@@ -28,7 +28,7 @@
 //   The setup mirrors create_vcpu_09's success path (mint a VmPolicy
 //   page frame, map+zero, mint a VM, mint an exit port, mint a vCPU
 //   that defuses every other §[create_vcpu] gate). The vCPU is minted
-//   in the test EC's own capability domain (target=self semantics of
+//   in the test thread's own capability domain (target=self semantics of
 //   create_vcpu), so the install lands in the test's own table — the
 //   spec property "installed at [tstart, tstart+N)" is still observable
 //   indirectly: with `move = 1` on each pair entry, the SOURCE slot
@@ -38,8 +38,8 @@
 //   Two extra page_frame handles are minted with caps = {move, r, w} —
 //   `move = 1` is required on the source for a `move = 1` pair entry
 //   per §[handle_attachments] [test 07] (E_PERM otherwise). With the
-//   handles being page_frames (not the source EC, the VM, the port,
-//   the vCPU EC, or the policy VMAR), the kernel installs them in the
+//   handles being page_frames (not the source thread, the VM, the port,
+//   the vCPU thread, or the policy VMAR), the kernel installs them in the
 //   vCPU's domain (= the test's domain) at some [tstart, tstart+2)
 //   slots without coalescing against any pre-existing handle.
 //
@@ -177,7 +177,7 @@ pub fn main(cap_table_base: u64) void {
     const vm_handle: HandleId = @truncate(cvm.v1 & 0xFFF);
 
     // 1e. Exit port. `bind` for create_vcpu's [4], `recv` for the
-    //     test EC to dequeue events, `xfer` so the recv-minted reply
+    //     test thread to dequeue events, `xfer` so the recv-minted reply
     //     handle carries `xfer = 1` per §[reply] reply-cap minting —
     //     the cap §[reply] [test 09] gates on. All three bits sit
     //     inside the runner-granted port_ceiling = 0x1C.
@@ -196,8 +196,8 @@ pub fn main(cap_table_base: u64) void {
     // 1f. create_vcpu success path. caps include `read` + `write` so
     //     the recv/reply state-transfer path is live across the
     //     vm_exit handshake. Bits 5-7 sit inside the runner's
-    //     ec_inner_ceiling = 0xFF.
-    const vcpu_caps = caps.EcCap{
+    //     thread_inner_ceiling = 0xFF.
+    const vcpu_caps = caps.ThreadCap{
         .susp = true,
         .read = true,
         .write = true,

@@ -1,4 +1,4 @@
-//! Execution-context lifecycle authority.
+//! Thread lifecycle authority.
 //!
 //! The scheduler, wait containers, and arch dispatch tails all consume the
 //! same state word, but lifecycle transitions are centralized here so there
@@ -11,7 +11,7 @@ const stygia = @import("stygia");
 const arch = stygia.arch.dispatch;
 const spin_diag = stygia.utils.spin_diag;
 
-/// Authoritative EC lifecycle state.
+/// Authoritative thread lifecycle state.
 pub const State = enum(u8) {
     /// Linked in exactly one run queue.
     ready,
@@ -84,18 +84,18 @@ pub fn directiveOwnerSlot(word: u32) u24 {
     return d.owner_slot;
 }
 
-pub fn load(ec: anytype) State {
-    return @atomicLoad(State, &ec.state, .acquire);
+pub fn load(thread: anytype) State {
+    return @atomicLoad(State, &thread.state, .acquire);
 }
 
-pub fn storePrivate(ec: anytype, state: State) void {
-    @atomicStore(State, &ec.state, state, .release);
+pub fn storePrivate(thread: anytype, state: State) void {
+    @atomicStore(State, &thread.state, state, .release);
 }
 
-pub fn cas(ec: anytype, expected: State, desired: State) bool {
+pub fn cas(thread: anytype, expected: State, desired: State) bool {
     return @cmpxchgStrong(
         State,
-        &ec.state,
+        &thread.state,
         expected,
         desired,
         .acq_rel,
@@ -103,12 +103,12 @@ pub fn cas(ec: anytype, expected: State, desired: State) bool {
     ) == null;
 }
 
-pub fn isDestroyMarked(ec: anytype) bool {
-    return ec.mark_state.load(.seq_cst) != @intFromEnum(MarkState.clear);
+pub fn isDestroyMarked(thread: anytype) bool {
+    return thread.mark_state.load(.seq_cst) != @intFromEnum(MarkState.clear);
 }
 
-pub fn markRetiring(ec: anytype) bool {
-    return ec.mark_state.cmpxchgStrong(
+pub fn markRetiring(thread: anytype) bool {
+    return thread.mark_state.cmpxchgStrong(
         @intFromEnum(MarkState.clear),
         @intFromEnum(MarkState.destroy),
         .seq_cst,
@@ -116,35 +116,35 @@ pub fn markRetiring(ec: anytype) bool {
     ) == null;
 }
 
-pub fn tryPinLive(ec: anytype) bool {
+pub fn tryPinLive(thread: anytype) bool {
     while (true) {
-        if (isDestroyMarked(ec)) return false;
+        if (isDestroyMarked(thread)) return false;
 
-        const old = ec.pin_depth.load(.seq_cst);
+        const old = thread.pin_depth.load(.seq_cst);
         std.debug.assert(old != std.math.maxInt(u8));
-        if (ec.pin_depth.cmpxchgWeak(old, old + 1, .seq_cst, .seq_cst) != null) {
-            spin_diag.note(.claim_cas, @intFromPtr(ec));
+        if (thread.pin_depth.cmpxchgWeak(old, old + 1, .seq_cst, .seq_cst) != null) {
+            spin_diag.note(.claim_cas, @intFromPtr(thread));
             std.atomic.spinLoopHint();
             continue;
         }
 
-        if (!isDestroyMarked(ec) and load(ec) != .retired and ec._gen_lock.currentGen() % 2 == 1) {
+        if (!isDestroyMarked(thread) and load(thread) != .retired and thread._gen_lock.currentGen() % 2 == 1) {
             return true;
         }
 
-        releasePin(ec);
+        releasePin(thread);
         return false;
     }
 }
 
-pub fn releasePin(ec: anytype) void {
-    const old = ec.pin_depth.fetchSub(1, .seq_cst);
+pub fn releasePin(thread: anytype) void {
+    const old = thread.pin_depth.fetchSub(1, .seq_cst);
     std.debug.assert(old > 0);
 }
 
-pub fn waitForPinsDrained(ec: anytype) void {
-    while (ec.pin_depth.load(.seq_cst) != 0) {
-        spin_diag.note(.pins_drained, @intFromPtr(ec));
+pub fn waitForPinsDrained(thread: anytype) void {
+    while (thread.pin_depth.load(.seq_cst) != 0) {
+        spin_diag.note(.pins_drained, @intFromPtr(thread));
         arch.paging.serviceTlbMaintenanceWhileSpinning();
         // stygia-8xl: pin holders can be blocked in `migrateFlush`.
         stygia.sched.fpu.serviceLocalFlushWhileSpinning();
@@ -152,173 +152,173 @@ pub fn waitForPinsDrained(ec: anytype) void {
     }
 }
 
-pub fn isReadyCacheValid(ec: anytype, not_in_queue: u8) bool {
-    return load(ec) == .ready and ec.current_queue_core.load(.acquire) != not_in_queue;
+pub fn isReadyCacheValid(thread: anytype, not_in_queue: u8) bool {
+    return load(thread) == .ready and thread.current_queue_core.load(.acquire) != not_in_queue;
 }
 
-pub fn initNewEc(ec: anytype, not_in_queue: u8) void {
-    storePrivate(ec, .ready);
-    ec.owner_core = not_in_queue;
-    ec.pin_depth.store(0, .release);
-    ec.mark_state.store(@intFromEnum(MarkState.clear), .release);
-    ec.directive_state.store(packDirective(.none, 0), .release);
-    ec.directive_result.store(0, .release);
-    ec.directive_port = null;
-    ec.directive_owner = null;
-    ec.wait.clear();
-    ec.current_queue_core.store(not_in_queue, .release);
+pub fn initNewThread(thread: anytype, not_in_queue: u8) void {
+    storePrivate(thread, .ready);
+    thread.owner_core = not_in_queue;
+    thread.pin_depth.store(0, .release);
+    thread.mark_state.store(@intFromEnum(MarkState.clear), .release);
+    thread.directive_state.store(packDirective(.none, 0), .release);
+    thread.directive_result.store(0, .release);
+    thread.directive_port = null;
+    thread.directive_owner = null;
+    thread.wait.clear();
+    thread.current_queue_core.store(not_in_queue, .release);
 }
 
-pub fn prepareDispatchLocked(ec: anytype, core: u8, not_in_queue: u8) bool {
-    if (!cas(ec, .ready, .running)) return false;
-    ec.owner_core = core;
-    ec.current_queue_core.store(not_in_queue, .release);
+pub fn prepareDispatchLocked(thread: anytype, core: u8, not_in_queue: u8) bool {
+    if (!cas(thread, .ready, .running)) return false;
+    thread.owner_core = core;
+    thread.current_queue_core.store(not_in_queue, .release);
     return true;
 }
 
-pub fn prepareRunningPark(ec: anytype, core: u8, kind: WaitKind) bool {
-    ec.wait.begin(kind);
-    ec.owner_core = core;
-    if (!cas(ec, .running, .parking)) {
-        ec.wait.clear();
+pub fn prepareRunningPark(thread: anytype, core: u8, kind: WaitKind) bool {
+    thread.wait.begin(kind);
+    thread.owner_core = core;
+    if (!cas(thread, .running, .parking)) {
+        thread.wait.clear();
         return false;
     }
     return true;
 }
 
-pub fn beginReadyClaim(ec: anytype) bool {
-    return cas(ec, .ready, .claimed);
+pub fn beginReadyClaim(thread: anytype) bool {
+    return cas(thread, .ready, .claimed);
 }
 
-pub fn beginReadyClaimPinned(ec: anytype) bool {
-    if (!tryPinLive(ec)) return false;
-    if (beginReadyClaim(ec)) return true;
-    releasePin(ec);
+pub fn beginReadyClaimPinned(thread: anytype) bool {
+    if (!tryPinLive(thread)) return false;
+    if (beginReadyClaim(thread)) return true;
+    releasePin(thread);
     return false;
 }
 
-pub fn beginWaitingClaim(ec: anytype) ClaimResult {
+pub fn beginWaitingClaim(thread: anytype) ClaimResult {
     while (true) {
-        switch (load(ec)) {
+        switch (load(thread)) {
             .waiting => {
-                if (cas(ec, .waiting, .claimed)) return .claimed;
+                if (cas(thread, .waiting, .claimed)) return .claimed;
             },
             .parking => {
-                if (cas(ec, .parking, .pended)) return .pended;
+                if (cas(thread, .parking, .pended)) return .pended;
             },
             else => return .none,
         }
-        spin_diag.note(.claim_cas, @intFromPtr(ec));
+        spin_diag.note(.claim_cas, @intFromPtr(thread));
         std.atomic.spinLoopHint();
     }
 }
 
 /// On `.claimed` or `.pended`, returns with one live pin held by caller.
 /// On `.none`, returns without a pin.
-pub fn beginWaitingClaimPinned(ec: anytype) ClaimResult {
+pub fn beginWaitingClaimPinned(thread: anytype) ClaimResult {
     while (true) {
-        if (!tryPinLive(ec)) return .none;
+        if (!tryPinLive(thread)) return .none;
 
-        switch (load(ec)) {
+        switch (load(thread)) {
             .waiting => {
-                if (cas(ec, .waiting, .claimed)) return .claimed;
+                if (cas(thread, .waiting, .claimed)) return .claimed;
             },
             .parking => {
-                if (cas(ec, .parking, .pended)) return .pended;
+                if (cas(thread, .parking, .pended)) return .pended;
             },
             else => {
-                releasePin(ec);
+                releasePin(thread);
                 return .none;
             },
         }
 
-        releasePin(ec);
-        spin_diag.note(.claim_cas, @intFromPtr(ec));
+        releasePin(thread);
+        spin_diag.note(.claim_cas, @intFromPtr(thread));
         std.atomic.spinLoopHint();
     }
 }
 
-pub fn pinLiveLocked(ec: anytype) bool {
-    return tryPinLive(ec);
+pub fn pinLiveLocked(thread: anytype) bool {
+    return tryPinLive(thread);
 }
 
-pub fn unpin(ec: anytype) void {
-    releasePin(ec);
+pub fn unpin(thread: anytype) void {
+    releasePin(thread);
 }
 
-pub fn waitPinsDrained(ec: anytype) void {
-    waitForPinsDrained(ec);
+pub fn waitPinsDrained(thread: anytype) void {
+    waitForPinsDrained(thread);
 }
 
-pub fn commitClaimedWaiting(ec: anytype) bool {
-    return cas(ec, .claimed, .waiting);
+pub fn commitClaimedWaiting(thread: anytype) bool {
+    return cas(thread, .claimed, .waiting);
 }
 
-pub fn commitParkingWaiting(ec: anytype, not_in_queue: u8) bool {
-    if (!cas(ec, .parking, .waiting)) return false;
-    ec.owner_core = not_in_queue;
+pub fn commitParkingWaiting(thread: anytype, not_in_queue: u8) bool {
+    if (!cas(thread, .parking, .waiting)) return false;
+    thread.owner_core = not_in_queue;
     return true;
 }
 
-pub fn publishPendedPayload(ec: anytype) void {
-    ec.wait.payload_done.store(true, .release);
+pub fn publishPendedPayload(thread: anytype) void {
+    thread.wait.payload_done.store(true, .release);
 }
 
-pub fn waitForPendedPayload(ec: anytype) void {
-    while (!ec.wait.payload_done.load(.acquire)) {
-        spin_diag.note(.pended_payload, @intFromPtr(ec));
+pub fn waitForPendedPayload(thread: anytype) void {
+    while (!thread.wait.payload_done.load(.acquire)) {
+        spin_diag.note(.pended_payload, @intFromPtr(thread));
         std.atomic.spinLoopHint();
     }
 }
 
-pub fn finishPendedReady(ec: anytype, not_in_queue: u8) bool {
-    waitForPendedPayload(ec);
-    if (!cas(ec, .pended, .ready)) return false;
-    ec.owner_core = not_in_queue;
-    ec.wait.clear();
+pub fn finishPendedReady(thread: anytype, not_in_queue: u8) bool {
+    waitForPendedPayload(thread);
+    if (!cas(thread, .pended, .ready)) return false;
+    thread.owner_core = not_in_queue;
+    thread.wait.clear();
     return true;
 }
 
-pub fn finishClaimedReady(ec: anytype, not_in_queue: u8) bool {
-    if (!cas(ec, .claimed, .ready)) return false;
-    ec.owner_core = not_in_queue;
-    ec.wait.clear();
+pub fn finishClaimedReady(thread: anytype, not_in_queue: u8) bool {
+    if (!cas(thread, .claimed, .ready)) return false;
+    thread.owner_core = not_in_queue;
+    thread.wait.clear();
     return true;
 }
 
-pub fn finishClaimedDispatch(ec: anytype, core: u8, not_in_queue: u8) bool {
-    if (!cas(ec, .claimed, .running)) return false;
-    ec.owner_core = core;
-    ec.current_queue_core.store(not_in_queue, .release);
-    ec.wait.clear();
+pub fn finishClaimedDispatch(thread: anytype, core: u8, not_in_queue: u8) bool {
+    if (!cas(thread, .claimed, .running)) return false;
+    thread.owner_core = core;
+    thread.current_queue_core.store(not_in_queue, .release);
+    thread.wait.clear();
     return true;
 }
 
-pub fn retire(ec: anytype) State {
+pub fn retire(thread: anytype) State {
     while (true) {
-        const from = load(ec);
+        const from = load(thread);
         if (from == .retired) return from;
-        if (from == .pended) waitForPendedPayload(ec);
-        if (cas(ec, from, .retired)) {
-            ec.mark_state.store(@intFromEnum(MarkState.destroy), .release);
+        if (from == .pended) waitForPendedPayload(thread);
+        if (cas(thread, from, .retired)) {
+            thread.mark_state.store(@intFromEnum(MarkState.destroy), .release);
             return from;
         }
-        spin_diag.note(.retire_cas, @intFromPtr(ec));
+        spin_diag.note(.retire_cas, @intFromPtr(thread));
         std.atomic.spinLoopHint();
     }
 }
 
-pub fn canSuspendTarget(ec: anytype) bool {
-    return switch (load(ec)) {
+pub fn canSuspendTarget(thread: anytype) bool {
+    return switch (load(thread)) {
         .running, .ready => true,
-        .waiting => ec.wait.kind == .idle,
+        .waiting => thread.wait.kind == .idle,
         else => false,
     };
 }
 
-pub fn isPortSuspended(ec: anytype) bool {
-    return switch (load(ec)) {
-        .waiting, .claimed, .pended, .parking => switch (ec.wait.kind) {
+pub fn isPortSuspended(thread: anytype) bool {
+    return switch (load(thread)) {
+        .waiting, .claimed, .pended, .parking => switch (thread.wait.kind) {
             .port_sender, .port_receiver, .reply => true,
             else => false,
         },
@@ -326,8 +326,8 @@ pub fn isPortSuspended(ec: anytype) bool {
     };
 }
 
-pub fn selfMarkSuspending(ec: anytype) bool {
-    return ec.directive_state.cmpxchgStrong(
+pub fn selfMarkSuspending(thread: anytype) bool {
+    return thread.directive_state.cmpxchgStrong(
         packDirective(.none, 0),
         packDirective(.suspending, 0),
         .acq_rel,
@@ -335,8 +335,8 @@ pub fn selfMarkSuspending(ec: anytype) bool {
     ) == null;
 }
 
-pub fn clearSelfDirective(ec: anytype) void {
-    _ = ec.directive_state.cmpxchgStrong(
+pub fn clearSelfDirective(thread: anytype) void {
+    _ = thread.directive_state.cmpxchgStrong(
         packDirective(.suspending, 0),
         packDirective(.none, 0),
         .acq_rel,
@@ -397,6 +397,6 @@ pub fn clearFailedDirectiveWord(target: anytype, failed_word: u32) bool {
     ) == null;
 }
 
-pub fn markDirectiveDead(ec: anytype) void {
-    ec.directive_state.store(packDirective(.dead, 0), .release);
+pub fn markDirectiveDead(thread: anytype) void {
+    thread.directive_state.store(packDirective(.dead, 0), .release);
 }

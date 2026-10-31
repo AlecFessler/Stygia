@@ -29,7 +29,7 @@ const CNTV_CTL_ENABLE: u64 = 1 << 0;
 const CNTV_CTL_IMASK: u64 = 1 << 1;
 const CNTV_CTL_ISTATUS: u64 = 1 << 2;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GuestState = vm_hw.GuestState;
 const PAddr = stygia.memory.address.PAddr;
 const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
@@ -43,10 +43,10 @@ pub const VmExitDelivery = struct {
     subcode: u8,
     payload: [3]u64,
     /// The owner-side acknowledgement of an arch vCPU cancel (stygia-8xl).
-    /// True means this vCPU EC was retired by another core while we were
+    /// True means this vCPU thread was retired by another core while we were
     /// executing guest code, so we left the run loop rather than exiting
     /// on a guest event. `subcode`/`payload` are meaningless in that case
-    /// and the caller must NOT deliver a vm_exit — the EC is dead. Twin of
+    /// and the caller must NOT deliver a vm_exit — the thread is dead. Twin of
     /// the x86-64 field; see `x64/vm_runloop.zig` for the full argument.
     cancelled: bool = false,
 };
@@ -64,13 +64,13 @@ const SUBCODE_SHUTDOWN: u8 = 8;
 const SUBCODE_UNKNOWN: u8 = 9;
 const SUBCODE_INITIAL_STATE: u8 = 10;
 
-/// Enter the guest bound to `vcpu_ec` and return on the next VM exit.
+/// Enter the guest bound to `vcpu_thread` and return on the next VM exit.
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support EL2).
-pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
+pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
     if (!vm_hw.vmSupported()) return null;
 
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return null;
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return null;
 
     if (!arch_state.started) return null;
 
@@ -79,15 +79,15 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     // and trip a stage-1 instruction-abort immediately. The synthetic-
     // exit fallback is the spec-test path before reply→GuestState
     // writeback is wired; once that lands, this guard flips on reply.
-    const vm_ref = vcpu_ec.vm orelse return null;
-    // caller-pinned: the vCPU EC holds a SlabRef on its VM for its lifetime;
+    const vm_ref = vcpu_thread.vm orelse return null;
+    // caller-pinned: the vCPU thread holds a SlabRef on its VM for its lifetime;
     // the run loop is the only consumer that needs the live pointer.
     const vm_ptr = vm_ref.lock(@src()) catch return null;
     const cb_pa_opt = controlBlockPaFor(vm_ptr);
     const stage2_root = vm_ptr.guest_pt_root;
     // Capture the cell pointer under the VM lock; the cell is freed
     // only by `freeVmArchState` in the VM teardown path, which cannot
-    // run while a vCPU EC holds a SlabRef on the VM (that's the
+    // run while a vCPU thread holds a SlabRef on the VM (that's the
     // creator-domain lifetime contract). Safe to use post-unlock.
     const cell_opt: ?*hv_vm.CtrlStateCell = hv_vm.cellOf(vm_ptr);
     vm_ref.unlock();
@@ -124,19 +124,19 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     while (true) {
         // ── Arch vCPU cancellation acknowledgement (stygia-8xl) ──────────
         //
-        // NEVER (RE-)ENTER THE GUEST ON A RETIRED EC. Twin of the x86-64
+        // NEVER (RE-)ENTER THE GUEST ON A RETIRED thread. Twin of the x86-64
         // check; the same reasoning applies, and this loop has the same
         // shape — `IRQ_EXIT_SENTINEL` below re-enters after servicing a
         // host IRQ, which is exactly how the scheduler's kick arrives.
         // Without this, the owner core stays in the loop forever holding
-        // a `retired` `current_ec` while ready ECs queue behind it.
+        // a `retired` `current_thread` while ready Threads queue behind it.
         //
         // This is `VcpuCancelExit` in the TLA lifecycle model: only the
-        // owner-side acknowledgement moves the EC out of guest submode so
+        // owner-side acknowledgement moves the thread out of guest submode so
         // the ordinary retired-current boundary → hop → finalize path can
-        // run. Acquire load; the EC is caller-pinned as this core's
-        // `current_ec` for the whole call.
-        if (lifecycle.load(vcpu_ec) == .retired) {
+        // run. Acquire load; the thread is caller-pinned as this core's
+        // `current_thread` for the whole call.
+        if (lifecycle.load(vcpu_thread) == .retired) {
             return .{ .subcode = SUBCODE_UNKNOWN, .payload = .{ 0, 0, 0 }, .cancelled = true };
         }
 
@@ -276,9 +276,9 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
                 // tryHandleMmio for kernel-emulated LAPIC/IOAPIC.
                 const iss_valid = (s.flags & vm_hw.VmExitInfo.Stage2Fault.FLAG_ISS_VALID) != 0;
                 const is_write = (s.flags & vm_hw.VmExitInfo.Stage2Fault.FLAG_IS_WRITE) != 0;
-                if (vcpu_ec.vm) |vm_ref_inner| {
+                if (vcpu_thread.vm) |vm_ref_inner| {
                     if (vm_ref_inner.lock(@src())) |vm_ptr_inner| {
-                        const handled = hv_vm.tryHandleStage2Mmio(vm_ptr_inner, vcpu_ec, s.guest_phys, iss_valid, is_write, s.srt);
+                        const handled = hv_vm.tryHandleStage2Mmio(vm_ptr_inner, vcpu_thread, s.guest_phys, iss_valid, is_write, s.srt);
                         vm_ref_inner.unlock();
                         if (handled) {
                             // Advance past the trapping instruction. A64
@@ -302,7 +302,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
             // On miss the trap surfaces to the VMM as `.sysreg_trap`
             // per §[vm_exit_state].
             .sysreg_trap => |t| {
-                if (vcpu_ec.vm) |vm_ref_inner| {
+                if (vcpu_thread.vm) |vm_ref_inner| {
                     if (vm_ref_inner.lock(@src())) |vm_ptr_inner| {
                         const handled = tryHandleSysregPolicy(vm_ptr_inner, &arch_state.guest_state, t);
                         vm_ref_inner.unlock();
@@ -331,7 +331,7 @@ fn controlBlockPaFor(vm_ptr: *VirtualMachine) ?PAddr {
 // ---------------------------------------------------------------------------
 //
 // vregs 1..31 = x0..x30 (kernel iret frame holds x1..x30 via the
-// per-EC `ctx`; x0 rides on the syscall return word).
+// per-thread `ctx`; x0 rides on the syscall return word).
 // vregs 32..127 spill onto the user stack starting at [sp + 8].
 
 const VREG32_PC_OFF: u64 = 8; // (32-31)*8
@@ -389,7 +389,7 @@ fn storeU64(sp: u64, off: u64, value: u64) void {
 }
 
 /// Plain-data snapshot of the receiver's §[vm_exit_state] vregs,
-/// captured outside the sender EC's `_gen_lock` so a fault on user-stack
+/// captured outside the sender thread's `_gen_lock` so a fault on user-stack
 /// reads can't strand the lock bit. `applyReplyStateToVcpu` projects
 /// this snapshot onto the vCPU's GuestState under the sender lock.
 pub const ReplyVregSnapshot = extern struct {
@@ -431,14 +431,14 @@ pub const ReplyVregSnapshot = extern struct {
 
 /// Snapshot the receiver's §[vm_exit_state] vregs into a kernel-stack
 /// buffer. Reads receiver-side state only. Receiver MUST be the running
-/// EC on the current core (so its address space is live).
+/// thread on the current core (so its address space is live).
 ///
 /// Caller MUST only invoke this for vm_exit-typed replies. The receiver
 /// opted into the wide window contract by recv'ing a vm_exit; if their
 /// stack reservation is too small the user-VA reads fault and
 /// `memory.fault.handlePageFault` aborts the syscall — safe because we
 /// run BEFORE acquiring the sender's `_gen_lock`.
-pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
+pub fn snapshotReplyVregs(receiver: *Thread) ReplyVregSnapshot {
     var snap: ReplyVregSnapshot = .{};
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
@@ -517,8 +517,8 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 /// back to synthetic-exit re-delivery instead of ERETing with the
 /// zero-initialized state. Any other sub-code projects the full state
 /// and flips `started = true`.
-pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
+pub fn applyReplyStateToVcpu(vcpu_thread: *Thread, snap: *const ReplyVregSnapshot) void {
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return;
     const gs = &arch_state.guest_state;
 
     // x0..x30 — projected from the snapshot's contiguous gpr block.
@@ -591,12 +591,12 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
 /// Write the suspending vCPU's GuestState onto the receiver's
 /// §[vm_exit_state] vreg slots. Companion to `applyReplyStateToVcpu`.
 pub fn populateVmExitVregs(
-    receiver: *ExecutionContext,
-    vcpu_ec: *ExecutionContext,
+    receiver: *Thread,
+    vcpu_thread: *Thread,
     subcode: u8,
     payload: [3]u64,
 ) void {
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return;
     const gs = &arch_state.guest_state;
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
@@ -676,8 +676,8 @@ pub fn populateVmExitVregs(
 /// state (post-first-reply). Synthetic pre-started exits skip the
 /// broad projection.
 pub fn populateVmExitVregsIfStarted(
-    receiver: *ExecutionContext,
-    sender: *ExecutionContext,
+    receiver: *Thread,
+    sender: *Thread,
     subcode: u8,
 ) void {
     const arch_state = hv_vcpu.archStateOf(sender) orelse return;
@@ -728,9 +728,9 @@ fn decodeDelivery(exit: VmExitInfo, gs: *const GuestState) VmExitDelivery {
             .subcode = SUBCODE_WFI_WFE,
             .payload = .{ @as(u64, @intFromBool(w.is_wfe)), 0, 0 },
         },
-        .unknown_ec => |ec| .{
+        .unknown_thread => |thread| .{
             .subcode = SUBCODE_UNKNOWN_EC,
-            .payload = .{ @as(u64, ec), 0, 0 },
+            .payload = .{ @as(u64, thread), 0, 0 },
         },
         .synchronous_el1 => |esr| .{
             .subcode = SUBCODE_SYNC_EL1,

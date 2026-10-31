@@ -6,13 +6,13 @@
 // Strategy
 //   `time_monotonic` requires no caps and takes no inputs, so the
 //   straightforward observable is: two back-to-back calls from the
-//   same EC must return strictly increasing nanosecond values. The
+//   same thread must return strictly increasing nanosecond values. The
 //   second call necessarily executes after the first returns, so the
 //   monotonic clock — which is required to advance — must report a
 //   later instant.
 //
 //   No setup is needed. Both calls are issued directly from the test
-//   EC; the syscall path itself takes well over 0 ns of work, and the
+//   thread; the syscall path itself takes well over 0 ns of work, and the
 //   spec promises strict monotonicity rather than mere non-decrease.
 //
 // Action

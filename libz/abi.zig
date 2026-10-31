@@ -92,7 +92,7 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u16,
-    initial_ec_affinity: u64,
+    initial_thread_affinity: u64,
     passed_handles_ptr: [*]const u64,
     passed_handles_len: usize,
 ) callconv(.c) c.Regs {
@@ -101,19 +101,19 @@ pub fn createCapabilityDomain(
         ceilings_inner,
         ceilings_outer,
         @truncate(elf_pf),
-        initial_ec_affinity,
+        initial_thread_affinity,
         passed_handles_ptr[0..passed_handles_len],
     ));
 }
 
-pub fn createExecutionContext(
+pub fn createThread(
     caps: u64,
     entry: u64,
     stack_pages: u64,
     target: u64,
     affinity_mask: u64,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.createExecutionContext(caps, entry, stack_pages, target, affinity_mask));
+    return toCRegs(syscall.createThread(caps, entry, stack_pages, target, affinity_mask));
 }
 
 pub fn self() callconv(.c) c.Regs {
@@ -124,8 +124,8 @@ pub fn terminate(target: u16) callconv(.c) c.Regs {
     return toCRegs(syscall.terminate(@truncate(target)));
 }
 
-pub fn yieldEc(target: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.yieldEc(target));
+pub fn yieldThread(target: u64) callconv(.c) c.Regs {
+    return toCRegs(syscall.yieldThread(target));
 }
 
 pub fn priority(target: u16, new_priority: u64) callconv(.c) c.Regs {
@@ -234,13 +234,13 @@ pub fn createPort(caps: u64) callconv(.c) c.Regs {
     return toCRegs(syscall.createPort(caps));
 }
 
-pub fn suspendEc(
+pub fn suspendThread(
     target: u16,
     port: u16,
     attachments_ptr: [*]const u64,
     attachments_len: usize,
 ) callconv(.c) c.Regs {
-    return toCRegs(syscall.suspendEc(
+    return toCRegs(syscall.suspendThread(
         @truncate(target),
         @truncate(port),
         attachments_ptr[0..attachments_len],
@@ -317,10 +317,10 @@ comptime {
     @export(&revoke, .{ .name = "revoke" });
     @export(&sync, .{ .name = "sync" });
     @export(&createCapabilityDomain, .{ .name = "createCapabilityDomain" });
-    @export(&createExecutionContext, .{ .name = "createExecutionContext" });
+    @export(&createThread, .{ .name = "createThread" });
     @export(&self, .{ .name = "self" });
     @export(&terminate, .{ .name = "terminate" });
-    @export(&yieldEc, .{ .name = "yieldEc" });
+    @export(&yieldThread, .{ .name = "yieldThread" });
     @export(&priority, .{ .name = "priority" });
     @export(&affinity, .{ .name = "affinity" });
     @export(&createVmar, .{ .name = "createVmar" });
@@ -338,7 +338,7 @@ comptime {
     @export(&vmSetPolicy, .{ .name = "vmSetPolicy" });
     @export(&vmInjectIrq, .{ .name = "vmInjectIrq" });
     @export(&createPort, .{ .name = "createPort" });
-    @export(&suspendEc, .{ .name = "suspendEc" });
+    @export(&suspendThread, .{ .name = "suspendThread" });
     @export(&recv, .{ .name = "recv" });
     @export(&reply, .{ .name = "reply" });
     @export(&replyTransfer, .{ .name = "replyTransfer" });

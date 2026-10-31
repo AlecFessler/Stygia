@@ -14,7 +14,7 @@
 //   The child capability domain's table is populated by the kernel at
 //   `create_capability_domain` time:
 //     slot 0  → self
-//     slot 1  → initial EC
+//     slot 1  → initial thread
 //     slot 2  → self-IDC
 //     slot 3+ → passed_handles (here: just the result port at slot 3)
 //   Userspace may then mint additional handles into the next free slots

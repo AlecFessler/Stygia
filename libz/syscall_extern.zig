@@ -61,7 +61,7 @@ pub const SyscallNum = enum(u12) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    create_execution_context = 22,
+    create_thread = 22,
     self = 23,
     terminate = 24,
     yield = 25,
@@ -251,11 +251,11 @@ const ext = struct {
         ceilings_inner: u64,
         ceilings_outer: u64,
         elf_pf: u16,
-        initial_ec_affinity: u64,
+        initial_thread_affinity: u64,
         passed_handles_ptr: [*]const u64,
         passed_handles_len: usize,
     ) callconv(.c) c.Regs;
-    extern fn createExecutionContext(
+    extern fn createThread(
         caps: u64,
         entry: u64,
         stack_pages: u64,
@@ -264,7 +264,7 @@ const ext = struct {
     ) callconv(.c) c.Regs;
     extern fn self() callconv(.c) c.Regs;
     extern fn terminate(target: u16) callconv(.c) c.Regs;
-    extern fn yieldEc(target: u64) callconv(.c) c.Regs;
+    extern fn yieldThread(target: u64) callconv(.c) c.Regs;
     extern fn priority(target: u16, new_priority: u64) callconv(.c) c.Regs;
     extern fn affinity(target: u16, new_affinity: u64) callconv(.c) c.Regs;
     extern fn createVmar(
@@ -315,7 +315,7 @@ const ext = struct {
     ) callconv(.c) c.Regs;
     extern fn vmInjectIrq(vm_handle: u16, irq_num: u64, assert_word: u64) callconv(.c) c.Regs;
     extern fn createPort(caps: u64) callconv(.c) c.Regs;
-    extern fn suspendEc(
+    extern fn suspendThread(
         target: u16,
         port: u16,
         attachments_ptr: [*]const u64,
@@ -381,7 +381,7 @@ pub fn createCapabilityDomain(
     ceilings_inner: u64,
     ceilings_outer: u64,
     elf_pf: u12,
-    initial_ec_affinity: u64,
+    initial_thread_affinity: u64,
     passed_handles: []const u64,
 ) Regs {
     return fromCRegs(ext.createCapabilityDomain(
@@ -389,22 +389,22 @@ pub fn createCapabilityDomain(
         ceilings_inner,
         ceilings_outer,
         @as(u16, elf_pf),
-        initial_ec_affinity,
+        initial_thread_affinity,
         passed_handles.ptr,
         passed_handles.len,
     ));
 }
 
-// 7..16: execution-context ops
+// 7..16: thread ops
 
-pub fn createExecutionContext(
+pub fn createThread(
     caps: u64,
     entry: u64,
     stack_pages: u64,
     target: u64,
     affinity_mask: u64,
 ) Regs {
-    return fromCRegs(ext.createExecutionContext(caps, entry, stack_pages, target, affinity_mask));
+    return fromCRegs(ext.createThread(caps, entry, stack_pages, target, affinity_mask));
 }
 
 pub fn self() Regs {
@@ -415,8 +415,8 @@ pub fn terminate(target: u12) Regs {
     return fromCRegs(ext.terminate(@as(u16, target)));
 }
 
-pub fn yieldEc(target: u64) Regs {
-    return fromCRegs(ext.yieldEc(target));
+pub fn yieldThread(target: u64) Regs {
+    return fromCRegs(ext.yieldThread(target));
 }
 
 pub fn priority(target: u12, new_priority: u64) Regs {
@@ -507,8 +507,8 @@ pub fn createPort(caps: u64) Regs {
     return fromCRegs(ext.createPort(caps));
 }
 
-pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
-    return fromCRegs(ext.suspendEc(
+pub fn suspendThread(target: u12, port: u12, attachments: []const u64) Regs {
+    return fromCRegs(ext.suspendThread(
         @as(u16, target),
         @as(u16, port),
         attachments.ptr,

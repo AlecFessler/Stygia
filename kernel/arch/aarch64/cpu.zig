@@ -24,7 +24,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const stygia = @import("stygia");
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const VAddr = stygia.memory.address.VAddr;
 
 /// True when the target CPU advertises the ARMv8.1 PAN (Privileged
@@ -362,7 +362,7 @@ pub fn zeroPage4K(ptr: *anyopaque) void {
     @memset(bytes[0..4096], 0);
 }
 
-// ── Spec v3 EC dispatch primitives ────────────────────────────────────
+// ── Spec v3 thread dispatch primitives ────────────────────────────────────
 
 /// SPSR_EL1.M[3:0] selector — EL1h (kernel, dedicated SP).
 /// ARM ARM DDI 0487 §C5.2.18 SPSR_EL1, M[3:0] = 0b0101 = EL1h.
@@ -371,7 +371,7 @@ const SPSR_M_EL1H: u64 = 0b0101;
 /// ARM ARM DDI 0487 §C5.2.18 SPSR_EL1, M[3:0] = 0b0000 = EL0t.
 const SPSR_M_EL0T: u64 = 0b0000;
 
-/// Naked tail of `loadEcContextAndReturn` — receives the saved
+/// Naked tail of `loadThreadContextAndReturn` — receives the saved
 /// ArchCpuContext base pointer in x0, sets sp to it, restores x0..x30,
 /// SP_EL0, ELR_EL1, SPSR_EL1, and ERETs. Splitting the prologue (Zig
 /// helper) from the restore path (this naked stub) ensures the compiler
@@ -421,27 +421,27 @@ export fn restoreContextAndEret() callconv(.naked) noreturn {
     );
 }
 
-/// Restore `ec.ctx` into the live register file and ERET to either EL0
-/// (user) or EL1 (kernel-mode init EC) depending on the saved SPSR_EL1.
+/// Restore `thread.ctx` into the live register file and ERET to either EL0
+/// (user) or EL1 (kernel-mode init thread) depending on the saved SPSR_EL1.
 /// Mirrors the restore-and-ERET tail of `arch/aarch64/exceptions.zig
-/// exceptionTrampoline`. Spec §[execution_context] dispatch; ARM ARM
+/// exceptionTrampoline`. Spec §[thread] dispatch; ARM ARM
 /// DDI 0487 §D1.10.1 (ERET) restores PC from ELR_EL1 and PSTATE from
 /// SPSR_EL1, switching exception level per SPSR.M.
-pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
+pub fn loadThreadContextAndReturn(thread: *Thread) noreturn {
     const cid: u8 = @truncate(stygia.arch.aarch64.gic.coreID());
-    stygia.sched.scheduler.drainTeardown(cid, ec);
+    stygia.sched.scheduler.drainTeardown(cid, thread);
 
-    // Swap TTBR0_EL1 to the EC's domain root so the post-ERET user-half
+    // Swap TTBR0_EL1 to the thread's domain root so the post-ERET user-half
     // translation walks the right tree. Kernel half lives in TTBR1 and
     // is shared, so no kernel-side TLBI is needed.
     //
-    // caller-pinned: `ec` was selected by the scheduler for this core; its
-    // domain is held live by the EC through the dispatch window (the EC
+    // caller-pinned: `thread` was selected by the scheduler for this core; its
+    // domain is held live by the thread through the dispatch window (the thread
     // carries a SlabRef into the domain), so reading addr_space_root /
     // addr_space_id directly off the deref'd pointer without re-locking
     // the SlabRef is sound here. Mirrors the matching exemption in
     // arch/x64/interrupts.zig switchTo.
-    const dom = ec.domain.ptr;
+    const dom = thread.domain.ptr;
     const new_root = dom.addr_space_root;
     if (new_root.addr != stygia.arch.aarch64.paging.getAddrSpaceRoot().addr) {
         stygia.arch.aarch64.paging.swapAddrSpace(new_root, dom.addr_space_id);
@@ -451,11 +451,11 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // tables — and retire the locked dispatch commitment. Mirrors
     // arch/x64/interrupts.zig switchTo.
     stygia.sched.scheduler.publishActiveRoot(cid, new_root.addr);
-    std.debug.assert((&stygia.sched.scheduler.core_states[cid]).current_ec == ec);
+    std.debug.assert((&stygia.sched.scheduler.core_states[cid]).current_thread == thread);
 
     // Spec §[syscall_abi]: flush the recv-deferred syscall word into
-    // user `[ec.ctx.sp_el0 + 0]` while we are guaranteed to be in the
-    // EC's address space. `port.deliverEvent` stages the value when the
+    // user `[thread.ctx.sp_el0 + 0]` while we are guaranteed to be in the
+    // thread's address space. `port.deliverEvent` stages the value when the
     // receiver is parked (rendezvous wake) — at that moment the kernel
     // is still running in the sender's TTBR0, so the write must be
     // deferred to the resume path. Flush after the TTBR0 swap above and
@@ -463,19 +463,19 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
     // PC; on aarch64 vreg 14 is GPR-backed at x13 — write into the
     // saved frame so ERET surfaces it. Mirrors arch/x64/interrupts.zig
     // switchTo.
-    if (ec.pending_event_word_valid) {
-        stygia.arch.aarch64.interrupts.writeUserSyscallWord(ec.ctx, ec.pending_event_word);
-        ec.pending_event_word = 0;
-        ec.pending_event_word_valid = false;
+    if (thread.pending_event_word_valid) {
+        stygia.arch.aarch64.interrupts.writeUserSyscallWord(thread.ctx, thread.pending_event_word);
+        thread.pending_event_word = 0;
+        thread.pending_event_word_valid = false;
 
-        if (ec.pending_event_rip_valid) {
-            stygia.arch.aarch64.interrupts.writeUserVreg14(ec.ctx, ec.pending_event_rip);
-            ec.pending_event_rip = 0;
-            ec.pending_event_rip_valid = false;
+        if (thread.pending_event_rip_valid) {
+            stygia.arch.aarch64.interrupts.writeUserVreg14(thread.ctx, thread.pending_event_rip);
+            thread.pending_event_rip = 0;
+            thread.pending_event_rip_valid = false;
         }
     }
 
-    const ctx_addr: u64 = @intFromPtr(ec.ctx);
+    const ctx_addr: u64 = @intFromPtr(thread.ctx);
     asm volatile (
         \\mov x0, %[ctx]
         \\b restoreContextAndEret
@@ -486,9 +486,9 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
 }
 
 /// Build a first-dispatch ERET frame on the kernel stack so a
-/// subsequent `loadEcContextAndReturn` lands at `entry` with x0=arg
+/// subsequent `loadThreadContextAndReturn` lands at `entry` with x0=arg
 /// and SP_EL0=ustack_top in EL0 (user) or, when `ustack_top` is null,
-/// stays in EL1 with sp=kstack_top for kernel-mode init ECs.
+/// stays in EL1 with sp=kstack_top for kernel-mode init Threads.
 ///
 /// The frame layout matches `arch/aarch64/interrupts.zig
 /// ArchCpuContext` (272 bytes — Registers 0..240, sp_el0@248,
@@ -496,7 +496,7 @@ pub fn loadEcContextAndReturn(ec: *ExecutionContext) noreturn {
 /// first integer arg in x0; x30 is left zero — `_start` has no return
 /// address. SPSR.M selects the post-ERET exception level (ARM ARM
 /// DDI 0487 §D1.10.1).
-pub fn prepareEcContext(
+pub fn prepareThreadContext(
     kstack_top: stygia.memory.address.VAddr,
     ustack_top: ?stygia.memory.address.VAddr,
     entry: stygia.memory.address.VAddr,
@@ -510,7 +510,7 @@ pub fn prepareEcContext(
     // (`exceptionTrampoline` consumes 16 bytes at `[sp, #-16]!` for
     // the vector stub's `stp x0,x30` save plus 272 bytes for its own
     // ArchCpuContext frame, totaling 288). Aligning the first-dispatch
-    // frame to the same window means ec.ctx still points at the saved
+    // frame to the same window means thread.ctx still points at the saved
     // frame after the next user→kernel transition.
     const frame_size: u64 = @sizeOf(ArchCpuContext);
     const stub_save: u64 = 16;
@@ -526,9 +526,9 @@ pub fn prepareEcContext(
         // Reserve a 16-byte slot at the top of the user stack for the
         // kernel-staged syscall return word. Spec §[syscall_abi]: vreg
         // 0 lives at `[sp_el0 + 0]` when a syscall executes, and the
-        // resume path (loadEcContextAndReturn) flushes the recv-deferred
+        // resume path (loadThreadContextAndReturn) flushes the recv-deferred
         // syscall word into that slot before the ERET. A freshly-prepared
-        // EC that suspends before its entry runs (e.g. a sender stashed
+        // thread that suspends before its entry runs (e.g. a sender stashed
         // by `suspend(W, port)` and then resumed via reply / reply_transfer)
         // would otherwise have sp_el0 == stack_top, putting `[sp_el0 + 0]`
         // one byte past the last mapped user-stack page — the kernel write
@@ -537,7 +537,7 @@ pub fn prepareEcContext(
         ctx.sp_el0 = us.addr - 16;
         ctx.spsr_el1 = SPSR_M_EL0T;
     } else {
-        // Kernel-mode init EC: stay at EL1h with the kernel stack as SP.
+        // Kernel-mode init thread: stay at EL1h with the kernel stack as SP.
         // SP_EL0 is unused at EL1h but mirror the kernel SP for safety.
         ctx.sp_el0 = kstack_top.addr;
         ctx.spsr_el1 = SPSR_M_EL1H;
@@ -547,8 +547,8 @@ pub fn prepareEcContext(
 }
 
 /// Re-patch a previously-built first-dispatch frame for user-mode entry.
-/// Used when an EC was allocated without a user stack (so
-/// `prepareEcContext` left the frame in EL1h kernel-mode shape) and the
+/// Used when an thread was allocated without a user stack (so
+/// `prepareThreadContext` left the frame in EL1h kernel-mode shape) and the
 /// caller is wiring in the user stack and entry afterward.
 pub fn patchUserModeIretFrame(
     ctx: *stygia.arch.aarch64.interrupts.ArchCpuContext,
@@ -563,7 +563,7 @@ pub fn patchUserModeIretFrame(
 }
 
 /// Halt the local core with DAIF.{I,F} clear until the next IRQ (WFI).
-/// Spec §[execution_context] idle EC. ARM ARM DDI 0487 §C5.2.4 WFI.
+/// Spec §[thread] idle thread. ARM ARM DDI 0487 §C5.2.4 WFI.
 pub fn idle() void {
     asm volatile (
         \\msr daifclr, #2
@@ -597,9 +597,9 @@ pub fn parkPerCoreCaches(core_id: u64, park_top: u64) void {
 /// aarch64 has no equivalent of x86's STI interrupt shadow, so the
 /// original `msr daifclr, #2; wfi` let a wake IPI land in the
 /// two-instruction window — delivered, EOI'd and CONSUMED — after
-/// which the WFI slept forever with ready ECs stranded in this core's
+/// which the WFI slept forever with ready Threads stranded in this core's
 /// run queue (caught live: four cores in WFI, two `.ready`
-/// futex-woken ECs queued on core 1). Callers reach here having
+/// futex-woken Threads queued on core 1). Callers reach here having
 /// re-checked the queue under the same mask, so the check-then-sleep
 /// pair is atomic.
 ///

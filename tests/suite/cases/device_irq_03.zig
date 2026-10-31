@@ -1,17 +1,17 @@
 // Spec §[device_irq] device_irq — test 03.
 //
-// "[test 03] when the device fires an IRQ, every EC blocked in
+// "[test 03] when the device fires an IRQ, every thread blocked in
 //  futex_wait_val keyed on the paddr of any domain-local copy of
 //  [1].field1 returns from the call with [1] = the corresponding
 //  domain-local vaddr of field1."
 //
 // Faithful path
-//   The faithful sequence parks a worker EC in
+//   The faithful sequence parks a worker thread in
 //   `futex_wait_val(addr=&handle.field1, expected=last_seen)`, then
 //   triggers an IRQ from the bound device. The kernel's onIrq path
 //   bumps every domain-local copy's `field1.irq_count` and issues a
 //   futex wake on its paddr (kernel/devices/device_region.zig
-//   propagateIrqAndWake), so the parked EC returns with [1] equal to
+//   propagateIrqAndWake), so the parked thread returns with [1] equal to
 //   the worker's domain-local vaddr of field1.
 //
 // What's reachable on this branch
@@ -66,14 +66,14 @@
 //      (regression) or the entry-fast-path semantics are broken.
 //
 // Faithful-test note (deferred half)
-//   Replace the entry-fast-path oracle with a parked-EC + injection
+//   Replace the entry-fast-path oracle with a parked-thread + injection
 //   sequence:
-//     - spawn a worker EC inside the test child capability domain
+//     - spawn a worker thread inside the test child capability domain
 //       (or a sibling domain holding a copied alias of [1]);
 //     - worker parks in futex_wait_val(addr=&copy.field1,
 //       expected=copy.field1.irq_count) and side-channels its
-//       observed return [1] back to the test EC;
-//     - test EC injects an IRQ on the dma+irq fixture; asserts
+//       observed return [1] back to the test thread;
+//     - test thread injects an IRQ on the dma+irq fixture; asserts
 //       worker's [1] == worker's domain-local vaddr of field1
 //       (id 4).
 //   Needs both a kernel-side test injection hook and

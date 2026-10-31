@@ -156,7 +156,7 @@ pub fn issueRegDiscard(word: u64, in: Regs) void {
 //
 // Stack reservation = 144 bytes (not 16). Rationale: §[event_state]
 // vreg 14 is delivered by `recv` at `[user_rsp + 8]` of the syscall-
-// time RSP — the kernel writes the suspended-EC's RIP there during
+// time RSP — the kernel writes the suspended-thread's RIP there during
 // rendezvous. With a 16-byte reservation, [rsp+8] from inside the asm
 // equals (caller_rsp - 16) + 8 = caller_rsp - 8 — squarely inside the
 // SysV AMD64 red zone (caller_rsp - 128 .. caller_rsp - 1) where LLVM
@@ -253,10 +253,10 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
 // `stack_vreg_buf` is @export'd so the asm can `lea` it via a RIP-
 // relative reference; a `_saved_rsp` companion stores the user rsp
 // across the syscall. Both are PROCESS-LOCAL (single libz instance per
-// EC; no SMP within an EC). Concurrent issue from a different EC in
-// the same process is impossible because each EC has its own user
+// thread; no SMP within an thread). Concurrent issue from a different thread in
+// the same process is impossible because each thread has its own user
 // stack and runs its own copy of libz code, but only one is in the
-// asm body at a time per EC, and different ECs can't share rsp.
+// asm body at a time per thread, and different Threads can't share rsp.
 // Hidden visibility: the inline asm uses direct (%%rip) relocations
 // which require non-preemptible symbols under PIC rules. The
 // `vm_exit_reply_buf` companion in the same file uses `export var`

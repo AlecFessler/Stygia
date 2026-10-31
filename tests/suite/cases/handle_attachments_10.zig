@@ -14,7 +14,7 @@
 //   The spec line under test is the visible behaviour of that rule.
 //   To exercise it we need:
 //
-//     (a) A suspending EC with N > 0 valid pair entries — at least one
+//     (a) A suspending thread with N > 0 valid pair entries — at least one
 //         `move = 1` and at least one `move = 0`, so the post-resume
 //         "unchanged sender table" check covers both branches.
 //     (b) A suspended state in which the port becomes terminally closed
@@ -32,26 +32,26 @@
 //
 //   So we mint a port whose only handle in the test domain carries
 //   bind + recv + xfer caps, queue up two pair entries, suspend the
-//   test EC itself onto that port, and arrange for a sibling EC in
+//   test thread itself onto that port, and arrange for a sibling thread in
 //   the same capability domain to release the port handle while the
-//   test EC is suspended. The port's recv refcount drops from 1 to 0
-//   with no recv ever queued, the kernel resumes the test EC with
+//   test thread is suspended. The port's recv refcount drops from 1 to 0
+//   with no recv ever queued, the kernel resumes the test thread with
 //   E_CLOSED, and the sender-table-unchanged invariant is what we
 //   probe afterwards.
 //
-//   Sibling-EC mechanic: ECs created with target = self (the test EC's
+//   Sibling-thread mechanic: Threads created with target = self (the test thread's
 //   own capability domain) share the same handle table per
-//   §[create_execution_context]. The test EC pins itself to its current
+//   §[create_thread]. The test thread pins itself to its current
 //   core, creates the sibling on that same core at idle priority, and
 //   stores the port handle id into a process-global with release
-//   ordering. The sibling EC's entry function loads it with acquire
-//   ordering, calls `delete(port_id)`, and halts. Once the test EC
+//   ordering. The sibling thread's entry function loads it with acquire
+//   ordering, calls `delete(port_id)`, and halts. Once the test thread
 //   suspends itself, the sibling can run; until then, same-core affinity
 //   plus lower priority prevents x86 work-stealing from deleting the
 //   recv-cap handle before the suspend has actually parked.
 //
 //   Pair-entry mechanic: §[handle_attachments] says "When N > 0, the
-//   entries occupy vregs [128-N..127]". libz's `suspendEc` panics on
+//   entries occupy vregs [128-N..127]". libz's `suspendThread` panics on
 //   N > 0 because the existing wrapper has no high-vreg path wired,
 //   so this test issues the syscall via raw inline asm, allocating a
 //   920-byte stack pad covering the syscall word at [rsp + 0] and
@@ -102,8 +102,8 @@
 //       are distinct handles.
 //
 //   And on suspend itself (§[suspend] tests 01..07): target = the test
-//   EC's own slot 1 (valid EC, has `susp` since runner-granted
-//   ec_inner_ceiling lets us mint with susp), port = the freshly minted
+//   thread's own slot 1 (valid thread, has `susp` since runner-granted
+//   thread_inner_ceiling lets us mint with susp), port = the freshly minted
 //   port (valid handle, has `bind`), no reserved bits, target is not a
 //   vCPU and is not already suspended.
 //
@@ -114,11 +114,11 @@
 //      — must succeed (PF_A, source for the move=1 entry).
 //   3. create_page_frame(caps = copy|r, props = sz=0, pages = 1)
 //      — must succeed (PF_B, source for the move=0 entry).
-//   4. Pin the test EC to its current core. Publish port_id via release
-//      store; create_execution_context pointing at deleterEntry, target
+//   4. Pin the test thread to its current core. Publish port_id via release
+//      store; create_thread pointing at deleterEntry, target
 //      = self, priority = 0, affinity = that same core.
 //      — must succeed.
-//   5. Issue suspend(self_ec=1, port, [pair_a (move=1, PF_A, caps=r),
+//   5. Issue suspend(self_thread=1, port, [pair_a (move=1, PF_A, caps=r),
 //                                       pair_b (move=0, PF_B, caps=r)])
 //      via raw asm with the 920-byte stack pad.
 //      — must resume with vreg 1 (rax) = E_CLOSED.
@@ -131,7 +131,7 @@
 //   1: create_port for the test port returned an error word
 //   2: create_page_frame for PF_A returned an error word
 //   3: create_page_frame for PF_B returned an error word
-//   4: create_execution_context for the deleter sibling returned an
+//   4: create_thread for the deleter sibling returned an
 //      error word
 //   5: suspend did not resume with E_CLOSED
 //   6: PF_A's slot is not a live page_frame handle after resume (the
@@ -154,12 +154,12 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Process-global the test EC writes (release) and the deleter sibling
-// reads (acquire). Both ECs run in the same capability domain so this
+// Process-global the test thread writes (release) and the deleter sibling
+// reads (acquire). Both Threads run in the same capability domain so this
 // is shared memory in the strict sense.
 var deleter_port_id: u32 = 0;
 
-// Sibling-EC entry. Loads the port handle id the test EC published,
+// Sibling-thread entry. Loads the port handle id the test thread published,
 // drops the only port handle in the table (the recv-cap holder), and
 // halts. The delete decrements the port's recv refcount from 1 to 0;
 // per §[capabilities] (port row) that transition resumes suspended
@@ -178,7 +178,7 @@ fn deleterEntry() callconv(.c) noreturn {
 }
 
 // Issue `suspend` with two pair entries in vregs 126 and 127. libz's
-// generic `suspendEc` panics on N > 0 because it has no high-vreg
+// generic `suspendThread` panics on N > 0 because it has no high-vreg
 // path wired; here we hand-roll the stack-pad sequence the spec ABI
 // requires.
 //
@@ -257,13 +257,13 @@ fn suspendWithTwoAttachmentsArm(
 }
 
 fn suspendWithTwoAttachments(
-    target_ec: u64,
+    target_thread: u64,
     port: u12,
     entry_a: u64,
     entry_b: u64,
 ) u64 {
     const word: u64 = syscall.buildWord(.@"suspend", syscall.extraCount(2));
-    const v1: u64 = target_ec;
+    const v1: u64 = target_thread;
     const v2: u64 = @as(u64, port);
     return switch (builtin.cpu.arch) {
         .x86_64 => suspendWithTwoAttachmentsX64(word, v1, v2, entry_a, entry_b),
@@ -335,16 +335,16 @@ pub fn main(cap_table_base: u64) void {
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, deleter_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, deleter_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(10);
         return;
@@ -360,10 +360,10 @@ pub fn main(cap_table_base: u64) void {
     // the sibling reads the just-written id.
     @atomicStore(u32, &deleter_port_id, @as(u32, port_handle), .release);
 
-    const deleter_caps = caps.EcCap{ .restart_policy = 0 };
+    const deleter_caps = caps.ThreadCap{ .restart_policy = 0 };
     const deleter_caps_word: u64 = @as(u64, deleter_caps.toU16());
     const deleter_entry_addr: u64 = @intFromPtr(&deleterEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         deleter_caps_word,
         deleter_entry_addr,
         1, // stack_pages
@@ -375,7 +375,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
     // The deleter handle id itself is irrelevant to the test logic —
-    // we never reference the EC again.
+    // we never reference the thread again.
 
     // Step 5: build pair entries and dispatch suspend. PairEntry
     // packed-struct construction zeroes _reserved_lo / _reserved_hi
@@ -393,10 +393,10 @@ pub fn main(cap_table_base: u64) void {
         .move = false,
     };
 
-    // SLOT_INITIAL_EC = 1 is the test EC itself per
+    // SLOT_INITIAL_THREAD = 1 is the test thread itself per
     // §[create_capability_domain]'s slot-1 invariant.
     const status = suspendWithTwoAttachments(
-        @as(u64, caps.SLOT_INITIAL_EC),
+        @as(u64, caps.SLOT_INITIAL_THREAD),
         port_handle,
         pair_a.toU64(),
         pair_b.toU64(),

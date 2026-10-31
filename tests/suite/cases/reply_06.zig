@@ -1,18 +1,18 @@
 // Spec §[reply] reply — test 06.
 //
-// "[test 06] on success when the originating EC handle did not have
-//  the `write` cap, the resumed EC's state matches its pre-suspension
+// "[test 06] on success when the originating thread handle did not have
+//  the `write` cap, the resumed thread's state matches its pre-suspension
 //  state, ignoring any modifications made by the receiver."
 //
 // Strategy
 //   The witness needs three things:
-//     (a) A reply handle for a sender W that the test EC owns, where
-//         the EC handle used to suspend W lacks `write` so the spec
+//     (a) A reply handle for a sender W that the test thread owns, where
+//         the thread handle used to suspend W lacks `write` so the spec
 //         line under test applies.
 //     (b) A way to write "modifications" into the receiver's event-
 //         state vregs between recv and reply. §[event_state] is a 1:1
 //         vreg map: the receiver's vreg N at reply time becomes vreg
-//         N of the resumed EC iff the originating EC handle had the
+//         N of the resumed thread iff the originating thread handle had the
 //         `write` cap. Issuing `reply` directly via `issueReg` lets us
 //         pin specific sentinel values into the vregs the kernel
 //         reads when consuming the reply.
@@ -50,10 +50,10 @@
 //
 // Action
 //   1. create_port(caps={bind, recv})         — must succeed
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, read, rp=0})        — must succeed
 //      (write cap deliberately *not* set; this is the originating
-//       EC handle the spec line conditions on.)
+//       thread handle the spec line conditions on.)
 //   3. suspend(W, port)                        — must return OK
 //   4. recv(port)                              — must return OK;
 //                                                 capture G1 = vregs.
@@ -70,7 +70,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error word)
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error word)
 //   3: first suspend did not return OK
 //   4: first recv did not return OK
@@ -89,7 +89,7 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Architecture-portable no-op EC entry. Equivalent to
+// Architecture-portable no-op thread entry. Equivalent to
 // libz testing.dummyEntry, defined locally so the body's idle
 // instruction can be selected per arch (`hlt` on x86-64,
 // `wfe` on aarch64) without touching libz.
@@ -120,17 +120,17 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W with read+susp+term but *no* write. The missing
     // `write` is the spec-line precondition that drives this test.
     // restart_policy = 0 (kill) keeps the call inside the runner's
-    // restart_policy_ceiling.ec_restart_max.
-    const w_caps = caps.EcCap{
+    // restart_policy_ceiling.thread_restart_max.
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .read = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,

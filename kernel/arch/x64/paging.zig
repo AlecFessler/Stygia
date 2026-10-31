@@ -141,7 +141,7 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 /// `shootdownTlbRange` over the whole range). The sync initiator's
 /// `!= 0` spin on the underflowed counter never terminated, hanging
 /// CPU0 in `waitForShootdownAcks` while every other core was halted
-/// in `parkAndAwaitIRQ` (the `pending_zombies=1` / RDY-EC-not-stolen
+/// in `parkAndAwaitIRQ` (the `pending_zombies=1` / RDY-thread-not-stolen
 /// dump pattern from t5r).
 ///
 /// The fix is to make ack tracking idempotent and per-core: each sync
@@ -480,7 +480,7 @@ pub fn serviceTlbArmsWhileSpinning() void {
 /// current holder sits in `waitForShootdownAcks` waiting for exactly
 /// this core's ack (stygia-rs6, captured live: core 0 IRQs-off in
 /// this spin, core 1 holding the lock waiting on core 0, both RDY
-/// test ECs stranded behind them). Servicing arms between attempts
+/// test Threads stranded behind them). Servicing arms between attempts
 /// is the standard IPI-vs-spinlock discipline; it is correct for
 /// IRQs-on contenders too (the IPI handler acking concurrently is
 /// idempotent — both store the latest gen).
@@ -885,7 +885,7 @@ pub fn mapPage(
         // and the orphaned table page leaks.
         //
         // Invisible until the suite actually ran on more than one core:
-        // `affinity = 0` put every test EC on the runner's core, so no
+        // `affinity = 0` put every test thread on the runner's core, so no
         // two mappers ever overlapped. `-Dspread_cores` is what exposed
         // it. `mapPageBoot` is deliberately left alone — single-core by
         // construction.
@@ -1282,7 +1282,7 @@ pub fn mapPageSized(
         // and the orphaned table page leaks.
         //
         // Invisible until the suite actually ran on more than one core:
-        // `affinity = 0` put every test EC on the runner's core, so no
+        // `affinity = 0` put every test thread on the runner's core, so no
         // two mappers ever overlapped. `-Dspread_cores` is what exposed
         // it. `mapPageBoot` is deliberately left alone — single-core by
         // construction.
@@ -1436,7 +1436,7 @@ pub fn freeUserAddrSpace(
     // PCID (which currently never happens — see allocAddrSpaceRoot
     // doc) — addressable later by deferring the free until after a
     // CR3 swap, e.g. via a per-core "pending PML4 free" slot drained
-    // by `loadEcContextAndReturn`.
+    // by `loadThreadContextAndReturn`.
 }
 
 fn freePdpt(pmm_mgr: *pmm.PhysicalMemoryManager, pdpt_phys: PAddr, skip1_start: u64, skip1_bytes: u64, skip2_start: u64, skip2_bytes: u64) void {
@@ -1594,7 +1594,7 @@ pub fn shootdownTlbRange(
 ///
 /// Publish-and-poll rather than publish-and-wait, deliberately. This is
 /// reachable from `stack.destroyKernel` on paths that hold object
-/// gen-locks (`destroyExecutionContextLocked` runs under the dying
+/// gen-locks (`destroyThreadLocked` runs under the dying
 /// domain's lock) and run with IRQs masked. Blocking for acks there
 /// closes a cycle against the IPC fast path, whose gen-lock CAS spins
 /// are hand-written assembly that runs IRQs-off and services no arms:

@@ -25,17 +25,17 @@
 //       ourselves the `recv` cap (the result port's caps as forwarded
 //       by the runner do not include `recv` by spec — the runner is
 //       the receiver of result events, not the test).
-//     - We spawn a helper EC inside this same capability domain. The
-//       helper, on entry, calls `self()` to obtain its own EC handle
+//     - We spawn a helper thread inside this same capability domain. The
+//       helper, on entry, calls `self()` to obtain its own thread handle
 //       id, then `suspend(self_handle, port, &.{})` so it queues as
 //       a sender on `port` with pair_count = 0. The handle table is
-//       shared between the test and helper ECs because they share a
-//       capability domain; `port` and the helper's EC handle live in
+//       shared between the test and helper Threads because they share a
+//       capability domain; `port` and the helper's thread handle live in
 //       the same table.
-//     - The test EC, after spawning the helper, saturates its handle
+//     - The test thread, after spawning the helper, saturates its handle
 //       table by repeated `create_port` until E_FULL is returned.
 //       With zero free slots, recv cannot mint the reply handle.
-//     - The test EC then calls `recv(port)`. recv blocks until the
+//     - The test thread then calls `recv(port)`. recv blocks until the
 //       helper's suspend lands on the queue (no race window matters:
 //       recv waits for a sender regardless). When the helper is
 //       dequeued the kernel attempts to allocate a slot for the reply
@@ -49,30 +49,30 @@
 //     - test 01 (BADCAP): port handle is freshly minted and valid.
 //     - test 02 (PERM): port_caps include `recv`.
 //     - test 03 (INVAL on [1]): no reserved bits set.
-//     - test 04 (CLOSED, no holders): the test EC keeps its bind-cap
+//     - test 04 (CLOSED, no holders): the test thread keeps its bind-cap
 //       holding port handle live across the recv.
 //     - test 05 (CLOSED while blocked): the test never releases the
 //       port between spawn and recv.
 //
-//   Helper entry uses the shared address space — both ECs run in the
+//   Helper entry uses the shared address space — both Threads run in the
 //   same capability domain, so a top-level `var` storing the port
 //   handle is visible to the helper. Stack pages are kernel-allocated
-//   per `create_execution_context` so the helper's stack does not
+//   per `create_thread` so the helper's stack does not
 //   collide with the test's.
 //
 // Action
 //   1. create_port(caps={bind, recv, xfer}) — mint port for the recv.
-//      Store the slot id in a top-level var so the helper EC can read
+//      Store the slot id in a top-level var so the helper thread can read
 //      it.
-//   2. create_execution_context(caps={susp}, entry=&helperEntry,
-//      stack_pages=1, target=0, affinity=0) — spawn the helper EC in
+//   2. create_thread(caps={susp}, entry=&helperEntry,
+//      stack_pages=1, target=0, affinity=0) — spawn the helper thread in
 //      this same domain.
 //   3. Saturate the handle table: loop create_port(0) until E_FULL.
 //   4. recv(port) — must return E_FULL in regs.v1.
 //
 // Assertions
 //   1: create_port for the recv target failed.
-//   2: create_execution_context for the helper failed.
+//   2: create_thread for the helper failed.
 //   3: handle table did not saturate before HANDLE_TABLE_MAX
 //      iterations.
 //   4: recv returned something other than E_FULL.
@@ -85,24 +85,24 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Visible to both the test EC and the helper EC: they share a
+// Visible to both the test thread and the helper thread: they share a
 // capability domain (and thus an address space) per
-// `create_execution_context([4] target = 0)`.
+// `create_thread([4] target = 0)`.
 var helper_port: u12 = 0;
 
 fn helperEntry() callconv(.c) noreturn {
-    // Resolve the helper's own EC handle id. By §[self], `self()`
+    // Resolve the helper's own thread handle id. By §[self], `self()`
     // returns a handle in the caller's table referencing the calling
-    // EC; the helper's own handle was minted by the test's
-    // `create_execution_context` call into this shared table.
+    // thread; the helper's own handle was minted by the test's
+    // `create_thread` call into this shared table.
     const sf = syscall.self();
-    const helper_ec: u12 = @truncate(sf.v1 & 0xFFF);
+    const helper_thread: u12 = @truncate(sf.v1 & 0xFFF);
 
     // Suspend ourselves on the test's recv-target port with no
     // attachments (pair_count = 0). This queues the helper as a
     // sender; the test's recv will dequeue it and attempt to mint a
     // reply handle in the (now-saturated) handle table.
-    _ = syscall.suspendEc(helper_ec, helper_port, &.{});
+    _ = syscall.suspendThread(helper_thread, helper_port, &.{});
 
     // If the kernel ever resumes us, halt deterministically so the
     // helper does not race the test's reporting path.
@@ -137,14 +137,14 @@ pub fn main(cap_table_base: u64) void {
     }
     helper_port = @truncate(cp.v1 & 0xFFF);
 
-    // Step 2: spawn a helper EC in this same capability domain. The
-    // EC handle is minted into our table at some slot. Caps include
+    // Step 2: spawn a helper thread in this same capability domain. The
+    // thread handle is minted into our table at some slot. Caps include
     // `susp` so the helper's `suspend(self_handle, port)` passes the
-    // EC-cap check. Stack pages = 1 satisfies test 08; affinity = 0
+    // thread-cap check. Stack pages = 1 satisfies test 08; affinity = 0
     // (any core) and priority = 0 keep tests 06/09 quiet.
-    const helper_caps = caps.EcCap{ .susp = true };
+    const helper_caps = caps.ThreadCap{ .susp = true };
     const caps_word: u64 = @as(u64, helper_caps.toU16());
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         @intFromPtr(&helperEntry),
         1, // stack_pages

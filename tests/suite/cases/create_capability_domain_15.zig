@@ -146,7 +146,7 @@ pub fn main(cap_table_base: u64) void {
         0, // ceilings_inner
         0, // ceilings_outer
         pf_handle,
-        0, // initial_ec_affinity
+        0, // initial_thread_affinity
         &.{}, // no passed handles
     );
 

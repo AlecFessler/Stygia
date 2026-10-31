@@ -58,19 +58,19 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_capability_domain_30", .path = "cases/create_capability_domain_30.zig" },
     .{ .name = "create_capability_domain_31", .path = "cases/create_capability_domain_31.zig" },
     .{ .name = "create_capability_domain_32", .path = "cases/create_capability_domain_32.zig" },
-    .{ .name = "create_execution_context_01", .path = "cases/create_execution_context_01.zig" },
-    .{ .name = "create_execution_context_02", .path = "cases/create_execution_context_02.zig" },
-    .{ .name = "create_execution_context_03", .path = "cases/create_execution_context_03.zig" },
-    .{ .name = "create_execution_context_06", .path = "cases/create_execution_context_06.zig" },
-    .{ .name = "create_execution_context_07", .path = "cases/create_execution_context_07.zig" },
-    .{ .name = "create_execution_context_08", .path = "cases/create_execution_context_08.zig" },
-    .{ .name = "create_execution_context_09", .path = "cases/create_execution_context_09.zig" },
-    .{ .name = "create_execution_context_10", .path = "cases/create_execution_context_10.zig" },
-    .{ .name = "create_execution_context_11", .path = "cases/create_execution_context_11.zig" },
-    .{ .name = "create_execution_context_12", .path = "cases/create_execution_context_12.zig" },
-    .{ .name = "create_execution_context_13", .path = "cases/create_execution_context_13.zig" },
-    .{ .name = "create_execution_context_14", .path = "cases/create_execution_context_14.zig" },
-    .{ .name = "create_execution_context_15", .path = "cases/create_execution_context_15.zig" },
+    .{ .name = "create_thread_01", .path = "cases/create_thread_01.zig" },
+    .{ .name = "create_thread_02", .path = "cases/create_thread_02.zig" },
+    .{ .name = "create_thread_03", .path = "cases/create_thread_03.zig" },
+    .{ .name = "create_thread_06", .path = "cases/create_thread_06.zig" },
+    .{ .name = "create_thread_07", .path = "cases/create_thread_07.zig" },
+    .{ .name = "create_thread_08", .path = "cases/create_thread_08.zig" },
+    .{ .name = "create_thread_09", .path = "cases/create_thread_09.zig" },
+    .{ .name = "create_thread_10", .path = "cases/create_thread_10.zig" },
+    .{ .name = "create_thread_11", .path = "cases/create_thread_11.zig" },
+    .{ .name = "create_thread_12", .path = "cases/create_thread_12.zig" },
+    .{ .name = "create_thread_13", .path = "cases/create_thread_13.zig" },
+    .{ .name = "create_thread_14", .path = "cases/create_thread_14.zig" },
+    .{ .name = "create_thread_15", .path = "cases/create_thread_15.zig" },
     .{ .name = "create_page_frame_01", .path = "cases/create_page_frame_01.zig" },
     .{ .name = "create_page_frame_02", .path = "cases/create_page_frame_02.zig" },
     .{ .name = "create_page_frame_03", .path = "cases/create_page_frame_03.zig" },
@@ -622,7 +622,7 @@ pub fn build(b: *std.Build) void {
     // test `.not_run`, finishes the remaining batches, prints a normal
     // summary and reboots, so by the time you see "MISS x" the
     // kernel state that explains it is gone. Freezing keeps the lost
-    // EC, its port and the per-core state exactly as they were —
+    // thread, its port and the per-core state exactly as they were —
     // the same technique that cracked stygia-3ys from a live corpse.
     //
     // OFF by default and deliberately so: it converts a MISS from "one
@@ -680,11 +680,11 @@ pub fn build(b: *std.Build) void {
     // Spread test domains across cores instead of letting them all pile
     // onto the runner's core.
     //
-    // The runner used to pass `initial_ec_affinity = 0` ("kernel picks
+    // The runner used to pass `initial_thread_affinity = 0` ("kernel picks
     // any core") for every test domain. Initial placement remains
     // local-biased, and runner-created test domains should keep
     // deterministic placement for stability triage even though x64 now
-    // has pull-side stealing for affinity-0 ready ECs. The old behavior
+    // has pull-side stealing for affinity-0 ready Threads. The old behavior
     // was a single-core pile-up (docs/kernel/open-design-questions.md
     // §2, stygia-yxj).
     //
@@ -697,7 +697,7 @@ pub fn build(b: *std.Build) void {
     //
     // Set `-Dspread_cores=false` to keep runner-spawned test domains on
     // the historical local-biased initial placement. That does not
-    // disable x64 pull-side stealing for affinity-0 ECs created inside
+    // disable x64 pull-side stealing for affinity-0 Threads created inside
     // a test; `scheduler_balance_01` covers that path explicitly.
     const spread_cores = b.option(
         bool,

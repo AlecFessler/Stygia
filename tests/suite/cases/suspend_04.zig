@@ -13,37 +13,37 @@
 //   Include `recv` and `bind` so create_port's structural rule
 //   (must include `recv` and one of `{suspend, bind}`) is satisfied
 //   while still leaving the suspend-syscall gate violated. Then mint
-//   a fresh EC handle with the `susp` cap so test 03 (E_PERM if [1]
-//   lacks `susp`) is neutralized, and call `suspend(ec, port, &.{})`.
+//   a fresh thread handle with the `susp` cap so test 03 (E_PERM if [1]
+//   lacks `susp`) is neutralized, and call `suspend(thread, port, &.{})`.
 //
 //   Failure-path neutralization:
-//     - test 01 (E_BADCAP if [1] not a valid EC handle): handle id
-//       comes from a successful create_execution_context.
+//     - test 01 (E_BADCAP if [1] not a valid thread handle): handle id
+//       comes from a successful create_thread.
 //     - test 02 (E_BADCAP if [2] not a valid port handle): handle id
 //       comes from a successful create_port.
-//     - test 03 (E_PERM if [1] lacks `susp`): EC is minted with `susp`.
-//     - test 05 (E_INVAL reserved bits): the typed `syscall.suspendEc`
+//     - test 03 (E_PERM if [1] lacks `susp`): thread is minted with `susp`.
+//     - test 05 (E_INVAL reserved bits): the typed `syscall.suspendThread`
 //       wrapper carries no reserved bits in [1] or [2].
-//     - test 06 (E_INVAL if [1] is a vCPU): we use a regular EC.
-//     - test 07 (E_INVAL if [1] already suspended): the EC was just
+//     - test 06 (E_INVAL if [1] is a vCPU): we use a regular thread.
+//     - test 07 (E_INVAL if [1] already suspended): the thread was just
 //       created and starts running at `dummyEntry`; it has not been
 //       suspended.
 //   The suspend-cap check is therefore the only spec-mandated failure
 //   path that applies, isolating E_PERM.
 //
-//   The new EC begins executing immediately at `dummyEntry`, which
+//   The new thread begins executing immediately at `dummyEntry`, which
 //   halts forever (`hlt`). No synchronization is needed because the
 //   suspend-cap check happens against the port handle's caps field in
-//   our domain's handle table; the running EC's state is irrelevant.
+//   our domain's handle table; the running thread's state is irrelevant.
 //
 // Action
 //   1. create_port(caps={recv, bind})                             — must succeed
-//   2. create_execution_context(target=self, caps={susp})         — must succeed
-//   3. suspend(ec, port, no_attachments)                          — must return E_PERM
+//   2. create_thread(target=self, caps={susp})         — must succeed
+//   3. suspend(thread, port, no_attachments)                          — must return E_PERM
 //
 // Assertions
 //   1: setup syscall failed (create_port returned an error word)
-//   2: setup syscall failed (create_execution_context returned an error word)
+//   2: setup syscall failed (create_thread returned an error word)
 //   3: suspend returned something other than E_PERM
 
 const lib = @import("lib");
@@ -71,18 +71,18 @@ pub fn main(cap_table_base: u64) void {
     }
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
-    // EcCap with `susp` so test 03 is neutralized.
-    const ec_caps = caps.EcCap{
+    // ThreadCap with `susp` so test 03 is neutralized.
+    const thread_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    // §[create_execution_context] caps word: caps in bits 0-15,
+    // §[create_thread] caps word: caps in bits 0-15,
     // target_caps in 16-31 (ignored when target=self), priority in
     // 32-33. priority=0 keeps the call within the child's pri ceiling.
-    const ec_caps_word: u64 = @as(u64, ec_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, thread_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1, // stack_pages
         0, // target = self
@@ -92,9 +92,9 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(2);
         return;
     }
-    const ec_handle: u12 = @truncate(cec.v1 & 0xFFF);
+    const thread_handle: u12 = @truncate(cec.v1 & 0xFFF);
 
-    const result = syscall.suspendEc(ec_handle, port_handle, &.{});
+    const result = syscall.suspendThread(thread_handle, port_handle, &.{});
 
     if (result.v1 != @intFromEnum(errors.Error.E_PERM)) {
         testing.fail(3);

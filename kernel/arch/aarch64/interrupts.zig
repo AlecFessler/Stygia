@@ -2,7 +2,7 @@
 //!
 //! This is the aarch64 equivalent of x64/interrupts.zig. It defines the
 //! ArchCpuContext layout, implements syscall/IPC register accessors, and
-//! provides the EC context switch mechanism.
+//! provides the thread context switch mechanism.
 //!
 //! ArchCpuContext layout — saved on exception entry by the vector stub:
 //!   x0-x30:    31 general-purpose registers (248 bytes)
@@ -33,7 +33,7 @@
 //!   Software must save x0-x30 and SP_EL0 manually in the vector stub.
 //!
 //! Context switch:
-//!   switchTo() restores the target EC's ArchCpuContext and executes ERET.
+//!   switchTo() restores the target thread's ArchCpuContext and executes ERET.
 //!   ARM ARM D1.10.1: ERET restores PC from ELR_EL1, PSTATE from SPSR_EL1.
 //!
 //! Key functions to implement:
@@ -179,9 +179,9 @@ pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x4 = value;
 }
 
-/// Spec §[event_state] vreg 32 read — the suspending EC's saved PC.
-/// `elr_el1` carries the entry point set in `prepareEcContext` for
-/// freshly created ECs and the saved exception-return address for
+/// Spec §[event_state] vreg 32 read — the suspending thread's saved PC.
+/// `elr_el1` carries the entry point set in `prepareThreadContext` for
+/// freshly created Threads and the saved exception-return address for
 /// ones suspended mid-execution.
 pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
     return ctx.elr_el1;
@@ -189,7 +189,7 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
 
 /// Spec §[event_state] vreg 32 write into the resumed sender's saved
 /// frame. Used by reply_transfer test 14 to commit a write-cap
-/// receiver's PC modification onto the suspended EC's saved frame.
+/// receiver's PC modification onto the suspended thread's saved frame.
 pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     ctx.elr_el1 = value;
 }
@@ -202,7 +202,7 @@ pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
     return ctx.regs.x13;
 }
 
-/// Spec §[event_state]: vreg 14 carries the suspended EC's saved PC
+/// Spec §[event_state]: vreg 14 carries the suspended thread's saved PC
 /// across both arches. On aarch64 vreg 14 is GPR-backed at x13 — write
 /// the saved PC into the receiver's saved x13 so the recv-time
 /// snapshot surfaces it. Mirrors x86-64's `[user_rsp + 8]` write but
@@ -215,8 +215,8 @@ pub fn writeUserVreg14(ctx: *ArchCpuContext, value: u64) void {
 /// Spec §[syscall_abi]: vreg 0 sits at `[user_sp + 0]` on the user
 /// stack — recv's success-return packs reply_handle_id / event_type /
 /// pair_count / tstart there per §[event_state]. TTBR0_EL1 must
-/// reference the EC's address space when called (the rendezvous wake
-/// path defers this write to `loadEcContextAndReturn` after the
+/// reference the thread's address space when called (the rendezvous wake
+/// path defers this write to `loadThreadContextAndReturn` after the
 /// TTBR0 swap). PAN is cleared for the write.
 pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
     cpu.panDisable();
@@ -227,14 +227,14 @@ pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
 /// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on aarch64:
 /// x0..x12) from `src` to `dst`. Companion to x86-64's `copyEventStateGprs`;
 /// used by `reply` (Spec §[reply] test 05) to apply the receiver's vreg
-/// modifications onto the suspended EC's saved iret frame when the
-/// originating EC handle held the `write` cap.
+/// modifications onto the suspended thread's saved iret frame when the
+/// originating thread handle held the `write` cap.
 ///
 /// Only vregs 1..13 are propagated — those are the spec's writable
 /// event-state GPR window. The wholesale `dst.regs = src.regs` shape
 /// would clobber x13..x30 (vreg 14 = suspended PC, plus AAPCS64
 /// callee-saved x19..x28, FP x29, and LR x30). LR corruption in
-/// particular makes the resumed EC `RET` to the receiver's stack frame
+/// particular makes the resumed thread `RET` to the receiver's stack frame
 /// instead of returning from its own `svc`, which silently traps the
 /// post-resume control flow (including the `delete(SLOT_SELF)` tail in
 /// `libz/start.zig`) — domains never tear down, leaked timer/PMM state
@@ -256,7 +256,7 @@ pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void
     dst.regs.x12 = src.regs.x12;
 }
 
-/// Snapshot the suspending EC's GPR-backed vregs 1..13 in canonical
+/// Snapshot the suspending thread's GPR-backed vregs 1..13 in canonical
 /// vreg order. Spec §[event_state] aarch64 maps vregs 1..13 onto
 /// x0..x12.
 pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
@@ -277,7 +277,7 @@ pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
     };
 }
 
-/// Project a vreg 1..13 GPR snapshot onto a receiving EC's frame in
+/// Project a vreg 1..13 GPR snapshot onto a receiving thread's frame in
 /// canonical vreg order. Companion to `getEventStateGprs`.
 pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
     ctx.regs.x0 = gprs[0];

@@ -1,31 +1,31 @@
 // Spec §[futex_wake] — test 04.
 //
-// "[test 04] on success, [1] is the number of ECs actually woken
+// "[test 04] on success, [1] is the number of Threads actually woken
 //  (0..count)."
 //
 // Spec semantics
-//   §[futex_wake]: "Wakes up to `count` ECs blocked in `futex_wait_val`
+//   §[futex_wake]: "Wakes up to `count` Threads blocked in `futex_wait_val`
 //   or `futex_wait_change` on the given address." The success
 //   post-condition asserts that vreg [1] reports the exact number of
-//   ECs actually woken, capped by the `count` argument and bounded
-//   below by 0 when no ECs are parked on the address.
+//   Threads actually woken, capped by the `count` argument and bounded
+//   below by 0 when no Threads are parked on the address.
 //
 // Strategy
 //   We exercise both endpoints of the spec's `0..count` range:
 //
 //   Leg A — empty-queue endpoint (woken == 0). `futex_wake(addr,
-//   count=1)` against an address with no parked EC must return OK
+//   count=1)` against an address with no parked thread must return OK
 //   with vreg 1 = 0. Catches a kernel that returns a non-zero count,
 //   an error word, or any non-zero value when the wake had nothing
 //   to drain.
 //
 //   Leg B — non-empty endpoint (woken == 1, capped by parked count).
-//   Spawn a sibling EC that calls `futex_wait_val` on a shared
+//   Spawn a sibling thread that calls `futex_wait_val` on a shared
 //   address with a long enough timeout to cover the wake handshake
 //   below. Once the sibling is parked, primary issues
 //   `futex_wake(addr, count=8)`. With exactly one sibling parked,
 //   the spec mandates vreg 1 = 1 (woken count, capped below `count`
-//   by the actual parked-EC count). Catches a kernel that returns
+//   by the actual parked-thread count). Catches a kernel that returns
 //   the `count` argument verbatim instead of the actual woken size,
 //   or that fails to filter the wake set down to the parked
 //   set's intersection with the addr's bucket.
@@ -42,7 +42,7 @@
 //   caller's domain, so test 02 / 03 cannot fire on Leg A.
 //   Choice of addr_b: `&shared` — process-global u64 in .bss; the
 //   sibling is spawned with `target = 0` so the same vaddr is valid
-//   in both ECs' (shared) domain, satisfying test 02 / 03 for Leg B.
+//   in both Threads' (shared) domain, satisfying test 02 / 03 for Leg B.
 //
 //   Self-handle: the runner mints children with `fut_wake = true`
 //   and `fut_wait_max = 63` (runner/primary.zig), so test 01
@@ -52,7 +52,7 @@
 // Action
 //   1. futex_wake(addr_a = cap_table_base, count = 1)
 //      — must return OK with [1] = 0.
-//   2. create_execution_context(target = 0, entry = &siblingEntry,
+//   2. create_thread(target = 0, entry = &siblingEntry,
 //                               stack_pages = 1, affinity = 0)
 //      — must succeed; sibling parks in futex_wait_val on &shared.
 //   3. up to MAX_WAKE_TRIES times:
@@ -63,8 +63,8 @@
 // Assertions
 //   1: leg A — futex_wake returned non-OK on the empty-queue wake.
 //   2: leg A — futex_wake returned a non-zero woken count even
-//      though no EC was parked on the address.
-//   3: create_execution_context returned an error, OR the sibling
+//      though no thread was parked on the address.
+//   3: create_thread returned an error, OR the sibling
 //      never started executing (no spawn = no parked sibling = leg
 //      B unreachable).
 //   5: leg B — every wake attempt returned 0; the sibling never
@@ -72,7 +72,7 @@
 //      line under test was not exercised.
 //   6: leg B — wake's woken count was in [2, count] when only one
 //      sibling was parked; kernel reported a wake that did not
-//      correspond to a parked EC.
+//      correspond to a parked thread.
 //   7: leg B — wake's woken count was > count; kernel returned a
 //      value outside the spec's 0..count range (e.g. an unhandled
 //      error code or the count arg verbatim past the cap).
@@ -111,10 +111,10 @@ fn siblingEntry() callconv(.c) noreturn {
 
 pub fn main(cap_table_base: u64) void {
     // Pre-fault the page holding `shared` and `sibling_alive` from
-    // the test EC so the kernel's syscall-time vaddr→paddr walk
+    // the test thread so the kernel's syscall-time vaddr→paddr walk
     // (resolveCallerVa) doesn't surface E_BADADDR on a demand-
     // paged .bss page. Both a read and a (no-op) write to the
-    // page guarantee the page is mapped before either EC issues
+    // page guarantee the page is mapped before either thread issues
     // a futex syscall against it.
     @atomicStore(u64, &shared, 0, .release);
     _ = @atomicLoad(u64, &sibling_alive, .acquire);
@@ -137,10 +137,10 @@ pub fn main(cap_table_base: u64) void {
     // Spawn the sibling. caps = 0 (no per-handle caps needed — fut_wake
     // / fut_wait_max live on the shared self-handle). target = 0 keeps
     // the sibling in this address space so &shared is valid for both.
-    const ec_caps = caps.EcCap{ .restart_policy = 0 };
-    const caps_word: u64 = @as(u64, ec_caps.toU16());
+    const thread_caps = caps.ThreadCap{ .restart_policy = 0 };
+    const caps_word: u64 = @as(u64, thread_caps.toU16());
     const entry: u64 = @intFromPtr(&siblingEntry);
-    const cec = syscall.createExecutionContext(
+    const cec = syscall.createThread(
         caps_word,
         entry,
         1, // stack_pages
@@ -163,15 +163,15 @@ pub fn main(cap_table_base: u64) void {
     // core's scheduler.
     //
     // We wait for `sibling_alive == 1`, which the sibling's first
-    // instruction sets before it calls futex_wait_val. yieldEc
+    // instruction sets before it calls futex_wait_val. yieldThread
     // (target = sibling) is the §[yield] test 03 pattern that
     // forces the kernel to run the sibling.
     var alive_spin: usize = 0;
     while (@atomicLoad(u64, &sibling_alive, .acquire) == 0) {
-        const yr = syscall.yieldEc(sibling_target);
+        const yr = syscall.yieldThread(sibling_target);
         if (yr.v1 != @intFromEnum(errors.Error.OK)) {
             // yield itself errored — handle slot is wrong, or the
-            // EC was destroyed before we could yield to it. Either
+            // thread was destroyed before we could yield to it. Either
             // way leg B is unreachable.
             testing.fail(3);
             return;
@@ -187,13 +187,13 @@ pub fn main(cap_table_base: u64) void {
 
     const addr_b: u64 = @intFromPtr(&shared);
     // count = 8 lets us catch a kernel that returns the `count` arg
-    // verbatim — the actual parked-EC count is 1, so the spec
+    // verbatim — the actual parked-thread count is 1, so the spec
     // mandates vreg 1 = 1 here, not 8.
     const wake_count: u64 = 8;
     // Bounded spin: each iteration tries one wake. Wakes on an
     // empty queue return 0 (Leg A's invariant); the first wake to
     // land on a parked sibling returns 1. Yield between attempts
-    // so the sibling EC actually gets scheduler time on its core
+    // so the sibling thread actually gets scheduler time on its core
     // to enter futex_wait_val and park; without the yield primary
     // can saturate one core's runqueue ordering on smp=4 long
     // enough to flake the handshake.
@@ -205,7 +205,7 @@ pub fn main(cap_table_base: u64) void {
         // success, OR an E_* code in 1..15 on failure. The two
         // ranges overlap (1..min(count, 15)); to disambiguate the
         // test reaches success only via r.v1 == 1 (the actual
-        // parked-EC count for this addr) and fails the only
+        // parked-thread count for this addr) and fails the only
         // codes that the spec lists as possible failures
         // (E_PERM = 12 from missing fut_wake, E_INVAL = 7 from
         // misaligned addr, E_BADADDR = 2 from unmapped addr) —
@@ -214,19 +214,19 @@ pub fn main(cap_table_base: u64) void {
         if (r.v1 == 0) {
             // No wake yet — sibling not parked, or wake fired
             // before park. Yield and retry.
-            _ = syscall.yieldEc(sibling_target);
+            _ = syscall.yieldThread(sibling_target);
             continue;
         }
         if (r.v1 == 1) {
             // Spec line under test confirmed: 1 sibling parked
             // and count = 8 → kernel returned woken = 1, capped
-            // by the parked-EC count (not by count = 8).
+            // by the parked-thread count (not by count = 8).
             testing.pass();
             return;
         }
         if (r.v1 <= wake_count) {
             // 2..wake_count: kernel reported more wakes than
-            // there were parked ECs. Spec violation.
+            // there were parked Threads. Spec violation.
             testing.fail(6);
             return;
         }

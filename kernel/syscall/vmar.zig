@@ -5,7 +5,7 @@ const errors = stygia.syscall.errors;
 const vmar = stygia.memory.vmar;
 
 const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const VmarCaps = stygia.memory.vmar.VmarCaps;
 const Word0 = capability.Word0;
 
@@ -90,8 +90,8 @@ pub fn createVmar(
     // (spec: "ignored otherwise"); vmar.createVmar gates that based
     // on the decoded caps word.
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    const cd_ref = thread.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
     const self_caps: CapabilityDomainCaps = @bitCast(Word0.caps(cd.user_table[SELF_HANDLE_SLOT].word0));
@@ -123,7 +123,7 @@ pub fn createVmar(
     // Test 04: caps.mmio = 1 requires the ceiling to permit mmio.
     if (requested_caps.mmio and !ceiling_caps.mmio) return errors.E_PERM;
 
-    return vmar.createVmar(ec, caps, props, pages, preferred_base, device_region);
+    return vmar.createVmar(thread, caps, props, pages, preferred_base, device_region);
 }
 
 /// Installs page_frames into a regular or DMA-flagged VMAR. The kernel
@@ -167,8 +167,8 @@ pub fn mapPf(caller: *anyopaque, vmar_handle: u64, pairs: []const u64) i64 {
     if (pairs.len % 2 != 0) return errors.E_INVAL;
     if (pairs.len == 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.mapPf(ec, vmar_handle, pairs);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    return vmar.mapPf(thread, vmar_handle, pairs);
 }
 
 /// Installs a device_region as an MMIO mapping into an MMIO-flagged VMAR.
@@ -196,8 +196,8 @@ pub fn mapMmio(caller: *anyopaque, vmar_handle: u64, device_region: u64) i64 {
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (device_region & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.mapMmio(ec, vmar_handle, device_region);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    return vmar.mapMmio(thread, vmar_handle, device_region);
 }
 
 /// Removes mappings from a VMAR. Dispatches on the VMAR's `map` field. With
@@ -236,8 +236,8 @@ pub fn unmap(caller: *anyopaque, vmar_handle: u64, selectors: []const u64) i64 {
     // (map=3); validation depends on the VMAR's current map type, which
     // only vmar can read under _gen_lock. Forward without per-element
     // checks here.
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.unmap(ec, vmar_handle, selectors);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    return vmar.unmap(thread, vmar_handle, selectors);
 }
 
 /// Updates a VMAR's `cur_rwx`, changing the effective permissions on its
@@ -266,8 +266,8 @@ pub fn remap(caller: *anyopaque, vmar_handle: u64, new_cur_rwx: u64) i64 {
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (new_cur_rwx & ~REMAP_RWX_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.remap(ec, vmar_handle, new_cur_rwx);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    return vmar.remap(thread, vmar_handle, new_cur_rwx);
 }
 
 /// Binds a source VMAR to a target VMAR. On the owning domain's restart,
@@ -313,6 +313,6 @@ pub fn snapshot(caller: *anyopaque, target_vmar: u64, source_vmar: u64) i64 {
     if (target_vmar & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (source_vmar & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.snapshot(ec, target_vmar, source_vmar);
+    const thread: *Thread = @ptrCast(@alignCast(caller));
+    return vmar.snapshot(thread, target_vmar, source_vmar);
 }

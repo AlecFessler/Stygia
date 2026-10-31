@@ -5,7 +5,7 @@
 //
 // Strategy
 //   Each spec test ELF is itself spawned by the runner primary as the
-//   initial EC of a freshly-minted capability domain. That spawn IS a
+//   initial thread of a freshly-minted capability domain. That spawn IS a
 //   `create_capability_domain` call, with `self_caps` populated from
 //   `runner/primary.zig`'s `child_self` SelfCap struct (crcd, crec,
 //   crvr, crpf, crvm, crpt, fut_wake, timer all set, pri = 3).

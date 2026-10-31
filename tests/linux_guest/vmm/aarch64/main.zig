@@ -268,7 +268,7 @@ fn handleSubcode(subcode: u8, state: *VmExitState) bool {
             return false;
         },
         .halt, .shutdown => return true,
-        .unknown_ec, .sync_el1, .unknown => {
+        .unknown_thread, .sync_el1, .unknown => {
             advancePc(state);
             return false;
         },

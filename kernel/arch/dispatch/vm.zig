@@ -4,7 +4,7 @@ const stygia = @import("stygia");
 const aarch64 = stygia.arch.aarch64;
 const x64 = stygia.arch.x64;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
 const PageFrame = stygia.memory.page_frame.PageFrame;
@@ -58,7 +58,7 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
 
 // ── Spec v3 VM dispatch primitives ───────────────────────────────────
 // Fine-grained per-VM and per-vCPU control surface tied to the spec-v3
-// VirtualMachine / ExecutionContext objects.
+// VirtualMachine / Thread objects.
 
 /// Allocate per-VM arch state (VMCS/VMCB region for the VM-level
 /// fields, stage-2 control structures, kernel-emulated interrupt
@@ -123,21 +123,21 @@ pub fn initVmDevices(devices: *VmDevices) void {
 }
 
 /// Allocate per-vCPU arch state (VMCS / VMCB save area, sysreg bank).
-/// Stored on the vCPU EC. Spec §[virtual_machine].create_vcpu.
-pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_ec: *ExecutionContext) !void {
+/// Stored on the vCPU thread. Spec §[virtual_machine].create_vcpu.
+pub fn allocVcpuArchState(vm: *VirtualMachine, vcpu_thread: *Thread) !void {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.hv.vcpu.allocVcpuArchState(vm, vcpu_ec),
-        .aarch64 => aarch64.hv.vcpu.allocVcpuArchState(vm, vcpu_ec),
+        .x86_64 => x64.hv.vcpu.allocVcpuArchState(vm, vcpu_thread),
+        .aarch64 => aarch64.hv.vcpu.allocVcpuArchState(vm, vcpu_thread),
         else => unreachable,
     };
 }
 
-/// Free per-vCPU arch state pinned on `vcpu_ec.vcpu_arch_state`.
-/// Counterpart to `allocVcpuArchState`; called on EC destruction.
-pub fn freeVcpuArchState(vcpu_ec: *ExecutionContext) void {
+/// Free per-vCPU arch state pinned on `vcpu_thread.vcpu_arch_state`.
+/// Counterpart to `allocVcpuArchState`; called on thread destruction.
+pub fn freeVcpuArchState(vcpu_thread: *Thread) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.hv.vcpu.freeVcpuArchState(vcpu_ec),
-        .aarch64 => aarch64.hv.vcpu.freeVcpuArchState(vcpu_ec),
+        .x86_64 => x64.hv.vcpu.freeVcpuArchState(vcpu_thread),
+        .aarch64 => aarch64.hv.vcpu.freeVcpuArchState(vcpu_thread),
         else => unreachable,
     }
 }
@@ -155,7 +155,7 @@ pub const VmExitDelivery = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-/// Enter the guest bound to `vcpu_ec` via VMLAUNCH/VMRESUME (Intel) or
+/// Enter the guest bound to `vcpu_thread` via VMLAUNCH/VMRESUME (Intel) or
 /// VMRUN (AMD), running the guest until the next VM exit. On exit the
 /// guest's GPR / sregs / MSRs are saved back into the vCPU's GuestState
 /// and the exit reason is decoded into a `VmExitDelivery` describing
@@ -164,10 +164,10 @@ pub const VmExitDelivery = switch (builtin.cpu.arch) {
 ///
 /// Returns `null` on platforms without hardware virtualization support;
 /// the caller must surface the synthetic-exit fallback in that case.
-pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
+pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm_runloop.enterGuest(vcpu_ec),
-        .aarch64 => aarch64.vm_runloop.enterGuest(vcpu_ec),
+        .x86_64 => x64.vm_runloop.enterGuest(vcpu_thread),
+        .aarch64 => aarch64.vm_runloop.enterGuest(vcpu_thread),
         else => unreachable,
     };
 }
@@ -260,7 +260,7 @@ pub fn vmInjectIrq(vm: *VirtualMachine, irq_num: u32, assert: bool) i64 {
 }
 
 /// Plain-data snapshot of the receiver's §[vm_exit_state] vregs.
-/// Captured outside the sender EC's `_gen_lock` so a fault on the
+/// Captured outside the sender thread's `_gen_lock` so a fault on the
 /// SMAP-bracketed user-stack reads can't strand the lock bit. Per-arch
 /// layout — only the matching arch's apply path consumes it.
 pub const ReplyVregSnapshot = switch (builtin.cpu.arch) {
@@ -274,7 +274,7 @@ pub const ReplyVregSnapshot = switch (builtin.cpu.arch) {
 /// bracketed user-stack loads). Run BEFORE acquiring the sender's
 /// `_gen_lock` so a page fault on the user reads can abort the syscall
 /// without leaking the sender lock bit.
-pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
+pub fn snapshotReplyVregs(receiver: *Thread) ReplyVregSnapshot {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm_runloop.snapshotReplyVregs(receiver),
         .aarch64 => aarch64.vm_runloop.snapshotReplyVregs(receiver),
@@ -283,14 +283,14 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 }
 
 /// Project a `ReplyVregSnapshot` onto a vCPU's per-arch GuestState,
-/// gated by the originating EC's `write` cap. Pure memory writes — no
+/// gated by the originating thread's `write` cap. Pure memory writes — no
 /// user-VA access, so safe under the sender's `_gen_lock`. Called by
 /// `sched.port.consumeReply` when a vm_exit reply lands on a vCPU
 /// sender. Non-vCPU senders short-circuit inside the per-arch impl.
-pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
+pub fn applyReplyStateToVcpu(vcpu_thread: *Thread, snap: *const ReplyVregSnapshot) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(vcpu_ec, snap),
-        .aarch64 => aarch64.vm_runloop.applyReplyStateToVcpu(vcpu_ec, snap),
+        .x86_64 => x64.vm_runloop.applyReplyStateToVcpu(vcpu_thread, snap),
+        .aarch64 => aarch64.vm_runloop.applyReplyStateToVcpu(vcpu_thread, snap),
         else => unreachable,
     }
 }
@@ -298,16 +298,16 @@ pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregS
 /// Stash the [3]u64 exit payload onto the vCPU's per-arch state so the
 /// rendezvous-resume / `deliverEvent` path can pick it up at delivery
 /// time without re-threading the payload through `suspendOnPort`.
-/// No-op when `ec` has no per-arch vCPU state (non-vCPU ECs).
-pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
+/// No-op when `thread` has no per-arch vCPU state (non-vCPU Threads).
+pub fn stashLastExitPayload(thread: *Thread, payload: [3]u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            if (x64.hv.vcpu.archStateOf(ec)) |arch_state| {
+            if (x64.hv.vcpu.archStateOf(thread)) |arch_state| {
                 arch_state.last_exit_payload = payload;
             }
         },
         .aarch64 => {
-            if (aarch64.hv.vcpu.archStateOf(ec)) |arch_state| {
+            if (aarch64.hv.vcpu.archStateOf(thread)) |arch_state| {
                 arch_state.last_exit_payload = payload;
             }
         },
@@ -321,10 +321,10 @@ pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
 /// pre-started exit delivers only sub-code + zeroed GPRs so receivers
 /// that haven't reserved the full vreg window aren't stomped.
 /// Called by `sched.port.fireVmExit` on `event_type = vm_exit` when
-/// the originating EC handle had the `read` cap.
+/// the originating thread handle had the `read` cap.
 pub fn populateVmExitVregsIfStarted(
-    receiver: *ExecutionContext,
-    sender: *ExecutionContext,
+    receiver: *Thread,
+    sender: *Thread,
     subcode: u8,
 ) void {
     switch (builtin.cpu.arch) {

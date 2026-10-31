@@ -6,7 +6,7 @@ const arch = stygia.arch.dispatch;
 const boot = stygia.boot;
 const capability_domain_mod = stygia.caps.capability_domain;
 const dev_region_mod = stygia.devices.device_region;
-const execution_context_mod = stygia.sched.execution_context;
+const thread_mod = stygia.sched.thread;
 const KA = address.KernelVA.KernelAllocators;
 const page_frame_mod = stygia.memory.page_frame;
 const paging = stygia.memory.paging;
@@ -185,10 +185,10 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.capability_domain_slab_ptrs,
         KA.capability_domain_slab_links,
     );
-    execution_context_mod.initSlab(
-        KA.execution_context_slab,
-        KA.execution_context_slab_ptrs,
-        KA.execution_context_slab_links,
+    thread_mod.initSlab(
+        KA.managed_thread_slab,
+        KA.managed_thread_slab_ptrs,
+        KA.managed_thread_slab_links,
     );
     vmar_mod.initSlab(
         KA.vmar_slab,

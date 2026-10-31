@@ -8,21 +8,21 @@
 //   To exercise the recv-port gate we must arrive at the reply syscall
 //   with a real reply handle in the caller's table — otherwise the
 //   reply-handle gate (test 01) would fire first. Pipeline (single
-//   domain, test EC owns both ends):
+//   domain, test thread owns both ends):
 //
 //     1. mint port with caps = {bind, recv}     — xfer not needed since
 //        pair_count = 0, but bind is required for suspend (§[suspend]
-//        [2] cap) and recv lets the test EC dequeue the suspension.
-//     2. mint EC W with caps = {susp}, target = self, restart_policy = 0.
+//        [2] cap) and recv lets the test thread dequeue the suspension.
+//     2. mint thread W with caps = {susp}, target = self, restart_policy = 0.
 //     3. suspend(W, port)                        — queues W as a
-//        suspended sender; non-blocking on the test EC since
+//        suspended sender; non-blocking on the test thread since
 //        [1] != self per §[suspend].
 //     4. recv(port, 0)                           — returns immediately
 //        with the reply handle id encoded in syscall word bits 32-43.
 //     5. unified reply syscall with pair_count = 0 and
 //        recv_port_handle_id = 4095. Slot 4095 is guaranteed empty by
 //        the create_capability_domain table layout (slot 0 = self,
-//        1 = initial EC, 2 = self-IDC, 3+ = passed_handles), so it
+//        1 = initial thread, 2 = self-IDC, 3+ = passed_handles), so it
 //        cannot name a valid port handle. The kernel must return
 //        E_BADCAP and must NOT consume the reply handle.
 //
@@ -35,7 +35,7 @@
 //
 // Action
 //   1. create_port(caps = {bind, recv})          — must succeed
-//   2. create_execution_context(target = self,
+//   2. create_thread(target = self,
 //        caps = {susp, restart_policy = 0})      — must succeed
 //   3. suspend(W, port)                          — must return OK
 //   4. recv(port, 0)                             — must return OK and
@@ -45,7 +45,7 @@
 //
 // Assertions
 //   1: setup port creation failed
-//   2: setup EC creation failed
+//   2: setup thread creation failed
 //   3: suspend itself did not return OK
 //   4: recv did not return OK
 //   5: recv returned reply_handle_id == 0
@@ -75,14 +75,14 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W. susp lets us queue W onto the port via suspend.
     // restart_policy = 0 (kill) keeps the call inside the runner-granted
     // ceiling.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&testing.dummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -96,7 +96,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 3: queue W as a suspended sender on the port. Since
     // [1] = W != self, the call returns immediately without blocking
-    // the test EC (§[suspend]).
+    // the test thread (§[suspend]).
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_handle,
@@ -106,7 +106,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. The port has the test EC as a live bind-cap holder
+    // Step 4: recv. The port has the test thread as a live bind-cap holder
     // and W queued as a suspension event, so recv returns immediately
     // with the reply handle id encoded in the syscall word per §[recv].
     const got = syscall.recv(port_handle, 0);

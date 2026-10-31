@@ -52,7 +52,7 @@ INSERT INTO entity(id,kind,qualified_name,module_id,def_file_id,
   (7,'type','proc.process.Process',     1,1, 0,39, 1, 1, NULL,0,1),  -- slab-backed
   (8,'fn','sched.SlabRef.lock<Port>',   2,2, 0,45, 1, 1, 9, 0,0),    -- generic instantiation
   (9,'fn','sched.SlabRef.lock',         2,2, 0,45, 1, 1, NULL,0,0),  -- generic parent
-  (10,'fn','sched.SlabRef.lock<EC>',    2,2, 0,45, 1, 1, 9, 0,0),    -- generic instantiation
+  (10,'fn','sched.SlabRef.lock<thread>',    2,2, 0,45, 1, 1, 9, 0,0),    -- generic instantiation
   (11,'fn','debug.assert',              2,2, 0,45, 1, 1, NULL,0,0),
   (12,'fn','std.mem.eql',               2,2, 0,45, 1, 1, NULL,0,0);
 
@@ -88,7 +88,7 @@ INSERT INTO ast_edge(parent_id,child_id,role) VALUES
 --   yield → debug.assert (direct, hidden by hide_assertions)
 --   start → std.mem.eql (direct, hidden by hide_library)
 --   start → <indirect>  (call_kind=indirect, callee NULL)
---   SlabRef.lock<Port> → SlabRef.lock<EC>  (cross-instantiation, exercises generic_parent_id)
+--   SlabRef.lock<Port> → SlabRef.lock<thread>  (cross-instantiation, exercises generic_parent_id)
 INSERT INTO ir_call(id,caller_entity_id,callee_entity_id,call_kind,resolved_via,confidence,ast_node_id,site_line) VALUES
   (1, 1, 6, 'direct', NULL, NULL, 102, 1),
   (2, 1, 2, 'direct', NULL, NULL, 103, 1),

@@ -65,7 +65,7 @@ pub fn main(cap_table_base: u64) void {
     const caller_fut_wait_max: u64 = (self_cap.field1 >> 32) & 0x3F;
 
     // Mirror the runner's mint. Inner ceiling (field0) and the
-    // restart_policy / ec / var portions of ceilings_outer use the
+    // restart_policy / thread / var portions of ceilings_outer use the
     // runner's all-valid-bits values so unrelated subset checks pass.
     // Splice the caller's fut_wait_max into bits 32-37 so the
     // `fut_wait_max` subset rule reduces to equality.
@@ -95,7 +95,7 @@ pub fn main(cap_table_base: u64) void {
     // fut_wait_max ceiling check happens before that step in any sane
     // ordering of permission vs argument validation, but for this
     // degraded variant we only require that the result is NOT E_PERM.
-    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, 0, 0, // initial_ec_affinity
+    const result = syscall.createCapabilityDomain(caps_word, ceilings_inner, ceilings_outer, 0, 0, // initial_thread_affinity
         &.{});
 
     if (result.v1 == @intFromEnum(errors.Error.E_PERM)) {

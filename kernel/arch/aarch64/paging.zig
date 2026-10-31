@@ -425,7 +425,7 @@ pub fn mapPage(
             //
             // That is a silent corruption whose fault surfaces arbitrarily
             // later and somewhere else, as a wild address. It cannot fire
-            // while every EC runs on one core, which is what `affinity = 0`
+            // while every thread runs on one core, which is what `affinity = 0`
             // was doing to the entire test suite until `-Dspread_cores`
             // (stygia-yxj), and it is worst on hardware where four cores
             // are genuinely simultaneous.

@@ -10,12 +10,12 @@
 //   domain whose `restart_policy_ceiling.port_restart_max = 0`. The
 //   ceiling is fixed on the calling domain's self-handle field1 at
 //   `create_capability_domain` time and cannot be lowered post-hoc on
-//   the test EC's own self-handle. Reaching a domain with that ceiling
+//   the test thread's own self-handle. Reaching a domain with that ceiling
 //   from inside this test would mean calling `create_capability_domain`
 //   with a reduced `ceilings_outer`, staging a separate ELF (or this
 //   ELF re-entered in a different mode) into a fresh page frame, and
 //   plumbing the grandchild's result back through a port — essentially
-//   recreating the runner. The runner provisions the test EC's domain
+//   recreating the runner. The runner provisions the test thread's domain
 //   with `port_restart_max = 1` (see `runner/primary.zig` ceilings_outer
 //   = 0x...01FE_FFFF), so `create_port(restart_policy=1)` from this
 //   domain is expected to succeed, not fail.
@@ -29,7 +29,7 @@
 //   construction to land (same blocker as revoke_03/04/06).
 //
 // Strategy
-//   The test EC's domain has `port_restart_max = 1` per the runner. Mint
+//   The test thread's domain has `port_restart_max = 1` per the runner. Mint
 //   a port with `caps.restart_policy = 1` plus `bind` so the handle is
 //   well-formed (port caps use bitwise subset against `port_ceiling`,
 //   which the runner sets to xfer|recv|bind = 0x1C; restart_policy lives

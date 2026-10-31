@@ -245,7 +245,7 @@ pub const ESR_EL2_ISS_MASK: u64 = (1 << 25) - 1; // bits [24:0]
 
 /// Exception class encodings, ARM ARM K.a §D23.2.41 Table D23-2.
 /// Only the values we explicitly handle are listed. Anything else
-/// surfaces as `unknown_ec` and is forwarded to the VMM.
+/// surfaces as `unknown_thread` and is forwarded to the VMM.
 pub const EC = enum(u6) {
     /// Unknown reason. Indicates a misconfigured trap.
     unknown = 0x00,

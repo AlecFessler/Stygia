@@ -27,7 +27,7 @@
 //     - pages != 0 (test 05): use pages = 1.
 //   With caps.dma = 1 set, the kernel must validate [5]. The child
 //   capability domain's table is populated by the kernel at
-//   create_capability_domain time — slot 0 self, slot 1 initial EC,
+//   create_capability_domain time — slot 0 self, slot 1 initial thread,
 //   slot 2 self-IDC, slot 3+ passed_handles (only the result port at
 //   slot 3 here). Slot 4095 (the maximum 12-bit handle id) is
 //   guaranteed unminted, so it cannot be a valid device_region handle.

@@ -223,7 +223,7 @@ pub fn main(cap_table_base: u64) void {
         0, // [2] ceilings_inner: all subset of any caller value
         0, // [3] ceilings_outer: all subset of any caller value
         pf_handle, // [4] elf_page_frame
-        0, // [5] initial_ec_affinity: any-core
+        0, // [5] initial_thread_affinity: any-core
         &.{}, // [6+] passed_handles: none
     );
     if (result.v1 != @intFromEnum(errors.Error.E_INVAL)) {

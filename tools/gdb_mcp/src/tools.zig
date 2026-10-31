@@ -965,7 +965,7 @@ pub const Registry = struct {
             return;
         };
         const field = argString(args, "field") orelse {
-            try out.appendSlice(al, "error: missing required arg `field` (dotted path like `current_ec` or `run_queue.head`)\n");
+            try out.appendSlice(al, "error: missing required arg `field` (dotted path like `current_thread` or `run_queue.head`)\n");
             return;
         };
         const result = (try self.resolveFieldPath(al, ty, field, out)) orelse return;

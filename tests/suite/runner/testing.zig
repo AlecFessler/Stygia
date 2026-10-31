@@ -3,10 +3,10 @@
 // Each test ELF is spawned by the primary as its own capability domain
 // with the result port at `SLOT_FIRST_PASSED`. A test reports its
 // outcome by calling `pass()` or `fail(id)`, which suspends the
-// initial EC on the port with the result encoding loaded into vregs
+// initial thread on the port with the result encoding loaded into vregs
 // 3 (result_code), 4 (assertion_id), and 5 (test tag — build-time
 // stable identity used by the runner to attribute the result to a
-// specific manifest entry). The kernel snapshots the suspended EC's
+// specific manifest entry). The kernel snapshots the suspended thread's
 // GPRs as part of §[event_state]; the primary recv's, reads vregs
 // 3-5, records into a tag-indexed table, and replies.
 
@@ -38,7 +38,7 @@ pub fn report(result_code: u64, assertion_id: u64) void {
     // still exercises the no-attachment fast-suspend ABI.
     markReportEntered(result_code, assertion_id);
     syscall.issueRawDiscard(0, .{
-        .v1 = caps.SLOT_INITIAL_EC,
+        .v1 = caps.SLOT_INITIAL_THREAD,
         .v2 = caps.SLOT_FIRST_PASSED,
         .v3 = result_code,
         .v4 = assertion_id,
@@ -63,9 +63,9 @@ pub fn isHandleError(v: u64) bool {
     return v > 0 and v < 16;
 }
 
-// A no-op EC entry. Tests that need an EC handle but don't care about
-// what the EC executes pass `&dummyEntry` as the entry argument to
-// `create_execution_context`. The EC will halt forever; the test EC
+// A no-op thread entry. Tests that need an thread handle but don't care about
+// what the thread executes pass `&dummyEntry` as the entry argument to
+// `create_thread`. The thread will halt forever; the test thread
 // reads/restricts/etc. the handle without interference.
 pub fn dummyEntry() noreturn {
     while (true) {
@@ -77,7 +77,7 @@ pub fn dummyEntry() noreturn {
     }
 }
 
-// Read the calling EC's currently-dispatched logical core id. On x86
+// Read the calling thread's currently-dispatched logical core id. On x86
 // this comes from RDPID (IA32_TSC_AUX MSR), which the kernel primes at
 // `apic.writeTscAuxCoreId` with the per-core index, NOT the raw APIC
 // id. On aarch64 it comes from MPIDR_EL1.Aff0 (single-cluster topology

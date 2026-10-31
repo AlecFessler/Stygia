@@ -52,7 +52,7 @@ pub fn endOfInterrupt(irq_line: u32) void {
 /// the IRQ epilogue, so on x86 the in-service sched vector (0xFE) would
 /// otherwise never be EOI'd — and because 0xFE outranks both the wake
 /// IPI and tlb_shootdown (0xFD) vectors, a core that parks in that
-/// state goes deaf to all of them: stranded-RDY-EC hangs and shootdown
+/// state goes deaf to all of them: stranded-RDY-thread hangs and shootdown
 /// initiators spinning forever on a missing ack. LAPIC EOI with an
 /// empty ISR is a no-op (every syscall-path `interrupts.switchTo`
 /// already issues one), so calling this from a non-IRQ yieldTo is safe.

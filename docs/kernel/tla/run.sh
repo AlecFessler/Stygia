@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Reproduces every TLC check for the EC-lifecycle model (systems.md rev 17).
+# Reproduces every TLC check for the thread-lifecycle model (systems.md rev 17).
 #   ./run.sh                 gates + probes + safety + the cheap liveness set
-#   RUN_XLARGE=1 ./run.sh    also the 3-core/4-EC safety run
+#   RUN_XLARGE=1 ./run.sh    also the 3-core/4-thread safety run
 #   RUN_SLOW=1   ./run.sh    also the extended/manual liveness rows
 #
 # Exit status: 0 iff every configured run is clean AND every gate
@@ -120,120 +120,120 @@ expect_unconverged() {
 }
 
 echo "== syntax =="
-if java -cp "$JAR" tla2sany.SANY ECLifecycle.tla > out/sany.log 2>&1 \
+if java -cp "$JAR" tla2sany.SANY ThreadLifecycle.tla > out/sany.log 2>&1 \
    && java -cp "$JAR" tla2sany.SANY ECProbes.tla >> out/sany.log 2>&1; then
   echo "PASS  sany"
 else echo "FAIL  sany (see out/sany.log)"; fail=1; fi
 
 echo "== falsification gates and stale-gate closures =="
 # rev-3 machine (PENDED=FALSE, PIN_GATE=FALSE)
-expect_violation x1 ECLifecycle.tla "Invariant InvS4Holder is violated" \
-  -deadlock -config ECLifecycle_rev3_x1.cfg
-expect_violation x2 ECLifecycle.tla "Deadlock reached" \
-  -config ECLifecycle_rev3_x2.cfg
-expect_violation x3 ECLifecycle.tla "Invariant InvNoLostOneShot is violated" \
-  -deadlock -config ECLifecycle_rev3_x3.cfg
+expect_violation x1 ThreadLifecycle.tla "Invariant InvS4Holder is violated" \
+  -deadlock -config ThreadLifecycle_rev3_x1.cfg
+expect_violation x2 ThreadLifecycle.tla "Deadlock reached" \
+  -config ThreadLifecycle_rev3_x2.cfg
+expect_violation x3 ThreadLifecycle.tla "Invariant InvNoLostOneShot is violated" \
+  -deadlock -config ThreadLifecycle_rev3_x3.cfg
 # rev-4 F1, don't-wait reading. With normative target claim pins,
 # RetireEnabled's pin drain now prevents the old pending-claim UAF even
 # when the retired hop arm does not wait on payload_done.
-expect_pass f1a ECLifecycle.tla -deadlock -config ECLifecycle_rev4_f1a.cfg
+expect_pass f1a ThreadLifecycle.tla -deadlock -config ThreadLifecycle_rev4_f1a.cfg
 # rev-4 F1, always-wait reading of the hop-side iff.
-expect_violation f1b ECLifecycle.tla "Deadlock reached" \
-  -config ECLifecycle_rev4_f1b.cfg
+expect_violation f1b ThreadLifecycle.tla "Deadlock reached" \
+  -config ThreadLifecycle_rev4_f1b.cfg
 # rev-5 literal unwind ordering (N4)
-expect_violation n4 ECLifecycle.tla "Invariant InvS1 is violated" \
-  -deadlock -config ECLifecycle_n4.cfg
+expect_violation n4 ThreadLifecycle.tla "Invariant InvS1 is violated" \
+  -deadlock -config ThreadLifecycle_n4.cfg
 # publish-claimable-before-hop (edge 4)
-expect_violation e4 ECLifecycle.tla "Invariant InvS3 is violated" \
-  -deadlock -config ECLifecycle_e4.cfg
+expect_violation e4 ThreadLifecycle.tla "Invariant InvS3 is violated" \
+  -deadlock -config ThreadLifecycle_e4.cfg
 # round-7 C1: lock-then-bump re-opens F3
-expect_violation pinord ECLifecycle.tla "Invariant InvNoPreemptedLockHolder is violated" \
-  -deadlock -config ECLifecycle_pinord.cfg
+expect_violation pinord ThreadLifecycle.tla "Invariant InvNoPreemptedLockHolder is violated" \
+  -deadlock -config ThreadLifecycle_pinord.cfg
 # round-7 C3: suspend cycles
-expect_violation crcyc ECLifecycle.tla "Invariant InvNoSuspendCycle2 is violated" \
-  -deadlock -config ECLifecycle_crcyc.cfg
-expect_violation cr3 ECLifecycle.tla "Invariant InvNoSuspendCycle3 is violated" \
-  -deadlock -config ECLifecycle_cr3.cfg
+expect_violation crcyc ThreadLifecycle.tla "Invariant InvNoSuspendCycle2 is violated" \
+  -deadlock -config ThreadLifecycle_crcyc.cfg
+expect_violation cr3 ThreadLifecycle.tla "Invariant InvNoSuspendCycle3 is violated" \
+  -deadlock -config ThreadLifecycle_cr3.cfg
 # LiveSuspender calibration: no rejection, no N6 assumptions, no stale/bad
 # port owner-failure branch. dpin+dres made the old SpecFairN3/drop-bearing
 # temporal phase non-calibrating; the N6 mutual-suspend lasso still fires
 # at the focused SpecSus scope.
-expect_violation crfals ECLifecycle.tla "Temporal properties were violated" \
-  -lncheck final -config ECLifecycle_crfals.cfg
+expect_violation crfals ThreadLifecycle.tla "Temporal properties were violated" \
+  -lncheck final -config ThreadLifecycle_crfals.cfg
 # round-8 C-1: mutual terminate. THIS is the gate that was missing.
-expect_violation mterm ECLifecycle.tla "Deadlock reached" \
-  -config ECLifecycle_mterm.cfg
+expect_violation mterm ThreadLifecycle.tla "Deadlock reached" \
+  -config ThreadLifecycle_mterm.cfg
 # round-10 C-D: the directive word is an ABA once `dropped` is deleted.
 # DIR_OWNED=FALSE is revision 10's value-based break; a suspender ends up
 # looping on, and disarming, a third party's directive.
-expect_violation diraba ECLifecycle.tla "Invariant InvNoForeignDisarm is violated" \
-  -deadlock -config ECLifecycle_diraba.cfg
+expect_violation diraba ThreadLifecycle.tla "Invariant InvNoForeignDisarm is violated" \
+  -deadlock -config ThreadLifecycle_diraba.cfg
 # round-11 C-1 stale-gate closure: before dpin, finalize's own `slot zero`
 # could destroy F6's `dead` marker and make the W5 break return SUCCESS for
 # a TERMINATED target. With dpin, the running-target directive waiter pins
 # the target through ack/return, so finalize/reuse is blocked and this stale
 # falsifier is expected clean.
-expect_pass dirf6 ECLifecycle.tla -deadlock -config ECLifecycle_dirf6.cfg
+expect_pass dirf6 ThreadLifecycle.tla -deadlock -config ThreadLifecycle_dirf6.cfg
 
 echo "== reachability probes: the violation IS the pass =="
 expect_violation pr1 ECProbes.tla "Invariant ProbeNoRetiredRvSender is violated" \
-  -deadlock -config ECLifecycle_pr1.cfg
+  -deadlock -config ThreadLifecycle_pr1.cfg
 expect_violation pr2 ECProbes.tla "Invariant ProbeNoRvPendedReceiver is violated" \
-  -deadlock -config ECLifecycle_pr2.cfg
+  -deadlock -config ThreadLifecycle_pr2.cfg
 expect_violation pr3 ECProbes.tla "Invariant ProbeNoRetireFromPended is violated" \
-  -deadlock -config ECLifecycle_pr3.cfg
+  -deadlock -config ThreadLifecycle_pr3.cfg
 # round-10 M-D: prove t1full's LiveTerm PASS is not vacuous — the
 # W3 -> W5 -> W3 configuration must actually be REACHED at that scope.
 expect_violation pr4 ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
-  -deadlock -config ECLifecycle_pr4.cfg
+  -deadlock -config ThreadLifecycle_pr4.cfg
 # round-11 M-3: InvNoForeignDisarm is analytically vacuous under
 # DIR_OWNED = TRUE (the disarm guard forces dsrc = u). This probe is the
 # other half of the honesty: it proves the drop/disarm path is exercised.
 expect_violation pr5 ECProbes.tla "Invariant ProbeNoDisarm is violated" \
-  -deadlock -config ECLifecycle_pr5.cfg
+  -deadlock -config ThreadLifecycle_pr5.cfg
 
 echo "== current safety, TLC deadlock detection ON =="
-expect_pass mtermfix  ECLifecycle.tla -config ECLifecycle_mtermfix.cfg
+expect_pass mtermfix  ThreadLifecycle.tla -config ThreadLifecycle_mtermfix.cfg
 # NOT RUN, and the reason is round-12 M-3's own finding: under
 # DIR_OWNED = TRUE the disarm guard forces dsrc = u, so InvNoForeignDisarm's
 # update term is identically FALSE and the invariant holds A PRIORI. A clean
 # dirabafix run therefore establishes TypeOK and deadlock-freedom at that
 # scope and says NOTHING about the ownership mechanism -- the falsifier
 # `diraba` is the whole of that gate's content, which is exactly what M-3
-# said. It is also the one config that cannot complete: 3 ECs x the
+# said. It is also the one config that cannot complete: 3 Threads x the
 # directive machine x round-11 C-1's five new fields runs past 117M
 # distinct states. Kept as a config; not in the battery, because a run that
 # proves nothing must not be what stops the battery finishing.
-#   expect_pass dirabafix ECLifecycle.tla -config ECLifecycle_dirabafix.cfg
+#   expect_pass dirabafix ThreadLifecycle.tla -config ThreadLifecycle_dirabafix.cfg
 # round-12 M-1: NO -deadlock here. With it the fix-check cannot show the
 # two-part disambiguator introduces no wedge, only that the invariant
 # holds -- and the wedge is the whole point of a fix-check.
-expect_pass dirf6fix  ECLifecycle.tla -config ECLifecycle_dirf6fix.cfg
-expect_violation vcpu_nocancel ECLifecycle.tla "Invariant InvRetiredVcpuCancelled is violated" \
-  -deadlock -config ECLifecycle_vcpu_nocancel.cfg
-expect_pass vcpu_cancel ECLifecycle.tla -config ECLifecycle_vcpu_cancel.cfg
-expect_pass small    ECLifecycle.tla -config ECLifecycle_small.cfg
-expect_pass large    ECLifecycle.tla -config ECLifecycle_large.cfg
-expect_pass cr3self  ECLifecycle.tla -deadlock -config ECLifecycle_cr3self.cfg
-expect_pass medium_nodir ECLifecycle.tla -config ECLifecycle_medium_nodir.cfg
+expect_pass dirf6fix  ThreadLifecycle.tla -config ThreadLifecycle_dirf6fix.cfg
+expect_violation vcpu_nocancel ThreadLifecycle.tla "Invariant InvRetiredVcpuCancelled is violated" \
+  -deadlock -config ThreadLifecycle_vcpu_nocancel.cfg
+expect_pass vcpu_cancel ThreadLifecycle.tla -config ThreadLifecycle_vcpu_cancel.cfg
+expect_pass small    ThreadLifecycle.tla -config ThreadLifecycle_small.cfg
+expect_pass large    ThreadLifecycle.tla -config ThreadLifecycle_large.cfg
+expect_pass cr3self  ThreadLifecycle.tla -deadlock -config ThreadLifecycle_cr3self.cfg
+expect_pass medium_nodir ThreadLifecycle.tla -config ThreadLifecycle_medium_nodir.cfg
 if [ "${RUN_XLARGE:-0}" = "1" ]; then
-  expect_pass xlarge ECLifecycle.tla -config ECLifecycle_xlarge.cfg
+  expect_pass xlarge ThreadLifecycle.tla -config ThreadLifecycle_xlarge.cfg
 fi
 
 echo "== current liveness (all carry -lncheck final) =="
 # LiveTerm ladder under SpecTrm, its per-property MINIMAL fairness set.
-expect_pass t1min ECLifecycle.tla -lncheck final -config ECLifecycle_t1min.cfg
-expect_pass t1s   ECLifecycle.tla -lncheck final -config ECLifecycle_t1s.cfg
-expect_pass t1r   ECLifecycle.tla -lncheck final -config ECLifecycle_t1r.cfg
+expect_pass t1min ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1min.cfg
+expect_pass t1s   ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1s.cfg
+expect_pass t1r   ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1r.cfg
 # LADDER RUNG 3d-min - LiveTerm WITH the directive. PAIRED with pr4d_min, which
 # MUST fire: without it this PASS is vacuous over the W3 -> W5 -> W3 shape
 # the rung exists to cover. Keep these two adjacent and edit their
 # CONSTANTS together (both .cfg headers say so).
-expect_pass t1d_min ECLifecycle.tla -lncheck final -config ECLifecycle_t1d_min.cfg
+expect_pass t1d_min ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1d_min.cfg
 expect_violation pr4d_min ECProbes.tla "Invariant ProbeNoTermSuspendCycle is violated" \
-  -deadlock -config ECLifecycle_pr4d_min.cfg
+  -deadlock -config ThreadLifecycle_pr4d_min.cfg
 # LiveSuspender under SpecSus (neither N6 assumption), paired with crfals.
-expect_pass cr1minself ECLifecycle.tla -lncheck final -config ECLifecycle_cr1minself.cfg
+expect_pass cr1minself ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_cr1minself.cfg
 if [ "${RUN_SLOW:-0}" = "1" ]; then
   # Full directive 2c x 3e medium is preserved on disk as the extended
   # aggregate target, but it is NOT a slow-battery verdict: after dpin/dres
@@ -246,20 +246,20 @@ if [ "${RUN_SLOW:-0}" = "1" ]; then
   # battery deliberately: a config that cannot converge at HEAD scope is a
   # real finding about the model's checkable boundary, and that boundary is
   # what a future revision needs to know. Its directive coverage moved to
-  # t1d_min. See the SCOPE NOTE in ECLifecycle_t1full.cfg.
+  # t1d_min. See the SCOPE NOTE in ThreadLifecycle_t1full.cfg.
   # The 8131498 is the DRIFT ALARM's recorded figure - if the graph moves
   # outside 2x of it, this row fails and demands a re-measurement rather
   # than quietly continuing to "pass" about a different machine.
-  expect_unconverged t1full 8131498 ECLifecycle.tla -lncheck final -config ECLifecycle_t1full.cfg
+  expect_unconverged t1full 8131498 ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1full.cfg
   # Full directive-bearing LiveTerm row. Preserved as extended/manual
   # measured-unconverged evidence after the current dpin/dres/failed-result
   # graph reached final temporal checking and timed out at 1,548,068
   # distinct / 3,096,136 product states. Its default coverage moved to the
   # bounded t1d_min/pr4d_min pair above; do not cite full t1d as a PASS.
-  expect_unconverged t1d 1548068 ECLifecycle.tla -lncheck final -config ECLifecycle_t1d.cfg
-  expect_pass cr1fullself ECLifecycle.tla -lncheck final -config ECLifecycle_cr1fullself.cfg
-  expect_pass liveness_a  ECLifecycle.tla -lncheck final -config ECLifecycle_liveness_a.cfg
-  expect_pass liveness_b  ECLifecycle.tla -lncheck final -config ECLifecycle_liveness_b.cfg
+  expect_unconverged t1d 1548068 ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_t1d.cfg
+  expect_pass cr1fullself ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_cr1fullself.cfg
+  expect_pass liveness_a  ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_liveness_a.cfg
+  expect_pass liveness_b  ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_liveness_b.cfg
 fi
 # NOT RUN and deliberately so: q1-q7/q7d (2c x 3e per-property liveness).
 # q7 did not converge in 90 minutes of pure temporal checking; see the

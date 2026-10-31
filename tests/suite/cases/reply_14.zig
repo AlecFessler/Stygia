@@ -21,7 +21,7 @@
 //
 //   Producing a reply handle with `xfer` follows the established
 //   sibling pipeline (reply_transfer_02/05/06): mint a port with
-//   `xfer | recv | bind`, mint a worker EC W as a suspended sender,
+//   `xfer | recv | bind`, mint a worker thread W as a suspended sender,
 //   then `recv` to dequeue. Per §[reply] the kernel sets `xfer = 1` on
 //   the minted reply handle iff the recv'ing port had the `xfer` cap.
 //
@@ -45,11 +45,11 @@
 // Action
 //   1. createPort(caps = {xfer, recv, bind}) — must succeed; xfer
 //      propagates into the reply handle so test 02 doesn't fire.
-//   2. createExecutionContext(target = self,
+//   2. createThread(target = self,
 //        caps = {susp, term, restart_policy = 0}) — must succeed; the
 //      omitted `move` cap on W is the assertion trip wire.
 //   3. suspend(W, port) — must return OK; queues W as a suspended
-//      sender on the port. Non-blocking on the test EC because
+//      sender on the port. Non-blocking on the test thread because
 //      [1] != self per §[suspend].
 //   4. recv(port) — must return OK; the syscall word carries the
 //      reply_handle_id in bits 32-43 per §[recv].
@@ -63,7 +63,7 @@
 //
 // Assertions
 //   1: createPort failed (precondition).
-//   2: createExecutionContext failed (precondition).
+//   2: createThread failed (precondition).
 //   3: suspend(W, port) did not return OK (precondition).
 //   4: recv(port) did not return OK (precondition).
 //   5: reply_transfer returned something other than E_PERM (the spec
@@ -157,18 +157,18 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: mint W. susp lets the test queue W onto the port via
     // suspend (§[suspend] [1] cap). term is cleanup hygiene only.
     // restart_policy = 0 keeps the call inside the runner-granted
-    // ec_inner_ceiling. `move` is intentionally omitted — that is
+    // thread_inner_ceiling. `move` is intentionally omitted — that is
     // exactly the bit reply_transfer test 07 looks for when the pair
     // entry below sets `move = 1`.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&localDummyEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -208,7 +208,7 @@ pub fn main(cap_table_base: u64) void {
     // kernel into reply_transfer test 07 — the move = 1 source-cap
     // check — which must surface E_PERM because W does not carry the
     // `move` cap.
-    const entry_caps = caps.EcCap{
+    const entry_caps = caps.ThreadCap{
         .susp = true,
     };
     const pair = caps.PairEntry{

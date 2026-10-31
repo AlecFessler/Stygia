@@ -7,7 +7,7 @@ const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 const vm_hw = stygia.arch.x64.vm;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const Ioapic = stygia.arch.x64.hv.ioapic.Ioapic;
 const Lapic = stygia.arch.x64.hv.lapic.Lapic;
 const MemoryPerms = stygia.memory.address.MemoryPerms;
@@ -339,18 +339,18 @@ pub fn vmPolicyFor(vm: *VirtualMachine) ?*const vm_hw.VmPolicy {
 /// if `guest_phys` is outside both ranges or the instruction can't be
 /// decoded — the exit then falls through to the VMM as a normal
 /// `ept_violation` delivery.
-pub fn tryHandleMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
+pub fn tryHandleMmio(vm: *VirtualMachine, vcpu_thread: *Thread, guest_phys: u64) bool {
     if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
-        return handleLapicMmio(vm, vcpu_ec, guest_phys);
+        return handleLapicMmio(vm, vcpu_thread, guest_phys);
     }
     if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
-        return handleIoapicMmio(vm, vcpu_ec, guest_phys);
+        return handleIoapicMmio(vm, vcpu_thread, guest_phys);
     }
     return false;
 }
 
-fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
-    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
+fn handleLapicMmio(vm: *VirtualMachine, vcpu_thread: *Thread, guest_phys: u64) bool {
+    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_thread) orelse return false;
     const gs = &arch_state.guest_state;
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
@@ -364,8 +364,8 @@ fn handleLapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: 
     return true;
 }
 
-fn handleIoapicMmio(vm: *VirtualMachine, vcpu_ec: *ExecutionContext, guest_phys: u64) bool {
-    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_ec) orelse return false;
+fn handleIoapicMmio(vm: *VirtualMachine, vcpu_thread: *Thread, guest_phys: u64) bool {
+    const arch_state = stygia.arch.x64.hv.vcpu.archStateOf(vcpu_thread) orelse return false;
     const gs = &arch_state.guest_state;
     const op = mmio_decode.decode(vm, gs) orelse return false;
     const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);

@@ -64,7 +64,7 @@ pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-/// Write event-state vreg 5 on a receiving EC — companion to
+/// Write event-state vreg 5 on a receiving thread — companion to
 /// `getEventVreg5`.
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
@@ -74,11 +74,11 @@ pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-/// Read the saved instruction pointer from a suspending EC — used to
+/// Read the saved instruction pointer from a suspending thread — used to
 /// snapshot the sender's RIP/PC at suspend time for delivery as Spec
 /// §[event_state] vreg 14 (x86-64 `[rsp+8]`) / vreg 32 (aarch64
-/// `[sp+8]`) at recv time. For an EC that has never executed this
-/// returns the entry point set up by `prepareEcContext`; for one
+/// `[sp+8]`) at recv time. For an thread that has never executed this
+/// returns the entry point set up by `prepareThreadContext`; for one
 /// suspended mid-execution it returns the saved iret-frame RIP/PC.
 pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
@@ -90,7 +90,7 @@ pub fn getEventRip(ctx: *const ArchCpuContext) u64 {
 
 /// Write the saved instruction pointer on a resumed sender's frame.
 /// Used by reply_transfer §[reply] test 14 to commit a write-cap
-/// receiver's vreg 14 modification onto the suspended EC's iret frame
+/// receiver's vreg 14 modification onto the suspended thread's iret frame
 /// before `resumeFromReply` re-enqueues it.
 pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
@@ -101,7 +101,7 @@ pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
 }
 
 /// Read the event-state vreg 14 (x86-64 `[user_rsp + 8]`) / vreg 32
-/// (aarch64 `[user_sp + 8]`) slot on the receiving EC — used by
+/// (aarch64 `[user_sp + 8]`) slot on the receiving thread — used by
 /// reply_transfer §[reply] test 14 to harvest a receiver-side RIP
 /// modification and commit it onto the resumed sender's saved frame.
 /// Companion to `writeUserVreg14`; the same CR3/TTBR0 contract
@@ -117,8 +117,8 @@ pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
 /// Copy the §[event_state] GPR-backed vregs from `src` (the receiver's
 /// in-flight syscall frame) to `dst` (the suspended sender's saved
 /// frame). Used by `reply` (Spec §[reply] test 05) to commit receiver-
-/// side vreg writes back to the resumed EC's user state when the
-/// originating EC handle had the `write` cap. x86-64: vregs 1..13 =
+/// side vreg writes back to the resumed thread's user state when the
+/// originating thread handle had the `write` cap. x86-64: vregs 1..13 =
 /// rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15. aarch64: vregs
 /// 1..31 = x0..x30.
 pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
@@ -129,10 +129,10 @@ pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void
     }
 }
 
-/// Read the §[event_state] GPR-backed vregs 1..13 from a suspending EC
+/// Read the §[event_state] GPR-backed vregs 1..13 from a suspending thread
 /// in canonical vreg order. Snapshotted in `suspendOnPort` and
 /// re-applied on the receiver in `port.deliverEvent` when the
-/// originating EC handle carries the `read` cap (Spec §[suspend] test
+/// originating thread handle carries the `read` cap (Spec §[suspend] test
 /// 10). x86-64 ordering matches the vreg → GPR table:
 /// rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10, r12, r13, r14, r15.
 /// aarch64 ordering: x0..x12 (vregs 1..13).
@@ -145,7 +145,7 @@ pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
 }
 
 /// Write the §[event_state] GPR-backed vregs 1..13 onto a receiving
-/// EC's frame in canonical vreg order. Companion to
+/// thread's frame in canonical vreg order. Companion to
 /// `getEventStateGprs`; used by `port.deliverEvent` to project the
 /// suspended sender's snapshotted GPR set onto the recv-side vregs
 /// when the originating handle carries the `read` cap.

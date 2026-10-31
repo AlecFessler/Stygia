@@ -4,7 +4,7 @@
 //  the value supplied in [1]."
 //
 // Strategy
-//   The test ELF runs as the initial EC of a brand-new capability
+//   The test ELF runs as the initial thread of a brand-new capability
 //   domain that the runner (`runner/primary.zig`) created via
 //   `create_capability_domain`. From this seat the test IS "the new
 //   domain": its own self-handle at slot 0 of its read-only cap table
@@ -13,7 +13,7 @@
 //
 //   Per §[capability_domain] Self handle, field0 lays idc_rx at bits
 //   32-39:
-//     bits  0-7   ec_inner_ceiling
+//     bits  0-7   thread_inner_ceiling
 //     bits  8-23  vmar_inner_ceiling
 //     bits 24-31  cridc_ceiling
 //     bits 32-39  idc_rx

@@ -6,40 +6,40 @@
 //
 // Strategy
 //   The assertion has two halves and both can be witnessed from a
-//   single test EC paired with a worker EC in the same capability
+//   single test thread paired with a worker thread in the same capability
 //   domain:
 //     (a) recv with a finite, nonzero timeout returns success — not
 //         E_TIMEOUT — when a sender is queued before the deadline.
 //     (b) After the original deadline elapses, no spurious E_TIMEOUT
 //         signal surfaces. The kernel must have cancelled the armed
 //         deadline when recv consumed the queued sender; if it had
-//         not, the timer would later fire on a recv slot the EC has
+//         not, the timer would later fire on a recv slot the thread has
 //         already returned from, producing either a stale E_TIMEOUT
 //         poked into vreg 1, an unsolicited resume, or a kernel-side
-//         crash. The test EC stays runnable past the deadline by
+//         crash. The test thread stays runnable past the deadline by
 //         busy-polling time_monotonic and then issuing a follow-up
 //         syscall whose return value verifies vreg 1 carries that
 //         syscall's result rather than a stale E_TIMEOUT.
 //
-//   Setup mirrors recv_05 / recv_16: the test EC mints a port with
-//   caps={bind, recv}, spawns a worker EC in the same domain, and
+//   Setup mirrors recv_05 / recv_16: the test thread mints a port with
+//   caps={bind, recv}, spawns a worker thread in the same domain, and
 //   yields to it so the worker reaches its blocking suspend before
-//   the test EC calls recv. The worker calls suspend(self, port) so
-//   the queued event is a suspended-EC sender the test EC can recv.
+//   the test thread calls recv. The worker calls suspend(self, port) so
+//   the queued event is a suspended-thread sender the test thread can recv.
 //
-//   For witness (a) the test EC calls recv(port, timeout_ns =
+//   For witness (a) the test thread calls recv(port, timeout_ns =
 //   100_000_000) — 100ms. The worker's queued suspend ensures the
 //   recv returns with vreg 1 = OK well before the deadline. The
 //   timeout is intentionally short enough that, were the deadline
 //   not cancelled, it would elapse during the witness-(b) wait
 //   window below.
 //
-//   For witness (b) the test EC busy-polls time_monotonic until at
+//   For witness (b) the test thread busy-polls time_monotonic until at
 //   least 4 * timeout_ns has elapsed (400ms — well past the original
 //   100ms deadline), then issues `time_monotonic` once more. A
 //   well-behaved kernel returns the current monotonic ns in vreg 1.
 //   A buggy kernel that left the deadline armed and let it fire on
-//   the test EC's now-returned recv slot could plausibly clobber
+//   the test thread's now-returned recv slot could plausibly clobber
 //   vreg 1 with E_TIMEOUT (15) on the next syscall return path; we
 //   guard against that exact corruption by checking the post-wait
 //   time_monotonic return is not in the error-code range 1..15.
@@ -51,27 +51,27 @@
 //     - test 02 (E_PERM no `recv`): port_caps.recv = true.
 //     - test 03 (E_INVAL on reserved bits): the libz wrapper takes
 //       u12 and zero-extends.
-//     - test 04 (E_CLOSED no bind/route/queue): the test EC holds
+//     - test 04 (E_CLOSED no bind/route/queue): the test thread holds
 //       the port handle with the bind cap and the worker queues a
-//       suspension event before the test EC recvs.
+//       suspension event before the test thread recvs.
 //     - test 05 (E_CLOSED on blocked recv when bind drops): the
-//       test EC never deletes the port handle.
+//       test thread never deletes the port handle.
 //     - test 06 (E_FULL): the test domain has plenty of free slots
 //       for the reply handle plus zero attached handles.
 //
-//   create_execution_context error paths neutralized for the worker
+//   create_thread error paths neutralized for the worker
 //   the same way recv_05 / recv_16 neutralize them (target = 0,
 //   stack_pages = 1, priority = 0, affinity = 0, caps subset of the
-//   runner's ec_inner_ceiling = 0xFF).
+//   runner's thread_inner_ceiling = 0xFF).
 //
 // Action
 //   1. create_port(caps = {bind, recv})           — must succeed.
-//   2. create_execution_context(target = self,
+//   2. create_thread(target = self,
 //        caps = {susp, term, restart_policy = 0},
 //        entry = &workerEntry, stack_pages = 1,
 //        affinity = 0)                             — must succeed.
 //   3. yield(worker) so it reaches its blocking suspend on the port
-//      before the test EC calls recv.
+//      before the test thread calls recv.
 //   4. recv(port_handle, timeout_ns = 100_000_000) — must return OK
 //      (a sender is queued well before the deadline).
 //   5. busy-poll time_monotonic until elapsed >= 4 * timeout_ns
@@ -81,7 +81,7 @@
 //
 // Assertions
 //   1: setup port creation failed (createPort returned an error).
-//   2: setup EC creation failed (createExecutionContext returned an
+//   2: setup thread creation failed (createThread returned an
 //      error).
 //   3: pre-recv yield to the worker did not return OK.
 //   4: recv did not return OK (witness-(a) failure: success path
@@ -99,10 +99,10 @@ const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
 
-// Process-global side channels shared across the test EC and the
-// worker EC — both run in the same capability domain so they share
+// Process-global side channels shared across the test thread and the
+// worker thread — both run in the same capability domain so they share
 // the address space and the handle table.
-//   - worker_self_slot: slot id of the worker's own EC handle, used
+//   - worker_self_slot: slot id of the worker's own thread handle, used
 //     by suspend(self, port).
 //   - worker_port_slot: slot id of the test-minted port; the worker
 //     suspends onto this port.
@@ -110,20 +110,20 @@ var worker_self_slot: u12 = 0;
 var worker_port_slot: u12 = 0;
 
 fn workerEntry() callconv(.c) noreturn {
-    // Both slot ids are published by the test EC before
-    // createExecutionContext returns, so the worker's first read
-    // sees them. No synchronisation needed: createExecutionContext
+    // Both slot ids are published by the test thread before
+    // createThread returns, so the worker's first read
+    // sees them. No synchronisation needed: createThread
     // happens-before the worker's first instruction.
     const self_slot = worker_self_slot;
     const port_slot = worker_port_slot;
     // suspend(self, port) queues the worker as a suspended sender on
     // the port. The libz wrapper is the safe path with N = 0.
-    _ = syscall.suspendEc(self_slot, port_slot, &.{});
+    _ = syscall.suspendThread(self_slot, port_slot, &.{});
     // The worker is left waiting indefinitely after suspend resolves.
-    // The test EC never replies on the minted reply handle and the
+    // The test thread never replies on the minted reply handle and the
     // capability domain is torn down at test exit, so the worker is
     // not expected to observe a particular resolution — it just must
-    // not race the test EC into surfacing an unrelated event.
+    // not race the test thread into surfacing an unrelated event.
     while (true) {
         switch (builtin.cpu.arch) {
             .x86_64 => asm volatile ("hlt"),
@@ -148,20 +148,20 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
     worker_port_slot = port_handle;
 
-    // Step 2: mint the worker EC. susp lets the worker self-suspend
+    // Step 2: mint the worker thread. susp lets the worker self-suspend
     // onto the port; term is held for symmetry with sibling tests.
     // restart_policy = 0 (kill) keeps the request inside the runner's
-    // ec_inner_ceiling and prevents any restart fallback after this
+    // thread_inner_ceiling and prevents any restart fallback after this
     // test ends.
-    const w_caps = caps.EcCap{
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&workerEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1, // stack_pages
         0, // target = self (this domain)
@@ -176,11 +176,11 @@ pub fn main(cap_table_base: u64) void {
     worker_self_slot = w_handle;
 
     // Step 3: yield to the worker so it reaches its blocking suspend
-    // syscall before the test EC calls recv. On a uniprocessor this
+    // syscall before the test thread calls recv. On a uniprocessor this
     // serialises the path; on multi-core the worker may execute
     // concurrently and either ordering reaches the witness-(a) state
     // (worker queued on port by the time recv runs).
-    const y1 = syscall.yieldEc(w_target);
+    const y1 = syscall.yieldThread(w_target);
     if (y1.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;

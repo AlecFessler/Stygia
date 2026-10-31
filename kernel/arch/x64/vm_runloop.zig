@@ -18,7 +18,7 @@ const mmio_decode = stygia.arch.x64.mmio_decode;
 const timers = stygia.arch.x64.timers;
 const vm_hw = stygia.arch.x64.vm;
 
-const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
+const Thread = stygia.sched.thread.Thread;
 const GuestState = vm_hw.GuestState;
 const PAddr = stygia.memory.address.PAddr;
 const VirtualMachine = stygia.hv.virtual_machine.VirtualMachine;
@@ -32,10 +32,10 @@ pub const VmExitDelivery = struct {
     subcode: u8,
     payload: [3]u64,
     /// The owner-side acknowledgement of an arch vCPU cancel (stygia-8xl).
-    /// True means this vCPU EC was retired by another core while we were
+    /// True means this vCPU thread was retired by another core while we were
     /// executing guest code, so we left the run loop rather than exiting
     /// on a guest event. `subcode`/`payload` are meaningless in that case
-    /// and the caller must NOT deliver a vm_exit — the EC is dead. See
+    /// and the caller must NOT deliver a vm_exit — the thread is dead. See
     /// `enterGuest`'s cancel check for the full argument.
     cancelled: bool = false,
 };
@@ -55,15 +55,15 @@ const SUBCODE_SHUTDOWN: u8 = 10;
 const SUBCODE_TRIPLE: u8 = 11;
 const SUBCODE_UNKNOWN: u8 = 12;
 
-/// Enter the guest bound to `vcpu_ec` and return on the next VM exit.
+/// Enter the guest bound to `vcpu_thread` and return on the next VM exit.
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support hardware virt).
-pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
+pub fn enterGuest(vcpu_thread: *Thread) ?VmExitDelivery {
 
     if (!vm_hw.vmSupported()) return null;
 
     // Resolve the VM's per-vCPU state and the VM's control-state PAddr.
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return null;
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return null;
 
     // Defer real VMLAUNCH/VMRUN until the VMM has supplied initial
     // guest state via reply. Otherwise we would VM-enter with a zeroed
@@ -72,8 +72,8 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     // writeback is wired; once that lands, this guard flips on reply.
     if (!arch_state.started) return null;
 
-    const vm_ref = vcpu_ec.vm orelse return null;
-    // caller-pinned: the vCPU EC holds a SlabRef on its VM for its lifetime;
+    const vm_ref = vcpu_thread.vm orelse return null;
+    // caller-pinned: the vCPU thread holds a SlabRef on its VM for its lifetime;
     // the run loop is the only consumer that needs the live pointer.
     const vm_ptr = vm_ref.lock(@src()) catch return null;
     const ctrl_phys = ctrlPhysFor(vm_ptr);
@@ -94,7 +94,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
     while (true) {
         // ── Arch vCPU cancellation acknowledgement (stygia-8xl) ──────────
         //
-        // NEVER (RE-)ENTER THE GUEST ON A RETIRED EC. Another core can
+        // NEVER (RE-)ENTER THE GUEST ON A RETIRED thread. Another core can
         // retire this vCPU at any point — domain teardown does exactly
         // that — and it kicks us with a scheduler IPI. The kick works:
         // `CTRL1_INTERCEPT_INTR` is set, so the IPI forces a VM exit and
@@ -103,13 +103,13 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         //
         // What was missing is this check. Every arm of the switch below
         // either breaks out or loops back to `vmResume`, and none of them
-        // consulted the EC's lifecycle — so after the IPI was serviced we
+        // consulted the thread's lifecycle — so after the IPI was serviced we
         // went straight back into the guest. The owner core then sat in
-        // this loop forever holding a `retired` `current_ec`, while ready
-        // ECs queued behind it and the runner timed out waiting for
+        // this loop forever holding a `retired` `current_thread`, while ready
+        // Threads queued behind it and the runner timed out waiting for
         // results that no core was left to produce. That is the terminal
-        // signature in stygia-8xl: `current_ec ... state=RETD owner=N`
-        // with RDY ECs on the same core's run queue.
+        // signature in stygia-8xl: `current_thread ... state=RETD owner=N`
+        // with RDY Threads on the same core's run queue.
         //
         // Checking around `enterGuest` in the scheduler cannot fix this,
         // because `enterGuest` never RETURNS — which is why the earlier
@@ -117,14 +117,14 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
         //
         // This is `VcpuCancelExit` in the TLA lifecycle model: the arch
         // forces the exit, and only the owner-side acknowledgement moves
-        // the EC out of guest submode so the ordinary retired-current
+        // the thread out of guest submode so the ordinary retired-current
         // boundary → hop → finalize path (`dischargeOwnedParking`, which
         // the caller already invokes) can run. `BoundaryRetired` requires
         // host submode for exactly this reason.
         //
-        // Acquire load, and the EC is caller-pinned: it is this core's
-        // `current_ec` for the whole call, so the pointer stays live.
-        if (lifecycle.load(vcpu_ec) == .retired) {
+        // Acquire load, and the thread is caller-pinned: it is this core's
+        // `current_thread` for the whole call, so the pointer stays live.
+        if (lifecycle.load(vcpu_thread) == .retired) {
             return .{ .subcode = SUBCODE_UNKNOWN, .payload = .{ 0, 0, 0 }, .cancelled = true };
         }
 
@@ -191,7 +191,7 @@ pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
 
         switch (exit_info) {
             .ept_violation => |ept| {
-                if (!hv_vm.tryHandleMmio(vm_ptr, vcpu_ec, ept.guest_phys)) break;
+                if (!hv_vm.tryHandleMmio(vm_ptr, vcpu_thread, ept.guest_phys)) break;
                 // Handled inline — re-enter the guest immediately.
             },
             // §[vm_policy] CPUID lookup — keyed on (leaf, subleaf) per
@@ -306,7 +306,7 @@ fn storeU64(rsp: u64, off: u64, value: u64) void {
 }
 
 /// Plain-data snapshot of the receiver's §[vm_exit_state] vregs,
-/// captured outside the sender EC's `_gen_lock` so a fault on the
+/// captured outside the sender thread's `_gen_lock` so a fault on the
 /// SMAP-bracketed user-stack reads can't strand the lock bit.
 /// `applyReplyStateToVcpu` projects this snapshot onto the vCPU's
 /// GuestState under the sender lock.
@@ -377,7 +377,7 @@ const WIDE_VREG_END_OFF: u64 = VREG64_INTR_NMI_OFF + 8;
 /// Snapshot the receiver's §[vm_exit_state] vregs into a kernel-stack
 /// buffer. Reads receiver-side state only — kernel-saved iret frame for
 /// vregs 1..13 and the receiver's user stack (gated by SMAP STAC/CLAC)
-/// for vregs 14..73. Receiver MUST be the running EC on the current
+/// for vregs 14..73. Receiver MUST be the running thread on the current
 /// core (so CR3 already references the receiver's address space).
 ///
 /// Caller MUST only invoke this for vm_exit-typed replies (per the
@@ -386,7 +386,7 @@ const WIDE_VREG_END_OFF: u64 = VREG64_INTR_NMI_OFF + 8;
 /// vm_exit; if their stack reservation is too small the SMAP-bracketed
 /// reads fault and `memory.fault.handlePageFault` aborts the syscall —
 /// safe because we run BEFORE acquiring the sender's `_gen_lock`.
-pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
+pub fn snapshotReplyVregs(receiver: *Thread) ReplyVregSnapshot {
     var snap: ReplyVregSnapshot = .{};
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
@@ -465,8 +465,8 @@ pub fn snapshotReplyVregs(receiver: *ExecutionContext) ReplyVregSnapshot {
 /// zero-initialized state. Any other sub-code projects the full state
 /// and flips `started = true` so the next `enterGuest` does a real
 /// VMRUN.
-pub fn applyReplyStateToVcpu(vcpu_ec: *ExecutionContext, snap: *const ReplyVregSnapshot) void {
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
+pub fn applyReplyStateToVcpu(vcpu_thread: *Thread, snap: *const ReplyVregSnapshot) void {
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return;
     const gs = &arch_state.guest_state;
 
     gs.rax = snap.rax;
@@ -562,19 +562,19 @@ fn storeSegment(rsp: u64, off: u64, seg: *const GuestState.SegmentReg) void {
 
 /// Write the suspending vCPU's GuestState onto the receiver's
 /// §[vm_exit_state] vreg slots. Called from `port.deliverEvent` when
-/// the suspending event is vm_exit. Receiver MUST be the running EC on
+/// the suspending event is vm_exit. Receiver MUST be the running thread on
 /// the current core (CR3 = receiver's address space; SMAP STAC/CLAC
 /// brackets the user-stack stores).
 ///
 /// Companion to `applyReplyStateToVcpu`. Together they implement the
 /// spec-v3 cross-domain guest-state-via-vregs contract.
 pub fn populateVmExitVregs(
-    receiver: *ExecutionContext,
-    vcpu_ec: *ExecutionContext,
+    receiver: *Thread,
+    vcpu_thread: *Thread,
     subcode: u8,
     payload: [3]u64,
 ) void {
-    const arch_state = hv_vcpu.archStateOf(vcpu_ec) orelse return;
+    const arch_state = hv_vcpu.archStateOf(vcpu_thread) orelse return;
     const gs = &arch_state.guest_state;
     const recv_frame = receiver.iret_frame orelse receiver.ctx;
 
@@ -651,13 +651,13 @@ pub fn populateVmExitVregs(
 /// Side-effect: clears `receiver.pending_event_rip_valid`. The
 /// generic event-state pipeline stages vreg 14 (`[user_rsp+8]`) for
 /// flushing at iretq time via `writeUserVreg14`, sourcing the value
-/// from `sender.event_rip` which is the sender EC's *host* RIP — for
-/// a vCPU EC that's a kernel-mode address from the run-loop hook,
+/// from `sender.event_rip` which is the sender thread's *host* RIP — for
+/// a vCPU thread that's a kernel-mode address from the run-loop hook,
 /// not the guest's RIP. Without this clear, the iretq writeback
 /// stomps the guest RIP we just wrote at offset VREG14_RIP_OFF.
 pub fn populateVmExitVregsIfStarted(
-    receiver: *ExecutionContext,
-    sender: *ExecutionContext,
+    receiver: *Thread,
+    sender: *Thread,
     subcode: u8,
 ) void {
     const arch_state = hv_vcpu.archStateOf(sender) orelse return;

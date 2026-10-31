@@ -1,48 +1,48 @@
 // Spec §[reply] reply — test 24.
 //
 // "[test 24] on success when `recv_port_handle_id != 0`, after the
-//  suspended EC is resumed the caller is parked on the named port and
+//  suspended thread is resumed the caller is parked on the named port and
 //  a subsequent event delivered on that port wakes the caller with the
 //  recv return contract — syscall word packed with the new
 //  `reply_handle_id` / `event_type` / `pair_count` / `tstart`, and
-//  vregs 1..13 carrying the suspending EC's state."
+//  vregs 1..13 carrying the suspending thread's state."
 //
 // Strategy
-//   The recv-mode reply path needs THREE actors so that the test EC can
+//   The recv-mode reply path needs THREE actors so that the test thread can
 //   observe both the resume of the original sender AND the wakeup from
 //   the freshly-named port:
 //
-//     - Test EC mints port_A (caps={bind,recv}) and port_B
+//     - Test thread mints port_A (caps={bind,recv}) and port_B
 //       (caps={bind,recv}). xfer is unnecessary because the test issues
 //       reply with pair_count = 0 and we never attach handles.
-//     - Test EC mints sibling W with caps={susp,term} priority 1.
-//       W's job is to self-suspend on port_A so the test EC can recv on
-//       it; that recv mints reply_handle_A in the test EC's table.
-//     - Test EC mints sibling X with caps={susp,term} priority 1.
-//       X's job is to self-suspend on port_B *after* the test EC has
+//     - Test thread mints sibling W with caps={susp,term} priority 1.
+//       W's job is to self-suspend on port_A so the test thread can recv on
+//       it; that recv mints reply_handle_A in the test thread's table.
+//     - Test thread mints sibling X with caps={susp,term} priority 1.
+//       X's job is to self-suspend on port_B *after* the test thread has
 //       parked itself on port_B via the recv-mode reply, so that the
-//       wakeup the test EC observes is X's suspension event (not a
+//       wakeup the test thread observes is X's suspension event (not a
 //       race with W's still-running tail).
-//     - Cross-EC handle ids and start-gates ride in shared module-scope
+//     - Cross-thread handle ids and start-gates ride in shared module-scope
 //       globals; the siblings spin on `g_ready_w` / `g_ready_x` until
-//       the test EC has installed the handles and given them the go
+//       the test thread has installed the handles and given them the go
 //       signal. Same single-domain in-process mailbox pattern as
 //       reply_transfer_12.zig.
-//     - Self-suspend uses the libz suspend wrapper so the test EC can
-//       sequence the start gates and observe a real cross-EC suspend
+//     - Self-suspend uses the libz suspend wrapper so the test thread can
+//       sequence the start gates and observe a real cross-thread suspend
 //       handoff without carrying architecture-local syscall asm.
-//     - The test EC then issues `syscall.replyRecv(reply_handle_A,
+//     - The test thread then issues `syscall.replyRecv(reply_handle_A,
 //       port_B)` (the new spec-v3 unified-reply libz wrapper). The
 //       kernel atomically: consumes reply_handle_A and resumes W, then
-//       parks the test EC on port_B as if it had immediately invoked
+//       parks the test thread on port_B as if it had immediately invoked
 //       `recv(port_B, 0)`. Once X self-suspends on port_B, the test
-//       EC's parked recv wakes with the §[event_state] return contract.
+//       thread's parked recv wakes with the §[event_state] return contract.
 //
 // Action
 //   1. create_port port_A — must succeed
 //   2. create_port port_B — must succeed
-//   3. create_execution_context W — must succeed
-//   4. create_execution_context X — must succeed
+//   3. create_thread W — must succeed
+//   4. create_thread X — must succeed
 //   5. release W via g_ready_w → W self-suspends on port_A
 //   6. recv(port_A, 0) — get reply_handle_A
 //   7. release X via g_ready_x
@@ -51,7 +51,7 @@
 //
 // SPEC AMBIGUITY: spec §[event_type] enumerates `suspension = 4`, but
 // libz does not export the EventType enum (the kernel keeps it private
-// in `kernel/sched/execution_context.zig`). The test hard-codes 4 with
+// in `kernel/sched/thread.zig`). The test hard-codes 4 with
 // a comment per §[event_type] until libz grows a typed wrapper.
 //
 // SPEC AMBIGUITY: spec §[event_state] tabulates the recv return word's
@@ -62,8 +62,8 @@
 // Assertions
 //   1: setup — create_port for port_A returned an error word
 //   2: setup — create_port for port_B returned an error word
-//   3: setup — create_execution_context for W returned an error
-//   4: setup — create_execution_context for X returned an error
+//   3: setup — create_thread for W returned an error
+//   4: setup — create_thread for X returned an error
 //   5: recv on port_A did not return OK
 //   6: recv on port_A returned reply_handle_id == 0
 //   7: replyRecv did not return OK in vreg 1
@@ -86,7 +86,7 @@ const HandleId = caps.HandleId;
 // §[event_type]: suspension = 4. libz does not export EventType.
 const EVENT_TYPE_SUSPENSION: u8 = 4;
 
-// Cross-EC channel. Test EC + siblings share the same address space
+// Cross-thread channel. Test thread + siblings share the same address space
 // (single domain, single ELF). Same in-process mailbox pattern as
 // reply_transfer_12.zig.
 var g_port_a_handle: u64 = 0;
@@ -96,8 +96,8 @@ var g_x_self_handle: u64 = 0;
 var g_ready_w: u32 = 0;
 var g_ready_x: u32 = 0;
 
-fn selfSuspendOnPort(self_ec_id: u64, port_id: u64) void {
-    _ = syscall.suspendEc(@truncate(self_ec_id), @truncate(port_id), &.{});
+fn selfSuspendOnPort(self_thread_id: u64, port_id: u64) void {
+    _ = syscall.suspendThread(@truncate(self_thread_id), @truncate(port_id), &.{});
 }
 
 fn parkForever() noreturn {
@@ -119,9 +119,9 @@ fn siblingW_entry() callconv(.c) noreturn {
         }
     }
 
-    const self_ec_id = @atomicLoad(u64, &g_w_self_handle, .acquire);
+    const self_thread_id = @atomicLoad(u64, &g_w_self_handle, .acquire);
     const port_id = @atomicLoad(u64, &g_port_a_handle, .acquire);
-    selfSuspendOnPort(self_ec_id, port_id);
+    selfSuspendOnPort(self_thread_id, port_id);
     parkForever();
 }
 
@@ -134,9 +134,9 @@ fn siblingX_entry() callconv(.c) noreturn {
         }
     }
 
-    const self_ec_id = @atomicLoad(u64, &g_x_self_handle, .acquire);
+    const self_thread_id = @atomicLoad(u64, &g_x_self_handle, .acquire);
     const port_id = @atomicLoad(u64, &g_port_b_handle, .acquire);
-    selfSuspendOnPort(self_ec_id, port_id);
+    selfSuspendOnPort(self_thread_id, port_id);
     parkForever();
 }
 
@@ -162,29 +162,29 @@ pub fn main(cap_table_base: u64) void {
     const port_b: HandleId = @truncate(cp_b.v1 & 0xFFF);
 
     // 3. Mint sibling W with susp|term. priority = 1 so W can be
-    //    dispatched alongside the test EC (also priority 1) — without
+    //    dispatched alongside the test thread (also priority 1) — without
     //    it, W sits at idle and never reaches its self-suspend.
-    const ec_caps = caps.EcCap{
+    const thread_caps = caps.ThreadCap{
         .susp = true,
         .term = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, ec_caps.toU16()) | (@as(u64, 1) << 32);
+    const thread_caps_word: u64 = @as(u64, thread_caps.toU16()) | (@as(u64, 1) << 32);
     const pinned_core = testing.currentCoreId();
     const sibling_affinity: u64 = @as(u64, 1) << @truncate(pinned_core);
     var self_pinned = false;
     defer {
         if (self_pinned) {
-            _ = syscall.affinity(caps.SLOT_INITIAL_EC, 0);
+            _ = syscall.affinity(caps.SLOT_INITIAL_THREAD, 0);
         }
     }
-    const self_aff = syscall.affinity(caps.SLOT_INITIAL_EC, sibling_affinity);
+    const self_aff = syscall.affinity(caps.SLOT_INITIAL_THREAD, sibling_affinity);
     if (self_aff.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
     }
     self_pinned = true;
-    const self_yield = syscall.yieldEc(0);
+    const self_yield = syscall.yieldThread(0);
     if (self_yield.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(3);
         return;
@@ -195,38 +195,38 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    const cec_w = syscall.createExecutionContext(
-        ec_caps_word,
+    const created_thread_w = syscall.createThread(
+        thread_caps_word,
         @intFromPtr(&siblingW_entry),
         1, // stack_pages
         0, // target = self
         sibling_affinity,
     );
-    if (testing.isHandleError(cec_w.v1)) {
+    if (testing.isHandleError(created_thread_w.v1)) {
         testing.fail(3);
         return;
     }
-    const w_ec: HandleId = @truncate(cec_w.v1 & 0xFFF);
+    const w_thread: HandleId = @truncate(created_thread_w.v1 & 0xFFF);
 
     // 4. Mint sibling X with the same cap profile.
-    const cec_x = syscall.createExecutionContext(
-        ec_caps_word,
+    const created_thread_x = syscall.createThread(
+        thread_caps_word,
         @intFromPtr(&siblingX_entry),
         1,
         0,
         sibling_affinity,
     );
-    if (testing.isHandleError(cec_x.v1)) {
+    if (testing.isHandleError(created_thread_x.v1)) {
         testing.fail(4);
         return;
     }
-    const x_ec: HandleId = @truncate(cec_x.v1 & 0xFFF);
+    const x_thread: HandleId = @truncate(created_thread_x.v1 & 0xFFF);
 
     // Hand the siblings their handle ids before unleashing them.
     @atomicStore(u64, &g_port_a_handle, @as(u64, port_a), .release);
     @atomicStore(u64, &g_port_b_handle, @as(u64, port_b), .release);
-    @atomicStore(u64, &g_w_self_handle, @as(u64, w_ec), .release);
-    @atomicStore(u64, &g_x_self_handle, @as(u64, x_ec), .release);
+    @atomicStore(u64, &g_w_self_handle, @as(u64, w_thread), .release);
+    @atomicStore(u64, &g_x_self_handle, @as(u64, x_thread), .release);
 
     // 5. Release W. W self-suspends on port_A; the kernel queues a
     //    suspension event there.
@@ -253,7 +253,7 @@ pub fn main(cap_table_base: u64) void {
     @atomicStore(u32, &g_ready_x, 1, .release);
 
     // 8. Atomic reply-then-recv. resumes W (consumes reply_handle_a),
-    //    then parks the test EC on port_b waiting for the next event.
+    //    then parks the test thread on port_b waiting for the next event.
     //    X's self-suspend on port_b feeds that recv. Returned word /
     //    regs follow §[recv]'s return contract.
     const rr = syscall.replyRecv(reply_handle_a, port_b);
@@ -278,7 +278,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
     // The kernel must have minted a fresh reply handle for X's
-    // suspension event in the test EC's table.
+    // suspension event in the test thread's table.
     if (new_reply_handle_id == 0) {
         testing.fail(9);
         return;

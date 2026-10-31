@@ -7,22 +7,22 @@
 //   §[handle_attachments] places pair entries in the high vregs
 //   `[128-N..127]`. With N=1 the lone entry occupies vreg 127, which
 //   per §[syscall_abi] lives at `[rsp + (127-13)*8] = [rsp + 912]`
-//   when the syscall executes. libz's `suspendEc` `@panic`s on N>0
+//   when the syscall executes. libz's `suspendThread` `@panic`s on N>0
 //   because its general stack-arg dispatcher isn't wired through; we
 //   open-code the syscall here with a fixed 920-byte stack pad that
 //   lands the entry at the right offset.
 //
-//   For the source handle we use the test child's initial EC at
-//   slot 1. Per §[create_capability_domain] test 21 the initial EC's
-//   caps equal the runner's `ec_inner_ceiling`, which the runner sets
-//   to 0xFF — bits 0-7 of `EcCap`: {move, copy, saff, spri, term,
+//   For the source handle we use the test child's initial thread at
+//   slot 1. Per §[create_capability_domain] test 21 the initial thread's
+//   caps equal the runner's `thread_inner_ceiling`, which the runner sets
+//   to 0xFF — bits 0-7 of `ThreadCap`: {move, copy, saff, spri, term,
 //   susp, read, write}. Since `copy` is set, an entry with `move = 0`
 //   does NOT trip test 05 (which fires only if move=0 AND the source
 //   lacks copy). Setting `move = 0` likewise sidesteps test 04 (fires
 //   only when move=1 AND source lacks move).
 //
 //   To violate test 03 we set entry.caps = source.caps | (1 << 10) —
-//   `EcCap.bind` (bit 10), which is NOT in the source's 0xFF. The
+//   `ThreadCap.bind` (bit 10), which is NOT in the source's 0xFF. The
 //   resulting caps word is a strict superset of the source's caps,
 //   so the kernel must return E_PERM.
 //
@@ -35,15 +35,15 @@
 //   entry so test 07 (duplicate ids) is moot.
 //
 // Action
-//   1. Read the initial EC's current caps from the cap table.
-//   2. Construct a PairEntry with id=SLOT_INITIAL_EC, move=0,
-//      caps = current | EcCap{ .bind = true } (a strict superset).
-//   3. Issue suspend(target=SLOT_INITIAL_EC, port=SLOT_FIRST_PASSED)
+//   1. Read the initial thread's current caps from the cap table.
+//   2. Construct a PairEntry with id=SLOT_INITIAL_THREAD, move=0,
+//      caps = current | ThreadCap{ .bind = true } (a strict superset).
+//   3. Issue suspend(target=SLOT_INITIAL_THREAD, port=SLOT_FIRST_PASSED)
 //      with the entry placed at vreg 127.
 //   4. Verify the returned vreg 1 equals E_PERM.
 //
 // Assertions
-//   1: EC slot 1 caps don't match the runner's ec_inner_ceiling shape
+//   1: thread slot 1 caps don't match the runner's thread_inner_ceiling shape
 //      we depend on (precondition for the superset construction).
 //   2: suspend with a strict-superset caps entry returned a value
 //      other than E_PERM.
@@ -125,30 +125,30 @@ fn suspendWith1Attachment(target: u12, port: u12, entry: u64) u64 {
 }
 
 pub fn main(cap_table_base: u64) void {
-    const ec = caps.readCap(cap_table_base, caps.SLOT_INITIAL_EC);
-    const ec_caps_now: u16 = ec.caps();
+    const thread = caps.readCap(cap_table_base, caps.SLOT_INITIAL_THREAD);
+    const thread_caps_now: u16 = thread.caps();
 
-    // Sanity check: this test depends on the source EC having `copy`
+    // Sanity check: this test depends on the source thread having `copy`
     // (bit 1) set so move=0 doesn't trip test 05, and on the restart-policy bit
     // (bit 8) being clear so the constructed caps is a strict
     // superset.
-    const ec_copy_bit: u16 = (caps.EcCap{ .copy = true }).toU16();
-    const ec_restart_bit: u16 = (caps.EcCap{ .restart_policy = 1 }).toU16();
-    if ((ec_caps_now & ec_copy_bit) == 0 or (ec_caps_now & ec_restart_bit) != 0) {
+    const thread_copy_bit: u16 = (caps.ThreadCap{ .copy = true }).toU16();
+    const thread_restart_bit: u16 = (caps.ThreadCap{ .restart_policy = 1 }).toU16();
+    if ((thread_caps_now & thread_copy_bit) == 0 or (thread_caps_now & thread_restart_bit) != 0) {
         testing.fail(1);
         return;
     }
 
-    const superset_caps: u16 = ec_caps_now | ec_restart_bit;
+    const superset_caps: u16 = thread_caps_now | thread_restart_bit;
 
     const entry = (caps.PairEntry{
-        .id = caps.SLOT_INITIAL_EC,
+        .id = caps.SLOT_INITIAL_THREAD,
         .caps = superset_caps,
         .move = false,
     }).toU64();
 
     const v1 = suspendWith1Attachment(
-        caps.SLOT_INITIAL_EC,
+        caps.SLOT_INITIAL_THREAD,
         caps.SLOT_FIRST_PASSED,
         entry,
     );

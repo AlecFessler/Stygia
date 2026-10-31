@@ -8,7 +8,7 @@
 //   This test runs *as* the new capability domain spawned by the
 //   primary runner. The runner's `spawnOne`
 //   (tests/suite/runner/primary.zig) is the create_capability_domain
-//   caller; the success path landed us here, executing the initial EC
+//   caller; the success path landed us here, executing the initial thread
 //   of the freshly-minted domain. By construction:
 //     - `cap_table_base` is this domain's read-only view of its own
 //       capability table (§[capabilities] domain self handle).

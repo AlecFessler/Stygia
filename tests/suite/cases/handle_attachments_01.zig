@@ -12,12 +12,12 @@
 //
 //   To isolate the xfer check we make every other prelude check pass
 //   on its own terms:
-//     - §[suspend] test 01 (E_BADCAP on bad EC) — use SLOT_INITIAL_EC,
-//       a valid EC handle the runner installed at spawn time.
+//     - §[suspend] test 01 (E_BADCAP on bad thread) — use SLOT_INITIAL_THREAD,
+//       a valid thread handle the runner installed at spawn time.
 //     - §[suspend] test 02 (E_BADCAP on bad port) — mint a fresh port
 //       below and use its handle.
-//     - §[suspend] test 03 (E_PERM, no `susp` on EC) — slot 1's EC
-//       handle was minted with `ec_inner_ceiling = 0xFF`, which
+//     - §[suspend] test 03 (E_PERM, no `susp` on thread) — slot 1's thread
+//       handle was minted with `thread_inner_ceiling = 0xFF`, which
 //       covers `susp` (bit 5).
 //     - §[suspend] test 04 (E_PERM, no `bind` on port) — mint the
 //       port with `bind` set so this prior gate is satisfied.
@@ -25,9 +25,9 @@
 //       handle id bits in [1] and [2] and only `pair_count` in the
 //       extra-bits range of the syscall word; everything else zero.
 //     - §[suspend] test 06 (E_INVAL on vCPU target) — slot 1 is a
-//       plain EC, not a vCPU.
+//       plain thread, not a vCPU.
 //     - §[suspend] test 07 (E_INVAL on already-suspended) — slot 1 is
-//       the calling EC, currently running, so it is not suspended.
+//       the calling thread, currently running, so it is not suspended.
 //
 //   The mint uses `caps = bind` only — no `xfer`. The runner's
 //   `port_ceiling = 0x1C` covers bind/recv/xfer (bit positions 4/3/2
@@ -56,7 +56,7 @@
 //
 // Action
 //   1. create_port(caps = {bind})       — must succeed
-//   2. issueReg(.suspend, extra = pair_count(1) << 12, [1] = SLOT_INITIAL_EC,
+//   2. issueReg(.suspend, extra = pair_count(1) << 12, [1] = SLOT_INITIAL_THREAD,
 //      [2] = port_handle)               — must return E_PERM
 //
 // Assertions
@@ -93,12 +93,12 @@ pub fn main(cap_table_base: u64) void {
     // 12-19 of the syscall word. `extraCount` packs a u8 into that
     // range; `issueReg` ORs syscall_num into bits 0-11 and dispatches.
     //
-    // [1] = SLOT_INITIAL_EC — a valid EC handle to the calling EC
-    //   with caps = ec_inner_ceiling = 0xFF (susp/read/write all set).
+    // [1] = SLOT_INITIAL_THREAD — a valid thread handle to the calling thread
+    //   with caps = thread_inner_ceiling = 0xFF (susp/read/write all set).
     // [2] = port_handle — the bind-only port minted above.
     const extra = syscall.extraCount(1);
     const r = syscall.issueReg(.@"suspend", extra, .{
-        .v1 = caps.SLOT_INITIAL_EC,
+        .v1 = caps.SLOT_INITIAL_THREAD,
         .v2 = port_handle,
     });
     if (r.v1 != @intFromEnum(errors.Error.E_PERM)) {

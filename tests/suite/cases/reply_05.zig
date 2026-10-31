@@ -1,25 +1,25 @@
 // Spec §[reply] reply — test 05.
 //
-// "[test 05] on success when the originating EC handle had the `write`
-//  cap, the resumed EC's state reflects modifications written to the
+// "[test 05] on success when the originating thread handle had the `write`
+//  cap, the resumed thread's state reflects modifications written to the
 //  receiver's event-state vregs between recv and reply."
 //
 // Strategy
 //   §[event_state] spells out the wiring this assertion rides on:
 //   "GPRs are 1:1 with hardware registers during handler execution —
-//   the handler reads or modifies EC state by directly reading or
+//   the handler reads or modifies thread state by directly reading or
 //   writing the hardware register." Between `recv` returning and the
 //   `reply` syscall executing, the receiver's GPRs *are* the suspended
-//   EC's GPRs. With the originating EC handle's `write` cap present,
-//   the kernel resumes the suspended EC with whatever values the
+//   thread's GPRs. With the originating thread handle's `write` cap present,
+//   the kernel resumes the suspended thread with whatever values the
 //   receiver leaves in its GPRs at reply-time; with `write` absent,
 //   the kernel restores the pre-suspension snapshot (the negative is
 //   covered by reply test 06).
 //
-//   To witness the positive direction we need a suspended EC W whose
+//   To witness the positive direction we need a suspended thread W whose
 //   originating handle carries `write`, plus an observable that W
 //   produces deterministically as a function of one of its registers.
-//   The test EC and W share an address space (W is created with
+//   The test thread and W share an address space (W is created with
 //   `target = self`), so W can simply store one of its own registers
 //   into a process-global cell. We pick `rbx` (vreg 2) because:
 //     - it is part of the §[event_state] x86-64 GPR set (vregs 1..13),
@@ -34,14 +34,14 @@
 //     1. Mint a port with {bind, recv}.
 //     2. Mint W with {term, susp, read, write, restart_policy=0} and
 //        entry = `observerEntry` (naked: `mov [observed], rbx; spin`).
-//        `term` so the test EC can clean up; `susp` so the test EC may
+//        `term` so the test thread can clean up; `susp` so the test thread may
 //        suspend W; `read`+`write` so the suspension event exposes and
 //        consumes W's state per §[event_state]; restart_policy=0
-//        keeps the call inside the runner-granted ec_restart_max.
+//        keeps the call inside the runner-granted thread_restart_max.
 //     3. `suspend(W, port)`. W has not run; kernel queues it as a
 //        suspended sender on the port with a fresh GPR snapshot
 //        (kernel-initialized — typically zero).
-//     4. `recv(port)`. recv returns immediately because the test EC
+//     4. `recv(port)`. recv returns immediately because the test thread
 //        still holds the port's bind cap. The syscall word carries
 //        `reply_handle_id` per §[event_state].
 //     5. Issue `reply` with vreg 2 (rbx) = MAGIC. The reply_handle_id
@@ -52,11 +52,11 @@
 //     6. `yield(W)` to schedule W. W executes the `mov` storing rbx
 //        (now MAGIC) into `observed`, then spins.
 //     7. Poll `observed` (with bounded yields to the scheduler so the
-//        test EC re-runs after W's timeslice expires).
+//        test thread re-runs after W's timeslice expires).
 //
 // Action
 //   1. create_port(caps={bind, recv})
-//   2. create_execution_context(target=self,
+//   2. create_thread(target=self,
 //        caps={term, susp, read, write, restart_policy=0},
 //        entry=&observerEntry)
 //   3. suspend(W, port)                   — must return OK
@@ -70,7 +70,7 @@
 //
 // Assertions
 //   1: setup port creation failed
-//   2: setup EC creation failed
+//   2: setup thread creation failed
 //   3: suspend did not return OK
 //   4: recv did not return OK
 //   5: reply did not return OK
@@ -87,7 +87,7 @@ const testing = lib.testing;
 
 // Cell W stores its rbx into. Sentinel 0 is distinguishable from MAGIC
 // (a non-zero pattern) so a "never wrote" outcome is detectable. The
-// test EC and W share an address space (W is created with target=self
+// test thread and W share an address space (W is created with target=self
 // in step 2 below), so W writes here directly. `export` so the inline
 // asm can address it via rip-relative addressing; an "m" memory operand
 // would route through a stack temp, which a naked entry has no
@@ -101,7 +101,7 @@ const MAGIC: u64 = 0xC0FFEE_CAFE_BEEF_50;
 // PC-relative addressing on the exported `observed` symbol directly
 // — no asm operands, so LLVM cannot spill through the (nonexistent)
 // stack frame. After the store W spins so it neither faults nor races
-// the test EC's reporter — the runner only cares about the test EC's
+// the test thread's reporter — the runner only cares about the test thread's
 // eventual `pass()`/`fail()` suspension on the result port; W never
 // touches the result port.
 fn observerEntry() callconv(.naked) noreturn {
@@ -126,7 +126,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Step 1: mint the port. bind keeps the port alive for the recv
-    // (no E_CLOSED on the recv path); recv lets the test EC dequeue
+    // (no E_CLOSED on the recv path); recv lets the test thread dequeue
     // the suspension event.
     const port_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
     const cp = syscall.createPort(@as(u64, port_caps.toU16()));
@@ -140,22 +140,22 @@ pub fn main(cap_table_base: u64) void {
     // assertion — read so the recv exposes W's state per §[event_state]
     // (without it, the receiver's vregs would be zeroed per recv test
     // 12), write so reply applies the receiver's GPR modifications to
-    // W on resume (the assertion under test). susp lets the test EC
+    // W on resume (the assertion under test). susp lets the test thread
     // suspend W; term lets a future revision tear W down explicitly
     // (currently W just spins after the store and is reaped when its
-    // domain — i.e. the test EC's domain — exits). restart_policy=0
-    // (kill) stays inside the runner's ec_restart_max ceiling.
-    const w_caps = caps.EcCap{
+    // domain — i.e. the test thread's domain — exits). restart_policy=0
+    // (kill) stays inside the runner's thread_restart_max ceiling.
+    const w_caps = caps.ThreadCap{
         .term = true,
         .susp = true,
         .read = true,
         .write = true,
         .restart_policy = 0,
     };
-    const ec_caps_word: u64 = @as(u64, w_caps.toU16());
+    const thread_caps_word: u64 = @as(u64, w_caps.toU16());
     const entry: u64 = @intFromPtr(&observerEntry);
-    const cec = syscall.createExecutionContext(
-        ec_caps_word,
+    const cec = syscall.createThread(
+        thread_caps_word,
         entry,
         1,
         0,
@@ -180,7 +180,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Step 4: recv. With the test EC as a live bind-cap holder and W
+    // Step 4: recv. With the test thread as a live bind-cap holder and W
     // queued, recv returns immediately. The syscall word's bits 32-43
     // carry the reply handle id per §[event_state].
     const got = syscall.recv(port_handle, 0);
@@ -209,9 +209,9 @@ pub fn main(cap_table_base: u64) void {
     // Step 6+7: schedule W and poll. Each iteration explicitly yields to
     // W (mirroring yield_03's bounded poll-and-yield-target pattern) and
     // then re-checks the side-channel. Yielding to the generic scheduler
-    // (`yieldEc(0)`) is insufficient here because W has the default
-    // priority (idle) — lower than the test EC's normal — so a
-    // round-robin pick would always re-dispatch the test EC and starve
+    // (`yieldThread(0)`) is insufficient here because W has the default
+    // priority (idle) — lower than the test thread's normal — so a
+    // round-robin pick would always re-dispatch the test thread and starve
     // W. Re-yielding to W on every iteration matches the spec's
     // observable-progress contract: yield(W) gives W the CPU, so any
     // dispatch that gets robbed of its first-instruction window by an
@@ -221,7 +221,7 @@ pub fn main(cap_table_base: u64) void {
     var i: usize = 0;
     while (i < 1024) {
         if (@as(*volatile u64, &observed).* == MAGIC) break;
-        _ = syscall.yieldEc(w_handle);
+        _ = syscall.yieldThread(w_handle);
         i += 1;
     }
 
