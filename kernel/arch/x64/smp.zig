@@ -38,6 +38,12 @@ const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
 const KERNEL_PERMS = MemoryPerms{ .read = true, .write = true };
 
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
+/// The root thread is queued before smpInit. The first AP to enter
+/// sched.run can claim it, so AP schedulers must wait until every AP
+/// has initialized its LAPIC, IDT, and per-core scheduler state. An
+/// early root TLB shootdown otherwise addresses APIC IDs that have not
+/// even received their SIPI; those IPIs cannot be delivered later.
+var aps_may_schedule: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// Boots all application processors via the INIT-SIPI-SIPI sequence.
 /// Intel SDM Vol 3A, §11.4.3 "MP Initialization Protocol Algorithm for MP Systems"
@@ -143,8 +149,9 @@ pub fn smpInit() !void {
                 // Deliberately LEAK the stack instead of reclaiming it.
                 // The SIPI above was already delivered and is never
                 // rescinded, so this AP is not stopped — merely late. It
-                // is somewhere between the trampoline's first instruction
-                // and `coreInit`, and `params.stack_top` still points into
+                // may be anywhere from the trampoline's first instruction
+                // through `coreInit`'s per-core setup, and its stack may still
+                // be in use. `params.stack_top` still points into
                 // `ap_stack`. `destroyKernel` unmaps those pages and hands
                 // them back to the PMM, where `stack.zig`'s LIFO freelist
                 // makes the reuse deterministic: the very next
@@ -165,7 +172,7 @@ pub fn smpInit() !void {
                 // A bounded, one-time leak of one kstack, paid only on a
                 // bring-up failure that has already gone wrong.
                 serial.print(
-                    "[smp] core (apic {d}): SIPI sent but core never signalled online" ++
+                    "[smp] core (apic {d}): SIPI sent but core never completed initialization" ++
                         " (kstack leaked; it may still arrive)\n",
                     .{la.apic_id},
                 );
@@ -175,9 +182,13 @@ pub fn smpInit() !void {
         }
     }
 
-    // All online APs have run `writeTscAuxCoreId` on themselves before
-    // bumping `cores_online` (see coreInit below); the BSP did the same
-    // at the top of this function. Safe to flip the global RDPID flag.
+    // `cores_online` is published only after each AP's per-core setup.
+    // A failed/late AP cannot safely be included in shootdown fanout;
+    // fail boot rather than release the pre-queued root thread early.
+    if (@as(u64, cores_online.load(.acquire)) != apic.coreCount()) return error.ApplicationProcessorNotReady;
+
+    // Every AP has written its TSC_AUX before publishing readiness;
+    // the BSP did the same at the top of this function.
     apic.enableRdpidFastPath();
 
     // Every AP that is going to come up has come up, so an ack-waiting
@@ -187,6 +198,9 @@ pub fn smpInit() !void {
     // what the bring-up path above needs when it tears down a kstack
     // whose mapping failed.
     arch_paging.armRemoteShootdown();
+    // Release all parked AP schedulers only after every target AP can
+    // receive and service the root thread's first cross-core IPI.
+    aps_may_schedule.store(true, .release);
 }
 
 /// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"
@@ -213,13 +227,20 @@ fn coreInit() callconv(.c) noreturn {
     cpu.enableSmapSmep();
     cpu.enablePcid();
     cpu.enableSpeculationBarriers();
-    _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
 
     // Visual confirmation that this AP reached the scheduler. Printed
     // from inside the AP — serial driver is multi-core safe via its
     // print_lock (see arch/x64/serial.zig).
     serial.print("[ap {}] entering sched.run\n", .{core_id});
+    _ = cores_online.fetchAdd(1, .release);
+
+    // The BSP waits for all APs to publish readiness, then releases
+    // this gate. Until then no AP may dispatch the pre-queued root.
+    while (!aps_may_schedule.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+    std.debug.assert(@as(u64, cores_online.load(.acquire)) == apic.coreCount());
 
     // Drop into the scheduler loop. APs start with empty run queues
     // and no per-core idle thread, so `sched.run` will fall through to
