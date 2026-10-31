@@ -123,14 +123,16 @@ fn recvCaptureNoReadPcArm(port: u12) struct { status: u64, rip: u64, word: u64 }
     var pc: u64 = undefined;
     var word: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #16
+        \\ sub sp, sp, #32
+        \\ str x18, [sp, #16]
         \\ str %[word], [sp]
         \\ mov x13, #-1
         \\ str x13, [sp, #8]
         \\ svc #0
         \\ ldr x15, [sp]
         \\ ldr x13, [sp, #8]
-        \\ add sp, sp, #16
+        \\ ldr x18, [sp, #16]
+        \\ add sp, sp, #32
         : [status] "={x0}" (status),
           [pc] "={x13}" (pc),
           [returned_word] "={x15}" (word),
