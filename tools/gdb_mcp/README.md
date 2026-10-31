@@ -16,8 +16,10 @@ cd tools/gdb_mcp
 zig build
 ```
 
-Produces `zig-out/bin/gdb_mcp`. Links the system `libsqlite3` (Arch:
-`pacman -S sqlite`).
+Produces `zig-out/bin/gdb_mcp`. The build emits a Zig object and links it
+with the system `cc`, so it requires a C compiler and system `libsqlite3`
+(Arch: `pacman -S sqlite`). Runtime debugging also requires `gdb` and a
+QEMU guest with its gdb stub enabled.
 
 The DB it queries is the same `tools/callgraph_http/test/dbs/*.db` the
 callgraph MCP uses; build it with `zig build index -Demit_index=true` from
@@ -54,7 +56,7 @@ CLI args:
 
 2. **Start a session:**
    ```
-   gdb_start { elf: "/home/alec/Stygia/zig-out/bin/kernel.elf" }
+   gdb_start { elf: "/home/alec/Stygia/zig-out/img/kernel.elf" }
    ```
    Default target is `:1234`. Pass `target: "none"` to spawn gdb without
    connecting (useful for sanity-checking symbol resolution).

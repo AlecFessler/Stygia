@@ -6,23 +6,29 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
 
-    const exe = b.addExecutable(.{
+    // GCC 16 crt objects contain .sframe relocations unsupported by Zig
+    // 0.15.2's bundled linker. Emit the Zig object, then link with system cc.
+    const obj = b.addObject(.{
         .name = "callgraph_mcp",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
-    // Link the system SQLite. We don't vendor the amalgamation so the binary
-    // shadows the OS-provided shared lib; on Arch this is `pacman -S sqlite`.
-    exe.linkSystemLibrary("sqlite3");
-    exe.linkLibC();
 
-    b.installArtifact(exe);
+    const link = b.addSystemCommand(&.{ "cc", "-o" });
+    const exe_path = link.addOutputFileArg("callgraph_mcp");
+    link.addFileArg(obj.getEmittedBin());
+    link.addArg("-lsqlite3");
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    const install = b.addInstallBinFile(exe_path, "callgraph_mcp");
+    b.getInstallStep().dependOn(&install.step);
+
+    const run_cmd = std.Build.Step.Run.create(b, "run callgraph_mcp");
+    run_cmd.addFileArg(exe_path);
+    run_cmd.step.dependOn(&install.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
