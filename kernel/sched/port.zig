@@ -1469,7 +1469,7 @@ fn deliverReplyTransferResume(
     if (event_type != .vm_exit and sender.originating_write_cap) {
         const sender_frame = sender.iret_frame orelse sender.ctx;
         const receiver_frame = caller.iret_frame orelse caller.ctx;
-        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
+        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame, sender.event_payload_count);
         arch.syscall.setEventRip(sender_frame, new_rip);
     }
     thread_mod.resumeFromReply(sender, sender.originating_write_cap);
@@ -2079,10 +2079,10 @@ fn deliverEvent(
         (@as(u64, sender.event_payload_count) << 49);
     if (event_type == .suspension) maybePrintReportDelivered(sender, receiver, reply_slot);
 
-    // §[event_state] vregs 1..13 = the suspending thread's GPRs snapshotted
+    // §[event_state] GPR-backed vregs = the suspending thread's snapshot
     // at `suspendOnPort` time, projected onto the receiver's matching
     // vregs here when the originating handle carried `read` (Spec
-    // §[suspend] test 10). When `read` is clear the entire 13-vreg
+    // §[suspend] test 10). When `read` is clear the GPR window
     // window is delivered as zero. vreg 2 then carries the
     // event-type-specific sub-code on top of the GPR projection
     // (overlapping the snapshot's vreg 2 slot — the firing site's
@@ -2110,7 +2110,7 @@ fn deliverEvent(
         // §[suspend] test 10 / §[recv] tests 11/12: the snapshot is
         // delivered iff the originating thread handle had the `read` cap;
         // otherwise the GPR-backed event-state vregs are zeroed.
-        arch.syscall.setEventStateGprs(target_ctx, [_]u64{0} ** 13);
+        arch.syscall.setEventStateGprs(target_ctx, [_]u64{0} ** arch.syscall.event_gpr_count);
     }
     // Spec §[error_codes]: vreg 1 (rax) is the syscall return register —
     // OK on success, error code on failure. setEventStateGprs above
@@ -2351,7 +2351,7 @@ fn consumeReply(
     if (sender.originating_write_cap) {
         const sender_frame = sender.iret_frame orelse sender.ctx;
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
-        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
+        arch.syscall.copyEventStateGprs(sender_frame, receiver_frame, sender.event_payload_count);
     }
     // Spec §[vm_exit_state] reply writeback only for vm_exit-typed
     // replies. Non-vm_exit reply paths (`suspension`)

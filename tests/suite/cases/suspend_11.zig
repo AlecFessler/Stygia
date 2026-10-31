@@ -124,6 +124,18 @@ const MAGIC: u64 = 0xCAFEBABEDEADBEEF;
 var g_released: u64 = 0;
 var g_observed: u64 = 0;
 var g_done: u64 = 0;
+var g_high_released: u64 = 0;
+var g_high_observed: u64 = 0;
+var g_high_done: u64 = 0;
+
+fn workerHighEntry() callconv(.c) noreturn {
+    while (@atomicLoad(u64, &g_high_released, .acquire) == 0) asm volatile ("yield");
+    var observed: u64 = undefined;
+    asm volatile ("mov %[out], x30" : [out] "=r" (observed));
+    @atomicStore(u64, &g_high_observed, observed, .release);
+    @atomicStore(u64, &g_high_done, 1, .release);
+    while (true) asm volatile ("yield");
+}
 
 fn workerEntry() callconv(.c) noreturn {
     // Spin until the test thread sets `g_released`. The acquire ordering
@@ -300,6 +312,73 @@ pub fn main(cap_table_base: u64) void {
     }
     if (@atomicLoad(u64, &g_done, .acquire) == 0) return testing.fail(12);
     if (@atomicLoad(u64, &g_observed, .acquire) != baseline) return testing.fail(13);
+
+    // ARM vreg31 is x30. A count32 event makes it a valid writeback lane.
+    // The raw reply sets x30 to MAGIC for the suspended worker while
+    // preserving this receiver's LR in a private stack slot.
+    if (builtin.cpu.arch == .aarch64) {
+        const high_caps = caps.ThreadCap{ .susp = true, .read = true, .write = true };
+        const made = syscall.createThread(@as(u64, high_caps.toU16()), @intFromPtr(&workerHighEntry), 1, 0, 0);
+        if (testing.isHandleError(made.v1)) return testing.fail(14);
+        const high_handle: u12 = @truncate(made.v1 & 0xFFF);
+        if (syscall.issueReg(.@"suspend", syscall.extraTstart(32), .{ .v1 = high_handle, .v2 = port_handle }).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(15);
+        const high_event = syscall.recv(port_handle, 0);
+        if (high_event.regs.v1 != @intFromEnum(errors.Error.OK)) return testing.fail(16);
+        if (((high_event.word >> 49) & 0x7F) != 32) return testing.fail(17);
+        const high_reply: u12 = @truncate((high_event.word >> 32) & 0xFFF);
+        const high_word = syscall.buildWord(.reply, syscall.extraReplyHandle(high_reply));
+        @atomicStore(u64, &g_high_released, 1, .release);
+        var high_status: u64 = undefined;
+        asm volatile (
+            \\ sub sp, sp, #800
+            \\ str x18, [sp, #784]
+            \\ str x30, [sp, #792]
+            \\ str %[word], [sp]
+            \\ mov x30, %[magic]
+            \\ svc #0
+            \\ ldr x30, [sp, #792]
+            \\ ldr x18, [sp, #784]
+            \\ add sp, sp, #800
+            : [status] "={x0}" (high_status),
+            : [word] "r" (high_word),
+              [magic] "r" (MAGIC),
+            : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x30 = true, .memory = true });
+        if (high_status != @intFromEnum(errors.Error.OK)) return testing.fail(18);
+        for (0..4096) |_| {
+            if (@atomicLoad(u64, &g_high_done, .acquire) != 0) break;
+            _ = syscall.yieldThread(high_handle);
+        }
+        if (@atomicLoad(u64, &g_high_done, .acquire) == 0) return testing.fail(19);
+        if (@atomicLoad(u64, &g_high_observed, .acquire) != MAGIC) return testing.fail(20);
+
+        // Suspend the same worker again while it loops without calls.
+        // Its x30 still contains MAGIC; receiving that nonzero value
+        // proves the read side copied the saved high GPR, not zeros.
+        if (syscall.issueReg(.@"suspend", syscall.extraTstart(32), .{ .v1 = high_handle, .v2 = port_handle }).v1 != @intFromEnum(errors.Error.OK)) return testing.fail(21);
+        var read_status: u64 = undefined;
+        var read_word: u64 = undefined;
+        var read_x30: u64 = undefined;
+        asm volatile (
+            \\ sub sp, sp, #800
+            \\ str x18, [sp, #784]
+            \\ str x30, [sp, #792]
+            \\ str %[word], [sp]
+            \\ svc #0
+            \\ mov x13, x30
+            \\ ldr x15, [sp]
+            \\ ldr x30, [sp, #792]
+            \\ ldr x18, [sp, #784]
+            \\ add sp, sp, #800
+            : [status] "={x0}" (read_status),
+              [word_out] "={x15}" (read_word),
+              [high] "={x13}" (read_x30),
+            : [word] "r" (@as(u64, 49)),
+              [port] "{x0}" (@as(u64, port_handle)),
+            : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x14 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        if (read_status != @intFromEnum(errors.Error.OK)) return testing.fail(22);
+        if (((read_word >> 49) & 0x7F) != 32) return testing.fail(23);
+        if (read_x30 != MAGIC) return testing.fail(24);
+    }
 
     testing.pass();
 }

@@ -546,7 +546,7 @@ pub const Thread = struct {
     /// payload value.
     event_addr: u64 = 0,
 
-    /// Spec §[event_state] vregs 1..13 = the suspending thread's GPRs at
+    /// Spec §[event_state] GPR-backed vregs = the suspending thread's state at
     /// suspend time. Snapshotted in `suspendOnPort` from the thread's
     /// iret frame in canonical vreg order via
     /// `arch.syscall.getEventStateGprs`, and rewritten into the
@@ -554,8 +554,8 @@ pub const Thread = struct {
     /// `originating_read_cap`) so the sender's payload is observable
     /// on recv per Spec §[suspend] test 10.
     /// x86-64 ordering: rax, rbx, rdx, rbp, rsi, rdi, r8, r9, r10,
-    /// r12, r13, r14, r15. aarch64 ordering: x0..x12.
-    event_state_gprs: [13]u64 = [_]u64{0} ** 13,
+    /// r12, r13, r14, r15. aarch64 ordering: x0..x30.
+    event_state_gprs: arch.syscall.EventStateGprs = [_]u64{0} ** arch.syscall.event_gpr_count,
 
     /// Valid event-state vreg window declared by the originating suspend.
     event_payload_count: u7 = 0,

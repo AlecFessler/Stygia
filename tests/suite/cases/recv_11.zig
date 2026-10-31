@@ -109,7 +109,7 @@ const testing = lib.testing;
 //     12 registers carry W's GPRs but we don't read them in this
 //     test — they are listed as clobbers so the compiler doesn't
 //     assume any prior value survives.
-const RecvRip = struct { v1: u64, rip: u64, word: u64, lr: u64 = 0 };
+const RecvRip = struct { v1: u64, rip: u64, word: u64, expected: u64, lr: u64 = 0 };
 
 // Portable no-op entry — local to this test so we don't depend on the
 // libz testing.dummyEntry (which is x86-only `hlt`). W never executes
@@ -126,7 +126,7 @@ fn localDummyEntry() noreturn {
     }
 }
 
-fn recvCaptureRipX64(port: u12) RecvRip {
+fn recvCaptureRipX64(port: u12, expected: u64) RecvRip {
     const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
@@ -145,22 +145,25 @@ fn recvCaptureRipX64(port: u12) RecvRip {
           [iv1] "{rax}" (@as(u64, port)),
         : .{ .rcx = true, .r11 = true, .rdx = true, .rbp = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true });
 
-    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out };
+    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out, .expected = expected };
 }
 
 // aarch64 ABI per spec §[event_state]: vreg 0 is [sp+0], vregs 1..31
 // are x0..x30, and vreg 32 (the saved PC) is [sp+8]. The slot starts
 // at -1, so a missing kernel write cannot accidentally pass as zero.
-fn recvCaptureRipArm(port: u12) RecvRip {
+fn recvCaptureRipArm(port: u12, expected: u64) RecvRip {
     const word: u64 = 49; // syscall_num for recv per §[recv]
     var v1_out: u64 = undefined;
     var rip_out: u64 = undefined;
     var lr_out: u64 = undefined;
     var word_out: u64 = undefined;
+    var expected_out: u64 = undefined;
 
     asm volatile (
-        \\ sub sp, sp, #32
-        \\ str x30, [sp, #24]
+        \\ sub sp, sp, #832
+        \\ str x18, [sp, #784]
+        \\ str x30, [sp, #792]
+        \\ str %[expected_in], [sp, #800]
         \\ str %[word], [sp]
         \\ mov x13, #-1
         \\ str x13, [sp, #8]
@@ -168,23 +171,27 @@ fn recvCaptureRipArm(port: u12) RecvRip {
         \\ mov x14, x30
         \\ ldr x15, [sp]
         \\ ldr x13, [sp, #8]
-        \\ ldr x30, [sp, #24]
-        \\ add sp, sp, #32
+        \\ ldr x16, [sp, #800]
+        \\ ldr x18, [sp, #784]
+        \\ ldr x30, [sp, #792]
+        \\ add sp, sp, #832
         : [v1] "={x0}" (v1_out),
           [rip] "={x13}" (rip_out),
           [lr] "={x14}" (lr_out),
           [returned_word] "={x15}" (word_out),
+          [expected_out] "={x16}" (expected_out),
         : [word] "r" (word),
+          [expected_in] "r" (expected),
           [iv1] "{x0}" (@as(u64, port)),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
-    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out, .lr = lr_out };
+    return .{ .v1 = v1_out, .rip = rip_out, .word = word_out, .expected = expected_out, .lr = lr_out };
 }
 
-fn recvCaptureRip(port: u12) RecvRip {
+fn recvCaptureRip(port: u12, expected: u64) RecvRip {
     return switch (builtin.cpu.arch) {
-        .x86_64 => recvCaptureRipX64(port),
-        .aarch64 => recvCaptureRipArm(port),
+        .x86_64 => recvCaptureRipX64(port, expected),
+        .aarch64 => recvCaptureRipArm(port, expected),
         else => @compileError("unsupported arch"),
     };
 }
@@ -283,7 +290,7 @@ pub fn main(cap_table_base: u64) void {
     // handle). With `read` set on the thread handle used at suspend, the
     // kernel writes W's saved register state into the vreg layout in
     // §[event_state]; vreg 14 = `[rsp + 8]` is W's RIP.
-    const got = recvCaptureRip(port_handle);
+    const got = recvCaptureRip(port_handle, entry);
     if (got.v1 != @intFromEnum(errors.Error.OK)) {
         testing.fail(4);
         return;
@@ -294,10 +301,15 @@ pub fn main(cap_table_base: u64) void {
     // §[create_thread] the kernel sets RIP to the entry we
     // passed. Any other value — most notably zero (the test 12
     // read-not-set path) — fails the assertion under test.
-    if (got.rip != entry) {
+    if (got.rip != got.expected) {
         testing.fail(5);
         return;
     }
+
+    // With payload_count=32, vreg 31 (x30) is valid event state.
+    // The freshly created worker has LR=0; the raw helper captures x30
+    // before restoring the receiver's own LR.
+    if (builtin.cpu.arch == .aarch64 and got.lr != 0) return testing.fail(7);
 
     testing.pass();
 }

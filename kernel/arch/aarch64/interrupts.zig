@@ -219,72 +219,26 @@ pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
     cpu.panEnable();
 }
 
-/// Copy the §[event_state] GPR-backed vregs (vregs 1..13 on aarch64:
-/// x0..x12) from `src` to `dst`. Companion to x86-64's `copyEventStateGprs`;
-/// used by `reply` (Spec §[reply] test 05) to apply the receiver's vreg
-/// modifications onto the suspended thread's saved iret frame when the
-/// originating thread handle held the `write` cap.
-///
-/// Only vregs 1..13 are currently propagated. The wholesale
-/// `dst.regs = src.regs` shape would clobber x13..x30 (including AAPCS64
-/// callee-saved x19..x28, FP x29, and LR x30). LR corruption in
-/// particular makes the resumed thread `RET` to the receiver's stack frame
-/// instead of returning from its own `svc`, which silently traps the
-/// post-resume control flow (including the `delete(SLOT_SELF)` tail in
-/// `libz/start.zig`) — processes never tear down, leaked timer/PMM state
-/// accumulates per test, and the in-kernel-parallel runner stalls in
-/// `createProcess` once PMM blocks are exhausted.
-pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext) void {
-    dst.regs.x0 = src.regs.x0;
-    dst.regs.x1 = src.regs.x1;
-    dst.regs.x2 = src.regs.x2;
-    dst.regs.x3 = src.regs.x3;
-    dst.regs.x4 = src.regs.x4;
-    dst.regs.x5 = src.regs.x5;
-    dst.regs.x6 = src.regs.x6;
-    dst.regs.x7 = src.regs.x7;
-    dst.regs.x8 = src.regs.x8;
-    dst.regs.x9 = src.regs.x9;
-    dst.regs.x10 = src.regs.x10;
-    dst.regs.x11 = src.regs.x11;
-    dst.regs.x12 = src.regs.x12;
+/// Apply receiver modifications to x0..x30 only within the originating
+/// event's declared window. The low 13 lanes retain the existing
+/// zero-count behavior pending the §suspend ambiguity tracked in .371.7.
+pub fn copyEventStateGprs(dst: *ArchCpuContext, src: *const ArchCpuContext, payload_count: u7) void {
+    var values: [31]u64 = @bitCast(dst.regs);
+    const source: [31]u64 = @bitCast(src.regs);
+    // Keep the low-lane behavior used by existing zero-count suspensions
+    // until the §suspend/§event_state conflict is resolved (.371.7).
+    // Higher lanes are applied only when the sender declared them valid.
+    const limit: usize = @max(13, @min(@as(usize, payload_count), 31));
+    for (0..limit) |i| values[i] = source[i];
+    dst.regs = @bitCast(values);
 }
 
-/// Snapshot the suspending thread's GPR-backed vregs 1..13 in canonical
-/// vreg order. Spec §[event_state] aarch64 maps vregs 1..13 onto
-/// x0..x12.
-pub fn getEventStateGprs(ctx: *const ArchCpuContext) [13]u64 {
-    return .{
-        ctx.regs.x0,
-        ctx.regs.x1,
-        ctx.regs.x2,
-        ctx.regs.x3,
-        ctx.regs.x4,
-        ctx.regs.x5,
-        ctx.regs.x6,
-        ctx.regs.x7,
-        ctx.regs.x8,
-        ctx.regs.x9,
-        ctx.regs.x10,
-        ctx.regs.x11,
-        ctx.regs.x12,
-    };
+/// Snapshot all 31 AArch64 GPR-backed event-state vregs, x0..x30.
+pub fn getEventStateGprs(ctx: *const ArchCpuContext) [31]u64 {
+    return @bitCast(ctx.regs);
 }
 
-/// Project a vreg 1..13 GPR snapshot onto a receiving thread's frame in
-/// canonical vreg order. Companion to `getEventStateGprs`.
-pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [13]u64) void {
-    ctx.regs.x0 = gprs[0];
-    ctx.regs.x1 = gprs[1];
-    ctx.regs.x2 = gprs[2];
-    ctx.regs.x3 = gprs[3];
-    ctx.regs.x4 = gprs[4];
-    ctx.regs.x5 = gprs[5];
-    ctx.regs.x6 = gprs[6];
-    ctx.regs.x7 = gprs[7];
-    ctx.regs.x8 = gprs[8];
-    ctx.regs.x9 = gprs[9];
-    ctx.regs.x10 = gprs[10];
-    ctx.regs.x11 = gprs[11];
-    ctx.regs.x12 = gprs[12];
+/// Project the x0..x30 event-state snapshot onto a receiver frame.
+pub fn setEventStateGprs(ctx: *ArchCpuContext, gprs: [31]u64) void {
+    ctx.regs = @bitCast(gprs);
 }

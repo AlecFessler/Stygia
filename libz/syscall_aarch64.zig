@@ -144,7 +144,7 @@ pub fn issueRegDiscard(word: u64, in: Regs) void {
 // spec; vreg 1 / x0 carries the success/error code. No red zone on
 // aarch64, so the 800-byte reservation covers the kernel-visible
 // receive window (vreg 0 at [sp + 0], vregs 32..127 at [sp + 8..768])
-// and keeps the private x18 save slot outside that window at [sp + 784].
+// and keeps private x18 and x19..x30 saves outside that window.
 pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov1: u64 = undefined;
     var ov2: u64 = undefined;
@@ -161,13 +161,27 @@ pub fn issueRawCaptureWord(word_in: u64, in: Regs) RecvReturn {
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #800
+        \\ sub sp, sp, #896
         \\ str x18, [sp, #784]
+        \\ add x16, sp, #800
+        \\ stp x19, x20, [x16, #0]
+        \\ stp x21, x22, [x16, #16]
+        \\ stp x23, x24, [x16, #32]
+        \\ stp x25, x26, [x16, #48]
+        \\ stp x27, x28, [x16, #64]
+        \\ stp x29, x30, [x16, #80]
         \\ str %[word], [sp]
         \\ svc #0
         \\ ldr %[oword], [sp]
+        \\ add x16, sp, #800
+        \\ ldp x19, x20, [x16, #0]
+        \\ ldp x21, x22, [x16, #16]
+        \\ ldp x23, x24, [x16, #32]
+        \\ ldp x25, x26, [x16, #48]
+        \\ ldp x27, x28, [x16, #64]
+        \\ ldp x29, x30, [x16, #80]
         \\ ldr x18, [sp, #784]
-        \\ add sp, sp, #800
+        \\ add sp, sp, #896
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
@@ -327,8 +341,15 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
     var ov13: u64 = undefined;
     var oword: u64 = undefined;
     asm volatile (
-        \\ sub sp, sp, #800
+        \\ sub sp, sp, #896
         \\ str x18, [sp, #784]
+        \\ add x16, sp, #800
+        \\ stp x19, x20, [x16, #0]
+        \\ stp x21, x22, [x16, #16]
+        \\ stp x23, x24, [x16, #32]
+        \\ stp x25, x26, [x16, #48]
+        \\ stp x27, x28, [x16, #64]
+        \\ stp x29, x30, [x16, #80]
         \\ mov x13, sp
         \\ mov x14, #97
         \\1: str xzr, [x13]
@@ -350,8 +371,15 @@ pub fn replyTransferRecvAsm(word: u64, attachments_ptr: [*]const u64, n: u64) Re
         \\ str %[word], [sp]
         \\ svc #0
         \\ ldr %[oword], [sp]
+        \\ add x16, sp, #800
+        \\ ldp x19, x20, [x16, #0]
+        \\ ldp x21, x22, [x16, #16]
+        \\ ldp x23, x24, [x16, #32]
+        \\ ldp x25, x26, [x16, #48]
+        \\ ldp x27, x28, [x16, #64]
+        \\ ldp x29, x30, [x16, #80]
         \\ ldr x18, [sp, #784]
-        \\ add sp, sp, #800
+        \\ add sp, sp, #896
         : [v1] "={x0}" (ov1),
           [v2] "={x1}" (ov2),
           [v3] "={x2}" (ov3),
