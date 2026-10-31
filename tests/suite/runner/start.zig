@@ -108,7 +108,15 @@ fn bootstrapLibz(cap_table_base: u64) void {
     // Pinning preferred_base = LIBZ_SLIDE is what makes the runner's
     // pre-applied RELATIVE relocs land correctly.
     const needs_writable_libz = builtin.cpu.arch == .x86_64;
-    const vmar_caps = lib.caps.VmarCap{ .r = true, .w = needs_writable_libz, .x = true };
+    // A restart-cap test process needs libz to remain mapped while a
+    // restart-at-entry worker runs after its initial thread faults.
+    const self_caps: lib.caps.SelfCap = @bitCast(lib.caps.readCap(cap_table_base, lib.caps.SLOT_SELF).caps());
+    const vmar_caps = lib.caps.VmarCap{
+        .r = true,
+        .w = needs_writable_libz,
+        .x = true,
+        .restart_policy = if (self_caps.restart) 2 else 0,
+    };
     const var_caps_word: u64 = @as(u64, vmar_caps.toU16());
     const props: u64 = if (needs_writable_libz) 0b111 else 0b101;
 

@@ -783,10 +783,10 @@ verify_image_arch() {
 # clean summary used to PASS this gate outright.
 #
 # `[UNHANDLED]` usually means a faulted thread will not report a result.
-# The full suite's breakpoint_fault_01 is the one exception: it deliberately
-# faults a nested child, then proves process teardown through E_CLOSED before
-# its parent reports PASS. check_kernel_fault_log.py requires that PASS, the
-# child's diagnostic tag and thread identity, and the architecture's breakpoint
+# breakpoint_fault_01 and the restart observers deliberately fault nested
+# children, then have an independent parent prove teardown or restart before
+# reporting PASS. check_kernel_fault_log.py requires that later PASS, an exact
+# manifest tag/name match, thread identity, and the architecture's breakpoint
 # subcode. VM subsets and all other unhandled faults still fail the gate.
 # [USR-PF] is not a marker: the map_pf tests fault on purpose.
 #

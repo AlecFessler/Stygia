@@ -432,6 +432,19 @@ pub fn unmapPageNoShootdown(addr_space_root: PAddr, virt: VAddr) ?PAddr {
     };
 }
 
+/// Clear a VMAR leaf of its declared size during quiesced process teardown.
+/// The architecture must remove a 2 MiB block before its PF is released;
+/// a 4 KiB-only walk would leave a live PTE and double-free its backing.
+pub fn unmapPageSizedNoShootdown(addr_space_root: PAddr, virt: VAddr, sz: VmarPageSize) ?PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.unmapPageSizedNoShootdown(addr_space_root, virt, sz),
+        // ARM's broadcast TLBI is safe during quiesced teardown. Its sized
+        // walker is required even though the invalidation is redundant.
+        .aarch64 => aarch64.paging.unmapPageSized(addr_space_root, virt, sz),
+        else => unreachable,
+    };
+}
+
 /// Publish a globals-inclusive cross-core TLB invalidation for a KERNEL
 /// virtual range whose leaf PTEs have just been cleared, and return an
 /// opaque epoch. The backing physical frames may only be recycled once

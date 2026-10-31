@@ -916,9 +916,10 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
-            _ = dispatch.paging.unmapPageNoShootdown(
+            _ = dispatch.paging.unmapPageSizedNoShootdown(
                 addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
+                v.sz,
             );
             off += sz_bytes;
         }
@@ -932,14 +933,103 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
         const sz_bytes = pageSizeBytes(v.sz);
         var off: u64 = 0;
         while (off < @as(u64, v.page_count) * sz_bytes) {
-            _ = dispatch.paging.unmapPageNoShootdown(
+            _ = dispatch.paging.unmapPageSizedNoShootdown(
                 addr_space_root,
                 .fromInt(v.base_vaddr.addr + off),
+                v.sz,
             );
             off += sz_bytes;
         }
     }
     slab_instance.destroy(v, gen) catch {};
+}
+
+/// Reset a VMAR's installed pages while retaining its reservation and
+/// handle. The restart owner has already quiesced the owning address space.
+pub fn restartDecommit(process: *Process, slot: u12) void {
+    const v = resolveVmar(process, slot) orelse return;
+    const irq = v._gen_lock.lockIrqSave(@src());
+    if (v.map != .unmapped) {
+        unmapAll(v, process);
+        v.map = .unmapped;
+    }
+    refreshVmarSnapshot(process, slot, v);
+    v._gen_lock.unlockIrqRestore(irq);
+}
+
+/// Copy a stable snapshot source into a fresh target backing. A missing or
+/// writable/shared source invalidates the restart rather than allowing a
+/// partially reset process to resume.
+pub fn restartSnapshot(process: *Process, slot: u12) bool {
+    const target = resolveVmar(process, slot) orelse return false;
+    const source_ref = target.snapshot_source orelse return false;
+    if (source_ref.ptr == target) return false;
+    const target_ref = SlabRef(VMAR).init(target, target._gen_lock.currentGen());
+    // Two VMARs may live in different processes. Acquire in address order
+    // so concurrent opposite-direction snapshot restarts cannot deadlock.
+    const SNAPSHOT_VMAR_GROUP: u32 = 0x564D4152;
+    if (@intFromPtr(target) < @intFromPtr(source_ref.ptr)) {
+        const target_lr = target_ref.lockOrderedIrqSave(SNAPSHOT_VMAR_GROUP, @src()) catch return false;
+        defer target_ref.unlockIrqRestore(target_lr.irq_state);
+        const source_lr = source_ref.lockOrderedIrqSave(SNAPSHOT_VMAR_GROUP, @src()) catch return false;
+        defer source_ref.unlockIrqRestore(source_lr.irq_state);
+        return restartSnapshotLocked(process, slot, target, source_lr.ptr);
+    }
+    const source_lr = source_ref.lockOrderedIrqSave(SNAPSHOT_VMAR_GROUP, @src()) catch return false;
+    defer source_ref.unlockIrqRestore(source_lr.irq_state);
+    const target_lr = target_ref.lockOrderedIrqSave(SNAPSHOT_VMAR_GROUP, @src()) catch return false;
+    defer target_ref.unlockIrqRestore(target_lr.irq_state);
+    return restartSnapshotLocked(process, slot, target, source_lr.ptr);
+}
+
+fn restartSnapshotLocked(process: *Process, slot: u12, target: *VMAR, source: *VMAR) bool {
+    if (source.map == .page_frame) {
+        for (source.installed_pfs) |installed| {
+            if (installed.pf == null) continue;
+            const pf = installed.pf.?.ptr;
+            if (@atomicLoad(u32, &pf.mapcnt, .acquire) != 1 or (installed.effective_rwx & 0b010) != 0)
+                return false;
+        }
+    } else if (source.map == .demand) {
+        if ((source.cur_rwx & 0b010) != 0) return false;
+    } else if (source.map != .unmapped) {
+        return false;
+    }
+
+    if (target.map != .unmapped) unmapAll(target, process);
+    target.map = .unmapped;
+
+    var has_backing = false;
+    for (source.installed_pfs) |installed| {
+        if (installed.pf != null) {
+            has_backing = true;
+            break;
+        }
+    }
+    if (has_backing) {
+        // One source installation may span multiple PF pages, and the
+        // source/target VMARs may use different page sizes as long as
+        // their byte lengths match. Build one target-sized backing span
+        // and copy each installed source span at its byte offset. Fresh
+        // PMM pages are zeroed, preserving unbacked source holes.
+        const copied_pf = stygia.memory.page_frame.allocForDemandPages(target.sz, target.page_count) catch return false;
+        defer stygia.memory.page_frame.releaseHandle(copied_pf);
+        const target_bytes = @as(u64, target.page_count) * pageSizeBytes(target.sz);
+        const dst_addr = VAddr.fromPAddr(copied_pf.phys_base, null).addr;
+        const dst: [*]u8 = @ptrFromInt(dst_addr);
+        for (source.installed_pfs) |installed| {
+            const src_pf = if (installed.pf) |ref| ref.ptr else continue;
+            const bytes = @as(u64, src_pf.page_count) * pageSizeBytes(src_pf.sz);
+            if (installed.offset > target_bytes or bytes > target_bytes - installed.offset) return false;
+            const src_addr = VAddr.fromPAddr(src_pf.phys_base, null).addr;
+            const src: [*]const u8 = @ptrFromInt(src_addr);
+            @memcpy(dst[installed.offset..][0..bytes], src[0..bytes]);
+        }
+        if (mappingInstall(target, 0, copied_pf, 0b111) != 0) return false;
+        target.map = .demand;
+    }
+    refreshVmarSnapshot(process, slot, target);
+    return true;
 }
 
 /// Allocate a contiguous VA range of `pages * sz` bytes for a new VMAR.

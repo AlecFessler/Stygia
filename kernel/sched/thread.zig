@@ -85,7 +85,10 @@ pub var inline_finalize_no: u64 = 0;
 var report_enter_prints: u32 = 0;
 const REPORT_TAG_MAGIC: u64 = 0x8000;
 const REPORT_PRINT_BUDGET: u32 = 4096;
-const PRE_REPORT_TERMINAL_PRINT_BUDGET: u32 = 64;
+// A full Pi gate runs the manifest three times in one boot. The restart
+// observers alone emit more than 64 proved child-fault records across those
+// runs, so retain a bounded record for every expected fault.
+const PRE_REPORT_TERMINAL_PRINT_BUDGET: u32 = 256;
 var pre_report_terminal_prints: u32 = 0;
 pub const PRE_REPORT_TERMINAL_RING_LEN: usize = if (build_options.kernel_spawn_diag) 32 else 0;
 pub const SPAWN_TRACE_RING_LEN: usize = if (build_options.kernel_spawn_diag) 128 else 0;
@@ -168,17 +171,17 @@ pub fn printPreReportTerminal(
     process: ?*Process,
     reason: []const u8,
     fault_subcode: ?u8,
-) void {
-    if (!build_options.kernel_spawn_diag) return;
+) bool {
+    if (!build_options.kernel_spawn_diag) return false;
     if (thread) |e| {
-        if (e.diag_report_entered) return;
+        if (e.diag_report_entered) return false;
     }
     const tag: u64 = blk: {
         if (thread) |e| if (e.diag_test_tag != 0) break :blk e.diag_test_tag;
         if (process) |d| if (d.diag_test_tag != 0) break :blk d.diag_test_tag;
         break :blk 0;
     };
-    if ((tag & REPORT_TAG_MAGIC) == 0) return;
+    if ((tag & REPORT_TAG_MAGIC) == 0) return false;
 
     recordSpawnTrace(thread, process, .terminal, 0);
 
@@ -192,7 +195,7 @@ pub fn printPreReportTerminal(
     slot.thread = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
     slot.reason = reason;
     slot.publish_seq.store(seq, .release);
-    if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return;
+    if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return false;
 
     const process_addr = if (process) |d| @intFromPtr(d) else @as(usize, 0);
     const thread_addr = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
@@ -209,6 +212,7 @@ pub fn printPreReportTerminal(
             .{ tag, tag - REPORT_TAG_MAGIC, process_addr, thread_addr, reason },
         );
     }
+    return true;
 }
 
 pub fn recordSpawnTrace(
@@ -828,7 +832,12 @@ pub var park_calls: u64 = 0;
 pub fn parkSelfFaulted(thread: *Thread) void {
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     park_calls +%= 1;
-    _ = retireAndBumpCurrentGen(thread);
+    // Leave the generation live until the queued process exit has decided
+    // between restart and destroy. A restart must be able to read this
+    // thread's entry and stack metadata after the core hops to its park
+    // stack. The queued owner retires the slab after that hop.
+    _ = lifecycle.markRetiring(thread);
+    _ = lifecycle.retire(thread);
 }
 
 /// Park the calling thread into `.idle_wait` — used by the aarch64 wfi/wfe
@@ -943,13 +952,6 @@ fn retireAndBumpDeadGen(
         .owner = retired_owner,
         .gen = gen,
     };
-}
-
-fn retireAndBumpCurrentGen(thread: *Thread) ?RetiredDeadGen {
-    const gen = thread._gen_lock.currentGen();
-    if (gen % 2 == 0) return null;
-    const thread_ref = SlabRef(Thread).init(thread, @intCast(gen));
-    return retireAndBumpDeadGen(thread_ref, thread);
 }
 
 pub fn terminate(caller: *Thread, target: u64) i64 {
@@ -1941,6 +1943,18 @@ pub fn dischargeClaimedHolderDead(thread: *Thread) void {
 }
 
 pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Process) void {
+    _ = destroyThreadRefLockedMode(thread_ref, caller_process, false);
+}
+
+/// Restart retires the old thread generation so outstanding reply handles
+/// resolve to E_TERM. Terminate's E_ABANDONED marker must not be applied to
+/// those replies: the old generation, rather than explicit termination, is
+/// what invalidates them.
+pub fn destroyThreadForRestart(thread_ref: SlabRef(Thread)) bool {
+    return destroyThreadRefLockedMode(thread_ref, null, true);
+}
+
+fn destroyThreadRefLockedMode(thread_ref: SlabRef(Thread), caller_process: ?*Process, restarting: bool) bool {
     const thread = thread_ref.ptr;
 
     // Route the slab destroy through the deferred-finalize path
@@ -1956,9 +1970,13 @@ pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Pro
     // unmap that `finalizeDestroyMarkedDead` does only fires once the
     // thread's `last_dispatched_core` has done a `switchTo` — i.e. the
     // running core is provably off the kstack.
-    const retired = retireAndBumpDeadGen(thread_ref, thread) orelse return;
+    const retired = retireAndBumpDeadGen(thread_ref, thread) orelse return false;
 
-    if (thread.pending_reply_holder != null) {
+    if (restarting) {
+        thread.pending_reply_holder = null;
+        thread.pending_reply_process = null;
+        thread.pending_reply_slot = 0;
+    } else if (thread.pending_reply_holder != null) {
         if (thread.pending_reply_process) |dom_ref| {
             if (caller_process != null and dom_ref.ptr == caller_process.?) {
                 // Same-process reply pin — the user_table has already been
@@ -2030,4 +2048,5 @@ pub fn destroyThreadRefLocked(thread_ref: SlabRef(Thread), caller_process: ?*Pro
     scheduler.removeFromQueue(thread);
 
     routeRetiredFinalize(thread, retired.gen, retired.from, retired.owner, null);
+    return true;
 }

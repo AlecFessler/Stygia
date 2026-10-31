@@ -430,20 +430,24 @@ pub fn deleteAndDetach(caller_process: ErasedSlabRef, slot: u12) i64 {
         const process = process_lr.ptr;
 
         const process_ref = SlabRef(Process).init(process, process._gen_lock.currentGen());
+        const exit_decision = stygia.caps.process.claimExitLocked(process);
         const caller_thread = stygia.sched.scheduler.currentThread();
         caller_process.unlockTypedIrqRestore(Process, process_lr.irq_state);
         tree_mutex.unlockIrqRestore(tree_irq);
 
-        stygia.sched.thread.printPreReportTerminal(caller_thread, process, "delete_slot_self", null);
+        _ = stygia.sched.thread.printPreReportTerminal(caller_thread, process, "delete_slot_self", null);
 
-        stygia.sched.scheduler.queueCurrentTeardown(.{
-            .kind = .self_delete,
-            .process = process_ref,
-            .caller_thread = if (caller_thread) |thread|
-                SlabRef(Thread).init(thread, thread._gen_lock.currentGen())
-            else
-                null,
-        });
+        if (exit_decision != .already_claimed) {
+            stygia.sched.scheduler.queueCurrentTeardown(.{
+                .kind = .self_delete,
+                .process = process_ref,
+                .caller_thread = if (caller_thread) |thread|
+                    SlabRef(Thread).init(thread, thread._gen_lock.currentGen())
+                else
+                    null,
+                .restart_chosen = exit_decision == .restart,
+            });
+        }
         if (caller_thread) |thread| {
             stygia.sched.thread.parkSelfFaulted(thread);
         }
@@ -466,6 +470,28 @@ pub fn deleteAndDetach(caller_process: ErasedSlabRef, slot: u12) i64 {
 
     detachForDelete(process, slot, entry);
     capability.releaseHandle(process, slot, entry);
+    capability.clearAndFreeSlot(process, slot, entry);
+    return 0;
+}
+
+/// Restart-policy reply drop: use the same derivation-tree splice as delete,
+/// but wake the suspended sender with E_REFUSED instead of E_ABANDONED.
+pub fn dropReplyForRestart(caller_process: ErasedSlabRef, slot: u12) i64 {
+    const tree_irq = tree_mutex.lockIrqSaveOrdered(@src(), TREE_MUTEX_GROUP);
+    defer tree_mutex.unlockIrqRestore(tree_irq);
+    const process_lr = caller_process.lockTypedIrqSaveOrdered(Process, TREE_PROCESS_GROUP) catch
+        return errors.E_BADCAP;
+    const process = process_lr.ptr;
+    defer caller_process.unlockTypedIrqRestore(Process, process_lr.irq_state);
+
+    const entry = capability.resolveHandleOnProcess(process, slot, .reply) orelse
+        return errors.E_BADCAP;
+    const sender_ref = capability.typedRef(Thread, entry.*) orelse return errors.E_BADCAP;
+    if (sender_ref.lockIrqSave(@src())) |sender_lr| {
+        stygia.sched.port.resumeWithRefused(sender_lr.ptr);
+        sender_ref.unlockIrqRestore(sender_lr.irq_state);
+    } else |_| {}
+    detachForDelete(process, slot, entry);
     capability.clearAndFreeSlot(process, slot, entry);
     return 0;
 }
