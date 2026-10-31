@@ -556,7 +556,7 @@ pub fn build(b: *std.Build) void {
     if (emit_index) {
         // Run the indexer (must already be built — `process tools/indexer && zig
         // build` once before invoking this) against the just-installed
-        // kernel ELF + IR. Output `.db` lands in tools/callgraph_http/test/dbs/
+        // kernel IR (and x86_64 ELF). Output `.db` lands in tools/callgraph_http/test/dbs/
         // where the callgraph daemons auto-discover it.
         //
         // We can't bootstrap the indexer's own zig build from here without
@@ -564,7 +564,6 @@ pub fn build(b: *std.Build) void {
         // -Demit_index=true` flags get inherited by the sub-build, where
         // they're invalid). Keep them as separate, explicit zig invocations.
         const installed_ir = b.fmt("{s}/kernel.{s}.ll", .{ b.install_path, @tagName(arch) });
-        const installed_elf = b.fmt("{s}/{s}/{s}", .{ b.install_path, out_dir, kernel.name });
         const db_dir = b.path("tools/callgraph_http/test/dbs").getPath(b);
         const db_filename = b.fmt("{s}-{s}.db", .{ @tagName(arch), commit_sha });
         const db_out = b.fmt("{s}/{s}", .{ db_dir, db_filename });
@@ -588,9 +587,13 @@ pub fn build(b: *std.Build) void {
             commit_sha,
             "--ir",
             installed_ir,
-            "--elf",
-            installed_elf,
         });
+        // The bin pass uses x86 objdump syntax and cannot decode an aarch64
+        // ELF. ARM indexes still include source, IR, callgraph and entries.
+        if (arch == .x86_64) {
+            const installed_elf = b.fmt("{s}/{s}/{s}", .{ b.install_path, out_dir, kernel.name });
+            run_indexer.addArgs(&.{ "--elf", installed_elf });
+        }
         run_indexer.step.dependOn(&install_kernel.step);
         if (maybe_install_ir) |ir| run_indexer.step.dependOn(&ir.step);
         const index_step = b.step("index", "Run the callgraph DB indexer after the kernel build (requires `process tools/indexer && zig build` and -Demit_index=true)");

@@ -6,22 +6,29 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseFast,
     });
 
-    const exe = b.addExecutable(.{
+    // GCC 16 crt objects contain .sframe relocations unsupported by Zig
+    // 0.15.2's bundled linker. Emit an object and link it with system cc.
+    const obj = b.addObject(.{
         .name = "callgraph_http",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
-    // Link the system SQLite. On Arch this is `pacman -S sqlite`.
-    exe.linkSystemLibrary("sqlite3");
-    exe.linkLibC();
 
-    b.installArtifact(exe);
+    const link = b.addSystemCommand(&.{ "cc", "-o" });
+    const exe_path = link.addOutputFileArg("callgraph_http");
+    link.addFileArg(obj.getEmittedBin());
+    link.addArg("-lsqlite3");
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    const install = b.addInstallBinFile(exe_path, "callgraph_http");
+    b.getInstallStep().dependOn(&install.step);
+
+    const run_cmd = std.Build.Step.Run.create(b, "run callgraph_http");
+    run_cmd.addFileArg(exe_path);
+    run_cmd.step.dependOn(&install.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

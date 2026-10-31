@@ -19,7 +19,7 @@ fi
 
 if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
     echo "smoke: no callgraph DB found." >&2
-    echo "  build one with: bash tests/test.sh dead-code  (or run the indexer manually)" >&2
+    echo "  build one with: (cd tools/indexer && zig build); zig build index -Demit_index=true" >&2
     exit 2
 fi
 
@@ -31,10 +31,21 @@ fi
 DB_SHA="$(sqlite3 "$DB_PATH" "SELECT value FROM meta WHERE key='commit_sha'" 2>/dev/null || echo unknown)"
 echo "smoke: DB=$DB_PATH (sha=$DB_SHA)"
 
+HALT_ADDR="$(sqlite3 "$DB_PATH" "SELECT printf('0x%016x', b.addr) FROM bin_symbol b JOIN entity e ON e.id = b.entity_id WHERE e.qualified_name = 'arch.x64.cpu.halt' LIMIT 1;")"
+if [[ -z "$HALT_ADDR" ]]; then
+    echo "smoke: arch.x64.cpu.halt has no indexed binary symbol" >&2
+    exit 2
+fi
+HALT_AT="$(sqlite3 "$DB_PATH" "SELECT f.path || ':' || d.line FROM bin_symbol b JOIN entity e ON e.id = b.entity_id JOIN bin_inst i ON i.addr >= b.addr AND i.addr < b.addr + b.size JOIN dwarf_line d ON i.addr BETWEEN d.addr_lo AND d.addr_hi JOIN file f ON f.id = d.file_id WHERE e.qualified_name = 'arch.x64.cpu.halt' AND i.mnemonic = 'hlt' ORDER BY i.addr LIMIT 1;")"
+if [[ -z "$HALT_AT" ]]; then
+    echo "smoke: arch.x64.cpu.halt has no indexed hlt source line" >&2
+    exit 2
+fi
+
 REQ_FILE="$(mktemp)"
 trap 'rm -f "$REQ_FILE"' EXIT
 
-# Build a single JSON-RPC stream: initialize + 15 tool calls.
+# Build a single JSON-RPC stream: initialize + 16 tool calls.
 {
     cat <<JSON
 {"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}
@@ -50,9 +61,9 @@ trap 'rm -f "$REQ_FILE"' EXIT
 {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"callgraph_trace","arguments":{"entry":"arch.x64.power.doReboot","depth":2}}}
 {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"callgraph_type","arguments":{"name":"memory.address.VAddr"}}}
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"callgraph_src_bin","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"callgraph_src_bin_at","arguments":{"at":"arch/x64/cpu.zig:430"}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"callgraph_src_bin_at","arguments":{"at":"$HALT_AT"}}}
 {"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"callgraph_bin_dataflow_reg","arguments":{"name":"arch.x64.cpu.halt","reg":"rsp"}}}
-{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"callgraph_bin_addr2line","arguments":{"addr":"0xffffffff8000f815"}}}
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"callgraph_bin_addr2line","arguments":{"addr":"$HALT_ADDR"}}}
 {"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"callgraph_commits","arguments":{"limit":3}}}
 {"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"callgraph_findings","arguments":{"limit":3}}}
 JSON
@@ -63,7 +74,7 @@ trap 'rm -f "$REQ_FILE" "$OUT_FILE"' EXIT
 
 "$CALLGRAPH_BIN" --db "$DB_PATH" --git-root "$STYGIA_ROOT" < "$REQ_FILE" > "$OUT_FILE" 2>/tmp/callgraph_mcp_smoke.err
 
-# Tools 1..15: each must have id:N with "result", not "error".
+# Tools 1..16: each must have id:N with "result", not "error".
 fail=0
 ok=0
 declare -A NAMES=(

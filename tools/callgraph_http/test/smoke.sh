@@ -29,7 +29,7 @@ fi
 
 if [[ -z "$DB_PATH" || ! -f "$DB_PATH" ]]; then
     echo "smoke: no callgraph DB found." >&2
-    echo "  build one with: bash tests/test.sh dead-code  (or run the indexer manually)" >&2
+    echo "  build one with: (cd tools/indexer && zig build); zig build index -Demit_index=true" >&2
     exit 2
 fi
 
@@ -77,7 +77,20 @@ DIFF_PATH="$(cd "$STYGIA_ROOT" && git show --pretty='' --name-only "$DB_SHA" 2>/
 # Spaces only — slashes go raw, the server's query-string parser handles them.
 DIFF_PATH_ENC="$(printf '%s' "$DIFF_PATH" | sed 's| |%20|g')"
 
-# 26 endpoints — must stay aligned with the route table in src/main.zig.
+# Resolve an address from this exact DB. A fixed address goes stale on every
+# kernel rebuild even when the address-to-line endpoint is working correctly.
+HALT_ADDR="$(sqlite3 "$DB_PATH" "SELECT printf('0x%016x', b.addr) FROM bin_symbol b JOIN entity e ON e.id = b.entity_id WHERE e.qualified_name = 'arch.x64.cpu.halt' LIMIT 1;")"
+if [[ -z "$HALT_ADDR" ]]; then
+    echo "smoke: arch.x64.cpu.halt has no indexed binary symbol" >&2
+    exit 2
+fi
+HALT_AT="$(sqlite3 "$DB_PATH" "SELECT f.path || ':' || d.line FROM bin_symbol b JOIN entity e ON e.id = b.entity_id JOIN bin_inst i ON i.addr >= b.addr AND i.addr < b.addr + b.size JOIN dwarf_line d ON i.addr BETWEEN d.addr_lo AND d.addr_hi JOIN file f ON f.id = d.file_id WHERE e.qualified_name = 'arch.x64.cpu.halt' AND i.mnemonic = 'hlt' ORDER BY i.addr LIMIT 1;")"
+if [[ -z "$HALT_AT" ]]; then
+    echo "smoke: arch.x64.cpu.halt has no indexed hlt source line" >&2
+    exit 2
+fi
+
+# 27 endpoints — must stay aligned with the route table in src/main.zig.
 probe arches             "$BASE/api/arches"                                                       'x86_64'
 probe find               "$BASE/api/find?q=halt"                                                  'halt'
 probe loc                "$BASE/api/loc?name=arch.x64.cpu.halt"                                   'cpu'
@@ -93,8 +106,8 @@ probe reaches_yes        "$BASE/api/reaches?from=arch.x64.power.doReboot&to=arch
 probe reaches_no         "$BASE/api/reaches?from=arch.x64.cpu.halt&to=main.kMain"                 'no path'
 probe type               "$BASE/api/type?name=memory.address.VAddr"                               'VAddr'
 probe src_bin            "$BASE/api/src_bin?name=arch.x64.cpu.halt"                               'hlt'
-probe src_bin_at         "$BASE/api/src_bin_at?at=arch/x64/cpu.zig:430"                           'hlt'
-probe bin_addr2line      "$BASE/api/bin_addr2line?addr=0xffffffff8000f815"                       'cpu.zig'
+probe src_bin_at         "$BASE/api/src_bin_at?at=$HALT_AT"                                        'hlt'
+probe bin_addr2line      "$BASE/api/bin_addr2line?addr=$HALT_ADDR"                                'cpu.zig'
 probe bin_dataflow_reg   "$BASE/api/bin_dataflow_reg?name=arch.x64.cpu.halt&reg=rsp"             '.'
 probe graph              "$BASE/api/graph"                                                        'definitions'
 probe source             "$BASE/api/source?path=arch/x64/cpu.zig&start=425&end=435"               'pub fn'
