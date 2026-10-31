@@ -1035,10 +1035,6 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
     // bump and (eventually) recycle to another thread.
     stygia.sched.fpu.clearFromLastFpuOwner(thread);
 
-    if (thread.vm != null and thread.vcpu_arch_state != null) {
-        arch.vm.freeVcpuArchState(thread);
-    }
-
     scheduler.removeFromQueue(thread);
     routeRetiredFinalize(thread, retired.gen, retired.from, retired.owner, caller);
     return errors.OK;
@@ -1062,6 +1058,19 @@ pub fn terminate(caller: *Thread, target: u64) i64 {
 pub fn finalizeDestroyMarkedDead(thread: *Thread) void {
     recordSpawnTrace(thread, null, .finalize, 0);
     lifecycle.markDirectiveDead(thread);
+    // The owner core can still be inside enterGuest after a remote retire.
+    // Both arch run loops retain a local pointer to this page across guest
+    // entry and inline exits. All callers of this finalizer have either
+    // proved the thread is no longer current or are the owner after it has
+    // left the guest loop, so this is the first safe point to release it.
+    if (thread.vcpu_arch_state != null) {
+        // The local caller must already have evicted the vCPU before
+        // releasing its page. Remote ownership is handled by
+        // routeRetiredFinalize and the owner-side discharge path; avoid
+        // reading another core's plain current_thread slot here.
+        std.debug.assert(!scheduler.coreCurrentIs(@truncate(arch.smp.coreID()), thread));
+        arch.vm.freeVcpuArchState(thread);
+    }
     if (thread.suspend_port) |port_ref| {
         if (port_ref.lockIrqSave(@src())) |plr| {
             const p = plr.ptr;
@@ -2048,12 +2057,6 @@ fn destroyThreadRefLockedMode(thread_ref: SlabRef(Thread), caller_process: ?*Pro
             port_ref.unlockIrqRestore(plr.irq_state);
         } else |_| {}
         thread.exit_port = null;
-    }
-
-    // vCPU thread: free per-vCPU arch state (GuestState + FxsaveArea page).
-    // No-op for regular Threads (vcpu_arch_state stays null).
-    if (thread.vm != null and thread.vcpu_arch_state != null) {
-        arch.vm.freeVcpuArchState(thread);
     }
 
     scheduler.removeFromQueue(thread);
