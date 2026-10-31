@@ -205,7 +205,7 @@ cd docs/kernel/tla
 ./run.sh                            # the DEFAULT battery: 33 configs + sany
 RUN_XLARGE=1 ./run.sh               # + xlarge (3c x 4e safety)
 RUN_SLOW=1   ./run.sh               # + measured t1full, full t1d, cr1fullself, liveness_a/b
-RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # all 39; hours, launch it detached
+RUN_XLARGE=1 RUN_SLOW=1 ./run.sh    # 49 configured rows; hours, launch it detached
 ```
 
 The former full `medium` aggregate (`ThreadLifecycle_medium.cfg`) is no
@@ -338,8 +338,8 @@ gitignored; keep all generated output under them.
 |---|---|
 | `ThreadLifecycle.tla` | the model: rev 17 plus the dispatch-tail and vCPU-cancel extensions, with older/defective machines as switches |
 | `ThreadProbes.tla` | reachability probes (`pr1`–`pr5`, with `pr4`, `pr4d`, and `pr4d_min` all checking `ProbeNoTermSuspendCycle` at their paired scopes) |
-| `run.sh` | **runs every config below except the `q*` set, `dirabafix`, the oversized full `medium`, and full `pr4d`; exits non-zero on any deviation** |
-| `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants |
+| `run.sh` | **runs 43 default rows and six opt-in rows; exits non-zero on any deviation** |
+| `ThreadLifecycle_small.cfg` | 2c × 2e, ALL features, full safety battery + both cycle invariants; TLC core/thread symmetry reduction |
 | `ThreadLifecycle_medium_nodir.cfg` | default 2c × 3e non-directive aggregate: RV, pin-lock, S7, fast path, suspend, term budget 2, symmetry |
 | `ThreadLifecycle_medium.cfg` | extended/manual 2c × 3e full directive aggregate, symmetry. **Oversized after dpin/dres; not default evidence.** Two documented scope cuts in-file: `DIR_DROP = FALSE` and `CR_BUDGET = 0` |
 | `ThreadLifecycle_large.cfg` | 3c × 3e, core + rendezvous, symmetry |
@@ -376,10 +376,12 @@ gitignored; keep all generated output under them.
 `ls ThreadLifecycle_*.cfg` and `grep -n '\.cfg' run.sh`, not from memory —
 an earlier version of this paragraph named `c2`, `mp*` and a `c1*`
 ladder, **none of which are on disk**; they were deleted in revisions
-9–11 and the taxonomy kept describing them. There are **50 `.cfg` files**
-and `run.sh` invokes **39**; the 11 it does not are `q1`–`q7`, `q7d`,
-`dirabafix`, full `medium`, and full `pr4d`, each with its reason
-recorded in `run.sh` itself.
+9–11 and the taxonomy kept describing them. There are **62 `.cfg` files**;
+the default runner invokes **43**, and `RUN_XLARGE=1 RUN_SLOW=1` adds six.
+The 13 outside those runs are `q1`–`q7`, `q7d`, `dirabafix`, full `medium`,
+full `pr4d`, and the superseded focused `g16`/`g16_two` configs. The
+current G16 rows in the runner are `g16_two_core`, `g16_remote`, and
+`g16_remote_two_core`.
 
 `small`/`medium_nodir`/`large`/`xlarge`, every gate, every probe,
 `liveness_a`/`liveness_b`, the `t1*` ladder and the `*self` files all run
@@ -539,7 +541,7 @@ incomparable/reconstruction.
   correctness. What checks C2 is `specv3.md` [test 06]/[test 07] and the
   doc's lock protocol; do not cite a green battery as evidence about
   priority ordering.
-- **G11 (modelled in the current lifecycle module; full battery pending).**
+- **G11 (modelled in the current lifecycle module; default battery passed).**
   Finalization now has two visible steps: `finalizing` publishes
   `directive_state = dead`, then `ClearFreedDirective` zeroes the word and
   advances the slab generation. `ProbeNoFinalizingDead` is expected to fail,
@@ -547,8 +549,8 @@ incomparable/reconstruction.
   terminal failure, consistent with the approved `E_TERM` outcome for a
   suspend after termination commits. The existing generation and target-pin
   checks remain necessary when the zero or a concurrent retire wins first.
-  Focused `dirf6fix` safety passed 1,949,216 distinct states and the G11
-  reachability probe fired at depth 2; the full battery remains to be run.
+  The G11 reachability probe fired; the current `dirf6fix` and all-feature
+  `small` safety rows passed, as did the full default battery recorded below.
 - **G10 (rev 8, MP — round-7 M-1's residue; its LOCK-ORDER half REFUTED
   in round 8, C-3)** — the reach-and-validate protocol (handle → gen
   lock → container lock → re-validate) is doc-side only, and that part
@@ -623,8 +625,9 @@ incomparable/reconstruction.
   A 1-core/1-thread positive check passed on 20 distinct states. With
   `WAKE_IPI = FALSE`, `InvParkedQueueHasWake` fails and `LiveReady` has a
   temporal counterexample on that same focused state space. This calibrates
-  the claim that the wake mechanism is represented. The full all-feature
-  safety and liveness battery remains pending after the state-space growth.
+  the claim that the wake mechanism is represented. The symmetry-reduced
+  all-feature `small` safety row also passed with parked-core interleavings
+  enabled; the full default battery passed as recorded below.
 - **G15 (NEW, rev 16, INC — round-14 parity review; RECORDED, not fixed,
   and the reasoning is the reason it is recorded).** **`InvS3` is
   NARROWER than S3, and the narrowing was unnamed.** The formula is
@@ -1316,28 +1319,40 @@ lives. **No probe covers `RecvPop` or `AffMove`** — so if a later revision
 sets `REQUEUE_ON = FALSE`, nothing fires. A dedicated reachability probe
 for `RecvPop` and `AffMove` remains absent.
 
-**Validation status.** The counts and verdicts in the historical tables below
-predate G11/G14/G16 and are not a current full-battery verdict. The earlier
-2026-10-31 default `./run.sh` battery (33 configs plus SANY) exited 0 before
-those additions. On the expanded model, a first default run passed SANY,
-all falsifiers and reachability probes through G16, and the positive
-`mtermfix`, `dirf6fix`, and vCPU cancel rows. It was stopped during the
-all-feature `small` row after 12,653,296 distinct states in 2m16s with
-924,582 states still queued, without a verdict. After the G16 remote-retire
-fix, the same prefix, including its new reachability probe, passed again;
-the run was deliberately stopped before repeating unchanged `small`.
-The later safety and liveness rows of the default battery therefore have
-no current full-run verdict. `RUN_XLARGE=1` and `RUN_SLOW=1` were not run.
+**Expanded-model validation (2026-10-31): `RESULT: OK`.** The unsymmetrized all-feature
+`small` row was stopped after 12,653,296 distinct states in 2m16s with
+924,582 queued and no verdict. The bounded repair adds `SYMMETRY Symm` to
+that safety-only config. Both core names and both thread names are
+interchangeable here: the constants distinguish neither, and the transition
+relation, deadlock check, and quantified invariants are permutation
+invariant. TLC then passed the same all-feature transitions and invariants
+at **4,828,424 distinct states in 53 seconds**, with deadlock detection on.
+This is state quotienting, not a feature cut; it preserves any reachable
+invariant violation or deadlock up to renaming.
+
+The current default `TLC_TIMEOUT=1800 ./run.sh` exited 0 and passed SANY, every
+falsifier and reachability probe (including G11/G14/G16), and every safety
+row. `small` was followed by `g14` (20), `g16` (18,832), `g16remote`
+(80), `g16remote2` (74,016), `large` (229,064), `cr3self` (1,430,720),
+and `medium_nodir` (256,383), all distinct-state counts. The liveness
+rows `t1min` (21,166), `t1s` (23,146), `t1r` (24,332), and `t1d_min`
+(83,544) passed; the paired `pr4d_min` probe fired. The final
+`cr1minself` row passed at 208,032 distinct states and 416,064 temporal
+product states in 13m09s. All 43 default rows reached their expected
+verdict. The full run's slowest obligation was this final temporal check;
+the 30-minute per-row cap did not fire.
+`RUN_XLARGE=1` and `RUN_SLOW=1` were not run.
 
 A controlled state-growth comparison used the same `small` config and TLC
 options. At pre-G11/G14/G16 commit `6035cc08`, it passed at 10,471,252
 distinct states in 1m36s. In a temporary copy of the current module with
 only `ParkDecision` disabled, it passed at 10,555,116 distinct states in
 1m43s. The actual expanded module exceeded 12,653,296 states without a
-verdict. This isolates parked-core interleavings as a material source of
-growth; it does not establish that they are the only source, nor does the
-temporary reduced model prove the G14 obligation. The full all-feature
-battery remains an explicit state-space blocker, not a green result.
+verdict before symmetry reduction. This isolates parked-core
+interleavings as a material source of growth; it does not establish that
+they are the only source, nor does the temporary reduced model prove the
+G14 obligation. The symmetry-reduced full all-feature safety row and the
+default liveness ladder now have verdicts as stated above.
 
 **What this validation does NOT establish.** It shows the split preserved
 the model, not that the model still describes the code. No active
