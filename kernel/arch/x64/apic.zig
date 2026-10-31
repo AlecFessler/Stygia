@@ -115,7 +115,6 @@ pub const X2ApicMsr = enum(u32) {
 
     local_vector_table_timer_register = 0x832,
     local_vector_table_thermal_sensor_register = 0x833,
-    local_vector_table_performance_monitor_register = 0x834,
     local_vector_table_lint0_register = 0x835,
     local_vector_table_lint1_register = 0x836,
     local_vector_table_error_register = 0x837,

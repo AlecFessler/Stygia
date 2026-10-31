@@ -474,7 +474,6 @@ entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_INTERRUPT_WINDOW_EXIT    
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_USE_TSC_OFFSETTING    sha256:f4ad8f878c78872fd22478e48e64dc0866ce9f8422917686098e07fd903eabd4
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_INVLPG_EXIT    sha256:bef216e48d8b6213454f9adb4da75dda0ec809f0f2eb2ace60d2f80677d3d88d
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_MWAIT_EXIT    sha256:b292cdc34ecd3d456c4aa51c496f301cdfec32d4f24c1b93503fdb09eea48af9
-entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_RDPMC_EXIT    sha256:e45954b76a65c382f4844669fe0c32a06eb4478cf489fce9cfb7f6a73488e9ec
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_RDTSC_EXIT    sha256:b5ca8068546513b15f0fc34cc677cd08d7c4d95fae031a6ea404c48a2698a146
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_CR3_LOAD_EXIT    sha256:46e9e9dc225bb650325ed8a7f5183f1f178fefaada16547905bdda58feaded71
 entity:arch/x64/intel/vmx.zig::arch.x64.intel.vmx.PROC_CR3_STORE_EXIT    sha256:0325af31e5dac7aad72697a7ed3b44f0c1e526ecf0514011bb660d89686212f3

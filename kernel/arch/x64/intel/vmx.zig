@@ -206,7 +206,6 @@ const PROC_USE_TSC_OFFSETTING: u32 = 1 << 3;
 const PROC_HLT_EXIT: u32 = 1 << 7;
 const PROC_INVLPG_EXIT: u32 = 1 << 9;
 const PROC_MWAIT_EXIT: u32 = 1 << 10;
-const PROC_RDPMC_EXIT: u32 = 1 << 11;
 const PROC_RDTSC_EXIT: u32 = 1 << 12;
 const PROC_CR3_LOAD_EXIT: u32 = 1 << 15;
 const PROC_CR3_STORE_EXIT: u32 = 1 << 16;
