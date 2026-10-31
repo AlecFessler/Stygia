@@ -492,7 +492,8 @@ create_process([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] elf_page_fr
                    bit 50:     xfer
                    bit 51:     recv
                    bit 52:     bind
-                   bits 48-49, 53-55: _reserved
+                   bit 54:     suspend
+                   bits 48-49, 53, 55: _reserved
     bits 56-63: _reserved
 
   [3] ceilings_outer: u64 packed as (matches self-handle field1)

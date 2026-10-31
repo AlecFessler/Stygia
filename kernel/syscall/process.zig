@@ -13,6 +13,17 @@ const Word0 = capability.Word0;
 /// bits 24-63 are reserved.
 const CREATE_CAPS_MASK: u64 = 0x0000_0000_00FF_FF7F;
 
+/// `ceilings_inner` packs thread, VMAR, IPC, page-frame, VM, and port
+/// ceilings. Reject unused bits before comparing requested ceilings with
+/// the caller's: a subset check would report E_PERM for some reserved bits,
+/// while high bits would otherwise be silently discarded by createProcess.
+const CREATE_CEILINGS_INNER_MASK: u64 =
+    0x0000_0000_0001_FFFF | // thread and VMAR, bits 0-16
+    0x0000_0000_FF00_0000 | // IPC, bits 24-31
+    0x0000_001F_0000_0000 | // page frame, bits 32-36
+    0x0000_0100_0000_0000 | // VM policy, bit 40
+    0x005C_0000_0000_0000; // port, bits 50-52 and 54
+
 /// Self-handle is always slot 0 in the calling process. Spec §[process].
 const SELF_HANDLE_SLOT: u12 = 0;
 
@@ -55,7 +66,8 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///                    bit 50:     xfer
 ///                    bit 51:     recv
 ///                    bit 52:     bind
-///                    bits 48-49, 53-55: _reserved
+///                    bit 54:     suspend
+///                    bits 48-49, 53, 55: _reserved
 ///     bits 56-63: _reserved
 ///
 ///   [3] ceilings_outer: u64 packed as (matches self-handle field1)
@@ -143,6 +155,7 @@ pub fn createProcess(
     passed_handles: []const u64,
 ) i64 {
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
+    if (ceilings_inner & ~CREATE_CEILINGS_INNER_MASK != 0) return errors.E_INVAL;
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     // Spec §[create_process]: passed_handles uses an all-zero
     // entry as end-of-list sentinel (matches the convention the kernel
