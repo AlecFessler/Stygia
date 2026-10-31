@@ -1812,16 +1812,16 @@ TermRetire(c) ==
   /\ cores' = RetireCoresAfter(t)
   /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
-(* Target already gone (freed, or otherwise not retirable): specv3       *)
-(* Sec [terminate] -- a stale handle returns E_TERM. Without this arm a  *)
-(* caller wedges in termR, which would be a MODELLING artifact rather    *)
-(* than a design defect.                                                  *)
+(* Target already retired or gone. A retired target needs no second retire;
+ * a finalizing/freed target is stale. A live target with a claim pin,
+ * directive pin, or unfinished pended payload must stay in termR until
+ * RetireEnabled permits TermRetire. These are waits, not stale handles. *)
 TermStale(c) ==
   LET w == cores[c].cur
       t == threads[w].tg IN
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ w # NULL
   /\ threads[w].pc = "termR" /\ threads[w].st \in {"running","retired"}
-  /\ ~RetireEnabled(t)
+  /\ threads[t].st \in {"retired","finalizing","freed"}
   /\ threads' = [threads EXCEPT ![w].pc = "user", ![w].tg = NULL]
   /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
