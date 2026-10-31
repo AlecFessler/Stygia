@@ -1,7 +1,0 @@
-echo hello
-ls
-pwd
-cd sub
-pwd
-cd ..
-exit

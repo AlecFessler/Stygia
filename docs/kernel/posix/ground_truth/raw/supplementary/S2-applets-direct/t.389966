@@ -1,8 +1,0 @@
-set_tid_address(0x1031748)              = 389966
-rt_sigprocmask(SIG_SETMASK, ~[KILL STOP RTMIN RT_1 RT_2], NULL, 8) = 0
-rt_sigprocmask(SIG_SETMASK, [], NULL, 8) = 0
-rt_sigaction(SIGQUIT, {sa_handler=SIG_DFL, sa_mask=~[RTMIN RT_1 RT_2], sa_flags=SA_RESTORER, sa_restorer=0x1024f3d}, NULL, 8) = 0
-execve("/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/false", ["/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/false"], ["SHLVL=1", "HOME=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work", "TERM=linux", "PATH=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin", "SHELL=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/bin/sh", "PWD=/tmp/claude-1000/-home-alec-Stygia/b7abdd81-1519-482b-9c0e-fa593991b36b/scratchpad/tr/work"]) = 0
-arch_prctl(ARCH_SET_FS, 0x1031798)      = 0
-set_tid_address(0x1031748)              = 389966
-exit_group(1)                           = ?
