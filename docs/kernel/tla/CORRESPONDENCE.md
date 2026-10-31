@@ -1,6 +1,6 @@
 # ThreadLifecycle action-to-kernel correspondence
 
-Status: **in progress**, reviewed against `main` at `6ad8bf71` (2026-10-31).
+Status: **in progress**, reviewed against `main` at `cf760313` (2026-10-31).
 This is implementation evidence for the active `Next` relation, not a refinement
 proof. The parity table in `README.md` maps the model to `systems.md`; this
 ledger maps actions to kernel code and distinguishes code review, an automated
@@ -30,7 +30,7 @@ that every interleaving or architecture has a passing kernel test.
 | `TickPreempt` | `scheduler.preempt` calls `yieldTo`; `yieldToTarget` uses `prepareRunningPark(.requeue)` under core lock. | Source review; `PIN_GATE` is in lifecycle primitive and IRQ entry discipline. No stand-alone kernel race test established here. |
 | `BoundaryRetired` | `scheduler.dispatchTailBody` checks lifecycle before context load; syscall/IRQ exits enter scheduler paths that discharge retired current. | Source review; x64 and aarch64 boundary entry points still need direct path audit. |
 | `VcpuGuestExit` | `scheduler.switchTo` calls `arch.vm.enterGuest`, then `port.fireVmExit` on an ordinary exit. | Source review; guest instructions are outside model. |
-| `VcpuCancelExit` | Both `arch/{x64,aarch64}/vm_runloop.enterGuest` check `retired` at the top of their guest loop and return `cancelled`; `scheduler.switchTo` skips `fireVmExit`, then `dischargeOwnedParking`. | **Automated** model/source order check with x64, arm, and scheduler mutation fixtures; focused TLC `vcpu_cancel` pass and `vcpu_nocancel` falsifier. This checks the acknowledgement path, **not arch-state lifetime**. |
+| `VcpuCancelExit` | Both `arch/{x64,aarch64}/vm_runloop.enterGuest` check `retired` at the top of their guest loop and return `cancelled`; `scheduler.switchTo` skips `fireVmExit`, then `dischargeOwnedParking`. `thread.finalizeDestroyMarkedDead` frees vCPU arch state only after owner-side eviction/finalization. | Automated model/source order check with x64, arm, and scheduler mutation fixtures; focused TLC `vcpu_cancel` pass and `vcpu_nocancel` falsifier. Kernel lifetime fix `6bcee799` and `vcpu_retire_remote` cover retirement and state-page reuse, but that test does not enter a real guest with a cached state pointer (`Stygia-s0p`). |
 | `RetireEnabled`, `RetireThreadsAfter`, `RetireCoresAfter`, `RetireThread` | `thread.retireAndBumpDeadGen` marks retiring, waits pins, removes ready queue, calls `lifecycle.retire`, then flips dead gen; `lifecycle.retire` waits for pended payload before CAS. | Source review and lifecycle model `small`/`vcpu_cancel` rows. Retire source is a multi-instruction protocol; model uses one atomic action. Owner-core cancellation is represented as `vm=cancel` but source relies on wake IPI and guest-loop check. |
 | `RetireUnwind` | Legacy/falsifier action, enabled only by the defective switch; current retire cleanup runs after state CAS in `terminate` and `destroyThreadRefLockedMode`. | No production correspondence claim; see model `N4` falsifier and README G4. |
 | `ClearFreedDirective` | `thread.finalizeDestroyMarkedDead` calls `lifecycle.markDirectiveDead` before `slab_instance.destroyAlreadyMarked` zeroes/recycles the slot. | G11-focused model proof and code review; physical slab gen flips earlier at `retireAndBumpDeadGen` (README G11). |
@@ -98,7 +98,7 @@ process teardown/refcount proof.
 | `TermStart` | `thread.terminate` resolves the target handle and enters retirement path, including self target. | Source review; `terminate_*` suite and `mterm`/`mtermfix` TLC pair. The model omits capability resolution errors and gen-lock acquisition. |
 | `TermRetire` | `thread.retireAndBumpDeadGen` marks retiring, waits pins, removes ready queue membership, retires state, flips dead gen. | Source review; `terminate_*` suite. The model's one retire step hides pre-CAS wait and cleanup ordering. The `mark_state` protocol differs (`.7`). |
 | `TermStale` | `thread.terminate` returns E_TERM when the target gen lock rejects a stale handle; if `retireAndBumpDeadGen` sees an already retired target, it returns OK. | The model has no return-code variable, so this action covers both terminal outcomes (`retired`, `finalizing`, `freed`). It excludes live pinned, directive-pinned, and pended targets: those remain in `termR` until `TermRetire` is enabled. The `termstale_reach`/`termstale_safe` TLC pair checks a reachable blocked-live state and excludes a stale return there. The pre-CAS pin/payload wait is still represented by a guard, not individual kernel instructions. |
-| `TermWait` | `thread.routeRetiredFinalize` sends remote IPI and waits for the target to leave `current_thread` unless target is self. | **Mismatch `.6`:** no retired-caller escape, so mutual terminate can deadlock. W4 owed-mark wait also has no source counterpart (`.7`). TLC `mtermfix` does not establish source liveness. |
+| `TermWait` | `thread.routeRetiredFinalize` sends a remote IPI and waits for the target to leave `current_thread` unless the target is self or the caller becomes retired. The retired-caller check uses `lifecycle.load` in the wait loop. | **Repaired `.6`:** `terminate_mutual_remote` synchronizes two pinned callers, requires both to attempt termination, and probes both owner cores after the calls. The original loop fails the probe on aarch64 TCG; the repaired loop passes repeated x64 KVM and aarch64 TCG runs. This race test cannot prove every interleaving or replace the `mtermfix` model check. W4 owed-mark wait still has no source counterpart (`.7`). |
 | `PinAcq`, `PinRel` | Representative model episode for any lock class with a preemptible thread-context hold. Current tree's effective-mask analysis says the production pin-class set is empty. | **Model-only over-approximation**, retained for F3/C1 falsifiers (`pinord`). There is no production `PinAcq` call to map; real claim pins are represented in wake/suspend/steal actions and implemented by `lifecycle.tryPinLive`/`releasePin`. |
 | `PinBump`, `PinUnlock` | `PIN_BUMP_FIRST = FALSE` defective-machine half-states only. | `pinord` TLC falsifier; no production correspondence. |
 | `CreateThread` | `thread.allocThread` initializes a private slot then publishes it live; `syscall.createThread` mints handle(s) and later calls `scheduler.enqueueOnCore`. vCPU creation uses `publishMintedVcpuAndEnqueue` under an exit-port lock and lifecycle pin. | Source review; `create_thread_*`/`create_vcpu_*` suites. **Atomicity gap:** model fuses slab publication and ready queue insertion. Ordinary source creation has a live `.ready` slab before its queue link; whether this can produce an observable failed dispatch under concurrent teardown requires a dedicated test/proof. |
@@ -127,28 +127,27 @@ not a proof of every interrupt/return interleaving.
   disarm, normal creation publish and enqueue, phase-2 teardown, and
   restart policy application. The named locks/pins above justify some
   fusion, but the source's split intervals remain subject to review.
-- **Mismatches under active switches:** `.1` vCPU state lifetime, `.2`
-  S7 routing, `.3` self-mark scope, `.4` ready priority move, `.5` recv
-  queued-sender ownership, `.6` mutual terminate escape, `.7` marking
-  protocol. The `.8` false `TermStale` guard is closed by the
-  `termstale_reach`/`termstale_safe` pair. No green TLC or precommit result
-  resolves these issues.
+- **Mismatches under active switches:** `.2` S7 routing, `.3` self-mark scope,
+  `.4` ready priority move, `.5` recv queued-sender ownership, and `.7`
+  marking protocol. `.1` and `.6` are repaired in the kernel and covered by
+  focused runtime tests. The `.8` model guard is repaired and checked by the
+  `termstale_reach`/`termstale_safe` pair. These results do not resolve the
+  remaining mismatches.
 
-### Open kernel mismatch exposed by this review
+### Repaired vCPU state lifetime mismatch
 
-`Stygia-o4a.4.2.2.1` records a remote vCPU lifetime race. Both
-`thread.terminate` and `destroyThreadRefLockedMode` call
-`arch.vm.freeVcpuArchState` **before** `routeRetiredFinalize` wakes or waits
-for the remote owner. Both arch `enterGuest` loops cache the state pointer
-and use it after guest exits. The model's `VcpuCancelExit` establishes an
-eventual owner acknowledgement, but has no state-page lifetime variable and
-cannot rule out this use-after-free. The new source gate intentionally does
-not certify this failed obligation.
+`Stygia-o4a.4.2.2.1` identified a remote vCPU lifetime race. Fix `6bcee799`
+moved `arch.vm.freeVcpuArchState` into `thread.finalizeDestroyMarkedDead`,
+after owner eviction or owner-side finalization. The model's
+`VcpuCancelExit` establishes eventual owner acknowledgement but has no
+state-page lifetime variable. `vcpu_retire_remote` covers remote retirement
+and state-page reuse; a real guest `VMRESUME` witness remains `Stygia-s0p`.
 
 Additional reviewed mismatches are filed as `Stygia-o4a.4.2.2.2` (S7 failed
 dispatch routing), `.3` (self-mark scope), `.4` (ready priority move), and
 `.5` (queued-sender recv lifetime). They are implementation/design parity
-questions, not model-only atomicity gaps. The final table names `.6`–`.8`.
+questions, not model-only atomicity gaps. The final table names repaired `.6`,
+open `.7`, and repaired model guard `.8`.
 
 ### Review boundary
 
