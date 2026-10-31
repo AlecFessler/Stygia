@@ -262,6 +262,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "reply_24", .path = "cases/reply_24.zig" },
     .{ .name = "reply_25", .path = "cases/reply_25.zig" },
     .{ .name = "reply_26", .path = "cases/reply_26.zig" },
+    .{ .name = "reply_return_ok_01", .path = "cases/reply_return_ok_01.zig" },
     .{ .name = "handle_restart_page_frame_drop", .path = "cases/handle_restart_page_frame_drop.zig" },
     .{ .name = "handle_restart_page_frame_keep", .path = "cases/handle_restart_page_frame_keep.zig" },
     .{ .name = "handle_restart_device_region_drop", .path = "cases/handle_restart_device_region_drop.zig" },

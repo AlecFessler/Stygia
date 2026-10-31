@@ -2348,6 +2348,10 @@ fn consumeReply(
         const receiver_frame = receiver.iret_frame orelse receiver.ctx;
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
+    // A queued sender resumes directly from its saved frame. Its vreg 1
+    // still contains the suspend target handle unless we write the reply
+    // result here; the ordinary syscall epilogue does not run on this path.
+    arch.syscall.setSyscallReturn(sender.iret_frame orelse sender.ctx, @bitCast(errors.OK));
     // Spec §[vm_exit_state] reply writeback only for vm_exit-typed
     // replies. Non-vm_exit reply paths (`suspension`)
     // never carry a vCPU sender, so `applyReplyStateToVcpu` would also
