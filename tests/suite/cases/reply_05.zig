@@ -24,7 +24,7 @@
 //   into a process-global cell. We pick `rbx` (vreg 2) because:
 //     - it is part of the §[event_state] x86-64 GPR set (vregs 1..13),
 //     - the new `reply` ABI carries the reply_handle_id in the syscall
-//       word (bits 12-23) rather than vreg 1, so every register-backed
+//       word (bits 20-31) rather than vreg 1, so every register-backed
 //       vreg 1..13 is free to carry receiver state mods through the
 //       syscall — no GPR is wasted on plumbing the handle,
 //     - it is callee-saved in SysV, but W's entry is a naked function
@@ -33,23 +33,24 @@
 //   The flow:
 //     1. Mint a port with {bind, recv}.
 //     2. Mint W with {term, susp, read, write, restart_policy=0} and
-//        entry = `observerEntry` (naked: `mov [observed], rbx; spin`).
+//        entry = `observerEntry` (naked: wait for observer_go,
+//        `mov [observed], rbx; spin`).
 //        `term` so the test thread can clean up; `susp` so the test thread may
 //        suspend W; `read`+`write` so the suspension event exposes and
 //        consumes W's state per §[event_state]; restart_policy=0
 //        keeps the call inside the runner-granted thread_restart_max.
-//     3. `suspend(W, port)`. W has not run; kernel queues it as a
-//        suspended sender on the port with a fresh GPR snapshot
-//        (kernel-initialized — typically zero).
+//     3. `suspend(W, port)`. W may already be running on another core;
+//        its entry waits without changing rbx. The kernel queues it as
+//        a suspended sender on the port.
 //     4. `recv(port)`. recv returns immediately because the test thread
 //        still holds the port's bind cap. The syscall word carries
 //        `reply_handle_id` per §[event_state].
 //     5. Issue `reply` with vreg 2 (rbx) = MAGIC. The reply_handle_id
-//        rides in the syscall word (bits 12-23) per §[reply]; vregs
+//        rides in the syscall word (bits 20-31) per §[reply]; vregs
 //        1..13 are the GPR snapshot the kernel will hand back to W,
 //        with vreg 1 (rax) freed up for receiver state modifications
 //        under the new ABI.
-//     6. `yield(W)` to schedule W. W executes the `mov` storing rbx
+//     6. Set observer_go and `yield(W)`. W executes the `mov` storing rbx
 //        (now MAGIC) into `observed`, then spins.
 //     7. Poll `observed` (with bounded yields to the scheduler so the
 //        test thread re-runs after W's timeslice expires).
@@ -62,9 +63,9 @@
 //   3. suspend(W, port)                   — must return OK
 //   4. recv(port)                         — must return OK
 //   5. issueReg(.reply, replyExtra(rid), {v2=MAGIC}) — OK
-//      (reply_handle_id rides in syscall-word bits 12-23 under the new
+//      (reply_handle_id rides in syscall-word bits 20-31 under the new
 //       ABI; vreg 2 carries the rbx state mod)
-//   6. yield(W)                           — schedule W
+//   6. observer_go=1; yield(W)            — schedule W after reply
 //   7. poll observed (bounded) until MAGIC or limit hit
 //   8. assert observed == MAGIC
 //
@@ -76,6 +77,8 @@
 //   5: reply did not return OK
 //   6: observed never picked up the MAGIC value W should have written
 //      after the reply applied the modified rbx
+//   7: W ran, but its restored rbx was not MAGIC
+//   8: yield(W) returned an error
 
 const builtin = @import("builtin");
 const lib = @import("lib");
@@ -93,6 +96,11 @@ const testing = lib.testing;
 // would route through a stack temp, which a naked entry has no
 // well-formed frame for (mirrors the reply_transfer_14 precedent).
 export var observed: u64 = 0;
+// create_thread may dispatch W on another core before suspend(W) reaches it.
+// Keep W before its one-time store until the reply has completed; the gate
+// contains no test value and the entry preserves rbx/x1 while waiting.
+export var observer_go: u64 = 0;
+export var observer_ran: u64 = 0;
 
 const MAGIC: u64 = 0xC0FFEE_CAFE_BEEF_50;
 
@@ -107,16 +115,33 @@ const MAGIC: u64 = 0xC0FFEE_CAFE_BEEF_50;
 fn observerEntry() callconv(.naked) noreturn {
     switch (builtin.cpu.arch) {
         .x86_64 => asm volatile (
-            \\ movq %%rbx, observed(%%rip)
-            \\ 1: pause
+            \\ 1: cmpq $0, observer_go(%%rip)
+            \\    jne 2f
+            \\    pause
             \\    jmp 1b
+            \\ 2:
+            \\ movq %%rbx, observed(%%rip)
+            \\ movq $1, observer_ran(%%rip)
+            \\ 3: pause
+            \\    jmp 3b
             ::: .{ .memory = true }),
         .aarch64 => asm volatile (
+            \\ adrp x2, observer_go
+            \\ add x2, x2, :lo12:observer_go
+            \\ 1: ldr x3, [x2]
+            \\    cbnz x3, 2f
+            \\    yield
+            \\    b 1b
+            \\ 2:
             \\ adrp x2, observed
             \\ add x2, x2, :lo12:observed
             \\ str x1, [x2]
-            \\ 1: yield
-            \\    b 1b
+            \\ adrp x2, observer_ran
+            \\ add x2, x2, :lo12:observer_ran
+            \\ mov x3, #1
+            \\ str x3, [x2]
+            \\ 3: yield
+            \\    b 3b
             ::: .{ .memory = true }),
         else => @compileError("unsupported arch"),
     }
@@ -169,8 +194,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 3: queue W as a suspended sender on the port. Per §[suspend]
     // when [1] != self, the call returns immediately after queuing the
-    // target. W has not yet been scheduled so its GPR snapshot is the
-    // kernel's freshly-initialized state.
+    // target. W may already be executing its wait loop on another core.
     const sus = syscall.issueReg(.@"suspend", 0, .{
         .v1 = w_handle,
         .v2 = port_handle,
@@ -192,7 +216,7 @@ pub fn main(cap_table_base: u64) void {
 
     // Step 5: issue reply with rbx (vreg 2) modified to MAGIC. Under
     // the new ABI the reply_handle_id rides in the syscall word
-    // (bits 12-23) rather than in vreg 1, freeing every register-backed
+    // (bits 20-31) rather than in vreg 1, freeing every register-backed
     // vreg to carry receiver state mods through the syscall. With the
     // `write` cap on W's originating handle the kernel resumes W with
     // the receiver's current rbx — which is MAGIC by the time the
@@ -205,6 +229,8 @@ pub fn main(cap_table_base: u64) void {
         testing.fail(5);
         return;
     }
+
+    @as(*volatile u64, &observer_go).* = 1;
 
     // Step 6+7: schedule W and poll. Each iteration explicitly yields to
     // W (mirroring yield_03's bounded poll-and-yield-target pattern) and
@@ -221,12 +247,16 @@ pub fn main(cap_table_base: u64) void {
     var i: usize = 0;
     while (i < 1024) {
         if (@as(*volatile u64, &observed).* == MAGIC) break;
-        _ = syscall.yieldThread(w_handle);
+        const yr = syscall.yieldThread(w_handle);
+        if (yr.v1 != @intFromEnum(errors.Error.OK)) {
+            testing.fail(8);
+            return;
+        }
         i += 1;
     }
 
     if (@as(*volatile u64, &observed).* != MAGIC) {
-        testing.fail(6);
+        testing.fail(if (@as(*volatile u64, &observer_ran).* == 0) 6 else 7);
         return;
     }
 

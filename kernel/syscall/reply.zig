@@ -37,10 +37,12 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 ///
 /// ```
 /// reply -> void
-///   syscall_num = 38
+///   syscall_num = 52
 ///   syscall word bits  0-11: syscall_num
-///   syscall word bits 12-23: reply_handle_id (12 bits)
-///   syscall word bits 24-63: _reserved
+///   syscall word bits 12-19: pair_count (0 for bare reply)
+///   syscall word bits 20-31: reply_handle_id (12 bits)
+///   syscall word bits 32-43: recv_port_handle_id (0 for no recv mode)
+///   syscall word bits 44-63: _reserved
 /// ```
 ///
 /// No self-handle cap required — the reply handle itself authorizes the
