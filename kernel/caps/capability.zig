@@ -32,7 +32,6 @@ const execution_context = stygia.sched.execution_context;
 const page_frame = stygia.memory.page_frame;
 const port = stygia.sched.port;
 const secure_slab = stygia.memory.allocators.secure_slab;
-const timer = stygia.sched.timer;
 const vmar = stygia.memory.vmar;
 const virtual_machine = stygia.hv.virtual_machine;
 
@@ -41,7 +40,6 @@ const DeviceRegion = device_region.DeviceRegion;
 const ExecutionContext = execution_context.ExecutionContext;
 const PageFrame = page_frame.PageFrame;
 const Port = port.Port;
-const Timer = timer.Timer;
 const VMAR = vmar.VMAR;
 const VirtualMachine = virtual_machine.VirtualMachine;
 
@@ -67,7 +65,6 @@ pub const CapabilityType = enum(u4) {
     port = 6,
     reply = 7,
     virtual_machine = 8,
-    timer = 9,
     _,
 };
 
@@ -367,8 +364,8 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
     // bit that contributes to a refcount-bearing object's lifetime
     // must run the matching dec as if `delete` had been performed
     // for that bit. Today only `.port` encodes lifetime authority in
-    // its caps (suspend / bind / recv); page_frame / device_region /
-    // timer use slot-keyed lifetime which is unaffected by restrict.
+    // its caps (suspend / bind / recv); page_frame and device_region
+    // use slot-keyed lifetime, unaffected by restrict.
     const cleared: u16 = current_caps & ~requested_caps;
     if (cleared != 0 and type_tag == .port) {
         const ref = typedRef(Port, entry.*) orelse return 0;
@@ -480,8 +477,8 @@ pub fn resolveHandleOnDomain(
 
 /// Per-type delete dispatch — switch on `entry`'s type tag (read from
 /// the parallel user `Capability`) and apply the type-specific delete
-/// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion,
-/// Timer) call their `decHandleRef` to release their per-handle
+/// behavior. Refcount-lifetime types (Port, PageFrame, DeviceRegion)
+/// call their `decHandleRef` to release their per-handle
 /// increment; capability-domain-lifetime types (EC, VMAR, VM) and
 /// system-lifetime IDC handles do not — those die only with the
 /// owning domain. Spec §[capabilities].delete table.
@@ -563,10 +560,6 @@ pub fn releaseHandle(holder: *CapabilityDomain, slot: u12, entry: *KernelHandle)
             const ref = typedRef(VirtualMachine, entry.*) orelse return;
             virtual_machine.releaseHandle(ref.ptr);
         },
-        .timer => {
-            const ref = typedRef(Timer, entry.*) orelse return;
-            timer.decHandleRef(ref.ptr);
-        },
         _ => {},
     }
 }
@@ -618,7 +611,7 @@ fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType)
 /// Bit mask of the `restart_policy` field within a handle's caps word
 /// for the given type, or 0 if the type carries no restart_policy.
 /// Tracks the per-type cap layouts in §[execution_context], §[var],
-/// §[port], §[page_frame], §[device_region], §[timer], §[capability_domain].
+/// §[port], §[page_frame], §[device_region], §[capability_domain].
 fn restartPolicyMask(type_tag: CapabilityType) u16 {
     return switch (type_tag) {
         .execution_context => 0b11 << 8, // EcCaps bits 8-9
@@ -626,7 +619,6 @@ fn restartPolicyMask(type_tag: CapabilityType) u16 {
         .port => 0b1 << 5, // PortCaps bit 5
         .page_frame => 0b1 << 7, // PageFrameCaps bit 7
         .device_region => 0b1 << 4, // DeviceRegionCaps bit 4
-        .timer => 0b1 << 4, // TimerCaps bit 4
         .virtual_machine => 0b1 << 1, // VmCaps bit 1
         .capability_domain => 0b1 << 5, // IdcCaps bit 5
         else => 0,
@@ -731,16 +723,6 @@ pub fn refreshSnapshot(holder: *CapabilityDomain, slot: u12, entry: *KernelHandl
                 },
             }
             user_entry.field0 = field0;
-        },
-        .timer => {
-            const ref = typedRef(Timer, entry.*) orelse return;
-            const lr = ref.lockIrqSave(@src()) catch return;
-            defer ref.unlockIrqRestore(lr.irq_state);
-            const t = lr.ptr;
-            // field0 = counter; field1 bit0 = armed, bit1 = periodic.
-            user_entry.field0 = t.counter;
-            user_entry.field1 = (@as(u64, @intFromBool(t.armed))) |
-                (@as(u64, @intFromBool(t.periodic)) << 1);
         },
         .page_frame => {
             const ref = typedRef(PageFrame, entry.*) orelse return;

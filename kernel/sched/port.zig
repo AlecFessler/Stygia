@@ -421,11 +421,6 @@ fn acquireHandleRefForCaps(entry: execution_context.PairEntryStashed, caps_word:
                 @ptrCast(@alignCast(entry.obj_ref.ptr.?));
             try stygia.memory.page_frame.incHandleRef(pf);
         },
-        .timer => {
-            const t: *stygia.sched.timer.Timer =
-                @ptrCast(@alignCast(entry.obj_ref.ptr.?));
-            try stygia.sched.timer.incHandleRef(t);
-        },
         .port => {
             const alias_ref = SlabRef(Port){
                 .ptr = @ptrCast(@alignCast(entry.obj_ref.ptr.?)),
@@ -456,7 +451,6 @@ pub fn acquirePendingPairEntryRef(entry: execution_context.PairEntryStashed) err
 fn releaseHandleRefForCaps(entry: execution_context.PairEntryStashed, caps_word: u16, held_port: ?*Port) void {
     switch (entry.obj_type) {
         .page_frame => stygia.memory.page_frame.releaseHandle(@ptrCast(@alignCast(entry.obj_ref.ptr.?))),
-        .timer => stygia.sched.timer.decHandleRef(@ptrCast(@alignCast(entry.obj_ref.ptr.?))),
         .port => {
             const sp: *Port = @ptrCast(@alignCast(entry.obj_ref.ptr.?));
             if (held_port != null and held_port.? == sp) {

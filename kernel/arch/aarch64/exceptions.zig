@@ -57,7 +57,6 @@ const scheduler = stygia.sched.scheduler;
 const serial = stygia.arch.aarch64.serial;
 const sync_debug = stygia.utils.sync.debug;
 const syscall_dispatch = stygia.syscall.dispatch;
-const timer_wheel = stygia.sched.timer;
 const timers = stygia.arch.aarch64.timers;
 const vmar = stygia.memory.vmar;
 const watchdog = stygia.arch.aarch64.watchdog;
@@ -1197,7 +1196,6 @@ fn dispatchIrq(intid: u32) void {
             timers.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
             port.expireTimedRecvWaiters();
             futex.expireTimedWaiters();
-            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         // SGI 2 — lazy-FPU cross-core flush. The requesting core wrote
@@ -1254,7 +1252,6 @@ fn dispatchIrq(intid: u32) void {
             timers.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
             port.expireTimedRecvWaiters();
             futex.expireTimedWaiters();
-            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         27, 30 => {
@@ -1320,7 +1317,6 @@ fn dispatchIrq(intid: u32) void {
             timers.getPreemptionTimer().armInterruptTimer(scheduler.TIMESLICE_NS);
             port.expireTimedRecvWaiters();
             futex.expireTimedWaiters();
-            timer_wheel.wheelExpireDue();
             scheduler.preempt();
         },
         else => {

@@ -188,21 +188,9 @@ pub const KernelVA = struct {
             .start = page_frame_slab_ptrs.end,
             .end = page_frame_slab_ptrs.end + SLAB_RESERVATION,
         };
-        pub const timer_slab: Range = .{
+        pub const virtual_machine_slab: Range = .{
             .start = page_frame_slab_links.end,
             .end = page_frame_slab_links.end + SLAB_RESERVATION,
-        };
-        pub const timer_slab_ptrs: Range = .{
-            .start = timer_slab.end,
-            .end = timer_slab.end + SLAB_RESERVATION,
-        };
-        pub const timer_slab_links: Range = .{
-            .start = timer_slab_ptrs.end,
-            .end = timer_slab_ptrs.end + SLAB_RESERVATION,
-        };
-        pub const virtual_machine_slab: Range = .{
-            .start = timer_slab_links.end,
-            .end = timer_slab_links.end + SLAB_RESERVATION,
         };
         pub const virtual_machine_slab_ptrs: Range = .{
             .start = virtual_machine_slab.end,

@@ -11,7 +11,7 @@
 //   `restrict` operates on (caps are word0 bits 48-63), so this test
 //   domain cannot lower its own `fut_wait_max` from the 63 the runner
 //   grants every spawned domain (see runner/primary.zig
-//   `ceilings_outer = 0x0000_003F_03FE_FFFF` — bits 32-37 = 63).
+//   `ceilings_outer = 0x0000_003F_01FE_FFFF` — bits 32-37 = 63).
 //
 //   Spawning a sub-domain with `fut_wait_max = 0` does not move the
 //   gate into our reach either: the test 01 check fires on the

@@ -5,8 +5,8 @@ const VAddr = stygia.memory.address.VAddr;
 
 /// Write a u64 to a physical address via the kernel physmap. Used by
 /// kernel-side propagators of handle field0/field1 updates that must
-/// land in every domain-local copy of a handle (Timer counter,
-/// device_region irq_count, etc.). Spec §[device_irq] §[timer].
+/// land in every domain-local copy of a handle (for example,
+/// device_region irq_count). Spec §[device_irq].
 pub fn writeU64ViaPhysmap(target_paddr: PAddr, value: u64) void {
     const vaddr = VAddr.fromPAddr(target_paddr, null);
     const ptr: *volatile u64 = @ptrFromInt(vaddr.addr);

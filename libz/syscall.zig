@@ -75,9 +75,6 @@ pub const SyscallNum = enum(u12) {
     create_port = 48,
     recv = 49,
     reply = 52,
-    timer_arm = 54,
-    timer_rearm = 55,
-    timer_cancel = 56,
     futex_wait_val = 57,
     futex_wait_change = 58,
     futex_wake = 59,
@@ -539,23 +536,7 @@ pub fn replyTransferRecv(
 }
 
 // ---------------------------------------------------------------
-// 40..42: timer
-// ---------------------------------------------------------------
-
-pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) Regs {
-    return issueReg(.timer_arm, 0, .{ .v1 = caps, .v2 = deadline_ns, .v3 = flags });
-}
-
-pub fn timerRearm(timer_handle: u12, deadline_ns: u64, flags: u64) Regs {
-    return issueReg(.timer_rearm, 0, .{ .v1 = timer_handle, .v2 = deadline_ns, .v3 = flags });
-}
-
-pub fn timerCancel(timer_handle: u12) Regs {
-    return issueReg(.timer_cancel, 0, .{ .v1 = timer_handle });
-}
-
-// ---------------------------------------------------------------
-// 43..45: futex
+// Futex
 // ---------------------------------------------------------------
 
 pub fn futexWaitVal(timeout_ns: u64, pairs: []const u64) Regs {

@@ -17,7 +17,7 @@
 //   plumbing the grandchild's result back through a port — essentially
 //   recreating the runner. The runner provisions the test EC's domain
 //   with `port_restart_max = 1` (see `runner/primary.zig` ceilings_outer
-//   = 0x...03FE_FFFF), so `create_port(restart_policy=1)` from this
+//   = 0x...01FE_FFFF), so `create_port(restart_policy=1)` from this
 //   domain is expected to succeed, not fail.
 //
 //   This test exercises the symmetric positive-path: when the calling

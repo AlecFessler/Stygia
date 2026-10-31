@@ -7,7 +7,7 @@
 //   `fut_wait_max` lives in the self-handle's field1 bits 32-37 — a
 //   6-bit field whose maximum representable value is 63. The runner
 //   primary mints each test domain with `fut_wait_max = 63` (see
-//   runner/primary.zig: ceilings_outer = 0x0000_003F_03FE_FFFF). The
+//   runner/primary.zig: ceilings_outer = 0x0000_003F_01FE_FFFF). The
 //   futex_wait_val syscall encodes N in syscall-word bits 12-19 with
 //   spec-mandated range 1..63, and §[futex_wait_val] test 02 catches
 //   N = 0 or N > 63 with E_INVAL before the fut_wait_max check runs.

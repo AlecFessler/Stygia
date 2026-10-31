@@ -20,7 +20,7 @@
 //
 //   The root domain's `vmar_inner_ceiling` permits {r, w, max_sz=0} and
 //   its `restart_policy_ceiling.vmar_restart_max` is 3 (see
-//   runner/primary.zig: ceilings_outer = 0x...03FE...), so both
+//   runner/primary.zig: ceilings_outer = 0x...01FE...), so both
 //   restart_policy values requested here are within bounds. mmio = 0
 //   and dma = 0 close off device-binding paths; preferred_base = 0 lets
 //   the kernel choose; cur_rwx = 0b011 matches caps.{r,w}; reserved

@@ -51,7 +51,7 @@ const syscall = lib.syscall;
 pub const RUNNER_STATIC = true;
 
 // Spec §[port].recv [2] timeout_ns. Allow enough time for the
-// CR3-swap-heavy timer batch on healthy runs while still detecting hangs.
+// test batches on healthy runs while still detecting hangs.
 const RECV_TIMEOUT_NS: u64 = 30_000_000_000;
 
 // stygia-ojs post-timeout probe budget. On a batch recv timeout the
@@ -413,10 +413,9 @@ pub fn main(cap_table_base: u64) void {
                 // Previous code read vreg 1 here, so `reply_handle_id`
                 // came back as 0 and every reply syscall hit
                 // `resolveHandleOnDomain(...) == null` → E_BADCAP. The
-                // sender ECs stayed parked on the result port, their CDs
-                // (and any periodic timer they'd armed) lived
-                // indefinitely, and accumulated wheel-tick load starved
-                // the runner past iter ~416 — the cascade-MISS root cause.
+                // sender ECs stayed parked on the result port and their CDs
+                // lived indefinitely, preventing the runner from draining
+                // those test batches.
                 //
                 // Layout: pair_count [12..19], tstart [20..31],
                 // reply_handle_id [32..43], event_type [44..].
@@ -438,11 +437,9 @@ pub fn main(cap_table_base: u64) void {
                 // chain INCLUDING the inner `asm volatile`. The visible
                 // failure was the runner emitting ~10 of ~420 expected
                 // reply syscalls, every elided reply leaving a test EC
-                // parked on the result port and the test's CD (with any
-                // periodic timer it armed) live indefinitely. The
-                // accumulated wheel-tick load starved the runner past
-                // iter ~416 and produced the cascade-MISS tail in
-                // `timer_arm_07..yield_04`.
+                // parked on the result port and the test's CD live
+                // indefinitely. Accumulated parked children starved the
+                // runner and produced a cascade-MISS tail.
                 //
                 // Spec §[reply]: reply_handle_id rides in syscall-word bits
                 // 20-31 — pass it through `extraReplyHandle`, leave vregs
@@ -621,7 +618,7 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x5C) << 48);
 
-    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     const child_self = caps.SelfCap{
         .crcd = true,
@@ -632,7 +629,6 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         .crpt = true,
         .setwall = true,
         .fut_wake = true,
-        .timer = true,
         .pri = 3,
     };
     const self_caps: u64 = @as(u64, child_self.toU16());

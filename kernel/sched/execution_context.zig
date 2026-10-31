@@ -449,8 +449,8 @@ pub const ExecutionContext = struct {
 
     // ── Futex wait state — meaningful iff state == .futex_wait ────────
 
-    /// Absolute monotonic-clock deadline (ns). Timer wheel uses this to
-    /// fire a wake when it expires. `0` = no deadline.
+    /// Absolute monotonic-clock deadline (ns). The scheduler tick checks
+    /// it to wake a timed-out futex waiter. `0` = no deadline.
     futex_deadline_ns: u64 = 0,
 
     /// Index 0..N-1 into the original (addr, expected/target) pair list

@@ -11,10 +11,10 @@
 //   hold, which would break the v3 monotonic-rights invariant.
 //
 //   The runner spawns each test with a child self-handle that has
-//   `timer = true` (see runner/primary.zig spawnOne). We first
-//   restrict slot 0 to drop the `timer` bit, then call
+//   `fut_wake = true` (see runner/primary.zig spawnOne). We first
+//   restrict slot 0 to drop the `fut_wake` bit, then call
 //   create_capability_domain with `self_caps` that re-asserts
-//   `timer`. The new caps word now contains a bit (timer) that is
+//   `fut_wake`. The new caps word now contains a bit (fut_wake) that is
 //   not set in the caller's current self-handle caps, so the
 //   kernel must reject with E_PERM.
 //
@@ -29,8 +29,8 @@
 //   exercised once the v3 kernel implementation lands.
 //
 // Action
-//   1. restrict(slot 0, current self caps without `timer`) — must succeed.
-//   2. create_capability_domain(self_caps with `timer` set, …)
+//   1. restrict(slot 0, current self caps without `fut_wake`) — must succeed.
+//   2. create_capability_domain(self_caps with `fut_wake` set, …)
 //      — must return E_PERM.
 //
 // Assertions
@@ -48,7 +48,7 @@ pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
     // Match the cap shape the runner installs on every test's self
-    // handle (see runner/primary.zig `child_self`) but with `timer`
+    // handle (see runner/primary.zig `child_self`) but with `fut_wake`
     // dropped. restrict only narrows caps, so this is a valid subset
     // of the current caps.
     const reduced = caps.SelfCap{
@@ -58,8 +58,7 @@ pub fn main(cap_table_base: u64) void {
         .crpf = true,
         .crvm = true,
         .crpt = true,
-        .fut_wake = true,
-        .timer = false,
+        .fut_wake = false,
         .pri = 3,
     };
     const restrict_word: u64 = @as(u64, reduced.toU16());
@@ -69,7 +68,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // self_caps re-asserts `timer`, which is no longer in the
+    // self_caps re-asserts `fut_wake`, which is no longer in the
     // caller's self-handle caps after the restrict above. The
     // kernel must reject the call with E_PERM.
     const requested = caps.SelfCap{
@@ -80,7 +79,6 @@ pub fn main(cap_table_base: u64) void {
         .crvm = true,
         .crpt = true,
         .fut_wake = true,
-        .timer = true,
         .pri = 3,
     };
     const self_caps_word: u64 = @as(u64, requested.toU16());

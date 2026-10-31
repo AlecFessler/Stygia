@@ -60,7 +60,6 @@ pub fn main(cap_table_base: u64) void {
         .crvm = true,
         .crpt = true,
         .fut_wake = true,
-        .timer = true,
         .pri = 3,
     };
     const reduced_word: u64 = @as(u64, reduced_self.toU16());

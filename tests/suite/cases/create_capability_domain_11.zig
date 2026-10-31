@@ -83,7 +83,7 @@ pub fn main(cap_table_base: u64) void {
     const ceilings_inner: u64 =
         (0x001C_011F_2701_FFFF & ~(@as(u64, 0xFF) << 40)) |
         (vm_ceiling_subset << 40);
-    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     const result = syscall.createCapabilityDomain(
         0, // [1] caps
@@ -139,7 +139,7 @@ fn runFaithfulProbe(
     const ceilings_inner: u64 =
         (template_inner & ~(@as(u64, 0xFF) << 40)) |
         (@as(u64, new_vm_ceiling) << 40);
-    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     const result = syscall.createCapabilityDomain(0, ceilings_inner, ceilings_outer, pf_handle, 0, // initial_ec_affinity
         &[_]u64{});

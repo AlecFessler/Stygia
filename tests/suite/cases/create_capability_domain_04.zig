@@ -18,7 +18,7 @@
 //
 // Degraded coverage gap
 //   The runner (tests/suite/runner/primary.zig) currently spawns each
-//   test domain with ceilings_outer = 0x0000_003F_03FE_FFFF, which sets
+//   test domain with ceilings_outer = 0x0000_003F_01FE_FFFF, which sets
 //   ec_outer_ceiling to 0xFF — every bit in the 8-bit field. There is
 //   no superset of 0xFF that fits in 8 bits, so a faithful violation
 //   is unconstructible at this caller-privilege level.

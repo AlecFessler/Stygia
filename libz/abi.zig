@@ -280,18 +280,6 @@ pub fn replyTransferRecv(
     ));
 }
 
-pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.timerArm(caps, deadline_ns, flags));
-}
-
-pub fn timerRearm(timer_handle: u16, deadline_ns: u64, flags: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.timerRearm(@truncate(timer_handle), deadline_ns, flags));
-}
-
-pub fn timerCancel(timer_handle: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.timerCancel(@truncate(timer_handle)));
-}
-
 pub fn futexWaitVal(
     timeout_ns: u64,
     pairs_ptr: [*]const u64,
@@ -364,9 +352,6 @@ comptime {
     @export(&replyTransfer, .{ .name = "replyTransfer" });
     @export(&replyRecv, .{ .name = "replyRecv" });
     @export(&replyTransferRecv, .{ .name = "replyTransferRecv" });
-    @export(&timerArm, .{ .name = "timerArm" });
-    @export(&timerRearm, .{ .name = "timerRearm" });
-    @export(&timerCancel, .{ .name = "timerCancel" });
     @export(&futexWaitVal, .{ .name = "futexWaitVal" });
     @export(&futexWaitChange, .{ .name = "futexWaitChange" });
     @export(&futexWake, .{ .name = "futexWake" });

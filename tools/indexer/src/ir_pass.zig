@@ -498,10 +498,10 @@ fn extractAttrs(palloc: std.mem.Allocator, line: []const u8) !?[]const u8 {
 // ── Unit tests ─────────────────────────────────────────────────────────
 
 test "parseAtName: bare identifier" {
-    const s = "define void @sched.timer.onFire(ptr %0) {";
+    const s = "define void @sched.port.expireTimedRecvWaiters(ptr %0) {";
     const at = std.mem.indexOfScalar(u8, s, '@').?;
     const p = (try parseAtName(std.testing.allocator, s, at)).?;
-    try std.testing.expectEqualStrings("sched.timer.onFire", p.name);
+    try std.testing.expectEqualStrings("sched.port.expireTimedRecvWaiters", p.name);
     try std.testing.expect(!p.quoted);
 }
 
@@ -538,12 +538,12 @@ test "resolveName: exact, mono-suffix, generic-erased" {
     const al = arena.allocator();
 
     var m: std.StringHashMapUnmanaged(u32) = .empty;
-    try m.put(al, "sched.timer.onFire", 1);
+    try m.put(al, "sched.port.expireTimedRecvWaiters", 1);
     try m.put(al, "a.b.SecureSlab", 2);
     try m.put(al, "a.b.forEachAlive", 3);
     try m.put(al, "a.b.helper", 4);
 
-    const exact = (try resolveName(al, "sched.timer.onFire", &m)).?;
+    const exact = (try resolveName(al, "sched.port.expireTimedRecvWaiters", &m)).?;
     try std.testing.expectEqual(@as(u32, 1), exact.entity_id);
     try std.testing.expect(exact.via == null);
 

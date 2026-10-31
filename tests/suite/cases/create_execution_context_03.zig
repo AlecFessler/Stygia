@@ -142,7 +142,7 @@ pub fn main(cap_table_base: u64) void {
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x5C) << 48);
 
-    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     // Pass the runner-supplied handles through to the child so the
     // child can report on the shared port and bootstrap libz. The ELF

@@ -39,7 +39,6 @@ const ROOT_SELF_CAPS = capdom.CapabilityDomainCaps{
     .restart = true,
     .reply_policy = true,
     .fut_wake = true,
-    .timer = true,
     .pri = @intFromEnum(Priority.realtime),
 };
 
@@ -225,12 +224,12 @@ pub fn init(root_service_elf: []const u8) !void {
     // ceilings_outer (field1):
     //   bits  0-7   ec_outer_ceiling           = 0xFF
     //   bits  8-15  vmar_outer_ceiling          = 0xFF
-    //   bits 16-31  restart_policy_ceiling     = 0xFFFF
+    //   bits 16-31  restart_policy_ceiling     = 0x01FF
     //   bits 32-37  fut_wait_max               = 63
     const root_field1_ceilings: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0xFF) << 8) |
-        (@as(u64, 0xFFFF) << 16) |
+        (@as(u64, 0x01FF) << 16) |
         (@as(u64, 63) << 32);
 
     const root_cd = try capdom.allocCapabilityDomain(

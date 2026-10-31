@@ -18,7 +18,6 @@ pub const HandleType = enum(u4) {
     port = 6,
     reply = 7,
     virtual_machine = 8,
-    timer = 9,
     _,
 };
 
@@ -131,8 +130,7 @@ pub const SelfCap = packed struct(u16) {
     restart: bool = false,
     reply_policy: bool = false,
     fut_wake: bool = false,
-    timer: bool = false,
-    _reserved: u1 = 0,
+    _reserved: u2 = 0,
     pri: u2 = 0,
 
     pub fn toU16(self: SelfCap) u16 {
@@ -255,20 +253,6 @@ pub const VmCap = packed struct(u16) {
     _reserved: u14 = 0,
 
     pub fn toU16(self: VmCap) u16 {
-        return @bitCast(self);
-    }
-};
-
-// §[timer] timer handle cap bits.
-pub const TimerCap = packed struct(u16) {
-    move: bool = false,
-    copy: bool = false,
-    arm: bool = false,
-    cancel: bool = false,
-    restart_policy: bool = false,
-    _reserved: u11 = 0,
-
-    pub fn toU16(self: TimerCap) u16 {
         return @bitCast(self);
     }
 };

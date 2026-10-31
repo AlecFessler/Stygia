@@ -17,7 +17,7 @@
 //   off field1[0:16], and assert it equals the runner-supplied value.
 //
 //   The runner's `ceilings_outer` is documented in `runner/primary.zig`
-//   `spawnOne` as `0x0000_003F_03FE_FFFF`, which gives:
+//   `spawnOne` as `0x0000_003F_01FE_FFFF`, which gives:
 //     ec_outer_ceiling  (bits  0-7)  = 0xFF
 //     vmar_outer_ceiling (bits  8-15) = 0xFF
 //   The full low-16-bit slice is therefore 0xFFFF. We compare against

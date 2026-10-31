@@ -187,7 +187,7 @@ fn writeMinimalElf(dst: [*]volatile u8) usize {
     // indefinitely (per spec §[delete] capability_domain IDC handle
     // drops do NOT terminate the bound domain — only an in-domain
     // delete(SLOT_SELF) does), and ~10 reps of the test runner exhaust
-    // the CD slab class and wedge the timer_rearm tail of the run.
+    // the CD slab class and wedge later test batches.
     //
     // x86-64 instruction stream (matches libz/syscall_x64.zig
     // issueRegDiscard):

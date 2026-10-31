@@ -44,7 +44,6 @@ const capability_domain = stygia.caps.capability_domain;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 const spin_diag = stygia.utils.spin_diag;
-const timer = stygia.sched.timer;
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
 const EventType = stygia.sched.execution_context.EventType;
 const State = stygia.sched.execution_context.State;
@@ -238,7 +237,6 @@ fn dump(elapsed_ns: u64) void {
     }
 
     dumpSpinLiveness(num_cores);
-    dumpTimerWheels(num_cores);
     dumpLifecycleCounters();
     dumpSpawnTraceSamples();
 
@@ -592,27 +590,6 @@ fn dumpCore(core_id: u8) void {
     } else {
         rawWrite("[HANG]   run_queue: empty\n");
     }
-}
-
-fn dumpTimerWheels(num_cores: u64) void {
-    rawWrite("[HANG] timer wheels:");
-    const now_ns = arch.time.currentMonotonicNs();
-    var core_id: u8 = 0;
-    while (core_id < num_cores) : (core_id += 1) {
-        const heap = &timer.wheels[core_id];
-        rawWrite(" c");
-        printDecimal(core_id);
-        rawWrite(" len=");
-        printDecimal(@as(u64, heap.len));
-        if (heap.len != 0) {
-            const top = heap.entries[0];
-            rawWrite(" top=");
-            printHex(@intFromPtr(top.timer.ptr));
-            rawWrite(" due=");
-            printDeadlineDelta(top.deadline_ns, now_ns);
-        }
-    }
-    rawWrite("\n");
 }
 
 fn countQueueLevelBounded(head: *ExecutionContext) u64 {

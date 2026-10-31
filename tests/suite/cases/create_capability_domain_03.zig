@@ -69,7 +69,7 @@ const testing = lib.testing;
 // runner/primary.zig's ceilings_inner; we substitute bits 0-7 with the
 // caller's actual ec_inner_ceiling read from slot 0.
 const RUNNER_CEILINGS_INNER_NON_EC: u64 = 0x001C_011F_2701_FF00;
-const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
+const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_01FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);

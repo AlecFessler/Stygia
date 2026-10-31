@@ -21,7 +21,6 @@ const page_frame = stygia.syscall.page_frame;
 const port = stygia.syscall.port;
 const reply = stygia.syscall.reply;
 const system = stygia.syscall.system;
-const timer = stygia.syscall.timer;
 const vmar = stygia.syscall.vmar;
 const virtual_machine = stygia.syscall.virtual_machine;
 
@@ -55,9 +54,6 @@ pub const SyscallNum = enum(u64) {
     create_port = 48,
     recv = 49,
     reply = 52,
-    timer_arm = 54,
-    timer_rearm = 55,
-    timer_cancel = 56,
     futex_wait_val = 57,
     futex_wait_change = 58,
     futex_wake = 59,
@@ -114,9 +110,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .vm_inject_irq,
         .create_port,
         .recv,
-        .timer_arm,
-        .timer_rearm,
-        .timer_cancel,
         .futex_wake,
         .time_monotonic,
         .time_getwall,
@@ -290,20 +283,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
 
         .reply => reply.reply(caller, syscall_word, args),
-
-        .timer_arm => timer.timerArm(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            arg(args, 2),
-        ),
-        .timer_rearm => timer.timerRearm(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            arg(args, 2),
-        ),
-        .timer_cancel => timer.timerCancel(caller, arg(args, 0)),
 
         .futex_wait_val => blk: {
             // Spec §[futex_wait_val]: syscall word bits 12-19 carry N

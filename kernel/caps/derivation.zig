@@ -417,10 +417,10 @@ inline fn erasedRefMatches(a: ErasedSlabRef, b: ErasedSlabRef) bool {
 pub fn deleteAndDetach(caller_domain: ErasedSlabRef, slot: u12) i64 {
     // SLOT_SELF (CD self-destruct) takes neither `tree_mutex` nor the
     // CD lock across phase 2 of the destroy. Phase 1 still runs under
-    // both locks (timer disarm needs a stable handle table; the CD
-    // gen-lock is the destroy gate); the locks are dropped before the
-    // EC and VM tear-downs lock their own slab classes. Otherwise the
-    // (CD._gen_lock → EC._gen_lock) and (tree_mutex → EC._gen_lock)
+    // both locks (the CD gen-lock is the destroy gate); the locks are
+    // dropped before the EC and VM tear-downs lock their own slab classes.
+    // Otherwise the (CD._gen_lock → EC._gen_lock) and
+    // (tree_mutex → EC._gen_lock)
     // edges registered by the in-line destroys close an AB-BA cycle
     // against any concurrent `port.recv` (CD → ...) or other delete /
     // revoke path that takes `tree_mutex` after touching an EC.

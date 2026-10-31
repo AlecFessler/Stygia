@@ -4,15 +4,15 @@ pub const Ctx = struct { value: u64 = 0 };
 
 pub var instance: slab.SecureSlab(Ctx, 256) = .{};
 
-/// wheelExpireDue → onFire → propagateAndWake → [generic forEachAlive]
+/// fire → dispatch → propagateAndWake → [generic forEachAlive]
 /// → visitor → wake. The middle hop is the one that used to be missing
 /// from ir_call, which silently truncated every reachability query that
 /// crossed a generic.
-pub fn wheelExpireDue() void {
-    onFire();
+pub fn fire() void {
+    dispatch();
 }
 
-pub fn onFire() void {
+pub fn dispatch() void {
     propagateAndWake();
 }
 

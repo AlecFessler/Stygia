@@ -84,9 +84,6 @@ pub const SyscallNum = enum(u12) {
     create_port = 48,
     recv = 49,
     reply = 52,
-    timer_arm = 54,
-    timer_rearm = 55,
-    timer_cancel = 56,
     futex_wait_val = 57,
     futex_wait_change = 58,
     futex_wake = 59,
@@ -340,9 +337,6 @@ const ext = struct {
         attachments_len: usize,
         recv_port: u16,
     ) callconv(.c) c.RecvReturn;
-    extern fn timerArm(caps: u64, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
-    extern fn timerRearm(timer_handle: u16, deadline_ns: u64, flags: u64) callconv(.c) c.Regs;
-    extern fn timerCancel(timer_handle: u16) callconv(.c) c.Regs;
     extern fn futexWaitVal(
         timeout_ns: u64,
         pairs_ptr: [*]const u64,
@@ -593,20 +587,6 @@ pub fn replyTransferVmExit(reply_handle: u12, attachments: []const u64, subcode:
         (@as(u64, n) << 12) |
         (@as(u64, reply_handle) << 20);
     return arch_impl.replyTransferVmExitAsm(word, attachments.ptr, @as(u64, n), @as(u64, subcode));
-}
-
-// 40..42: timer
-
-pub fn timerArm(caps: u64, deadline_ns: u64, flags: u64) Regs {
-    return fromCRegs(ext.timerArm(caps, deadline_ns, flags));
-}
-
-pub fn timerRearm(timer_handle: u12, deadline_ns: u64, flags: u64) Regs {
-    return fromCRegs(ext.timerRearm(@as(u16, timer_handle), deadline_ns, flags));
-}
-
-pub fn timerCancel(timer_handle: u12) Regs {
-    return fromCRegs(ext.timerCancel(@as(u16, timer_handle)));
 }
 
 // 43..45: futex

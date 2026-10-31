@@ -1378,7 +1378,7 @@ DirConsume(c) ==
 
 (***************************************************************************)
 (* T1: interrupt-context wake sources. One generic one-shot source stands  *)
-(* for the deadline-table, timer-wheel, and device-IRQ rows: the pop is    *)
+(* for deadline expiry and device-IRQ delivery: the pop is    *)
 (* consumed by the claim exactly once (both run under the same reaching    *)
 (* lock, so pop+claim is one atomic action -- W1 masking).                 *)
 (* The handler's remaining body (place / payload / release-wait) is the    *)
@@ -1979,7 +1979,7 @@ SpecNF == Init /\ [][Next]_vars
 (*    preemptible EC is eventually preempted (same storm argument).       *)
 (*  - SF DispatchOrS7(c,e): stands for FIFO queue order, which the set    *)
 (*    abstraction of the run queue loses; covers the S7 claim route too.  *)
-(*  - SF FireAny(e):   an armed deadline/timer/device source eventually   *)
+(*  - SF FireAny(e):   an armed deadline/device source eventually   *)
 (*    fires (T1 persistence), even though busy irq slots may transiently  *)
 (*    block delivery.                                                     *)
 (* No fairness on WakeStart/SuspendStart/UserPark/FastPath/RetireEC:      *)

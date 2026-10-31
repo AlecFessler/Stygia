@@ -10,7 +10,7 @@
 //   syscall-word maximum for N (§[futex_wait_change]: bits 12-19, range
 //   1..63 per test 02). The runner primary mints each test domain with
 //   `fut_wait_max = 63` (see runner/primary.zig: ceilings_outer =
-//   0x0000_003F_03FE_FFFF), saturating the field.
+//   0x0000_003F_01FE_FFFF), saturating the field.
 //
 //   Constructing an N that *exceeds* the caller's `fut_wait_max` while
 //   still being a "valid" N (1..63) is therefore unconstructible from

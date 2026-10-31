@@ -223,28 +223,6 @@ pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
-/// Arm the LAPIC timer to fire at absolute monotonic-clock time
-/// `deadline_ns`. Used by the per-core timer wheel
-/// (`sched.timer.wheelInsert`) to schedule the next wheel wake on the
-/// local core. Spec §[timer].
-///
-/// Reuses the same scheduler vector (`IntVecs.sched`) the preemption
-/// timer is already on — `schedTimerHandler` calls
-/// `sched.timer.wheelExpireDue` so a wheel-driven IRQ and a
-/// preemption-driven IRQ run through the same handler. Computes a
-/// delta from the current monotonic time and delegates to the same
-/// LAPIC programming path used by the preemption tick
-/// (`getPreemptionTimer().armInterruptTimer`), so the LAPIC vs.
-/// TSC-deadline split stays in one place.
-pub fn armDeadline(deadline_ns: u64) void {
-    const timers = stygia.arch.x64.timers;
-    const preemption = timers.getPreemptionTimer();
-    const monotonic = timers.getMonotonicClock();
-    const now_ns = monotonic.now();
-    const delta_ns: u64 = if (deadline_ns > now_ns) deadline_ns - now_ns else 0;
-    preemption.armInterruptTimer(delta_ns);
-}
-
 /// Signal end-of-interrupt by writing 0 to the EOI register. For level-triggered
 /// interrupts, this also causes an EOI message to be broadcast to I/O APICs.
 /// Intel SDM Vol 3A, Section 13.8.5 "Signaling Interrupt Servicing Completion", Figure 13-21.

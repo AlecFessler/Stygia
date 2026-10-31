@@ -18,7 +18,7 @@
 //
 //     2. A calling domain with `dr_restart_max = 0` in its
 //        `restart_policy_ceiling`. The runner's child template sets
-//        `ceilings_outer = 0x0000_003F_03FE_FFFF`, which puts
+//        `ceilings_outer = 0x0000_003F_01FE_FFFF`, which puts
 //        dr_restart_max = 1 — explicitly the wrong polarity for this
 //        test's failure path.
 //

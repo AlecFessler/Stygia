@@ -8,8 +8,6 @@
 // integer regardless — we just deterministically pick the earliest
 // representable timestamp.
 //
-// Once Stygia's userspace timer object lands a syscall, all of this gets
-// wired through it.
 
 const Timespec = extern struct { sec: i64, nsec: i64 };
 const Timeval = extern struct { sec: i64, usec: i64 };

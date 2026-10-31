@@ -25,7 +25,7 @@
 //! it as E_BADCAP / stale, and the destroy-owner runs cleanup unraced.
 //!
 //! Used wherever the spec says "refcount lifetime" — Port, PageFrame,
-//! DeviceRegion, Timer.
+//! DeviceRegion.
 
 const std = @import("std");
 

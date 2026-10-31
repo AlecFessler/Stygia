@@ -207,13 +207,3 @@ pub inline fn getMonotonicClock() Timer {
         .vtable = &monotonic_vtable,
     };
 }
-
-/// Arm CNTV_CVAL_EL0 to fire at absolute monotonic-clock time
-/// `deadline_ns`. Spec §[timer].
-pub fn armDeadline(deadline_ns: u64) void {
-    const monotonic = getMonotonicClock();
-    const now_ns = monotonic.now();
-    const delta_ns: u64 = if (deadline_ns > now_ns) deadline_ns - now_ns else 0;
-    const preemption = getPreemptionTimer();
-    preemption.armInterruptTimer(delta_ns);
-}

@@ -24,7 +24,7 @@
 //   The current test infrastructure embeds each test ELF directly in
 //   the primary's manifest and spawns each as a single capability
 //   domain whose ceilings are fixed in `runner/primary.zig` to
-//   `restart_policy_ceiling = 0x03FE` (which sets bit 4 = bit 20-of-the-
+//   `restart_policy_ceiling = 0x01FE` (which sets bit 4 = bit 20-of-the-
 //   ceiling-field, i.e., `pf_restart_max = 1`). A test ELF cannot
 //   reduce its own ceiling: `restrict` only operates on the caps field
 //   (word0 bits 48-63) of the self-handle, not on field0/field1 where

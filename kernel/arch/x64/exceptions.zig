@@ -324,7 +324,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // IRQs deliberately stay MASKED through the dispatch
             // attempt: fault handling may have parked `ec` with its
             // kstack release stashed on this core, and an IRQ handler
-            // here could spin on that very release (timer-wheel wakes
+            // here could spin on that very release (deadline wakes
             // routed through `markReady`'s kstack barrier) — a
             // self-deadlock on our own pending stash.
             scheduler.yieldTo(null);

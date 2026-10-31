@@ -4,39 +4,39 @@
 ; a `__anon_NNNN` discriminator for the comptime callback parameter.
 ModuleID = 'BitcodeBuffer'
 
-define internal fastcc void @timer.wheelExpireDue() unnamed_addr #1 !dbg !1 {
-  call fastcc void @timer.onFire(), !dbg !10
+define internal fastcc void @source.fire() unnamed_addr #1 !dbg !1 {
+  call fastcc void @source.dispatch(), !dbg !10
   ret void
 }
 
-define internal fastcc void @timer.onFire() unnamed_addr #1 !dbg !2 {
-  call fastcc void @timer.propagateAndWake(), !dbg !11
+define internal fastcc void @source.dispatch() unnamed_addr #1 !dbg !2 {
+  call fastcc void @source.propagateAndWake(), !dbg !11
   ret void
 }
 
-define internal fastcc void @timer.propagateAndWake() unnamed_addr #1 !dbg !3 {
-  call fastcc void @"slab.SecureSlab(timer.Ctx,256).forEachAlive__anon_1234"(ptr nonnull @timer.instance), !dbg !12
+define internal fastcc void @source.propagateAndWake() unnamed_addr #1 !dbg !3 {
+  call fastcc void @"slab.SecureSlab(source.Ctx,256).forEachAlive__anon_1234"(ptr nonnull @source.instance), !dbg !12
   ret void
 }
 
-define internal fastcc void @"slab.SecureSlab(timer.Ctx,256).forEachAlive__anon_1234"(ptr nonnull %0) unnamed_addr #1 !dbg !4 {
-  call fastcc i1 @timer.visitor(ptr %0, ptr %0), !dbg !13
+define internal fastcc void @"slab.SecureSlab(source.Ctx,256).forEachAlive__anon_1234"(ptr nonnull %0) unnamed_addr #1 !dbg !4 {
+  call fastcc i1 @source.visitor(ptr %0, ptr %0), !dbg !13
   ret void
 }
 
-define internal fastcc i1 @timer.visitor(ptr %0, ptr %1) unnamed_addr #1 !dbg !5 {
-  call fastcc void @timer.wake(), !dbg !14
+define internal fastcc i1 @source.visitor(ptr %0, ptr %1) unnamed_addr #1 !dbg !5 {
+  call fastcc void @source.wake(), !dbg !14
   ret i1 true
 }
 
-define internal fastcc void @timer.wake() unnamed_addr #1 !dbg !6 {
+define internal fastcc void @source.wake() unnamed_addr #1 !dbg !6 {
   ret void
 }
 
 ; A second instantiation of the same generic collapses onto the same
 ; declaration entity — proving the merge is by generic decl, not by
 ; monomorphization.
-define internal fastcc ptr @"slab.SecureSlab(timer.Ctx,512).create"(ptr nonnull %0) unnamed_addr #1 !dbg !7 {
+define internal fastcc ptr @"slab.SecureSlab(source.Ctx,512).create"(ptr nonnull %0) unnamed_addr #1 !dbg !7 {
   ret ptr %0
 }
 

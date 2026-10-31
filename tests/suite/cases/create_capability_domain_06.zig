@@ -103,10 +103,10 @@ pub fn main(cap_table_base: u64) void {
     // and rewrite vmar_outer_ceiling with the superset value.
     //   bits  0-7   ec_outer_ceiling          = 0xFF
     //   bits  8-15  vmar_outer_ceiling         = caller | extra_bit
-    //   bits 16-31  restart_policy_ceiling    = 0x03FE
+    //   bits 16-31  restart_policy_ceiling    = 0x01FE
     //   bits 32-37  fut_wait_max              = 0x3F (63)
     //   bits 38-63  _reserved                 = 0
-    const template_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const template_outer: u64 = 0x0000_003F_01FE_FFFF;
     const ceilings_outer: u64 =
         (template_outer & ~(@as(u64, 0xFF) << 8)) |
         (@as(u64, new_vmar_outer) << 8);

@@ -12,7 +12,6 @@ const page_frame_mod = stygia.memory.page_frame;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
 const port_mod = stygia.sched.port;
-const timer_mod = stygia.sched.timer;
 const vmar_mod = stygia.memory.vmar;
 const virtual_machine_mod = stygia.hv.virtual_machine;
 
@@ -205,11 +204,6 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.page_frame_slab,
         KA.page_frame_slab_ptrs,
         KA.page_frame_slab_links,
-    );
-    timer_mod.initSlab(
-        KA.timer_slab,
-        KA.timer_slab_ptrs,
-        KA.timer_slab_links,
     );
     virtual_machine_mod.initSlab(
         KA.virtual_machine_slab,

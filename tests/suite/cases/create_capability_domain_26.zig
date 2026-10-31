@@ -193,7 +193,7 @@ pub fn main(cap_table_base: u64) void {
 
     // [3] ceilings_outer — match the runner-installed values so no
     // outer subset check fires.
-    const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
+    const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
     // Pass through the runner-supplied handles so the sub-domain can
     // bootstrap libz and report on the shared port.

@@ -22,7 +22,7 @@
 //   The v0 runner (tests/suite/runner/primary.zig) hard-codes
 //   `restart_policy_ceiling.idc_restart_max = 1` in the
 //   `ceilings_outer` it passes to every spawned test domain
-//   (encoded into the 0x03FE block at bits 16-31 of word 3, with
+//   (encoded into the 0x01FE block at bits 16-31 of word 3, with
 //   bit 24 = idc_restart_max). The spawned test therefore runs as
 //   a calling domain with `idc_restart_max = 1`, not 0. Forcing
 //   `idc_restart_max = 0` on this test would require either

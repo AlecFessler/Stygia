@@ -70,7 +70,7 @@ const testing = lib.testing;
 // Mirrors runner/primary.zig's ceilings_inner; we substitute bits 8-23
 // with the caller's actual vmar_inner_ceiling read from slot 0.
 const RUNNER_CEILINGS_INNER_NON_VMAR: u64 = 0x001C_011F_2700_00FF;
-const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
+const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_01FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);

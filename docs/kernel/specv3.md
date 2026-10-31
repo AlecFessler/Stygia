@@ -122,14 +122,13 @@ Handle types a capability domain can hold:
 | port | `create_port`; received via suspend/reply transfer |
 | reply | created by recv |
 | virtual_machine | `create_virtual_machine` |
-| timer | `timer_arm`; received via suspend/reply transfer |
 
 ### Lifetimes
 
 Kernel objects are grouped by the **ceiling** of their lifetime — the longest they could possibly persist. An object may die sooner (via delete, revoke, kill, etc.) but cannot outlive its ceiling.
 
 - **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
-- **Refcount lifetime** — Port, Page Frame, Timer. Bounded by the distributed set of handles referencing them.
+- **Refcount lifetime** — Port, Page Frame. Bounded by the distributed set of handles referencing them.
 - **Capability domain lifetime** — Execution Context, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
 - **Execution context lifetime** — Reply. Replies cannot outlive the execution context they are bound to.
 
@@ -216,7 +215,6 @@ Per-type observable behavior:
 | `port` | Decrement the bind-side refcount if this handle has `bind`; decrement the recv-side refcount if this handle has `recv`. The `suspend` cap does not contribute to either refcount. When the recv-side refcount hits zero, suspended senders resume with `E_CLOSED` and the port slab is destroyed. When the bind-side refcount hits zero and no vCPU `exit_port` pins remain, receivers suspended on the port resume with `E_CLOSED`; the port slab itself stays alive while any recv-cap holder remains. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
 | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
-| `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |
 
 #### Capabilities
 
@@ -352,7 +350,7 @@ cap (word 0, bits 48-63):
 ```
  15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
 ┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│pri(2)│_rsv│timer│fut_wk│reply │restrt│_rsv  │setwal│_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│pri(2)│_rsv│_rsvd│fut_wk│reply │restrt│_rsv  │setwal│_rsv  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
 │      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
 └──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
@@ -371,7 +369,7 @@ cap (word 0, bits 48-63):
 | 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
 | 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
 | 11 | `fut_wake` — futex wake | `futex_wake` syscall |
-| 12 | `timer` — mint timer | `timer_arm` syscall |
+| 12-13 | _reserved | — |
 | 14-15 | `pri` — priority ceiling (0-3) | max priority any EC in this domain may be created with or raised to |
 
 field0:
@@ -508,8 +506,7 @@ create_capability_domain([1] caps, [2] ceilings_inner, [3] ceilings_outer, [4] e
                    bit 22:     port_restart_max   (drop / keep)
                    bit 23:     vm_restart_max     (drop / keep)
                    bit 24:     idc_restart_max    (drop / keep)
-                   bit 25:     tm_restart_max     (drop / keep)
-                   bits 26-31: _reserved
+                   bits 25-31: _reserved
     bits 32-37: fut_wait_max         — max addresses per `futex_wait_*` call (0..63); 0 disables futex wait
     bits 38-63: _reserved
 
@@ -650,7 +647,6 @@ Per-handle policies are ordered least-to-most privileged. The `restart_policy` c
 | `port` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `virtual_machine` | 0=drop / 1=keep | |
 | `capability_domain` (IDC) | 0=drop / 1=keep | |
-| `timer` | 0=drop / 1=keep | refcount semantics apply on `drop` |
 | `reply` | governed by domain `reply_policy` | drop: pending callers resume with `E_REFUSED`; keep: reply remains valid, caller stays suspended |
 
 Each handle's `restart_policy` value is bounded at create time (and at copy time) by the domain's `restart_policy_ceiling` corresponding field on its self-handle.
@@ -669,7 +665,6 @@ Each handle's `restart_policy` value is bounded at create time (and at copy time
 
 [test 07] returns E_PERM if any device_region handle minted by transfer (e.g., copy/move via xfer) has `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.dr_restart_max = 0`.
 
-[test 08] returns E_PERM if `timer_arm` is called with `caps.restart_policy = 1` and the calling domain's `restart_policy_ceiling.tm_restart_max = 0`.
 
 
 ## §[execution_context] Execution Context
@@ -2936,237 +2931,6 @@ The reply handle itself authorizes the operation; no self-handle cap is required
 [test 25] returns E_TERM when `recv_port_handle_id != 0` and the suspended EC was terminated before reply could deliver; the reply handle is consumed and the caller does NOT park on the recv port.
 
 [test 26] on success when both `pair_count > 0` and `recv_port_handle_id != 0`, both effects are applied atomically: the resumed EC receives the attached handles, then the caller parks on the named port.
-
-
-## §[timer] Timer
-
-A timer is a kernel object that fires either once or periodically and exposes a u64 counter directly in its handle's `field0`. Userspace observes fires by polling the counter or waiting on it via `futex_wait_val`. Timers are independent of any specific EC: a timer handle can be copied, moved, or transferred over IDC, and any holder may wait on the counter (only holders with the `arm`/`cancel` caps may reconfigure or stop it).
-
-The handle table is mapped read-only into the holding domain, so `field0`'s vaddr (computable from the handle id and table base) is a valid futex address. The kernel propagates each fire to every domain-local copy of the handle, but propagation is not atomic across copies — different copies may transiently observe different counter values.
-
-The kernel reserves `u64::MAX` as the cancellation sentinel; fire-driven increments saturate at `u64::MAX − 1`, so a real counter value is never confused with cancellation.
-
-Handle ABI:
-
-```
-word 0:
- 63            48 47                          16 15   12 11         0
-┌────────────────┬──────────────────────────────┬───────┬────────────┐
-│   cap (16)     │       _reserved (32)         │type(4)│   id(12)   │
-└────────────────┴──────────────────────────────┴───────┴────────────┘
-
-word 1 (field0):
- 63                                                                  0
-┌─────────────────────────────────────────────────────────────────────┐
-│                       counter (64)                                  │
-└─────────────────────────────────────────────────────────────────────┘
-
-word 2 (field1):
- 63                                              2 1   0
-┌─────────────────────────────────────────────────┬─────┬───┐
-│              _reserved (62)                     │ pd  │arm│
-└─────────────────────────────────────────────────┴─────┴───┘
-```
-
-Field layout:
-
-| field | location | meaning |
-|---|---|---|
-| counter | field0 bits 0-63 | u64 incremented on each fire (saturating at u64::MAX − 1); set to u64::MAX by `timer_cancel`; reset to 0 by `timer_rearm`. Kernel-mutable; eagerly propagated to every domain-local copy of the handle, but not atomically across copies |
-| arm | field1 bit 0 | armed (1) / not armed (0); kernel-mutable, sync-refreshed |
-| pd | field1 bit 1 | periodic (1) / one-shot (0); kernel-mutable, sync-refreshed |
-
-cap (word 0, bits 48-63):
-
-```
- 15                       5    4    3    2    1    0
-┌─────────────────────────┬──────┬────┬────┬────┬────┬────┐
-│    _reserved (11)       │rstrt │canc│ arm│copy│move│
-│                         │_plcy │    │    │    │    │
-└─────────────────────────┴──────┴────┴────┴────┴────┴────┘
-```
-
-| Bit | Name | Meaning |
-|---|---|---|
-| 0 | `move` | transferring this handle via move to another capability domain |
-| 1 | `copy` | transferring this handle via copy to another capability domain |
-| 2 | `arm` | reconfiguring the timer via `timer_rearm` |
-| 3 | `cancel` | cancelling the timer via `timer_cancel` |
-| 4 | `restart_policy` | timer behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
-
-### timer_arm
-
-#### Summary
-
-Mints a new timer handle with its own counter and arms it. Each call yields an independent timer; previously-minted timers are unaffected.
-
-#### Declaration
-
-```
-timer_arm([1] caps, [2] deadline_ns, [3] flags) -> [1] handle
-  syscall_num = 54
-
-  [1] caps: u64 packed as
-    bits  0-15: caps     — caps on the returned timer handle
-    bits 16-63: _reserved
-
-  [2] deadline_ns: nanoseconds until first fire (and period if periodic)
-
-  [3] flags: u64 packed as
-    bit 0:     periodic
-    bits 1-63: _reserved
-```
-
-#### Description
-
-On each fire, the kernel atomically increments `field0` of every domain-local copy of the handle (saturating at `u64::MAX − 1`) and issues a futex wake on each copy's `field0` paddr. One-shot timers transition `field1.arm` to 0 after the single fire; periodic timers stay armed until `timer_cancel`.
-
-#### Capabilities
-
-- Self-handle: `timer`
-- `[1].caps.restart_policy` ≤ caller's `restart_policy_ceiling.tm_restart_max`
-
-#### Return value
-
-`[1]`: timer handle with caps = `[1].caps`. field0 = 0; field1.arm = 1; field1.pd = `[3].periodic`.
-
-#### Errors
-
-**E_PERM** — self-handle lacks `timer`; `caps.restart_policy = 1` and `restart_policy_ceiling.tm_restart_max = 0`.
-
-**E_INVAL** — `[2] deadline_ns = 0`; reserved bits set in `[1]` or `[3]`.
-
-**E_NOMEM** — insufficient kernel memory.
-
-**E_FULL** — caller's handle table has no free slot.
-
-#### Tests
-
-[test 01] returns E_PERM if the caller's self-handle lacks `timer`.
-
-[test 02] returns E_PERM if [1].caps.restart_policy = 1 and the caller's `restart_policy_ceiling.tm_restart_max = 0`.
-
-[test 03] returns E_INVAL if [2] deadline_ns is 0.
-
-[test 04] returns E_INVAL if any reserved bits are set in [1] or [3].
-
-[test 05] on success, the caller receives a timer handle with caps = [1].caps.
-
-[test 06] on success, [1].field0 = 0, [1].field1.arm = 1, and [1].field1.pd = [3].periodic.
-
-[test 07] on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns; [1].field1.arm becomes 0 after the fire.
-
-[test 08] on success with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or `timer_rearm`; [1].field1.arm remains 1.
-
-[test 09] on each fire, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
-
-[test 10] calling `timer_arm` again yields a fresh, independent timer handle; the prior handle's field0 and field1 are unaffected.
-
-
-### timer_rearm
-
-#### Summary
-
-Reconfigures an existing timer. Resets `field0` to 0, sets `field1.arm = 1`, sets `field1.pd = [3].periodic`, and applies the new `deadline_ns`. Works regardless of whether the timer was armed or disarmed at call time.
-
-#### Declaration
-
-```
-timer_rearm([1] timer, [2] deadline_ns, [3] flags) -> void
-  syscall_num = 55
-
-  [1] timer: timer handle
-  [2] deadline_ns: nanoseconds until first fire (and period if periodic)
-  [3] flags: u64 packed as
-    bit 0:     periodic
-    bits 1-63: _reserved
-```
-
-#### Capabilities
-
-- Timer handle `[1]`: `arm`
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid timer handle.
-
-**E_PERM** — `[1]` does not have the `arm` cap.
-
-**E_INVAL** — `[2] deadline_ns = 0`; reserved bits set in `[1]` or `[3]`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid timer handle.
-
-[test 02] returns E_PERM if [1] does not have the `arm` cap.
-
-[test 03] returns E_INVAL if [2] deadline_ns is 0.
-
-[test 04] returns E_INVAL if any reserved bits are set in [1] or [3].
-
-[test 05] on success, the calling domain's copy of [1] has `field0 = 0` immediately on return; every other domain-local copy returns 0 from a fresh `sync` within a bounded delay.
-
-[test 06] on success, [1].field1.arm = 1 and [1].field1.pd = [3].periodic.
-
-[test 07] on success with [3].periodic = 0, [1].field0 is incremented by 1 once after [2] deadline_ns and `[1].field1.arm` becomes 0; with [3].periodic = 1, [1].field0 is incremented by 1 every [2] deadline_ns until `timer_cancel` or another `timer_rearm`.
-
-[test 08] on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0.
-
-[test 09] `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
-
-[test 10] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
-### timer_cancel
-
-#### Summary
-
-Disarms a timer. Sets `field0` to `u64::MAX` (the cancellation sentinel), sets `field1.arm = 0`, and wakes futex waiters.
-
-#### Declaration
-
-```
-timer_cancel([1] timer) -> void
-  syscall_num = 56
-
-  [1] timer: timer handle
-```
-
-#### Description
-
-Returns an error if the timer is not currently armed (e.g., a one-shot that already fired, or one already cancelled).
-
-#### Capabilities
-
-- Timer handle `[1]`: `cancel`
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid timer handle.
-
-**E_PERM** — `[1]` does not have the `cancel` cap.
-
-**E_INVAL** — `[1].field1.arm = 0`; reserved bits set in `[1]`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid timer handle.
-
-[test 02] returns E_PERM if [1] does not have the `cancel` cap.
-
-[test 03] returns E_INVAL if [1].field1.arm = 0.
-
-[test 04] returns E_INVAL if any reserved bits are set in [1].
-
-[test 05] on success, the calling domain's copy of [1] has `field0 = u64::MAX` immediately on return; every other domain-local copy returns u64::MAX from a fresh `sync` within a bounded delay.
-
-[test 06] on success, [1].field1.arm becomes 0.
-
-[test 07] on success, every EC blocked in futex_wait_val keyed on the paddr of any domain-local copy of [1].field0 returns from the call with [1] = the corresponding domain-local vaddr of field0; subsequent reads observe field0 = u64::MAX.
-
-[test 08] on success, after one full prior `deadline_ns` has elapsed, every domain-local copy of [1] still returns `field0 = u64::MAX` from a fresh `sync`.
-
-[test 09] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
 
 ## §[futex] Futex

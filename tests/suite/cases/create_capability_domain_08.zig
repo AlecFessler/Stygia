@@ -7,7 +7,7 @@
 //   `fut_wait_max` lives in `ceilings_outer` (field1) bits 32-37 — a
 //   6-bit field whose maximum representable value is 63. The runner
 //   primary mints each test domain with `fut_wait_max = 63` (see
-//   runner/primary.zig: ceilings_outer = 0x0000_003F_03FE_FFFF).
+//   runner/primary.zig: ceilings_outer = 0x0000_003F_01FE_FFFF).
 //
 //   Constructing a value that *exceeds* the caller's ceiling is
 //   therefore unconstructible from inside this test domain: the field
@@ -71,7 +71,7 @@ pub fn main(cap_table_base: u64) void {
     // `fut_wait_max` subset rule reduces to equality.
     const ceilings_inner: u64 = 0x001C_011F_2701_FFFF;
 
-    const ceilings_outer_low: u64 = 0x0000_0000_03FE_FFFF;
+    const ceilings_outer_low: u64 = 0x0000_0000_01FE_FFFF;
     const ceilings_outer: u64 = ceilings_outer_low | (caller_fut_wait_max << 32);
 
     // Self caps and idc_rx mirroring the runner. Withhold `restart` (consistent with the runner) so the self_caps subset
@@ -85,7 +85,6 @@ pub fn main(cap_table_base: u64) void {
         .crvm = true,
         .crpt = true,
         .fut_wake = true,
-        .timer = true,
         .pri = 3,
     };
     const caps_word: u64 = @as(u64, child_self.toU16());

@@ -12,7 +12,7 @@
 //   primary runner spawns each test as a child capability domain with
 //   `restart_policy_ceiling.vmar_restart_max = 3` (snapshot, the
 //   maximum-privilege value — see runner/primary.zig's
-//   `ceilings_outer = 0x...03FE...`). With the ceiling at the field's
+//   `ceilings_outer = 0x...01FE...`). With the ceiling at the field's
 //   maximum representable value, no `caps.restart_policy` value can
 //   exceed it, so the E_PERM branch is structurally unreachable from
 //   inside the child without first spawning a *nested* sub-domain

@@ -404,16 +404,11 @@ pub fn SecureSlab(
         ///
         /// This is a MIXED-MODE class: it is taken from process context
         /// with IRQs enabled (every `alloc*` / `destroy*` entry point —
-        /// `allocExecutionContext`, `allocPort`, `allocTimer`,
-        /// `destroyVmar`, `destroyTimer`, … — none of which runs inside
+        /// `allocExecutionContext`, `allocPort`,
+        /// `destroyVmar`, … — none of which runs inside
         /// an IRQ-mask bracket) AND from asynchronous interrupt context.
-        /// Two concrete async chains, both established from the IR call
+        /// One concrete async chain, established from the IR call
         /// graph rather than by inspection:
-        ///
-        ///   → `fireVmExit` → `suspendOnPort` → `rendezvousWithReceiver`
-        ///   → `deliverEvent` → `sched.timer.decHandleRef` →
-        ///   `decHandleRefLocked` → `destroyTimer` → `destroy` →
-        ///   `destroyLockedInner`
         ///
         ///   `schedTimerHandler` → `preempt` → `yieldTo` → `switchTo` →
         ///   `finalizeDestroyMarkedDead` (the reaper cited on
@@ -691,9 +686,8 @@ pub fn SecureSlab(
         /// alongside the pointer is the snapshot the visitor would use
         /// to construct a `SlabRef(T)` for verify-and-acquire.
         ///
-        /// Used by cross-domain object-holder lookups (e.g. timer
-        /// fire propagation walks every CapabilityDomain to find handles
-        /// pointing at a given Timer) where no inverse index exists.
+        /// Used by cross-domain object-holder lookups where no inverse
+        /// index exists.
         pub fn forEachAlive(self: *Self, ctx: anytype, comptime visit: fn (@TypeOf(ctx), *T, u63) bool) void {
             // Snapshot count_total once. New slots minted concurrently
             // will sit at indices >= the snapshot; visiting them is
@@ -714,7 +708,7 @@ pub fn SecureSlab(
         /// established the slot's gen-lock is held at `expected_gen`.
         fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
             // IRQ-masked: this function is itself ON the async chain
-            // (`schedTimerHandler` → … → `destroyTimer` → `destroy` → here)
+            // (`schedTimerHandler` → … → `destroyAlreadyMarked` → here)
             // while also running from process context with IRQs enabled.
             // See the `lock` field doc.
             const irq = self.lock.lockIrqSave(@src());

@@ -58,7 +58,6 @@ pub fn main(cap_table_base: u64) void {
         .crvm = true,
         .crpt = false, // <-- the bit under test
         .fut_wake = true,
-        .timer = true,
         .pri = 3,
     };
 

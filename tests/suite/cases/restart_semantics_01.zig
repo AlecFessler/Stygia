@@ -13,7 +13,7 @@
 //
 //   The runner spawns each test in a child capability domain whose
 //   `ceilings_outer` encodes `ec_restart_max = 2` (see
-//   runner/primary.zig — restart_policy_ceiling = 0x03FE puts
+//   runner/primary.zig — restart_policy_ceiling = 0x01FE puts
 //   ec_restart_max in bits 0-1 of the field = 0b10). Asking for
 //   `caps.restart_policy = 3` therefore exceeds the ceiling and is
 //   the value the spec test calls out.

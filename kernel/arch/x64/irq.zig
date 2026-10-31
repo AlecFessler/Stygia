@@ -13,7 +13,6 @@ const interrupts = stygia.arch.x64.interrupts;
 const paging_mod = stygia.arch.x64.paging;
 const port = stygia.sched.port;
 const sched = stygia.sched.scheduler;
-const timer_wheel = stygia.sched.timer;
 const timers = stygia.arch.x64.timers;
 
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
@@ -258,11 +257,6 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.
     port.expireTimedRecvWaiters();
     futex.expireTimedWaiters();
-    // Drain the per-core timer-object wheel — fires onFire for every
-    // entry whose deadline_ns <= now and re-arms the LAPIC against
-    // whatever entry sits at the heap top after draining (no-op when
-    // empty). Spec §[timer].
-    timer_wheel.wheelExpireDue();
     if (sched.consumeYieldHandoffGuard(@truncate(apic.coreID()))) return;
     sched.preempt();
 }

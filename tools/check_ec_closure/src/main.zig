@@ -41,15 +41,9 @@
 //! monomorphized generics carry decorated IR names
 //! (`…SecureSlab(caps.capability_domain.CapabilityDomain,256).forEachAlive__anon_94571`)
 //! that never match an entity row — so every call *through* a generic is
-//! silently absent from `ir_call`. This is not hypothetical: on today's
-//! tree the timer-wheel wake source
-//!
-//!     wheelExpireDue → onFire → propagateAndWake
-//!                    → [SecureSlab(CapabilityDomain,256).forEachAlive]   ← IR edge missing
-//!                    → propagateField0Visitor → propagateVisit → futex.wake
-//!
-//! is completely invisible in the raw `ir_call` graph. A tool built on
-//! `ir_call` alone would have reported four wake sources and looked
+//! silently absent from `ir_call`. The indexer generic-call fixture
+//! demonstrates this gap through `SecureSlab(...).forEachAlive`.
+//! A tool built on `ir_call` alone can undercount wake sources and look
 //! authoritative doing it.
 //!
 //! So we overlay a *syntactic* call graph derived from the token stream
@@ -1592,9 +1586,7 @@ fn ruleA(ctx: *Ctx, o: Opts, w: W, counts: *Counts) ![]ClaimSite {
     // Deliberately NOT "the first non-arch node on a shortest witness
     // path": a claim site reachable from several ISRs would then be
     // attributed to whichever path happened to be shortest, and the other
-    // sources would silently vanish from the table. (That bug hid the
-    // timer-wheel source behind the device-IRQ source on the first run of
-    // this analyzer.)
+    // sources would silently vanish from the table.
     var sources: ArrayList(u32) = .{};
     for (0..ctx.ents.len) |ni| {
         const n: u32 = @intCast(ni);
@@ -1718,7 +1710,6 @@ fn ruleA(ctx: *Ctx, o: Opts, w: W, counts: *Counts) ![]ClaimSite {
 
     return site_slice;
 }
-
 
 const ClassVerdict = enum { masked_all, plain_ec, no_sites, irq_only_plain, plain_unreachable };
 

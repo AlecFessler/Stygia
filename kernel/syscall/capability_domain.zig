@@ -68,8 +68,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 ///                    bit 22:     port_restart_max   (drop / keep)
 ///                    bit 23:     vm_restart_max     (drop / keep)
 ///                    bit 24:     idc_restart_max    (drop / keep)
-///                    bit 25:     tm_restart_max     (drop / keep)
-///                    bits 26-31: _reserved
+///                    bits 25-31: _reserved
 ///     bits 32-37: fut_wait_max         — max addresses per `futex_wait_*` call (0..63); 0 disables futex wait
 ///     bits 38-63: _reserved
 ///
@@ -194,8 +193,7 @@ pub fn createCapabilityDomain(
     //   bit 22     port_restart_max (bool)
     //   bit 23     vm_restart_max   (bool)
     //   bit 24     idc_restart_max  (bool)
-    //   bit 25     tm_restart_max   (bool)
-    //   bits 26-31 _reserved
+    //   bits 25-31 _reserved
     // For numeric fields "exceeds" means a strict numeric greater-than;
     // for bool fields it reduces to the bitwise-superset case (a 1-bit
     // requested value with the caller's bit clear). Reserved bit
@@ -207,8 +205,12 @@ pub fn createCapabilityDomain(
     const requested_ec_rmax: u2 = @truncate(requested_rpc & 0x3);
     const caller_vmar_rmax: u2 = @truncate((caller_rpc >> 2) & 0x3);
     const requested_vmar_rmax: u2 = @truncate((requested_rpc >> 2) & 0x3);
-    const caller_bools: u8 = @truncate((caller_rpc >> 4) & 0x3F);
-    const requested_bools: u8 = @truncate((requested_rpc >> 4) & 0x3F);
+    if (requested_rpc & ~@as(u16, 0x01FF) != 0) {
+        cd_ref.unlockIrqRestore(irq_state);
+        return errors.E_INVAL;
+    }
+    const caller_bools: u8 = @truncate((caller_rpc >> 4) & 0x1F);
+    const requested_bools: u8 = @truncate((requested_rpc >> 4) & 0x1F);
     if (requested_ec_rmax > caller_ec_rmax or
         requested_vmar_rmax > caller_vmar_rmax or
         (requested_bools & ~caller_bools) != 0)

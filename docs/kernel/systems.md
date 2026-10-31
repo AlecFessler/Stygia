@@ -1382,7 +1382,7 @@ with both sides IRQ-masked. Never a silent drop, either way.
   The owner core's hop discharges (§4). This replaces rev 3's
   release-wait wholesale and with it the same-core decline rule and L4's
   carve-out: interrupt-context wakes are never declined and never wait
-  (X2, X3). One-shot wake sources (device IRQs, timer-wheel pops) are
+  (X2, X3). One-shot wake sources (device IRQs) are
   therefore always consumed by exactly one discharge path (§5.1).
 
 ### 3.3 Interrupt discipline
@@ -1426,7 +1426,7 @@ only:
 
 - **while holding the lock of the container through which the EC was
   reached** — run-queue lock, port lock, futex bucket lock, deadline-table
-  lock, timer-wheel lock, device-region lock (§5.1); or
+  lock or device-region lock (§5.1); or
 - **under the EC's own `_gen_lock` with gen validation** for ref-reached
   holders (reply pin, terminate, teardown walks). Retire's CAS+gen-fuse
   runs under the same `_gen_lock`; the fast path's fused publish lives
@@ -1739,7 +1739,6 @@ defects.
 |---|---|---|---|---|
 | futex deadline expiry | tick → `expireTimedWaiters` | periodic scan over intrusive nodes | 5a → claimant places inline; 5b → `pended`, owner's hop places | loser leaves node; winner unlinks (L4) |
 | recv deadline expiry | tick → `expireTimedRecvWaiters` | periodic scan (same unified table, §8.4) | same | same |
-| timer wheel (one-shot & periodic) | tick → `wheelExpireDue` | **one-shot pop** — the firing consumes the registration | same; the pop is consumed by the claim exactly once — no re-insertion, no replay, no double side-effects (X3) | losing to a racing winner is safe: the wake's meaning is level-encoded (futex word / port event already staged) and the winner delivers it |
 | device-region IRQ | device IRQ → `device_region.onIrq` (`device_region.zig:552-586`) — masks the line until userspace acks, then `futex.wake` | **one-shot until user ack** — the would-be acker may be the very EC being woken | same: 5a inline or 5b `pended`; the owner's hop places the waiter, which then runs and acks. **No decline path exists**, so the X3 lost-interrupt (wake dropped, acker parked, line masked forever) is unconstructible | as above — level-encoded ack word |
 
 Row template for future sources: name the entry, the persistence class
@@ -1801,7 +1800,6 @@ definition.
 | port queue | recv pop (5a); close propagation; cascade destroys; **`priority` re-bucket** (§8.1 — `Port.waiters` is an `EcQueue` whose `enqueue` keys on `ec.priority` at LINK time and whose `dequeue` never re-reads it, so a bare field store leaves the old selection order standing) | under the port `_gen_lock` | claim CAS fails on `retired`; skip | recall (`port.zig:613`, `sched/priority_queue.zig`) |
 | futex buckets (**plural** — one waiter links into every bucket of its multi-word wait) | `futex.wake`'s bucket pop, **plus the same function's re-enqueue of the non-matching nodes it dequeued** (`futex.zig:249,255,364` — multiple paddrs hash to one bucket, so a dequeued node may not match the wake's address; VERIFIED present, round 7); **`priority` re-bucket** of every node of the wait (§8.1 — the `WaitNode` SNAPSHOTS `ec.priority` at park, `futex.zig:427,530`) | under the bucket lock(s), sorted all-buckets discipline for multi-bucket ops | gen-checked `node.ec.lockIrqSave` generalized to claim-CAS-or-skip (§3.5) | recall (`futex.zig:434`) + the cited line numbers, re-checked against the tree in round 7 |
 | deadline table | tick scan (`expireTimedWaiters`/`expireTimedRecvWaiters`) | under the table lock | claim CAS fails on `retired`; loser/stale nodes left for the unwind | recall (§8.4) |
-| timer wheel | `wheelExpireDue` pop | under the wheel lock | pop finds `retired` ⇒ pop consumed, moot (T1/§8.2) | recall (§5.1) |
 | device-region list | `onIrq` waiter lookup | under the device-region lock | claim CAS fails on `retired`; line stays masked (see G6 note, §8.4) | recall (§5.1) |
 | **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving an EC handle to a `SlabRef` and retiring through it | ref-reached: caller-CD lock, then EC `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
 | **domain teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying domain's ECs and retiring each | ref-reached, scheduler context: CD `_gen_lock` for the walk, EC `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
@@ -2222,7 +2220,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
   intact), places via edge 7; placement failure ⇒ undo mint, deferred
   marking n/a (pin never visible), finalize, re-pop.
 - **reply / reply_transfer / delete-E_ABANDONED / E_CLOSED / expiries /
-  timer-wheel deliveries**: all `lifecycle.wake` under R-claim; 5a or 5b
+  deadline expiries**: all `lifecycle.wake` under R-claim; 5a or 5b
   per the target's state; T1 governs the interrupt-context rows.
 - **Cross-EC suspend**: `.ready` → 5c + 7; `.idle_wait` → 5a + 7
   (ending `waiting(port)`); `.running` → directive (§2.5, terminal
@@ -2234,7 +2232,7 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
 - Port lifetime and the vCPU cascade unchanged; cascade destroys are
   `retire` calls.
 
-### 8.4 Futex and timers
+### 8.4 Futex and deadlines
 
 - **wait**: edge 3, staging + value checks pre-publish; links + publish
   in the sorted all-buckets section; deadline registration post-publish
@@ -2247,13 +2245,6 @@ kernel frame, protected by the §3.1 gates (not by any liveness claim).
   lock, drops it, then discharges (5a place or 5b pend) — **no decline
   rule, no same-core carve-out** (deleted with the release-wait). Loser
   ticks leave the node; winners unlink (L4).
-- **timer wheel** (`wheelExpireDue`): a T1 row. Its pop is consumed by
-  the claim exactly once — 5a inline or 5b pended — so the one-shot
-  fire needs no re-insertion or replay and its non-idempotent
-  side-effects (counter increments) run once. Rev 3's "applies
-  identically; no bespoke path" was false as written because "decline
-  and retry" was inexpressible for a pop; with the decline path deleted
-  the statement is now true structurally.
 - **device-region IRQ** (`onIrq`): a T1 row — the masked-line-until-ack
   one-shot that made X3 critical. Claim + discharge as above; the parked
   acker is placed by its own core's hop; the line unmasks when it runs
@@ -2832,7 +2823,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    an instrument that reports EC-lifecycle or scheduler state. That is
    `leak_tag` (`sched/execution_context.zig:341`, writers `:779`/`:919`/
    `:2100`) and the EC-state diagnostic writers. Everything whose subject
-   is memory, handle tables or timers stays, because §0.1's test excludes
+   is memory or handle tables stays, because §0.1's test excludes
    it — but **do not take that list from this paragraph**; derive it:
    `grep -rn 'stygia-2u0\|stygia-afo\|stygia-9zr' kernel --include='*.zig'`.
    Revision 16 wrote "**`stygia-2u0`** — two sites" when the tag has
@@ -2895,7 +2886,7 @@ on promotion** is a precondition of step 1, and again of step 9 for
    construct and revisions up to 15 introduced it only by implication,
    via `payload_done` — together with `claimed`, `pended`, R-claim,
    placement CASes, `payload_done`, and the hop's pended arm for every
-   wake/move; add the T1 rows (device-region, timer wheel).
+   wake/move; add the T1 device-region row.
    **The descriptor FOLD lands here too, and it is fast-path asm work,
    not a struct rename**: `suspend_port` (34 refs / 5 files, **15 of them
    in `arch/x64/interrupts.zig`**) and `pending_reply_holder`/`_domain`/
@@ -4151,7 +4142,7 @@ M-A–M-C, text repairs), and adopts its method finding:
   rule (a)), the same-core decline rule, and L4's carve-out (no decline
   path exists — one-shot sources in T1 are consumed exactly once, X3).
   The syscall-context release-wait is deleted too — 5b is uniform.
-  `device_region.onIrq` and `wheelExpireDue` are enumerated T1 rows.
+  `device_region.onIrq` is the enumerated T1 row.
 - **M-A (dead-mark in EC context / S7 silent drop)**: the self-delete
   dead-mark moves behind the hop into scheduler context —
   `teardown_pending` now carries the pre-teardown CD ref and the park
@@ -4181,7 +4172,7 @@ rev 4 by `pended`); user-boundary entry-check gate (F3); deferred
 abandoned-marking (F4/F12); saved-frame/descriptor rule split (F5);
 CD-locked publish liveness gate (F6a); create-unwind protection restated
 (F6b); release-before-commit hop order (F8); two-word directive (F9);
-timer wheel classified (F10 — completed in rev 4's T1); release-wait
+device-IRQ source classified (F10 — completed in rev 4's T1); release-wait
 lock/bound contract (F11 — deleted in rev 4).
 
 **Revision 2 (2026-07-31)** — closed round 1 (C1–C3, M1–M5, m1–m3):

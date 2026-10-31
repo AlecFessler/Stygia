@@ -11,7 +11,7 @@
 //   primary runner (runner/primary.zig) currently spawns each test in a
 //   child capability domain whose `restart_policy_ceiling` field has
 //   `vm_restart_max = 1` (bit 7 of the ceiling = 1, encoded in
-//   ceilings_outer = 0x0000_003F_03FE_FFFF). With vm_restart_max = 1,
+//   ceilings_outer = 0x0000_003F_01FE_FFFF). With vm_restart_max = 1,
 //   `caps.restart_policy = 1` is *within* the ceiling and the kernel
 //   must NOT return E_PERM on that field — the spec violation can't
 //   fire from inside the runner's child domain as currently provisioned.

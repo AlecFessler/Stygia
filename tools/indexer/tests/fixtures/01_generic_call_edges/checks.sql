@@ -6,7 +6,7 @@ SELECT 'edge ' || ca.qualified_name || ' -> ' || ce.qualified_name ||
   FROM ir_call ic
   JOIN entity ca ON ca.id = ic.caller_entity_id
   JOIN entity ce ON ce.id = ic.callee_entity_id
- WHERE ca.qualified_name = 'timer.propagateAndWake'
+ WHERE ca.qualified_name = 'source.propagateAndWake'
  ORDER BY 1;
 
 -- The generic's own body must be attributed to the declaration entity too,
@@ -27,7 +27,7 @@ SELECT 'ir_fn ' || e.qualified_name || ' <= ' || f.ir_name
 
 -- End-to-end: the full chain is walkable through ir_call alone.
 WITH RECURSIVE r(id, depth) AS (
-    SELECT id, 0 FROM entity WHERE qualified_name = 'timer.wheelExpireDue' AND kind = 'fn'
+    SELECT id, 0 FROM entity WHERE qualified_name = 'source.fire' AND kind = 'fn'
     UNION
     SELECT c.callee_entity_id, r.depth + 1
       FROM ir_call c JOIN r ON c.caller_entity_id = r.id

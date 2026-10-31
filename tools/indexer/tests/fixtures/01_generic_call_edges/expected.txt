@@ -1,10 +1,10 @@
-edge timer.propagateAndWake -> slab.forEachAlive via=ir_generic_erased
-edge slab.forEachAlive -> timer.visitor via=exact
-ir_fn slab.create <= slab.SecureSlab(timer.Ctx,512).create
-ir_fn slab.forEachAlive <= slab.SecureSlab(timer.Ctx,256).forEachAlive__anon_1234
-reach timer.wheelExpireDue @depth 0
-reach timer.onFire @depth 1
-reach timer.propagateAndWake @depth 2
+edge source.propagateAndWake -> slab.forEachAlive via=ir_generic_erased
+edge slab.forEachAlive -> source.visitor via=exact
+ir_fn slab.create <= slab.SecureSlab(source.Ctx,512).create
+ir_fn slab.forEachAlive <= slab.SecureSlab(source.Ctx,256).forEachAlive__anon_1234
+reach source.fire @depth 0
+reach source.dispatch @depth 1
+reach source.propagateAndWake @depth 2
 reach slab.forEachAlive @depth 3
-reach timer.visitor @depth 4
-reach timer.wake @depth 5
+reach source.visitor @depth 4
+reach source.wake @depth 5

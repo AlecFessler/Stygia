@@ -81,17 +81,6 @@ pub fn writeRtc(unix_ns: u64) i64 {
     };
 }
 
-/// Arm the platform's per-core deadline timer to fire at absolute
-/// monotonic-clock time `deadline_ns`. Used by the timer wheel to
-/// schedule the next wake. Spec §[timer].
-pub fn armWheelDeadline(deadline_ns: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.apic.armDeadline(deadline_ns),
-        .aarch64 => aarch64.timers.armDeadline(deadline_ns),
-        else => unreachable,
-    }
-}
-
 /// Read the monotonic clock in nanoseconds. Convenience wrapper over
 /// `getMonotonicClock` for callers that only want the scalar value.
 /// Spec §[time].time_monotonic.

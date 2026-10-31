@@ -477,7 +477,7 @@ pub fn switchTo(ec: *ExecutionContext) void {
             // send a wake IPI, and on x86 that vector IS the scheduler
             // vector (`IntVecs.sched` — see `arch.smp.sendWakeIpi`), so
             // the "wake" preempts an EC that was running fine. That
-            // shows up as latency, e.g. `timer_rearm_09`'s 5 ms
+            // shows up as latency, e.g. a 5 ms deadline
             // arm-then-observe window closing late.
             (&core_states[core]).idle_parked = false;
             return;

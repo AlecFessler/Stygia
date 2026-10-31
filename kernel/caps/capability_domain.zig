@@ -62,8 +62,7 @@ pub const CapabilityDomainCaps = packed struct(u16) {
     restart: bool = false,
     reply_policy: bool = false,
     fut_wake: bool = false,
-    timer: bool = false,
-    _reserved: u1 = 0,
+    _reserved: u2 = 0,
     pri: u2 = 0,
 };
 
@@ -353,8 +352,8 @@ pub fn createCapabilityDomain(
     // the failure paths in `loadElfSegments` / `mapUserStack` /
     // `allocExecutionContext` / `mintHandle` accumulated ~5 leaked CDs
     // per rep before this teardown was added — slabs filled and the
-    // 11th rep wedged at `timer_rearm_05..08` once handle-table /
-    // PCID exhaustion gated the next createPort/createTimer.
+    // 11th rep wedged at a later test batch once handle-table /
+    // PCID exhaustion gated the next createPort.
 
     // Load ELF segments into the child's address space.
     userspace_init.loadElfSegments(child_cd, elf_bytes, &parsed, layout.elf_slide) catch {
@@ -508,7 +507,7 @@ pub fn createCapabilityDomain(
             derive_count += 1;
         }
 
-        // For refcount-lifetime types (page_frame, timer, port,
+        // For refcount-lifetime types (page_frame, port,
         // device_region per spec proposal §3) the new alias is a real
         // lifetime contributor: bump the object-side refcount so the
         // child's destroyPhase2 kernel_table walk sees a balanced
@@ -522,10 +521,6 @@ pub fn createCapabilityDomain(
                 .page_frame => {
                     const alias_pf: *stygia.memory.page_frame.PageFrame = @ptrCast(@alignCast(src_kh.ref.ptr.?));
                     stygia.memory.page_frame.incHandleRef(alias_pf) catch unreachable;
-                },
-                .timer => {
-                    const alias_t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(src_kh.ref.ptr.?));
-                    stygia.sched.timer.incHandleRef(alias_t) catch unreachable;
                 },
                 .port => {
                     const alias_p: *stygia.sched.port.Port = @ptrCast(@alignCast(src_kh.ref.ptr.?));
@@ -790,7 +785,7 @@ fn maybePrintSpawnChild(cd: *CapabilityDomain, ec: *ExecutionContext) void {
 /// EC is reaped here. Spec §[create_capability_domain] failure paths
 /// must not leak the freshly-allocated CD; without this cleanup the
 /// kernel slab class fills after ~10 reps of the test runner and any
-/// subsequent `createPort` / `createTimer` returns E_NOMEM.
+/// subsequent `createPort` returns E_NOMEM.
 fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionContext) void {
     execution_context_mod.printPreReportTerminal(partial_ec, cd, "partial_create_cleanup");
     // `partial_ec` itself is covered by destroyEcsInDomain's slab-walk match.
@@ -991,8 +986,7 @@ pub const DestroyDeferred = struct {
 
 /// Phase-1 destroy: runs WITH the CD's `_gen_lock` held by the caller
 /// AND with `caps.derivation.tree_mutex` held by the caller. Disarms
-/// every Timer reachable through the domain's handle table, snapshots
-/// all cd.* fields the phase-2 tear-down needs, and releases the CD
+/// snapshots all cd.* fields the phase-2 tear-down needs, and releases the CD
 /// slab slot via `destroyLocked` (clears the lock bit + bumps gen →
 /// even in one store). On return the CD's `_gen_lock` is no longer
 /// held — the caller MUST drop `tree_mutex` (and any other locks)
@@ -1005,8 +999,6 @@ pub const DestroyDeferred = struct {
 /// `lockEntrySkip` (also `TREE_DOMAIN_GROUP`) trip lockdep's
 /// same-class overlap check.
 pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext)) DestroyDeferred {
-    stygia.sched.timer.disarmTimerHandlesInDomain(cd);
-
     // Spec §[capabilities].revoke / Lifetimes: every live handle in
     // the dying domain may sit on the cross-domain copy-derivation
     // tree (parent in another domain, children in another domain,
@@ -1352,7 +1344,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     }
 
     // Walk slots [3..MAX) and apply per-handle release semantics for
-    // refcount-lifetime object types (page_frame, timer, port,
+    // refcount-lifetime object types (page_frame, port,
     // device_region per spec proposal §3). With the alias-side
     // `incHandleRef`/`onHandleAcquire` in passed_handles processing,
     // every such handle is a real lifetime contributor and must be
@@ -1362,7 +1354,7 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
     //
     // The gen-validate-under-lock dance: destroyPhase2 runs after
     // destroyPhase1 dropped the CD's gen-lock, so concurrent destroys
-    // on a port / page_frame / timer / device_region handle can
+    // on a port / page_frame / device_region handle can
     // complete in the window. Take the slot's `_gen_lock`; if the
     // stamped `entry.ref.gen` no longer matches the live slab's gen,
     // skip — the object has already been destroyed (and possibly
@@ -1383,15 +1375,6 @@ pub fn destroyPhase2(deferred: DestroyDeferred) void {
                     continue;
                 }
                 stygia.memory.page_frame.releaseHandleLocked(pf, slot_irq);
-            },
-            .timer => {
-                const t: *stygia.sched.timer.Timer = @ptrCast(@alignCast(obj_ptr));
-                const slot_irq = t._gen_lock.lockIrqSave(@src());
-                if (t._gen_lock.currentGen() != entry.ref.gen) {
-                    t._gen_lock.unlockIrqRestore(slot_irq);
-                    continue;
-                }
-                stygia.sched.timer.decHandleRefLocked(t, slot_irq);
             },
             .port => {
                 const p: *stygia.sched.port.Port = @ptrCast(@alignCast(obj_ptr));

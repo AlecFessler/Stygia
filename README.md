@@ -16,7 +16,6 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 | **Virtual Machine** | A guest execution environment with its own guest physical address space. Execution contexts enter guest mode within a VM to run. | [§[virtual_machine]](docs/kernel/specv3.md#virtual_machine-virtual-machine) |
 | **Port** | A rendezvous point between a calling execution context and a receiving execution context. Used for IDC, capability transfer, and event delivery. | [§[port]](docs/kernel/specv3.md#port-port) |
 | **Reply** | A one-shot capability referencing a suspended execution context dequeued from a port by a receive. Consuming the handle is the only way to resume or abandon the suspended sender. | [§[reply]](docs/kernel/specv3.md#reply-reply) |
-| **Timer** | A kernel object that fires once or periodically. Each fire increments a u64 counter exposed in the timer's handle; userspace polls the counter or waits on it via `futex_wait_val`. | [§[timer]](docs/kernel/specv3.md#timer-timer) |
 
 ## Scope
 
@@ -28,7 +27,7 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 **Kernel-event routing.** Per-EC events (memory faults, thread faults, breakpoints) can be bound to ports so that debuggers and supervisors handle them as IPC messages. Suspension events and VM exits are always delivered to a port by construction.
 
-**Time.** Monotonic and wall-clock primitives. Programmable one-shot and periodic timers; each fire increments a u64 counter exposed in the timer's handle, and userspace either polls the counter or waits on it via `futex_wait_val`.
+**Time.** Monotonic and wall-clock primitives. Internal scheduler ticks and deadline checks drive preemption and timed waits.
 
 **Virtual machines.** KVM-style guest containers. vCPUs are execution contexts in a VM-flavored capability domain; userspace maps guest-physical memory, sets per-VM policies, and injects IRQs.
 
@@ -85,7 +84,7 @@ kernel/                Kernel proper
   devices/               Device region registry
   hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
   memory/                PMM, VMM, VMARs, page frames, paging, allocators/ (SecureSlab lives here)
-  sched/                 Scheduler, EC, futex, port, timer, FPU
+  sched/                 Scheduler, EC, futex, port, FPU
   syscall/               Per-object syscall handlers and dispatch
   utils/                 Sync primitives, ELF and DWARF debug info, generic Range
   stygia.zig                Root module (every kernel file imports through this)

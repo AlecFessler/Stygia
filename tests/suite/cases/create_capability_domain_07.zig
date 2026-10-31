@@ -13,12 +13,11 @@
 //     bit  6:   port_restart_max   (drop / keep)
 //     bit  7:   vm_restart_max     (drop / keep)
 //     bit  8:   idc_restart_max    (drop / keep)
-//     bit  9:   tm_restart_max     (drop / keep)
-//     bits 10-15: _reserved
+//     bits 9-15: _reserved
 //
 //   The runner (runner/primary.zig) installs ceilings_outer
-//   = 0x0000_003F_03FE_FFFF, so the test domain's restart_policy_ceiling
-//   sub-field = 0x03FE — ec_restart_max=2, vmar_restart_max=3, all type
+//   = 0x0000_003F_01FE_FFFF, so the test domain's restart_policy_ceiling
+//   sub-field = 0x01FE — ec_restart_max=2, vmar_restart_max=3, all type
 //   bools=1.
 //
 //   We construct a `ceilings_outer` whose `restart_policy_ceiling`

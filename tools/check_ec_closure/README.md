@@ -68,8 +68,8 @@ the granularity a hand-written table uses.
 Deliberately *not* "the first non-arch node on a shortest witness path": a
 claim site reachable from several ISRs would then be attributed to whichever
 path happened to be shortest and the other sources would silently vanish.
-That bug hid the timer-wheel source behind the device-IRQ source on the first
-run of this analyzer.
+That bug can hide a second wake source behind the first source to reach the
+same claim site.
 
 The report also lists **wake-free** entries — the negative half of the answer,
 and the half a hand derivation is most likely to get wrong.
@@ -126,16 +126,9 @@ LLVM IR callee names back to entities by exact name, and Zig's monomorphized
 generics carry decorated IR names —
 `…SecureSlab(caps.capability_domain.CapabilityDomain,256).forEachAlive__anon_94571`
 — that never match an entity row. Every call *through* a generic is silently
-absent. On today's tree the timer-wheel wake source
-
-```
-wheelExpireDue → onFire → propagateAndWake
-               → [SecureSlab(CapabilityDomain,256).forEachAlive]   ← IR edge missing
-               → propagateField0Visitor → propagateVisit → futex.wake
-```
-
-is completely invisible in the raw `ir_call` graph. A tool built on `ir_call`
-alone reports four wake sources and looks authoritative doing it.
+absent. The indexer generic-call fixture demonstrates the missing edge
+through `SecureSlab(...).forEachAlive`; a tool built on raw `ir_call`
+alone can undercount wake sources while appearing complete.
 
 So the analyzer overlays a *syntactic* call graph derived from the token
 stream: every identifier chain inside a function body that resolves
