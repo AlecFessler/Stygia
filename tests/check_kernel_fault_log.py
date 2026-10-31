@@ -65,20 +65,25 @@ def unexpected_faults(body: str, mode: str) -> list[str]:
             bad.append(line)
             continue
         pass_at = later_passes[0]
-        # Match an intact fault line to the terminal record by thread,
-        # architecture subcode, and position before the test's PASS.
-        matching = [
-            fault_at for run_at, fault_at, fault_line in faults
+        # The locked terminal record supplies identity and subcode evidence.
+        # The raw printer can interleave with another core, leaving one
+        # malformed [UNHANDLED] line between that record and the test PASS.
+        # Claim at most one such line; an intact line with different identity
+        # or subcode, or any additional line, remains an unexpected fault.
+        interval = [
+            (fault_at, fault_line) for run_at, fault_at, fault_line in faults
             if run_at == fault_run and number < fault_at < pass_at
             and fault_at not in matched_faults
-            and (fault := UNHANDLED.search(fault_line)) is not None
+        ]
+        matching = [
+            fault_at for fault_at, fault_line in interval
+            if (fault := UNHANDLED.search(fault_line)) is not None
             and fault.groups() == (thread, expected_subcode)
         ]
         if matching:
             matched_faults.add(matching[0])
-            continue
-        # The locked terminal record itself supplies subcode evidence when
-        # the raw [UNHANDLED] writer interleaves with another core.
+        elif len(interval) == 1 and UNHANDLED.search(interval[0][1]) is None:
+            matched_faults.add(interval[0][0])
 
     for _run, number, line in faults:
         if number not in matched_faults:
