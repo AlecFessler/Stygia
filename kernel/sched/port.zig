@@ -1068,7 +1068,9 @@ fn recvInner(
     if (timeout_ns != 0) {
         const now_ns = arch.time.getMonotonicClock().now();
         caller.recv_deadline_ns = now_ns + timeout_ns;
-        _ = addTimedRecvWaiter(caller);
+        if (addTimedRecvWaiter(caller)) {
+            stygia.utils.hang_detector.noteTimedRecv(caller.recv_deadline_ns, timeout_ns);
+        }
     }
 
     port_ref.unlockIrqRestore(port_irq_state);
