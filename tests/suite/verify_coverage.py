@@ -56,6 +56,20 @@ TEST_FILE_RE = re.compile(r"^(?P<section>[A-Za-z][A-Za-z0-9_]*?)_(?P<num>[0-9]+[
 # but are not one-to-one assertions from docs/kernel/specv3.md.
 NON_SPEC_TEST_FILES = {
     "scheduler_balance_01.zig",
+    # Regression for the saved-frame reply return value; not a new spec assertion.
+    "reply_return_ok_01.zig",
+    # Restart policy observers cover the policy table rather than numbered
+    # assertions in §[restart_semantics].
+    "process_restart_01.zig",
+    "process_restart_02.zig",
+    "process_restart_03.zig",
+    "process_restart_04.zig",
+    "process_restart_05.zig",
+    "process_restart_06.zig",
+    "vmar_restart_00.zig",
+    "vmar_restart_01.zig",
+    "vmar_restart_02.zig",
+    "vmar_restart_03.zig",
 }
 
 # Valid assertions with no faithful test in the current suite. Each requires
