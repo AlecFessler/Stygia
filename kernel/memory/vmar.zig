@@ -8,6 +8,7 @@
 //! protection across processes comes from `_gen_lock`.
 
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const std = @import("std");
 const stygia = @import("stygia");
 
@@ -99,6 +100,9 @@ pub const MAX_INSTALLED_PFS: usize = 64;
 /// null` marks an empty slot in the inline `installed_pfs` array.
 pub const InstalledPf = struct {
     offset: u64 = 0,
+    /// PF rights captured from the installing handle. They remain stable
+    /// after that handle is restricted, moved, or deleted.
+    pf_rwx: u3 = 0,
     /// Effective permissions installed in the PTEs for this mapping:
     /// VMAR.cur_rwx & page_frame.rwx for map_pf, or VMAR.cur_rwx for
     /// demand pages. Used by the fault path to distinguish a genuine
@@ -646,38 +650,13 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
     // Spec §[var].remap test 04: for map = page_frame, new_cur_rwx must
     // be a subset of the intersection of every installed page_frame's
     // r/w/x caps. The intersection starts at all-bits-set and ANDs in
-    // each live entry's caps; an empty installed list (shouldn't occur
-    // when map = page_frame) leaves the intersection at all-bits.
+    // each live entry's installation rights; an empty installed list
+    // (shouldn't occur when map = page_frame) leaves all bits set.
     if (v.map == .page_frame) {
         var pf_intersect_rwx: u3 = 0b111;
         for (&v.installed_pfs) |*entry| {
-            // caller-pinned: PF refcount kept by VMAR's installed list;
-            // VMAR's gen-lock is held, so no concurrent install/unmap.
-            const pf_ref = entry.pf orelse continue;
-            const pf = pf_ref.ptr;
-            const pf_caps_word: u16 = blk: {
-                var i: usize = 0;
-                while (i < process.user_table.len) : (i += 1) {
-                    if (Word0.typeTag(process.user_table[i].word0) != .page_frame) continue;
-                    const kh = process.kernel_table[i];
-                    if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
-                        break :blk Word0.caps(process.user_table[i].word0);
-                    }
-                }
-                // No handle to this pf in the calling process: derive
-                // r/w/x from the pf's effective state by treating it
-                // as fully permissive (all bits set). The owning
-                // process's handle is what gates installation, and the
-                // intersection is taken across installed frames; the
-                // remap caller already passed a caps-subset check via
-                // the VMAR's own caps.
-                break :blk @as(u16, 0xFFFF);
-            };
-            const pf_caps: PageFrameCaps = @bitCast(pf_caps_word);
-            const pf_rwx: u3 = (@as(u3, @intFromBool(pf_caps.r))) |
-                (@as(u3, @intFromBool(pf_caps.w)) << 1) |
-                (@as(u3, @intFromBool(pf_caps.x)) << 2);
-            pf_intersect_rwx &= pf_rwx;
+            if (entry.pf == null) continue;
+            pf_intersect_rwx &= entry.pf_rwx;
         }
         if ((new_rwx & ~pf_intersect_rwx) != 0) return errors.E_INVAL;
     }
@@ -696,53 +675,119 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
     // user-visible handle so we treat its caps as 0b111 — same as the
     // demandAlloc path that pinned 0b111 into mappingInstall.
     const sz_bytes = pageSizeBytes(v.sz);
-    for (&v.installed_pfs) |*entry| {
+    const dma_device: ?*DeviceRegion = if (vmar_caps.dma) blk: {
+        const dev_ref = v.device orelse return errors.E_INVAL;
+        break :blk dev_ref.ptr;
+    } else null;
+    for (&v.installed_pfs, 0..) |*entry, entry_index| {
         const pf_ref = entry.pf orelse continue;
         const pf = pf_ref.ptr;
-        // PageFrame caps for the intersection. For demand pages the
-        // PF is kernel-allocated and not in any user_table, so the
-        // lookup falls through to 0b111 (matches demandAlloc).
-        const pf_rwx_for_remap: u3 = blk: {
-            if (v.map == .demand) break :blk 0b111;
-            var i: usize = 0;
-            while (i < process.user_table.len) : (i += 1) {
-                if (Word0.typeTag(process.user_table[i].word0) != .page_frame) continue;
-                const kh = process.kernel_table[i];
-                if (kh.ref.ptr == @as(*const anyopaque, @ptrCast(pf))) {
-                    const pfc: PageFrameCaps = @bitCast(Word0.caps(process.user_table[i].word0));
-                    break :blk (@as(u3, @intFromBool(pfc.r))) |
-                        (@as(u3, @intFromBool(pfc.w)) << 1) |
-                        (@as(u3, @intFromBool(pfc.x)) << 2);
-                }
-            }
-            break :blk 0b111;
-        };
-        const effective_rwx = new_rwx & pf_rwx_for_remap;
+        const effective_rwx = new_rwx & entry.pf_rwx;
         const eff_perms = rwxToPerms(effective_rwx);
         const pf_bytes = @as(u64, pf.page_count) * pageSizeBytes(pf.sz);
         var byte_off: u64 = 0;
         while (byte_off < pf_bytes) : (byte_off += sz_bytes) {
             const off_p = entry.offset + byte_off;
             const phys_p = PAddr.fromInt(pf.phys_base.addr + byte_off);
-            dispatch.paging.mapPageSized(
-                process.addr_space_root,
-                phys_p,
-                .fromInt(v.base_vaddr.addr + off_p),
-                v.sz,
-                v.cch,
-                eff_perms,
-            ) catch {};
+            if (dma_device) |device| {
+                dispatch.iommu.iommuMapPage(
+                    device,
+                    v.base_vaddr.addr + off_p,
+                    phys_p,
+                    v.sz,
+                    eff_perms,
+                ) catch {
+                    // These leaves existed before remap, so restoring them
+                    // cannot require new page-table allocations. Include
+                    // only leaves updated before the failed call.
+                    restoreDmaRemapPrefix(v, device, entry_index, byte_off);
+                    return errors.E_NOMEM;
+                };
+            } else {
+                dispatch.paging.mapPageSized(
+                    process.addr_space_root,
+                    phys_p,
+                    .fromInt(v.base_vaddr.addr + off_p),
+                    v.sz,
+                    v.cch,
+                    eff_perms,
+                ) catch {};
+            }
         }
-        entry.effective_rwx = effective_rwx;
+        if (dma_device == null) entry.effective_rwx = effective_rwx;
     }
-    dispatch.paging.shootdownTlbRange(
-        process.addr_space_id,
-        v.base_vaddr,
-        v.sz,
-        v.page_count,
-    );
+    if (dma_device) |device| {
+        // The fixture suite has no syscall for inspecting CPU or IOMMU
+        // tables. Read back both hardware tables here in test profiles so
+        // its DMA remap case fails if a CPU PTE appears or an IOMMU leaf
+        // retains old permissions. This is independent of the write path.
+        if (build_options.tests_fixture_devices and !verifyDmaRemapLeaves(v, process, device, new_rwx)) {
+            restoreDmaRemapPrefix(v, device, MAX_INSTALLED_PFS, 0);
+            return errors.E_INVAL;
+        }
+        // Publish metadata only after every IOMMU leaf has been updated.
+        for (&v.installed_pfs) |*entry| {
+            if (entry.pf == null) continue;
+            entry.effective_rwx = new_rwx & entry.pf_rwx;
+        }
+        dispatch.iommu.invalidateIotlbRange(device, v.base_vaddr.addr, v.sz, v.page_count);
+    } else {
+        dispatch.paging.shootdownTlbRange(
+            process.addr_space_id,
+            v.base_vaddr,
+            v.sz,
+            v.page_count,
+        );
+    }
     v.cur_rwx = new_rwx;
     return 0;
+}
+
+fn verifyDmaRemapLeaves(v: *VMAR, process: *Process, device: *DeviceRegion, expected_rwx: u3) bool {
+    // x86 test boots request an emulated IOMMU; fail instead of silently
+    // turning this into a metadata-only smoke test if discovery breaks.
+    if (builtin.cpu.arch == .x86_64 and !dispatch.iommu.isAvailable()) return false;
+    const leaf_bytes = pageSizeBytes(v.sz);
+    for (&v.installed_pfs) |*entry| {
+        const pf_ref = entry.pf orelse continue;
+        const pf = pf_ref.ptr;
+        const effective_rwx = expected_rwx & entry.pf_rwx;
+        const pf_bytes = @as(u64, pf.page_count) * pageSizeBytes(pf.sz);
+        var byte_off: u64 = 0;
+        while (byte_off < pf_bytes) : (byte_off += leaf_bytes) {
+            const iova = v.base_vaddr.addr + entry.offset + byte_off;
+            if (dispatch.paging.resolveVaddr(process.addr_space_root, VAddr.fromInt(iova)) != null) return false;
+            if (dispatch.iommu.isAvailable()) {
+                const leaf = dispatch.iommu.inspectLeaf(device, iova, v.sz) orelse return false;
+                if (leaf.phys.addr != pf.phys_base.addr + byte_off) return false;
+                if (leaf.read != (effective_rwx & 0b001 != 0)) return false;
+                if (leaf.write != (effective_rwx & 0b010 != 0)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn restoreDmaRemapPrefix(v: *VMAR, device: *DeviceRegion, last_index: usize, last_byte_off: u64) void {
+    const leaf_bytes = pageSizeBytes(v.sz);
+    for (&v.installed_pfs, 0..) |*entry, idx| {
+        if (idx > last_index) break;
+        const pf_ref = entry.pf orelse continue;
+        const pf = pf_ref.ptr;
+        const pf_bytes = @as(u64, pf.page_count) * pageSizeBytes(pf.sz);
+        const limit = if (idx == last_index) last_byte_off else pf_bytes;
+        var byte_off: u64 = 0;
+        while (byte_off < limit) : (byte_off += leaf_bytes) {
+            dispatch.iommu.iommuMapPage(
+                device,
+                v.base_vaddr.addr + entry.offset + byte_off,
+                PAddr.fromInt(pf.phys_base.addr + byte_off),
+                v.sz,
+                rwxToPerms(entry.effective_rwx),
+            ) catch @panic("DMA remap rollback failed on an existing IOMMU leaf");
+        }
+    }
+    dispatch.iommu.invalidateIotlbRange(device, v.base_vaddr.addr, v.sz, v.page_count);
 }
 
 /// `snapshot` syscall handler. Spec §[var].snapshot.
@@ -1318,6 +1363,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     }
     v.installed_pfs[slot_reserved.?] = .{
         .offset = offset,
+        .pf_rwx = pf_rwx,
         .effective_rwx = effective_rwx,
         .pf = SlabRef(PageFrame).init(pf, pf._gen_lock.currentGen()),
     };

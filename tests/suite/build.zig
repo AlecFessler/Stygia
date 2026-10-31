@@ -12,6 +12,7 @@ const TestEntry = struct {
 // under tests/ then add an entry below.
 const test_entries = [_]TestEntry{
     .{ .name = "breakpoint_fault_01", .path = "cases/breakpoint_fault_01.zig" },
+    .{ .name = "dma_remap_table_state", .path = "cases/dma_remap_table_state.zig" },
     .{ .name = "ack_01", .path = "cases/ack_01.zig" },
     .{ .name = "ack_02", .path = "cases/ack_02.zig" },
     .{ .name = "ack_03", .path = "cases/ack_03.zig" },

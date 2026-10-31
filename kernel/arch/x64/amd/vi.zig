@@ -674,6 +674,28 @@ pub fn unmapPage(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?PAddr {
     return PAddr.fromInt(entry & AMDVI_ADDR_MASK);
 }
 
+/// Test diagnostic: read the actual I/O page-table leaf without changing it.
+pub fn inspectLeaf(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?u64 {
+    if (unit_count == 0) return null;
+    const state = device.iommu_state orelse return null;
+    const domain: *PerDevice = @ptrCast(@alignCast(state));
+    if (!domain.provisioned) return null;
+    const pml4: *[512]u64 = @ptrFromInt(domain.pt_root_virt.addr);
+    const l4: u9 = @truncate(iova >> 39);
+    if (!amdviPresent(pml4[l4])) return null;
+    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[l4] & AMDVI_ADDR_MASK), null).addr);
+    const l3: u9 = @truncate(iova >> 30);
+    if (sz == .sz_1g) return if (amdviPresent(pdpt[l3]) and ((pdpt[l3] >> 9) & 7) == 7) pdpt[l3] else null;
+    if (!amdviPresent(pdpt[l3]) or ((pdpt[l3] >> 9) & 7) != 2) return null;
+    const pd_table: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[l3] & AMDVI_ADDR_MASK), null).addr);
+    const l2: u9 = @truncate(iova >> 21);
+    if (sz == .sz_2m) return if (amdviPresent(pd_table[l2]) and ((pd_table[l2] >> 9) & 7) == 7) pd_table[l2] else null;
+    if (!amdviPresent(pd_table[l2]) or ((pd_table[l2] >> 9) & 7) != 1) return null;
+    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd_table[l2] & AMDVI_ADDR_MASK), null).addr);
+    const l1: u9 = @truncate(iova >> 12);
+    return if (amdviPresent(pt[l1])) pt[l1] else null;
+}
+
 /// Page-selective IOTLB invalidation for `[iova, iova + page_count*sz)`.
 /// Issues one INVALIDATE_IOMMU_PAGES per page and a trailing
 /// COMPLETION_WAIT so the caller observes the flush before resuming.

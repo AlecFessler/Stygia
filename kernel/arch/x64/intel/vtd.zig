@@ -466,6 +466,30 @@ pub fn unmapPage(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?PAddr {
     return PAddr.fromInt(entry & 0xFFFF_FFFF_FFFF_F000);
 }
 
+/// Test diagnostic: read the actual second-stage leaf without changing it.
+pub fn inspectLeaf(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?u64 {
+    if (!initialized) return null;
+    const state = device.iommu_state orelse return null;
+    const pd: *PerDevice = @ptrCast(@alignCast(state));
+    if (!pd.provisioned) return null;
+    const pml4: *[512]u64 = @ptrFromInt(pd.sl_pt_root_virt.addr);
+    const l4: u9 = @truncate(iova >> 39);
+    if (pml4[l4] & 1 == 0) return null;
+    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[l4] & 0xFFFFFFFFF000), null).addr);
+    const l3: u9 = @truncate(iova >> 30);
+    if (sz == .sz_1g) return if (pdpt[l3] & 0x80 != 0) pdpt[l3] else null;
+    if (pdpt[l3] & 1 == 0 or pdpt[l3] & 0x80 != 0) return null;
+    const pd_table: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[l3] & 0xFFFFFFFFF000), null).addr);
+    const l2: u9 = @truncate(iova >> 21);
+    if (sz == .sz_2m) return if (pd_table[l2] & 0x80 != 0) pd_table[l2] else null;
+    if (pd_table[l2] & 1 == 0 or pd_table[l2] & 0x80 != 0) return null;
+    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd_table[l2] & 0xFFFFFFFFF000), null).addr);
+    const l1: u9 = @truncate(iova >> 12);
+    // R/W=0 denies all DMA, but the leaf can still hold a nonzero
+    // physical address; inspect it so remap-to-none can be verified.
+    return if (pt[l1] != 0) pt[l1] else null;
+}
+
 /// Page-selective IOTLB invalidation per Section 11.4.6.4.
 ///
 /// IOTLB Invalidate Register (offset IRO+8) layout:
