@@ -54,6 +54,28 @@ pub fn isAvailable() bool {
     return active_type != .none;
 }
 
+pub const InspectedLeaf = struct { phys: PAddr, read: bool, write: bool };
+
+/// Test-only page-table readback. No device transaction is generated.
+pub fn inspectLeaf(device: *SpecDeviceRegion, iova: u64, sz: VmarPageSize) ?InspectedLeaf {
+    const raw = switch (active_type) {
+        .intel_vtd => vtd.inspectLeaf(device, iova, sz),
+        .amd_vi => vi.inspectLeaf(device, iova, sz),
+        .none => null,
+    } orelse return null;
+    const mask: u64 = switch (sz) {
+        .sz_4k => 0x000F_FFFF_FFFF_F000,
+        .sz_2m => 0x000F_FFFF_FFE0_0000,
+        .sz_1g => 0x000F_FFFF_C000_0000,
+        ._reserved => return null,
+    };
+    return switch (active_type) {
+        .intel_vtd => .{ .phys = PAddr.fromInt(raw & mask), .read = raw & 1 != 0, .write = raw & 2 != 0 },
+        .amd_vi => .{ .phys = PAddr.fromInt(raw & mask), .read = raw & (@as(u64, 1) << 61) != 0, .write = raw & (@as(u64, 1) << 62) != 0 },
+        .none => unreachable,
+    };
+}
+
 pub fn iommuMapPage(
     device: *SpecDeviceRegion,
     iova: u64,

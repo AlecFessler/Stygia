@@ -9,6 +9,28 @@ const MemoryPerms = stygia.memory.address.MemoryPerms;
 const PAddr = stygia.memory.address.PAddr;
 const VmarPageSize = stygia.memory.vmar.PageSize;
 
+pub const InspectedLeaf = struct { phys: PAddr, read: bool, write: bool };
+
+/// Test-profile diagnostic. Returns null when no hardware IOMMU is active.
+pub fn inspectLeaf(device: *DeviceRegion, iova: u64, sz: VmarPageSize) ?InspectedLeaf {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            const leaf = x64.iommu.inspectLeaf(device, iova, sz) orelse return null;
+            return .{ .phys = leaf.phys, .read = leaf.read, .write = leaf.write };
+        },
+        .aarch64 => return null,
+        else => unreachable,
+    }
+}
+
+pub fn isAvailable() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.isAvailable(),
+        .aarch64 => false,
+        else => unreachable,
+    };
+}
+
 /// Map a single page-sized IOVA in `device`'s domain to `phys` with
 /// `perms`. Spec §[var].map_pf (caps.dma=1).
 pub fn iommuMapPage(
