@@ -1,24 +1,7 @@
 # Stygia systems: the execution-context lifecycle machine
 
-Status: **design target, revision 16** (2026-08-02). **Revision 16's
-systems text is DOC-ONLY — the lifecycle transition relation in
-`docs/kernel/tla/ECLifecycle.tla` is the module the revision-15 exit-0
-battery ran against.** The later TLA recovery pass changes artifact
-coverage (`t1d`/`pr4d`) and the scoping of `LiveSuspender`, not the
-state-transition graph. It has two halves.
-**First**, it states one premise the domain-pause argument had been
-asserting (the quiesced-resume rule, §3.3), fixes which leg of the user
-boundary the domain-paused arm is checked on (§3.1 rule 3), and records
-the tree obligation both create (§11.13) — all three invisible to a model
-that has no domains and no user memory, so this is exactly the shape the
-README's parity discipline warns about and its ledger entry is **G12**.
-**Second**, it closes **§12's first review**, which the plan FAILED with
-five blockers: the domain-wide pause is DEFERRED out of the refactor to
-bead `stygia-qap`, `restart_at_entry` is downgraded from "IN, deferred"
-to not a design obligation, and steps 1, 3, 4, 5, 8 and 9 are corrected
-against the tree. §12 now ends with the closure check that catches the
-recurring failure — a mechanism written normatively into §§0–9 and
-scheduled nowhere — and running that check found two more.
+Status: **design target, revision 16** (2026-08-02). The TLA+ lifecycle transition relation lives in `docs/kernel/tla/ECLifecycle.tla`; its validation history and remaining parity gaps are recorded in `docs/kernel/tla/README.md`.
+
 Review history: round 1
 (`docs/kernel/systems-review.md`, UNSOUND — mechanisms; closed in rev 2),
 round 2 (UNSOUND but converging — protocols; closed in rev 3), round 3
@@ -58,7 +41,6 @@ here). §13 maps every finding to its fix. This revision is CO-EVOLVED with the
 model: every normative mechanism here is encoded in
 `docs/kernel/tla/ECLifecycle.tla` **except those the README's ledger
 names as unmodelled — G9 (`priority` re-bucket), G11 (`dir = "dead"`),
-G12 (the whole domain pause, including §3.3's quiesced-resume rule),
 G13 (`current_queue_core`) and G14 (`idle_parked` + L3's wake-IPI
 rule), and G16 (`teardown_pending` / `TeardownRequest`)** — with no model-invented repair
 mechanisms, and the falsification gates (X1–X3, F1 both readings, N4,
@@ -173,18 +155,11 @@ EC-lifecycle or lost-wake bug, include it.
 - **Teardown and reclamation ordering**, including the kstack hop
   (§4, §8.2).
 - **The claim protocol** — who owns an EC in transit (§3.5, §5.2's T2).
-- **The domain-wide pause AND its resume** (§0.3) — it moves N ECs off
-  cores and then back onto them, which is the test's own definition.
-  **IN SCOPE, but DEFERRED out of the §12 refactor to bead `stygia-qap`**
-  (maintainer decision, revision 16): it is unimplemented at HEAD,
-  unmodelled in the battery, and no migration step depends on it. In
-  scope means the design is here and normative; it does not mean this
-  refactor builds it.
 - **The wakes caused by `revoke`/`restrict`** — a port-refcount cascade
   waking suspended senders with `E_CLOSED` is a wake, so it is in, via
   edge 5a's existing close-propagation trigger. No new edge.
 - ~~**`restart_at_entry`** — it makes an EC runnable.~~ **NO LONGER AN
-  OBLIGATION as of revision 16** (maintainer decision, §0.3). It WOULD
+  OBLIGATION as of revision 16** (maintainer decision, §[restart_semantics]). It WOULD
   make an EC runnable, and the machine will route it when restart
   semantics are built — but the tree implements only the policy plumbing,
   so this listed a scope commitment against a feature that does not
@@ -194,7 +169,7 @@ EC-lifecycle or lost-wake bug, include it.
   VALIDITY PREDICATE** (§6, §2.6). **This is the deliverable**, and it
   is worth stating precisely rather than as "provably redundant"
   (round-13): the machine **adds** words — `pin_depth`, `mark_state`,
-  `payload_done`, `directive_state`, `teardown_pending`, `cd.paused`,
+  `payload_done`, `directive_state`, `teardown_pending`,
   and the `pended` state. §2.6 calls that "the honest price" and it is.
   Redundancy is met **literally** for the four signals actually deleted
   (`on_cpu`, `committed_ec`, `pending_zombie[64]` and its three
@@ -235,145 +210,6 @@ extra complexity this machine must not carry.
   itself, as distinct from any EC movement it triggers.
 
 ### 0.3 BORDERLINE, each judged on the test and each stated with which way it lands
-
-- **Domain-wide pause — IN, and routed by a GATE rather than by N
-  suspensions (round-13 C-1).** `specv3.md` says verbatim at `:722`,
-  `:1894` and `:1952` that `acquire_vmars` / `idc_read` / `idc_write`
-  each **pause every EC in the target domain**. Two earlier attempts at
-  routing it were wrong: revision 13 said "N applications of the
-  existing suspend edge" (does not type-check — every suspend route ends
-  in `waiting(port_queue)` and §[suspend] requires a port handle), and
-  revision 14 said the pauser "arms N directives" (does not type-check
-  either — §2.5's directive has exactly ONE consume arm and it parks
-  into a port, while a pause has no port). **`running` was left with no
-  route at all**, which is the common case: a debugger pausing a live
-  domain.
-
-  **The mechanism is a per-domain gate checked at the user boundary, and
-  it touches §2.5 not at all.** No directive kind discriminator, no
-  second payload, no new lock class in the park sequence, no change to
-  the break disambiguator:
-
-  1. The capability domain carries a **`paused` word** (§3.4).
-  2. **Pause entry** CASes the target domain's `paused` 0 → 1 under its
-     `_gen_lock`.
-  3. **§3.1 rule 3 gains a third boundary arm**: an EC arriving at a
-     user boundary whose own domain reads `paused` performs a standard
-     edge-3 park into `waiting(domain_pause)`. **On BOTH legs of that
-     boundary** — the kernel → user return leg is the one that makes the
-     pause a pause, and revision 15 left it to the ambiguity of the word
-     "boundary" (§3.1 rule 3, revision 16).
-  4. **Resume** clears the word, then 5a-claims each gated EC and places
-     it (edge 6).
-
-  **Why this needs no per-state routing on 5a/5c, which is the question
-  revision 14 left open.** The gate is on the path back to user code, so
-  it catches every EC regardless of the state it was in. A
-  `waiting(futex)` target is NOT claimed and NOT left to run: an
-  unrelated `futex_wake` makes it `ready`, it dispatches, it runs the
-  tail of its own futex return in KERNEL code, and it parks at the gate
-  before executing a single user instruction in the rewritten address
-  space. Claiming it instead would destroy the futex wait; leaving it
-  ungated would let it run user code. **The gate does neither, and it
-  does the same thing for every state**, which is why this is smaller
-  than the per-state table revision 14 would have needed.
-
-  **That argument has a premise, and revisions 14–15 ASSERTED it rather
-  than stating it (round-13 follow-up).** The pauser's predicate covers
-  the **runnable subset only**, so the moment it is satisfied the pauser
-  proceeds and `acquire_vmars` / `idc_read` / `idc_write` begin operating
-  on the address space — and a **later** wake can still make an EC of
-  that domain `ready` and then `running`, in kernel code, while that work
-  is mid-flight. Everything such an EC executes between the wake and the
-  gate therefore runs against an address space that is being rewritten
-  underneath it. Revision 15 discharged this with a parenthetical citing
-  §3.3, and **§3.3 does not cover it**: §3.3's ban is on user-memory
-  access **inside container-lock and gen-lock holds**, and a syscall
-  return tail is not inside a hold. The premise is now a rule of its
-  own — **the quiesced-resume rule (§3.3)** — with a §9.2 assertion and a
-  §9.3(2) analyzer clause, on the standing principle that a premise
-  nobody can execute is a premise nobody has checked.
-
-  **The rule is not free, and pretending it was is what the parenthetical
-  did.** The tree violates it at HEAD on **both** arches: the dispatch
-  tail flushes `pending_event_word` into `[user_sp + 0]` and
-  `pending_event_rip` into the vreg-14 slot *after* the CR3/TTBR0 swap
-  into the resumed EC's address space and *before* the `iretq`/`ERET`
-  (`arch/x64/interrupts.zig:3003`, `arch/aarch64/cpu.zig:555`), with
-  SMAP/PAN deliberately cleared for the write — a kernel write to the
-  woken EC's user stack on the rendezvous-wake resume path, downstream of
-  any gate that could park the EC instead. Recorded as §11.13, which is
-  where the implementer's choice lives; it is a real obligation on the
-  refactor and not a doc-side flourish.
-
-  **What the pauser actually waits for, which fixes W5-N's contradiction
-  with T3 rule (b).** It does NOT enumerate N and it does not hold a
-  lock while waiting. It waits on a predicate over the **runnable subset
-  only** — no EC of the domain is `running`, `ready` or `parking` —
-  because those are the only states from which user code is reachable
-  without passing the gate; `waiting`, `claimed` and `pended` are safe
-  by construction, since every path from them back to user code goes
-  through the boundary. The set cannot grow underneath the wait:
-  **edge 1's publish already takes the CD `_gen_lock` in its section**
-  (§8.5), so a creation into a paused domain publishes into
-  `waiting(domain_pause)` rather than `ready`, serialized by a lock the
-  publisher already holds and the pauser does not. So the pauser spins
-  holding nothing (rule (b) satisfied) over a predicate that only ever
-  decreases.
-
-  **Two refusals make the no-cycle argument real** — revision 14 claimed
-  §2.5.1 covered this and it did not, because §2.5.1's mechanism is the
-  suspender CASing its *own* directive word and nothing said a pauser
-  does that. The domain-level analogue, stated directly:
-  - **A pause whose target domain contains the calling EC is refused.**
-    A pauser inside the paused set would gate itself at its own
-    boundary and never reach its resume.
-  - **A pause is refused if the CALLER's own domain is already paused.**
-    This is §2.5.1's shape lifted to domains — check your own word
-    before claiming another's — and it is what makes mutual pause
-    unrepresentable: P1 ∈ D2 pauses D1, then P2 ∈ D1 attempting to
-    pause D2 finds D1 already paused and is refused. Without it, both
-    pausers sit in kernel frames waiting for targets that can never
-    reach a boundary, which is round-8 C-1's shape in a third
-    mechanism.
-
-  Both refusals return an E_BUSY-class error. **`idc_read`/`idc_write`/
-  `acquire_vmars` have no E_BUSY cause in `specv3.md`**, so this is a
-  spec addition and it is recorded in §11.8 alongside `suspend`'s —
-  not invented here. A caller that retries must back off; a tight retry
-  is a new spin and would need a T3 row, which this design does not add.
-
-  **DEFERRED out of the §12 refactor to bead `stygia-qap` (maintainer
-  decision, 2026-08-02), the same treatment `restart_at_entry` already
-  carries.** Everything above stays normative and the follow-on will use
-  it verbatim — only the MIGRATION STATUS changes. **It has no rows in
-  §5.2 and no step in §12**, and the three reasons are:
-  1. **It is unimplemented at HEAD, so deferring regresses nothing.**
-     DERIVED, not recalled: `memory/vmar.zig:1606`/`:1610` are
-     `fn quiesceDomain(cd: *CapabilityDomain) void { _ = cd; }` and its
-     resume twin — empty stubs — called from `:795` (`idc_read`) and
-     `:873` (`idc_write`), and `acquire_vmars`
-     (`caps/capability_domain.zig:860`) has no pause call at all. So
-     `specv3.md` `:722`/`:1894`/`:1952` is unhonoured on all three
-     syscalls today.
-  2. **It is UNMODELLED in the battery** (`docs/kernel/tla/README.md`
-     ledger **G12**). Building it during the refactor would repeat
-     precisely the mistake the refactor exists to undo — implementing
-     against a mechanism no battery has exercised.
-  3. **Nothing in steps 1–10 depends on it.** Its own step would sit
-     after step 6, needing edge 6 from step 3, the boundary gate from
-     4c, and the CD-locked publish arm from step 7.
-
-  **And the follow-on is a RESTRUCTURING, not a stub-fill** — recorded
-  here because it is the part that makes this more than a one-line
-  scheduling note. `vmar.zig:780` takes `v._gen_lock.lockIrqSave` and
-  holds it across BOTH the pause point at `:795` AND the SMAP window at
-  `:807` (identically at `:848`/`:873`/`:877`). §3.6 W5-N requires the
-  pauser to spin **holding no lock** with `pin_depth == 0`; §9.2
-  requires every EC-context spin entry to assert **IRQs enabled**; and
-  §3.3's in-hold ban makes `:807`/`:877` violations of §9.3(2) in their
-  own right (see §12's note on hoisting them). All three fail at the
-  call sites as they stand, so the pause cannot be dropped into them.
 
 - **`restart_at_entry` — NOT A DESIGN OBLIGATION OF THIS MACHINE
   (maintainer decision, 2026-08-02; downgraded from revisions 13–15's
@@ -631,8 +467,7 @@ A single struct, `ec.wait`, valid only in `parking`/`waiting`/`claimed`/
 
 ```zig
 pub const Wait = struct {
-    kind: enum(u8) { none, port_queue, reply_pin, futex, idle, requeue,
-                     domain_pause },   // §0.3 / round-12 C-1
+    kind: enum(u8) { none, port_queue, reply_pin, futex, idle, requeue }
     port: ?SlabRef(Port),                  // port_queue / reply_pin
     reply_holder: ?*KernelHandle,          // reply_pin (+ domain, slot)
     futex_nodes: ?[*]WaitNode, futex_count: u8,
@@ -660,20 +495,6 @@ pub const Wait = struct {
 Today's `suspend_port`, `pending_reply_holder/domain/slot`, futex node
 fields, and both deadline fields fold in. `kind == .requeue` covers
 preemption and affinity migration; deletes `pending_cross_enqueue`.
-
-**`kind == .domain_pause`** (round-12 C-1) is the port-less pause
-`acquire_vmars` / `idc_read` / `idc_write` perform (§0.3). It carries
-**no port, no event and no reply capability** — which is exactly why it
-could not be "N applications of the existing suspend edge": every
-suspend route terminates in `waiting(port_queue)` and §[suspend]
-requires a port handle. **Its container is the paused domain's EC list,
-reached under the CD `_gen_lock`** — the same list §8.2's teardown walk
-already iterates, so this adds a wait kind and a use of an existing
-container rather than a new container. The design decision is recorded
-here rather than left implicit: **no kernel-synthesized internal port.**
-A synthetic port would have to be minted, refcounted, torn down on
-domain death and made invisible to `recv`, which is more machinery than
-a wait kind whose container already exists.
 
 **What is NOT in here** (round 7 M-1, stated because the review read
 §8.1's "descriptor write" as creating a fourth `ec.wait` writer):
@@ -763,7 +584,7 @@ pub const PerCore = struct {
 };
 
 pub const TeardownRequest = struct {
-    kind: enum(u8) { self_delete, no_route_fault },
+    kind: enum(u8) { self_delete, unhandled_fault },
     cd: SlabRef(CapabilityDomain), // held from validation through phase 2
 };
 ```
@@ -1425,43 +1246,9 @@ context** (the park kstack).
    requeue, and `pended` discharge run here, un-abandonable, IRQs
    enabled.
 3. **Entry checks are user-boundary-gated, and they run FIRST.** The
-   `retired` and `directive` arms fire only on entry from user mode; the
-   **domain-paused** arm fires on **both legs** of the boundary, and the
-   difference is load-bearing (see below). **The domain-paused arm
-   (round-13 C-1, §0.3):** an EC
-   whose own domain reads `paused` performs a standard edge-3 park into
-   `waiting(domain_pause)`, published under the CD `_gen_lock`. Its
-   precedence sits **below `retired` and below the directive**: a dying
-   EC must not be gated into a wait its resumer would then have to
-   discharge, and an armed suspension is already a park to a port that
-   the pause has no reason to pre-empt. So the order is
-   **retired → directive → domain-paused → requeue**, and the tick is an
-   entry from user mode for all four (§5's edge-3 row).
-
-   **WHICH LEG, stated normatively because revision 15 left it to the
-   phrase "user boundary" and the two readings are not equivalent
-   (round-13 follow-up).** The entry leg alone does not implement the
-   pause. An EC parked in `waiting(futex)` when the pauser proceeds, and
-   woken afterwards, never re-enters from user mode on its way back —
-   it is dispatched and *returns*. Under an entry-only reading it would
-   execute user instructions in the rewritten address space until the
-   next tick, which contradicts §0.3's "before executing a single user
-   instruction" outright, and falsifies §3.6 W5-N's own soundness
-   argument that *"every path from [`waiting`/`claimed`/`pended`] back to
-   user code passes the §3.1 rule-3 gate"* — a wake→dispatch→return path
-   passes no entry check at all. So:
-   - **Return leg (kernel → user), the domain-paused arm ONLY**: every
-     path that hands control back to user mode — syscall return, fault
-     return, interrupt return, and the arch dispatch trampoline that
-     resumes a woken EC — re-reads `cd.paused` and parks instead of
-     returning if it is set. This is the leg that makes the pause a
-     pause. It is also the leg the quiesced-resume rule (§3.3) constrains,
-     and the leg the tree's trampoline currently writes user memory on
-     ahead of (§11.13).
-   - **Entry leg (user → kernel), all four arms in the order above**:
-     this is what discharges an EC that was `running` in user mode when
-     the pause landed, and it is the per-EC progress W5-N's boundedness
-     column is about.
+   `retired` and `directive` arms fire on entry from user mode before
+   any requeue action. The tick is an entry from user mode (§5's
+   edge-3 row).
 
    `retired` and `directive` do not need the return leg: both are
    asynchronous by construction — a retired EC is caught by the wake IPI
@@ -1610,99 +1397,6 @@ with both sides IRQ-masked. Never a silent drop, either way.
   holds, as today's reply path already does (`port.zig:753-756`).
   Analyzer-checkable (9.3(2)); this is also the boundary condition under
   which T3's W1 row is sound (W1's argument covers maskable IRQs only).
-- **The QUIESCED-RESUME RULE. Normative, and new in revision 16 — it is
-  the premise §0.3's domain-pause argument rests on, which revisions 14
-  and 15 asserted through a citation of the bullet above that does not
-  reach it.** Scope first, because the two rules are easy to conflate:
-  the bullet above bans user-memory access **inside a hold**; this one
-  bans it **outside any hold**, on one specific path, and neither
-  implies the other.
-
-  > **From the moment a wake makes an EC of a PAUSED domain runnable
-  > (edge 5a, then edge 6) until that EC reaches the §3.1 rule-3
-  > domain-paused gate, no kernel code executing on that EC's behalf may
-  > read or write that EC's user memory** — not in the wake body, not in
-  > the syscall return tail, and not in the arch dispatch trampoline.
-
-  **Why the exposure is real and specific**, rather than a tidiness
-  rule: the whole point of the pause is that `idc_read` / `idc_write` /
-  `acquire_vmars` operate on a QUIESCED address space, and the predicate
-  W5-N waits on covers only the runnable subset (§3.6). `waiting`,
-  `claimed` and `pended` ECs are excluded from it by design — that is
-  what lets the pauser finish — so the pauser proceeds while they are
-  still parked, and a wake arriving afterwards resumes one of them
-  concurrently with the rewrite. A kernel access to that EC's user
-  memory in that window is a read or write against a mapping the pauser
-  may already have unmapped, replaced or copied, performed with
-  SMAP/PAN cleared and therefore with no fault gate behind it.
-
-  **What the rule does NOT require**, so it is not read wider than it
-  is: register-only work on the saved frame is fine (the frame lives on
-  the kernel stack, not in user memory) — this is why `setEventStateGprs`
-  and the GPR-backed vreg writers are unaffected and only the
-  stack-backed slots (`vreg 0` at `[user_sp + 0]`, `vreg 14` on x86-64 at
-  `[user_rsp + 8]`, and `vreg >= 32`) are in scope. Nor does it apply to
-  ECs of unpaused domains, which is why the enforcement below is gated on
-  `cd.paused` rather than made universal.
-
-  **Two ways to satisfy it, and this document does not pick** (§11.13
-  records the call): either the gate is evaluated **before** any
-  user-memory access on the resume path — which means the domain-paused
-  arm is checked in the dispatch path ahead of the trampoline's flush,
-  not merely at syscall entry — or the access is **re-deferred** past the
-  gate, i.e. staged work stays staged for a gated EC and is flushed on
-  the resume that follows the pause, which is the same deferral
-  `port.deliverEvent` already performs once for the TTBR0/CR3 swap.
-  **The tree today does neither** (§11.13).
-
-  Enforcement: §9.2 assertion and §9.3(2) analyzer clause. Stated as a
-  rule rather than left in §0.3's prose because §0.3 is rationale and
-  §0.4 says explicitly that rationale is not what an implementer codes
-  against.
-
-  **WHEN it binds: with the pause, not before.** The rule is conditioned
-  on `cd.paused`, and the domain pause is DEFERRED out of §12 to bead
-  `stygia-qap` (§0.3). At HEAD no domain is ever paused, so the rule is
-  **dormant** — it is not an obligation on §12 steps 1–10, and §11.13's
-  HEAD violation is not a §12 blocker. It becomes live the moment `qap`
-  lands, which is exactly why it is written down now: `qap` must not be
-  implemented against a premise nobody recorded.
-- **EC-context kernel frames run with IRQs ENABLED. Normative, and new
-  in revision 10 (round-9 C-4) — it was the single most load-bearing
-  unstated premise in this document.** On entry from user mode the arch
-  entry path unmasks IRQs once its saved-state publication is complete,
-  and they stay unmasked for the body of the syscall or fault handler,
-  except inside the container/gen-lock holds above and the explicitly
-  masked windows this document names. **Twelve normative arguments
-  depend on it and none of them said so**: §3.1 rule 1 (a preempt tick
-  that can never arrive gates nothing), §2.4's C1 ordering rule (whose
-  entire argument is that there is "a live preemption point between the
-  two instructions"), T2's ready×K row, §2.5's mutual-remote-suspend
-  break, and the "preemptible" column of W3, W4 and W5 — including
-  §3.6's W3→W5 cycle argument.
-
-  Two things made this urgent rather than pedantic. First, what this
-  document *did* say pointed the other way: the bullet this replaces read
-  "no kernel code outside `arch/` enables interrupts; today's single
-  violation is deleted with its mechanism", and §12 step 5 deletes "the
-  last `enableInterrupts()` outside `arch/`" with **no step anywhere
-  adding one back**. Second, the tree today is masked: x86-64 `SYSCALL`
-  clears IF via `IA32_FMASK` (`arch/x64/cpu.zig`), and aarch64's only
-  `daifclr` sites are `cpu.enableInterrupts` and the park primitives —
-  so **following §12 literally leaves fewer enable windows than exist
-  today**, and every gate above goes vacuous *with the battery still
-  fully green*, because the model's `TickPreempt` fires on any unpinned
-  `running` EC regardless of what its frame is doing. A model cannot
-  catch this: IRQ state is below its granularity and the premise is
-  exactly what its atomicity grants for free.
-
-  The rule that remains true, restated correctly: **no kernel code
-  outside `arch/` MANIPULATES the interrupt-enable state** — the enable
-  is the arch entry path's job and the masked windows are the lock
-  classes' job. That is what the deleted `enableInterrupts()` violated;
-  it was an ad-hoc re-enable inside a must-complete sequence, not the
-  entry-path enable this rule requires.
-- The park primitive's masked-halt contract is unchanged.
 
 ### 3.4 Atomicity granularity
 
@@ -1719,7 +1413,6 @@ with both sides IRQ-masked. Never a silent drop, either way.
 | `ec.directive_result` | 8 bytes (`i64`) | owner core, release-store before `(armed, owner) → (failed, owner)` | matching suspender after acquire-observing `(failed, me)` | carries the owner-side consume-failure code only while `directive_state` is `failed`. The matching waiter reads it before CASing `failed → none` and returns the error; the ack does not clear the result because that would be a second, non-atomic word update. Outside `failed`, the value may be stale and no success path reads it |
 | `ec.wait.*` | multi-word | per §2.2 | claim/retire winner; owner's hop after `payload_done` | ownership transfers with CAS; reachability-gating sections; `payload_done` release/acquire |
 | `ec.ctx` saved-frame payload | multi-word | claim winner only | the EC after re-dispatch | claim CAS + saved-frame ban + discharge ordering |
-| `cd.paused` | 1 byte, on the capability domain | the pausing EC, CAS 0 → 1 under the target CD's `_gen_lock` at pause entry, and 0 at resume under the same lock | **every EC of that domain at its own user boundary, on BOTH legs** (§3.1 rule 3's third arm — the kernel → user return leg is the one that catches a woken `waiting` EC, which enters from nowhere); edge 1's publish, under the CD `_gen_lock` it already holds | single word, CAS-arbitrated, so two pausers of one domain serialize and the loser gets E_BUSY. Read at the boundary WITHOUT the lock — a stale FALSE is safe (the EC runs on and is caught at its next boundary; the pauser is still waiting on the runnable predicate), and a stale TRUE cannot occur because only the pauser clears it and it clears after every gated EC has been resumed (§0.3) |
 | `ec.current_queue_core` | 1 byte (`u8`; `NOT_IN_RUN_QUEUE` sentinel outside the validity set) | **the party holding the DESTINATION queue lock at the CAS-then-link of edges 1 / 6 / 6p / 8** — i.e. whoever makes the EC `ready` writes it in the same section. Whoever takes it out of `ready` (edge 2's dequeue, a 5c claim, pull-side steal's victim removal, retire's ready row) clears it to the sentinel in the section it already holds. The x86-64 IPC fast path mirrors this in R13's ready-enqueue branches: queue links/tail first, then `current_queue_core = local core`, then unlock | `removeFromQueue`; §8.1's reach-and-validate step 2 (which container am I in); §5.3's run-queue row; pull-side steal's victim scan as a hint only | **valid iff `state == ready`**, poisoned to the sentinel otherwise (debug builds assert it). Single byte, so no tearing; written and cleared only under the queue lock that owns the membership it names, which is the same section the state CAS runs in — so it cannot disagree with `state` at any point a reader can observe both. **A stale read is safe by construction**: the reader re-validates under the lock it was directed to and retries on mismatch (§3.5's drop-and-retry). Steal likewise does not trust this field alone: the victim scan validates actual run-queue membership under the victim lock before claiming/removing |
 | `PerCore.current` | 8 bytes | owning core (2 sites) | identity compares only | caller-pinned identity rules; bytes intact until finalize |
 | `PerCore.active_root` | 8 bytes | owning core, release-after-load | teardown barrier | as today |
@@ -1801,7 +1494,6 @@ callgraph (§9.3(6)).
 | W3 | terminate eviction spin | EC context, `pin_depth == 0`, no locks held | target leaving its core's `current` slot | target's kernel sequence completion + one user-boundary event (tick/IPI-bounded) | none — waiter is preemptible; target needs no interrupt of the waiter to return | target's progress is tick-driven, independent of the waiter — **CONDITIONAL on the two exit conditions below (round-8 C-1); without them this column is FALSE and mutual terminate is a hard two-core deadlock, reached by the model in 7 states**. **(i) Self carve-out**: if the target IS the caller, the wait is skipped entirely — a caller cannot wait for its own eviction. The tree already does this (`execution_context.zig:1028`, `if (ec != caller and ...)`); revision 8 had no such carve-out anywhere, so the tree was SAFER than the design. **(ii) Retired-waiter escape**: the spin also exits if the WAITING EC has itself become `retired`. The tree's `ec != caller` does NOT cover mutual terminate — A terminates B and B terminates A, and both cores pass `ec != caller`. Both callers end `retired` in kernel frames, and a `retired` EC in a kernel frame is moved by NOTHING: the requeue CAS fails on `retired` (§3.1 rule 1) and rule 3's entry checks are user-boundary-gated. Sound because a retired terminator never returns to user mode, so L5 has no observer to disappoint; safe because the frame holds no claim (`pin_depth == 0` at spin entry, rule (b)) |
 | W4 | L5 deferred-marking wait (terminate, prior `claimed`/`pended`): **acquire-load of `mark_state` until the owed bit is CLEAR** (§2.4, M-3) | EC context, `pin_depth == 0`, **no locks held**, preemptible | the discharger's bounded body (holder's L6 body, or owner's hop after `payload_done`) — its clearing release-store is the paired write | W1, W2 | none | discharger never waits on the terminator; bound = discharger instructions + scheduling latency, and the acquire/release pairing that bound presumes is now an explicit §3.4 discipline rather than an implicit one |
 | W5 | directive-suspender wait | EC context, `pin_depth == 0`, preemptible | target leaving `running`, OR consuming at a boundary | tick (requeue), its own park, or the **arming wake IPI forcing a user-boundary event → entry-check consumption** | none | round-2 verified for the requeue break; round-6 model addendum (N5): the requeue break ALONE is not total — a target duty-cycling pin-class holds can phase-align so the suspender never observes it off-CPU — and W5's termination then rests on rule 3's MANDATORY boundary consumption: every kernel entry from user mode (each periodic tick included) runs the directive arm, so an armed running target consumes within one unpinned tick; §2.5's wake IPI adds promptness for a target that never faults or syscalls. This is a distinct starvation class from N3 (N3: the SPINNER's recheck; N5: the spun-on EVENT), closed by rule 3, not by a fairness assumption — and rule 3's precedence over the requeue arm is what makes it work, which rev 7 left as a consequence and rev 8 states as a rule (round 7 M-5, §3.1). **This column is NOT a bound**: it is termination under assumptions (1)+(2) below, and the round-7 measurements show assumption (2) is the one the model can barely check (§11.7) |
-| W5-N | **domain-pause wait** (round-13 C-1 — rewritten; revision 14's row said the pauser "arms N directives", which does not type-check, and asserted "N fixed at entry" by holding the CD `_gen_lock`, which contradicts rule (b) in the same row) | EC context, `pin_depth == 0`, **holding NO lock** — the CD `_gen_lock` is dropped before the wait begins | a PREDICATE, not a set: no EC of the target domain is `running`, `ready` or `parking`. `waiting`/`claimed`/`pended` are not waited on — every path from them back to user code passes the §3.1 rule-3 gate, **and revision 16 is what makes that true rather than hoped for**: such a path is a wake → dispatch → *return*, which passes no ENTRY check at all, so the domain-paused arm is specified on the return leg as well. Excluding these three states is also what creates §3.3's quiesced-resume obligation — the pauser proceeds while they are still parked, so a later wake resumes one concurrently with the rewrite | per EC: its own progress to a user boundary, which is tick-driven exactly as W3's is | none — the waiter is preemptible and no target needs the waiter to return | **the predicate only ever decreases while the wait runs.** Each runnable EC reaches its boundary and gates itself; nothing re-enters the runnable set, because edge 1's publish reads `cd.paused` under the CD `_gen_lock` it already holds and publishes gated (§8.5), and a resume is the pauser's own later act. Rule (b) is satisfied because the pauser holds nothing while spinning; the "N fixed at entry" claim is not needed and is withdrawn. **No cycle**: §0.3's two refusals make a pauser neither a member of the set it pauses nor able to pause while its own domain is paused |
 | W6 | `awaitDomainQuiesced` | scheduler context, no locks held | cores republishing roots / evicting dying-domain ECs | W3-like per-core progress | none (ack-while-spinning services shootdowns) | per-core progress is tick-driven; barrier holds nothing they need |
 | W7 | retire-from-`pended` `payload_done` pre-wait (edge 9, §8.2) | retire caller: EC-syscall or scheduler context — never interrupt context (asserted) | the pended claimant's straight-line body | W1 only | none | same bounded provider as W2; the wait precedes the retire CAS, so no later observer of `retired` ever waits (F1) |
 | W8 | FPU migrate-flush ack (`fpu.zig:337-414`) | EC/scheduler context, IRQ-masked, **holding `request_lock`** | remote core's flush-IPI handler, or inline service at the remote's spin sites | none unbounded: the handler is lock-free and bounded; a remote spinning IRQ-masked services the flush inline (ack-while-spinning) | provider needs an IRQ delivery OR an inline service — never this core's held lock | rule (b) exception; sound per the ack-while-spinning closure below (F4) |
@@ -2008,16 +1700,16 @@ failure arm — never a plain store (the resurrection shape S8 prevents).
 
 | # | Edge | Actor | Trigger | Precondition | Postcondition |
 |---|---|---|---|---|---|
-| 1 | *(slab-private)* → `ready` | creator | `publish`, the last step of creation | all fallible work done; nothing externally visible yet; **domain liveness validated under the CD `_gen_lock` inside the publish section** (§8.5). `create_vcpu` follows the same runnable-first shape: the vCPU is published ready and its first dispatch synthesizes the initial `vm_exit` through the normal running→parking path | gen live + linked, one lock section; domain-dead ⇒ private-unwind arm. **Paused-domain arm (round-13 C-1): the same section reads `cd.paused`, and publishes into `waiting(domain_pause)` rather than `ready` when set** — which is what keeps the pauser's runnable predicate from growing underneath it without the pauser holding any lock |
+| 1 | *(slab-private)* → `ready` | creator | `publish`, the last step of creation | all fallible work done; nothing externally visible yet; **domain liveness validated under the CD `_gen_lock` inside the publish section** (§8.5). `create_vcpu` follows the same runnable-first shape: the vCPU is published ready and its first dispatch synthesizes the initial `vm_exit` through the normal running→parking path | gen live + linked, one lock section; domain-dead ⇒ private-unwind arm. |
 | 2 | `ready` → `running` | dispatching core | dequeue / **`yieldTo` target — qualified in §8.1 (round 7 M-4): `ready` ON THIS CORE'S QUEUE, S7-live, and affinity-mask-admitted; anything else degenerates to a plain `yield`** | inside `core_locks[core]` — a single core lock, which is exactly why the `yieldTo` arm is local-only; S7 filter (failure ⇒ dispatcher retires inline, §3.2); CAS wins | `current`, `owner_core`, queue field — same section; then park-stack tail lifecycle recheck and SP/root load. If lifecycle is no longer `running`, abandon to `run()` |
-| 3 | `running` → `parking` | owner core | blocking syscall, wfi/hlt trap, event-route delivery, directive consumption (user boundary), **domain-paused gate (user boundary, BOTH legs, §0.3 / §3.1 rule 3 — the pause's ONLY route, and it is uniform over the target's prior state; the return leg is subject to §3.3's quiesced-resume rule)**, preempt tick (requeue; `pin_depth == 0`), **plain `yield` and the `yieldTo` caller's own requeue park (requeue — round 6 M4; this list is the closure and had omitted both)**, affinity migration (requeue). **PRECEDENCE (round 7 M-5): where directive consumption and the preempt tick are both enabled — i.e. the tick lands on an unpinned user-mode frame with `directive_state == armed` — CONSUMPTION WINS; the tick is an entry from user mode and §3.1 rule 3 runs its checks before the requeue arm.** | park sequence §3.2 (staging pre-publish; links+CAS under final container lock; requeue = bare CAS) | straight line (bounded work) to the hop |
+| 3 | `running` → `parking` | owner core | blocking syscall, wfi/hlt trap, directive consumption (user boundary), preempt tick (requeue; `pin_depth == 0`), **plain `yield` and the `yieldTo` caller's own requeue park (requeue — round 6 M4; this list is the closure and had omitted both)**, affinity migration (requeue). **PRECEDENCE (round 7 M-5): where directive consumption and the preempt tick are both enabled — i.e. the tick lands on an unpinned user-mode frame with `directive_state == armed` — CONSUMPTION WINS; the tick is an entry from user mode and §3.1 rule 3 runs its checks before the requeue arm.** | park sequence §3.2 (staging pre-publish; links+CAS under final container lock; requeue = bare CAS) | straight line (bounded work) to the hop |
 | 4 | `parking` → `waiting` | owner core | the hop (or degenerate) | SP off kstack / never on it; `current` released (hop step 1) | claimable; `owner_core` poisoned (debug) |
 | 5a | `waiting` → `claimed` | any waker/mover (any context) | see T1 (§5.1) + syscall-context sources: the `futex_wake` syscall, recv pop, close propagation, reply via pin, rendezvous pop, suspend of idle-waiter, **`vm_inject_irq` waking a wfi-parked vCPU (round 6 M4; 5b if it races the vCPU's park; no T1 row unless an IRQ-context injection path is ever added, which would require one)** | CAS under R-claim; one winner per episode | holder owns descriptor+frame; unlinks containers incl. deadline node; **holder discharges** (edges 6/7) |
 | 5b | `parking` → `pended` | any waker (any context) | same wake sources racing a not-yet-committed park | CAS under R-claim | claimant: unlink + payload + `payload_done` release-store, then DONE. **Owner core discharges at its hop** (§4): placement, finalize-on-retired, deferred marking |
 | 5c | `ready` → `claimed` | cross-EC suspender; the dispatcher on S7-filter failure (§3.2, F2); the `affinity` claim-move (§8.1) | `suspend` of a `.ready` target; a popped gen-dead-domain EC; **a cross-EC `affinity` edit whose new mask excludes the target's current queue core (round 7 M-6 — rev 7 applied the closure standard to edge 3 and not to this row, so the rev-7 claim-move it had just introduced was missing from its own trigger list)**. NOT a trigger: a `priority` edit — the new bucket is in the SAME container, so it is an in-lock relink with no state change (§8.1) | inside the target's run-queue lock: unlink + CAS | holder discharges (edge 7; or edge 6 for the claim-move; or retire-as-holder for the S7 route) |
-| 6 | `claimed` → `ready` | the holder | wake placement; **domain-pause RESUME — the pauser 5a-claims each paused EC off its domain's list and places it (round-12 C-1: the resume moves N ECs back onto cores, which §0.1 defines as in scope, and revision 13 had no edge for it)** | payload complete; CAS-then-link inside destination queue-lock section, **destination computed there from the fresh descriptor** (M-2) | failure ⇒ `retired` ⇒ holder performs deferred marking + finalize |
+| 6 | `claimed` → `ready` | the holder | wake placement | payload complete; CAS-then-link inside destination queue-lock section, **destination computed there from the fresh descriptor** (M-2) | failure ⇒ `retired` ⇒ holder performs deferred marking + finalize |
 | 6p | `pended` → `ready` | **owner core, at its hop** | hop `pended` arm | `payload_done` observed; CAS-then-link inside destination queue-lock section, destination from the fresh descriptor (M-2) | failure ⇒ `retired` ⇒ owner performs deferred marking + finalize |
-| 7 | `claimed` → `waiting` | the holder | re-containment: recv pop → reply pin; suspend of ready/idle → port; delivery-failure relink. **Not domain pause**: `waiting(domain_pause)` is published directly by §3.1 rule 3's boundary arm as edge 3 (`running → parking`) followed by the hop to edge 4 (`parking → waiting`), under the CD `_gen_lock`; no holder claim or edge 7 re-containment exists on that route | descriptor re-targeted; CAS-then-link inside destination wait-container lock section (the link's bucket key reads the fresh `ec.priority`, §3.4) | failure ⇒ `retired` ⇒ holder: deferred marking + finalize + undo partial placement |
+| 7 | `claimed` → `waiting` | the holder | re-containment: recv pop → reply pin; suspend of ready/idle → port; delivery-failure relink. | descriptor re-targeted; CAS-then-link inside destination wait-container lock section (the link's bucket key reads the fresh `ec.priority`, §3.4) | failure ⇒ `retired` ⇒ holder: deferred marking + finalize + undo partial placement |
 | 8 | `parking(requeue)` → `ready` | owner core | the hop | placement CAS inside destination queue-lock section, destination from the fresh descriptor (M-2) | failure ⇒ `retired` ⇒ finalize at hop |
 | 9 | `{ready, waiting, running, parking, claimed, pended}` → `retired` | retirer | retire | CAS fused with gen flip under `ec._gen_lock` (order EcGen → CoreLock when the run-queue lock is also needed, §3.5); **if the observed from-state is `pended`, acquire-wait `payload_done` before the CAS** (W7; the CAS loop re-dispatches on the fresh state if the owner's discharge wins meanwhile — F1) | routing per the retire matrix (§5.2); marking eager only for stable descriptors, else deferred to the discharger, with terminate waiting (L5) |
 | 10 | `retired` → *(freed)* | the designated finalizer (§5.2) | finalize | kstack quiescent per route; pended-origin payload completion guaranteed by edge 9's pre-CAS wait (F1) | **finalize's first act is the idempotent container unwind** (§8.2, N4), then deferred marking, release body (directive → `dead`, F6), kstack unmap (epoch-quarantined), slot zero + freelist |
@@ -2049,7 +1741,6 @@ defects.
 | recv deadline expiry | tick → `expireTimedRecvWaiters` | periodic scan (same unified table, §8.4) | same | same |
 | timer wheel (one-shot & periodic) | tick → `wheelExpireDue` | **one-shot pop** — the firing consumes the registration | same; the pop is consumed by the claim exactly once — no re-insertion, no replay, no double side-effects (X3) | losing to a racing winner is safe: the wake's meaning is level-encoded (futex word / port event already staged) and the winner delivers it |
 | device-region IRQ | device IRQ → `device_region.onIrq` (`device_region.zig:552-586`) — masks the line until userspace acks, then `futex.wake` | **one-shot until user ack** — the would-be acker may be the very EC being woken | same: 5a inline or 5b `pended`; the owner's hop places the waiter, which then runs and acks. **No decline path exists**, so the X3 lost-interrupt (wake dropped, acker parked, line masked forever) is unconstructible | as above — level-encoded ack word |
-| event-route delivery from exception/IRQ context (fault, breakpoint) that rendezvouses with a parked receiver | `fireRouted` → `rendezvousWithReceiver` | event is carried by the suspending EC; receiver wake is the interrupt-context claim | receiver 5a → place inline; receiver 5b → `pended` | claim loss impossible per-episode (one receiver pop per rendezvous, under the port lock) |
 
 Row template for future sources: name the entry, the persistence class
 (periodic vs one-shot), and the discharge — which after this revision is
@@ -2112,7 +1803,6 @@ definition.
 | deadline table | tick scan (`expireTimedWaiters`/`expireTimedRecvWaiters`) | under the table lock | claim CAS fails on `retired`; loser/stale nodes left for the unwind | recall (§8.4) |
 | timer wheel | `wheelExpireDue` pop | under the wheel lock | pop finds `retired` ⇒ pop consumed, moot (T1/§8.2) | recall (§5.1) |
 | device-region list | `onIrq` waiter lookup | under the device-region lock | claim CAS fails on `retired`; line stays masked (see G6 note, §8.4) | recall (§5.1) |
-| **paused-domain EC list** (`kind == .domain_pause`, round-12 C-1) | the pauser's resume walk at syscall completion; §8.2's teardown walk over the same list | under the CD `_gen_lock` | a `retired` EC is skipped by the resume walk (its 5a claim CAS fails); the terminate/teardown path owns it from there | recall |
 | **`terminate`'s handle deref** (round-10 M-G — MISSING from rev 10) | the `terminate` syscall resolving an EC handle to a `SlabRef` and retiring through it | ref-reached: caller-CD lock, then EC `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim/retire CAS fails on `retired`; a stale handle returns E_TERM per §[terminate] | recall |
 | **domain teardown walk** (round-10 M-G — MISSING from rev 10) | §8.2 phase 2 iterating a dying domain's ECs and retiring each | ref-reached, scheduler context: CD `_gen_lock` for the walk, EC `_gen_lock` per victim | victims already `retired` are skipped; the walk is the retirer for the rest | recall |
 | reply-pin handle slot | reply / reply_transfer / delete-E_ABANDONED via the pin | **ref-reached, NOT container-lock-reached**: the pin is a KernelHandle in the HOLDER's domain table; deref under the holder-CD lock with EC `_gen_lock` gen validation (R-claim's second arm, §3.5) | claim CAS fails on `retired`; if the HOLDER domain is itself in teardown, its gen is dead and the handle resolution fails — teardown's handle release owns the slot, and finalize's unwind treats a dead-gen pin as already-unlinked (idempotent skip) | recall (§8.3) |
@@ -2481,7 +2171,7 @@ the zero; identity-compare-only for stale bare pointers; payload writers
 always hold a claim retire respects, and pended-origin payload
 completion precedes the `retired` state itself (edge 9's pre-CAS wait).
 
-**Domain teardown, self-delete path** (`delete(SLOT_SELF)`, no-route
+**Domain teardown, self-delete path** (`delete(SLOT_SELF)`, unhandled
 memory-fault) — revised per round-3 M-A: the syscall validates under the
 CD lock, releases it, then self-retires (edge 9) and stashes the **CD
 ref** in `PerCore.teardown_pending` — the dead-mark has NOT yet happened.
@@ -2645,85 +2335,6 @@ comptime table mirrors §5.
   directive arm ran first. Without this an implementer can wire the
   entry checks into syscall entry only, leave the tick requeue-first,
   and silently reintroduce N5.
-- **Quiesced resume (round-13 follow-up, §3.3, §0.3)**: a **debug-only**
-  shadow bit and three asserts. It has to be a bit rather than a direct
-  read of `cd.paused`, and the reason is the one that makes the naive
-  version wrong: **`cd.paused` is set at pause ENTRY, before the pauser's
-  predicate is satisfied**, so an EC that was already `running` in a
-  syscall when the pause landed would trip a bare
-  `assert(!current_ec.domain.paused)` — and that EC is SAFE, because the
-  predicate covers `running` and the pauser has not proceeded. The rule's
-  window is narrower than the word: it is the resume path only.
-  - **(1)** edge 6's placement sets `ec._dbg_resumed_pre_gate` when it
-    places into a domain reading `paused` — i.e. exactly the
-    wake-into-a-paused-domain case §3.3's rule is about — in the
-    destination queue lock section it already holds.
-  - **(2)** every user-memory accessor asserts that bit is CLEAR. The
-    accessor set is closed and identifiable precisely because the
-    SMAP/PAN bracket is what defines it, which is the same handle
-    §9.3(2)'s existing in-hold check already uses.
-  - **(3)** §3.1 rule 3's return leg clears the bit when it gates, and
-    the `iretq`/`ERET` trampoline asserts it is clear — which is the
-    assert with teeth, because it says the gate DOMINATES the accessor
-    rather than merely that the two do not co-occur.
-    **CORRECTION (revision 16, round-14 N-2): this assert CANNOT fire
-    against HEAD, and revision 16 claimed it could.** Assert (1) only sets
-    the bit when edge 6 places into a domain reading `paused`; §3.3 states
-    that no domain is ever paused at HEAD (the pause is deferred to
-    `stygia-qap`), so the bit is never set and (3) is vacuous today —
-    correctly, since the hazard it guards does not exist yet. **The
-    HEAD-firing property belongs to §9.3(2)'s analyzer clause**, which is
-    a static path check over the resume path and does not depend on a
-    domain being paused. Two different instruments; revision 16 credited
-    one with the other's proof-of-fire.
-
-  Debug-only, so it adds no production word and needs no §3.4 row; §9.2
-  is the debug-assertion section and this is what that licence is for.
-- **Boundary LEG (round-13 follow-up, §3.1 rule 3) — NOT a runtime
-  assertion, corrected in revision 16 (round-14 N-3).** "Assert the arm is
-  reachable from both legs" is a statement about the CALLGRAPH, and no
-  runtime assert can observe a leg that was never wired. Revision 16 wrote
-  it as a §9.2 assert, which is unwritable. It is two instruments instead:
-  - **§9.3 static clause**: the domain-paused arm must be reachable from
-    BOTH the user-entry path set and the user-return path set. That is the
-    same reachability query §9.3(2)'s resume-path clause already needs.
-  - **Debug COVERAGE PAIR** (runtime, and this part is writable): two
-    counters, one bumped by each leg's gate. A build that exercises a
-    pause with either counter at zero has a leg that is not wired.
-
-  Why it matters that this is enforced somewhere: an implementer who wires
-  the arm into syscall entry only produces a machine in which a
-  futex-woken EC returns to user code inside a paused domain **with the
-  whole battery still green** — the model has no domains (G12), so nothing
-  here is machine-checked.
-- **`mark_state` (round 7 M-3, §2.4)**: retire asserts it writes the
-  word exactly once, under the CAS's exclusivity; the discharger asserts
-  it observed the bit SET before clearing it; finalize asserts the bit is
-  CLEAR when it completes (this replaces rev 7's unattributed
-  "deferred-marking-owed flag consumed").
-- Into `ready` ⇒ linked in the same section. Hop order
-  release-before-commit; outgoing state ∈ {parking, pended, retired}
-  (outgoing `claimed` asserts unreachable); pended discharge asserts
-  `payload_done`.
-- Finalize: 64-way `current` scan + SP-range check; `mark_state` owed bit
-  CLEAR; **`directive_state → dead` (F6's marker), NOT merely "cleared"**
-  (round-11 minor: this line said "directive cleared" while edge 10 says
-  `→ dead`, and an implementer writing from §9.2 codes revision 4's F6
-  bug — a dead target indistinguishable from a delivered suspension).
-- **The suspender's break disambiguator is assert-checkable because both
-  halves are NAMED SNAPSHOTS** (round-11, the reviewer's suggestion):
-  the suspender records `armed_port_ref` and `armed_target_ref` when its
-  `claiming → armed` CAS wins, and §9.2 asserts at the break that
-  `armed_port_ref.gen == port_ref_at_break.gen` and
-  `armed_target_ref.gen == target_ref_at_break.gen` — rather than the
-  rule resting on prose. Both halves are also modelled (`pok` and `gen`
-  in `ECLifecycle.tla`), which retracts revision 11's ledger claim that
-  the port half was un-model-checkable.
-- Pop-side: `stale(ec)` (`state == retired`) is the only skip predicate —
-  except edge 2's S7 filter, which retires inline (asserted as the only
-  other pop-side action).
-- Descriptor/`owner_core` poisoning outside validity; entry-check
-  retired/directive arms assert a user frame.
 
 ### 9.3 Static analysis (the existing grain)
 
@@ -2735,22 +2346,6 @@ comptime table mirrors §5.
    violations; post-publish descriptor accesses only inside
    reachability-gating sections; user-memory accesses (SMAP brackets)
    inside any container/gen-lock hold are violations (§3.3).
-   **Quiesced resume (round-13 follow-up, §3.3's second rule):** on the
-   resume path — every callgraph path from a dispatch or edge-6 placement
-   entry to a user-mode return — a user-memory access (SMAP/PAN bracket)
-   that is not dominated by the §3.1 rule-3 domain-paused gate is a
-   violation. **Deliberately conservative**: it cannot tell a
-   wake-into-a-paused-domain resume from an ordinary requeue resume, so
-   it flags both, and the fix (gate-before-access, or re-deferral) is
-   correct for both anyway. This is the same shape as the
-   in-hold check one clause up and reuses the same bracket detection;
-   what differs is the region, which is a path property rather than a
-   lexical one, so it needs the dominance query the closure work in
-   9.3(6) needs anyway. **Proof of fire is available today and should be
-   the fixture**: run it against HEAD and it must flag
-   `arch/x64/interrupts.zig:3003` and `arch/aarch64/cpu.zig:555`
-   (§11.13). An implementation of this clause that reports zero against
-   HEAD is broken, not clean.
 3. **Paired-arch transitions**: every lifecycle site carries an
    arch-neutral ID reachable from both arch entry sets; fused sites are
    x64-only until an aarch64 FP exists.
@@ -2997,28 +2592,6 @@ ideal composition is exactly this section's decision list plus
    > construction — a test that receives E_BUSY from an otherwise-valid
    > call passes rather than fails.)
 
-   **Second, smaller spec addition in the same section (round-13 C-1):
-   `acquire_vmars`, `idc_read` and `idc_write` need an E_BUSY cause.
-   NOT URGENT — this rides with bead `stygia-qap`, not with §12**
-   (revision 16): the pause is deferred out of the refactor, and at HEAD
-   the three syscalls cannot emit this error because they do not pause at
-   all. Proposed now so the bead does not have to re-derive it.
-   §0.3's domain-pause gate refuses a pause in two cases — the target
-   domain contains the calling EC, or the caller's own domain is already
-   paused — and those refusals are what make mutual pause
-   unrepresentable. `specv3.md` licenses no E_BUSY for any of the three
-   syscalls today. Proposed:
-
-   > **E_BUSY** — the target domain contains the calling execution
-   > context, or the calling execution context's own domain is itself
-   > paused. A caller that retries must back off rather than spin.
-
-   The two clauses are not cosmetic: the first stops a pauser gating
-   itself and never reaching its own resume; the second is what makes a
-   cycle of mutually-pausing domains unrepresentable, the same shape
-   §2.5.1 closes for `suspend`. **Rule on this together with the
-   `suspend` addition above and §11.4** — three sections, one opening.
-
    **Note for whoever writes the test file** (the maintainer has
    approved landing this after the model clears, so a real test will
    exist). [test 13]'s shape is deliberate: it **attempts** to trigger
@@ -3101,7 +2674,7 @@ ideal composition is exactly this section's decision list plus
    whose semantics will move when it is designed. **The machine routes it
    when restart semantics are built; the sketch above is what that
    follow-on starts from.** (`persist` is unaffected — it remains OUT by
-   §0.2 reason B with its W6 obligation retained, per §0.3.) **The
+   §0.2 reason B with its W6 obligation retained.) **The
    meta-finding is the
    more valuable half and is fixed now** (§13, and the model README's
    sufficiency table): that table was derived by walking the spec's
@@ -3112,19 +2685,14 @@ ideal composition is exactly this section's decision list plus
    > **~~"that walk surfaces restart and nothing else new"~~ — RETRACTED
    > IN REVISION 11, and it was the most damaging sentence in revision
    > 10.** It was false, and worse, it was the kind of false that stops
-   > the next person looking. An independent section walk found FIVE more
-   > gaps, one of them larger than restart itself:
+   > the next person looking. An independent section walk found further gaps:
    >
-   > - **A domain-pause primitive** (`acquire_vmars` / `idc_read` /
-   >   `idc_write`): a domain-wide, N-EC pause carrying a resume
-   >   obligation. Architecturally LARGER than restart and **not
-   >   additive** — it is not restart's mechanism applied N times.
    > - **`restrict`'s port-refcount cascade**, which wakes suspended
    >   senders with E_CLOSED — a wake this machine's T1/5a routing does
    >   not enumerate.
    > - **`revoke`** — zero mentions in this document.
-   > - **The no-route fallback**: `thread_fault` terminates the EC. That
-   >   is a kernel-initiated terminate **from exception context**, i.e. a
+   > - **Unhandled faults**: the kernel initiates domain teardown
+   >   **from exception context**, i.e. a
    >   DIFFERENT ACTOR than T2's terminator, and T2 names actors.
    > - **`delete` of an EC handle** is mapped to edge 9 here, while the
    >   spec says ECs are not destroyed by handle drops.
@@ -3209,17 +2777,6 @@ ideal composition is exactly this section's decision list plus
    needs. This document does not resolve it silently in either
    direction.
 
-13. **The dispatch trampoline writes user memory on the resume path, and
-    the quiesced-resume rule (§3.3) makes that a decision rather than an
-    accident (round-13 follow-up).** DERIVED — callgraph DB plus the two
-    sites read directly, both arches; not recalled.
-    **SCHEDULING: this rides with bead `stygia-qap`, NOT with §12.** The
-    rule is conditioned on `cd.paused`; the pause is deferred out of the
-    refactor (§0.3), and at HEAD no domain is ever paused, so these two
-    sites are harmless today and none of §12 steps 1–10 is blocked on
-    them. Recorded now because `qap` cannot be implemented correctly
-    without this decision already made.
-
     **What the tree does.** The final step of dispatch flushes staged
     event state into the resumed EC's USER memory, after the address-space
     swap and before the return to user mode, with SMAP/PAN cleared for the
@@ -3238,48 +2795,10 @@ ideal composition is exactly this section's decision list plus
     the write has to wait for the swap. The deferral is the fix for one
     problem; it is what creates this one.
 
-    **There are TWO staging sites, and both stage onto an EC parked in a
-    port wait** — which is exactly the state W5-N's predicate excludes,
-    so this is not an edge of the exposure but its centre:
-    - `sched/port.zig:2023` — onto the **receiver** of a rendezvous
-      delivery. Its own comment: *"only safe at iretq time — both the
-      sender-already-waiting path and the rendezvous path can run with a
-      different CR3 active here"*.
-    - `sched/port.zig:1018` — onto the **sender** being resumed by a
-      `reply`, i.e. an EC exiting `suspend`.
-
     (`caps/capability_domain.zig:833`/`:1016` stage onto `caller`, which
     is `running`, so those are outside the window. Enumerating the
     staging sites is a `grep -rn pending_event_word_valid` away and
     should be re-derived, not recalled, whenever this item is revisited.)
-
-    **Why it collides with the pause.** A `recv` waiter sits in
-    `waiting(port_queue)`, which W5-N's predicate deliberately does not
-    cover — that exclusion is what lets the pauser finish. So: pauser
-    proceeds; a sender in an UNPAUSED domain rendezvous-delivers; the
-    receiver goes `claimed` → `ready` → dispatched on some core; the
-    trampoline writes two words into its user stack while
-    `idc_write`/`acquire_vmars` is rewriting exactly that address space.
-    The write is downstream of every gate — it is the last thing before
-    `iretq`/`ERET` — so no placement of the §3.1 rule-3 check inside Zig
-    can dominate it. Cross-domain IDC is the ordinary case here, not an
-    exotic one.
-
-    **The call.** §3.3 names two ways to satisfy the rule and this
-    document does not pick, because the choice is an arch-path decision
-    with costs the design cannot weigh from here:
-    - **(i) Gate ahead of the flush** — evaluate the domain-paused arm
-      in the dispatch path before the trampoline, and park rather than
-      resume. Costs a `cd.paused` load on every dispatch and puts a park
-      decision inside the arch return path, which §3.2's park sequence
-      currently keeps out of arch code.
-    - **(ii) Re-defer the flush** — leave `pending_event_word_valid` set
-      for a gated EC, so the staged word survives the pause and is
-      flushed by the resume that follows it. Costs nothing on the common
-      path and reuses machinery that already exists (the flag is already
-      a deferral), but it makes the staged word outlive a pause, so
-      §8.2's teardown walk must clear it and the resume walk must not
-      double-flush.
 
     (ii) looks smaller from the design side and (i) is the one that
     generalises to any future user-memory access on the resume path. The
@@ -3677,12 +3196,8 @@ on promotion** is a precondition of step 1, and again of step 9 for
    `memory/vmar.zig:807` (under `v._gen_lock` taken at `:780`) and `:877`
    (taken at `:852`) — the tree comment at `:800-804` acknowledges the
    hazard and dodges it by rejecting `.unmapped` rather than hoisting.
-   §11.13 adds two more, against 9.3(2)'s new quiesced-resume clause:
-   `arch/x64/interrupts.zig:3003` and `arch/aarch64/cpu.zig:555`.
    **So either the hoist lands with this step, or 9.3(2) goes in
-   REPORT-ONLY first and is promoted after.** Note the two `vmar.zig`
-   sites are the same call sites bead `stygia-qap` must restructure, so
-   the cheapest sequencing is report-only here and hoist-with-`qap`.
+   REPORT-ONLY first and is promoted after.**
 10. **`priority`/`affinity` re-bucketing** (§8.1, round 7 C2/M-1;
     beads `stygia-va7`, `stygia-me9`): the two words gain their named
     writer and the reach-and-validate protocol; the `ready` in-lock
@@ -3702,24 +3217,6 @@ tests instead.
 omission** (§12's first review found five blockers, and the one that
 recurs across revisions is this shape — a mechanism written normatively
 into §§0–9 and scheduled nowhere):
-
-- **The domain-wide pause** — `cd.paused`, `.domain_pause`, §3.1 rule 3's
-  third boundary arm, edge 1's gated publish, edge 7's paused-list arm,
-  W5-N, §0.3's two refusals, §3.3's quiesced-resume rule, §9.2's
-  quiesced-resume asserts, §11.8's E_BUSY addition and §11.13. **All
-  DEFERRED to bead `stygia-qap`** (§0.3). It would sit after step 6, and
-  nothing in steps 1–10 depends on it.
-- **`restart_at_entry`** — not a design obligation of this machine until
-  restart semantics exist (§0.3). No edge, no §5.2 row, no step.
-- **Cross-class lock ordering** — out of scope entirely by §0.2; §11.10
-  is retracted and nothing here is gated on it.
-- **Words the machine does NOT change, so they need no step** — listed
-  because the closure check flags them every time and an unexplained flag
-  costs the next reader the same hour twice: `PerCore.active_root` (§2.3,
-  "retained unchanged", with `awaitDomainQuiesced`), `PerCore.idle_parked`
-  (§3.4, "as today" — and see §2.1.1's withdrawal for why it is the only
-  idleness fact), and `PerCore.current_ec`, which is not deleted but
-  **RENAMED** to `PerCore.current` and lands under that name at step 4.
 
 **FOUND BY THE CLOSURE CHECK, BOTH NOW RESOLVED.** Running that check
 (the last paragraph of this section: grep §12 for each mechanism's name)
@@ -3742,13 +3239,7 @@ The other was resolved by the maintainer in the other direction:
   containment obligation.** The dead field and its stale declaration
   comment are a cleanup, not this machine's business.
 
-**Three deferrals, three shapes, and the pattern is worth naming.** The
-pause is deferred because it is unimplemented and unmodelled;
-`restart_at_entry` because the feature it belongs to does not exist; the
-idle EC because **the tree deliberately does something better**. Only the
-first is likely to come back as written. The common cause is that all
-three were carried as design obligations on the strength of a paragraph
-rather than a check against the tree.
+**The idle EC and `restart_at_entry` remain outside this migration.** The idle EC was superseded by the current per-core idle path; restart semantics require a separate design pass.
 
 Everything else that §§0–9 states normatively has a step above. That
 closure is the property to re-check after any edit to §§0–9.
@@ -3767,12 +3258,8 @@ document carries it. Confirmed clean:
   go at step 8 holds.
 - **`current_queue_core`'s five clear sites**, including the finding that
   two of them are reader-side self-repair rather than exits from `ready`.
-- **The `vmar` stubs** — `quiesceDomain`/`resumeDomain` empty, called from
-  `idc_read`/`idc_write`, and `acquire_vmars` with no pause call at all.
 - **The restart plumbing** — policy-only, with all eight
   `restart_semantics_*` cases testing `E_PERM` bounding.
-- **§11.13's sites** — both dispatch-tail user-memory writes and both
-  staging sites.
 - **Step 3's and step 8's entire asm inventory** — the `suspend_port` and
   `pending_reply_*` `@offsetOf` sites, the layout-drift `@compileError`
   guards, and the `timed_recv_waiters` scratch threading.
@@ -3822,195 +3309,14 @@ otherwise is how the check earns trust it has not got.
 ASSERTED rather than made checkable. **Doc-only: no model change, so no
 revision-15 verdict went stale.**
 
-- **The quiesced-resume rule is now normative (§3.3), and it was a
-  parenthetical before.** §0.3's argument that the pause needs no
-  per-state routing on 5a/5c turns on a `waiting(futex)` target running
-  "the tail of its own futex return in KERNEL code — which touches no
-  user memory (§3.3 bans that inside holds anyway)". **The parenthetical
-  does not carry the claim.** §3.3's ban is on user-memory access inside
-  container-lock and gen-lock holds; a syscall return tail is not inside
-  a hold, so the citation is to a rule about a different region. And the
-  exposure it was papering over is specific: W5-N's predicate covers the
-  RUNNABLE subset only — which is exactly what lets the pauser finish —
-  so once the pauser proceeds, a later wake can make a `waiting` EC of
-  that domain `running` in kernel code while `idc_read`/`idc_write`/
-  `acquire_vmars` is mid-flight. The rule is now stated in §3.3 in its
-  own right, with a §9.2 assertion pair and a §9.3(2) analyzer clause,
-  because a premise nobody can execute is a premise nobody has checked —
-  the same argument revision 12 made about §2.5's arm CAS.
-- **WHICH LEG of the user boundary the domain-paused arm is checked on is
-  now normative (§3.1 rule 3), and the two readings are not equivalent.**
-  Revision 15 said the `retired`, `directive` and domain-paused arms
-  "fire only on entry from user mode" while §0.3 said a gated EC "parks
-  at the boundary before executing a single user instruction" and §3.6
-  W5-N justified excluding `waiting`/`claimed`/`pended` from the
-  predicate on the ground that "every path from them back to user code
-  passes the §3.1 rule-3 gate". **A wake → dispatch → syscall-return path
-  passes no entry check at all**, so under the entry-only reading a
-  futex-woken EC returns to user code inside a paused domain and W5-N's
-  own soundness argument is false. The domain-paused arm is now specified
-  on **both** legs, with the return leg named as the one that makes the
-  pause a pause; `retired` and `directive` stay entry-only and the reason
-  is stated. §9.2 asserts the arm is reachable from both legs, because
-  the model has no domains and this assert is the only enforcement there
-  is.
-- **§11.13 — the tree violates the quiesced-resume rule at HEAD on BOTH
-  arches, and this is a decision, not a bug report.** DERIVED, not
-  recalled: the dispatch tail flushes `pending_event_word` into
-  `[user_sp + 0]` and `pending_event_rip` into the vreg-14 slot after the
-  CR3/TTBR0 swap and before the `iretq`/`ERET`, SMAP/PAN cleared
-  (`arch/x64/interrupts.zig:3003`, `arch/aarch64/cpu.zig:555`). It is a
-  kernel write to a woken EC's user stack on the rendezvous-wake resume
-  path, downstream of any gate placeable in Zig. The deferral is itself a
-  correctness fix (`port.deliverEvent` stages the word while the kernel
-  is still in the *sender's* address space) — it solves one problem and
-  creates this one. §11.13 states the two ways out and does not pick.
-  The §9.3(2) clause has its proof-of-fire built in: run it against
-  pre-fix HEAD and it must flag both sites, and an implementation that
-  reports zero has not been shown to work.
-
 **Revision 16, second half — §12 was REVIEWED FOR THE FIRST TIME and it
 failed.** Five blockers, and the dominant pattern is the one §13 has now
 caught three times (round-10 M-E, round-11 M-6, and here): **a mechanism
 written normatively into §§0–9 and scheduled into no §12 step.** This
 time at the largest scale yet. Two maintainer decisions and the repairs:
 
-- **The domain-wide pause is DEFERRED out of the refactor** to bead
-  `stygia-qap` (maintainer decision). It appeared in nine normative
-  places and zero migration steps. Every normative section stays — the
-  design is good and the follow-on uses it verbatim — and only its
-  MIGRATION STATUS changes, in the same shape `restart_at_entry` carries.
-  Three reasons, in §0.3: it is unimplemented at HEAD
-  (`memory/vmar.zig:1606`/`:1610` are `_ = cd;` stubs and `acquire_vmars`
-  has no pause call at all, so deferring regresses nothing), it is
-  UNMODELLED in the battery (ledger G12), and nothing in steps 1–10
-  depends on it. §0.3 also records that the follow-on is a
-  RESTRUCTURING, not a stub-fill: `vmar.zig:780`/`:848` hold `_gen_lock`
-  across both the pause point and the SMAP window, which W5-N and §9.2
-  both forbid. §3.3's quiesced-resume rule and §11.13 are marked dormant
-  until that bead lands, so neither is a §12 blocker.
-- **`restart_at_entry` is downgraded from "IN, deferred" to NOT A DESIGN
-  OBLIGATION** (maintainer decision). Revisions 13–15 promised it an
-  edge, which commits the machine to routing one value of one policy in
-  a feature that does not exist and whose semantics will move when it is
-  designed. The tree agrees: only the policy plumbing is implemented
-  (`caps/capability.zig:346`/`:581`/`:591`/`:604`) and all eight
-  `restart_semantics_*` cases test `E_PERM` bounding, not restart
-  behaviour. The analysis of what the edge would look like is KEPT; only
-  its status is demoted.
-- **Step 3 no longer deletes a registry the x64 fast-path asm scans
-  inline.** `timed_recv_waiters` is threaded through `SyscallScratch` and
-  walked by hand-written assembly with its own `@compileError` drift
-  guards, so §8.4's intrusive-node unification could not compile on
-  x86-64 at step 3 — and revision 15 simultaneously claimed step 3
-  deleted the `xchgl` spin AND that the spin was still a 4c hazard. Step
-  3 now unifies the FUTEX registry only; `timed_recv_waiters` moves to
-  step 8; step 8's back-constraint is restated against what survives.
-- **Step 4's 4a/4b/4c decomposition now says where the REPLACEMENT
-  lands.** 4a was "the deletions first" and listed only deletions, which
-  is not landable — `on_cpu`'s replacement IS the hop completing
-  everything, and `takePendingReleaseByte` (`sched/scheduler.zig:722-728`)
-  literally returns `&pending.on_cpu`. 4a is now the deletions **and** the
-  mechanism they depend on; 4c is the entry-path enable, the pin gate,
-  §2.4's bump/acquire order with its §9.2 brackets, and the boundary
-  gates with rule 3's precedence. All FOUR PerCore companions are named,
-  not two.
-- **4b's alternative B was a no-op and is replaced.** The "temporary
-  explicit mask over `destroyPhase2`" it proposed already exists at
-  `caps/capability_domain.zig:1381-1382`, and `:1394` says thirteen lines
-  later why it is insufficient. The real constraint is that step 5's
-  deletion of the ad-hoc `enableInterrupts()`
-  (`sched/execution_context.zig:2225`) and the `pending_zombie` fallback
-  it guards must land no later than 4c. Two corrections ride with it: the
-  22% orphan measurement 4b is written around is **already closed at
-  HEAD** by the two-stage `stygia-afo` fix, and is retained as evidence
-  for the ordering rather than as a live defect; and step 4 now says why
-  `pin_depth` is not the refuted `preempt_block` counter at `:1408-1418`,
-  because both of that counter's stated causes die in 4a.
-- **Step 9 no longer gates step 4 on unbuildable tooling.** §9.3(7)'s own
-  STATUS says the third-clause check needs an IF-state model in
-  `asm_analyzer.zig` that does not exist — verified:
-  `tools/check_gen_lock/src/asm_analyzer.zig` is 1493 lines and models
-  LOCK state per register, with **zero** `cli`/`sti` tracking. The
-  pin-class DERIVATION (effective-mask, report-only) lands by step 4; the
-  third clause lands at step 9 and is meanwhile enforced by review, which
-  is what §2.4 already said. Maintainer sign-off on promoting
-  `tests/precommit.sh`'s `[0d]` stage to gating is now an explicit
-  precondition of steps 1 and 9, per that file's own `:563-564`.
-- **Step 1's "drop diagnostics" was the one genuine OVERSHOOT** and is
-  scoped to `leak_tag` plus the EC-state writers. As written it was
-  tree-wide and would have taken instruments belonging to `stygia-2u0`
-  and `stygia-9zr`, neither of which touches EC lifecycle or scheduler
-  state — §0.1's own test excludes them. Rider: the `stygia-afo`
-  counters survive through step 6, because they are the only instruments
-  that measure the abandonment 4b is ordered around.
-- **Non-blocking, all landed in the same pass:** `committed_ec` gains its
-  deletion step (8, and §2.3 is why it can only be 8); `ec.wait` is
-  introduced by name at step 3 along with the `suspend_port` /
-  `pending_reply_holder` fold and its 19 x64-asm `@offsetOf` sites;
-  §9.3(2)'s two in-hold SMAP violations (`memory/vmar.zig:807`/`:877`)
-  get an explicit report-only-first-or-hoist obligation at step 9;
-  `current_queue_core`'s §3.4 discipline gets its step (4 for the Zig
-  sites, 8 for the fast path), with the note that HEAD's `:1691`/`:1705`
-  clears are reader-side self-repair rather than exits from `ready`;
-  step 2's deferred-marking arm is flagged inert so a green step-2 pass
-  is not misread as validating the split; and step 5 states where the
-  caller-EC finalize routes once `pending_zombie` goes, since §5.2 has no
-  cell for a frame running an unbounded body after its own retire.
-- **§2.4's blockquote no longer contradicts itself.** It opened "the set
-  is NOT empty — revision 13's 'EMPTY at HEAD' was refuted" and closed
-  three paragraphs later with "revision 13's 'the class is empty at HEAD'
-  is correct". An implementer reading top-down to derive step 4's class
-  set read the refuted answer first. The conclusion is now stated up
-  front and the three derivation steps are labelled as such.
-- **§12 now ends with a CLOSURE CHECK, and running it found two more.**
-  The recurring failure is a mechanism written normatively into §§0–9 and
-  scheduled nowhere, so the section now states the check that catches it:
-  **grep §12 for each mechanism's name**, mechanically, rather than
-  reading §12 and judging. Running it against revision 16's own §12
-  turned up **`PerCore.teardown_pending`** — a word §2.6 lists among
-  those the machine ADDS, unnamed in any step, now at step 6 — and
-  **§2.1.1's per-core idle EC**, which was normative, defined S1's
-  containment answer for that EC, was UNMODELLED (ledger G7 — since
-  CLOSED by the withdrawal below, the model having been right), and whose
-  slot at `sched/scheduler.zig:184` is declared and read and **never
-  assigned** at HEAD (`:1098` handles the "no `idle_ec` set up" case
-  outright). Reading had missed both across sixteen revisions; the grep
-  found them in one pass.
-- **§2.1.1 is WITHDRAWN (maintainer decision), and it is the most
-  instructive of revision 16's three deferrals because here the tree is
-  not merely different — it is deliberately BETTER.** `parkAndAwaitIRQ`
-  replaced the idle EC to kill a real bug, recorded at
-  `sched/scheduler.zig:1098`: several idle cores held stale `gs:0` into
-  one suspended EC's kstack and concurrently pushed IRQ frames onto it
-  from kernel mode, stomping each other's saved state and surfacing as
-  `iretq` #GP or NO-EC page faults. **Building an idle EC to satisfy a
-  doc paragraph would have regressed that fix**, which is why the answer
-  is withdrawal and NOT a §12 step. Landing with it: §5.3's T4 row for
-  the "per-core idle slot" is deleted (it is not a container — there is
-  no EC to contain), §2.3's `PerCore` drops the field with the reason
-  in-line, and **S1's answer is restated where the withdrawal touched
-  it**: a core with an empty run queue holds NO execution context; it
-  parks on its own park kstack, which is core-owned storage rather than
-  an EC container; idleness is a fact about a CORE, recorded in
-  `PerCore.idle_parked`, not a state of any EC — so it raises no
-  containment obligation and S1 is untouched. Explicitly NOT affected:
-  the `.idle_wait` EC state and `wait.kind == .idle`, which are real and
-  live (the aarch64 EL0 `wfi` trap at
-  `arch/aarch64/exceptions.zig:737`, x86-64 `#GP`-on-`hlt` at
-  `arch/x64/exceptions.zig:260`, and `suspend` accepts such a target) —
-  those are a USER EC choosing to idle, which is a different thing from a
-  core having no EC to run.
-- **Three deferrals in one revision, three different shapes, one common
-  cause.** The pause: unimplemented and unmodelled. `restart_at_entry`:
-  the feature it belongs to does not exist. The idle EC: the tree
-  deliberately does something better. All three had been carried as
-  design obligations on the strength of a paragraph rather than a check
-  against the tree, and all three were surfaced by mechanical checks —
-  the §12 grep and `grep -rn` over the kernel — not by rereading.
-
 **Revision 16, third pass — ROUND 14's REVIEWS.** Parity: **no blocking
-findings** (G12/G13 accurate, every `U*/G*/N*` label resolves).
+findings** (every retained `U*/G*/N*` label resolves).
 Sufficiency: **NOT CLEAN, three blocking**, all of the form "an
 instruction that cannot be executed as written" — and two of them inside
 paragraphs revision 16 wrote to fix that exact class, which is the
@@ -4073,13 +3379,7 @@ standing lesson arriving again.
   conclusion was right and the stated evidence was wrong, which in a
   claim labelled DERIVED is the whole defect. Now `grep -cE
   '\b(cli|sti)\b'` → 0, with the trap recorded.
-- **N-2/N-3/N-5/N-6/N-7, same pass.** §9.2's quiesced-resume assert (3)
-  claimed a HEAD proof-of-fire that is impossible by its own construction
-  (the bit is never set at HEAD because no domain is ever paused) — that
-  property belongs to §9.3(2)'s analyzer clause, a different instrument.
-  §9.2's "asserts it is reachable from BOTH legs" is not writable as a
-  runtime assertion and is now a §9.3 static clause plus a debug coverage
-  pair. §2.4's rule sentence and §9.3(7) both still stated the SYNTACTIC
+- **N-5/N-6/N-7, same pass.** §2.4's rule sentence and §9.3(7) both still stated the SYNTACTIC
   reading while the blockquote declared effective-mask normative, so a
   top-down reader built the reading revision 14 got wrong; and §2.4
   credited `check_gen_lock` with carving a site out "by name" when (c2) is
@@ -4103,56 +3403,6 @@ standing lesson arriving again.
 
 **Revision 15 (2026-08-02)** — closes round 13's single blocker.
 
-- **C-1 (the domain pause had no route for a `running` target)**: §2.1
-  makes `running` unclaimable except by retire and a §2.5 directive, and
-  §2.5's directive has exactly one consume arm which parks into a PORT —
-  while §0.3's own argument establishes a pause has no port. Two earlier
-  routings both failed to type-check (rev 13's "N applications of the
-  suspend edge", rev 14's "arms N directives"), and the common case — a
-  debugger pausing a live domain — had no route at all. **Fixed with
-  shape (b), the per-domain gate**, which is strictly smaller than
-  giving the directive a kind and a second payload: a `cd.paused` word,
-  a third arm on §3.1 rule 3's boundary check, and resume via 5a + edge
-  6. **§2.5 is untouched** — no kind discriminator, no second payload,
-  no CD gen lock newly introduced into the park sequence, no change to
-  the break disambiguator.
-  Three things landed with it, each of which the review showed was
-  load-bearing: **(1)** the no-cycle argument is now REAL rather than
-  borrowed — §2.5.1's self-mark is about `suspend` and nothing said a
-  pauser executes it, so §0.3 states the domain-level analogue directly
-  (refuse if the target domain contains the caller; refuse if the
-  caller's own domain is already paused), with the E_BUSY spec addition
-  in §11.8. **(2)** per-state routing on 5a/5c is not needed and the
-  reason is stated: the gate is at the boundary, so it catches every EC
-  uniformly — a `waiting(futex)` target is neither claimed (which would
-  destroy the wait) nor left to run user code (it parks at its boundary
-  after only kernel-side tail work). **(3)** W5-N's contradiction with
-  rule (b) is resolved by dropping the "N fixed at entry" claim: the
-  pauser holds no lock and waits on a predicate over the RUNNABLE subset
-  only, which cannot grow because edge 1's publish already reads
-  `cd.paused` under the CD `_gen_lock` it holds.
-- **§8.1 steps 3/4 no longer contradict each other on retry.** Step 4's
-  argument is complete, so step 3 now says there is no retry — the
-  retry reading would have been an unbounded loop on a remote word with
-  no T3 row, which §3.6 forbids and step 4 denies creating.
-- **§2.4 states WHICH READING its computed rule uses.** Revision 14
-  applied the syntactic one (is the call `lock()` or `lockIrqSave()`?)
-  and concluded the vCPU gen-lock sites were a tree defect. The
-  analyzer applies the **effective-mask** reading — can a tick land in
-  this hold? — and it cannot: `enterGuest` is bracketed at
-  `scheduler.zig:598`/`:618` and `check_gen_lock` (c2) carves it out by
-  name. **Effective-mask is now normative**, revision 13's "class is
-  empty at HEAD" is restored, and revision 14's tree defect is
-  withdrawn — including its prescription to convert to
-  `lockWithGenIrqSave`, a `GenLock` method that does not exist on
-  `SlabRef`.
-- **§0.1 no longer overclaims.** The machine ADDS words; what §6
-  delivers is one writer and one validity predicate per fact.
-  Redundancy is literal for the four deleted signals and derivational
-  for the rest.
-- **`restart_at_entry` marked DEFERRED** to a named follow-on: it has no
-  rows in §5/§5.2/§12, and "plus one T2 row" understated that.
-
 **Revision 14 (2026-08-02)** — closes round 12's blocking set. **The
 boundary is now a TEST, not an enumeration** — *does this affect EC
 lifecycle or scheduler state: where an EC is, what core it is on,
@@ -4164,68 +3414,6 @@ related to EC lifecycle, but another instrument already handles them and
 duplicating it here is complexity this machine must not carry) or
 **genuinely does not touch EC state**.
 
-- **C-1 (the domain pause: primitive IN, callers OUT, eight lines
-  apart)**: §0.2 scoped `idc_read`/`idc_write`/`acquire_vmars` out under
-  "does not move an EC" while §0.3 named the primitive they implement as
-  IN. `specv3.md` says verbatim at `:722`, `:1894` and `:1952` that each
-  **pauses every EC in the domain**. Fixed: the pause AND its resume are
-  in §0.1, the three syscalls are named as the callers, only their
-  VMAR/handle work is out. Revision 13's "N applications of the existing
-  suspend edge" **did not type-check** — every suspend route ends in
-  `waiting(port_queue)` and §[suspend] requires a port handle, delivers
-  an event and resumes via a reply capability, and these three pass no
-  port, deliver no event and resume from inside the same syscall. Four
-  pieces added, and no more: **`wait.kind = .domain_pause`** (explicitly
-  NOT a kernel-synthesized internal port — a synthetic port would need
-  minting, refcounting, teardown-on-domain-death and invisibility to
-  `recv`, which is more machinery than a wait kind), its container = the
-  paused domain's EC list under the CD `_gen_lock` (a container §8.2
-  already walks), a **T4 row**, and the **resume edge** (edge 6, the
-  pauser 5a-claims each paused EC and places it). Plus **W5-N** in §3.6:
-  one pauser, N targets — a shape W5's row did not describe. Its
-  termination is W5's argument per target plus the conjunction, and the
-  load-bearing part is that **a pauser is an EC, so pausing a domain
-  containing a pauser is a suspend cycle and §2.5.1 already rejects it.**
-- **M-4 (`current_queue_core`, the eighth signal — now discharged)**: it
-  was retained by §2.6 with no §3.4 row, no named writer, no width and
-  no validity set — verbatim the argument §2.2 used to DELETE the staged
-  destination. **KEPT and given the row**: written under the destination
-  queue lock at the CAS-then-link of edges 1/6/6p/8, cleared under the
-  same lock on every exit from `ready`, valid iff `state == ready` and
-  poisoned otherwise, and safe when stale because every reader
-  re-validates under the lock it points at (§3.5's drop-and-retry). Kept
-  rather than deleted because deleting it reinstates the 64-core sweep
-  §2.6 records as removed. **All eight legacy signals are now
-  discharged**, which is §0.1's deliverable.
-- **M-3 (the pin class is NOT empty, and revision 13's conclusion was
-  refuted by §2.4's own next paragraph)**: the two NAMED classes do
-  leave the set — both are `lockIrqSave` at every acquire at HEAD,
-  converted in `f1215bbf5`, and the doc's line numbers were stale — but
-  the **gen-lock classes are in the set** via plain `SlabRef.lock()` at
-  genuine EC-context sites (`vm_runloop.zig:73` and neighbours, both
-  arches). A rule about what the code must do is not a filter that
-  empties the computed set. Consequence, and it is load-bearing:
-  §5.2's `ready × K` justification goes **back to the original two-arm
-  dichotomy**, because revision 13's "every class masks" strengthening
-  is false at HEAD — with §3.3's IRQs-enabled rule a tick can land
-  inside the vCPU run loop's gen-lock hold, a frame neither masked nor
-  pin-counted. Those sites are a **tree defect**: convert to
-  `lockWithGenIrqSave`.
-- **Battery apparatus (M-1)**: revision 12/13's `RESULT: FAIL` was the
-  runner, not the model — two `run.sh` instances raced and collided on
-  TLC metadir names (TLC derives the directory from the current time, so
-  two runs starting in the same second abort). `run.sh` now **refuses to
-  start when a TLC run is in flight** and makes metadirs PID-unique.
-  `InvNoFalseSuspendSuccess` added to `small`/`medium`/`large`/`xlarge`
-  so round-11 C-1's invariant is carried by the main safety configs
-  rather than only by its own two gates, and **`-deadlock` dropped from
-  `dirf6fix`** so the fix-check can show the two-part disambiguator
-  introduces no wedge.
-- **Non-blocking, deliberately deferred** (round-12's own bar): M-2's
-  `dead` modelling is ledgered rather than modelled, the results-section
-  rewrite, and every header/table staleness item. These are hygiene and
-  land alongside implementation.
-
 **Revision 13 (2026-08-02)** — **SCOPE CORRECTION.** The mechanism has
 been stable for six rounds; what churned was the boundary. §0 is new,
 normative, and at the top: the machine owns the EC lifecycle and every
@@ -4234,16 +3422,6 @@ deliverable is §6's invariants making §2.6's eight legacy signals
 provably redundant. Everything else is named OUT with a reason so it
 cannot be re-opened as an omission.
 
-- **§0 added** — IN scope, OUT of scope with reasons, and the three
-  BORDERLINE cases resolved explicitly. All three resolve to LESS
-  machinery than earlier revisions proposed: `restart_at_entry` is one
-  edge (claim by the state's normal route, frame reset under the won
-  claim, edge 6, one T2 row); **domain-wide pause needs no design of its
-  own** — the movement it causes is N applications of the existing
-  suspend edge, and revision 11's "architecturally larger than restart"
-  assessment was about the primitive, not about the part this machine
-  owns; `restrict`/`revoke` wakes ride edge 5a's existing
-  close-propagation trigger, no new edge.
 - **§3.5's chain project RETRACTED, and with it §11.10's blocker.**
   Revisions 10–12 turned a refuted chain into a blocker gating §8.1,
   §8.2, §8.5 and six migration steps on a lockdep group design nobody
@@ -4294,7 +3472,7 @@ cannot be re-opened as an omission.
   including the bolded lead-in an implementer reads as the rule. Fixed.
 - **DEFERRED, explicitly, as outside §0's boundary**: the analyzer
   inversion cost and §9.4's masking decision (§11.11, recorded not
-  worked), §12's step ordering, the domain-pause design, `persist`,
+  worked), §12's step ordering, `persist`,
   `revoke`/`restrict` cascade mechanics, the three-class
   lock cycle (retracted with the chain project), and README/changelog
   bookkeeping beyond keeping the results accurate.
@@ -4395,8 +3573,7 @@ PARITY DIFF, and it is the diff that would have caught C-1.**
 
 **Revision 11 (2026-08-01)** — closes review round 10 (C-A, C-B, C-D,
 majors). **Scope note: this revision fixes what is already covered and
-deliberately starts NO scope expansion.** Restart (§11.9) and the
-domain-pause primitive each get their own revision, per the maintainer's
+deliberately starts NO scope expansion.** Restart (§11.9) gets its own revision, per the maintainer's
 decision; nothing is scoped out.
 
 - **C-A (the new IRQ rule had no re-entrancy arm, making two fast-path
@@ -4476,9 +3653,7 @@ decision; nothing is scoped out.
 - **M-G**: T4 gains `terminate`'s handle deref and the teardown walk.
 - **Retracted immediately (§11.9)**: revision 10's "that walk surfaces
   restart and nothing else new" was false and was the kind of false that
-  stops the next reviewer looking. Six further gaps are now listed,
-  including a **domain-pause primitive architecturally larger than
-  restart and not additive**.
+  stops the next reviewer looking. Further gaps were identified and recorded.
 - Minors: the `mark_state` collapse finished in §2.4's declaration
   comment and §2.6; README de-staled (`mst` → `mo`, G10's §11.9 → §11.10,
   the confidence section); two orphan configs deleted.

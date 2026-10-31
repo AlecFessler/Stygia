@@ -185,7 +185,7 @@ pub fn wireIstGates() void {
     idt.setIst(@intFromEnum(Exception.page_fault), gdt.IST_PAGE_FAULT);
 }
 
-/// Event-route classification of an architectural exception. `null` for
+/// Classification of an architectural exception. `null` for
 /// vectors handled out-of-band (lazy FPU trap, single-step, NMI, machine
 /// check, double fault).
 const ExceptionEvent = union(enum) {
@@ -322,7 +322,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 .breakpoint => port.fireBreakpoint(ec, 0),
             }
             // IRQs deliberately stay MASKED through the dispatch
-            // attempt: the fired event may have suspended `ec` with its
+            // attempt: fault handling may have parked `ec` with its
             // kstack release stashed on this core, and an IRQ handler
             // here could spin on that very release (timer-wheel wakes
             // routed through `markReady`'s kstack barrier) — a
@@ -331,7 +331,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // If `yieldTo` dispatched a fresh EC it would never return
             // here (the park-kstack hop into the dispatch tail is
             // noreturn). Reaching this line means the run queue was
-            // empty — the no-route fallback (`parkSelfFaulted` for
+            // empty — the unhandled-fault path (`parkSelfFaulted` for
             // thread_fault, `markReady` of the resumed EC was the last
             // work) drained `current_ec` to null. We CANNOT iretq back
             // to the kernel-stack iret frame: that frame still holds
@@ -551,7 +551,7 @@ fn emulateVirtualBar(
     domain: *CapabilityDomain,
 ) void {
     // Snapshot under the lock then release before any path that may
-    // suspend or terminate `ec`: the fault-routing handlers may unwind
+    // suspend or terminate `ec`: the fault handlers may unwind
     // through the scheduler and never return here, so holding the VMAR
     // lock across them would strand the gen and deadlock any future
     // walk of the domain's vars[]. The DeviceRegion pointer is stable
@@ -574,13 +574,12 @@ fn emulateVirtualBar(
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
     const phys = paging_mod.resolveVaddr(domain.addr_space_root, rip_page) orelse {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        // IRQs stay MASKED through the dispatch attempt: the fired
-        // event may have suspended the EC with its kstack release
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`)
+        // `fireThreadFault`'s unhandled-fault path (`parkSelfFaulted`)
         // cleared `current_ec`; if `yieldTo` couldn't dispatch fresh
         // work, returning would iretq back to the now-stale faulting
         // user RIP. Hand off to `scheduler.run()` (noreturn) — it idles
@@ -614,14 +613,13 @@ fn emulateVirtualBar(
     // Decode the instruction
     const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
         port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-        // IRQs stay MASKED through the dispatch attempt: the fired
-        // event may have suspended the EC with its kstack release
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
         // See the rip_page-resolve fallback above: if the run queue is
-        // empty after firing the no-route park, return into
+        // empty after firing the unhandled-fault park, return into
         // `scheduler.run()` rather than letting iretq return to a stale
         // user frame.
         if (scheduler.currentEc() == null) scheduler.hopParkRun();
@@ -636,8 +634,7 @@ fn emulateVirtualBar(
         else
             MemoryFaultSubcode.invalid_read;
         port.fireMemoryFault(ec, subcode, faulting_addr);
-        // IRQs stay MASKED through the dispatch attempt: the fired
-        // event may have suspended the EC with its kstack release
+        // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
         // stashed on this core; an IRQ handler here could spin on
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
@@ -663,8 +660,7 @@ fn emulateVirtualBar(
             4 => cpu.outd(value, io_port),
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                // IRQs stay MASKED through the dispatch attempt: the fired
-                // event may have suspended the EC with its kstack release
+                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
                 // stashed on this core; an IRQ handler here could spin on
                 // that very release (markReady's kstack barrier) — a
                 // self-deadlock on our own pending stash.
@@ -680,8 +676,7 @@ fn emulateVirtualBar(
             4 => cpu.ind(io_port),
             else => {
                 port.fireThreadFault(ec, ThreadFaultSubcode.protection, rip);
-                // IRQs stay MASKED through the dispatch attempt: the fired
-                // event may have suspended the EC with its kstack release
+                // IRQs stay MASKED through the dispatch attempt: fault handling may have parked the EC with its kstack release
                 // stashed on this core; an IRQ handler here could spin on
                 // that very release (markReady's kstack barrier) — a
                 // self-deadlock on our own pending stash.

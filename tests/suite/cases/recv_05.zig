@@ -1,8 +1,7 @@
 // Spec §[recv] recv — test 05.
 //
 // "[test 05] returns E_CLOSED when a recv is blocked on a port and the
-//  last bind-cap holder releases its handle while no event_routes
-//  target the port and no events are queued."
+//  last bind-cap holder releases its handle while no events are queued."
 //
 // Strategy
 //   The assertion needs a witness chain:
@@ -16,7 +15,7 @@
 //         is still blocked. Per §[capabilities] handle release behavior
 //         on a `port` handle (line 175): "Decrement the send refcount
 //         if this handle has `bind`; ... When the send refcount hits
-//         zero and no event routes target the port, receivers suspended
+//         zero, receivers suspended
 //         on the port resume with E_CLOSED."
 //
 //   Both ECs are minted in the test's own capability domain so they
@@ -30,8 +29,7 @@
 //   holder is the test domain's slot. The worker calling recv does not
 //   itself add to the bind refcount — recv is gated by the `recv` cap,
 //   not `bind`. Deleting the slot therefore drops the bind refcount
-//   from 1 to 0 in one step, and with no event routes bound and no
-//   queued events, the spec mandates the worker's blocked recv resume
+//   from 1 to 0 in one step, and with no queued events, the spec mandates the worker's blocked recv resume
 //   with E_CLOSED.
 //
 //   Synchronisation. The test EC must observe two distinct events:
@@ -51,7 +49,7 @@
 //         cap drop.
 //     (ii) test 04 path: the worker reached recv after the bind-cap
 //         drop but the slot still resolves; recv sees no senders, no
-//         event_routes, no events queued and returns E_CLOSED rather
+//         no events queued and returns E_CLOSED rather
 //         than blocking.
 //     (iii) E_BADCAP: the worker's recv runs after `delete` has freed
 //         the slot — the slot resolves to nothing in the worker's
@@ -204,7 +202,7 @@ pub fn main(cap_table_base: u64) void {
     }
 
     // Step 4: drop the last bind-cap holder. Per §[capabilities] line
-    // 175, the send refcount falls to zero and — with no event routes
+    // 175, the send refcount falls to zero and — with no queued events
     // and no queued events — receivers suspended on the port resume
     // with E_CLOSED. The kernel will write E_CLOSED into the worker's
     // recv return path; the worker stores it into worker_recv_result.

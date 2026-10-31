@@ -66,7 +66,7 @@
 //   write) per primary.zig.
 //
 // Why a runtime spin instead of `hlt`
-//   `hlt` from CPL3 #GPs (and we'd need `bind`/event-route plumbing to
+//   `hlt` from CPL3 #GPs (and we would need exception handling to
 //   surface that as a fault event the test could observe). A bounded
 //   busy-wait on a u64 with `pause` keeps W in a predictable state
 //   (i.e., touching no GPRs other than the loop addr/value pair) and

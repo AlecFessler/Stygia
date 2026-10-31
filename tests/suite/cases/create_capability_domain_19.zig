@@ -106,9 +106,9 @@ const EM_AARCH64: u16 = 183;
 /// EM_X86_64 made the crafted child un-runnable on aarch64: the kernel
 /// mapped it, the initial EC executed the x86 stub bytes as A64
 /// (`adr x17, …` / `stxrh w0, w0, [x0]`), stored through its read-only
-/// cap_table_base, and died as a routeless `memory_fault` — one
-/// `[NOROUTE] subcode=0` per suite run, with the domain torn down by the
-/// no-route fallback instead of the intended `delete(SLOT_SELF)`.
+/// cap_table_base, and died as a unhandled `memory_fault` — one
+/// `[UNHANDLED] subcode=0` per suite run, with the domain torn down by the
+/// unhandled-fault path instead of the intended `delete(SLOT_SELF)`.
 const EM_NATIVE: u16 = switch (@import("builtin").cpu.arch) {
     .x86_64 => EM_X86_64,
     .aarch64 => EM_AARCH64,

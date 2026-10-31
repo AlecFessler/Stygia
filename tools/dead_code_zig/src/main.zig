@@ -1399,13 +1399,12 @@ pub fn main() !void {
     // hyprvOS, bootloader) compile separately, so the indexer doesn't
     // emit IR / entry_reaches data for them. Without per-tree IR the
     // alive-set falls back to bare-token heuristics that get tricked by
-    // cross-tree homonyms (e.g. hyprvOS/libz/syscall.zig:acquireEcs
-    // looks "alive" because the kernel's acquireEcs is referenced from
-    // syscall/dispatch.zig). The verdict on those trees would be too
+    // cross-tree homonyms. The verdict on those trees would be too
     // unreliable to gate on, so reject them outright.
     if (!std.mem.eql(u8, target_name, "kernel")) {
         var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf,
+        const msg = std.fmt.bufPrint(
+            &buf,
             "unsupported --target: {s} (only `kernel` is supported — non-kernel trees lack per-tree IR/entry_reaches)\n",
             .{target_name},
         ) catch "unsupported --target\n";
@@ -1481,7 +1480,8 @@ pub fn main() !void {
             const alt_sha = (try fetchMeta(g_arena, &alt_db, "commit_sha")) orelse "";
             if (!mem.eql(u8, primary_sha, alt_sha)) {
                 var buf: [512]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf,
+                const msg = std.fmt.bufPrint(
+                    &buf,
                     "alt DB commit_sha mismatch: primary={s} alt={s} (path: {s})\n",
                     .{ primary_sha, alt_sha, alt_path },
                 ) catch "alt DB commit_sha mismatch\n";
@@ -1637,4 +1637,3 @@ fn writeFindingsToDb(
 
     try rwdb.exec("COMMIT");
 }
-

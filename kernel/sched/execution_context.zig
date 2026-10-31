@@ -274,10 +274,7 @@ pub const EcCaps = packed struct(u16) {
     read: bool = false,
     write: bool = false,
     restart_policy: u2 = 0,
-    bind: bool = false,
-    rebind: bool = false,
-    unbind: bool = false,
-    _reserved: u3 = 0,
+    _reserved: u6 = 0,
 };
 
 /// Scheduling priority. Mirrors handle field0.pri (2 bits, 0..3).
@@ -319,28 +316,10 @@ pub const Wait = struct {
 /// Event type carried by a suspension. Matches spec §[event_type] values.
 pub const EventType = enum(u5) {
     none = 0,
-    memory_fault = 1,
-    thread_fault = 2,
-    breakpoint = 3,
     suspension = 4,
     vm_exit = 5,
+    _,
 };
-
-/// Number of registerable event types — the subset bindable through
-/// `bind_event_route` (memory_fault, thread_fault, breakpoint). `suspension` and `vm_exit` are not registered through
-/// these syscalls and so do not occupy an `event_routes` slot.
-pub const REGISTERABLE_EVENT_COUNT = 3;
-
-/// Index into `event_routes` for a given EventType. Returns `null` for
-/// the unregisterable types (`none`, `suspension`, `vm_exit`).
-pub fn eventRouteSlot(et: EventType) ?u8 {
-    return switch (et) {
-        .memory_fault => 0,
-        .thread_fault => 1,
-        .breakpoint => 2,
-        else => null,
-    };
-}
 
 pub const ExecutionContext = struct {
     /// Slab generation lock. Protects every handle holding a
@@ -665,8 +644,7 @@ pub const ExecutionContext = struct {
 
     /// Write-cap snapshot from the originating EC handle taken at the
     /// moment this EC was suspended (the suspending EC handle for
-    /// explicit suspend, the EC handle used at `bind_event_route` for
-    /// fault events, the vCPU EC handle for vm_exit). Read at reply time
+    /// explicit suspend, or the vCPU EC handle for vm_exit). Read at reply time
     /// so the receiver's vreg modifications are committed back to the
     /// sender's saved state iff the originating handle had `write`.
     /// Spec §[reply] tests 05/06.
@@ -680,13 +658,6 @@ pub const ExecutionContext = struct {
     /// the receiver as zero. Spec §[suspend] test 10.
     originating_read_cap: bool = false,
 
-    /// Kernel-held event route bindings, one slot per registerable event
-    /// type. Index follows `EventType` ordering minus the unregisterable
-    /// ones: 0=memory_fault, 1=thread_fault, 2=breakpoint.
-    /// `null` ⇒ no route; firing falls back to the type-specific
-    /// no-route handling per §[event_route].
-    event_routes: [REGISTERABLE_EVENT_COUNT]?SlabRef(Port) = .{ null, null, null },
-
     // ── Restart ───────────────────────────────────────────────────────
 
     /// Original entry point recorded at create time. Used by
@@ -696,8 +667,7 @@ pub const ExecutionContext = struct {
     // ── vCPU (null on regular ECs) ────────────────────────────────────
 
     /// VM this EC is a vCPU of, or `null` for a regular EC. Set at
-    /// `create_vcpu`; immutable. `acquire_ecs` filters vCPUs out of its
-    /// returned set by checking this field.
+    /// `create_vcpu`; immutable.
     vm: ?SlabRef(VirtualMachine) = null,
 
     /// Port where vm_exit events are delivered for this vCPU. Set at
@@ -822,9 +792,8 @@ pub fn self(caller: *ExecutionContext) i64 {
 /// same lazy eviction applies to stale handles in other capability
 /// domains.
 /// Park the calling EC out of every run queue with no possibility of
-/// resuming. Used by no-route fault fallbacks (§[event_route]): when an
-/// exception fires and the EC has no thread_fault route bound, the
-/// kernel must keep the faulting EC from being re-dispatched. Otherwise
+/// resuming. Used by unhandled fault teardown: the kernel must keep
+/// the faulting EC from being re-dispatched. Otherwise
 /// the EC re-iretq's onto the same instruction, faults again, and
 /// (especially at higher-than-default priority) starves every other EC
 /// in its domain. A full `destroyExecutionContext` from this path would
@@ -1047,8 +1016,6 @@ pub fn terminate(caller: *ExecutionContext, target: u64) i64 {
     // `fpuSave(&ec.fpu_state)` into a slab slot we're about to gen-
     // bump and (eventually) recycle to another EC.
     stygia.sched.fpu.clearFromLastFpuOwner(ec);
-
-    for (&ec.event_routes) |*slot_ptr| slot_ptr.* = null;
 
     if (ec.vm != null and ec.vcpu_arch_state != null) {
         arch.vm.freeVcpuArchState(ec);
@@ -1301,7 +1268,7 @@ pub fn setAffinity(caller: *ExecutionContext, target: u64, new_affinity: u64) i6
 }
 
 /// Suspend `ec` on `port` with the given event metadata. Used by both
-/// the explicit `suspend` syscall and event-route fault delivery.
+/// the explicit `suspend` syscall and vCPU exit delivery.
 /// Rejects vCPUs with E_PERM (spec §[port].suspend test 06).
 ///
 /// Slow-path mirror of arch/x64/interrupts.zig Phase 4: the observable
@@ -1492,9 +1459,7 @@ fn suspendOnPortInner(
     // matching GPR slots in `port.deliverEvent`. `iret_frame` is the
     // canonical user-state pointer set on syscall/exception entry;
     // fall back to `ctx` for ECs that suspend outside an in-flight
-    // syscall (e.g. event-route fault paths that suspend a
-    // not-currently-executing EC; ctx still references the most
-    // recent saved frame).
+    // syscall; ctx still references the most recent saved frame.
     const sender_ctx = ec.iret_frame orelse ec.ctx;
     ec.event_state_gprs = arch.syscall.getEventStateGprs(sender_ctx);
     ec.event_rip = arch.syscall.getEventRip(sender_ctx);
@@ -1935,9 +1900,7 @@ pub fn countEcsInDomain(cd_ref: SlabRef(CapabilityDomain)) u64 {
 /// For pending replies pointing at OTHER domains (cross-domain reply
 /// pin), we run the normal `abandonPendingReply` path.
 /// `caller_cd` is the domain whose teardown is driving this destroy, or
-/// `null` when no domain is being torn down (the no-route fault paths in
-/// `sched/port.zig`, which destroy a single EC while its domain stays
-/// live). It exists solely for the same-CD pending-reply shortcut below,
+/// `null` when no domain is being torn down. It exists solely for the same-CD pending-reply shortcut below,
 /// so `null` correctly forces the `abandonPendingReply` branch: nothing
 /// is freeing the holder's `user_table`, and silently dropping the
 /// back-pointer there would leak the holder slot.
@@ -2020,22 +1983,6 @@ pub fn destroyExecutionContextRefLocked(ec_ref: SlabRef(ExecutionContext), calle
     stygia.sched.futex.cancelWait(ec);
     if (ec.recv_deadline_ns != 0) stygia.sched.port.cancelRecvDeadline(ec);
     stygia.sched.fpu.clearFromLastFpuOwner(ec);
-
-    // Spec §[port] lifetime: each kernel-held event route increments
-    // the destination port's bind_refcount; the matching dec runs
-    // here when the route owner (this EC) goes away. Without this dec
-    // the port's bind_refcount is leaked and recv-side E_CLOSED is
-    // never delivered even after every bind-cap holder releases.
-    for (&ec.event_routes) |*slot| {
-        const port_ref = slot.* orelse continue;
-        const port_lr = port_ref.lockIrqSave(@src()) catch {
-            slot.* = null;
-            continue;
-        };
-        stygia.sched.port.decBindRef(port_lr.ptr);
-        port_ref.unlockIrqRestore(port_lr.irq_state);
-        slot.* = null;
-    }
 
     // Spec §[port] lifetime: a vCPU's exit_port is pinned for the
     // vCPU's lifetime. Unlink from the port's vcpu_list_head and

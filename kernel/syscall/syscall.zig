@@ -2,7 +2,6 @@ pub const capability = @import("capability.zig");
 pub const capability_domain = @import("capability_domain.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const errors = @import("errors.zig");
-pub const event_route = @import("event_route.zig");
 pub const execution_context = @import("execution_context.zig");
 pub const futex = @import("futex.zig");
 pub const page_frame = @import("page_frame.zig");

@@ -6,11 +6,11 @@
 // Strategy
 //   `cridc_ceiling` is the 8-bit field at bits 24-31 of the self-handle
 //   field0 (= ceilings_inner). Only bits 0-5 are valid IDC cap bits
-//   (move/copy/crec/aqec/aqvr/restart_policy); bits 6-7 are reserved
+//   (move/copy/crec/restart_policy); bits 6-7 are reserved
 //   and trip the reserved-bits rule (test 17), so they cannot be used
 //   to construct a superset for this test.
 //
-//   The runner mints each child with `cridc_ceiling = 0x3F` (full 6
+//   The runner mints each child with `cridc_ceiling = 0x27` (full 6
 //   valid bits set — see runner/primary.zig `ceilings_inner`). When the
 //   caller already holds the full set there is no valid superset to
 //   pass, so a faithful E_PERM probe of test 09 is impossible from this
@@ -18,7 +18,7 @@
 //
 //   This is the degraded smoke variant the brief authorises: read the
 //   caller's `cridc_ceiling` and, if any of bits 0-5 is unset, build a
-//   true superset and assert E_PERM. Otherwise (caller has 0x3F),
+//   true superset and assert E_PERM. Otherwise (caller has 0x27),
 //   submit a request with `cridc_ceiling = caller_value` (an equal-set,
 //   which is a subset by definition) and assert the kernel does not
 //   return E_PERM — proving the subset rule does not fire on a non-
@@ -31,7 +31,7 @@
 //   1. create_capability_domain(... ceilings_inner with cridc bits =
 //      caller_cridc | missing_bit ...) — must return E_PERM
 //
-// Action — degraded path (caller already at 0x3F)
+// Action — degraded path (caller already at 0x27)
 //   1. create_capability_domain(... ceilings_inner with cridc bits =
 //      caller_cridc ...) — must return anything except E_PERM
 //
@@ -98,19 +98,16 @@ pub fn main(cap_table_base: u64) void {
     // 09 and use fields we leave unchanged from the caller's view.
     const self_caps_word: u64 = self_cap.word0 >> 48; // caps live in bits 48-63 of word0.
 
-    // Find a missing valid bit in caller_cridc (bits 0-5).
+    // Only bits 0, 1, 2, and 5 remain defined for IDC handles.
     var missing_bit: u8 = 0;
-    var found_missing: bool = false;
-    var i: u3 = 0;
-    while (i < 6) {
+    var found_missing = false;
+    for ([_]u3{ 0, 1, 2, 5 }) |i| {
         const bit: u8 = @as(u8, 1) << i;
         if ((caller_cridc & bit) == 0) {
             missing_bit = bit;
             found_missing = true;
             break;
         }
-        if (i == 5) break;
-        i += 1;
     }
 
     if (found_missing) {
@@ -135,7 +132,7 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
 
-    // Degraded path: caller already holds full 0x3F, so no valid
+    // Degraded path: caller already holds full 0x27, so no valid
     // superset exists. Submit an equal-set value (a subset by
     // definition) and assert the kernel does NOT return E_PERM —
     // proving the subset check does not misfire on equal sets.

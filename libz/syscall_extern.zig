@@ -61,8 +61,6 @@ pub const SyscallNum = enum(u12) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    acquire_ecs = 20,
-    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -75,8 +73,6 @@ pub const SyscallNum = enum(u12) {
     unmap = 35,
     remap = 36,
     snapshot = 37,
-    idc_read = 38,
-    idc_write = 39,
     create_page_frame = 40,
     ack = 41,
     create_virtual_machine = 42,
@@ -87,8 +83,6 @@ pub const SyscallNum = enum(u12) {
     vm_inject_irq = 47,
     create_port = 48,
     recv = 49,
-    bind_event_route = 50,
-    clear_event_route = 51,
     reply = 52,
     timer_arm = 54,
     timer_rearm = 55,
@@ -267,8 +261,6 @@ const ext = struct {
         passed_handles_ptr: [*]const u64,
         passed_handles_len: usize,
     ) callconv(.c) c.Regs;
-    extern fn acquireEcs(target: u16) callconv(.c) c.RecvReturn;
-    extern fn acquireVmars(target: u16) callconv(.c) c.RecvReturn;
     extern fn createExecutionContext(
         caps: u64,
         entry: u64,
@@ -301,13 +293,6 @@ const ext = struct {
     ) callconv(.c) c.Regs;
     extern fn remap(vmar_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs;
     extern fn snapshot(target_vmar: u16, source_vmar: u16) callconv(.c) c.Regs;
-    extern fn idcRead(vmar_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs;
-    extern fn idcWrite(
-        vmar_handle: u16,
-        offset: u64,
-        qwords_ptr: [*]const u64,
-        qwords_len: usize,
-    ) callconv(.c) c.Regs;
     extern fn createPageFrame(caps: u64, props: u64, pages: u64) callconv(.c) c.Regs;
     extern fn ack(device_region: u16) callconv(.c) c.Regs;
     extern fn createVirtualMachine(caps: u64, policy_pf: u16) callconv(.c) c.Regs;
@@ -343,8 +328,6 @@ const ext = struct {
         attachments_len: usize,
     ) callconv(.c) c.Regs;
     extern fn recv(port: u16, timeout_ns: u64) callconv(.c) c.RecvReturn;
-    extern fn bindEventRoute(target: u16, event_type: u64, port: u16) callconv(.c) c.Regs;
-    extern fn clearEventRoute(target: u16, event_type: u64) callconv(.c) c.Regs;
     extern fn reply(reply_handle: u16) callconv(.c) c.Regs;
     extern fn replyTransfer(
         reply_handle: u16,
@@ -424,14 +407,6 @@ pub fn createCapabilityDomain(
     ));
 }
 
-pub fn acquireEcs(target: u12) RecvReturn {
-    return fromCRecvReturn(ext.acquireEcs(@as(u16, target)));
-}
-
-pub fn acquireVmars(target: u12) RecvReturn {
-    return fromCRecvReturn(ext.acquireVmars(@as(u16, target)));
-}
-
 // 7..16: execution-context ops
 
 pub fn createExecutionContext(
@@ -494,14 +469,6 @@ pub fn snapshot(target_vmar: u12, source_vmar: u12) Regs {
     return fromCRegs(ext.snapshot(@as(u16, target_vmar), @as(u16, source_vmar)));
 }
 
-pub fn idcRead(vmar_handle: u12, offset: u64, count: u8) Regs {
-    return fromCRegs(ext.idcRead(@as(u16, vmar_handle), offset, count));
-}
-
-pub fn idcWrite(vmar_handle: u12, offset: u64, qwords: []const u64) Regs {
-    return fromCRegs(ext.idcWrite(@as(u16, vmar_handle), offset, qwords.ptr, qwords.len));
-}
-
 // 25: page frame
 
 pub fn createPageFrame(caps: u64, props: u64, pages: u64) Regs {
@@ -546,7 +513,7 @@ pub fn vmInjectIrq(vm_handle: u12, irq_num: u64, assert_word: u64) Regs {
     return fromCRegs(ext.vmInjectIrq(@as(u16, vm_handle), irq_num, assert_word));
 }
 
-// 33..39: port / IDC / event-route / reply
+// 33..39: port / reply
 
 pub fn createPort(caps: u64) Regs {
     return fromCRegs(ext.createPort(caps));
@@ -563,14 +530,6 @@ pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
 
 pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
     return fromCRecvReturn(ext.recv(@as(u16, port), timeout_ns));
-}
-
-pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
-    return fromCRegs(ext.bindEventRoute(@as(u16, target), event_type, @as(u16, port)));
-}
-
-pub fn clearEventRoute(target: u12, event_type: u64) Regs {
-    return fromCRegs(ext.clearEventRoute(@as(u16, target), event_type));
 }
 
 pub fn reply(reply_handle: u12) Regs {

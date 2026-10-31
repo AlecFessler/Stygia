@@ -9,7 +9,7 @@
 //     - caller self-handle has `crvr` (root_service launches every test
 //       domain with the full self-cap set — see runner/primary.zig).
 //     - caps.r/w/x ⊆ vmar_inner_ceiling.r/w/x (test 02): the runner's
-//       ceilings_inner = 0x001C_011F_3F01_FFFF places vmar_inner_ceiling
+//       ceilings_inner = 0x001C_011F_2701_FFFF places vmar_inner_ceiling
 //       at field0 bits 8-23 = 0x01FF, which permits r, w, and dma. We
 //       use only r|w here (no x) so test 12 (caps.dma = 1 and caps.x
 //       set → E_INVAL) cannot fire.

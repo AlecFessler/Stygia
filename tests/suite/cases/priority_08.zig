@@ -18,8 +18,7 @@
 //   the kernel's authoritative state having drifted in between. In
 //   practice that requires two cap-table slots aliasing the same EC
 //   (so an operation on slot A leaves slot B stale until something
-//   touches B), which in turn needs an `acquire_ecs` round-trip into
-//   a sibling capability domain. The current test infrastructure
+//   touches B), which requires a second alias handle. The current test infrastructure
 //   spawns each test as a single-domain child with no sibling, so the
 //   alias-slot path is not yet wired.
 //

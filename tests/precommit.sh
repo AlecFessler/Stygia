@@ -729,9 +729,9 @@ verify_image_arch() {
 # clean summary used to PASS this gate outright.
 #
 # Marker choice is measured against a known-clean x86 run (485/485):
-#   KERNEL PANIC  0   Zig `panic:`  0   [NOROUTE]  0
+#   KERNEL PANIC  0   Zig `panic:`  0   [UNHANDLED]  0
 #   [USR-PF]    102  <-- NOT a marker; the map_pf tests fault on purpose.
-# `[NOROUTE]` means an event fired with no bound route and the EC parked
+# `[UNHANDLED]` means an event fired with no bound route and the EC parked
 # forever, so a result that should exist never will — abnormal by
 # construction, and zero in healthy runs.
 #
@@ -748,11 +748,11 @@ verify_no_kernel_faults() {
     # The runner's per-test progress ticks interleave `~` into output, so
     # strip them before matching (same reason the summary greps do).
     local hard_hits
-    hard_hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[NOROUTE\]' | head -10)
+    hard_hits=$(tr -d '~' < "$log" | grep -aE 'KERNEL PANIC|^panic: |\[UNHANDLED\]' | head -10)
     if [[ -n "$hard_hits" ]]; then
         echo "[FAIL] $label: kernel-level fault in the log (runner summary cannot see this)"
         echo "$hard_hits" | sed 's/^/    /'
-        FAILURES+=("$label: kernel fault (panic/noroute) in serial log")
+        FAILURES+=("$label: kernel fault (panic/unhandled) in serial log")
         return 1
     fi
 
@@ -1126,7 +1126,7 @@ run_aarch64_tcg_3reps() {
         local tcg_log
         tcg_log=$(mktemp)
         # virtualization=on so qemu exposes EL2; required by the VM-
-        # related spec tests (acquire_ecs_07, create_vcpu_03/06/07,
+        # related spec tests (create_vcpu_03/06/07,
         # create_virtual_machine_*) which would otherwise hit
         # `vmSupported() == false` and surface E_NODEV from
         # create_virtual_machine. Pi 5 KVM cannot host these tests
@@ -1187,7 +1187,7 @@ run_aarch64_tcg_3reps() {
 # exercised against the real EL2/VHE path, not the spec's E_NODEV
 # degraded-pass branch the Pi 5 KVM gets. Pi 5 KVM doesn't expose
 # nested virt + only supports gic-version=2, so vCPU execution paths
-# can't run there. Build root_service with just the 6 VM-related spec
+# can't run there. Build root_service with just the 5 VM-related spec
 # tests and run them under local TCG (gic-version=3). When aarch64
 # kernel-side VM dispatch graduates from stub to real, this gate
 # catches regressions on the real path.
@@ -1196,10 +1196,10 @@ stage_aarch64_vm_tests_tcg() {
     echo "=================================================="
     echo "[2a/4] aarch64 VM spec tests (local TCG, gic-version=3, 3 reps)"
     echo "=================================================="
-    echo "Building aarch64 root_service (6-test VM bundle)..."
+    echo "Building aarch64 root_service (5-test VM bundle)..."
     if ! (cd "$SCRIPT_DIR/suite" && rm -rf bin/ .zig-cache && \
           zig build -Darch=arm \
-          -Dtests='acquire_ecs_07,create_vcpu_03,create_vcpu_06,create_vcpu_07,create_virtual_machine_06,create_virtual_machine_07'); then
+          -Dtests='create_vcpu_03,create_vcpu_06,create_vcpu_07,create_virtual_machine_06,create_virtual_machine_07'); then
         FAILURES+=("aarch64 vm-tests root_service build")
         return 1
     fi

@@ -35,7 +35,7 @@
 //   port_ceiling does not allow `copy` on port handles, so port
 //   handles cannot serve here.)
 //
-//   Saturating the table is done as in acquire_ecs_04: repeated
+//   Saturating the table uses repeated
 //   create_port({}) until E_FULL is observed, confirming zero free
 //   slots remain. After saturation a reply with pair_count = 1 must
 //   return E_FULL because no contiguous run of 1 slot exists for the
@@ -175,12 +175,7 @@ fn replyOne(reply_handle: u12, pair_entry: u64) u64 {
                 : [v1] "={x0}" (x0_out),
                 : [word] "r" (word),
                   [pair] "r" (pair_entry),
-                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-                     .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-                     .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-                     .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-                     .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-                     .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+                : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
             return x0_out;
         },
         else => @compileError("unsupported target architecture"),

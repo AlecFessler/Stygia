@@ -98,7 +98,7 @@ const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 // the child halt immediately at startup (MISS).
 const CHILD_EC_INNER: u8 = 0xE5; // bits 0/2/5/6/7 of EC inner caps (susp+read+write set)
 const CHILD_VMAR_INNER: u16 = 0x00BE; // strict subset of runner 0x01FF (copy|r|w|x|mmio|max_sz=2)
-const CHILD_CRIDC: u8 = 0x15; // strict subset of runner 0x3F (move|crec|aqvr)
+const CHILD_CRIDC: u8 = 0x05; // strict subset of runner 0x27 (move|crec)
 const CHILD_IDC_RX: u8 = 0xA3; // arbitrary 8-bit mask (no ceiling subset to satisfy)
 const CHILD_PF_CLG: u8 = 0x0F; // strict subset of runner 0x1F (max_rwx all + max_sz=01)
 const CHILD_VM_CLG: u8 = 0x01; // matches runner 0x01 (only valid bit is bit 0 = policy)

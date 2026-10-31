@@ -18,15 +18,15 @@
 //   The spec-faithful test requires two distinct capability domains
 //   communicating over IDC:
 //     1. Receiver R is created with a known `idc_rx` mask M (e.g.,
-//        IdcCap{ .copy = true, .crec = true } — `aqec` cleared).
+//        IdcCap{ .copy = true } — `move` cleared).
 //     2. Sender S holds an IDC handle to R with caps a strict superset
-//        of M (e.g., {copy, crec, aqec}).
+//        of M (e.g., {copy, move}).
 //     3. S calls `suspend` on a port bound to R, attaching an IDC
-//        handle entry whose caps include `aqec`.
+//        handle entry whose caps include `move`.
 //     4. R calls `recv`, dequeues the suspension, and the kernel
 //        installs the IDC handle into R's table per §[handle_attachments].
 //     5. R reads the installed slot and asserts caps == granted ∩ M
-//        — specifically, that `aqec` is cleared because M cleared it.
+//        — specifically, that `move` is cleared because M cleared it.
 //
 //   This needs (a) a way to spawn a child capability domain from a
 //   test ELF (currently each test is itself a single capability

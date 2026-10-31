@@ -25,11 +25,6 @@ const HANDLE_ARG_MASK: u64 = 0xFFF;
 /// Reserved-bit mask for `remap`'s new_cur_rwx (bits 0-2 only).
 const REMAP_RWX_MASK: u64 = 0x7;
 
-/// Maximum qwords transferable per `idc_read` / `idc_write`. Spec §[var]
-/// caps the syscall word's count subfield at 125 to fit the available
-/// vreg payload window.
-const IDC_QWORDS_MAX: u64 = 125;
-
 /// Reserves a range of virtual address space bound to the caller's
 /// domain.
 ///
@@ -166,7 +161,6 @@ pub fn createVmar(
 /// [test 13] on success, when [1].caps.dma = 1, a DMA read by the bound device from `VMAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VMAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
 /// [test 14] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn mapPf(caller: *anyopaque, vmar_handle: u64, pairs: []const u64) i64 {
-
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     // Pairs slice always carries a (offset, page_frame) tuple per i — odd
     // length means the dispatcher mis-parsed N from the syscall word.
@@ -321,85 +315,4 @@ pub fn snapshot(caller: *anyopaque, target_vmar: u64, source_vmar: u64) i64 {
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
     return vmar.snapshot(ec, target_vmar, source_vmar);
-}
-
-/// Reads qwords from a VMAR into the caller's vregs. Used for cross-domain
-/// memory inspection (e.g., debugger reads of an acquired VMAR's
-/// contents). The kernel pauses every EC in the VMAR's owning domain for
-/// the duration of the call so the read returns a consistent snapshot;
-/// this is intended as a debugger primitive, not a performance path.
-///
-/// ```
-/// idc_read([1] var, [2] offset) -> [3..2+count] qwords
-///   syscall_num = 23
-///
-///   syscall word bits 12-19: count (number of qwords; max 125)
-///
-///   [1] var:    VMAR handle
-///   [2] offset: byte offset within the VMAR (must be 8-byte aligned)
-/// ```
-///
-/// VMAR cap required on [1]: `r`.
-///
-/// [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
-/// [test 02] returns E_PERM if [1] does not have the `r` cap.
-/// [test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
-/// [test 04] returns E_INVAL if count is 0 or count > 125.
-/// [test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
-/// [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-/// [test 07] on success, vregs `[3..2+count]` contain the qwords from the VMAR starting at [2] offset.
-/// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-pub fn idcRead(caller: *anyopaque, vmar_handle: u64, offset: u64, count: u8) i64 {
-
-    if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
-    // Offset must be 8-byte aligned per spec [test 03].
-    if (offset & 0x7 != 0) return errors.E_INVAL;
-    if (count == 0) return errors.E_INVAL;
-    if (count > IDC_QWORDS_MAX) return errors.E_INVAL;
-
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.idcRead(ec, vmar_handle, offset, count);
-}
-
-/// Writes qwords from the caller's vregs into a VMAR. Used for
-/// cross-domain memory writes (e.g., debugger writes of an acquired VMAR's
-/// contents). The kernel pauses every EC in the VMAR's owning domain for
-/// the duration of the call so the write commits without observable
-/// interleaving; this is intended as a debugger primitive, not a
-/// performance path.
-///
-/// ```
-/// idc_write([1] var, [2] offset, [3..2+count] qwords) -> void
-///   syscall_num = 24
-///
-///   syscall word bits 12-19: count (number of qwords; max 125)
-///
-///   [1] var:    VMAR handle
-///   [2] offset: byte offset within the VMAR (must be 8-byte aligned)
-///   [3..2+count] qwords: bytes to write into the VMAR
-/// ```
-///
-/// VMAR cap required on [1]: `w`.
-///
-/// [test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
-/// [test 02] returns E_PERM if [1] does not have the `w` cap.
-/// [test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
-/// [test 04] returns E_INVAL if count is 0 or count > 125.
-/// [test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
-/// [test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-/// [test 07] on success, the qwords from vregs `[3..2+count]` are written into the VMAR starting at [2] offset.
-/// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-pub fn idcWrite(caller: *anyopaque, vmar_handle: u64, offset: u64, count: u8, qwords: []const u64) i64 {
-
-    if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
-    if (offset & 0x7 != 0) return errors.E_INVAL;
-    // The raw count comes straight from the syscall word so we can gate
-    // count > 125 even though the args slice tops out at the 13-vreg
-    // register window. The qwords slice carries only the payload that
-    // was actually delivered (≤ 11 register-vreg qwords today).
-    if (count == 0) return errors.E_INVAL;
-    if (count > IDC_QWORDS_MAX) return errors.E_INVAL;
-
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    return vmar.idcWrite(ec, vmar_handle, offset, count, qwords);
 }

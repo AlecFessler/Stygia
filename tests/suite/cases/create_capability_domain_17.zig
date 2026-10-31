@@ -17,7 +17,7 @@
 //   [1], [2], and a passed handle entry, asserting the kernel returns
 //   E_INVAL each time. We mirror the runner's known-valid argument
 //   template (see runner/primary.zig: `ceilings_inner =
-//   0x001C_011F_3F01_FFFF`, `ceilings_outer = 0x0000_003F_03FE_FFFF`)
+//   0x001C_011F_2701_FFFF`, `ceilings_outer = 0x0000_003F_03FE_FFFF`)
 //   so that with all-zero reserved bits the call would otherwise pass
 //   the subset/ceiling/restart-policy checks. The reserved-bit check
 //   is therefore the only spec-mandated failure path that mutates
@@ -65,7 +65,7 @@ const testing = lib.testing;
 
 // Mirror runner/primary.zig's known-valid ceiling templates so the
 // only spec violation in each branch is the injected reserved bit.
-const VALID_CEILINGS_INNER: u64 = 0x001C_011F_3F01_FFFF;
+const VALID_CEILINGS_INNER: u64 = 0x001C_011F_2701_FFFF;
 const VALID_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {

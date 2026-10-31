@@ -10,7 +10,7 @@
 //   with E_PERM before any kernel state mutates.
 //
 //   The runner (runner/primary.zig) constructs each test domain with
-//   `ceilings_inner = 0x001C_011F_3F01_FFFF`, so the test's
+//   `ceilings_inner = 0x001C_011F_2701_FFFF`, so the test's
 //   pf_ceiling (bits 32-39) is 0x1F — every defined bit set
 //   (max_rwx at bits 32-34, max_sz=3 at bits 35-36; bits 37-39 are
 //   reserved). With a fully-saturated caller ceiling, every legal
@@ -69,7 +69,7 @@ const testing = lib.testing;
 // Runner-supplied baseline for the non-pf_ceiling fields. Mirrors
 // runner/primary.zig's ceilings_inner; we substitute bits 32-39 with
 // the caller's actual pf_ceiling read from slot 0.
-const RUNNER_CEILINGS_INNER_NON_PF: u64 = 0x001C_0100_3F01_FFFF;
+const RUNNER_CEILINGS_INNER_NON_PF: u64 = 0x001C_0100_2701_FFFF;
 const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {

@@ -106,14 +106,6 @@ pub fn createCapabilityDomain(
     ));
 }
 
-pub fn acquireEcs(target: u16) callconv(.c) c.RecvReturn {
-    return toCRecvReturn(syscall.acquireEcs(@truncate(target)));
-}
-
-pub fn acquireVmars(target: u16) callconv(.c) c.RecvReturn {
-    return toCRecvReturn(syscall.acquireVmars(@truncate(target)));
-}
-
 pub fn createExecutionContext(
     caps: u64,
     entry: u64,
@@ -180,19 +172,6 @@ pub fn remap(vmar_handle: u16, new_cur_rwx: u64) callconv(.c) c.Regs {
 
 pub fn snapshot(target_vmar: u16, source_vmar: u16) callconv(.c) c.Regs {
     return toCRegs(syscall.snapshot(@truncate(target_vmar), @truncate(source_vmar)));
-}
-
-pub fn idcRead(vmar_handle: u16, offset: u64, count: u8) callconv(.c) c.Regs {
-    return toCRegs(syscall.idcRead(@truncate(vmar_handle), offset, count));
-}
-
-pub fn idcWrite(
-    vmar_handle: u16,
-    offset: u64,
-    qwords_ptr: [*]const u64,
-    qwords_len: usize,
-) callconv(.c) c.Regs {
-    return toCRegs(syscall.idcWrite(@truncate(vmar_handle), offset, qwords_ptr[0..qwords_len]));
 }
 
 pub fn createPageFrame(caps: u64, props: u64, pages: u64) callconv(.c) c.Regs {
@@ -270,14 +249,6 @@ pub fn suspendEc(
 
 pub fn recv(port: u16, timeout_ns: u64) callconv(.c) c.RecvReturn {
     return toCRecvReturn(syscall.recv(@truncate(port), timeout_ns));
-}
-
-pub fn bindEventRoute(target: u16, event_type: u64, port: u16) callconv(.c) c.Regs {
-    return toCRegs(syscall.bindEventRoute(@truncate(target), event_type, @truncate(port)));
-}
-
-pub fn clearEventRoute(target: u16, event_type: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.clearEventRoute(@truncate(target), event_type));
 }
 
 pub fn reply(reply_handle: u16) callconv(.c) c.Regs {
@@ -370,8 +341,6 @@ comptime {
     @export(&revoke, .{ .name = "revoke" });
     @export(&sync, .{ .name = "sync" });
     @export(&createCapabilityDomain, .{ .name = "createCapabilityDomain" });
-    @export(&acquireEcs, .{ .name = "acquireEcs" });
-    @export(&acquireVmars, .{ .name = "acquireVmars" });
     @export(&createExecutionContext, .{ .name = "createExecutionContext" });
     @export(&self, .{ .name = "self" });
     @export(&terminate, .{ .name = "terminate" });
@@ -384,8 +353,6 @@ comptime {
     @export(&unmap, .{ .name = "unmap" });
     @export(&remap, .{ .name = "remap" });
     @export(&snapshot, .{ .name = "snapshot" });
-    @export(&idcRead, .{ .name = "idcRead" });
-    @export(&idcWrite, .{ .name = "idcWrite" });
     @export(&createPageFrame, .{ .name = "createPageFrame" });
     @export(&ack, .{ .name = "ack" });
     @export(&createVirtualMachine, .{ .name = "createVirtualMachine" });
@@ -397,8 +364,6 @@ comptime {
     @export(&createPort, .{ .name = "createPort" });
     @export(&suspendEc, .{ .name = "suspendEc" });
     @export(&recv, .{ .name = "recv" });
-    @export(&bindEventRoute, .{ .name = "bindEventRoute" });
-    @export(&clearEventRoute, .{ .name = "clearEventRoute" });
     @export(&reply, .{ .name = "reply" });
     @export(&replyTransfer, .{ .name = "replyTransfer" });
     @export(&replyRecv, .{ .name = "replyRecv" });

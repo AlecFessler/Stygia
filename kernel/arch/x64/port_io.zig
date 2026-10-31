@@ -13,7 +13,7 @@
 //!   3. Compute the target port: `dev.access.port_io.base_port +
 //!      (fault_vaddr - var_base)`.
 //!   4. Bounds-check `port_offset + width <= port_count`. Out of range
-//!      fires `memory_fault` per spec test 06.
+//!      tears down the owning domain with an unhandled memory fault.
 //!   5. Emit IN/OUT of the matching width (`cpu.inb/inw/ind` /
 //!      `cpu.outb/outw/outd`).
 //!   6. Deposit the read-back into the destination GPR (loads;
@@ -35,8 +35,7 @@
 //! `cur_rwx` enforcement (spec tests 07/08, the read/write rights
 //! checks) happens upstream in `vmar.handlePageFault` before this
 //! function is reached: the access-rwx vs `cur_rwx` test there
-//! returns `E_PERM` which `fault.handlePageFault` routes as
-//! `memory_fault`.
+//! returns `E_PERM` which `fault.handlePageFault` treats as an unhandled memory fault.
 
 const stygia = @import("stygia");
 
@@ -143,7 +142,7 @@ pub fn emulatePortIoFault(
         // that very release (markReady's kstack barrier) — a
         // self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        // `fireMemoryFault`'s no-route fallback (`parkSelfFaulted`)
+        // `fireMemoryFault` teardown (`parkSelfFaulted`)
         // clears the local core's `current_ec`. If the run queue is
         // empty after yieldTo, returning would iretq back onto the
         // now-stale faulting user RIP. Hand off to `scheduler.run()`

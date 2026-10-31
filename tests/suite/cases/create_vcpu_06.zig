@@ -135,7 +135,7 @@ pub fn main(cap_table_base: u64) void {
 
     // 5. Exit port. `bind` is required for the create_vcpu cap check
     //    on [4]; `recv` is harmless and matches the canonical exit-
-    //    port shape used by acquire_ecs_07 and the spec narrative.
+    //    port shape used by the spec narrative.
     const exit_port_caps = caps.PortCap{ .bind = true, .recv = true };
     const cp = syscall.createPort(@as(u64, exit_port_caps.toU16()));
     if (testing.isHandleError(cp.v1)) {

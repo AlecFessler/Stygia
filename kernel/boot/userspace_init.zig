@@ -56,9 +56,6 @@ const ROOT_EC_CAPS = EcCaps{
     .read = true,
     .write = true,
     .restart_policy = 1,
-    .bind = true,
-    .rebind = true,
-    .unbind = true,
 };
 
 /// Pages reserved for the per-EC user stack created by
@@ -212,16 +209,16 @@ pub fn init(root_service_elf: []const u8) !void {
     // Self-handle field0 layout per §[capability_domain] Self handle:
     //   bits  0-7   ec_inner_ceiling          = 0xFF
     //   bits  8-23  vmar_inner_ceiling         = 0xFFFF
-    //   bits 24-31  cridc_ceiling             = 0xFF
-    //   bits 32-39  idc_rx                    = 0xFF
+    //   bits 24-31  cridc_ceiling             = 0x27
+    //   bits 32-39  idc_rx                    = 0x27
     //   bits 40-47  pf_ceiling                = 0x1F  (max_rwx=7, max_sz=3)
     //   bits 48-55  vm_ceiling                = 0x01  (policy=1)
     //   bits 56-63  port_ceiling              = 0x5C  (xfer|recv|bind|suspend)
     const root_field0_ceilings: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0xFFFF) << 8) |
-        (@as(u64, 0xFF) << 24) |
-        (@as(u64, 0xFF) << 32) |
+        (@as(u64, 0x27) << 24) |
+        (@as(u64, 0x27) << 32) |
         (@as(u64, 0x1F) << 40) |
         (@as(u64, 0x01) << 48) |
         (@as(u64, 0x5C) << 56);

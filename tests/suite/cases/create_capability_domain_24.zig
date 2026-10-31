@@ -29,7 +29,7 @@
 //   Child path: the spawned sub-domain re-enters this same ELF. We
 //   discriminate parent vs. child by reading the caller's own
 //   self-handle field0 `cridc_ceiling` (bits 24-31). The runner
-//   installs 0x3F; the parent path passes a strict-subset 0x07 to
+//   installs 0x27; the parent path passes a strict-subset 0x07 to
 //   the sub-domain so the child branch can detect itself and silently
 //   return — the runner's libz `_start` then issues
 //   delete(SLOT_SELF) and the child CD tears down. No report from
@@ -62,7 +62,7 @@ const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
 const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
 // Strict-subset cridc_ceiling for the spawned sub-domain. Distinct
-// from the runner-installed 0x3F so the child path can detect itself
+// from the runner-installed 0x27 so the child path can detect itself
 // via the field0 cridc_ceiling byte.
 const CHILD_CRIDC: u8 = 0x07;
 
@@ -71,7 +71,7 @@ pub fn main(cap_table_base: u64) void {
     // §[capability_domain] Self handle field0: cridc_ceiling at bits 24-31.
     const my_cridc_ceiling: u8 = @truncate((self_cap.field0 >> 24) & 0xFF);
 
-    if (my_cridc_ceiling != 0x3F) {
+    if (my_cridc_ceiling != 0x27) {
         // ── Child path ──────────────────────────────────────────────
         // We're the spawned sub-domain. Test 24's assertion lives in
         // the parent (it observes the caller's own table); the child

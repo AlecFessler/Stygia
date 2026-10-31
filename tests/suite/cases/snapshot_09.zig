@@ -48,17 +48,11 @@
 //       not retain a snapshot/restart fixture for the child. There is
 //       no "restart this test domain and read back T" hook in
 //       runner/primary.zig; adding one would introduce a parent-side
-//       result-port handshake (mint S/T from the parent, hand the test
-//       EC just enough to call `snapshot(T, S)`, then restart the test
-//       domain from the parent and `idc_read(T)` from the parent's
-//       perspective post-restart).
+//       result-port handshake to observe the copied pages after restart).
 //
 //   (c) Even with a parent-side restart driver, observing T's contents
-//       post-copy requires a cross-domain reader. `idc_read` from the
-//       parent against an acquired handle to T would work, but that
-//       requires acquire wiring not currently present in the runner's
-//       test scaffold, plus a result-port roundtrip to surface the
-//       observed-equals-source assertion back to the test reporter.
+//       post-copy requires a mapped reader in a suitable domain. The
+//       current runner has no fixture for that observation.
 //
 //   Reaching the faithful path needs a *runner-side* restart harness
 //   that:
@@ -66,9 +60,8 @@
 //     - lets the test call `snapshot(T, S)`, then signal "ready" via
 //       the result port;
 //     - on receipt of "ready", the parent restarts the test child;
-//     - after restart, the parent reads T (via idc_read on its own
-//       handle) and compares against S's pre-restart sentinel,
-//       reporting pass/fail back through its own assertion channel.
+//     - after restart, the parent maps and reads T, compares it against
+//       S's pre-restart sentinel, and reports the result.
 //   That harness does not yet exist; the snapshot suite currently has
 //   no test that crosses the restart boundary observably.
 //
@@ -109,8 +102,8 @@
 //     - grants them to the test child,
 //     - waits for a "binding established" signal on the result port,
 //     - restarts the test child domain,
-//     - post-restart, reads T's contents (via idc_read on a parent-held
-//       acquired handle) and compares against the sentinel pattern
+//     - post-restart, maps and reads T in the owning domain and
+//       compares against the sentinel pattern
 //       pre-loaded into S.
 //   Once that exists, the action becomes:
 //     <parent: mint S (preserve), fill S with 0xA5...>
@@ -118,7 +111,7 @@
 //     <parent: hand S, T to child, run child>
 //     <child: snapshot(T, S); signal ready>
 //     <parent: restart child domain>
-//     <parent: idc_read(T) -> *expected* 0xA5... pattern>
+//     <parent: observe T -> *expected* 0xA5... pattern>
 //   That equality assertion (id 1) would replace this smoke's
 //   pass-with-id-0.
 

@@ -61,7 +61,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
 /// | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 /// | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 /// | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
-/// | `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero and no event routes target the port, receivers suspended on the port resume with `E_CLOSED`. Release handle |
+/// | `port` | Decrement the send refcount if this handle has `bind`; decrement the recv refcount if this handle has `recv`. When the recv refcount hits zero, suspended senders resume with `E_CLOSED`. When the send refcount hits zero, receivers suspended on the port resume with `E_CLOSED`. Release handle |
 /// | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
 /// | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
 /// | `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |

@@ -10,8 +10,7 @@
 //   the per-sender EC handle's `field0` priority snapshot (refreshed
 //   implicitly on every syscall touching the handle, per §[priority]
 //   test 08) and the recv-side `reply_handle_id` round-trip (proven
-//   live by `reply` returning OK, mirroring bind_event_route_08's
-//   round-trip).
+//   live by `reply` returning OK).
 //
 //   Identification trick. We deliberately suspend the LOW-priority
 //   sender FIRST and the HIGH-priority sender SECOND on the same

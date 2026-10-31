@@ -12,7 +12,7 @@
 //     bits 48-49, 53-55: _reserved
 //
 //   The runner (runner/primary.zig) installs ceilings_inner =
-//   0x001C_011F_3F01_FFFF, so the test domain's port_ceiling sub-field
+//   0x001C_011F_2701_FFFF, so the test domain's port_ceiling sub-field
 //   = 0x1C — bits 2/3/4 set (xfer/recv/bind), bits 0/1 clear. (The
 //   sub-field bits are numbered relative to the byte; in field0 bits
 //   the runner's value covers bits 50/51/52.)
@@ -91,7 +91,7 @@ pub fn main(cap_table_base: u64) void {
     // values to remain subsets:
     //   bits  0-7  ec_inner_ceiling   = 0xFF
     //   bits  8-23 vmar_inner_ceiling  = 0x01FF
-    //   bits 24-31 cridc_ceiling      = 0x3F
+    //   bits 24-31 cridc_ceiling      = 0x27
     //   bits 32-39 pf_ceiling         = 0x1F
     //   bits 40-47 vm_ceiling         = 0x01
     //   bits 48-55 port_ceiling       = 0x1D  <-- violator
@@ -101,7 +101,7 @@ pub fn main(cap_table_base: u64) void {
         (port_ceiling_violator << 48) |
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x1F) << 32) |
-        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x27) << 24) |
         (@as(u64, 0x01FF) << 8) |
         @as(u64, 0xFF);
 

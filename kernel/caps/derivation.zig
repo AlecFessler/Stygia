@@ -72,7 +72,7 @@ const MAX_DEPTH: u32 = 1 << 20;
 /// acquiring arbitrary third-party CD gen-locks via `lockEntrySkip`, so
 /// ANY path that holds a CD gen-lock while acquiring `tree_mutex` forms
 /// a real AB-BA with them. The old code let mint sites (suspend/recv/
-/// reply pair transfers, `acquire_ecs`/`acquire_vmars`) call `derive`
+/// reply pair transfers) call `derive`
 /// with a CD lock held and waved the inversion off in this very comment
 /// ("since tree_mutex is a single global mutex, AB-BA on tree_mutex
 /// itself is impossible") — but the cycle was never tree-vs-tree, it
@@ -255,7 +255,7 @@ fn deriveInternal(
 
     // Every further entry acquire in this call (the ancestor hops, the
     // child) must skip the domain whose gen-lock the parent acquire
-    // just took — the same-CD shape (self-IDC acquire_ecs/vmars,
+    // just took — the same-CD shape (self-IDC capability derivation,
     // single-domain pair transfers) has parent and child in ONE domain,
     // and a second blocking acquire of the same gen-lock is a
     // self-deadlock (caught by lockdep as a recursive acquire). This is

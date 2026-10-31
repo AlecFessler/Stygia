@@ -97,7 +97,7 @@ pub fn main(cap_table_base: u64) void {
     // intent is to keep every other ceiling check satisfied so the
     // only ceiling violation is vmar_outer_ceiling in [3]. The exact
     // bit pattern matches runner/primary.zig.
-    const ceilings_inner: u64 = 0x001C_011F_3F01_FFFF;
+    const ceilings_inner: u64 = 0x001C_011F_2701_FFFF;
 
     // [3] ceilings_outer: start from the runner template, then clear
     // and rewrite vmar_outer_ceiling with the superset value.

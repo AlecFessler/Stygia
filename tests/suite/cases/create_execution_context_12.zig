@@ -10,8 +10,8 @@
 //     slot 1  → initial EC
 //     slot 2  → self-IDC  (caps = parent's `cridc_ceiling`)
 //     slot 3  → result port (passed_handle)
-//   The runner sets `cridc_ceiling = 0x3F` (bits 0-5: move, copy, crec,
-//   aqec, aqvr, restart_policy), so slot 2's IDC caps include `crec`
+//   The runner sets `cridc_ceiling = 0x27` (bits 0-5: move, copy, crec,
+//   restart_policy), so slot 2's IDC caps include `crec`
 //   (bit 2). slot 2 is therefore a valid IDC `[4]` for a cross-domain
 //   `create_execution_context` and points back at this same domain —
 //   so both the caller-side and target-side EC handles materialize in

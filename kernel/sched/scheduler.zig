@@ -75,7 +75,7 @@ pub const EcQueue = stygia.sched.priority_queue.PriorityQueue(
     @typeInfo(Priority).@"enum".fields.len,
 );
 
-pub const TeardownKind = enum(u8) { self_delete, no_route_fault };
+pub const TeardownKind = enum(u8) { self_delete, unhandled_fault };
 
 pub const TeardownRequest = struct {
     kind: TeardownKind,
@@ -675,7 +675,7 @@ fn runDomainTeardown(req: TeardownRequest) void {
     stygia.caps.derivation.tree_mutex.unlockIrqRestore(tree_irq);
 
     switch (req.kind) {
-        .self_delete, .no_route_fault => stygia.caps.capability_domain.destroyPhase2(deferred),
+        .self_delete, .unhandled_fault => stygia.caps.capability_domain.destroyPhase2(deferred),
     }
 }
 

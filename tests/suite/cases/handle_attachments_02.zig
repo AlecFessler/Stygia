@@ -11,7 +11,7 @@
 //     slot 3  → result port (granted with `bind | xfer` by the runner)
 //   By construction every other slot is empty. Slot 4095 — the
 //   maximum 12-bit handle id — is therefore guaranteed to be invalid,
-//   matching the shape used by restrict_01 / acquire_ecs_01.
+//   matching the shape used by restrict_01.
 //
 //   The test issues `suspend([1] = SLOT_INITIAL_EC, [2] = port)` with
 //   `pair_count = 1` and a single entry placed at vreg 127 per
@@ -145,10 +145,7 @@ fn suspendWithOnePairAtV127Arm(word: u64, target: u64, port: u64, entry: u64) sy
           [entry] "r" (entry),
           [iv1] "{x0}" (target),
           [iv2] "{x1}" (port),
-        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true,
-             .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true,
-             .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true,
-             .x29 = true, .x30 = true, .memory = true });
+        : .{ .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
 
     return .{
         .v1 = ov1,

@@ -15,11 +15,11 @@
 //   `cridc_ceiling` the parent passed.
 //
 //   Discriminator: the runner spawns this test with `cridc_ceiling =
-//   0x3F` (matches runner/primary.zig). The parent restricts the
+//   0x27` (matches runner/primary.zig). The parent restricts the
 //   sub-domain's `cridc_ceiling` to a strict subset (0x07 = move|copy
 //   |crec, the 3 lowest IDC cap bits). The child detects "I'm the
 //   spawned child" by observing its own self-handle field0
-//   `cridc_ceiling` byte != 0x3F. The child then reads slot
+//   `cridc_ceiling` byte != 0x27. The child then reads slot
 //   SLOT_SELF_IDC (= 2) via `caps.readCap(cap_table_base, 2)`, pulls
 //   out the cap field via `Cap.caps()` (word0 bits 48-63), and
 //   asserts equality with the chosen sub-domain `cridc_ceiling` byte
@@ -60,8 +60,8 @@ const SLOT_TEST_ELF_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 1; // 4
 const SLOT_LIBZ_PF: caps.HandleId = caps.SLOT_FIRST_PASSED + 2; // 5
 
 // Sub-domain cridc_ceiling. Strict subset of the runner-installed
-// 0x3F so the [test 09] subset check accepts the spawn, distinct
-// from 0x3F so the child can discriminate its branch by reading
+// 0x27 so the [test 09] subset check accepts the spawn, distinct
+// from 0x27 so the child can discriminate its branch by reading
 // the cridc_ceiling byte out of its own self-handle field0.
 const CHILD_CRIDC: u8 = 0x07; // move | copy | crec
 
@@ -70,7 +70,7 @@ pub fn main(cap_table_base: u64) void {
     // §[capability_domain] Self handle field0: cridc_ceiling at bits 24-31.
     const my_cridc_ceiling: u8 = @truncate((self_cap.field0 >> 24) & 0xFF);
 
-    if (my_cridc_ceiling != 0x3F) {
+    if (my_cridc_ceiling != 0x27) {
         // ── Child path ──────────────────────────────────────────────
         // We're the spawned sub-domain. Read our SLOT_SELF_IDC and
         // assert its cap word matches the cridc_ceiling the parent
@@ -78,7 +78,7 @@ pub fn main(cap_table_base: u64) void {
         //
         // §[capability_domain] IDC handle cap bits live in word0
         // bits 48-63. IdcCap is defined over bits 0-5 (move/copy/
-        // crec/aqec/aqvr/restart_policy); upper bits in the 16-bit
+        // crec/restart_policy); upper bits in the 16-bit
         // cap word are reserved and zero. The kernel mints SLOT_SELF_IDC
         // with caps = `cridc_ceiling`, so the low 8 bits of caps()
         // must equal CHILD_CRIDC (and the high 8 bits must be zero).

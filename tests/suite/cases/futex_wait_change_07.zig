@@ -23,7 +23,7 @@
 //   After map_pf the VMAR's `map` is 1 (pf-installed) per §[map_pf]
 //   test 11; CPU stores at VMAR.base land in the page_frame and
 //   subsequent kernel reads of those qwords observe the same bytes
-//   (same model that idc_read_07 uses for cross-mode visibility).
+//  .
 //
 //   With base in hand, we plant two qwords:
 //     base[0] = 0                  — pair-A current value
@@ -49,7 +49,7 @@
 //   would fire; neither matches the test 07 expectation that the
 //   match-on-entry pair's addr is returned synchronously.
 //
-//   Volatile qword stores (same idiom as idc_read_07) defeat
+//   Volatile qword stores defeat
 //   ReleaseSmall constant-folding: the kernel must observe the
 //   bytes we wrote, not whatever the optimizer would have left in
 //   the page.

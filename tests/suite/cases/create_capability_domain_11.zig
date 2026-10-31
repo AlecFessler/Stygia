@@ -81,7 +81,7 @@ pub fn main(cap_table_base: u64) void {
     // an acceptable outcome here.
     const vm_ceiling_subset: u64 = 0x01;
     const ceilings_inner: u64 =
-        (0x001C_011F_3F01_FFFF & ~(@as(u64, 0xFF) << 40)) |
+        (0x001C_011F_2701_FFFF & ~(@as(u64, 0xFF) << 40)) |
         (vm_ceiling_subset << 40);
     const ceilings_outer: u64 = 0x0000_003F_03FE_FFFF;
 
@@ -135,7 +135,7 @@ fn runFaithfulProbe(
     }
     const pf_handle: caps.HandleId = @truncate(cpf.v1 & 0xFFF);
 
-    const template_inner: u64 = 0x001C_011F_3F01_FFFF;
+    const template_inner: u64 = 0x001C_011F_2701_FFFF;
     const ceilings_inner: u64 =
         (template_inner & ~(@as(u64, 0xFF) << 40)) |
         (@as(u64, new_vm_ceiling) << 40);

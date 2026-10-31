@@ -320,7 +320,7 @@ pub fn stashLastExitPayload(ec: *ExecutionContext, payload: [3]u64) void {
 /// supplied initial state (post-first-reply). The synthetic
 /// pre-started exit delivers only sub-code + zeroed GPRs so receivers
 /// that haven't reserved the full vreg window aren't stomped.
-/// Called by `sched.port.fireRouted` on `event_type = vm_exit` when
+/// Called by `sched.port.fireVmExit` on `event_type = vm_exit` when
 /// the originating EC handle had the `read` cap.
 pub fn populateVmExitVregsIfStarted(
     receiver: *ExecutionContext,

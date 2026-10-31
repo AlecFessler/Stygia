@@ -33,8 +33,7 @@ const PAIR_BUF_LEN: usize = MAX_PAIR_COUNT;
 /// §[event_state] / §[vm_exit_state]) between recv and reply are applied
 /// to the suspended EC's state on resume, gated by the `write` cap on the
 /// EC handle that originated the binding (the suspending EC handle for
-/// explicit suspend, the EC handle used at `bind_event_route` for fault
-/// events, the vCPU EC handle for vm_exit).
+/// explicit suspend, the vCPU EC handle for vm_exit).
 ///
 /// ```
 /// reply -> void

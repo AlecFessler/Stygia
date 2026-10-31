@@ -69,7 +69,7 @@ pub fn main(cap_table_base: u64) void {
     // runner's all-valid-bits values so unrelated subset checks pass.
     // Splice the caller's fut_wait_max into bits 32-37 so the
     // `fut_wait_max` subset rule reduces to equality.
-    const ceilings_inner: u64 = 0x001C_011F_3F01_FFFF;
+    const ceilings_inner: u64 = 0x001C_011F_2701_FFFF;
 
     const ceilings_outer_low: u64 = 0x0000_0000_03FE_FFFF;
     const ceilings_outer: u64 = ceilings_outer_low | (caller_fut_wait_max << 32);

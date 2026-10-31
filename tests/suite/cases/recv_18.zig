@@ -40,7 +40,7 @@
 //       createPort, not deleted.
 //     - recv test 02 (E_PERM no `recv`): we kept `recv`.
 //     - recv test 03 (E_INVAL reserved bits): libz truncates to u12.
-//     - recv test 04 (E_CLOSED on no-bind / no-route / no-event):
+//     - recv test 04 (E_CLOSED on no-bind / no-event):
 //       the bind cap is preserved across restrict, so bind_refcount
 //       remains 1 and this gate does not fire.
 //     - recv test 06 (E_FULL): plenty of free slots; the timeout

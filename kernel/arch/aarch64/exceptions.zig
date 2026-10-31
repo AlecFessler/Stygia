@@ -455,7 +455,7 @@ fn readFarEl1() u64 {
 ///   EC=0x15 (SVC64): syscall -- dispatch to syscall handler.
 ///   EC=0x24 (Data Abort from lower EL): page fault -- dispatch to fault handler.
 ///   EC=0x20 (Instruction Abort from lower EL): page fault -- dispatch to fault handler.
-///   Others: route via `port.fireThreadFault` / `port.fireBreakpoint`.
+///   Others: handle via `port.fireThreadFault` / `port.fireBreakpoint`.
 /// Intercept a data-abort that hit a userspace port-IO VMAR (no PTEs
 /// installed → every access faults) and forward the access to the
 /// underlying port-IO device. Returns `true` when the fault was
@@ -1374,17 +1374,14 @@ fn dispatchIrq(intid: u32) void {
 }
 
 /// Look up the running EC, fire a `thread_fault` event with `subcode`
-/// and `payload`, then yield. Spec §[event_type] row 2.
+/// and `payload`, then yield after the faulting domain is torn down.
 fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     const ec = scheduler.currentEc() orelse
         @panic("user thread fault with no current EC");
     port.fireThreadFault(ec, @intFromEnum(subcode), payload);
-    // IRQs stay masked: the routed fault may have suspended `ec` with
-    // its kstack release stashed on this core — an IRQ handler here
-    // could spin on that release (markReady's kstack barrier), a
-    // self-deadlock on our own pending stash.
+    // Keep IRQs masked through fault teardown and the scheduler hop.
     scheduler.yieldTo(null);
-    // `fireThreadFault`'s no-route fallback (`parkSelfFaulted`) cleared
+    // `fireThreadFault`'s unhandled-fault path (`parkSelfFaulted`) cleared
     // this core's `current_ec`; if `yieldTo` couldn't dispatch fresh
     // work, ERET back through `exceptionTrampoline` would surface the
     // now-stale faulting user context, re-fault on the same PC, and
@@ -1397,8 +1394,7 @@ fn deliverThreadFault(subcode: ThreadFaultSubcode, payload: u64) void {
     if (scheduler.currentEc() == null) scheduler.hopParkRun();
 }
 
-/// Look up the running EC, fire a `breakpoint` event with `subcode`,
-/// then yield. Spec §[event_type] row 3.
+/// Handle a user breakpoint, then yield.
 fn deliverBreakpoint(subcode: BreakpointSubcode) void {
     const ec = scheduler.currentEc() orelse
         @panic("user breakpoint with no current EC");
@@ -1406,12 +1402,6 @@ fn deliverBreakpoint(subcode: BreakpointSubcode) void {
     // Masked + hop for the same kstack-release reasons as
     // `deliverThreadFault`.
     scheduler.yieldTo(null);
-    // Same post-yieldTo guard as `deliverThreadFault`. `fireBreakpoint`'s
-    // no-route fallback does NOT park (it just drops the event), so
-    // currentEc() stays valid in the no-route case; but the routed-
-    // delivery path suspends the EC via `port.deliverEvent`, clearing
-    // `current_ec` on this core. Without this guard a routed delivery
-    // followed by an empty run queue would ERET back to a stale user
-    // PC and re-fault.
+    // Keep the post-yieldTo guard used by the other exception paths.
     if (scheduler.currentEc() == null) scheduler.hopParkRun();
 }

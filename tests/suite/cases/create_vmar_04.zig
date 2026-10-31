@@ -146,14 +146,14 @@ pub fn main(cap_table_base: u64) void {
     // §[create_capability_domain] [2] ceilings_inner sub-fields:
     //   bits  0-7   ec_inner_ceiling   = 0xFF   (matches runner)
     //   bits  8-23  vmar_inner_ceiling  = 0x01DF (mmio bit 5 cleared)
-    //   bits 24-31  cridc_ceiling      = 0x3F   (matches runner)
+    //   bits 24-31  cridc_ceiling      = 0x27   (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F   (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01   (matches runner)
     //   bits 48-55  port_ceiling       = 0x5C   (matches runner: xfer|recv|bind|suspend)
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
         (VMAR_INNER_CEILING_CHILD << 8) |
-        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x27) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x5C) << 48);

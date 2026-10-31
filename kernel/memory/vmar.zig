@@ -4,7 +4,7 @@
 //!
 //! Capability-domain lifetime: dies when the owning CapabilityDomain
 //! is destroyed. Multiple capability domains may hold handles to a VMAR
-//! via `acquire_vmars` (debugger primitive) or `copy`/`move` — UAF
+//! via `copy`/`move` — UAF
 //! protection across domains comes from `_gen_lock`.
 
 const builtin = @import("builtin");
@@ -120,7 +120,6 @@ pub const VMAR = struct {
     /// `destroyVmar` runs ahead of any domain teardown — but the
     /// invariant lives in code, not the type, so the slot is carried
     /// as a SlabRef for analyzer-level UAF safety on cross-domain
-    /// `acquire_vmars` lookups.
     domain: SlabRef(CapabilityDomain),
 
     /// Base virtual address (or base IOVA for DMA VARs). Mirrors the
@@ -316,8 +315,8 @@ pub fn createVmar(
     // capture base/size without a second VA load on the hot create_vmar
     // path.
     // TEMP DIAGNOSTIC (stygia-idc, REMOVE). Discriminator for the
-    // recurring bare-metal `[NOROUTE] memory_fault subcode=0
-    // payload=0x10` on `idc_read_07`: that test stores through
+    // recurring bare-metal `[UNHANDLED] memory_fault subcode=0
+    // payload=0x10`: a store through
     // `cvar.v2`, so a fault at 0x10 means the base it received was
     // near-null. NOTE (measured): `user_aslr.start` is 0x1000 on BOTH
     // arches, so a low base is legal, merely rare — a first bare-metal
@@ -769,127 +768,6 @@ pub fn snapshot(caller: *ExecutionContext, target_vmar: u64, source_vmar: u64) i
     if (t_size != s_size) return errors.E_INVAL;
 
     target.snapshot_source = SlabRef(VMAR).init(source, source._gen_lock.currentGen());
-    return 0;
-}
-
-/// `idc_read` syscall handler. Spec §[var].idc_read.
-pub fn idcRead(caller: *ExecutionContext, vmar_handle: u64, offset: u64, count: u8) i64 {
-    if (count == 0 or count > 125) return errors.E_INVAL;
-    if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
-
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
-    const slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
-
-    const caps_word: u16 = Word0.caps(domain.user_table[slot].word0);
-    const vmar_caps: VmarCaps = @bitCast(caps_word);
-    if (!vmar_caps.r) return errors.E_PERM;
-
-    const v_irq = v._gen_lock.lockIrqSave(@src());
-    defer v._gen_lock.unlockIrqRestore(v_irq);
-
-    const sz_bytes = pageSizeBytes(v.sz);
-    const var_size = @as(u64, v.page_count) * sz_bytes;
-    if (offset + @as(u64, count) * 8 > var_size) return errors.E_INVAL;
-
-    // Cross-domain coherent read: pause every EC in the VMAR's owning
-    // domain, copy `count` qwords from VMAR.base + offset into the
-    // caller's vregs in offset order (vreg 3 -> offset 0, vreg 4 ->
-    // offset 8, ...), then resume. Spec §[idc_read] test 07. The
-    // syscall executes with the caller's CR3 active so VMAR.base_vaddr
-    // is directly addressable; SMAP gates the user-mem load.
-    // caller-pinned: VMAR's domain is its owner; the VMAR cannot exist
-    // without it (destroyVmar runs ahead of any domain teardown).
-    quiesceDomain(v.domain.ptr);
-    defer resumeDomain(v.domain.ptr); // caller-pinned
-
-    // Per §[var], VARs with `map = unmapped` have no backing storage.
-    // Reading from a user vaddr in that range would page-fault under
-    // SMAP-bracketed user access; the resulting kernel-side fault would
-    // re-enter the VMAR's `_gen_lock` via the fault handler and deadlock.
-    // Return E_INVAL so the caller can install backing (map_pf /
-    // map_mmio / demand fault) before retrying.
-    if (v.map == .unmapped) return errors.E_INVAL;
-
-    const src_base: u64 = v.base_vaddr.addr + offset;
-    dispatch.cpu.userAccessBegin();
-    defer dispatch.cpu.userAccessEnd();
-    const src_ptr: [*]const u64 = @ptrFromInt(src_base);
-    var i: u8 = 0;
-    while (i < count) {
-        const qword = src_ptr[i];
-        // vreg 3 = first qword, vreg 4 = second. Higher-vreg setters
-        // (5..127) need a per-vreg writer that's not yet plumbed
-        // through arch.dispatch.syscall; for the v0 register-only
-        // window (counts ≤ 2) the tests today exercise only vregs 3-4.
-        switch (i) {
-            0 => dispatch.syscall.setSyscallVreg3(caller.ctx, qword),
-            1 => dispatch.syscall.setSyscallVreg4(caller.ctx, qword),
-            else => {
-                // SPEC AMBIGUITY: counts > 2 require setters for vregs
-                // 5..127; not yet plumbed. Surface as E_INVAL rather
-                // than dropping the qword on the floor — the test
-                // surface today only drives counts up to 2.
-                return errors.E_INVAL;
-            },
-        }
-        i += 1;
-    }
-    return 0;
-}
-
-/// `idc_write` syscall handler. Spec §[var].idc_write.
-pub fn idcWrite(
-    caller: *ExecutionContext,
-    vmar_handle: u64,
-    offset: u64,
-    count: u8,
-    qwords: []const u64,
-) i64 {
-    if (count == 0 or count > 125) return errors.E_INVAL;
-    if (!std.mem.isAligned(offset, 8)) return errors.E_INVAL;
-
-    const domain = caller.domain.ptr; // caller-pinned: caller is the running EC; its domain stays alive across this syscall
-    const slot: u12 = @truncate(vmar_handle & 0xFFF);
-    const v = resolveVmar(domain, slot) orelse return errors.E_BADCAP;
-
-    const caps_word: u16 = Word0.caps(domain.user_table[slot].word0);
-    const vmar_caps: VmarCaps = @bitCast(caps_word);
-    if (!vmar_caps.w) return errors.E_PERM;
-
-    const v_irq = v._gen_lock.lockIrqSave(@src());
-    defer v._gen_lock.unlockIrqRestore(v_irq);
-
-    const sz_bytes = pageSizeBytes(v.sz);
-    const var_size = @as(u64, v.page_count) * sz_bytes;
-    if (offset + @as(u64, count) * 8 > var_size) return errors.E_INVAL;
-
-    // The dispatcher delivered only the qwords that fit in the
-    // register-vreg window; counts beyond `qwords.len` would draw
-    // from stack-spilled vregs the v0 ABI doesn't yet plumb through.
-    if (qwords.len < count) return errors.E_INVAL;
-
-    // Per §[var], VARs with `map = unmapped` have no backing storage.
-    // Writing to a user vaddr in that range would page-fault under
-    // SMAP-bracketed user access; the fault handler would re-enter the
-    // VMAR's `_gen_lock` and deadlock. Return E_INVAL so the caller can
-    // install backing (map_pf / map_mmio) before retrying.
-    if (v.map == .unmapped) return errors.E_INVAL;
-
-    // caller-pinned: VMAR's domain is its owner; the VMAR cannot exist
-    // without it.
-    quiesceDomain(v.domain.ptr);
-    defer resumeDomain(v.domain.ptr); // caller-pinned
-
-    const dst_base: u64 = v.base_vaddr.addr + offset;
-    dispatch.cpu.userAccessBegin();
-    defer dispatch.cpu.userAccessEnd();
-    const dst_ptr: [*]u64 = @ptrFromInt(dst_base);
-    var i: u8 = 0;
-    while (i < count) {
-        dst_ptr[i] = qwords[i];
-        i += 1;
-    }
     return 0;
 }
 
@@ -1481,7 +1359,7 @@ pub fn handlePageFault(domain: *CapabilityDomain, fault_vaddr: VAddr, access_rwx
             // Port-IO virtualization — decode MOV, emit IN/OUT, advance
             // RIP. Spec §[port_io_virtualization]. Plain MMIO faults
             // here are spurious (real PTEs were installed at map time)
-            // and route to the EC's memory_fault event.
+            // and tear down the faulting domain.
             // caller-pinned: device ref under VMAR's gen-lock.
             const dev_ref = v.device orelse {
                 v._gen_lock.unlockIrqRestore(v_irq);
@@ -1629,17 +1507,6 @@ fn unmapAll(v: *VMAR, domain: *CapabilityDomain) void {
         v.sz,
         v.page_count,
     );
-}
-
-/// Pause every EC bound to `cd`. Used by idc_read/idc_write to obtain
-/// a coherent snapshot of the VMAR's contents without observable
-/// interleaving.
-fn quiesceDomain(cd: *CapabilityDomain) void {
-    _ = cd;
-}
-
-fn resumeDomain(cd: *CapabilityDomain) void {
-    _ = cd;
 }
 
 /// Decode the MOV that hit a port-IO VMAR, emit the matching IN/OUT,

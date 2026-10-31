@@ -7,13 +7,9 @@
 //   The faithful test 08 observable is a CPU access pattern:
 //     - allowed accesses (those whose access type is in `cur_rwx`) round-
 //       trip without fault.
-//     - denied accesses fault and route through the EC's memory_fault
-//       event.
-//   The denied-access leg requires an exception-handler hook the v0
-//   runner does not yet expose (see map_pf_12 for the same constraint;
-//   the worker-EC scaffold there gates on a port-bound memory_fault
-//   route which would also work here once memory_fault paths quiesce
-//   on MMIO VMAR faults). The allowed-access leg runs on the bare
+//     - denied accesses fault and tear down the owning domain.
+//   The denied-access leg requires a runner fixture that can observe
+//   teardown without losing its own result channel. The allowed-access leg runs on the bare
 //   fixture device_region (phys_base = 0xBABE_0000) which is a
 //   sentinel address — issuing a load/store directly against it is
 //   architecturally undefined on bare metal and may surface as #MC

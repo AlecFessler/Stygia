@@ -134,7 +134,7 @@ pub fn main(cap_table_base: u64) void {
 
     // ceilings_inner: zero everything we don't need. The runner's
     // outer view of our `idc_rx` is opaque to us; we mirror the
-    // runner's encoded value at bits 24-31 (0x3F: all IDC bits) so
+    // runner's encoded value at bits 24-31 (0x27: all IDC bits) so
     // the new domain can mint its own IDCs. All other ceilings
     // narrow to 0 (still a subset of our ceilings).
     const sub_ceilings_inner: u64 = 0x0000_0000_3F00_0000;

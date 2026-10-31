@@ -266,7 +266,7 @@ pub fn createVcpu(
         // Spec §[port] lifetime: the vCPU pins exit_port via
         // bind_refcount for as long as the vCPU exists (vm_exit events
         // fire spontaneously on the bound port — same lifetime class as
-        // event_routes and bind-cap holders). The matching dec runs in
+        // bind-cap holders). The matching dec runs in
         // `destroyExecutionContextLocked`. observed_zero is structurally
         // impossible — `lookupPort` resolved against the caller's CD
         // whose handle pins the port.

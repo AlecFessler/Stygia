@@ -1,16 +1,14 @@
 // Spec §[recv] recv — test 17.
 //
 // "[test 17] returns E_CLOSED if `restrict` clears the `bind` cap on
-//  the only `bind`-cap-holding handle while no event_routes target the
-//  port and no vCPU `exit_port` pins it; the recv call observes this
+//  the only `bind`-cap-holding handle while no vCPU `exit_port` pins it; the recv call observes this
 //  on its very next invocation against the (still-recv-capable)
 //  handle."
 //
 // Strategy
 //   The cap split (kernel commits b666b6751 / 1944005f2) decouples
 //   port lifetime into bind-side and recv-side refcounts. The bind-
-//   side refcount aggregates `bind`-cap-holding handles, kernel-held
-//   event_routes targeting the port, and vCPU `exit_port` pins. When
+//   side refcount aggregates `bind`-cap-holding handles and vCPU `exit_port` pins. When
 //   it hits zero, blocked receivers wake with E_CLOSED and any
 //   subsequent recv on a still-recv-capable handle short-circuits the
 //   same way (kernel/sched/port.zig:527 — `if (p.bind_refcount.snapshot()
@@ -21,8 +19,7 @@
 //   side: a handle minted with `{recv, bind, suspend}` and then
 //   restricted to `{recv, suspend}` keeps the slab alive through its
 //   recv-cap pin while the bind-cap-clear edge dispatches into
-//   port.decBindRef under the port's `_gen_lock`. With no event_route
-//   and no vCPU bound to the port, the bind refcount falls from 1 to
+//   port.decBindRef under the port's `_gen_lock`. With no vCPU bound to the port, the bind refcount falls from 1 to
 //   0 and propagateClosedToReceivers fires.
 //
 //   recv on the same (still-recv-capable) handle then exercises the
@@ -91,7 +88,7 @@ pub fn main(cap_table_base: u64) void {
     // Step 2: restrict the handle to {recv, suspend}. The clear edge
     // on `bind` runs through kernel/caps/capability.zig:336 ->
     // port.decBindRef(p) under the port's _gen_lock. With no
-    // event_route and no vCPU exit_port bound to this port, the bind
+    // vCPU exit_port bound to this port, the bind
     // refcount falls to 0 and propagateClosedToReceivers wakes any
     // blocked receivers (none here). The slab stays alive because the
     // recv-cap holder (this handle) keeps recv_refcount = 1.

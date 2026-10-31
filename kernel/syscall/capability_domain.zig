@@ -7,7 +7,6 @@ const execution_context = stygia.sched.execution_context;
 
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
 const ExecutionContext = execution_context.ExecutionContext;
-const IdcCaps = capability_domain.IdcCaps;
 const Word0 = capability.Word0;
 
 /// `caps` argument: bits 0-23 valid (self_caps + idc_rx); bits 24-63 reserved.
@@ -143,7 +142,6 @@ pub fn createCapabilityDomain(
     initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
-
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     // Spec §[create_capability_domain]: passed_handles uses an all-zero
@@ -335,105 +333,4 @@ pub fn createCapabilityDomain(
         initial_ec_affinity,
         passed_handles,
     );
-}
-
-/// Returns handles to all non-vCPU execution contexts bound to the target
-/// domain referenced by an IDC handle.
-///
-/// ```
-/// acquire_ecs([1] target) -> [1..N] handles
-///   syscall_num = 5
-///
-///   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
-///
-///   [1] target: IDC handle
-/// ```
-///
-/// IDC cap required on [1]: `aqec`.
-///
-/// Each returned handle has caps = `target.ec_outer_ceiling` ∩
-/// `target.ec_cap_ceiling` of the IDC handle in [1]. The kernel sets the
-/// syscall word's count field to N, the number of handles returned, and
-/// writes them to vregs `[1..N]`.
-///
-/// Returns E_FULL if the caller's handle table cannot accommodate all
-/// returned handles.
-///
-/// [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
-/// [test 02] returns E_PERM if [1] does not have the `aqec` cap.
-/// [test 03] returns E_INVAL if any reserved bits are set in [1].
-/// [test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-/// [test 05] on success, the syscall word's count field equals the number of non-vCPU ECs bound to the target domain.
-/// [test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
-/// [test 07] vCPUs in the target domain are not included in the returned handles.
-pub fn acquireEcs(caller: *anyopaque, target: u64) i64 {
-    return acquireDispatch(caller, target, .aqec);
-}
-
-/// Returns handles to all `map=1` (pf) and `map=3` (demand) VARs bound to
-/// the target domain referenced by an IDC handle. MMIO and DMA VARs are
-/// excluded.
-///
-/// ```
-/// acquire_vmars([1] target) -> [1..N] handles
-///   syscall_num = 6
-///
-///   syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
-///
-///   [1] target: IDC handle
-/// ```
-///
-/// IDC cap required on [1]: `aqvr`.
-///
-/// Each returned handle has caps = `target.vmar_outer_ceiling` ∩ the IDC's
-/// `vmar_cap_ceiling`. While in flight, all ECs in the target domain are
-/// paused — `acquire_vmars` and the resulting `idc_read`/`idc_write`
-/// traffic is intended as a debugger primitive, not a performance path.
-///
-/// [test 01] returns E_BADCAP if [1] is not a valid IDC handle.
-/// [test 02] returns E_PERM if [1] does not have the `aqvr` cap.
-/// [test 03] returns E_INVAL if any reserved bits are set in [1].
-/// [test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-/// [test 05] on success, the syscall word's count field equals the number of `map=1` and `map=3` VARs bound to the target domain.
-/// [test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VARs, each with caps = target's `vmar_outer_ceiling` intersected with the IDC's `vmar_cap_ceiling`.
-/// [test 07] MMIO and DMA VARs in the target domain are not included in the returned handles.
-pub fn acquireVmars(caller: *anyopaque, target: u64) i64 {
-    return acquireDispatch(caller, target, .aqvr);
-}
-
-/// IDC cap selector for `acquireDispatch`. Distinguishes which cap bit
-/// gates the call (`aqec` for ECs, `aqvr` for VARs) and which caps
-/// entry point handles enumeration.
-const AcquireKind = enum { aqec, aqvr };
-
-/// Shared trampoline body for `acquire_ecs` / `acquire_vmars`. Both
-/// validate the IDC handle, gate on the kind-specific cap bit, then
-/// hand off to caps.
-fn acquireDispatch(caller: *anyopaque, target: u64, kind: AcquireKind) i64 {
-    if (target & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
-
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    const cd_ref = ec.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    const irq_state = lr.irq_state;
-
-    const slot: u12 = @truncate(target);
-    if (capability.resolveHandleOnDomain(cd, slot, .capability_domain) == null) {
-        cd_ref.unlockIrqRestore(irq_state);
-        return errors.E_BADCAP;
-    }
-
-    const idc_caps: IdcCaps = @bitCast(Word0.caps(cd.user_table[slot].word0));
-    const has_cap = switch (kind) {
-        .aqec => idc_caps.aqec,
-        .aqvr => idc_caps.aqvr,
-    };
-    cd_ref.unlockIrqRestore(irq_state);
-    if (!has_cap) return errors.E_PERM;
-
-    return switch (kind) {
-        .aqec => capability_domain.acquireEcs(ec, target),
-        .aqvr => capability_domain.acquireVmars(ec, target),
-    };
 }

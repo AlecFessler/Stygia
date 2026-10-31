@@ -6,7 +6,7 @@
 //   The kernel populates slot 2 of every fresh capability domain with
 //   an IDC handle to the domain itself (§[capability_domain] /
 //   §[create_capability_domain] test 22). The primary builds the test
-//   child with `cridc_ceiling = 0x3F` (all six IDC cap bits set,
+//   child with `cridc_ceiling = 0x27` (all six IDC cap bits set,
 //   including `crec` at bit 2), so slot 2 starts with `crec`.
 //
 //   To isolate the test 02 failure path we drop `crec` from the
@@ -57,7 +57,7 @@ const testing = lib.testing;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Drop `crec` from the self-IDC. Keep every other bit set so the
+    // Drop `crec` from the self-IDC. Keep the other defined bits set so the
     // handle stays a fully-formed IDC reference — only the cap test 02
     // checks is missing. `restart_policy` is a single bool field on
     // IdcCap; clearing it would force the bit to 0, so leave it set
@@ -66,8 +66,6 @@ pub fn main(cap_table_base: u64) void {
         .move = true,
         .copy = true,
         .crec = false,
-        .aqec = true,
-        .aqvr = true,
         .restart_policy = true,
     };
     const restrict_result = syscall.restrict(

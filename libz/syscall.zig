@@ -52,8 +52,6 @@ pub const SyscallNum = enum(u12) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    acquire_ecs = 20,
-    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -66,8 +64,6 @@ pub const SyscallNum = enum(u12) {
     unmap = 35,
     remap = 36,
     snapshot = 37,
-    idc_read = 38,
-    idc_write = 39,
     create_page_frame = 40,
     ack = 41,
     create_virtual_machine = 42,
@@ -78,8 +74,6 @@ pub const SyscallNum = enum(u12) {
     vm_inject_irq = 47,
     create_port = 48,
     recv = 49,
-    bind_event_route = 50,
-    clear_event_route = 51,
     reply = 52,
     timer_arm = 54,
     timer_rearm = 55,
@@ -243,17 +237,6 @@ pub fn createCapabilityDomain(
     return issueReg(.create_capability_domain, 0, in);
 }
 
-pub fn acquireEcs(target: u12) RecvReturn {
-    // count is set by the kernel on return in syscall word bits 12-19.
-    const word = buildWord(.acquire_ecs, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
-}
-
-pub fn acquireVmars(target: u12) RecvReturn {
-    const word = buildWord(.acquire_vmars, 0);
-    return arch_impl.issueRawCaptureWord(word, .{ .v1 = target });
-}
-
 // ---------------------------------------------------------------
 // 7..16: execution-context ops
 // ---------------------------------------------------------------
@@ -364,31 +347,6 @@ pub fn remap(vmar_handle: u12, new_cur_rwx: u64) Regs {
 
 pub fn snapshot(target_vmar: u12, source_vmar: u12) Regs {
     return issueReg(.snapshot, 0, .{ .v1 = target_vmar, .v2 = source_vmar });
-}
-
-pub fn idcRead(vmar_handle: u12, offset: u64, count: u8) Regs {
-    return issueReg(.idc_read, extraCount(count), .{ .v1 = vmar_handle, .v2 = offset });
-}
-
-pub fn idcWrite(vmar_handle: u12, offset: u64, qwords: []const u64) Regs {
-    const n: u8 = @intCast(qwords.len);
-    var in = Regs{ .v1 = vmar_handle, .v2 = offset };
-    if (qwords.len >= 1) in.v3 = qwords[0];
-    if (qwords.len >= 2) in.v4 = qwords[1];
-    if (qwords.len >= 3) in.v5 = qwords[2];
-    if (qwords.len >= 4) in.v6 = qwords[3];
-    if (qwords.len >= 5) in.v7 = qwords[4];
-    if (qwords.len >= 6) in.v8 = qwords[5];
-    if (qwords.len >= 7) in.v9 = qwords[6];
-    if (qwords.len >= 8) in.v10 = qwords[7];
-    if (qwords.len >= 9) in.v11 = qwords[8];
-    if (qwords.len >= 10) in.v12 = qwords[9];
-    if (qwords.len >= 11) in.v13 = qwords[10];
-    const extra = extraCount(n);
-    if (qwords.len > 11) {
-        return issueStack(.idc_write, extra, in, qwords[11..]);
-    }
-    return issueReg(.idc_write, extra, in);
 }
 
 // ---------------------------------------------------------------
@@ -502,7 +460,7 @@ pub fn vmInjectIrq(vm_handle: u12, irq_num: u64, assert_word: u64) Regs {
 }
 
 // ---------------------------------------------------------------
-// 33..39: port / IDC / event-route / reply
+// 33..39: port / reply
 // ---------------------------------------------------------------
 
 pub fn createPort(caps: u64) Regs {
@@ -530,18 +488,6 @@ pub fn suspendEc(target: u12, port: u12, attachments: []const u64) Regs {
 pub fn recv(port: u12, timeout_ns: u64) RecvReturn {
     const word = buildWord(.recv, 0);
     return issueRawCaptureWord(word, .{ .v1 = port, .v2 = timeout_ns });
-}
-
-pub fn bindEventRoute(target: u12, event_type: u64, port: u12) Regs {
-    return issueReg(.bind_event_route, 0, .{
-        .v1 = target,
-        .v2 = event_type,
-        .v3 = port,
-    });
-}
-
-pub fn clearEventRoute(target: u12, event_type: u64) Regs {
-    return issueReg(.clear_event_route, 0, .{ .v1 = target, .v2 = event_type });
 }
 
 pub fn reply(reply_handle: u12) Regs {

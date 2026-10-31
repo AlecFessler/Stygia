@@ -7,8 +7,7 @@
 //! Slab teardown is gated solely on the recv side so the recv-cap holder
 //! always has a chance to observe E_CLOSED before the underlying slot is
 //! reclaimed. `bind_refcount` aggregates the contributors that fire
-//! events on the port (handles with the `bind` cap, kernel-held
-//! event_routes targeting the port, and vCPU `exit_port` pins);
+//! events on the port (handles with the `bind` cap, vCPU `exit_port` pins);
 //! `recv_refcount` counts handles with `recv`. A handle that carries
 //! only `copy`/`move`/`restart_policy`/`xfer`/`suspend` authorizes no
 //! port-lifetime contribution. When `bind_refcount` hits zero, blocked
@@ -20,9 +19,7 @@
 //! `.observed_zero` on `recv_refcount` owns teardown.
 //!
 //! Spec §[recv] tests 04/05 map directly to the bind-side check: recv
-//! returns E_CLOSED iff the port has no bind-cap holders, no
-//! event_routes targeting it (both contribute to `bind_refcount`), and
-//! no queued events.
+//! returns E_CLOSED iff the port has no bind-cap holders, no vCPU exit-port pins, and no queued events.
 
 const std = @import("std");
 const stygia = @import("stygia");
@@ -51,51 +48,6 @@ const SecureSlab = stygia.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 const SpinLock = stygia.utils.sync.SpinLock;
 const Word0 = capability.Word0;
-const ROUTE_DIAG_BUDGET: u32 = 4096;
-
-var route_diag_prints: u32 = 0;
-
-fn diagTag(ec: *ExecutionContext) u64 {
-    if (ec.diag_test_tag != 0) return ec.diag_test_tag;
-    return ec.domain.ptr.diag_test_tag;
-}
-
-fn logRouteDiag(
-    site: []const u8,
-    ec: *ExecutionContext,
-    event: EventType,
-    subcode: u8,
-    addr: u64,
-    route_gen: u64,
-    port_word: u64,
-    bind_raw: i32,
-    suspend_rc: i64,
-) void {
-    if (!build_options.kernel_spawn_diag) return;
-    const n = @atomicRmw(u32, &route_diag_prints, .Add, 1, .monotonic);
-    if (n >= ROUTE_DIAG_BUDGET) return;
-    arch.boot.print(
-        "[routediag] site={s} tag=0x{x} ec=0x{x} event={d} sub={d} addr=0x{x} route_gen={x} port_word=0x{x} port_gen={x} bind_raw={d} rc={d} state={x} wait={x} owner={x} qcore={x}\n",
-        .{
-            site,
-            diagTag(ec),
-            @intFromPtr(ec),
-            @intFromEnum(event),
-            subcode,
-            addr,
-            route_gen,
-            port_word,
-            port_word >> 1,
-            bind_raw,
-            suspend_rc,
-            @intFromEnum(lifecycle.load(ec)),
-            @intFromEnum(ec.wait.kind),
-            ec.owner_core,
-            ec.current_queue_core.load(.acquire),
-        },
-    );
-}
-
 // ── Timed recv waiters ───────────────────────────────────────────────
 //
 // Parallel structure to sched.futex.timed_waiters: a fixed array of EC
@@ -330,7 +282,6 @@ pub const Port = struct {
     /// Bind-side reference count. Aggregates everything that can fire
     /// an event on this port spontaneously:
     ///   - handles with the `bind` cap (one per handle),
-    ///   - kernel-held event routes targeting this port (one per route),
     ///   - vCPU ECs whose `exit_port` references this port (one per vCPU).
     /// `inc → .observed_zero` raises `error.BadCap` so a SlabRef-walking
     /// minter that races a concurrent close aborts the mint instead of
@@ -398,8 +349,8 @@ const EVENT_TYPE_SHIFT: u6 = 44;
 const REPORT_TAG_MAGIC: u64 = 0x8000;
 const REPORT_PRINT_BUDGET: u32 = 4096;
 var report_deliver_prints: u32 = 0;
-const NO_ROUTE_PRINT_BUDGET: u32 = 64;
-var no_route_prints: u32 = 0;
+const UNHANDLED_PRINT_BUDGET: u32 = 64;
+var unhandled_prints: u32 = 0;
 
 // ── External API ─────────────────────────────────────────────────────
 
@@ -1031,7 +982,7 @@ fn recvInner(
     }
 
     // No sender ready. Spec §[recv] test 04: if the port has no
-    // bind-cap holders, no event_routes targeting it, and no queued
+    // bind-cap holders, no vCPU exit-port pins, and no queued
     // events, return E_CLOSED rather than blocking forever. Routes
     // and vCPU exit_ports also contribute to `bind_refcount`, so this
     // single check covers the full "no future events possible" set.
@@ -1504,346 +1455,20 @@ fn deliverReplyTransferResume(
     execution_context.resumeFromReply(sender, sender.originating_write_cap);
 }
 
-/// Install `port_ref` as `ec.event_routes[slot_idx]`, replacing any
-/// prior binding. Caller has already locked `ec` and validated caps.
-/// This function acquires any involved Port locks itself so cross-port
-/// rebinds can use one global order instead of inheriting the caller's
-/// new-port-first order. The new port's increment runs BEFORE the prior
-/// port's decrement so the rebind is observably monotonic to event
-/// firing.
-pub fn installEventRoute(ec: *ExecutionContext, port_ref: SlabRef(Port), slot_idx: u8) i64 {
-    const prior_ref_opt = ec.event_routes[slot_idx];
-    if (prior_ref_opt) |prior_ref| {
-        if (prior_ref.eql(port_ref)) {
-            const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-            port_ref.unlockIrqRestore(lr.irq_state);
-            return 0;
-        }
-    }
-
-    const prior_ref = prior_ref_opt orelse {
-        const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-        return installEventRouteNewOnly(ec, port_ref, lr.ptr, lr.irq_state, slot_idx);
-    };
-
-    if (prior_ref.ptr == port_ref.ptr) {
-        const lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-        return installEventRouteNewOnly(ec, port_ref, lr.ptr, lr.irq_state, slot_idx);
-    }
-
-    // caller-pinned: address-order compare only. Neither route slot is
-    // dereferenced through these raw pointers; each object is accessed
-    // only after the matching SlabRef gen-lock acquire below succeeds.
-    const prior_first = @intFromPtr(prior_ref.ptr) < @intFromPtr(port_ref.ptr);
-    if (prior_first) {
-        const prior_lr = prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch {
-            const new_lr = port_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-            return installEventRouteNewOnly(ec, port_ref, new_lr.ptr, new_lr.irq_state, slot_idx);
-        };
-        const new_lr = port_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch {
-            prior_ref.unlockIrqRestore(prior_lr.irq_state);
-            return errors.E_BADCAP;
-        };
-        return installEventRouteBothLocked(
-            ec,
-            port_ref,
-            new_lr.ptr,
-            new_lr.irq_state,
-            prior_ref,
-            prior_lr.ptr,
-            prior_lr.irq_state,
-            slot_idx,
-            true,
-        );
-    }
-
-    const new_lr = port_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch return errors.E_BADCAP;
-    const prior_lr_opt = prior_ref.lockOrderedIrqSave(PORT_REROUTE_GROUP, @src()) catch null;
-    if (prior_lr_opt) |prior_lr| {
-        return installEventRouteBothLocked(
-            ec,
-            port_ref,
-            new_lr.ptr,
-            new_lr.irq_state,
-            prior_ref,
-            prior_lr.ptr,
-            prior_lr.irq_state,
-            slot_idx,
-            false,
-        );
-    }
-    return installEventRouteNewOnly(ec, port_ref, new_lr.ptr, new_lr.irq_state, slot_idx);
-}
-
-fn installEventRouteNewOnly(
-    ec: *ExecutionContext,
-    port_ref: SlabRef(Port),
-    port_ptr: *Port,
-    irq_state: u64,
-    slot_idx: u8,
-) i64 {
-    incBindRef(port_ptr) catch {
-        logRouteDiag(
-            "install_inc_bind_ref",
-            ec,
-            .memory_fault,
-            slot_idx,
-            0,
-            port_ref.gen,
-            port_ptr._gen_lock.word.load(.monotonic),
-            @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire),
-            errors.E_BADCAP,
-        );
-        port_ref.unlockIrqRestore(irq_state);
-        return errors.E_BADCAP;
-    };
-    ec.event_routes[slot_idx] = port_ref;
-    port_ref.unlockIrqRestore(irq_state);
-    return 0;
-}
-
-fn installEventRouteBothLocked(
-    ec: *ExecutionContext,
-    port_ref: SlabRef(Port),
-    port_ptr: *Port,
-    port_irq_state: u64,
-    prior_ref: SlabRef(Port),
-    prior_ptr: *Port,
-    prior_irq_state: u64,
-    slot_idx: u8,
-    prior_first: bool,
-) i64 {
-    incBindRef(port_ptr) catch {
-        logRouteDiag(
-            "install_inc_bind_ref",
-            ec,
-            .memory_fault,
-            slot_idx,
-            0,
-            port_ref.gen,
-            port_ptr._gen_lock.word.load(.monotonic),
-            @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire),
-            errors.E_BADCAP,
-        );
-        unlockEventRouteBoth(port_ref, port_irq_state, prior_ref, prior_irq_state, prior_first);
-        return errors.E_BADCAP;
-    };
-    decBindRef(prior_ptr);
-    ec.event_routes[slot_idx] = port_ref;
-    unlockEventRouteBoth(port_ref, port_irq_state, prior_ref, prior_irq_state, prior_first);
-    return 0;
-}
-
-fn unlockEventRouteBoth(
-    port_ref: SlabRef(Port),
-    port_irq_state: u64,
-    prior_ref: SlabRef(Port),
-    prior_irq_state: u64,
-    prior_first: bool,
-) void {
-    if (prior_first) {
-        port_ref.unlockIrqRestore(port_irq_state);
-        prior_ref.unlockIrqRestore(prior_irq_state);
-    } else {
-        prior_ref.unlockIrqRestore(prior_irq_state);
-        port_ref.unlockIrqRestore(port_irq_state);
-    }
-}
-
-/// `Port._gen_lock` ordered_group used when `installEventRoute`
-/// acquires two distinct route destination ports. The function orders
-/// by slab-slot address before acquiring either lock, so two ECs
-/// swapping A→B and B→A both take the same A-then-B order.
-const PORT_REROUTE_GROUP: u32 = 0x504F; // "PO"
-
-/// Remove the binding at `ec.event_routes[slot_idx]`. Caller has already
-/// locked `ec` and validated `unbind` cap and that the slot is non-null.
-/// Decrements the bound port's `bind_refcount` under its `_gen_lock`,
-/// triggering `propagateClosedToReceivers` if the port now has no
-/// remaining bind-side holders.
-pub fn removeEventRoute(ec: *ExecutionContext, slot_idx: u8) i64 {
-    const prior_ref = ec.event_routes[slot_idx] orelse return errors.E_NOENT;
-    const prior_lr = prior_ref.lockIrqSave(@src()) catch {
-        ec.event_routes[slot_idx] = null;
-        return 0;
-    };
-    decBindRef(prior_lr.ptr);
-    prior_ref.unlockIrqRestore(prior_lr.irq_state);
-    ec.event_routes[slot_idx] = null;
-    return 0;
-}
-
-// ── Kernel-internal event firing (called from arch fault paths) ──
-
-/// Common dispatch for `fire*`. Looks up `ec.event_routes[event_type]`;
-/// if bound, suspends `ec` on the port. Returns true iff the suspend was
-/// performed; false leaves the caller to apply the no-route fallback.
-/// Why `fireRouted` declined to deliver an event. The no-route
-/// fallbacks are drastic — `fireMemoryFault` destroys the whole
-/// capability domain, `fireThreadFault` parks the EC as `.exited` — and
-/// three unrelated conditions funnel into them through a single
-/// `return false`. stygia-ojs was unattributable for exactly that
-/// reason: a bound route whose port slot had been recycled was
-/// indistinguishable from a domain that never bound one.
-pub const NoRouteReason = enum(u8) {
-    /// The event type maps to no route slot at all.
-    no_slot,
-    /// `ec.event_routes[slot]` is null — nothing ever bound, or a
-    /// `removeEventRoute` cleared it before the fault fired.
-    unbound,
-    /// A route WAS bound, but the Port it names now carries a different
-    /// slab generation: the Port was freed (and possibly recycled)
-    /// between `bind_event_route` and the fault.
-    port_stale,
-    /// A route and live Port existed, but the EC could not be suspended
-    /// onto it. This is a lifecycle rejection, not a missing binding.
-    suspend_failed,
-};
-
-pub const NoRouteInfo = struct {
-    reason: NoRouteReason = .no_slot,
-    /// Generation the route recorded at bind time (`port_stale` only).
-    expected_gen: u64 = 0,
-    /// The Port gen-lock word as observed at fault time (`port_stale`
-    /// only). Bit 0 is the lock bit; `word >> 1` is the live gen.
-    current_word: u64 = 0,
-    /// Return code from `suspendOnPort` (`suspend_failed` only).
-    suspend_rc: i64 = 0,
-    /// Faulting EC lifecycle state observed after `suspendOnPort`.
-    ec_state: lifecycle.State = .retired,
-    /// Faulting EC wait kind observed after `suspendOnPort`.
-    wait_kind: lifecycle.WaitKind = .none,
-};
-
-fn fireRouted(
-    ec: *ExecutionContext,
-    event: EventType,
-    subcode: u8,
-    addr: u64,
-    info: *NoRouteInfo,
-) bool {
-    const slot_idx = execution_context.eventRouteSlot(event) orelse {
-        info.* = .{ .reason = .no_slot };
-        logRouteDiag("no_slot", ec, event, subcode, addr, 0, 0, 0, errors.E_NOENT);
-        return false;
-    };
-    // Snapshot `ec.event_routes[slot_idx]` under `ec._gen_lock` — the
-    // optional `SlabRef(Port)` is two words (ptr + gen) and an in-flight
-    // `installEventRoute`/`removeEventRoute` writer (see lines 967/989)
-    // can be torn-read by this fault-context observer otherwise. Match
-    // the wake/install pattern that uses `ec._gen_lock` as the route-
-    // table mutator's exclusion. Note: this fault path runs on the
-    // EC's own core, but cross-core rebind is allowed and is the race
-    // we're plugging.
-    const ec_irq = ec._gen_lock.lockIrqSave(@src());
-    const route_ref_opt = ec.event_routes[slot_idx];
-    ec._gen_lock.unlockIrqRestore(ec_irq);
-    const route_ref = route_ref_opt orelse {
-        info.* = .{ .reason = .unbound };
-        logRouteDiag("unbound", ec, event, subcode, addr, 0, 0, 0, errors.E_NOENT);
-        return false;
-    };
-    const route_lr = route_ref.lockIrqSave(@src()) catch {
-        info.* = .{
-            .reason = .port_stale,
-            .expected_gen = route_ref.gen,
-            .current_word = 0,
-        };
-        logRouteDiag("port_stale", ec, event, subcode, addr, route_ref.gen, 0, 0, errors.E_BADCAP);
-        return false;
-    };
-    const port_ptr = route_lr.ptr;
-    // `suspendOnPort` is responsible for releasing `port_ptr._gen_lock`
-    // (it must drop Port before any receiver-CD acquisition to honor the
-    // canonical CD → Port order). We must NOT also `defer route_ref.unlockIrqRestore(...)`.
-
-    // A route whose port has lost every bind-cap holder AND has no other
-    // routes pointing at it survives only on the route's own increment.
-    // Receivers are still allowed to dequeue from such a port, so honor
-    // the route here — the EC will sit suspended until either a recv
-    // arrives or the route itself is cleared.
-    // The originating EC handle here is the one that called
-    // `bind_event_route` (Spec §[reply] originating-handle table). Its
-    // write-cap snapshot is not yet plumbed through to this path; until
-    // event_route bookkeeping records that snapshot at bind time the
-    // safe default is to discard receiver mutations on reply (§[reply]
-    // test 06's no-write-cap branch). The fault-firing site has read
-    // access to the EC's full saved frame so default `read=true` —
-    // §[suspend] test 10 only zeroes the payload when the originating
-    // handle explicitly lacks `read`, which the bind_event_route path
-    // would record once plumbed through.
-    const port_word_before = port_ptr._gen_lock.word.load(.monotonic);
-    const bind_raw_before = @atomicLoad(i32, &port_ptr.bind_refcount.raw, .acquire);
-    logRouteDiag("route_locked", ec, event, subcode, addr, route_ref.gen, port_word_before, bind_raw_before, 0);
-    const suspend_rc = execution_context.suspendOnPort(ec, port_ptr, event, subcode, addr, false, true, route_lr.irq_state);
-    logRouteDiag("suspend_result", ec, event, subcode, addr, route_ref.gen, port_word_before, bind_raw_before, suspend_rc);
-    if (suspend_rc != 0) {
-        info.* = .{
-            .reason = .suspend_failed,
-            .expected_gen = route_ref.gen,
-            .current_word = port_word_before,
-            .suspend_rc = suspend_rc,
-            .ec_state = lifecycle.load(ec),
-            .wait_kind = ec.wait.kind,
-        };
-        return false;
-    }
-    return true;
-}
-
-/// Fire a memory_fault event for `ec`. Looks up `ec.event_routes[0]`;
-/// if bound, suspends `ec` on the port; else applies the no-route
-/// fallback per Spec §[event_route]:3247: "the EC's capability domain
-/// is restarted if its self-handle has the `restart` cap (per
-/// §[restart_semantics]); otherwise the capability domain is destroyed".
-///
-/// Restart engine is not yet wired in this kernel. We honor the destroy
-/// arm here: drive the standard SLOT_SELF-style teardown by parking the
-/// calling EC, then queueing phase1 + phase2 of `destroyCapabilityDomain`.
-/// Without this — when this path used to just `parkSelfFaulted` — a
-/// faulting child stayed parked but its domain leaked, and any peer EC in
-/// the same domain kept running over a half-broken address space until the
-/// test runner timed out.
-///
-/// Lock discipline: phase1 acquires the CD `_gen_lock`. The in-tree
-/// fault paths reach this fallback with the CD lock already dropped (see
-/// fault.zig: the user-fault arm `defer`s the unlock before
-/// `fireMemoryFault`; the catch arm runs without taking the lock at all).
-/// `tree_mutex` is also untaken on these paths. If a
-/// future caller arrives with the CD lock held, `lockIrqSave` would
-/// dead-spin — hence the explicit lock-state contract documented on
-/// each call site under fault.zig / arch/*/exceptions.zig.
-/// Announce that `ec` took a fault with no event route bound, and is
-/// therefore about to be parked (`parkSelfFaulted`) or have its domain
-/// torn down. Both fallbacks were previously SILENT, which made this the
-/// hardest possible failure to diagnose: `parkSelfFaulted` sets
-/// `state = .exited`, clears `on_cpu` and drops the EC from
-/// `current_ec`, so an EC that dies here leaves behind exactly the same
-/// corpse as one that exited normally, and any result it owed its
-/// caller simply never arrives.
-///
-/// That is precisely how stygia-ojs presented: a test EC vanished
-/// mid-run, the harness reported "MISS <test> (no result delivered)",
-/// and the post-mortem state was indistinguishable from a clean exit.
-/// Printing here costs nothing on a healthy system — a no-route fault
-/// means an EC is dying unannounced, which is never routine — and turns
-/// a silent disappearance into an attributable event.
-///
-/// Uses the raw lock-free writer: this runs on the fault path, which may
-/// hold locks the normal printer takes.
-fn reportNoRouteFault(
+/// Report an unhandled user fault before tearing down its domain.
+/// The fault path may hold locks, so use the raw printer.
+fn reportUnhandledFault(
     ec: *ExecutionContext,
     kind: []const u8,
     terminal_reason: []const u8,
     subcode: u8,
     payload: u64,
-    info: NoRouteInfo,
 ) void {
     execution_context.printPreReportTerminal(ec, null, terminal_reason);
-    const n = @atomicRmw(u32, &no_route_prints, .Add, 1, .monotonic);
-    if (n >= NO_ROUTE_PRINT_BUDGET) return;
+    const n = @atomicRmw(u32, &unhandled_prints, .Add, 1, .monotonic);
+    if (n >= UNHANDLED_PRINT_BUDGET) return;
 
-    arch.boot.printRaw("[NOROUTE] ");
+    arch.boot.printRaw("[UNHANDLED] ");
     arch.boot.printRaw(kind);
     arch.boot.printRaw(" ec=0x");
     printHex64(@intFromPtr(ec));
@@ -1856,110 +1481,7 @@ fn reportNoRouteFault(
         arch.boot.printRaw(" tag=0x");
         printHex64(maybe_tag);
     }
-    // Which of the three no-route conditions fired. `port_stale` means
-    // the domain DID bind a route and the kernel dropped the event
-    // anyway — a kernel bug, not a userspace omission.
-    arch.boot.printRaw(" why=");
-    arch.boot.printRaw(switch (info.reason) {
-        .no_slot => "no_slot",
-        .unbound => "unbound",
-        .port_stale => "port_stale",
-        .suspend_failed => "suspend_failed",
-    });
-    if (info.reason == .port_stale) {
-        arch.boot.printRaw(" bound_gen=");
-        printHex64(info.expected_gen);
-        arch.boot.printRaw(" port_word=0x");
-        printHex64(info.current_word);
-        arch.boot.printRaw(" (live_gen=");
-        printHex64(info.current_word >> 1);
-        arch.boot.printRaw(")");
-    }
-    if (info.reason == .suspend_failed) {
-        arch.boot.printRaw(" suspend_rc=");
-        printHex64(@bitCast(info.suspend_rc));
-        arch.boot.printRaw(" bound_gen=");
-        printHex64(info.expected_gen);
-        arch.boot.printRaw(" port_word=0x");
-        printHex64(info.current_word);
-        arch.boot.printRaw(" ec_state=");
-        printHex64(@intFromEnum(info.ec_state));
-        arch.boot.printRaw(" wait=");
-        printHex64(@intFromEnum(info.wait_kind));
-    }
     arch.boot.printRaw(" -- EC parked, result (if any) will never be delivered\n");
-
-    // TEMP DIAGNOSTIC (stygia-idc, REMOVE). The bare-metal cap is a
-    // single recurring no-route memory_fault (`subcode=0 payload=0x10`,
-    // test `idc_read_07`, three occurrences across two independent
-    // N=100 runs on two different builds). Nothing in the line above
-    // says WHICH user instruction faulted, so the entire diagnosis so
-    // far has been inference from the address. Print the faulting EC's
-    // saved user frame: `pc-entry` is the byte offset into the test's
-    // own PIE image (entry_point is `e_entry + elf_slide`), which
-    // identifies the instruction exactly against
-    // `llvm-objdump -d tests/suite/bin/<case>.elf`, and the GPR dump
-    // names the register that carried the bad address.
-    arch.boot.printRaw("[nrdbg] entry=0x");
-    printHex64(ec.entry_point.addr);
-    arch.boot.printRaw(" pc=0x");
-    printHex64(arch_syscall.getEventRip(ec.ctx));
-    arch.boot.printRaw(" pc-entry=0x");
-    printHex64(arch_syscall.getEventRip(ec.ctx) -% ec.entry_point.addr);
-    arch.boot.printRaw("\n");
-    arch.cpu.dumpFaultRegs(ec.ctx);
-
-    // TEMP DIAGNOSTIC (stygia-idc, REMOVE). The frame above is `ec.ctx`,
-    // which is assigned ONCE at EC creation and thereafter merely
-    // ASSUMED to be where the next exception entry parks its frame
-    // (`kstack.top - 288`). Cycle 4's dump of it was internally
-    // inconsistent, so print the LIVE fault context the arch handler was
-    // actually handed. `live_ctx` differing from `ec.ctx` refutes every
-    // inference cycles 3 and 4 drew from that dump; `live_rip` is the
-    // real faulting instruction.
-    const dbg_core: u8 = @truncate(arch.smp.coreID());
-    const st = stygia.memory.fault.dbg_fault[
-        if (dbg_core < stygia.memory.fault.dbg_fault.len) dbg_core else 0
-    ];
-    arch.boot.printRaw("[nrdbg2] core=");
-    printHex64(dbg_core);
-    arch.boot.printRaw(" valid=");
-    printHex64(@intFromBool(st.valid));
-    arch.boot.printRaw(" site=");
-    printHex64(st.site);
-    arch.boot.printRaw(" kpriv=");
-    printHex64(@intFromBool(st.kpriv));
-    arch.boot.printRaw(" w=");
-    printHex64(@intFromBool(st.is_write));
-    arch.boot.printRaw(" x=");
-    printHex64(@intFromBool(st.is_exec));
-    arch.boot.printRaw(" far=0x");
-    printHex64(st.far);
-    arch.boot.printRaw(" live_rip=0x");
-    printHex64(st.rip);
-    arch.boot.printRaw(" live_rip-entry=0x");
-    printHex64(st.rip -% ec.entry_point.addr);
-    arch.boot.printRaw("\n[nrdbg2] live_ctx=0x");
-    printHex64(@intFromPtr(st.live_ctx));
-    arch.boot.printRaw(" ec_ctx=0x");
-    printHex64(@intFromPtr(ec.ctx));
-    arch.boot.printRaw(" kstack=0x");
-    printHex64(ec.kernel_stack.base.addr);
-    arch.boot.printRaw("..0x");
-    printHex64(ec.kernel_stack.top.addr);
-    arch.boot.printRaw(" state=");
-    printHex64(@intFromEnum(lifecycle.load(ec)));
-    arch.boot.printRaw(" owner=");
-    printHex64(ec.owner_core);
-    arch.boot.printRaw(" wait=");
-    printHex64(@intFromEnum(ec.wait.kind));
-    arch.boot.printRaw("\n");
-    if (st.live_ctx) |lc| {
-        if (@intFromPtr(lc) != @intFromPtr(ec.ctx)) {
-            arch.boot.printRaw("[nrdbg2] LIVE FRAME (differs from ec.ctx):\n");
-            arch.cpu.dumpFaultRegs(lc);
-        }
-    }
 }
 
 fn printHex64(n: u64) void {
@@ -1999,35 +1521,25 @@ fn queueFaultDomainTeardown(ec: *ExecutionContext, kind: scheduler.TeardownKind)
 }
 
 pub fn fireMemoryFault(ec: *ExecutionContext, subcode: u8, fault_addr: u64) void {
-    var info: NoRouteInfo = .{};
-    if (fireRouted(ec, .memory_fault, subcode, fault_addr, &info)) return;
-    reportNoRouteFault(ec, "memory_fault", "no_route_memory_fault", subcode, fault_addr, info);
+    reportUnhandledFault(ec, "memory_fault", "unhandled_memory_fault", subcode, fault_addr);
 
-    queueFaultDomainTeardown(ec, .no_route_fault);
+    queueFaultDomainTeardown(ec, .unhandled_fault);
 }
 
-/// Fire a thread_fault event. Fallback on no route: park the EC so the
-/// same fault doesn't loop forever.
+/// An unhandled thread fault tears down the execution context's domain.
 pub fn fireThreadFault(ec: *ExecutionContext, subcode: u8, payload: u64) void {
-    var info: NoRouteInfo = .{};
-    if (fireRouted(ec, .thread_fault, subcode, payload, &info)) return;
-    reportNoRouteFault(ec, "thread_fault", "no_route_thread_fault", subcode, payload, info);
-    queueFaultDomainTeardown(ec, .no_route_fault);
+    reportUnhandledFault(ec, "thread_fault", "unhandled_thread_fault", subcode, payload);
+    queueFaultDomainTeardown(ec, .unhandled_fault);
 }
 
-/// Fire a breakpoint event. Fallback: drop, advance past trap, resume.
+/// A breakpoint trap has no userspace route. The architecture owns trap advancement.
 pub fn fireBreakpoint(ec: *ExecutionContext, subcode: u8) void {
-    var info: NoRouteInfo = .{};
-    if (fireRouted(ec, .breakpoint, subcode, 0, &info)) return;
-    // No-route fallback: drop the event and let `ec` resume. The
-    // arch-specific helper that advances past the trap instruction
-    // lives in arch.dispatch.cpu — until that one-byte INT3 advance is
-    // wired through dispatch, leave the EC at the trapping RIP and
-    // rely on the arch entry path to continue.
+    _ = ec;
+    _ = subcode;
 }
 
-/// Fire a vm_exit event for a vCPU EC. Routes to `ec.exit_port`
-/// directly (not through `event_routes`). Spec §[vm_exit_state].
+/// Fire a vm_exit event for a vCPU EC through its exit_port.
+/// Spec §[vm_exit_state].
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
     const exit_port_ref = ec.exit_port orelse return;
     const exit_lr = exit_port_ref.lockIrqSave(@src()) catch return;
@@ -2076,12 +1588,8 @@ fn destroyPort(p: *Port) void {
 /// Returns the snapshot head; caller must invoke `finalizePendingVcpus`
 /// on it AFTER `p._gen_lock` has been released.
 ///
-/// Lock-order rationale: `destroyExecutionContextLocked` walks
-/// `ec.event_routes` and locks each non-null route's destination port.
-/// If any vCPU has an `event_routes[i]` slot pointing back at `p`, doing
-/// the destroy walk under `p._gen_lock` self-deadlocks. Even routes that
-/// don't loop back create lock-order inversions vs. paths that go
-/// EC-lock-first. Detach under the lock; finalize after release.
+/// Detach under the port lock and finalize after release so teardown
+/// never recursively locks this port while unlinking a vCPU.
 fn cascadeDetachVcpus(p: *Port) ?SlabRef(ExecutionContext) {
     var head: ?SlabRef(ExecutionContext) = null;
     var cur = p.vcpu_list_head;
@@ -2154,7 +1662,7 @@ pub fn incBindRef(p: *Port) error{BadCap}!void {
 }
 
 /// Drop one bind-side reference. On `observed_zero` (last bind holder
-/// gone, no routes targeting the port, no vCPU `exit_port` pin), wake
+/// gone, no vCPU `exit_port` pin), wake
 /// any blocked receivers with E_CLOSED but DO NOT destroy the slab —
 /// the recv-cap holder is still authorized to call `recv` and observe
 /// E_CLOSED until they release. Slab teardown is gated solely on
@@ -2599,18 +2107,17 @@ fn deliverEvent(
     // projection.
     arch.syscall.setSyscallReturn(target_ctx, @bitCast(errors.OK));
     // Surface `subcode` in vreg 2 for events that carry an event-
-    // specific sub-code (memory_fault, thread_fault, breakpoint,
-    // vm_exit). The firing-site sub-code overlays the
+    // specific sub-code (vm_exit). The firing-site sub-code overlays the
     // GPR projection's vreg 2 slot — §[create_vcpu] test 12 requires
     // the synthetic initial vm_exit to surface the initial-state
     // sentinel even though the sender's GPR snapshot is all zero.
     // For `suspension` the spec leaves `subcode` 0, so we leave the
     // snapshot's rbx (the suspending EC's value) untouched.
     switch (event_type) {
-        .memory_fault, .thread_fault, .breakpoint, .vm_exit => {
+        .vm_exit => {
             arch.syscall.setEventSubcode(target_ctx, subcode);
         },
-        .none, .suspension => {},
+        else => {},
     }
 
     // Spec §[vm_exit_state]: project the vCPU's full guest state
@@ -2830,7 +2337,7 @@ fn consumeReply(
         arch.syscall.copyEventStateGprs(sender_frame, receiver_frame);
     }
     // Spec §[vm_exit_state] reply writeback only for vm_exit-typed
-    // replies. Non-vm_exit reply paths (`suspension`, fault events)
+    // replies. Non-vm_exit reply paths (`suspension`)
     // never carry a vCPU sender, so `applyReplyStateToVcpu` would also
     // no-op via `archStateOf == null`, but skipping the call entirely
     // is the explicit type-driven gate.

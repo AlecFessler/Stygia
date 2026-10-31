@@ -86,7 +86,7 @@ pub fn print(comptime format: []const u8, args: anytype) void {
     // dying and only the panic owner may write to the wire. Continuing
     // here interleaved this printer's output INTO the panic report at
     // UART-FIFO granularity — every multi-core corpse from the rig had
-    // its first report line shredded by a concurrent [NOROUTE] print.
+    // its first report line shredded by a concurrent [UNHANDLED] print.
     // Halting a non-owner core that is merely trying to print is
     // strictly better than destroying the evidence.
     if (stygia.panic.claimedByOtherCore()) stygia.arch.aarch64.cpu.halt();

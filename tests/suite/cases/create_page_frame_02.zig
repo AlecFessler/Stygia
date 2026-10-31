@@ -5,7 +5,7 @@
 //
 // Faithful test rationale (and why this is a degraded smoke variant)
 //   The runner (tests/suite/runner/primary.zig) mints every spec-test
-//   domain with `ceilings_inner = 0x001C_011F_3F01_FFFF`. Bits 32-39
+//   domain with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 32-39
 //   of that word are the `pf_ceiling` byte, which carries the value
 //   0x1F: bits 0-2 = max_rwx (r|w|x all permitted), bits 3-4 = max_sz
 //   (= 3). See §[capability_domain] field0 and §[create_capability_domain]

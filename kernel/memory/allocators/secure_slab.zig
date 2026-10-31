@@ -410,7 +410,7 @@ pub fn SecureSlab(
         /// Two concrete async chains, both established from the IR call
         /// graph rather than by inspection:
         ///
-        ///   → `fireRouted` → `suspendOnPort` → `rendezvousWithReceiver`
+        ///   → `fireVmExit` → `suspendOnPort` → `rendezvousWithReceiver`
         ///   → `deliverEvent` → `sched.timer.decHandleRef` →
         ///   `decHandleRefLocked` → `destroyTimer` → `destroy` →
         ///   `destroyLockedInner`

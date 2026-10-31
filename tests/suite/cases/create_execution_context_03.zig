@@ -8,9 +8,7 @@
 //   field — see §[capability_domain]). The kernel's create_ec inner
 //   subset check reads those 8 bits and compares against caps[0..7];
 //   EcCap bits 8-9 (`restart_policy`) are governed by
-//   restart_policy_ceiling, and bits 10-12 (`bind`/`rebind`/`unbind`)
-//   carry their own runtime gates in bind_event_route — none of them
-//   is constrained by ec_inner_ceiling at create_ec time. Exercising
+//   restart_policy_ceiling, while bits 10-15 are reserved. Exercising
 //   the test 03 reject path therefore requires a domain whose
 //   ec_inner_ceiling drops at least one of bits 0-7.
 //
@@ -132,14 +130,14 @@ pub fn main(cap_table_base: u64) void {
     // [2] ceilings_inner:
     //   bits  0-7   ec_inner_ceiling   = 0x7F (bit 7 cleared)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
-    //   bits 24-31  cridc_ceiling      = 0x3F  (matches runner)
+    //   bits 24-31  cridc_ceiling      = 0x27  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
     //   bits 48-55  port_ceiling       = 0x5C  (matches runner)
     const ceilings_inner: u64 =
         @as(u64, 0x7F) |
         (@as(u64, 0x01FF) << 8) |
-        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x27) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x5C) << 48);

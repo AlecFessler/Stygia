@@ -5,7 +5,7 @@
 //
 // Faithful test rationale (and why this is a degraded smoke variant)
 //   The runner (tests/suite/runner/primary.zig) mints every spec-test
-//   domain with `ceilings_inner = 0x001C_011F_3F01_FFFF`. Bits 56-63
+//   domain with `ceilings_inner = 0x001C_011F_2701_FFFF`. Bits 56-63
 //   of that word are the `port_ceiling` byte, which carries the value
 //   0x1C: bits 2-4 = `xfer | recv | bind` per §[capability_domain]
 //   field0 (port_ceiling at bits 56-63 with `xfer` at field-bit 2,

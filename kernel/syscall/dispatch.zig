@@ -15,7 +15,6 @@ const build_options = @import("build_options");
 const capability = stygia.syscall.capability;
 const capability_domain = stygia.syscall.capability_domain;
 const errors = stygia.syscall.errors;
-const event_route = stygia.syscall.event_route;
 const execution_context = stygia.syscall.execution_context;
 const futex = stygia.syscall.futex;
 const page_frame = stygia.syscall.page_frame;
@@ -33,8 +32,6 @@ pub const SyscallNum = enum(u64) {
     revoke = 17,
     sync = 18,
     create_capability_domain = 19,
-    acquire_ecs = 20,
-    acquire_vmars = 21,
     create_execution_context = 22,
     self = 23,
     terminate = 24,
@@ -47,8 +44,6 @@ pub const SyscallNum = enum(u64) {
     unmap = 35,
     remap = 36,
     snapshot = 37,
-    idc_read = 38,
-    idc_write = 39,
     create_page_frame = 40,
     ack = 41,
     create_virtual_machine = 42,
@@ -59,8 +54,6 @@ pub const SyscallNum = enum(u64) {
     vm_inject_irq = 47,
     create_port = 48,
     recv = 49,
-    bind_event_route = 50,
-    clear_event_route = 51,
     reply = 52,
     timer_arm = 54,
     timer_rearm = 55,
@@ -105,8 +98,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .delete,
         .revoke,
         .sync,
-        .acquire_ecs,
-        .acquire_vmars,
         .self,
         .terminate,
         .yield,
@@ -117,7 +108,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .map_mmio,
         .remap,
         .snapshot,
-        .idc_read,
         .create_page_frame,
         .ack,
         .create_virtual_machine,
@@ -125,8 +115,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .vm_inject_irq,
         .create_port,
         .recv,
-        .bind_event_route,
-        .clear_event_route,
         .timer_arm,
         .timer_rearm,
         .timer_cancel,
@@ -148,10 +136,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         // unmap, unmap_guest: singleton entries. vreg 1 = handle,
         // vregs 2..1+N = entries.
         .unmap, .unmap_guest => @intCast(@min(1 + n_reg, 127)),
-
-        // idc_write: vreg 1 = vmar, vreg 2 = offset, vregs 3..2+count
-        // = qwords.
-        .idc_write => @intCast(@min(2 + n_reg, 127)),
 
         // vm_set_policy: bit 12 = kind, bits 13-20 = count. Per-arch
         // entry width — surface the full upper window.
@@ -233,9 +217,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 4),
             if (args.len > 5) args[5..] else &.{},
         ),
-        .acquire_ecs => capability_domain.acquireEcs(caller, arg(args, 0)),
-        .acquire_vmars => capability_domain.acquireVmars(caller, arg(args, 0)),
-
         .create_execution_context => execution_context.createExecutionContext(
             caller,
             arg(args, 0),
@@ -290,40 +271,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         },
         .remap => vmar.remap(caller, arg(args, 0), arg(args, 1)),
         .snapshot => vmar.snapshot(caller, arg(args, 0), arg(args, 1)),
-        .idc_read => blk: {
-            // Spec §[var].idc_read: syscall word bits 12-19 carry count
-            // (number of qwords, max 125). Args carry only [1] var and
-            // [2] offset — vreg 3 onwards holds the *return* qwords, so
-            // sourcing count from `arg(args, 2)` would read whatever the
-            // caller left in rdx (typically 0) and trip the count-zero
-            // guard before the BADCAP / alignment / size checks ever
-            // run, breaking [test 01] / [test 02] / [test 07] / [test 08].
-            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            break :blk vmar.idcRead(
-                caller,
-                arg(args, 0),
-                arg(args, 1),
-                n,
-            );
-        },
-        .idc_write => blk: {
-            // Spec §[var].idc_write: syscall word bits 12-19 carry count
-            // (number of qwords, max 125). Qwords occupy vregs 3..2+count
-            // — args[2..2+count]. The handler needs the *raw* count
-            // (before slice truncation) so it can return E_INVAL for
-            // count > 125 even though the args slice tops out at 13
-            // entries (test 04 boundary).
-            const n: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            const end_idx: usize = @min(2 + @as(usize, n), args.len);
-            break :blk vmar.idcWrite(
-                caller,
-                arg(args, 0),
-                arg(args, 1),
-                n,
-                if (end_idx > 2) args[2..end_idx] else &.{},
-            );
-        },
-
         .create_page_frame => page_frame.createPageFrame(
             caller,
             arg(args, 0),
@@ -343,14 +290,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             break :blk port.@"suspend"(caller, arg(args, 0), arg(args, 1), pair_count);
         },
         .recv => port.recv(caller, arg(args, 0), arg(args, 1)),
-
-        .bind_event_route => event_route.bindEventRoute(
-            caller,
-            arg(args, 0),
-            arg(args, 1),
-            arg(args, 2),
-        ),
-        .clear_event_route => event_route.clearEventRoute(caller, arg(args, 0), arg(args, 1)),
 
         .reply => reply.reply(caller, syscall_word, args),
 

@@ -287,7 +287,7 @@ pub fn createKernel() !Stack {
 /// time those two slots held two DIFFERENT foreign values (`0xfff` and
 /// `0x3296000`) and the saved return address at `[rbp+8]` had become
 /// `0x7ea98000`. The wild `0xfff` became the
-/// `[NOROUTE] memory_fault subcode=2 payload=0xfff` that then wedged the
+/// `[UNHANDLED] memory_fault subcode=2 payload=0xfff` that then wedged the
 /// whole suite.
 ///
 /// The reclaim is DEFERRED, not waited on. This function is reachable
@@ -366,4 +366,3 @@ pub fn destroyKernel(stack: Stack) void {
         recycleSlot(stack.slot);
     }
 }
-

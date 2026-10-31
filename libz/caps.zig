@@ -145,8 +145,7 @@ pub const IdcCap = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     crec: bool = false,
-    aqec: bool = false,
-    aqvr: bool = false,
+    _reserved_3_4: u2 = 0,
     restart_policy: bool = false,
     _reserved: u10 = 0,
 
@@ -166,10 +165,7 @@ pub const EcCap = packed struct(u16) {
     read: bool = false,
     write: bool = false,
     restart_policy: u2 = 0,
-    bind: bool = false,
-    rebind: bool = false,
-    unbind: bool = false,
-    _reserved: u3 = 0,
+    _reserved: u6 = 0,
 
     pub fn toU16(self: EcCap) u16 {
         return @bitCast(self);

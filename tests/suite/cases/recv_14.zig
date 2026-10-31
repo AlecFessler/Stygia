@@ -13,15 +13,14 @@
 //   We mint a fresh port with caps={bind, recv}:
 //     - bind keeps a live bind-cap holder on the port, so the call
 //       does not short-circuit through test 04 (E_CLOSED on no
-//       bind-cap holder + no event_routes + no queued events) before
+//       bind-cap holder + no queued events) before
 //       the kernel can even arm the deadline.
 //     - recv lets this handle pass test 02 (E_PERM without `recv`).
 //   The handle returned by createPort sits in the test domain's table
 //   with reserved bits clean (the libz wrapper truncates to u12), so
 //   tests 01 (E_BADCAP) and 03 (E_INVAL on reserved bits) cannot fire.
 //
-//   The runner does not bind any event_route to this freshly-minted
-//   port and the test EC never queues an event on it, so the only EC
+//   The test EC never queues an event on this freshly-minted port, so the only EC
 //   able to drive a sender event onto the port is none — recv must
 //   block, the deadline must elapse, and the kernel must return
 //   E_TIMEOUT in vreg 1.
@@ -74,7 +73,7 @@ pub fn main(cap_table_base: u64) void {
     const port_handle: u12 = @truncate(cp.v1 & 0xFFF);
 
     // Step 2: recv with a finite, nonzero timeout. No other EC exists
-    // in this domain, no event_route targets the port, and no event
+    // in this domain, no event
     // is ever queued, so the kernel's only spec-defined return is the
     // timeout path: vreg 1 = E_TIMEOUT once the 10ms deadline elapses.
     const timeout_ns: u64 = 10_000_000; // 10 ms

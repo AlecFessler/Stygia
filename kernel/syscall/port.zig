@@ -354,8 +354,7 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
 /// suspended until the reply handle is consumed: `reply` resumes them,
 /// `delete` on the reply handle resolves them with `E_ABANDONED`.
 ///
-/// Returns E_CLOSED if the port has no bind-cap holders, no event_routes
-/// targeting it, and no events queued — the call returns immediately
+/// Returns E_CLOSED if the port has no bind-cap holders and no events queued — the call returns immediately
 /// rather than blocking. If the port becomes terminally closed while a
 /// recv is blocked, the call returns E_CLOSED.
 ///
@@ -365,8 +364,8 @@ fn validatePairEntries(ec: *ExecutionContext, pair_count: u8) ?i64 {
 /// [test 01] returns E_BADCAP if [1] is not a valid port handle.
 /// [test 02] returns E_PERM if [1] does not have the `recv` cap.
 /// [test 03] returns E_INVAL if any reserved bits are set in [1].
-/// [test 04] returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
-/// [test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
+/// [test 04] returns E_CLOSED if the port has no bind-cap holders and no queued events.
+/// [test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no events are queued.
 /// [test 06] returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
 /// [test 07] on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
 /// [test 08] on success, the syscall word's event_type equals the event_type that triggered delivery.

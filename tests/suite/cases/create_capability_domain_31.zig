@@ -15,14 +15,9 @@
 //   to read the authoritative current value. This is the spec's
 //   blessed observation channel for the child's initial-EC affinity.
 //
-//   Cross-domain `acquire_ecs` is not implemented in the kernel as of
-//   this writing — `kernel/caps/capability_domain.zig:acquireEcs`
-//   bails with E_BADCAP on any IDC whose target is a different domain
-//   than the caller's. So the parent cannot reach across the domain
-//   boundary to read the child EC's field1; the assertion has to be
-//   made *inside* the child via its own SLOT_INITIAL_EC handle (slot
-//   1 by §[capability_domain] / §[create_capability_domain] [test
-//   21]).
+//   The parent cannot read the child EC's field1 across the domain
+//   boundary, so the assertion is made inside the child via its own
+//   SLOT_INITIAL_EC handle (slot 1).
 //
 //   Pattern (mirrors create_execution_context_03):
 //     - The runner stages this ELF and passes its page frame at
@@ -133,14 +128,14 @@ pub fn main(cap_table_base: u64) void {
     // §[create_capability_domain] [2] ceilings_inner sub-fields:
     //   bits  0-7   ec_inner_ceiling   = 0x7F (bit 7 cleared)
     //   bits  8-23  vmar_inner_ceiling  = 0x01FF (matches runner)
-    //   bits 24-31  cridc_ceiling      = 0x3F  (matches runner)
+    //   bits 24-31  cridc_ceiling      = 0x27  (matches runner)
     //   bits 32-39  pf_ceiling         = 0x1F  (matches runner)
     //   bits 40-47  vm_ceiling         = 0x01  (matches runner)
     //   bits 48-55  port_ceiling       = 0x5C  (matches runner: xfer|recv|bind|suspend)
     const ceilings_inner: u64 =
         @as(u64, 0x7F) |
         (@as(u64, 0x01FF) << 8) |
-        (@as(u64, 0x3F) << 24) |
+        (@as(u64, 0x27) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
         (@as(u64, 0x5C) << 48);

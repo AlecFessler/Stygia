@@ -66,8 +66,7 @@ pub fn setSyscallVreg4(ctx: *ArchCpuContext, value: u64) void {
 ///            `[ctx.sp_el0 + (idx - 31) * 8]`.
 ///
 /// Used by syscalls that surface a packed array of return values
-/// (e.g. `random`, `idc_read`/`idc_write`,
-/// `acquire_ecs`/`acquire_vmars`, `create_ecs`, `create_vmars`)
+/// (e.g. `random`, `create_ecs`, `create_vmars`)
 /// where the count exceeds the small fixed set covered by the
 /// `setSyscallVreg{2,3,4}` helpers.
 ///

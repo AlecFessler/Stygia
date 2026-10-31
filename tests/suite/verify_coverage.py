@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify 1:1 correspondence between spec-v3 assertions and per-file test stubs.
+"""Verify spec-v3 assertions against test files and explicit coverage gaps.
 
 Spec source: docs/kernel/specv3.md
 Test files:  tests/suite/cases/<section>_<NN>.zig
@@ -23,10 +23,11 @@ Test file naming:
   corresponding file at tests/suite/cases/<section>_<NN>.zig.
 
 Cross-checks (both directions):
-  - Every spec test entry has a matching test file (else: MISSING TEST FILE).
+  - Every spec test entry has a matching test file or an explicit known gap
+    (else: MISSING TEST FILE).
   - Every test file has a matching spec entry (else: ORPHAN TEST FILE).
 
-Exits 0 if everything is in correspondence, 1 otherwise.
+Exits 0 if every assertion is covered or explicitly tracked, 1 otherwise.
 """
 
 import os
@@ -55,6 +56,24 @@ TEST_FILE_RE = re.compile(r"^(?P<section>[A-Za-z][A-Za-z0-9_]*?)_(?P<num>[0-9]+[
 # but are not one-to-one assertions from docs/kernel/specv3.md.
 NON_SPEC_TEST_FILES = {
     "scheduler_balance_01.zig",
+}
+
+# Valid assertions with no faithful test in the current suite. Each requires
+# fixture design in the
+# test-review issue Stygia-o4a.6.4. Keep the spec assertion; reject any
+# unlisted gap or stale entry here.
+KNOWN_MISSING_TESTS = {
+    # Lower target-domain EC ceiling is unavailable in the current fixture.
+    "create_execution_context_04.zig": "lower ec_outer_ceiling fixture",
+    "create_execution_context_05.zig": "lower ec_inner_ceiling fixture",
+    "create_vcpu_02.zig": "lower VM-owner ec_inner_ceiling fixture",
+    # These observations require a runner-side reporting fixture.
+    "map_pf_12.zig": "permission-fault teardown observation fixture",
+    "self_01.zig": "self-handle result reporting fixture",
+    # Port-I/O fault assertions need an issued device_region and a runner
+    # that can observe the child domain's unhandled-fault teardown.
+    **{f"port_io_virtualization_{num:02}.zig": "port-I/O fault fixture"
+       for num in range(6, 12)},
 }
 
 
@@ -191,6 +210,7 @@ def main() -> int:
 
     missing: dict[str, list[str]] = defaultdict(list)   # spec entry, no file
     orphan: dict[str, list[str]] = defaultdict(list)    # file, no spec entry
+    known_missing: dict[str, list[str]] = defaultdict(list)
     unknown_sections: list[str] = []                    # file section absent from spec
 
     spec_section_names = set(spec.keys())
@@ -200,7 +220,11 @@ def main() -> int:
         file_nums = tests.get(section, set())
         for num in tests_in_sec:
             if num not in file_nums:
-                missing[section].append(num)
+                fname = f"{section}_{num}.zig"
+                if fname in KNOWN_MISSING_TESTS:
+                    known_missing[section].append(num)
+                else:
+                    missing[section].append(num)
 
     # Direction 2: every test file has a matching spec entry.
     for section, file_nums in tests.items():
@@ -214,11 +238,16 @@ def main() -> int:
             if num not in spec_nums:
                 orphan[section].append(num)
 
+    # A resolved or removed assertion must not remain hidden by the manifest.
+    active_known = {f"{section}_{num}.zig" for section, nums in known_missing.items() for num in nums}
+    stale_known = sorted(set(KNOWN_MISSING_TESTS) - active_known)
+
     # Report.
     mismatch_count = (
         sum(len(v) for v in missing.values())
         + sum(len(v) for v in orphan.values())
         + len(unknown_sections)
+        + len(stale_known)
     )
 
     if missing:
@@ -227,6 +256,20 @@ def main() -> int:
             for num in sorted(missing[section]):
                 text = spec[section][num]
                 print(f"  {section}_{num}.zig  --  [test {num}] {text}")
+
+    if known_missing:
+        print("== Tracked coverage gaps (Stygia-o4a.6.4) ==")
+        for section in sorted(known_missing):
+            for num in sorted(known_missing[section]):
+                fname = f"{section}_{num}.zig"
+                print(f"  {fname}  --  {KNOWN_MISSING_TESTS[fname]}")
+        print()
+
+    if stale_known:
+        print("== Stale coverage-gap entries (remove after test restoration/spec removal) ==")
+        for fname in stale_known:
+            print(f"  {fname}")
+        print()
 
     if orphan:
         if missing:
@@ -248,7 +291,7 @@ def main() -> int:
     print(
         f"Spec has {spec_total} tests; "
         f"{os.path.relpath(TESTS_DIR)}/ has {tests_total} files; "
-        f"{mismatch_count} mismatches."
+        f"{len(active_known)} tracked gaps; {mismatch_count} mismatches."
     )
 
     return 0 if (mismatch_count == 0 and spec_warnings == 0) else 1

@@ -777,11 +777,9 @@ fn printDirectiveTag(tag: lifecycle.DirectiveTag) void {
 fn printEventType(event_type: EventType) void {
     rawWrite(switch (event_type) {
         .none => "none",
-        .memory_fault => "mem_fault",
-        .thread_fault => "thread_fault",
-        .breakpoint => "breakpoint",
         .suspension => "suspension",
         .vm_exit => "vm_exit",
+        _ => "reserved",
     });
 }
 

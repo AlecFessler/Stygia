@@ -46,7 +46,7 @@
 //   bytes are a VmPolicy struct. An all-zero buffer is a valid policy
 //   (zero counts ⇒ kernel scans no entries). We mint a page frame,
 //   map it via a temporary VMAR, zero VM_POLICY_BYTES, and pass the
-//   frame in. This mirrors acquire_ecs_07's setup.
+//   frame in. This exercises the vCPU setup.
 //
 // Action
 //   1. restrict(SLOT_SELF, SelfCap{crec, crvm, crvr, crpf, crpt, pri=1})

@@ -19,7 +19,7 @@
 //
 //   The runner's ceilings_inner word encodes `ec_inner_ceiling` in bits
 //   0-7. It passes 0xFF there (see primary.zig: `ceilings_inner =
-//   0x001C_011F_3F01_FFFF`, low byte = 0xFF). Per the spec line, slot
+//   0x001C_011F_2701_FFFF`, low byte = 0xFF). Per the spec line, slot
 //   1's caps field must therefore equal 0xFF. The test asserts:
 //     - slot 1 is non-empty / not an error encoding,
 //     - its handle type is execution_context (§[capabilities] type tag),

@@ -61,7 +61,7 @@ fn logPfDiag(
 
 // TEMP DIAGNOSTIC (stygia-idc, REMOVE).
 //
-// The bare-metal cap is a recurring no-route `memory_fault subcode=0`.
+// The bare-metal cap is a recurring unhandled `memory_fault subcode=0`.
 // Cycle 4's reporter dumped `ec.ctx` and produced a frame that is
 // INTERNALLY INCONSISTENT: `elr` named `bfxil x9, x0, #0, #12` (a
 // register-only instruction that cannot take a data abort) while every
@@ -91,7 +91,7 @@ const DbgFaultStash = struct {
 };
 
 /// Indexed by core id. Written on the fault path immediately before
-/// `port.fireMemoryFault`, read by `port.reportNoRouteFault` on the same
+/// `port.fireMemoryFault`, read by `port.reportUnhandledFault` on the same
 /// core before anything can preempt it.
 pub var dbg_fault: [64]DbgFaultStash = @splat(.{});
 
@@ -111,9 +111,7 @@ fn dbgStashFault(fault: *const PageFaultContext, site: u8) void {
     };
 }
 
-/// Memory-fault sub-code carried in the event payload alongside
-/// `EventType.memory_fault` per spec §[event_type] table 1840 ("invalid
-/// read/write/execute, unmapped access, protection violation").
+/// Classifies invalid memory accesses for kernel diagnostics.
 const MemoryFaultSubcode = enum(u8) {
     unmapped = 0,
     invalid_read = 1,
@@ -385,7 +383,6 @@ fn accessSubcode(is_write: bool, is_exec: bool) MemoryFaultSubcode {
 }
 
 pub fn handlePageFault(fault: *const PageFaultContext) void {
-
     const faulting_virt = VAddr.fromInt(fault.faulting_address);
     const is_kernel_privilege = fault.is_kernel_privilege;
     const is_user_va = faulting_virt.addr < address.AddrSpacePartition.user.end;
@@ -408,14 +405,14 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         //     is actively harmful: the arm below abandons the faulting
         //     kernel frame via `yieldTo`/`hopParkRun` WITHOUT unwinding
         //     it, so every lock that frame holds stays locked in memory
-        //     forever. `fireMemoryFault`'s no-route fallback then takes
+        //     forever. `fireMemoryFault`'s unhandled-fault path then takes
         //     `caps.derivation.tree_mutex` and blocking-acquires the
         //     EC's capability-domain gen-lock — which, on the demand-
         //     paging path, is exactly one of the locks just leaked
         //     (fault.zig's own user arm took it, and vmar.handlePageFault
         //     took the VMAR's). The result is an unkillable spin holding
         //     a global mutex: captured live as
-        //     `[NOROUTE] memory_fault subcode=2 payload=0xfff` followed
+        //     `[UNHANDLED] memory_fault subcode=2 payload=0xfff` followed
         //     by whole-suite starvation.
         //
         // Two structural discriminators, both cheap and exact:
@@ -472,7 +469,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // spin on that very release (markReady's kstack barrier) —
         // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        // `fireMemoryFault`'s no-route fallback terminates `ec` and
+        // `fireMemoryFault`'s unhandled-fault path terminates `ec` and
         // clears `current_ec`; if the run queue is empty, returning
         // would iretq back into the now-stale faulting frame and re-
         // enter exception handling with `currentEc() == null`. Hand
@@ -558,7 +555,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const dom_ref = ec.domain;
     const dom_lr = dom_ref.lockIrqSave(@src()) catch {
         // Domain torn down between exception entry and here — fire
-        // memory_fault so the no-route fallback retires the EC.
+        // memory_fault so the unhandled-fault path retires the EC.
         if (comptime pf_log.enabled) {
             pf_log.mark(ec, .USER_DOMAIN_GONE, faulting_virt.addr, 0);
         }
@@ -572,7 +569,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         // spin on that very release (markReady's kstack barrier) —
         // a self-deadlock on our own pending stash.
         scheduler.yieldTo(null);
-        // See the kernel-on-user-VA branch above: the no-route fallback
+        // See the kernel-on-user-VA branch above: the unhandled-fault path
         // drains `current_ec`; if no other EC is ready we MUST not iretq
         // back to the stale faulting frame.
         // Identity, not just null: the wake/destroy machinery can leave
@@ -592,11 +589,8 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // Spec v3 vmar.handlePageFault returns 0 on a resolved fault
     // (demand alloc, MMIO/port-IO virtualization, etc.). Any non-zero
     // return — E_BADADDR (no covering VMAR), E_PERM (rights mismatch),
-    // E_NOMEM (demand alloc exhausted) — routes through the EC's
-    // memory_fault event. fireMemoryFault either suspends the EC on the
-    // bound port or applies the no-route fallback (restart or destroy
-    // the owning domain) per spec §[event_route]. Either outcome leaves
-    // this EC unrunnable, so yield the CPU after firing.
+    // E_NOMEM (demand alloc exhausted) — tears down the faulting domain.
+    // Yield the CPU after firing because this EC is no longer runnable.
     if (comptime pf_log.enabled) {
         if (rc == 0) {
             pf_log.mark(ec, .USER_RESOLVED, faulting_virt.addr, 0);

@@ -110,12 +110,7 @@ fn suspendWith1AttachmentArm(word: u64, target: u64, port: u64, entry: u64) u64 
           [iv1] "{x0}" (target),
           [iv2] "{x1}" (port),
           [entry] "r" (entry),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true,
-             .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true,
-             .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-             .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true,
-             .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true,
-             .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .x19 = true, .x20 = true, .x21 = true, .x22 = true, .x23 = true, .x24 = true, .x25 = true, .x26 = true, .x27 = true, .x28 = true, .x29 = true, .x30 = true, .memory = true });
     return ov1;
 }
 
@@ -134,17 +129,17 @@ pub fn main(cap_table_base: u64) void {
     const ec_caps_now: u16 = ec.caps();
 
     // Sanity check: this test depends on the source EC having `copy`
-    // (bit 1) set so move=0 doesn't trip test 05, and on the bind bit
-    // (bit 10) being clear so the constructed caps is a strict
+    // (bit 1) set so move=0 doesn't trip test 05, and on the restart-policy bit
+    // (bit 8) being clear so the constructed caps is a strict
     // superset.
     const ec_copy_bit: u16 = (caps.EcCap{ .copy = true }).toU16();
-    const ec_bind_bit: u16 = (caps.EcCap{ .bind = true }).toU16();
-    if ((ec_caps_now & ec_copy_bit) == 0 or (ec_caps_now & ec_bind_bit) != 0) {
+    const ec_restart_bit: u16 = (caps.EcCap{ .restart_policy = 1 }).toU16();
+    if ((ec_caps_now & ec_copy_bit) == 0 or (ec_caps_now & ec_restart_bit) != 0) {
         testing.fail(1);
         return;
     }
 
-    const superset_caps: u16 = ec_caps_now | ec_bind_bit;
+    const superset_caps: u16 = ec_caps_now | ec_restart_bit;
 
     const entry = (caps.PairEntry{
         .id = caps.SLOT_INITIAL_EC,

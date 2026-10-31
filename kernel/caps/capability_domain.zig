@@ -14,9 +14,7 @@
 //!
 //! ECs bound to this domain are reachable through the handle table (walk
 //! looking for type = execution_context) and through whatever pins them
-//! (run queue, port wait queue, etc.). No separate ECs array — the spec's
-//! `acquire_ecs` is an explicitly slow debugger primitive, the linear walk
-//! is fine for it.
+//! (run queue, port wait queue, etc.). No separate ECs array.
 //!
 //! STUB. Forward refs to VMAR and VirtualMachine point at intended future
 //! paths.
@@ -75,8 +73,7 @@ pub const IdcCaps = packed struct(u16) {
     move: bool = false,
     copy: bool = false,
     crec: bool = false,
-    aqec: bool = false,
-    aqvr: bool = false,
+    _reserved_3_4: u2 = 0,
     restart_policy: u1 = 0,
     _reserved: u10 = 0,
 };
@@ -150,7 +147,6 @@ pub const CapabilityDomain = struct {
 
     /// Flat array of VARs bound to this domain. Used for:
     ///   - VA-range overlap check at `create_vmar` (linear scan)
-    ///   - Enumeration via `acquire_vmars` (debugger primitive)
     ///   - Walk-and-free at domain destroy
     /// Entries `[0..var_count)` are populated; entries beyond are null.
     /// On removal the tail is moved into the freed slot to keep the
@@ -833,416 +829,6 @@ fn cleanupPartiallyCreatedCd(cd: *CapabilityDomain, partial_ec: ?*ExecutionConte
     destroyPhase2(deferred);
 }
 
-/// `acquire_ecs` syscall handler.
-/// Spec §[capability_domain].acquire_ecs.
-///
-/// Walks the target IDC's referenced domain enumerating non-vCPU ECs,
-/// mints a handle in the caller's table for each (caps =
-/// `target.ec_outer_ceiling` ∩ `idc.ec_cap_ceiling`), writes the slot
-/// ids into vregs `[1..N]`, and returns N in the syscall word's count
-/// field (bits 12-19).
-///
-/// On the wire:
-///   - Vreg 1 (rax / x0) carries the first handle word (caps + type +
-///     slot via Word0.pack); userspace disambiguates against the
-///     §[error_codes] 1..15 range using the type tag in bits 12-15.
-///     N == 0 surfaces as `errors.OK` in vreg 1 and count=0 in the
-///     syscall word — no handles to write back.
-///   - Vregs 2..min(N, 5) reuse the existing `setSyscallVreg{2,3,4,5}`
-///     helpers. v0 spawns one EC per test domain, so N is bounded at 1
-///     in the spec test surface; vregs 6+ remain TODO until a test
-///     spawns a multi-EC domain through acquire_ecs.
-/// Derivation-tree link work recorded by the acquire_ecs/acquire_vmars
-/// mint loops for execution AFTER the caller's CD gen-lock drops.
-/// `derive` takes `tree_mutex` and must never run under a CD gen-lock
-/// (see the order contract on `caps.derivation.tree_mutex`) — the old
-/// inline derive (with the held CD passed as `held_dom`) established
-/// the `CD → tree_mutex` edge that deadlocks against the teardown /
-/// revoke tree walks. Both acquire paths are same-CD (self-IDC) only,
-/// so one domain ref covers parent and child sides.
-const DeferredAcquireDerives = struct {
-    dom: ErasedSlabRef = .{ .ptr = null, .gen = 0 },
-    n: u8 = 0,
-    src: [127]u12 = undefined,
-    dst: [127]u12 = undefined,
-
-    /// Caller must hold NO CD gen-lock. Safe to run after the mint's
-    /// critical section: the minted handles belong to the calling EC,
-    /// which is right here in this syscall; every `derive` re-validates
-    /// the domain gen and bails on slots a racer touched.
-    fn run(self: *const DeferredAcquireDerives) void {
-        var k: u8 = 0;
-        while (k < self.n) : (k += 1) {
-            _ = stygia.caps.derivation.derive(
-                self.dom,
-                self.src[k],
-                self.dom,
-                self.dst[k],
-            );
-        }
-    }
-};
-
-pub fn acquireEcs(caller: *ExecutionContext, target_idc: u64) i64 {
-    var deferred: DeferredAcquireDerives = .{};
-    const ret = acquireEcsInner(caller, target_idc, &deferred);
-    deferred.run();
-    return ret;
-}
-
-fn acquireEcsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
-
-    // Re-resolve the IDC handle's referenced domain. acquireDispatch
-    // already validated the slot's type tag and the aqec cap; we need
-    // the kernel-side ref to walk the target's handle table.
-    const slot: u12 = @truncate(target_idc & 0xFFF);
-    const target_ref_ptr = cd.kernel_table[slot].ref.ptr orelse return errors.E_BADCAP;
-    const target_cd: *CapabilityDomain = @ptrCast(@alignCast(target_ref_ptr));
-
-    // Self-IDC is the only target shape exercised by spec tests 04-07
-    // (the runner provisions slot 2 to point at the caller's own
-    // domain). Cross-domain acquire requires a second GenLock acquire
-    // with a stable ordering against the caller's lock and is left for
-    // when a non-self-IDC test surfaces it. For now bail E_BADCAP so
-    // an unimplemented call site is loud rather than silently wrong.
-    if (target_cd != cd) return errors.E_BADCAP;
-
-    // Spec §[acquire_ecs] [test 06]: each minted EC handle gets caps =
-    // `target.ec_outer_ceiling` ∩ `idc.ec_cap_ceiling`.
-    //   - target.ec_outer_ceiling lives in slot-0 self-handle field1
-    //     bits 0-7 (ceilings_outer layout).
-    //   - idc.ec_cap_ceiling lives in user_table[slot].field0 bits 0-15.
-    const ec_outer_ceiling: u16 = @truncate(target_cd.user_table[0].field1 & 0xFF);
-    const idc_ec_cap_ceiling: u16 = @truncate(cd.user_table[slot].field0 & 0xFFFF);
-    const minted_caps: u16 = ec_outer_ceiling & idc_ec_cap_ceiling;
-
-    // EC enumeration. Handle-table walks find every EC bound to the
-    // target whose handle is still alive; the calling EC is always a
-    // non-vCPU member of its own domain even when its self-handle has
-    // been deleted (spec §[self] [test 01] — the test exercises that
-    // exact shape via `acquire_ecs(SLOT_SELF_IDC)` after dropping the
-    // initial-EC handle). Track seen EC pointers so we don't double-
-    // mint the calling EC if its handle still exists.
-    //
-    // E_FULL pre-check ([test 04]): scan once to count, ensuring no
-    // partial-mint state if the table is too small. The mint loop
-    // re-walks rather than caching pointers because the count loop
-    // reads through user_table whose word0 type tag is the
-    // discriminator, while mint needs the kernel_table ref.
-    var ec_count: u32 = 0;
-    {
-        var j: u16 = 0;
-        var caller_seen: bool = false;
-        while (j < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (j += 1) {
-            const tag = Word0.typeTag(target_cd.user_table[j].word0);
-            if (tag != .execution_context) continue;
-            const ec_ptr = target_cd.kernel_table[j].ref.ptr orelse continue;
-            const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
-            if (ec_obj.vm != null) continue;
-            if (ec_obj == caller) caller_seen = true;
-            ec_count += 1;
-        }
-        if (!caller_seen and target_cd == cd and caller.vm == null) ec_count += 1;
-    }
-    if (cd.free_count < ec_count) return errors.E_FULL;
-
-    // Spec §[acquire_ecs] tests 04/05: kernel returns handles for every
-    // non-vCPU EC bound to the target domain. The syscall word's count
-    // field is 8 bits (0..255), and vreg space tops out at 127, so cap
-    // the minted-slot buffer at 127 — handles 1..127 land in vregs
-    // 1..127 per §[acquire_ecs] return shape.
-    var minted_slots: [127]u12 = undefined;
-    var n: u8 = 0;
-    var seen_caller: bool = false;
-
-    var i: u16 = 0;
-    while (i < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (i += 1) {
-        const tag = Word0.typeTag(target_cd.user_table[i].word0);
-        if (tag != .execution_context) continue;
-        const ec_ref = target_cd.kernel_table[i].ref;
-        const ec_ptr = ec_ref.ptr orelse continue;
-        const ec_obj: *ExecutionContext = @ptrCast(@alignCast(ec_ptr));
-        if (ec_obj.vm != null) continue; // [test 07] excludes vCPUs
-
-        if (ec_obj == caller) seen_caller = true;
-        if (n >= minted_slots.len) break;
-        const new_slot = mintHandle(
-            cd,
-            ec_ref,
-            .execution_context,
-            minted_caps,
-            0, // EC handle field0/field1 carry priority/affinity/etc.
-            0, // refreshed lazily by `sync`; zero-init is fine for v0.
-        ) catch return errors.E_FULL;
-
-        // Spec §[capabilities].revoke: derive the freshly-minted alias
-        // from the source handle in `target_cd` so a later revoke on
-        // any ancestor of `(target_cd, i)` reaches the new handle.
-        // mintHandle may have coalesced (the at-most-one invariant
-        // hits when `cd == target_cd` and `caller`'s self-handle in
-        // its domain already references the EC); skip the derive when
-        // the slot's links are already populated.
-        if (cd.kernel_table[new_slot].parent.domain.ptr == null and
-            cd.kernel_table[new_slot].first_child.domain.ptr == null and
-            cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
-        {
-            // Same-CD case (self-IDC): cd === target_cd (cross-CD is
-            // bailed E_BADCAP above). RECORDED, not derived inline —
-            // `derive` takes `tree_mutex` and this CD's gen-lock is
-            // held; see `DeferredAcquireDerives`.
-            deferred.dom = .{
-                .ptr = cd,
-                .gen = @intCast(cd._gen_lock.currentGen()),
-            };
-            deferred.src[deferred.n] = @intCast(i);
-            deferred.dst[deferred.n] = new_slot;
-            deferred.n += 1;
-        }
-
-        minted_slots[n] = new_slot;
-        n += 1;
-    }
-
-    // Always include the calling EC when its domain matches the target.
-    // The handle-table scan above misses an EC that has had every
-    // handle to it deleted (the at-most-one invariant + prior `delete`
-    // → no handle in the table → no scan hit), but the EC object is
-    // still bound to the domain and the spec requires its enumeration.
-    if (!seen_caller and target_cd == cd and caller.vm == null and n < minted_slots.len) {
-        // Coalescing in `mintHandle.findExistingHandle` matches by
-        // (ptr, gen, type) — must use the EC's own gen so subsequent
-        // ops via the minted handle resolve correctly through SlabRef.
-        const caller_ref: ErasedSlabRef = .{
-            .ptr = @ptrCast(caller),
-            .gen = @intCast(caller._gen_lock.currentGen()),
-        };
-        const new_slot = mintHandle(
-            cd,
-            caller_ref,
-            .execution_context,
-            minted_caps,
-            0,
-            0,
-        ) catch return errors.E_FULL;
-        minted_slots[n] = new_slot;
-        n += 1;
-    }
-
-    // Stage the syscall-word count writeback. The dispatch path flushes
-    // `pending_event_word` to user `[rsp+0]` after the handler returns,
-    // matching how recv delivers its composed return word.
-    const count_field: u64 = @as(u64, n) << 12;
-    caller.pending_event_word = count_field;
-    caller.pending_event_word_valid = true;
-
-    // Vregs 2..N. Vreg 1 rides the i64 return value below. Vregs 2..5
-    // use the dedicated event-state helpers (rbx/rdx/rbp/rsi on x86-64;
-    // x1..x4 on aarch64); vregs 6..N route via the generic
-    // `setSyscallVreg(idx)` helper, which lands GPR-backed indices in
-    // their architectural register and stack-spilled indices on the
-    // caller's user stack via SMAP/PAN-gated writes. The caller's CR3 /
-    // TTBR0 is active throughout the handler so the user-stack writes
-    // reach the right address space.
-    if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
-    if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
-    if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
-    if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
-    var k: u8 = 6;
-    while (k <= n) : (k += 1) {
-        arch.syscall.setSyscallVreg(caller.ctx, k, packHandleWord(minted_slots[k - 1], minted_caps));
-    }
-
-    if (n == 0) return @bitCast(@as(i64, errors.OK));
-    return @intCast(packHandleWord(minted_slots[0], minted_caps));
-}
-
-inline fn packHandleWord(slot: u12, caps_word: u16) u64 {
-    return Word0.pack(slot, .execution_context, caps_word);
-}
-
-/// `acquire_vmars` syscall handler.
-/// Spec §[capability_domain].acquire_vmars.
-///
-/// Enumerates `map=1` (page_frame) and `map=3` (demand) VARs bound to the
-/// target IDC's referenced domain. MMIO and DMA-only VARs (`map=0` / `map=2`)
-/// are excluded — see §[acquire_vmars] [test 07].
-pub fn acquireVmars(caller: *ExecutionContext, target_idc: u64) i64 {
-    var deferred: DeferredAcquireDerives = .{};
-    const ret = acquireVmarsInner(caller, target_idc, &deferred);
-    deferred.run();
-    return ret;
-}
-
-fn acquireVmarsInner(caller: *ExecutionContext, target_idc: u64, deferred: *DeferredAcquireDerives) i64 {
-    const cd_ref = caller.domain;
-    const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
-    const cd = lr.ptr;
-    defer cd_ref.unlockIrqRestore(lr.irq_state);
-
-    // Re-resolve the IDC handle's referenced domain. acquireDispatch
-    // already validated the slot's type tag and the aqvr cap.
-    const slot: u12 = @truncate(target_idc & 0xFFF);
-    const target_ref_ptr = cd.kernel_table[slot].ref.ptr orelse return errors.E_BADCAP;
-    const target_cd: *CapabilityDomain = @ptrCast(@alignCast(target_ref_ptr));
-
-    // Self-IDC is the only target shape exercised by spec tests 04-07
-    // (the runner provisions slot 2 to point at the caller's own domain).
-    // Cross-domain acquire requires a second GenLock acquire with stable
-    // ordering against the caller's lock and is left for when a non-self-
-    // IDC test surfaces it.
-    if (target_cd != cd) return errors.E_BADCAP;
-
-    // Spec §[acquire_vmars] [test 06]: each minted VMAR handle gets caps =
-    // `target.vmar_outer_ceiling` ∩ `idc.vmar_cap_ceiling`.
-    //   - target.vmar_outer_ceiling lives in slot-0 self-handle field1
-    //     bits 8-15 (ceilings_outer layout).
-    //   - idc.vmar_cap_ceiling lives in user_table[slot].field0 bits 16-23.
-    const vmar_outer_ceiling: u16 = @truncate((target_cd.user_table[0].field1 >> 8) & 0xFF);
-    const idc_var_cap_ceiling: u16 = @truncate((cd.user_table[slot].field0 >> 16) & 0xFF);
-    const minted_caps: u16 = vmar_outer_ceiling & idc_var_cap_ceiling;
-
-    // E_FULL pre-check ([test 04]): count eligible VARs once. Eligible =
-    // map ∈ {page_frame, demand}. The `vars[]` array tracks every VMAR
-    // bound to the domain; coalescing in `mintHandle` deduplicates against
-    // any existing handle in the caller's table.
-    var var_count: u32 = 0;
-    {
-        var j: u16 = 0;
-        while (j < target_cd.var_count) : (j += 1) {
-            const v_ref = target_cd.vars[j] orelse continue;
-            // caller-pinned: VMAR's domain ref pins it for the
-            // duration of this walk (target_cd's gen-lock is held).
-            const v = v_ref.ptr;
-            switch (v.map) {
-                .page_frame, .demand => var_count += 1,
-                else => {},
-            }
-        }
-    }
-    if (cd.free_count < var_count) return errors.E_FULL;
-
-    // Spec §[acquire_vmars] tests 04/05: kernel returns handles for
-    // every map=1/3 VMAR bound to the target domain. Same vreg-127
-    // bound as acquire_ecs.
-    var minted_slots: [127]u12 = undefined;
-    var n: u8 = 0;
-
-    var i: u16 = 0;
-    while (i < target_cd.var_count) : (i += 1) {
-        const v_ref = target_cd.vars[i] orelse continue;
-        // caller-pinned: see prior loop.
-        const v = v_ref.ptr;
-        switch (v.map) {
-            .page_frame, .demand => {},
-            else => continue, // [test 07]: exclude MMIO and unmapped/DMA-only
-        }
-
-        if (n >= minted_slots.len) break;
-
-        const var_field0: u64 = v.base_vaddr.addr;
-        const vmar_field1: u64 = stygia.memory.vmar.packField1(
-            v.page_count,
-            v.sz,
-            v.cch,
-            v.cur_rwx,
-            v.map,
-            0, // device_id: VARs eligible here are pf/demand, not MMIO/DMA
-        );
-
-        const var_ref: ErasedSlabRef = .{
-            .ptr = @ptrCast(v),
-            .gen = @intCast(v._gen_lock.currentGen()),
-        };
-        // Spec §[acquire_vmars] [test 06] says the returned handle has
-        // caps = `vmar_outer_ceiling ∩ vmar_cap_ceiling`. If a handle
-        // to this VMAR already exists in the caller's table (the
-        // at-most-one-per-(domain,object) invariant + self-IDC case
-        // means the create_vmar-minted handle is already there), the
-        // coalescing path in mintHandle returns that existing slot
-        // with its original caps. Detect that case and overwrite caps
-        // / field0 / field1 to the spec-required intersection so the
-        // handle reflects what acquire_vmars promises.
-        const new_slot = mintHandle(
-            cd,
-            var_ref,
-            .virtual_memory_address_region,
-            minted_caps,
-            var_field0,
-            vmar_field1,
-        ) catch return errors.E_FULL;
-        cd.user_table[new_slot].word0 = Word0.pack(new_slot, .virtual_memory_address_region, minted_caps);
-        cd.user_table[new_slot].field0 = var_field0;
-        cd.user_table[new_slot].field1 = vmar_field1;
-
-        // Spec §[capabilities].revoke: derive the freshly-minted alias
-        // from the source handle in `target_cd`. Skip if `mintHandle`
-        // coalesced (slot links already populated). The source slot is
-        // the existing VMAR handle in target_cd — find it by linear
-        // scan since `vars[]` carries no slot id.
-        if (cd.kernel_table[new_slot].parent.domain.ptr == null and
-            cd.kernel_table[new_slot].first_child.domain.ptr == null and
-            cd.kernel_table[new_slot].next_sibling.domain.ptr == null)
-        {
-            var src_slot: u12 = 0;
-            var src_found = false;
-            var k: u16 = 0;
-            while (k < stygia.caps.capability.MAX_HANDLES_PER_DOMAIN) : (k += 1) {
-                const ent = &target_cd.kernel_table[k];
-                if (ent.ref.ptr == null) continue;
-                if (ent.ref.ptr != @as(*anyopaque, @ptrCast(v))) continue;
-                if (Word0.typeTag(target_cd.user_table[k].word0) != .virtual_memory_address_region) continue;
-                src_slot = @intCast(k);
-                src_found = true;
-                break;
-            }
-            if (src_found) {
-                // Same-CD (self-IDC) only — RECORDED, not derived
-                // inline; see `DeferredAcquireDerives`.
-                deferred.dom = .{
-                    .ptr = cd,
-                    .gen = @intCast(cd._gen_lock.currentGen()),
-                };
-                deferred.src[deferred.n] = src_slot;
-                deferred.dst[deferred.n] = new_slot;
-                deferred.n += 1;
-            }
-        }
-
-        minted_slots[n] = new_slot;
-        n += 1;
-    }
-
-    // Stage the syscall-word count writeback. The dispatch path flushes
-    // `pending_event_word` to user `[rsp+0]` after the handler returns.
-    const count_field: u64 = @as(u64, n) << 12;
-    caller.pending_event_word = count_field;
-    caller.pending_event_word_valid = true;
-
-    // Vregs 2..N. Vreg 1 rides the i64 return value below. Vregs 6..N
-    // route via the generic `setSyscallVreg(idx)` helper — see
-    // `acquireEcs` for the shared CR3/TTBR0 contract.
-    if (n >= 2) arch.syscall.setSyscallVreg2(caller.ctx, packHandleWord(minted_slots[1], minted_caps));
-    if (n >= 3) arch.syscall.setSyscallVreg3(caller.ctx, packHandleWord(minted_slots[2], minted_caps));
-    if (n >= 4) arch.syscall.setSyscallVreg4(caller.ctx, packHandleWord(minted_slots[3], minted_caps));
-    if (n >= 5) arch.syscall.setEventVreg5(caller.ctx, packHandleWord(minted_slots[4], minted_caps));
-    var k: u8 = 6;
-    while (k <= n) : (k += 1) {
-        arch.syscall.setSyscallVreg(caller.ctx, k, packHandleWord(minted_slots[k - 1], minted_caps));
-    }
-
-    if (n == 0) return @bitCast(@as(i64, errors.OK));
-    return @intCast(packHandleWord(minted_slots[0], minted_caps));
-}
-
-// ── Internal API ─────────────────────────────────────────────────────
-
-/// Round handle-table size up to a power-of-two-page block. Buddy
-/// `allocBlock` requires power-of-two multiples of 4 KiB. Wastes some
-/// memory at the tail but keeps the alloc path simple.
 fn handleTableBlockBytes(comptime T: type) u64 {
     const raw: u64 = @as(u64, MAX_HANDLES_PER_DOMAIN) * @sizeOf(T);
     const pages: u64 = (raw + 0xFFF) / 0x1000;
@@ -1331,38 +917,10 @@ pub fn allocCapabilityDomain(
     user_table[1] = .{ .word0 = 0, .field0 = 0, .field1 = 0 };
     kernel_table[1].ref = .{};
 
-    // Slot 2 — self-IDC. Caps = `cridc_ceiling` from field0_ceilings
-    // bits 24-31 per spec §[cridc_ceiling]. The IDC handle's per-handle
-    // `ec_cap_ceiling` (field0 bits 0-15) and `vmar_cap_ceiling` (field0
-    // bits 16-23) — see spec §[capability_domain] IDC handle — are not
-    // initialized by `create_capability_domain` (no spec-defined
-    // syscall arg covers them); we apply a kernel-internal permissive
-    // default here so `acquire_ecs` / `acquire_vmars` through the
-    // self-IDC mint handles whose caps are bounded by the domain's
-    // `*_outer_ceiling` alone (the per-IDC ceilings degenerate to no-op
-    // intersections). Spec §[acquire_ecs] [test 06] / §[acquire_vmars]
-    // [test 06] consume these ceilings via intersection; without the
-    // permissive default the minted handles would carry no caps.
-    //
-    // SELF_IDC_FIELD0_DEFAULT = 0x00DF_FFFF:
-    //   bits  0-15 ec_cap_ceiling   = 0xFFFF (every defined EcCap bit set)
-    //   bits 16-23 vmar_cap_ceiling = 0xDF
-    //                                 (every defined VmarCap bit EXCEPT
-    //                                 bit 5 / VmarCap.mmio, at field0
-    //                                 bit 21)
-    //
-    // Clearing mmio is deliberate: §[acquire_vmars] [test 07] requires
-    // MMIO and DMA VARs be excluded from acquire_vmars output. The
-    // vmar_cap_ceiling intersection (`vmar_outer_ceiling ∩
-    // vmar_cap_ceiling`) drops the mmio bit on every minted handle so
-    // the result naturally honors test 07. dma at VmarCap bit 8 falls
-    // outside the 8-bit vmar_cap_ceiling field, so it is implicitly
-    // excluded.
-    const SELF_IDC_FIELD0_DEFAULT: u64 = 0x0000_0000_00DF_FFFF;
+    // Slot 2 — self-IDC. Caps come from the domain's cridc ceiling.
     const cridc_ceiling: u16 = @truncate((field0_ceilings >> 24) & 0xFF);
-    const idc_self_field0: u64 = SELF_IDC_FIELD0_DEFAULT;
     user_table[2].word0 = Word0.pack(2, .capability_domain, cridc_ceiling);
-    user_table[2].field0 = idc_self_field0;
+    user_table[2].field0 = 0;
     user_table[2].field1 = 0;
     kernel_table[2].ref = .{
         .ptr = cd,
@@ -1377,7 +935,7 @@ pub fn allocCapabilityDomain(
 /// `kernel_table` releasing every used slot per type, tears down the
 /// address space, frees the table pages, frees slab.
 ///
-/// Step 10 minimal teardown. SLOT_SELF and no-route teardown callers
+/// Step 10 minimal teardown. SLOT_SELF and unhandled-fault teardown callers
 /// invoke this AFTER the calling EC has been retired via
 /// `parkSelfFaulted` (it is the bound initial EC by spec —
 /// `delete(SLOT_SELF)` from inside the child runs on this very EC). At
@@ -1472,7 +1030,7 @@ pub fn destroyPhase1(cd: *CapabilityDomain, caller_ec: ?SlabRef(ExecutionContext
     // instruction-fetch fault on an address with no VMAR. The resulting
     // `memory_fault` is then unroutable (this CD's gen is already even,
     // so the fault port cannot be resolved) and the EC is parked with
-    // `[NOROUTE] ... why=unbound`.
+    // `[UNHANDLED] ... why=unbound`.
     //
     // Observed on x86-64 with the suite spread across 4 cores: the
     // victim faults at the return address of libz's syscall stub

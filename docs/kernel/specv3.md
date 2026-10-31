@@ -131,7 +131,7 @@ Kernel objects are grouped by the **ceiling** of their lifetime — the longest 
 - **System lifetime** — Device Region, Capability Domain. Could persist as long as the kernel runs.
 - **Refcount lifetime** — Port, Page Frame, Timer. Bounded by the distributed set of handles referencing them.
 - **Capability domain lifetime** — Execution Context, Virtual Memory Address Region, Virtual Machine. Cannot outlive the capability domain they are bound to.
-- **Execution context lifetime** — Event Route, Reply. Event routes are kernel-held bindings (not handles) that are swept when the execution context they route from is destroyed. Replies cannot outlive the execution context they are bound to.
+- **Execution context lifetime** — Reply. Replies cannot outlive the execution context they are bound to.
 
 ### restrict
 
@@ -213,7 +213,7 @@ Per-type observable behavior:
 | `page_frame` | Release handle. When the last handle to a page frame is released, the physical memory returns to the free pool |
 | `virtual_memory_address_region` | Non-transferable; exactly one handle exists. Delete unmaps everything installed, frees the address range, releases the handle |
 | `device_region` | Release handle. When the last handle to a device region is released, the region returns to the root service |
-| `port` | Decrement the bind-side refcount if this handle has `bind`; decrement the recv-side refcount if this handle has `recv`. The `suspend` cap does not contribute to either refcount. When the recv-side refcount hits zero, suspended senders resume with `E_CLOSED` and the port slab is destroyed. When the bind-side refcount hits zero and no event routes target the port and no vCPU `exit_port` pins remain, receivers suspended on the port resume with `E_CLOSED`; the port slab itself stays alive while any recv-cap holder remains. Release handle |
+| `port` | Decrement the bind-side refcount if this handle has `bind`; decrement the recv-side refcount if this handle has `recv`. The `suspend` cap does not contribute to either refcount. When the recv-side refcount hits zero, suspended senders resume with `E_CLOSED` and the port slab is destroyed. When the bind-side refcount hits zero and no vCPU `exit_port` pins remain, receivers suspended on the port resume with `E_CLOSED`; the port slab itself stays alive while any recv-cap holder remains. Release handle |
 | `reply` | If the suspended sender is still waiting, resume them with `E_ABANDONED`. Release handle |
 | `virtual_machine` | Non-transferable; exactly one handle exists. Destroy the VM: all vCPU ECs terminate, guest memory is freed, kernel-emulated LAPIC/IOAPIC/timer state is torn down. Release handle |
 | `timer` | Release handle. When the last handle to the timer is released, the kernel cancels the timer if armed and reclaims its kernel state |
@@ -425,11 +425,10 @@ word 0:
 └────────────────┴──────────────────────────────┴───────┴────────────┘
 
 word 1 (field0):
- 63                                          24 23        16 15           0
-┌─────────────────────────────────────────────┬─────────────┬───────────────┐
-│              _reserved (40)                 │vmar_cap_clg │ec_cap_ceiling │
-│                                             │    (8)      │     (16)      │
-└─────────────────────────────────────────────┴─────────────┴───────────────┘
+ 63                                                                  0
+┌─────────────────────────────────────────────────────────────────────┐
+│                         _reserved (64)                              │
+└─────────────────────────────────────────────────────────────────────┘
 
 word 2 (field1):
  63                                                                  0
@@ -438,21 +437,14 @@ word 2 (field1):
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Field layout:
-
-| field | location | meaning |
-|---|---|---|
-| ec_cap_ceiling | field0 bits 0-15 | per-IDC ceiling on caps of EC handles minted via `acquire_ecs` through this IDC |
-| vmar_cap_ceiling | field0 bits 16-23 | per-IDC ceiling on caps of VMAR handles minted via `acquire_vmars` through this IDC |
-
 cap (word 0, bits 48-63):
 
 ```
- 15                          6    5    4    3    2    1    0
-┌─────────────────────────────┬──────┬──────┬──────┬──────┬────┬────┐
-│      _reserved (10)         │rstrt │ aqvr │ aqec │ crec │copy│move│
-│                             │_plcy │      │      │      │    │    │
-└─────────────────────────────┴──────┴──────┴──────┴──────┴────┴────┘
+ 15                     6    5    4..3  2    1    0
+┌────────────────────────┬──────┬───────┬──────┬────┬────┐
+│     _reserved (10)     │rstrt │_rsvd  │ crec │copy│move│
+│                        │_plcy │ (2)   │      │    │    │
+└────────────────────────┴──────┴───────┴──────┴────┴────┘
 ```
 
 | Bit | Name | Gates |
@@ -460,8 +452,6 @@ cap (word 0, bits 48-63):
 | 0 | `move` | transferring this handle via move to another capability domain |
 | 1 | `copy` | transferring this handle via copy to another capability domain |
 | 2 | `crec` — create execution context in referenced domain | `create_execution_context` with this handle as `target` |
-| 3 | `aqec` — acquire ECs | `acquire_ecs` syscall on this IDC |
-| 4 | `aqvr` — acquire VMARs | `acquire_vmars` syscall on this IDC |
 | 5 | `restart_policy` | IDC handle behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 
 ### create_capability_domain
@@ -644,118 +634,6 @@ The caller receives an IDC handle to the new domain with caps = the caller's own
 [test 32] returns E_INVAL if `[5]` has bits set outside the system's core count.
 
 
-### acquire_ecs
-
-#### Summary
-
-Returns handles to all non-vCPU execution contexts bound to the target domain referenced by an IDC handle.
-
-#### Declaration
-
-```
-acquire_ecs([1] target) -> [1..N] handles
-  syscall_num = 20
-
-  syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
-
-  [1] target: IDC handle
-```
-
-#### Description
-
-The kernel sets the syscall word's count field to N, the number of handles returned, and writes them to vregs `[1..N]`.
-
-#### Capabilities
-
-- IDC handle `[1]`: `aqec`
-
-#### Return value
-
-`[1..N]`: EC handles, each with caps = `target.ec_outer_ceiling` ∩ `[1].ec_cap_ceiling`. The syscall word's count field is set to N.
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid IDC handle.
-
-**E_PERM** — `[1]` does not have the `aqec` cap.
-
-**E_INVAL** — reserved bits set in `[1]`.
-
-**E_FULL** — caller's handle table cannot accommodate all returned handles.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid IDC handle.
-
-[test 02] returns E_PERM if [1] does not have the `aqec` cap.
-
-[test 03] returns E_INVAL if any reserved bits are set in [1].
-
-[test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-
-[test 05] on success, the syscall word's count field equals the number of non-vCPU ECs bound to the target domain.
-
-[test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those ECs, each with caps = target's `ec_outer_ceiling` intersected with the IDC's `ec_cap_ceiling`.
-
-[test 07] vCPUs in the target domain are not included in the returned handles.
-
-
-### acquire_vmars
-
-#### Summary
-
-Returns handles to all `map=1` (pf) and `map=3` (demand) VMARs bound to the target domain referenced by an IDC handle. MMIO and DMA VMARs are excluded.
-
-#### Declaration
-
-```
-acquire_vmars([1] target) -> [1..N] handles
-  syscall_num = 21
-
-  syscall word bits 12-19: count (set by the kernel on return; 0 on entry)
-
-  [1] target: IDC handle
-```
-
-#### Description
-
-While in flight, all ECs in the target domain are paused — `acquire_vmars` and the resulting `idc_read`/`idc_write` traffic is intended as a debugger primitive, not a performance path.
-
-#### Capabilities
-
-- IDC handle `[1]`: `aqvr`
-
-#### Return value
-
-`[1..N]`: VMAR handles, each with caps = `target.vmar_outer_ceiling` ∩ `[1].vmar_cap_ceiling`. The syscall word's count field is set to N.
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid IDC handle.
-
-**E_PERM** — `[1]` does not have the `aqvr` cap.
-
-**E_INVAL** — reserved bits set in `[1]`.
-
-**E_FULL** — caller's handle table cannot accommodate all returned handles.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid IDC handle.
-
-[test 02] returns E_PERM if [1] does not have the `aqvr` cap.
-
-[test 03] returns E_INVAL if any reserved bits are set in [1].
-
-[test 04] returns E_FULL if the caller's handle table cannot accommodate all returned handles.
-
-[test 05] on success, the syscall word's count field equals the number of `map=1` and `map=3` VMARs bound to the target domain.
-
-[test 06] on success, vregs `[1..N]` contain handles in the caller's table referencing those VMARs, each with caps = target's `vmar_outer_ceiling` intersected with the IDC's `vmar_cap_ceiling`.
-
-[test 07] MMIO and DMA VMARs in the target domain are not included in the returned handles.
-
-
 ### §[restart_semantics] Restart Semantics
 
 When a capability domain holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the domain rather than tearing it down. ECs re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting domain are governed by the domain-wide `reply_policy` bit on the self-handle.
@@ -833,11 +711,11 @@ Both fields are kernel-mutable: `priority` and `affinity` syscalls update them, 
 cap (word 0, bits 48-63):
 
 ```
- 15      13 12    11    10   9     8 7      6    5    4    3    2    1    0
-┌──────────┬──────┬──────┬──────┬───────┬───────┬──────┬──────┬──────┬──────┬──────┬────┬────┐
-│_rsvd (3) │unbind│rebind│ bind │ rstrt │ write │ read │ susp │ term │ spri │ saff │copy│move│
-│          │      │      │      │ _plcy │       │      │      │      │      │      │    │    │
-└──────────┴──────┴──────┴──────┴───────┴───────┴──────┴──────┴──────┴──────┴──────┴────┴────┘
+ 15                   10 9     8 7      6    5    4    3    2    1    0
+┌───────────────────────┬───────┬───────┬──────┬──────┬──────┬──────┬──────┬────┬────┐
+│    _reserved (6)      │ rstrt │ write │ read │ susp │ term │ spri │ saff │copy│move│
+│                       │ _plcy │       │      │      │      │      │      │    │    │
+└───────────────────────┴───────┴───────┴──────┴──────┴──────┴──────┴──────┴────┴────┘
 ```
 
 | Bit | Name | Gates |
@@ -851,9 +729,6 @@ cap (word 0, bits 48-63):
 | 6 | `read` | exposing this EC's state in event payloads during event delivery (§[event_state]); when absent, state in the payload is zeroed |
 | 7 | `write` | applying modifications written to the event payload back to this EC's state on reply; when absent, modifications are discarded |
 | 8-9 | `restart_policy` | EC behavior on domain restart: 0=kill, 1=restart_at_entry, 2=persist, 3=_reserved (see §[restart_semantics]) |
-| 10 | `bind` | `bind_event_route` on this EC when no prior route exists for the given event type |
-| 11 | `rebind` | `bind_event_route` on this EC when a prior route exists for the given event type (atomic overwrite) |
-| 12 | `unbind` | `clear_event_route` on this EC |
 
 ### create_execution_context
 
@@ -997,7 +872,7 @@ terminate([1] target) -> void
 
 Termination atomically destroys the EC. Handles referencing it in any capability domain become stale; a syscall invoked with a stale handle returns `E_TERM` and the stale handle is removed from the caller's table on the same call.
 
-Termination also clears the kernel-held event routes bound to the EC (§[event_route]) and marks any reply handles whose suspended sender was the terminated EC such that subsequent operations on those reply handles return `E_ABANDONED`.
+Termination marks any reply handles whose suspended sender was the terminated EC such that subsequent operations on those reply handles return `E_ABANDONED`.
 
 #### Capabilities
 
@@ -1023,7 +898,6 @@ Termination also clears the kernel-held event routes bound to the EC (§[event_r
 
 [test 05] on success, syscalls invoked with any handle to the terminated EC return E_TERM and remove that handle from the caller's table on the same call.
 
-[test 06] on success, no further events generated by the terminated EC are delivered to any port previously bound by an event_route from that EC.
 
 [test 07] on success, reply handles whose suspended sender was the terminated EC return E_ABANDONED on subsequent operations.
 
@@ -1658,117 +1532,6 @@ If the source's stability cannot be verified at restart, the restart fails and t
 [test 11] on domain restart, when [2].map = 3 and `[2].cur_rwx.w = 1`, the restart fails and the domain is terminated.
 
 
-### idc_read
-
-#### Summary
-
-Reads qwords from a VMAR into the caller's vregs. Used for cross-domain memory inspection (e.g., debugger reads of an acquired VMAR's contents).
-
-#### Declaration
-
-```
-idc_read([1] vmar, [2] offset) -> [3..2+count] qwords
-  syscall_num = 38
-
-  syscall word bits 12-19: count (number of qwords; max 125)
-
-  [1] vmar:    VMAR handle
-  [2] offset: byte offset within the VMAR (must be 8-byte aligned)
-```
-
-#### Description
-
-The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the read returns a consistent snapshot; this is intended as a debugger primitive, not a performance path.
-
-#### Capabilities
-
-- VMAR handle `[1]`: `r`
-
-#### Return value
-
-`[3..2+count]`: qwords read from the VMAR starting at `[2]`.
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid VMAR handle.
-
-**E_PERM** — `[1]` does not have the `r` cap.
-
-**E_INVAL** — `[2]` not 8-byte aligned; count is 0 or > 125; `[2] + count*8` exceeds the VMAR's size; reserved bits set in `[1]` or `[2]`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
-
-[test 02] returns E_PERM if [1] does not have the `r` cap.
-
-[test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
-
-[test 04] returns E_INVAL if count is 0 or count > 125.
-
-[test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
-
-[test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-
-[test 07] on success, vregs `[3..2+count]` contain the qwords from the VMAR starting at [2] offset.
-
-[test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
-### idc_write
-
-#### Summary
-
-Writes qwords from the caller's vregs into a VMAR. Used for cross-domain memory writes (e.g., debugger writes of an acquired VMAR's contents).
-
-#### Declaration
-
-```
-idc_write([1] vmar, [2] offset, [3..2+count] qwords) -> void
-  syscall_num = 39
-
-  syscall word bits 12-19: count (number of qwords; max 125)
-
-  [1] vmar:    VMAR handle
-  [2] offset: byte offset within the VMAR (must be 8-byte aligned)
-  [3..2+count] qwords: bytes to write into the VMAR
-```
-
-#### Description
-
-The kernel pauses every EC in the VMAR's owning domain for the duration of the call so the write commits without observable interleaving; this is intended as a debugger primitive, not a performance path.
-
-#### Capabilities
-
-- VMAR handle `[1]`: `w`
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid VMAR handle.
-
-**E_PERM** — `[1]` does not have the `w` cap.
-
-**E_INVAL** — `[2]` not 8-byte aligned; count is 0 or > 125; `[2] + count*8` exceeds the VMAR's size; reserved bits set in `[1]` or `[2]`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid VMAR handle.
-
-[test 02] returns E_PERM if [1] does not have the `w` cap.
-
-[test 03] returns E_INVAL if [2] offset is not 8-byte aligned.
-
-[test 04] returns E_INVAL if count is 0 or count > 125.
-
-[test 05] returns E_INVAL if [2] + count*8 exceeds the VMAR's size.
-
-[test 06] returns E_INVAL if any reserved bits are set in [1] or [2].
-
-[test 07] on success, the qwords from vregs `[3..2+count]` are written into the VMAR starting at [2] offset.
-
-[test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
 ## §[page_frame] Page Frame
 
 A page frame is a reference to physical memory. Installing it into virtual memory address regions bound to multiple capability domains creates shared memory.
@@ -1950,9 +1713,9 @@ A device_region with `dev_type = port_io` carries a 16-bit `base_port` and `port
 
 The kernel handles such faults by decoding the faulting MOV instruction, computing the target port as `base_port + (fault_vaddr - VMAR.base)`, executing the corresponding x86-64 `in`/`out` of the operand width, writing the result into the destination GPR (loads) or committing the source value (stores), and advancing RIP past the instruction.
 
-Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — deliver a `thread_fault` event with the protection_fault sub-code.
+Supported decoder forms: `MOV r/m ↔ reg` and `MOV r/m ← imm` with operand widths of 1, 2, or 4 bytes. Other instruction forms targeting the range — `IN`/`OUT` named mnemonics, `INS`/`OUTS`, 8-byte operand widths, and `LOCK`-prefixed variants — cause an unhandled thread fault and teardown of the owning capability domain.
 
-Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, delivers a `memory_fault` event. Accesses with computed offset `>= port_count` deliver a `memory_fault` event.
+Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or a write MOV when `cur_rwx.w = 0`, causes an unhandled memory fault and teardown of the owning capability domain. Accesses with computed offset `>= port_count` cause the same unhandled memory fault teardown.
 
 [test 01] `map_mmio` returns E_INVAL if [2].field0.dev_type = port_io and the running architecture is not x86-64.
 
@@ -1964,17 +1727,17 @@ Effective permissions follow `VMAR.cur_rwx`: a read MOV when `cur_rwx.r = 0`, or
 
 [test 05] a 1-, 2-, or 4-byte MOV store to `VMAR.base + offset` (offset < port_count, `cur_rwx.w = 1`) commits the source value to port `base_port + offset` (observable on a loopback device_region as a subsequent MOV load returning that value), and execution resumes at the instruction immediately following the MOV.
 
-[test 06] a MOV access to `VMAR.base + offset` with `offset >= port_count` delivers a `memory_fault` event.
+[test 06] a MOV access to `VMAR.base + offset` with `offset >= port_count` causes an unhandled memory fault and teardown of the owning capability domain.
 
-[test 07] a MOV load when `VMAR.cur_rwx.r = 0` delivers a `memory_fault` event.
+[test 07] a MOV load when `VMAR.cur_rwx.r = 0` causes an unhandled memory fault and teardown of the owning capability domain.
 
-[test 08] a MOV store when `VMAR.cur_rwx.w = 0` delivers a `memory_fault` event.
+[test 08] a MOV store when `VMAR.cur_rwx.w = 0` causes an unhandled memory fault and teardown of the owning capability domain.
 
-[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 09] an `IN`, `OUT`, `INS`, or `OUTS` instruction targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
 
-[test 10] a `LOCK`-prefixed MOV targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 10] a `LOCK`-prefixed MOV targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
 
-[test 11] an 8-byte MOV access targeting the VMAR delivers a `thread_fault` event with the protection_fault sub-code.
+[test 11] an 8-byte MOV access targeting the VMAR causes an unhandled thread fault and teardown of the owning capability domain.
 
 
 ### §[device_irq] Device IRQ Delivery
@@ -2566,7 +2329,7 @@ cap (word 0, bits 48-63):
 | 1 | `copy` | transferring this handle via copy to another capability domain |
 | 2 | `xfer` | transferring capabilities on this port (attaching handles to a suspension event payload, or to a reply payload) |
 | 3 | `recv` | reading events off this port and receiving the associated reply capability |
-| 4 | `bind` | using this port as the `exit_port` of a `create_vcpu` or as an `event_route` registration target; pins the port's bind-side lifetime |
+| 4 | `bind` | using this port as the `exit_port` of a `create_vcpu`; pins the port's bind-side lifetime |
 | 5 | `restart_policy` | port behavior on domain restart: 0=drop, 1=keep (see §[restart_semantics]) |
 | 6 | `suspend` | using this port as the destination of a `suspend` syscall |
 
@@ -2751,7 +2514,7 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 **E_INVAL** — reserved bits set in `[1]`.
 
-**E_CLOSED** — port has no bind-cap holders, no event_routes targeting it, no vCPU `exit_port` bindings to it, and no queued events (call returns immediately rather than blocking); also raised if the port becomes terminally closed while a recv is blocked.
+**E_CLOSED** — port has no bind-cap holders, no vCPU `exit_port` bindings to it, and no queued events (call returns immediately rather than blocking); also raised if the port becomes terminally closed while a recv is blocked.
 
 **E_TIMEOUT** — `[2] timeout_ns` is nonzero, no sender queued, and none becomes queued within the deadline.
 
@@ -2765,9 +2528,9 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 [test 03] returns E_INVAL if any reserved bits are set in [1].
 
-[test 04] returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, no vCPU `exit_port` pinning it, and no queued events.
+[test 04] returns E_CLOSED if the port has no bind-cap holders, no vCPU `exit_port` pinning it, and no queued events.
 
-[test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port, no vCPU `exit_port` pins it, and no events are queued.
+[test 05] returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no vCPU `exit_port` pins it, and no events are queued.
 
 [test 06] returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
 
@@ -2791,27 +2554,27 @@ When multiple senders are queued on the port, the kernel selects the highest-pri
 
 [test 16] on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
-[test 17] returns E_CLOSED if `restrict` clears the `bind` cap on the only `bind`-cap-holding handle while no event_routes target the port and no vCPU `exit_port` pins it; the recv call observes this on its very next invocation against the (still-recv-capable) handle.
+[test 17] returns E_CLOSED if `restrict` clears the `bind` cap on the only `bind`-cap-holding handle while no vCPU `exit_port` pins it; the recv call observes this on its very next invocation against the (still-recv-capable) handle.
 
 [test 18] does NOT return E_CLOSED when `restrict` clears the `suspend` cap on a port whose `bind`-cap holder remains: the `suspend` cap does not contribute to bind-side lifetime, so a recv with a finite `timeout_ns` returns `E_TIMEOUT` (no sender queued) rather than E_CLOSED.
 
 
 ### §[event_type] Event Type
 
-Event type identifies the kind of event an event route binds or that a reply originated from.
+Event type identifies whether a received event came from an explicit suspension or a vCPU exit.
 
 | Value | Name | Description |
 |---|---|---|
 | 0 | _reserved | |
-| 1 | memory_fault | invalid read/write/execute, unmapped access, protection violation |
-| 2 | thread_fault | arithmetic fault, illegal instruction, alignment check, stack overflow |
-| 3 | breakpoint | software or hardware breakpoint trap |
+| 1 | _reserved | |
+| 2 | _reserved | |
+| 3 | _reserved | |
 | 4 | suspension | EC suspended via the `suspend` syscall (subsumes IDC call delivery; the receiver inspects/mutates the suspended EC's state per §[event_state] gated by the `read`/`write` caps on the EC handle the suspender used) |
 | 5 | vm_exit | vCPU exited guest mode |
 | 6 | _reserved | |
 | 7..31 | _reserved | |
 
-Sub-codes within an event type (e.g., read vs write vs execute within memory_fault; arithmetic vs illegal_instruction vs alignment vs stack_overflow within thread_fault; the architecture-specific exit reason within vm_exit) are carried in the event payload rather than as separate event type values.
+Sub-codes within `vm_exit` are carried in the event payload rather than as separate event type values.
 
 ### §[event_state] Event State
 
@@ -3019,128 +2782,6 @@ Exit payload per sub-code (up to 3 vregs = 24 bytes; unused vregs in the payload
 | unknown | raw ESR_EL2 | _reserved | _reserved |
 | initial_state | _reserved | _reserved | _reserved |
 
-## §[event_route] Event Route
-
-An event route is a kernel-held binding of events generated by an execution context to a given port, such that the execution context is suspended on the port when the event occurs. Event routes are not handles — they are identified by the `(execution_context, event_type)` tuple and cleared either by explicit syscall or by destruction of the execution context they are bound to.
-
-The registerable event types (per §[event_type]) are `memory_fault` (1), `thread_fault` (2), and `breakpoint` (3). `suspension` (4) and `vm_exit` (5) are not registered through these syscalls — `suspension` is delivered to the port specified in the `suspend` syscall directly, and `vm_exit` is bound at `create_vcpu` to the vCPU's exit_port.
-
-When an event of a registered type fires for an EC, the kernel suspends the EC and delivers an event of the corresponding type on the bound port per §[event_state]; the receiver may modify the EC's state and reply through the included reply capability to resume it.
-
-When an event of a registerable type fires for an EC and no route is bound for `(EC, event_type)` — never bound, cleared, or the bound port lost its last `bind` holder — the kernel resolves the event per the no-route fallback:
-
-| event_type | Fallback |
-|---|---|
-| memory_fault | the EC's capability domain is restarted if its self-handle has the `restart` cap (per §[restart_semantics]); otherwise the capability domain is destroyed |
-| thread_fault | the EC is terminated |
-| breakpoint | the event is dropped; the kernel advances past the trapping instruction and resumes the EC |
-
-`suspension` and `vm_exit` always have a bound port by construction (the `suspend` syscall's `port` argument and the `create_vcpu` `exit_port` respectively), so the no-route fallback does not apply to them.
-
-### bind_event_route
-
-#### Summary
-
-Installs the kernel-held binding `(target, event_type) → port`.
-
-#### Declaration
-
-```
-bind_event_route([1] target, [2] event_type, [3] port) -> void
-  syscall_num = 50
-
-  [1] target:     EC handle
-  [2] event_type: u64; must be a registerable event type (1, 2, 3, or 6)
-  [3] port:       port handle
-```
-
-#### Description
-
-If a binding already exists for `(target, event_type)`, it is replaced atomically — there is no window during which the route falls back to the no-route handling.
-
-#### Capabilities
-
-- EC handle `[1]`: `bind` if no prior route exists for `(target, event_type)`; `rebind` if one does.
-- Port handle `[3]`: `bind`
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid EC handle; `[3]` is not a valid port handle.
-
-**E_PERM** — `[3]` lacks `bind`; no prior route exists and `[1]` lacks `bind`; a prior route exists and `[1]` lacks `rebind`.
-
-**E_INVAL** — `[2]` is not a registerable event type (i.e., not in {1, 2, 3, 6}); reserved bits set in `[1]`, `[2]`, or `[3]`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
-
-[test 02] returns E_BADCAP if [3] is not a valid port handle.
-
-[test 03] returns E_INVAL if [2] is not a registerable event type (i.e., not in {1, 2, 3, 6}).
-
-[test 04] returns E_INVAL if any reserved bits are set in [1], [2], or [3].
-
-[test 05] returns E_PERM if [3] does not have the `bind` cap.
-
-[test 06] returns E_PERM if no prior route exists for ([1], [2]) and [1] does not have the `bind` cap.
-
-[test 07] returns E_PERM if a prior route exists for ([1], [2]) and [1] does not have the `rebind` cap.
-
-[test 08] on success, when [2] subsequently fires for [1], the EC is suspended and an event of type [2] is delivered on [3] per §[event_state] with the reply handle id placed in the receiver's syscall word `reply_handle_id` field.
-
-[test 09] on success when a prior route existed, the replacement is observable atomically: every subsequent firing of [2] for [1] is delivered to [3], and no firing in the interval is delivered to the prior port or to the no-route fallback.
-
-[test 10] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
-### clear_event_route
-
-#### Summary
-
-Removes the binding for `(target, event_type)`. Subsequent firings of that event type for the EC fall back to the no-route handling defined above.
-
-#### Declaration
-
-```
-clear_event_route([1] target, [2] event_type) -> void
-  syscall_num = 51
-
-  [1] target:     EC handle
-  [2] event_type: u64; must be a registerable event type
-```
-
-#### Capabilities
-
-- EC handle `[1]`: `unbind`
-
-#### Errors
-
-**E_BADCAP** — `[1]` is not a valid EC handle.
-
-**E_PERM** — `[1]` does not have the `unbind` cap.
-
-**E_INVAL** — `[2]` is not a registerable event type; reserved bits set in `[1]` or `[2]`.
-
-**E_NOENT** — no binding exists for `([1], [2])`.
-
-#### Tests
-
-[test 01] returns E_BADCAP if [1] is not a valid EC handle.
-
-[test 02] returns E_PERM if [1] does not have the `unbind` cap.
-
-[test 03] returns E_INVAL if [2] is not a registerable event type.
-
-[test 04] returns E_INVAL if any reserved bits are set in [1] or [2].
-
-[test 05] returns E_NOENT if no binding exists for ([1], [2]).
-
-[test 06] on success, the binding for ([1], [2]) is removed; subsequent firings of [2] for [1] follow the no-route fallback above.
-
-[test 07] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
-
-
 ## §[reply] Reply
 
 A reply is a one-shot capability referencing a suspended execution context that has been dequeued from a port by a receive but has not yet been resumed. Holding a reply handle authorizes resuming or abandoning the suspended sender; consuming the handle (via `reply` or `delete`) is the only way to free the suspended sender.
@@ -3208,14 +2849,14 @@ reply([128-N..127] pair_entries when pair_count > 0) -> void
 
 #### Description
 
-State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend, the EC handle used at `bind_event_route` for fault events, the vCPU EC handle for vm_exit).
+State modifications written to the receiver's event-state vregs (per §[event_state] / §[vm_exit_state]) between recv and reply are applied to the suspended EC's state on resume, gated by the `write` cap on the EC handle that originated the binding (the suspending EC handle for explicit suspend or the vCPU EC handle for vm_exit).
 
 The reply handle id rides in the syscall word rather than vreg 1 so the GPR-backed event-state vregs (1..13 on x86-64; 1..31 on aarch64) survive intact across the reply syscall — receivers handling exits can keep modified guest GPRs in registers throughout the handler and on into the syscall, preserving the L4-style IPC fast path.
 
 The reply handle is typed by the originating event_type at recv time. The kernel routes the reply on this type:
 
 - For replies typed as `vm_exit`, the kernel reads the §[vm_exit_state] window from the receiver's user stack (vregs 14..N for that arch), projects it onto the vCPU's guest state gated by the `write` cap, and re-enters guest mode. As a special case, when the receiver writes the `initial_state` sub-code into the reply (vreg 70 on x86-64 / vreg 117 on aarch64), the kernel does NOT enter guest mode; instead it keeps the vCPU not-started and re-delivers an initial vm_exit on the bound exit_port. This is how a receiver acknowledges the initial vm_exit (§[create_vcpu]) without yet supplying real guest state.
-- For all other reply types (`suspension`, `memory_fault`, `thread_fault`, `breakpoint`), the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
+- For `suspension` replies, the kernel applies receiver modifications to the GPR-backed event-state vregs only (vregs 1..13 on x86-64 / 1..31 on aarch64) gated by the `write` cap, and resumes the suspended EC at its pre-suspension instruction pointer. The §[vm_exit_state] window is not read.
 
 The receiver knows the reply's type because the kernel returned the originating `event_type` in the receiver's syscall word at recv (§[event_state]); the kernel remembers the same type on the kernel-side reply handle so the routing is symmetric without a user-visible cap bit.
 

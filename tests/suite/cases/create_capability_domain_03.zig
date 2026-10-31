@@ -10,7 +10,7 @@
 //   must reject the call with E_PERM before any kernel state mutates.
 //
 //   The runner (runner/primary.zig) constructs each test domain with
-//   `ceilings_inner = 0x001C_011F_3F01_FFFF`, so the test's
+//   `ceilings_inner = 0x001C_011F_2701_FFFF`, so the test's
 //   ec_inner_ceiling is 0xFF — every bit set. With a fully-saturated
 //   caller ceiling, every 8-bit value the test could legally place in
 //   bits 0-7 is a subset, and no test-controlled `ec_inner_ceiling`
@@ -68,7 +68,7 @@ const testing = lib.testing;
 // Runner-supplied baseline for the non-ec_inner_ceiling fields. Mirrors
 // runner/primary.zig's ceilings_inner; we substitute bits 0-7 with the
 // caller's actual ec_inner_ceiling read from slot 0.
-const RUNNER_CEILINGS_INNER_NON_EC: u64 = 0x001C_011F_3F01_FF00;
+const RUNNER_CEILINGS_INNER_NON_EC: u64 = 0x001C_011F_2701_FF00;
 const RUNNER_CEILINGS_OUTER: u64 = 0x0000_003F_03FE_FFFF;
 
 pub fn main(cap_table_base: u64) void {

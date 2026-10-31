@@ -10,7 +10,7 @@
 //   set and trip the subset check. The runner primary spawns each test
 //   as a child capability domain with `vmar_inner_ceiling = 0x01FF`
 //   (every defined bit set: move, copy, r, w, x, mmio, max_sz, dma —
-//   see runner/primary.zig's `ceilings_inner = 0x001C_011F_3F01_FFFF`).
+//   see runner/primary.zig's `ceilings_inner = 0x001C_011F_2701_FFFF`).
 //   With every r/w/x bit already permitted by the ceiling, the
 //   strict-superset case is unconstructible from inside this domain.
 //
