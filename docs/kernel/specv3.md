@@ -894,6 +894,7 @@ Termination marks any reply handles whose suspended sender was the terminated th
 
 [test 05] on success, syscalls invoked with any handle to the terminated thread return E_TERM and remove that handle from the caller's table on the same call.
 
+[test 06] evicting a stale copied thread handle unlinks it from the copy-derivation tree; a later revoke of its ancestor does not affect an unrelated handle minted into the freed slot.
 
 [test 07] on success, reply handles whose suspended sender was the terminated thread return E_ABANDONED on subsequent operations.
 

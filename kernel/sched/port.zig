@@ -691,15 +691,24 @@ pub fn createPort(caller: *Thread, caps: u64) i64 {
 /// so the two are interchangeable.
 fn terminalSuspendResult(process_ref: SlabRef(Process), target_slot: u12, target_ref: SlabRef(Thread)) i64 {
     // The thread lock must be released before taking the process lock.
-    // Revalidate the slot identity: another caller may have removed and
-    // reused it while suspend was resolving the target on this core.
+    // Snapshot the slot identity before entering the tree -> process lock
+    // order required to unlink a copied handle from the derivation tree.
     const lr = process_ref.lockIrqSave(@src()) catch return errors.E_TERM;
+    var instance: ?u64 = null;
     if (capability.resolveHandleOnProcess(lr.ptr, target_slot, .thread)) |entry| {
         if (capability.typedRef(Thread, entry.*)) |current_ref| {
-            if (current_ref.eql(target_ref)) capability.clearAndFreeSlot(lr.ptr, target_slot, entry);
+            if (current_ref.eql(target_ref)) instance = entry.instance;
         }
     }
     process_ref.unlockIrqRestore(lr.irq_state);
+    if (instance) |expected_instance| {
+        // The helper revalidates the instance after lock reacquisition and
+        // detaches parent/children before freeing the slot. If another caller
+        // consumed it in the meantime, the terminal result is still E_TERM.
+        _ = stygia.caps.derivation.deleteAndDetachExpected(
+            @bitCast(process_ref), target_slot, @bitCast(target_ref), .thread, 0, expected_instance,
+        );
+    }
     return errors.E_TERM;
 }
 
