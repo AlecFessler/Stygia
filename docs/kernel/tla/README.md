@@ -432,12 +432,12 @@ here.
 
 | Spec | Model | Notes |
 |---|---|---|
-| §2.1 lifecycle word, 7 states | `threads[e].st`, CAS = guarded atomic actions | + `"freed"` as the post-edge-10 pseudo-state |
+| §2.1 lifecycle word, 7 states | `threads[e].st`, CAS = guarded atomic actions | + `"finalizing"`/`"freed"` as model-only release-body phases around G11's `dead` marker and slot zero |
 | ~~§2.1.1 idle thread~~ | **nothing to model — §2.1.1 WITHDRAWN in doc rev 16** | **G7 CLOSED by the doc retracting.** There is no per-core idle thread (`idle_thread` never assigned; `parkAndAwaitIRQ` is the real mechanism and replaced it to fix a cross-core kstack-sharing bug). A core with an empty run queue holds no thread, so the model having none is faithful, not a gap. Unaffected: the `.idle_wait` thread state / `wait.kind == .idle`, which are a USER thread choosing to idle |
 | §2.2 wait descriptor | `pk/shot/pd` fields; payload writes abstract | saved-frame ban surfaces only as `InvNoUAF`; the timed-vs-port flavor is encoded by `shot` alone. **Rev 8: the staged destination `dst` is DELETED (M-2)** — §2.2 now calls staging a locality hint and every placement computes its destination fresh |
 | §2.2 `payload_done` | `pd`; claimant release-store = `WakePendDone`/`IrqPendDone`/`RvDeliver` pended arm | reset at discharge (G8) |
 | §2.2 "what is NOT in here" (M-1) | **no model construct, deliberately** | `priority`/`affinity` are stable per-thread words; their *ordering* effect is below set-queue granularity and their *destination* effect is the nondeterministic placement below |
-| §2.3 per-core words | `cores[c].q/cur/pc/outg`; `pc` distinguishes `dispatchLoad` from `ecrun`; `committed_thread` etc. absent as designed | queues are sets, FIFO abstracted. `teardown_pending` is deliberately unmodelled; see G16 |
+| §2.3 per-core words | `cores[c].q/cur/pc/outg/parked/wake/pending/active`; `pc` distinguishes `dispatchLoad` from `ecrun`; `committed_thread` etc. absent as designed | queues are sets, FIFO abstracted. `parked`/`wake` model §3.4's locked park and wake IPI (G14); `pending`/`active` carry the same process identity and generation across park-stack teardown (G16). Physical refcount arithmetic remains abstract |
 | §2.4 `owner_core` | `own`, NULL outside validity set | poison = NULL |
 | §2.4 `pin_depth` + pin class (F3) | `pin`; wake/suspend claim actions pin the protected target thread, pin-class locks pin the executing thread via `PinAcq`/`PinRel`; `dpin` is the running-target remote-directive lifetime pin | "computed membership" is the analyzer's job; model has one representative class. `RetireEnabled` gates on target `pin = 0` and `dpin = FALSE`; `InvPinCells` permits transient ready publish pins because containment is still the run queue. `dpin` is deliberately separate because Zig's directive waiter pin blocks retire/finalize but must not block the target owner's tick/boundary directive consumption |
 | §2.4 `pin_depth` ORDER (C1) | `PIN_BUMP_FIRST` + `plk \in {none,held,preB,postD}` + `PinBump`/`PinUnlock` + `InvNoPreemptedLockHolder` | **pin-class half CHECKED** (the `pinord` falsifier); **claim half BELOW GRANULARITY and not checked** — see finding C1 |
@@ -646,27 +646,25 @@ incomparable/reconstruction.
   core; here it is a core per kstack. Any invariant whose prose quantifies
   over a PAIR should be checked against the model's arity before it is
   believed to be encoded.
-- **G16 (NEW, rev 16, LP — preliminary reviewer parity blocker,
-  LEDGERED, not modelled).** **`PerCore.teardown_pending` and
-  `TeardownRequest` are normative in §2.3/§8.2 but have no TLA+ field.**
-  The model represents the lifecycle consequence of teardown with
-  `ProcessDie` (dead-process marking) plus `RetireThread`; it does not represent
-  the per-core park-stack handoff that carries the process ref across the
-  self-delete hop.
-
-  **What is lost:** the model cannot check that the request is produced
-  before self-retire, consumed exactly once on the park stack, or that the
-  same process ref is held across dead-mark and phase 2. Those are
-  implementation-ordering facts below the current per-thread lifecycle graph.
-  The marked spec now defines the payload shape directly:
-  `{ kind: self_delete | unhandled_fault, process: SlabRef(Process) }`.
-
-  **Why not model it here:** doing so properly needs the same process
-  structure needed (`Process`, process refs, and scheduler-context phase-1/
-  phase-2 ownership). A standalone Boolean would be a ledger-silencing
-  token: it would not prove ref identity, exactly-once consumption, or
-  dead-mark ordering. This gap needs a dedicated model revision, not
-  as a fake projection in the thread-only model.
+- **G16 (process-reference handoff now modelled in this lifecycle module;
+  focused gates passed).** A thread in a live process queues a typed
+  `TeardownRequest` carrying process identity and generation before its
+  self-retire. The IRQ-masked syscall/fault entry cannot be timer-preempted
+  between those steps. After the owner leaves its kernel stack, the park-stack
+  consumer clears `pending`, takes the same reference in `active`, and marks
+  the process dead. Phase 2 retires its threads, waits for them to be freed,
+  then releases the active reference. `InvTeardownRefHandoff` requires one
+  matching reference in each phase and one consumption; a lost-reference
+  falsifier fails. A completion probe reaches `done`.
+  The 1-core/1-thread focused safety+liveness check passed 38 distinct states;
+  the 2-core/2-thread check, including same-process and separate-process
+  assignments, passed 18,832 distinct states after active-teardown dispatch gating. This abstraction checks
+  request identity, ownership transfer, the safe-stack boundary, and phase
+  order. It does not represent the individual VMAR, handle, or page-table
+  releases inside phase 2, the physical refcount arithmetic, or process
+  restart; those require separate correspondence review as implementation
+  work. The full all-feature model battery remains pending after state-space
+  growth.
 
 ## Validation gates — results
 
@@ -1313,7 +1311,7 @@ predate removal of obsolete model state. On 2026-10-31, the current default
 all expected falsifiers fired, all expected-clean checks passed, and the
 paired `t1d_min`/`pr4d_min` liveness and reachability checks passed.
 `RUN_XLARGE=1` and `RUN_SLOW=1` were not run in that battery. This is a
-model verdict; the G11, G14, and G16 parity gaps above remain open.
+model verdict; G11, G14, and G16 now have focused gates, while full-battery and code-correspondence review remain open.
 
 **What this validation does NOT establish.** It shows the split preserved
 the model, not that the model still describes the code. No active

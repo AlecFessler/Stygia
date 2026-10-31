@@ -199,6 +199,12 @@ expect_violation g14miss ThreadLifecycle.tla "Invariant InvParkedQueueHasWake is
   -config ThreadLifecycle_g14_missing.cfg
 expect_violation g14live ThreadLifecycle.tla "Temporal properties were violated" \
   -deadlock -config ThreadLifecycle_g14_missing_live.cfg
+# G16: the self-retire -> park-stack -> phase-2 handoff reaches completion;
+# dropping the process reference at consumption violates ownership.
+expect_violation g16probe ThreadProbes.tla "Invariant ProbeNoTeardownDone is violated" \
+  -deadlock -config ThreadLifecycle_g16_probe.cfg
+expect_violation g16bad ThreadLifecycle.tla "Invariant InvTeardownRefHandoff is violated" \
+  -config ThreadLifecycle_g16_bad.cfg
 
 echo "== current safety, TLC deadlock detection ON =="
 expect_pass mtermfix  ThreadLifecycle.tla -config ThreadLifecycle_mtermfix.cfg
@@ -222,6 +228,7 @@ expect_violation vcpu_nocancel ThreadLifecycle.tla "Invariant InvRetiredVcpuCanc
 expect_pass vcpu_cancel ThreadLifecycle.tla -config ThreadLifecycle_vcpu_cancel.cfg
 expect_pass small    ThreadLifecycle.tla -config ThreadLifecycle_small.cfg
 expect_pass g14      ThreadLifecycle.tla -config ThreadLifecycle_g14.cfg
+expect_pass g16      ThreadLifecycle.tla -config ThreadLifecycle_g16_two_core.cfg
 expect_pass large    ThreadLifecycle.tla -config ThreadLifecycle_large.cfg
 expect_pass cr3self  ThreadLifecycle.tla -deadlock -config ThreadLifecycle_cr3self.cfg
 expect_pass medium_nodir ThreadLifecycle.tla -config ThreadLifecycle_medium_nodir.cfg

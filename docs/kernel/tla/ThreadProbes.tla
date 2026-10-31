@@ -52,4 +52,9 @@ ProbeNoRetireFromPended ==
    probe could still skip the state whose suspend result matters. *)
 ProbeNoFinalizingDead ==
   \A e \in Threads: ~(threads[e].st = "finalizing" /\ threads[e].dir = "dead")
+
+(* G16: phase 2 must be reachable from a staged request through self-retire,
+   hop, park-stack consumption, and release of the same process reference. *)
+ProbeNoTeardownDone ==
+  \A p \in Threads: processes[p].phase # "done"
 ====================================================================================
