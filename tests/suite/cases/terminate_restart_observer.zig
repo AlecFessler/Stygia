@@ -14,7 +14,12 @@ const ELF: caps.HandleId = ENTRY + 1;
 const LIBZ: caps.HandleId = ENTRY + 2;
 const TRIGGER: caps.HandleId = ENTRY + 3;
 const TIMEOUT_NS: u64 = 10_000_000_000;
+const Mode = enum { before, after, race };
 var armed: bool = false;
+var race_go: bool = false;
+var race_target: caps.HandleId = 0;
+var race_port: caps.HandleId = 0;
+var race_result: u64 = 0;
 
 fn pause() void {
     switch (builtin.cpu.arch) {
@@ -52,6 +57,13 @@ fn workerEntry() callconv(.c) noreturn {
     // restart and sends the second parent-visible event.
     while (!@atomicLoad(bool, &armed, .acquire)) pause();
     _ = syscall.suspendThread(ownHandle(), ENTRY, &.{});
+    spin();
+}
+fn raceTerminator() callconv(.c) noreturn {
+    while (!@atomicLoad(bool, &race_go, .acquire)) pause();
+    const result = syscall.terminate(race_target).v1;
+    @atomicStore(u64, &race_result, result, .release);
+    _ = syscall.suspendThread(ownHandle(), race_port, &.{});
     spin();
 }
 
@@ -116,6 +128,13 @@ fn makePort(xfer: bool, keep: bool) ?caps.HandleId {
     return handle(syscall.createPort(cap.toU16()).v1);
 }
 pub fn run(comptime terminate_first: bool, base: u64) void {
+    runMode(if (terminate_first) .before else .after, base);
+}
+pub fn runRace(base: u64) void {
+    runMode(.race, base);
+}
+fn runMode(comptime mode: Mode, base: u64) void {
+    var race_winner: u64 = 0;
     const self = caps.readCap(base, caps.SLOT_SELF);
     if (@as(u8, @truncate(self.field0 >> 24)) == CHILD_CRIPC) child(base);
 
@@ -154,13 +173,13 @@ pub fn run(comptime terminate_first: bool, base: u64) void {
     const trigger_reply: caps.HandleId = @truncate((trigger.word >> 32) & 0xFFF);
     if (trigger_reply == 0) return fail(10);
 
-    if (terminate_first) {
+    if (mode == .before) {
         if (syscall.terminate(foreign).v1 != @intFromEnum(errors.Error.OK)) return fail(11);
         if (syscall.reply(first_reply).v1 != @intFromEnum(errors.Error.E_ABANDONED)) return fail(14);
         if (syscall.reply(trigger_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(12);
         const closed = syscall.recv(entry_port, TIMEOUT_NS);
         if (closed.regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) return fail(13);
-    } else {
+    } else if (mode == .after) {
         if (syscall.reply(trigger_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(15);
         const again = syscall.recv(entry_port, TIMEOUT_NS);
         if (again.regs.v1 != @intFromEnum(errors.Error.OK)) return fail(16);
@@ -168,8 +187,46 @@ pub fn run(comptime terminate_first: bool, base: u64) void {
         if (syscall.terminate(foreign).v1 != @intFromEnum(errors.Error.E_TERM)) return fail(17);
         const again_reply: caps.HandleId = @truncate((again.word >> 32) & 0xFFF);
         if (again_reply == 0 or syscall.delete(again_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(19);
+    } else {
+        // The helper and child fault are released by the same parent. Its
+        // completion event witnesses the foreign terminate result; the
+        // retained child bind port then witnesses the corresponding process
+        // outcome without treating a timeout as proof.
+        const completion = makePort(false, false) orelse return fail(21);
+        race_target = foreign;
+        race_port = completion;
+        race_result = @intFromEnum(errors.Error.E_NOENT);
+        @atomicStore(bool, &race_go, false, .release);
+        const helper_caps = caps.ThreadCap{ .susp = true };
+        _ = handle(syscall.createThread(helper_caps.toU16(), @intFromPtr(&raceTerminator), 1, 0, 0).v1) orelse return fail(22);
+        @atomicStore(bool, &race_go, true, .release);
+        if (syscall.reply(trigger_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(23);
+        const done = syscall.recv(completion, TIMEOUT_NS);
+        if (done.regs.v1 != @intFromEnum(errors.Error.OK)) return fail(24);
+        const done_reply: caps.HandleId = @truncate((done.word >> 32) & 0xFFF);
+        if (done_reply == 0 or syscall.reply(done_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(25);
+        const result = @atomicLoad(u64, &race_result, .acquire);
+        if (result == @intFromEnum(errors.Error.OK)) {
+            race_winner = 1;
+            const closed = syscall.recv(entry_port, TIMEOUT_NS);
+            if (closed.regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) return fail(26);
+            if (syscall.reply(first_reply).v1 != @intFromEnum(errors.Error.E_ABANDONED)) return fail(27);
+        } else if (result == @intFromEnum(errors.Error.E_TERM)) {
+            race_winner = 2;
+            const again = syscall.recv(entry_port, TIMEOUT_NS);
+            if (again.regs.v1 != @intFromEnum(errors.Error.OK)) return fail(28);
+            if (syscall.reply(first_reply).v1 != @intFromEnum(errors.Error.E_TERM)) return fail(29);
+            if (syscall.sync(process).v1 != @intFromEnum(errors.Error.OK)) return fail(32);
+            const again_reply: caps.HandleId = @truncate((again.word >> 32) & 0xFFF);
+            if (again_reply == 0 or syscall.delete(again_reply).v1 != @intFromEnum(errors.Error.OK)) return fail(30);
+        } else {
+            return fail(31 + result);
+        }
     }
-    _ = process;
     _ = syscall.restrict(caps.SLOT_SELF, 0);
-    testing.pass();
+    if (mode == .race) {
+        testing.report(testing.PASS_CODE, race_winner);
+    } else {
+        testing.pass();
+    }
 }
