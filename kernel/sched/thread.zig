@@ -757,7 +757,8 @@ pub fn self(caller: *Thread) i64 {
     var slot: u16 = 0;
     while (slot < capability.MAX_HANDLES_PER_PROCESS) {
         const entry = &process.kernel_table[slot];
-        if (entry.ref.ptr == @as(*anyopaque, @ptrCast(caller))) {
+        if (entry.ref.ptr == @as(*anyopaque, @ptrCast(caller)) and
+            entry.ref.gen == caller._gen_lock.currentGen()) {
             const user_word0 = process.user_table[slot].word0;
             if (capability.Word0.typeTag(user_word0) == .thread) {
                 const caps_word = capability.Word0.caps(user_word0);
