@@ -170,11 +170,6 @@ pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x2 = value;
 }
 
-/// Spec §[event_state] vreg 4 — x3 on aarch64.
-pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.x3 = value;
-}
-
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x4 = value;
 }

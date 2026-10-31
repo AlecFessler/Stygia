@@ -28,6 +28,10 @@
 #     stderr; re-review the change, then `--update-skip` to refresh.
 #
 # Why we skip rather than delete:
+#   * caps/process.zig (ProcessCaps/IpcCaps) and libz/caps.zig
+#     (SelfCap/IpcCap) — packed 16-bit kernel/userspace handle-cap ABIs.
+#     Spec §[process] reserves self-cap bits 6-8 and IPC-cap bits 3-4;
+#     deleting these fields would shift live restart and policy bits.
 #   * arch/aarch64/acpi.zig, arch/x64/acpi.zig         — ACPI table layout fields.
 #     We model the full struct so reads at fixed offsets are correct even when
 #     today's code only consumes a subset. Deleting fields would corrupt the
@@ -702,3 +706,11 @@ entity:panic.zig::panic.interface.exactDivisionRemainder    sha256:bcade69a39473
 entity:panic.zig::panic.interface.integerPartOutOfBounds    sha256:b7e26ef6d6d923eb16da93f539a4900da1c9d9d4f7a41bf8646eb55867d75546
 entity:panic.zig::panic.interface.forLenMismatch    sha256:a824d236ed368e4060cfa60942a422a9b01067d03b119056eb42a75cf0dcbd32
 entity:panic.zig::panic.interface.noreturnReturned    sha256:375f14e0df7798859a6aff99d71f886b07c5aea8648038e9a44c47a381177ca4
+entity:caps/process.zig::caps.process.ProcessCaps._reserved_6    sha256:97372bfa833288ff632f461d189c048f07114dbacdab4c08e47168ed0b58211b
+entity:caps/process.zig::caps.process.ProcessCaps._reserved_7    sha256:ee20e265d3d9393dbcbfb1f846cae3e0a7796b2047065ce987eae67fb81dc2e9
+entity:caps/process.zig::caps.process.ProcessCaps._reserved_8    sha256:de00fa14b5356cff21f49c878d8676b0b8365e4b138abaf7fc214c759127ed87
+entity:caps/process.zig::caps.process.IpcCaps._reserved_3_4    sha256:5c46f67aea178f88124d276655c71332a68161830e0b8bc4b6f5ed83e4dfd436
+entity:libz/caps.zig::libz.caps.SelfCap._reserved_6    sha256:97372bfa833288ff632f461d189c048f07114dbacdab4c08e47168ed0b58211b
+entity:libz/caps.zig::libz.caps.SelfCap._reserved_7    sha256:ee20e265d3d9393dbcbfb1f846cae3e0a7796b2047065ce987eae67fb81dc2e9
+entity:libz/caps.zig::libz.caps.SelfCap._reserved_8    sha256:de00fa14b5356cff21f49c878d8676b0b8365e4b138abaf7fc214c759127ed87
+entity:libz/caps.zig::libz.caps.IpcCap._reserved_3_4    sha256:5c46f67aea178f88124d276655c71332a68161830e0b8bc4b6f5ed83e4dfd436

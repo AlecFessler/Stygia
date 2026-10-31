@@ -178,7 +178,6 @@ pub const GuestInterrupt = extern struct {
     error_code_valid: bool,
     _pad: [5]u8 = .{0} ** 5,
     error_code: u32 = 0,
-    _pad2: [4]u8 = .{0} ** 4,
 };
 
 /// Exception to inject into a guest vCPU.

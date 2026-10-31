@@ -3429,11 +3429,6 @@ pub fn setEventAddr(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rdx = value;
 }
 
-/// Spec §[event_state] vreg 4 — rbp on x86-64.
-pub fn setEventVreg4(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.rbp = value;
-}
-
 pub fn setEventVreg5(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rsi = value;
 }

@@ -405,7 +405,7 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps_arg: u64) i64 {
 /// test 04), then runs the per-type release and clears the slot.
 ///
 /// Lock order: `tree_mutex` → caller's process gen-lock. Matches the
-/// order taken by `derivation.revoke`/`derivation.derive`.
+/// order taken by `derivation.revoke`/`derivation.deriveExpected`.
 pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
 

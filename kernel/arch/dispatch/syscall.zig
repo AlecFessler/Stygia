@@ -44,16 +44,6 @@ pub fn setSyscallVreg3(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-/// Write syscall-return vreg 4 for multi-vreg payloads. Same physical reg as event-state
-/// vreg 4 (rbp on x86-64; x3 on aarch64).
-pub fn setSyscallVreg4(ctx: *ArchCpuContext, value: u64) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.setEventVreg4(ctx, value),
-        .aarch64 => aarch64.interrupts.setEventVreg4(ctx, value),
-        else => unreachable,
-    }
-}
-
 /// Write event-state vreg 2 — the per-event-type sub-code (Spec
 /// §[event_state]). x86-64: rbx; aarch64: x1.
 pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {

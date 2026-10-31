@@ -189,15 +189,6 @@ pub fn revoke(caller_process: ErasedSlabRef, handle: u64) i64 {
 /// concurrent copy/delete touch the fresh slot first; linking over it
 /// would corrupt the tree, dropping the link only costs revoke
 /// reachability for a handle the racer already owns).
-pub fn derive(
-    parent_dom_ref: ErasedSlabRef,
-    parent_slot: u12,
-    child_dom_ref: ErasedSlabRef,
-    child_slot: u12,
-) bool {
-    return deriveInternal(parent_dom_ref, parent_slot, null, child_dom_ref, child_slot);
-}
-
 pub fn deriveExpected(
     parent_dom_ref: ErasedSlabRef,
     parent_slot: u12,
