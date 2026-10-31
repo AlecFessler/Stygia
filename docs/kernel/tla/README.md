@@ -676,8 +676,8 @@ incomparable/reconstruction.
   liveness verdict. This abstraction checks request identity, ownership
   transfer, the safe-stack boundary, and phase order. It does not represent
   the individual VMAR, handle, or page-table releases inside phase 2, the
-  physical refcount arithmetic, or process restart; those require separate
-  correspondence review as implementation work. The full all-feature G16
+  physical refcount arithmetic. The bounded restart extension below
+  covers the process gate and lifecycle outcomes, not physical byte counts. The full all-feature G16
   safety and liveness configuration remains unverified.
 
 ## Validation gates — results
@@ -876,8 +876,7 @@ what its tooling actually RAN.
   `persist` keeps a thread running while its process's VMARs are freed. **The
   instructive part is the method**: this README's sufficiency table was
   derived by walking the spec's SYSCALL list, and `§[restart_semantics]`
-  is not a syscall section. **Current status (2026-10-31): process restart
-  remains a required core feature under the approved spec.** The earlier
+  is not a syscall section. **Status: the bounded restart lifecycle extension below now covers the gate, quiescence, and per-thread outcomes.** The earlier
   rev-16 downgrade was incorrect: implementation absence does not remove
   the obligation. Stygia-o4a.16 tracks implementation and model coverage.
   The FINDING is unaffected and is the reason this entry stays: what C-5
@@ -1827,8 +1826,8 @@ distinction a closure table exists to make.
 | `delete(SLOT_SELF)` process teardown; vCPU pre-loop | §8.2 / §8.1 | OUT OF SCOPE, stated: scheduler-context teardown phases and the degenerate-hop loop | park-stack code |
 | IPC fast paths | §9.4 fused compositions | `FastPath`, `ReplyFP` as ideal atomic compositions | pinned asm sites |
 | **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireThread` / `Terminate` | the exiting process's teardown |
-| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **REQUIRED BY APPROVED SPEC; MISSING FROM IMPLEMENTATION AND MODEL (Stygia-o4a.16).** The tree implements policy plumbing and ceiling checks, but no process-restart path. The seven `restart_semantics_*.zig` cases do not test restart behavior; six are labeled degraded smoke variants. A thread in any state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + frame reset under the won claim + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
-| **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps a thread *running* while its process's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live thread, and it collides directly with `active_root` / translation quiescence (W6): a running thread on a root being rewritten is what `awaitProcessQuiesced` exists to prevent | **not modelled** | — |
+| **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | bounded `RestartRetire` + `RestartApply` after quiescence | old generation freed; new generation ready at saved entry (frame bytes abstracted) | `restart_success` probe; `restart` safety/liveness |
+| **§[restart_semantics] `restart_policy = 2` (persist)** | bounded `RestartApply` after quiescence | non-retired state/frame preserved; retired trigger is not a survivor | `restart_persist` and `restart_zero` probes |
 | `sync`, `restrict`, `ack`, all VMAR/page-frame/VM-policy calls, `create_port`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any thread's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability or memory state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 
 Two rows in that table are the round-7 additions that closed acceptance
@@ -1954,3 +1953,11 @@ unwired assert protects nothing.
 Everything beyond the boundary and the bounded scope remains
 unestablished. A green run here is one closed layer — the
 interleaving-protocol layer — of a multi-instrument argument.
+
+## §[restart_semantics] bounded lifecycle extension (2026-10-31)
+
+`ThreadLifecycle.tla` now extends the existing G16 request, self-retire, park-stack consume, and phase-2 machine. `RESTART_ON=FALSE` preserves the pre-restart transition relation in all existing configs. The new `restart` row uses `RESTART_ON=TRUE` with two threads, one core, and one restart per process; it retains `TypeOK`, `InvTeardownRefHandoff`, `InvS4Holder`, `InvNoLostOneShot`, `InvRetiredPdOrdered`, `InvNoUAF`, and `LiveTeardown`. The six adjacent probe rows must each violate their named reachability invariant. They cover successful relaunch, unstable/missing snapshot fallback, no-survivor fallback, reply drop, reply keep, and a policy-2 survivor. The single-thread zero-survivor probe admits a retired policy-2 trigger, which is *not* a survivor; it must reach ordinary teardown. `run.sh` includes all seven new rows in its default battery.
+
+The restart gate is `processes[p].phase` from trigger through completion. A dispatcher checks the phase at commitment; the post-commit load checks it again. The park-stack consumer retains the original process generation and reference. `RestartQuiesced` requires every core to leave that process before policy application. Policy 0 retires/finalizes; policy 1 retires/finalizes the old thread and relaunches a new generation as ready at the original entry (saved frame contents are abstracted); policy 2 preserves only a non-retired thread. The success action preserves process generation, records a full-span snapshot copy, applies reply drop/keep, clears the gate, and enqueues policy-1 threads. Missing/unstable snapshot and zero runnable survivor flow to the existing `TeardownRetire`/`FinishTeardown` path.
+
+The `snapshotGood` Boolean abstracts the source binding and stability predicates; `snapshotCopied` denotes a copy of every target byte, including zeroed holes, but the machine does not count bytes, mappings, handle references, PF refcounts, or VMAR policy combinations. It treats the policy walk as one action after quiescence and thus cannot detect a defect inside a partially completed policy walk or allocation failure after a replacement thread is created. These need kernel tests and code review. Mixed-size ARM snapshot execution remains blocked by the separately tracked `mapPageSized` 4 KiB-only assertion; the TLA success probe does not validate that hardware path. The kernel/model correspondence is in `kernel/caps/process.zig` (`claimExitLocked`, `restartProcess`), `kernel/sched/scheduler.zig` (`queueCurrentTeardown`, `drainTeardown`, `runProcessTeardown`, dispatch filter), `kernel/sched/thread.zig` (`destroyThreadForRestart`), and `kernel/memory/vmar.zig` (`restartDecommit`, `restartSnapshot`).

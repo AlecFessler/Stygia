@@ -77,6 +77,7 @@ CONSTANTS
                 \* FALSE is the missing-wake falsifier.
   G16_ON,       \* BOOLEAN: model self-delete's scheduler-stack handoff.
   G16_DROP_REF, \* BOOLEAN: falsifier: consumer loses the process ref.
+  RESTART_ON,   \* BOOLEAN: bounded §[restart_semantics] G16 extension.
   DROP_BUDGET,  \* Nat: stale/bad-port owner failure events (DirDrop is the
                 \* only unbounded generator in the directive machine --
                 \* arm/fail/ack/arm cycles freely -- and at 3 Threads that
@@ -207,6 +208,7 @@ ASSUME REQUEUE_ON \in BOOLEAN
 ASSUME WAKE_IPI \in BOOLEAN
 ASSUME G16_ON \in BOOLEAN
 ASSUME G16_DROP_REF \in BOOLEAN
+ASSUME RESTART_ON \in BOOLEAN
 
 (***************************************************************************)
 (* State                                                                   *)
@@ -427,6 +429,7 @@ TypeOK ==
                       dfs: BOOLEAN,  \* GHOST: returned SUCCESS falsely
                       dsrc: Threads \cup {NULL},
                       proc: Threads,
+                      rp: 0..2, \* §[restart_semantics] thread policy
                       dd: BOOLEAN]]
   /\ cores \in [Cores -> [q: SUBSET Threads,
                           cur: Threads \cup {NULL},
@@ -437,8 +440,10 @@ TypeOK ==
                                "rvdeliver","s7ret","stealCommit"},
                           outg: Threads \cup {NULL},
                           irq: IrqFrames]]
-  /\ processes \in [Threads -> [phase: {"live","queued","dead","done"},
-                               gen: 0..1, consumes: 0..1]]
+  /\ processes \in [Threads -> [phase: {"live","queued","restart","dead","done"},
+                               gen: 0..1, consumes: 0..1, restarts: 0..1,
+                               snapshotGood: BOOLEAN, snapshotCopied: BOOLEAN,
+                               replyKeep: BOOLEAN, reply: {"pending","refused"}]]
   /\ tb \in 0..TERM_BUDGET
   /\ cb \in 0..CR_BUDGET
   /\ db \in 0..1
@@ -454,7 +459,12 @@ ThreadCtx(c) == /\ cores[c].pc = "ecrun"
 (* Init: every thread starts `ready` in some core's run queue.                 *)
 (***************************************************************************)
 Init ==
-  /\ \E f \in [Threads -> Cores], p \in [Threads -> Threads]:
+  /\ \E f \in [Threads -> Cores], p \in [Threads -> Threads],
+         rp \in [Threads -> 0..2], sg \in [Threads -> BOOLEAN],
+         rk \in [Threads -> BOOLEAN]:
+       /\ (~RESTART_ON => /\ rp = [e \in Threads |-> 0]
+                           /\ sg = [e \in Threads |-> TRUE]
+                           /\ rk = [e \in Threads |-> TRUE])
        /\ (~G16_ON => p = [e \in Threads |-> e])
        /\ cores = [c \in Cores |->
                     [q |-> {e \in Threads : f[e] = c},
@@ -472,9 +482,12 @@ Init ==
                    dres |-> "none", dpin |-> FALSE,
                    dbad |-> FALSE, gen |-> 0, dgen |-> 0,
                    dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
-                   dsrc |-> NULL, proc |-> p[e], dd |-> FALSE]]
+                   dsrc |-> NULL, proc |-> p[e], rp |-> rp[e], dd |-> FALSE]]
        /\ processes = [q \in Threads |->
-                         [phase |-> "live", gen |-> 0, consumes |-> 0]]
+                         [phase |-> "live", gen |-> 0, consumes |-> 0,
+                          restarts |-> 0, snapshotGood |-> sg[q],
+                          snapshotCopied |-> FALSE, replyKeep |-> rk[q],
+                          reply |-> "pending"]]
   /\ tb = TERM_BUDGET
   /\ cb = CR_BUDGET
   /\ db = IF S7_ON THEN 1 ELSE 0
@@ -509,6 +522,7 @@ DispatchThread(c, e) ==
   /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ ~threads[e].dd                                    \* S7 filter passes
+  /\ (~RESTART_ON \/ processes[threads[e].proc].phase = "live")
   /\ c \in threads[e].am
   /\ cores' = [cores EXCEPT ![c].q = @ \ {e}, ![c].cur = e,
                             ![c].pc = "dispatchLoad"]
@@ -518,7 +532,8 @@ DispatchThread(c, e) ==
 DispatchAbort(c) ==
   LET e == cores[c].cur IN
   /\ cores[c].pc = "dispatchLoad" /\ cores[c].irq = NULL /\ e # NULL
-  /\ threads[e].st # "running"
+  /\ \/ threads[e].st # "running"
+     \/ (RESTART_ON /\ processes[threads[e].proc].phase # "live")
   /\ cores' = [cores EXCEPT ![c].cur = NULL, ![c].pc = "idle"]
   /\ threads' = IF threads[e].st = "retired"
             THEN [threads EXCEPT ![e].st = "finalizing", ![e].mo = FALSE,
@@ -535,6 +550,7 @@ DispatchLoad(c) ==
   LET e == cores[c].cur IN
   /\ cores[c].pc = "dispatchLoad" /\ cores[c].irq = NULL /\ e # NULL
   /\ threads[e].st = "running"
+  /\ (~RESTART_ON \/ processes[threads[e].proc].phase = "live")
   /\ cores' = [cores EXCEPT ![c].pc = "ecrun"]
   /\ threads' = [threads EXCEPT ![e].vm =
                         IF e \in VCPU_THREADS THEN "guest" ELSE "host"]
@@ -595,6 +611,7 @@ StealDispatch(c) ==
   /\ threads[e].st = "claimed"
   /\ threads[e].hld = [ty |-> "cpu", cid |-> c]
   /\ ~threads[e].dd
+  /\ (~RESTART_ON \/ processes[threads[e].proc].phase = "live")
   /\ cores' = [cores EXCEPT ![c].cur = e, ![c].pc = "dispatchLoad",
                             ![c].outg = NULL]
   /\ threads' = [threads EXCEPT ![e].st = "running", ![e].own = c,
@@ -1634,10 +1651,12 @@ ConsumeTeardown(c) ==
   /\ processes[p].gen = req.gen /\ processes[p].consumes = 0
   /\ cores' = [cores EXCEPT ![c].pending = NULL,
                             ![c].active = IF G16_DROP_REF THEN NULL ELSE req]
-  /\ processes' = [processes EXCEPT ![p].phase = "dead",
-                                   ![p].consumes = 1]
+  /\ processes' = [processes EXCEPT
+                    ![p].phase = IF RESTART_ON /\ processes[p].restarts = 0
+                                 THEN "restart" ELSE "dead",
+                    ![p].consumes = 1]
   /\ threads' = [e \in Threads |->
-                   IF threads[e].proc = p
+                   IF threads[e].proc = p /\ ~RESTART_ON
                    THEN [threads[e] EXCEPT !.dd = TRUE]
                    ELSE threads[e]]
   /\ UNCHANGED <<tb, cb, db, pb>>
@@ -1660,6 +1679,70 @@ FinishTeardown(c) ==
   /\ processes' = [processes EXCEPT ![p].phase = "done",
                                    ![p].gen = (@ + 1) % 2]
   /\ UNCHANGED <<threads, tb, cb, db, pb>>
+
+(* §[restart_semantics]: the active request keeps the same process ref.
+   The phase is a dispatch gate from trigger until publication.  The atomic
+   apply abstracts per-handle policy processing after all current threads
+   have left the address space.  snapshotGood represents a bound stable
+   source; snapshotCopied represents copying the full target byte span,
+   including zero-filled holes.  This model does not count physical bytes. *)
+RestartQuiesced(p) ==
+  \A c \in Cores:
+    IF cores[c].cur = NULL THEN TRUE ELSE threads[cores[c].cur].proc # p
+
+RestartRetire(c, e) ==
+  LET req == cores[c].active IN
+  /\ RESTART_ON /\ req # NULL /\ processes[req.proc].phase = "restart"
+  /\ threads[e].proc = req.proc /\ threads[e].rp # 2
+  /\ RetireEnabled(e)
+  /\ threads' = RetireThreadsAfter(e)
+  /\ cores' = RetireCoresAfter(e)
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
+
+RestartApply(c) ==
+  LET req == cores[c].active
+      p == req.proc IN
+  /\ RESTART_ON /\ req # NULL /\ processes[p].phase = "restart"
+  /\ processes[p].gen = req.gen
+  /\ RestartQuiesced(p)
+  /\ processes[p].snapshotGood
+  /\ \A e \in Threads: (threads[e].proc = p /\ threads[e].rp # 2) =>
+       threads[e].st = "freed"
+  /\ \E e \in Threads:
+       /\ threads[e].proc = p
+       /\ \/ threads[e].rp = 1
+          \/ (threads[e].rp = 2 /\ threads[e].st \notin {"retired","finalizing","freed"})
+  /\ threads' = [e \in Threads |->
+       IF threads[e].proc # p THEN threads[e]
+       ELSE IF threads[e].rp = 1 THEN
+         [threads[e] EXCEPT !.st = "ready", !.gen = (@ + 1) % 8,
+                            !.pc = "user", !.tg = NULL, !.ks = NULL,
+                            !.own = NULL, !.pin = 0, !.hld = NULL,
+                            !.mo = FALSE, !.dir = "none", !.dd = FALSE]
+       ELSE IF threads[e].rp = 0 THEN threads[e]
+       ELSE threads[e]]
+  /\ cores' = [cores EXCEPT ![c].active = NULL,
+       ![c].q = @ \cup {e \in Threads: threads[e].proc = p /\ threads[e].rp = 1}]
+  /\ processes' = [processes EXCEPT ![p].phase = "live",
+       ![p].consumes = 0, ![p].restarts = 1,
+       ![p].snapshotCopied = TRUE,
+       ![p].reply = IF processes[p].replyKeep THEN "pending" ELSE "refused"]
+  /\ UNCHANGED <<tb, cb, db, pb>>
+
+RestartFallback(c) ==
+  LET req == cores[c].active
+      p == req.proc IN
+  /\ RESTART_ON /\ req # NULL /\ processes[p].phase = "restart"
+  /\ RestartQuiesced(p)
+  /\ \/ ~processes[p].snapshotGood
+     \/ \A e \in Threads: threads[e].proc = p =>
+          (threads[e].rp # 1 /\ (threads[e].rp # 2 \/
+            threads[e].st \in {"retired","finalizing","freed"}))
+  /\ processes' = [processes EXCEPT ![p].phase = "dead"]
+  /\ threads' = [e \in Threads |->
+       IF threads[e].proc = p THEN [threads[e] EXCEPT !.dd = TRUE]
+       ELSE threads[e]]
+  /\ UNCHANGED <<cores, tb, cb, db, pb>>
 
 (* REVISION-5 LITERAL ONLY (~FIN_UNWIND): retire's step-3 container        *)
 (* unwind as a separate retirer continuation after its CAS, running        *)
@@ -2076,7 +2159,8 @@ Next ==
        \/ BaseStep(c) \/ IrqStep(c) \/ TickPreempt(c)
        \/ ParkDecision(c) \/ WakeIpi(c)
        \/ ConsumeTeardown(c) \/ FinishTeardown(c)
-       \/ \E e \in Threads: TeardownRetire(c, e)
+       \/ RestartApply(c) \/ RestartFallback(c)
+       \/ \E e \in Threads: TeardownRetire(c, e) \/ RestartRetire(c, e)
   \/ \E e \in Threads: FireAny(e) \/ RetireThread(e) \/ RetireUnwind(e)
                        \/ ClearFreedDirective(e)
   \/ ProcessDie
@@ -2228,8 +2312,11 @@ FairSpinDir  == \A c \in Cores: SF_vars(DirLoop(c))    \* N3, W5
 FairTeardown ==
   /\ \A c \in Cores: /\ WF_vars(ConsumeTeardown(c))
                      /\ WF_vars(FinishTeardown(c))
+                     /\ WF_vars(RestartApply(c))
+                     /\ WF_vars(RestartFallback(c))
                      /\ SF_vars(SelfRetireForTeardown(c))
-  /\ \A c \in Cores, e \in Threads: WF_vars(TeardownRetire(c, e))
+  /\ \A c \in Cores, e \in Threads: /\ WF_vars(TeardownRetire(c, e))
+                                   /\ WF_vars(RestartRetire(c, e))
 
 (* Per-property specs. Each names EXACTLY the constraints its property    *)
 (* needs; a PASS is then a statement about those assumptions and no       *)
@@ -2543,7 +2630,7 @@ InvTeardownRefHandoff ==
               /\ cores[c].pending.gen = processes[p].gen
               /\ threads[cores[c].pending.owner].proc = p
          /\ processes[p].consumes = 0
-    /\ processes[p].phase = "dead" =>
+    /\ processes[p].phase \in {"dead","restart"} =>
          /\ Cardinality(ActiveFor(p)) = 1
          /\ Cardinality(PendingFor(p)) = 0
          /\ LET c == CHOOSE c2 \in ActiveFor(p): TRUE IN
@@ -2611,7 +2698,18 @@ LiveTerm ==      \* L5/W3/W4: terminate returns (eviction + marking done)
 
 LiveTeardown ==
   \A p \in Threads: processes[p].phase = "queued" ~>
-                     processes[p].phase = "done"
+                     processes[p].phase \in {"done","live"}
+
+InvRestartGate ==
+  \A p \in Threads: processes[p].phase \in {"queued","restart"} =>
+    \A c \in Cores: cores[c].pc # "ecrun" \/ cores[c].cur = NULL \/
+      threads[cores[c].cur].proc # p \/ threads[cores[c].cur].pc = "teardown"
+
+InvRestartGeneration ==
+  \A p \in Threads: (processes[p].snapshotCopied /\ processes[p].phase = "live") =>
+    /\ processes[p].gen = 0
+    /\ processes[p].phase = "live"
+    /\ processes[p].restarts = 1
 
 (* ROUND-7: the SAME obligation as `SpecFairAligned |= LiveSuspender`,     *)
 (* with the assumption moved from the SPECIFICATION to the PROPERTY.       *)

@@ -64,4 +64,23 @@ ProbeNoRemoteRetiredTeardown ==
   \A e \in Threads:
     ~(threads[e].pc = "teardown" /\ threads[e].st = "retired"
       /\ processes[threads[e].proc].phase = "queued")
+(* §[restart_semantics] positive and failure reachability. *)
+ProbeNoRestartSuccess ==
+  \A p \in Threads: ~processes[p].snapshotCopied
+ProbeNoRestartSnapshotFallback ==
+  \A p \in Threads: ~(processes[p].phase = "dead" /\
+    ~processes[p].snapshotGood /\ processes[p].consumes = 1)
+ProbeNoRestartZeroSurvivorFallback ==
+  \A p \in Threads: ~(processes[p].phase = "dead" /\
+    processes[p].snapshotGood /\ processes[p].consumes = 1 /\
+    \A e \in Threads: threads[e].proc = p => threads[e].rp # 1)
+ProbeNoRestartReplyDrop ==
+  \A p \in Threads: processes[p].reply # "refused"
+ProbeNoRestartReplyKeep ==
+  \A p \in Threads: ~(processes[p].snapshotCopied /\
+    processes[p].replyKeep /\ processes[p].reply = "pending")
+ProbeNoPersistSurvivor ==
+  \A p \in Threads: ~(processes[p].snapshotCopied /\
+    \E e \in Threads: threads[e].proc = p /\ threads[e].rp = 2 /\
+      threads[e].st \notin {"retired","finalizing","freed"})
 ====================================================================================
