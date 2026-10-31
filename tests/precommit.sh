@@ -174,6 +174,8 @@ PI_BARE_REPEAT="${PI_BARE_REPEAT:-3}"
 PI_BARE_RETURN_TIMEOUT="${PI_BARE_RETURN_TIMEOUT:-900}"
 PI_BARE_DEPLOY_SCRIPT="${PI_BARE_DEPLOY_SCRIPT:-~/stygia-tools/deploy_stub.sh}"
 PI_BARE_LOG_DIR="${PI_BARE_LOG_DIR:-$STYGIA_ROOT/out/precommit/pi5-bare}"
+FAILED_KERNEL_LOG_DIR="${FAILED_KERNEL_LOG_DIR:-$STYGIA_ROOT/out/precommit/failed-kernel-runs}"
+source "$SCRIPT_DIR/preserve_failed_kernel_log.sh"
 
 # PI_HOST is kept as a compatibility knob for the first QEMU/KVM target.
 # The same Pi may also run Stygia on bare metal: QEMU/KVM does not expose
@@ -305,7 +307,7 @@ stage_kernel_fault_log_oracle() {
     echo "=================================================="
     echo "[oracle] Kernel fault-log regression tests"
     echo "=================================================="
-    (cd "$SCRIPT_DIR" && python3 -m unittest test_kernel_fault_log.py)
+    (cd "$SCRIPT_DIR" && python3 -m unittest test_kernel_fault_log.py && bash test_preserve_failed_kernel_log.sh)
 }
 
 # ── Pre-stage suite warmup ────────────────────────────────────────────
@@ -895,7 +897,7 @@ stage_x86_kernel_tests() {
             echo "--- last 30 lines of QEMU output ---"
             tail -30 "$qemu_log"
             echo "--- end ---"
-            rm -f "$qemu_log"
+            preserve_failed_kernel_log "$qemu_log" "x86" "$rep"
             FAILURES+=("x86 kernel runner timeout/qemu error (rep ${rep}/3)")
             return 1
         fi
@@ -909,7 +911,7 @@ stage_x86_kernel_tests() {
             echo "--- last 30 lines of QEMU output ---"
             tail -30 "$qemu_log"
             echo "--- end ---"
-            rm -f "$qemu_log"
+            preserve_failed_kernel_log "$qemu_log" "x86" "$rep"
             FAILURES+=("x86 kernel tests (no [runner] total, rep ${rep}/3)")
             return 1
         fi
@@ -917,7 +919,7 @@ stage_x86_kernel_tests() {
         if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
             echo "[FAIL] rep ${rep}/3: $total"
             grep -E '^\[runner\] (FAIL|MISS)' "$qemu_log" | head -20
-            rm -f "$qemu_log"
+            preserve_failed_kernel_log "$qemu_log" "x86" "$rep"
             FAILURES+=("x86 kernel tests rep ${rep}/3: ${total#'[runner] '}")
             return 1
         fi
@@ -925,7 +927,7 @@ stage_x86_kernel_tests() {
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
         if ! verify_no_kernel_faults "$qemu_log" "x86 kernel tests (rep ${rep}/3)" breakpoint_x86; then
-            rm -f "$qemu_log"
+            preserve_failed_kernel_log "$qemu_log" "x86" "$rep"
             return 1
         fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
@@ -1217,7 +1219,7 @@ run_aarch64_tcg_3reps() {
             echo "--- last 30 lines of QEMU output ---"
             tail -30 "$tcg_log"
             echo "--- end ---"
-            rm -f "$tcg_log"
+            preserve_failed_kernel_log "$tcg_log" "aarch64-tcg" "$rep"
             rm -rf "$fat"
             FAILURES+=("${fail_tag}: tcg run timeout/qemu error (rep ${rep}/3)")
             return 1
@@ -1229,7 +1231,7 @@ run_aarch64_tcg_3reps() {
             echo "--- last 30 lines of QEMU output ---"
             tail -30 "$tcg_log"
             echo "--- end ---"
-            rm -f "$tcg_log"
+            preserve_failed_kernel_log "$tcg_log" "aarch64-tcg" "$rep"
             rm -rf "$fat"
             FAILURES+=("${fail_tag}: no [runner] total (rep ${rep}/3)")
             return 1
@@ -1237,7 +1239,7 @@ run_aarch64_tcg_3reps() {
         if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
             echo "[FAIL] rep ${rep}/3 (${label}): $total"
             grep -E '^\[runner\] (FAIL|MISS)' "$tcg_log" | head -20
-            rm -f "$tcg_log"
+            preserve_failed_kernel_log "$tcg_log" "aarch64-tcg" "$rep"
             rm -rf "$fat"
             FAILURES+=("${fail_tag} rep ${rep}/3: ${total#'[runner] '}")
             return 1
@@ -1245,7 +1247,7 @@ run_aarch64_tcg_3reps() {
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
         if ! verify_no_kernel_faults "$tcg_log" "${label} (rep ${rep}/3)"; then
-            rm -f "$tcg_log"
+            preserve_failed_kernel_log "$tcg_log" "aarch64-tcg" "$rep"
             return 1
         fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
@@ -1351,7 +1353,7 @@ stage_aarch64_vm_nodev_pi_kvm() {
             echo "--- last 30 lines of Pi output ---"
             tail -30 "$pi_log"
             echo "--- end ---"
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-nodev-kvm" "$rep"
             FAILURES+=("aarch64 create_virtual_machine_03: Pi KVM run timeout/qemu error (rep ${rep}/3)")
             return 1
         fi
@@ -1362,14 +1364,14 @@ stage_aarch64_vm_nodev_pi_kvm() {
             echo "--- last 30 lines of Pi output ---"
             tail -30 "$pi_log"
             echo "--- end ---"
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-nodev-kvm" "$rep"
             FAILURES+=("aarch64 create_virtual_machine_03: no [runner] total (rep ${rep}/3)")
             return 1
         fi
         if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
             echo "[FAIL] rep ${rep}/3 (create_virtual_machine_03 Pi KVM on $qemu_host): $total"
             grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-nodev-kvm" "$rep"
             FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM rep ${rep}/3: ${total#'[runner] '}")
             return 1
         fi
@@ -1378,12 +1380,12 @@ stage_aarch64_vm_nodev_pi_kvm() {
             echo "--- runner diagnostics ---"
             grep -E '^\[runner\] (deliver|PASS|FAIL|MISS|[0-9]+ total)' "$pi_log" | tail -20
             echo "--- end ---"
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-nodev-kvm" "$rep"
             FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM rep ${rep}/3: missing PASS aid=8 evidence")
             return 1
         fi
         if ! verify_no_kernel_faults "$pi_log" "aarch64 create_virtual_machine_03 Pi KVM on $qemu_host (rep ${rep}/3)"; then
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-nodev-kvm" "$rep"
             return 1
         fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '} (PASS aid=8/E_NODEV observed)"
@@ -1492,7 +1494,7 @@ stage_aarch64_kernel_tests_pi() {
             echo "--- last 30 lines of Pi output ---"
             tail -30 "$pi_log"
             echo "--- end ---"
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-kvm" "$rep"
             FAILURES+=("aarch64 kernel runner timeout/qemu error (rep ${rep}/3)")
             return 1
         fi
@@ -1504,7 +1506,7 @@ stage_aarch64_kernel_tests_pi() {
             echo "--- last 30 lines of Pi output ---"
             tail -30 "$pi_log"
             echo "--- end ---"
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-kvm" "$rep"
             FAILURES+=("aarch64 kernel tests (no [runner] total, rep ${rep}/3)")
             return 1
         fi
@@ -1512,7 +1514,7 @@ stage_aarch64_kernel_tests_pi() {
         if ! echo "$total" | grep -qE '0 fail / 0 miss'; then
             echo "[FAIL] rep ${rep}/3: $total"
             grep -E '^\[runner\] (FAIL|MISS)' "$pi_log" | head -20
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-kvm" "$rep"
             FAILURES+=("aarch64 kernel tests rep ${rep}/3: ${total#'[runner] '}")
             return 1
         fi
@@ -1520,7 +1522,7 @@ stage_aarch64_kernel_tests_pi() {
         # A clean summary is not proof the kernel survived — another core
         # can die while the runner keeps reporting. See verify_no_kernel_faults.
         if ! verify_no_kernel_faults "$pi_log" "aarch64 kernel tests on $qemu_host (rep ${rep}/3)" breakpoint_arm; then
-            rm -f "$pi_log"
+            preserve_failed_kernel_log "$pi_log" "aarch64-kvm" "$rep"
             return 1
         fi
         echo "[OK]   rep ${rep}/3: ${total#'[runner] '}"
