@@ -1139,13 +1139,30 @@ fn dequeueOrIdle() ?*Thread {
 fn dequeueOrIdleLocked(core: u8) ?*Thread {
     const state = &core_states[core];
     drainDeferredRequeuesLocked(core);
+    // A locally runnable idle-priority thread must not prevent this core
+    // from taking normal-priority affinity-0 work queued on another core.
+    // The ordinary local-first path below would keep redispatching an idle
+    // spinner on every tick, so the remote workers would never be stolen.
+    if (highestLocalQueuedPriority(core) == .idle) {
+        if (tryStealReadyLocked(core, .idle)) |thread| return thread;
+    }
     if (dequeueLocalReadyLocked(core)) |thread| return thread;
-    if (tryStealReadyLocked(core)) |thread| return thread;
+    if (tryStealReadyLocked(core, null)) |thread| return thread;
     // Nothing to run: the caller parks this core. Publish that decision
     // under `core_locks[core]` so a concurrent `enqueueOnCore` knows to
     // send the wake IPI even though `current_thread` has not been cleared
     // yet. See `PerCore.idle_parked`.
     state.idle_parked = true;
+    return null;
+}
+
+fn highestLocalQueuedPriority(core: u8) ?Priority {
+    const levels = &core_states[core].run_queue.levels;
+    var idx: usize = levels.len;
+    while (idx > 0) {
+        idx -= 1;
+        if (levels[idx].head != null) return @enumFromInt(@as(u2, @intCast(idx)));
+    }
     return null;
 }
 
@@ -1174,7 +1191,7 @@ fn dequeueLocalReadyLocked(core: u8) ?*Thread {
     return null;
 }
 
-fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*Thread {
+fn stealCandidateFromVictimLocked(thief: u8, victim: u8, above: ?Priority) ?*Thread {
     const state = &core_states[victim];
     var idx: usize = state.run_queue.levels.len;
     while (idx > 0) {
@@ -1182,6 +1199,9 @@ fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*Thread {
         var cur = state.run_queue.levels[idx].head;
         while (cur) |thread| {
             cur = thread.next;
+            if (above) |floor| {
+                if (@intFromEnum(thread.priority) <= @intFromEnum(floor)) continue;
+            }
             if (!affinityAdmitsCore(thread.affinity, thief)) continue;
             if (!canPublishReady(thread)) continue;
             if (thread.owner_core != NOT_IN_RUN_QUEUE) continue;
@@ -1201,7 +1221,7 @@ fn stealCandidateFromVictimLocked(thief: u8, victim: u8) ?*Thread {
     return null;
 }
 
-fn stealFromVictimsUnlocked(thief: u8) ?*Thread {
+fn stealFromVictimsUnlocked(thief: u8, above: ?Priority) ?*Thread {
     if (!WORK_STEALING_ENABLED) return null;
 
     const core_count_u64 = @min(arch.smp.coreCount(), @as(u64, MAX_CORES));
@@ -1219,7 +1239,7 @@ fn stealFromVictimsUnlocked(thief: u8) ?*Thread {
         const victim_core: u8 = @intCast(victim);
         const lock = &core_locks[victim];
         const irq = lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
-        const stolen = stealCandidateFromVictimLocked(thief, victim_core);
+        const stolen = stealCandidateFromVictimLocked(thief, victim_core, above);
         lock.unlockIrqRestore(irq);
 
         checked += 1;
@@ -1261,15 +1281,26 @@ fn commitStolenDispatchLocked(core: u8, thread: *Thread) bool {
     return true;
 }
 
-fn tryStealReadyLocked(core: u8) ?*Thread {
+fn tryStealReadyLocked(core: u8, above: ?Priority) ?*Thread {
     if (!WORK_STEALING_ENABLED) return null;
 
     const thief_lock = &core_locks[core];
     thief_lock.unlock();
-    const stolen = stealFromVictimsUnlocked(core);
+    const stolen = stealFromVictimsUnlocked(core, above);
     const thief_irq = thief_lock.lockIrqSaveOrdered(@src(), SCHED_CORE_GROUP);
 
     const thread = stolen orelse return null;
+    if (above != null) {
+        // A peer may have enqueued a higher-priority local thread while
+        // we searched victims with this core's lock dropped. Prefer that
+        // local work; otherwise let the stolen thread run ahead of idle.
+        const local_priority = highestLocalQueuedPriority(core);
+        if (local_priority == null or
+            @intFromEnum(local_priority.?) < @intFromEnum(thread.priority))
+        {
+            if (commitStolenDispatchLocked(core, thread)) return thread;
+        }
+    }
     if (dequeueLocalReadyLocked(core)) |local| {
         thief_lock.unlockIrqRestore(thief_irq);
         abandonStolenReadyUnlocked(thread);
