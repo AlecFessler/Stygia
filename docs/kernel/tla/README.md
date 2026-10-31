@@ -656,15 +656,26 @@ incomparable/reconstruction.
   then releases the active reference. `InvTeardownRefHandoff` requires one
   matching reference in each phase and one consumption; a lost-reference
   falsifier fails. A completion probe reaches `done`.
-  The 1-core/1-thread focused safety+liveness check passed 38 distinct states;
-  the 2-core/2-thread check, including same-process and separate-process
-  assignments, passed 18,832 distinct states after active-teardown dispatch gating. This abstraction checks
-  request identity, ownership transfer, the safe-stack boundary, and phase
-  order. It does not represent the individual VMAR, handle, or page-table
-  releases inside phase 2, the physical refcount arithmetic, or process
-  restart; those require separate correspondence review as implementation
-  work. The full all-feature model battery remains pending after state-space
-  growth.
+  The original 1-core/1-thread focused safety+liveness check passed 38
+  distinct states; the 2-core/2-thread check, including same-process and
+  separate-process assignments, passed 18,832 distinct states. Both set
+  `TERM_BUDGET = 0` and therefore missed an external retire between
+  `QueueTeardown` and the caller's self-retire. With `TERM_BUDGET = 1`, TLC
+  found a hard deadlock at depth 4: the caller was already `retired` but
+  remained at `pc = teardown`, so no hop or park-stack consumer could run.
+  `SelfRetireForTeardown` now accepts the already-retired caller and advances
+  its continuation to the normal retired hop without a second retirement
+  CAS. A reachability probe fires on that exact ordering (52 distinct
+  states); the one-core safety and `LiveTeardown` check passes (80 distinct
+  states), and two-core/two-thread safety passes (74,016 distinct states).
+  The corresponding two-core temporal graph has 148,032 product states and
+  did not finish final temporal checking within 180 seconds; it is not a
+  liveness verdict. This abstraction checks request identity, ownership
+  transfer, the safe-stack boundary, and phase order. It does not represent
+  the individual VMAR, handle, or page-table releases inside phase 2, the
+  physical refcount arithmetic, or process restart; those require separate
+  correspondence review as implementation work. The full all-feature G16
+  safety and liveness configuration remains unverified.
 
 ## Validation gates — results
 
@@ -1306,12 +1317,27 @@ sets `REQUEUE_ON = FALSE`, nothing fires. A dedicated reachability probe
 for `RecvPop` and `AffMove` remains absent.
 
 **Validation status.** The counts and verdicts in the historical tables below
-predate removal of obsolete model state. On 2026-10-31, the current default
-`./run.sh` battery (33 configs plus SANY) exited 0 with `RESULT: OK`:
-all expected falsifiers fired, all expected-clean checks passed, and the
-paired `t1d_min`/`pr4d_min` liveness and reachability checks passed.
-`RUN_XLARGE=1` and `RUN_SLOW=1` were not run in that battery. This is a
-model verdict; G11, G14, and G16 now have focused gates, while full-battery and code-correspondence review remain open.
+predate G11/G14/G16 and are not a current full-battery verdict. The earlier
+2026-10-31 default `./run.sh` battery (33 configs plus SANY) exited 0 before
+those additions. On the expanded model, a first default run passed SANY,
+all falsifiers and reachability probes through G16, and the positive
+`mtermfix`, `dirf6fix`, and vCPU cancel rows. It was stopped during the
+all-feature `small` row after 12,653,296 distinct states in 2m16s with
+924,582 states still queued, without a verdict. After the G16 remote-retire
+fix, the same prefix, including its new reachability probe, passed again;
+the run was deliberately stopped before repeating unchanged `small`.
+The later safety and liveness rows of the default battery therefore have
+no current full-run verdict. `RUN_XLARGE=1` and `RUN_SLOW=1` were not run.
+
+A controlled state-growth comparison used the same `small` config and TLC
+options. At pre-G11/G14/G16 commit `6035cc08`, it passed at 10,471,252
+distinct states in 1m36s. In a temporary copy of the current module with
+only `ParkDecision` disabled, it passed at 10,555,116 distinct states in
+1m43s. The actual expanded module exceeded 12,653,296 states without a
+verdict. This isolates parked-core interleavings as a material source of
+growth; it does not establish that they are the only source, nor does the
+temporary reduced model prove the G14 obligation. The full all-feature
+battery remains an explicit state-space blocker, not a green result.
 
 **What this validation does NOT establish.** It shows the split preserved
 the model, not that the model still describes the code. No active

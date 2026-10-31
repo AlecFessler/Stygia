@@ -1613,8 +1613,12 @@ SelfRetireForTeardown(c) ==
   /\ G16_ON /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL
   /\ w # NULL /\ threads[w].pc = "teardown"
   /\ cores[c].pending # NULL /\ cores[c].pending.owner = w
-  /\ RetireEnabled(w)
-  /\ threads' = [RetireThreadsAfter(w) EXCEPT ![w].pc = "user"]
+  \* An external retirer can win after QueueTeardown. In that case the
+  \* retirement CAS is already done; the caller must still reach its hop.
+  /\ (RetireEnabled(w) \/ threads[w].st = "retired")
+  /\ threads' = [(IF threads[w].st = "retired"
+                  THEN threads ELSE RetireThreadsAfter(w))
+                 EXCEPT ![w].pc = "user"]
   /\ cores' = RetireCoresAfter(w)
   /\ UNCHANGED <<processes, tb, cb, db, pb>>
 

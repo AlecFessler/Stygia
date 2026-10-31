@@ -205,6 +205,10 @@ expect_violation g16probe ThreadProbes.tla "Invariant ProbeNoTeardownDone is vio
   -deadlock -config ThreadLifecycle_g16_probe.cfg
 expect_violation g16bad ThreadLifecycle.tla "Invariant InvTeardownRefHandoff is violated" \
   -config ThreadLifecycle_g16_bad.cfg
+# The environment retirer wins after QueueTeardown, before the caller's
+# self-retire. The positive row below must still complete through the hop.
+expect_violation g16remoteprobe ThreadProbes.tla "Invariant ProbeNoRemoteRetiredTeardown is violated" \
+  -deadlock -config ThreadLifecycle_g16_remote_probe.cfg
 
 echo "== current safety, TLC deadlock detection ON =="
 expect_pass mtermfix  ThreadLifecycle.tla -config ThreadLifecycle_mtermfix.cfg
@@ -229,6 +233,10 @@ expect_pass vcpu_cancel ThreadLifecycle.tla -config ThreadLifecycle_vcpu_cancel.
 expect_pass small    ThreadLifecycle.tla -config ThreadLifecycle_small.cfg
 expect_pass g14      ThreadLifecycle.tla -config ThreadLifecycle_g14.cfg
 expect_pass g16      ThreadLifecycle.tla -config ThreadLifecycle_g16_two_core.cfg
+expect_pass g16remote ThreadLifecycle.tla -lncheck final -config ThreadLifecycle_g16_remote.cfg
+# Two-core safety exercises same-process and distinct-process assignments
+# with an external retire. Its temporal phase is measured-unconverged.
+expect_pass g16remote2 ThreadLifecycle.tla -config ThreadLifecycle_g16_remote_two_core.cfg
 expect_pass large    ThreadLifecycle.tla -config ThreadLifecycle_large.cfg
 expect_pass cr3self  ThreadLifecycle.tla -deadlock -config ThreadLifecycle_cr3self.cfg
 expect_pass medium_nodir ThreadLifecycle.tla -config ThreadLifecycle_medium_nodir.cfg
