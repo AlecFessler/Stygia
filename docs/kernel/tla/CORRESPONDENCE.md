@@ -70,6 +70,69 @@ transition relation, not the Zig source.
 | `FastPath`, `ReplyFP` | x64 `arch/x64/interrupts.zig` inline asm classifier implements fused suspend/reply paths with slow-path fallback; aarch64 uses generic Zig paths. | Code review of entry/classifier only; **full asm state-write audit remains open** (README assigns `stygia-qde`). `recv_*`/`reply_*` interface suites cannot alone prove the fused intermediate-state compression. |
 | `AffMove` | `thread.repairAffinityPlacement` claims a ready target then calls `scheduler.enqueue` using current affinity. | Code review and `affinity_*` kernel suite. Model only enables moves when old queue is excluded; source may claim/requeue any ready target. Priority repair also uses this shape despite its model identity abstraction: `Stygia-o4a.4.2.2.4`. |
 
+## Milestone 3: creation, termination, process lifecycle, and model-only steps
+
+`create_thread_*`, `create_vcpu_*`, `terminate_*`, `delete_*`,
+`process_restart_*`, `handle_restart_*`, `reply_restart_*`, and the VMAR
+restart cases are the available kernel interface suites. The first two
+milestone gates ran them as part of 380/380 cases on each x86 boot and
+1140/1140 aggregate cases on Pi5 bare metal. These broad results show
+interface regressions did not appear in those runs. The specific races
+listed below need focused tests. The existing G16/restart source-order
+checker and its four earlier mutation fixtures are narrower than a
+process teardown/refcount proof.
+
+| Active action | Kernel correspondence | Evidence and limit |
+|---|---|---|
+| `Init` | Boot initializes per-core scheduler state; initial user threads are created through `thread.allocThread`/`process.createProcess`. | Model seed, not a runtime kernel transition. No code-level one-to-one state mapping exists for TLC's bounded initial thread set. |
+| `ProcessDie` | `process.claimExitLocked` claims an exit decision; `destroyPhase1` dead-marks the process gen so `scheduler.processRefAlive` rejects future dispatch. | Model environment surrogate: one `dd` bit can flip at a time, while source has a process-wide gen gate. `S7Claim`/`S7Retire` remains a separate mismatch (`.2`). |
+| `QueueTeardown` | `derivation.delete(SLOT_SELF)` and `port.queueFaultProcessTeardown` call `scheduler.queueCurrentTeardown`; it writes one typed request under the core lock. | G16 source-order gate; focused G16 TLC pass/falsifier rows; `delete_*`/fault cases. The model makes process phase `queued` visible with the request; source has a separate `claimExitLocked` before queue publication. |
+| `SelfRetireForTeardown` | Both exit paths call `thread.parkSelfFaulted` after queuing; it marks retiring and retires, then scheduler hops off the caller kstack. | Source review and G16 model external-retire probe. The model handles an already-retired caller; source `lifecycle.retire` returns immediately in that case. |
+| `ConsumeTeardown` | `scheduler.scheduler_hop_run`/`scheduler_run_after_park` drain the pending request on a safe stack; `drainTeardown` clears the core slot before `runProcessTeardown`. | G16 source-order gate and mutation fixtures; G16 TLC rows. `active` is an abstract ownership state, not a literal second core slot in source; the request is held by the park-stack frame. |
+| `TeardownRetire` | `process.destroyPhase2` calls `thread.destroyThreadsInProcess`, which retires each matching live thread. | Source review and broad `delete_*`/process suites. The model compresses slab walk, gen validation, per-thread cleanup, and deferred finalize. |
+| `FinishTeardown` | `process.destroyPhase2` waits at `scheduler.awaitProcessQuiesced`, releases VMAR/handle/root resources, and destroys the process slab after the thread walk. | Source review; G16 TLC completion probe and broad suites. Model waits for every abstract thread to be `freed`; source uses on-core/root barriers and zombie finalization. Refcount arithmetic and byte releases are outside model. |
+| `RestartQuiesced` | `scheduler.awaitProcessQuiesced` checks active roots and committed/current threads before `process.restartProcess` walks old threads or VMARs. | Restart source-order gate and `process_restart_*` suite. Model predicate quantifies current thread only and omits active translation-root state. |
+| `RestartRetire` | `process.restartProcess` invokes `thread.destroyThreadForRestart` for non-persist old threads, preserving stale reply-handle behavior. | Restart gate and `process_restart_term_*`/`thread_restart_policy` suites. Model `rp` is a bounded policy abstraction. |
+| `RestartApply` | `restartProcess` evicts cores, retires/recreates old threads, applies VMAR policy and handle/reply policy, clears `restarting`, then enqueues survivors. | Restart source-order gate with gate-clear mutation; restart model configs and kernel suites. One model action compresses many source steps. Intermediate states and byte/refcount effects are not checked by TLC. |
+| `RestartFallback` | `scheduler.runProcessTeardown` tries `restartProcess`; on false it clears caller-thread ownership and enters `runProcessTeardownWithoutRestart`. | Source-order gate and fallback mutation; restart fallback TLC configs. Model makes fallback one state update; source can fail at several policy points. |
+| `TermStart` | `thread.terminate` resolves the target handle and enters retirement path, including self target. | Source review; `terminate_*` suite and `mterm`/`mtermfix` TLC pair. The model omits capability resolution errors and gen-lock acquisition. |
+| `TermRetire` | `thread.retireAndBumpDeadGen` marks retiring, waits pins, removes ready queue membership, retires state, flips dead gen. | Source review; `terminate_*` suite. The model's one retire step hides pre-CAS wait and cleanup ordering. The `mark_state` protocol differs (`.7`). |
+| `TermStale` | `thread.terminate` reports E_TERM for a stale handle/gen and may detach its slot. | **Model bug `.8`:** `~RetireEnabled` also accepts a live pinned/pended target, allowing false stale return. `LiveTerm` evidence is provisional for W7/pin waits until this guard is corrected and probed. |
+| `TermWait` | `thread.routeRetiredFinalize` sends remote IPI and waits for the target to leave `current_thread` unless target is self. | **Mismatch `.6`:** no retired-caller escape, so mutual terminate can deadlock. W4 owed-mark wait also has no source counterpart (`.7`). TLC `mtermfix` does not establish source liveness. |
+| `PinAcq`, `PinRel` | Representative model episode for any lock class with a preemptible thread-context hold. Current tree's effective-mask analysis says the production pin-class set is empty. | **Model-only over-approximation**, retained for F3/C1 falsifiers (`pinord`). There is no production `PinAcq` call to map; real claim pins are represented in wake/suspend/steal actions and implemented by `lifecycle.tryPinLive`/`releasePin`. |
+| `PinBump`, `PinUnlock` | `PIN_BUMP_FIRST = FALSE` defective-machine half-states only. | `pinord` TLC falsifier; no production correspondence. |
+| `CreateThread` | `thread.allocThread` initializes a private slot then publishes it live; `syscall.createThread` mints handle(s) and later calls `scheduler.enqueueOnCore`. vCPU creation uses `publishMintedVcpuAndEnqueue` under an exit-port lock and lifecycle pin. | Source review; `create_thread_*`/`create_vcpu_*` suites. **Atomicity gap:** model fuses slab publication and ready queue insertion. Ordinary source creation has a live `.ready` slab before its queue link; whether this can produce an observable failed dispatch under concurrent teardown requires a dedicated test/proof. |
+| `DirectiveDispatchThread` | `scheduler.dequeueLocalReadyLocked` is the corresponding normal dispatch. | This action belongs only to the reduced `DirectiveNext` checking relation; it fuses `DispatchThread` and `DispatchLoad`, so no separate production path exists. |
+| `Quiescent`, `Terminating` | TLC's terminal-state predicate and stuttering self-loop. | **Model-only harness actions**, with no kernel operation to map. |
+
+The architecture entry path reviewed for `TickPreempt`, `DirConsume`, and
+`BoundaryRetired` is x64 `arch/x64/interrupts.zig:dispatchInterrupt`
+and aarch64 `arch/aarch64/exceptions.zig:handleIrqLowerEl` / the SVC
+entry. Both async user IRQ handlers check a pending directive before
+their scheduler handler and guard the return on current-thread identity;
+the scheduler tail rechecks lifecycle before loading the saved context.
+The x64 inline IPC assembly and the arch stack-switch instructions have
+not had a complete instruction-by-instruction correspondence audit. The
+kernel suites passing on both architectures are functional evidence,
+not a proof of every interrupt/return interleaving.
+
+### Abstraction classes and unresolved obligations
+
+- **Model-only/historical:** `Init` seed, `Terminating`, `Quiescent`,
+  `DirectiveDispatchThread`, `PinAcq`/`PinRel` with today's empty class,
+  `PinBump`/`PinUnlock`, `RelwaitPlace`, `IrqRelwait`, `HopCommitClaimed`,
+  and `RetireUnwind` under the current feature switches.
+- **Source steps fused by model:** park publish and linkage, scheduler
+  commit and dispatch load, one-shot pop and claim, directive park and
+  disarm, normal creation publish and enqueue, phase-2 teardown, and
+  restart policy application. The named locks/pins above justify some
+  fusion, but the source's split intervals remain subject to review.
+- **Mismatches under active switches:** `.1` vCPU state lifetime, `.2`
+  S7 routing, `.3` self-mark scope, `.4` ready priority move, `.5` recv
+  queued-sender ownership, `.6` mutual terminate escape, `.7` marking
+  protocol, `.8` false `TermStale` guard. No green TLC or precommit result
+  resolves these issues.
+
 ### Open kernel mismatch exposed by this review
 
 `Stygia-o4a.4.2.2.1` records a remote vCPU lifetime race. Both
@@ -81,14 +144,15 @@ eventual owner acknowledgement, but has no state-page lifetime variable and
 cannot rule out this use-after-free. The new source gate intentionally does
 not certify this failed obligation.
 
-Other reviewed mismatches are filed as `Stygia-o4a.4.2.2.2` (S7 failed
+Additional reviewed mismatches are filed as `Stygia-o4a.4.2.2.2` (S7 failed
 dispatch routing), `.3` (self-mark scope), `.4` (ready priority move), and
 `.5` (queued-sender recv lifetime). They are implementation/design parity
-questions, not model-only atomicity gaps.
+questions, not model-only atomicity gaps. The final table names `.6`–`.8`.
 
-### Still to review
+### Review boundary
 
-Termination spin, pin, creation, G16/restart details, full x64 fast-path
-assembly, device IRQ wake sources, and remaining arch boundary paths still
-need direct review. The rows above are code correspondences or explicit
-mismatches; they do not yet satisfy the full-bead acceptance criterion.
+The tables cover the active model actions through the creation and
+process-lifecycle families below. Full x64 fast-path assembly, device
+IRQ wake sources, arch stack-switch instructions, and the unresolved
+race/atomicity obligations still need focused review or tests. The
+parent bead remains open until the active mismatches are resolved.
