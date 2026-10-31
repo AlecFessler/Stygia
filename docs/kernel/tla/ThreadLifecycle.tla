@@ -1955,7 +1955,7 @@ CreateThread(c) ==
                      gen |-> threads[e].gen,   \* INHERIT, never reset (round-12)
                      dgen |-> 0,
                      dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
-                     dsrc |-> NULL, proc |-> threads[w].proc,
+                     dsrc |-> NULL, proc |-> threads[w].proc, rp |-> 0,
                      dd |-> FALSE]]
        /\ cores' = [cores EXCEPT ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
 
