@@ -123,6 +123,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "create_vcpu_10", .path = "cases/create_vcpu_10.zig" },
     .{ .name = "create_vcpu_11", .path = "cases/create_vcpu_11.zig" },
     .{ .name = "create_vcpu_12", .path = "cases/create_vcpu_12.zig" },
+    .{ .name = "vcpu_retire_remote", .path = "cases/vcpu_retire_remote.zig" },
     .{ .name = "create_virtual_machine_01", .path = "cases/create_virtual_machine_01.zig" },
     .{ .name = "create_virtual_machine_02", .path = "cases/create_virtual_machine_02.zig" },
     .{ .name = "create_virtual_machine_03", .path = "cases/create_virtual_machine_03.zig" },
