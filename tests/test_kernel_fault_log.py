@@ -22,6 +22,23 @@ PASS = "[runner] PASS breakpoint_fault_01"
 
 
 class FaultLogTests(unittest.TestCase):
+    def test_mixed_snapshot_restart_fault_requires_matching_pass(self) -> None:
+        names = manifest_test_names()
+        index = names.index("snapshot_mixed_page_sizes")
+        pre = (
+            f"[pre-report-terminal] tag=0x{0x8000 | index:x} index={index:x} "
+            "process=0x0 thread=0xabc reason=unhandled_thread_fault subcode=2"
+        )
+        passed = "[runner] PASS snapshot_mixed_page_sizes"
+        self.assertEqual(unexpected_faults(log(pre, X86_FAULT, passed), "breakpoint_x86"), [])
+        self.assertEqual(unexpected_faults(log(
+            pre.replace("subcode=2", "subcode=0"), ARM_FAULT, passed,
+        ), "breakpoint_arm"), [])
+        self.assertTrue(unexpected_faults(log(pre, X86_FAULT), "breakpoint_x86"))
+        self.assertTrue(unexpected_faults(log(
+            pre.replace(f"tag=0x{0x8000 | index:x}", "tag=0x8000"), X86_FAULT, passed,
+        ), "breakpoint_x86"))
+
     def test_proved_restart_child_fault_on_both_architectures(self) -> None:
         names = manifest_test_names()
         index = names.index("process_restart_03")
