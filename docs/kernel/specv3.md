@@ -634,7 +634,7 @@ The caller receives an IPC handle to the new process with caps = the caller's ow
 
 ### §[restart_semantics] Restart Semantics
 
-When a process holding the `restart` cap on its self-handle exits — voluntary, fault, or kill — the kernel restarts the process rather than tearing it down. Threads re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting process are governed by the process-wide `reply_policy` bit on the self-handle.
+When a process holding the `restart` cap on its self-handle exits voluntarily or through an unhandled fault, the kernel restarts the process rather than tearing it down. The current API has no operation that kills a process. Threads re-enter at their original entry points (or `persist` through the restart, see below); the handle table survives; each handle is processed per its `restart_policy` bits. Reply handles held by the restarting process are governed by the process-wide `reply_policy` bit on the self-handle.
 
 Per-handle policies are ordered least-to-most privileged. The `restart_policy` cap field is monotonic-reducing along this ordering: a holder may reduce its handle's policy to any value at or below the current setting. (For 2-bit policies, "reducing" is numeric reduction along the privilege ordering, not bitwise subset.)
 
