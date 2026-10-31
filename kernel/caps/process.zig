@@ -699,7 +699,7 @@ inline fn pageFrameSizeBytes(sz: stygia.memory.vmar.PageSize) u64 {
 fn extractDiagTestTag(elf_bytes: []const u8) u64 {
     if (!build_options.kernel_spawn_diag) return 0;
 
-    const aarch64_tag = extractAarch64DiagTestTag(elf_bytes);
+    const aarch64_tag = @import("diag_test_tag.zig").extractAarch64(elf_bytes);
     if (aarch64_tag != 0) return aarch64_tag;
 
     var mov_imm_seen: [DIAG_TEST_TAG_COUNT]bool = .{false} ** DIAG_TEST_TAG_COUNT;
@@ -732,24 +732,6 @@ fn extractDiagTestTag(elf_bytes: []const u8) u64 {
             continue;
         }
 
-        if (found == 0) {
-            found = v;
-        } else if (found != v) {
-            return 0;
-        }
-    }
-    return found;
-}
-
-fn extractAarch64DiagTestTag(elf_bytes: []const u8) u32 {
-    var found: u32 = 0;
-    var i: usize = 0;
-    while (i + 4 <= elf_bytes.len) : (i += 4) {
-        const insn = readLeU32(elf_bytes, i);
-        if ((insn & 0x7F80_0000) != 0x5280_0000) continue;
-
-        const v = (insn >> 5) & 0xFFFF;
-        if (v < DIAG_TEST_TAG_MAGIC or v >= DIAG_TEST_TAG_LIMIT) continue;
         if (found == 0) {
             found = v;
         } else if (found != v) {
