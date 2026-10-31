@@ -1,5 +1,6 @@
 // §[restart_semantics] test 07: transfer of a device_region with keep
-// is forbidden when the caller's dr_restart_max is zero.
+// is forbidden when the caller's dr_restart_max is zero. The runner passes
+// this test's valid ELF page frame in slot 4.
 const lib = @import("lib");
 const caps = lib.caps;
 const errors = lib.errors;
@@ -26,12 +27,12 @@ pub fn main(base: u64) void {
         .caps = (caps.DeviceCap{ .restart_policy = true }).toU16(),
         .move = false,
     }).toU64()};
-    // A fresh zero-filled frame is deliberately not an ELF. If the ceiling
-    // check is missing, the call returns E_INVAL without spawning a child.
-    const pf = syscall.createPageFrame((caps.PfCap{ .r = true }).toU16(), 0, 1);
-    if (testing.isHandleError(pf.v1)) return testing.fail(4);
-    const elf: caps.HandleId = @truncate(pf.v1 & 0xFFF);
+    const elf: caps.HandleId = caps.SLOT_FIRST_PASSED + 1;
+    const elf_cap = caps.readCap(base, elf);
+    if (elf_cap.handleType() != .page_frame or
+        (elf_cap.caps() & (caps.PfCap{ .r = true }).toU16()) == 0) return testing.fail(4);
     const result = syscall.createProcess(0, 0, 0, elf, 0, &passed);
-    if (result.v1 != @intFromEnum(errors.Error.E_PERM)) return testing.fail(100 + result.v1);
+    if (result.v1 != @intFromEnum(errors.Error.E_PERM))
+        return testing.fail(if (testing.isHandleError(result.v1)) 100 + result.v1 else 3);
     testing.pass();
 }
