@@ -36,8 +36,18 @@ fn spinForever() noreturn {
 
 fn workerEntry() callconv(.c) noreturn {
     // `self` resolves the worker's own handle without depending on the
-    // handle-slot chosen by create_thread. This call runs again on restart.
-    const own = syscall.self();
+    // handle-slot chosen by create_thread. A newly runnable worker can
+    // start before its creator finishes minting that handle; retry E_NOENT
+    // until the creator's cap-table write becomes visible.
+    var own = syscall.self();
+    while (own.v1 == @intFromEnum(errors.Error.E_NOENT)) {
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("pause"),
+            .aarch64 => asm volatile ("yield"),
+            else => unreachable,
+        }
+        own = syscall.self();
+    }
     if (testing.isHandleError(own.v1)) spinForever();
     const own_handle: caps.HandleId = @truncate(own.v1 & 0xFFF);
     const result = syscall.suspendThread(own_handle, CHILD_PORT, &.{});
