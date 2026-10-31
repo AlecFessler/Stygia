@@ -688,8 +688,8 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
     // multi-page) and `map = demand` (kernel-allocated single-page PF
     // installed by demandAlloc). For each installed entry we know the
     // VMAR offset and the bound PageFrame; the per-page phys is
-    // `pf.phys_base + p * pf.sz` and the per-page virt is
-    // `v.base_vaddr + entry.offset + p * pf.sz`. New perms intersect
+    // `pf.phys_base + p * v.sz` and the per-page virt is
+    // `v.base_vaddr + entry.offset + p * v.sz`. New perms intersect
     // the PageFrame's caps with `new_rwx` (Spec §[var].remap test 08:
     // effective = `new_cur_rwx ∩ page_frame.r/w/x` for map=1, or
     // `new_cur_rwx` for map=3). For map=3 the demand-paged PF has no
@@ -719,12 +719,11 @@ pub fn remap(caller: *Thread, vmar_handle: u64, new_cur_rwx: u64) i64 {
         };
         const effective_rwx = new_rwx & pf_rwx_for_remap;
         const eff_perms = rwxToPerms(effective_rwx);
-        const pf_sz_bytes = pageSizeBytes(pf.sz);
-        var p: u32 = 0;
-        while (p < pf.page_count) : (p += 1) {
-            const off_p = entry.offset + @as(u64, p) * pf_sz_bytes;
-            if (off_p + pf_sz_bytes > @as(u64, v.page_count) * sz_bytes) break;
-            const phys_p = PAddr.fromInt(pf.phys_base.addr + @as(u64, p) * pf_sz_bytes);
+        const pf_bytes = @as(u64, pf.page_count) * pageSizeBytes(pf.sz);
+        var byte_off: u64 = 0;
+        while (byte_off < pf_bytes) : (byte_off += sz_bytes) {
+            const off_p = entry.offset + byte_off;
+            const phys_p = PAddr.fromInt(pf.phys_base.addr + byte_off);
             dispatch.paging.mapPageSized(
                 process.addr_space_root,
                 phys_p,
@@ -914,14 +913,26 @@ pub fn destroyVmarDuringProcessTeardown(v_ref: SlabRef(VMAR), addr_space_root: P
     const gen: u63 = @intCast(v_ref.gen);
     if (v.map == .page_frame or v.map == .demand) {
         const sz_bytes = pageSizeBytes(v.sz);
-        var off: u64 = 0;
-        while (off < @as(u64, v.page_count) * sz_bytes) {
-            _ = dispatch.paging.unmapPageSizedNoShootdown(
-                addr_space_root,
-                .fromInt(v.base_vaddr.addr + off),
-                v.sz,
-            );
-            off += sz_bytes;
+        if (v.device) |dev_ref| {
+            for (&v.installed_pfs) |*entry| {
+                const pf_ref = entry.pf orelse continue;
+                const pf_bytes = @as(u64, pf_ref.ptr.page_count) * pageSizeBytes(pf_ref.ptr.sz);
+                var byte_off: u64 = 0;
+                while (byte_off < pf_bytes) : (byte_off += sz_bytes) {
+                    const iova = v.base_vaddr.addr + entry.offset + byte_off;
+                    _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, iova, v.sz);
+                    dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, iova, v.sz, 1);
+                }
+            }
+        } else {
+            var off: u64 = 0;
+            while (off < @as(u64, v.page_count) * sz_bytes) : (off += sz_bytes) {
+                _ = dispatch.paging.unmapPageSizedNoShootdown(
+                    addr_space_root,
+                    .fromInt(v.base_vaddr.addr + off),
+                    v.sz,
+                );
+            }
         }
         for (&v.installed_pfs) |*entry| {
             if (entry.pf) |pf_ref| {
@@ -1195,6 +1206,8 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     const effective_rwx: u3 = v.cur_rwx & pf_rwx;
     const perms = rwxToPerms(effective_rwx);
     const pf_sz_bytes = pageSizeBytes(pf.sz);
+    const leaf_bytes = pageSizeBytes(v.sz);
+    const pf_bytes = @as(u64, pf.page_count) * pf_sz_bytes;
 
     // Reserve a slot in the inline installed-pf table before touching
     // any PTE so a full table is reported as E_NOMEM up front. The
@@ -1209,11 +1222,11 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
     }
     if (slot_reserved == null) return errors.E_NOMEM;
 
-    var p: u32 = 0;
-    while (p < pf.page_count) {
-        const off_p = offset + @as(u64, p) * pf_sz_bytes;
+    var byte_off: u64 = 0;
+    while (byte_off < pf_bytes) {
+        const off_p = offset + byte_off;
         const phys_p = stygia.memory.address.PAddr.fromInt(
-            pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
+            pf.phys_base.addr + byte_off,
         );
         const map_failed = if (vmar_caps.dma) blk: {
             // caller-pinned: device ref under VMAR's gen-lock.
@@ -1238,16 +1251,16 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
             break :blk false;
         };
         if (map_failed) {
-            // Roll back PTEs from earlier iterations [0..p) so a partial
+            // Roll back PTEs from earlier iterations so a partial
             // install never leaves dangling translations behind. After the
             // caller drops its handle the page_frame can be freed and its
             // physical pages handed back to PMM; a stale PTE here would be
             // a UAF primitive. mapcnt was not yet bumped (the bump
             // runs only after the loop) and installed_pfs[slot_reserved]
             // was never committed, so this only undoes hardware state.
-            var u: u32 = 0;
-            while (u < p) : (u += 1) {
-                const off_u = offset + @as(u64, u) * pf_sz_bytes;
+            var undo_off: u64 = 0;
+            while (undo_off < byte_off) : (undo_off += leaf_bytes) {
+                const off_u = offset + undo_off;
                 if (vmar_caps.dma) {
                     // dma branch only reached if v.device is non-null —
                     // the very first iteration above already proved it.
@@ -1299,9 +1312,9 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
         // issue the required `dc cvau` / `ic ivau` itself.
         if (perms.exec) {
             const kva = stygia.memory.address.VAddr.fromPAddr(phys_p, null);
-            dispatch.cpu.syncInstructionCacheRange(kva.addr, pf_sz_bytes);
+            dispatch.cpu.syncInstructionCacheRange(kva.addr, leaf_bytes);
         }
-        p += 1;
+        byte_off += leaf_bytes;
     }
     v.installed_pfs[slot_reserved.?] = .{
         .offset = offset,
@@ -1316,7 +1329,7 @@ fn mappingInstall(v: *VMAR, offset: u64, pf: *PageFrame, pf_rwx: u3) i64 {
 /// Returns the removed page_frame so caller can release its handle ref.
 ///
 /// `mappingInstall` writes one `installed_pfs` entry per installation
-/// but installs `pf.page_count` PTEs (one per page of the PageFrame).
+/// but installs one PTE per VMAR-sized leaf in the PageFrame's byte span.
 /// Symmetric removal must tear down every PTE in that span — leaving
 /// stale leaf PTEs behind would surface as a UAF primitive once the
 /// PageFrame is freed and its physical pages return to PMM (the leftover
@@ -1332,31 +1345,29 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
     const vmar_caps: VmarCaps = @bitCast(caps_word);
 
     var removed: ?*PageFrame = null;
-    var pf_page_count: u32 = 1;
-    var pf_sz_bytes: u64 = pageSizeBytes(v.sz);
+    var pf_bytes: u64 = pageSizeBytes(v.sz);
     for (&v.installed_pfs) |*entry| {
         if (entry.pf) |pf_ref| {
             if (entry.offset == offset) {
                 removed = pf_ref.ptr;
-                pf_page_count = pf_ref.ptr.page_count;
-                pf_sz_bytes = pageSizeBytes(pf_ref.ptr.sz);
+                pf_bytes = @as(u64, pf_ref.ptr.page_count) * pageSizeBytes(pf_ref.ptr.sz);
                 entry.* = .{};
-                // PageFrame mapcnt was bumped at install;
-                // this is the matching decrement. `releaseMapping` may
-                // run destroyPageFrame inline if the last handle has
-                // also been released.
-                stygia.memory.page_frame.releaseMapping(pf_ref.ptr);
                 break;
             }
         }
     }
+    if (removed == null) return null;
 
-    var p: u32 = 0;
-    while (p < pf_page_count) : (p += 1) {
-        const off_p = offset + @as(u64, p) * pf_sz_bytes;
+    const leaf_bytes = pageSizeBytes(v.sz);
+    var byte_off: u64 = 0;
+    while (byte_off < pf_bytes) : (byte_off += leaf_bytes) {
+        const off_p = offset + byte_off;
         if (vmar_caps.dma) {
             // caller-pinned: device ref under VMAR's gen-lock.
-            const dev_ref = v.device orelse return removed;
+            const dev_ref = v.device orelse {
+                stygia.memory.page_frame.releaseMapping(removed.?);
+                return removed;
+            };
             _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz);
             dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, v.base_vaddr.addr + off_p, v.sz, 1);
         } else {
@@ -1367,6 +1378,17 @@ fn mappingRemove(v: *VMAR, offset: u64) ?*PageFrame {
             );
         }
     }
+    if (!vmar_caps.dma) {
+        // `releaseMapping` can return the backing to PMM when the last
+        // handle is gone. Retire every cached translation first.
+        dispatch.paging.shootdownTlbRange(
+            process.addr_space_id,
+            .fromInt(v.base_vaddr.addr + offset),
+            v.sz,
+            @intCast(pf_bytes / leaf_bytes),
+        );
+    }
+    stygia.memory.page_frame.releaseMapping(removed.?);
     return removed;
 }
 
@@ -1571,14 +1593,35 @@ fn installedEffectiveRwxAt(v: *VMAR, offset: u64) ?u3 {
 /// invalidate. Called by `unmap` (N=0) and `destroyVmar`.
 fn unmapAll(v: *VMAR, process: *Process) void {
     const sz_bytes = pageSizeBytes(v.sz);
-    var off: u64 = 0;
-    while (off < @as(u64, v.page_count) * sz_bytes) {
-        _ = dispatch.paging.unmapPageSized(
-            process.addr_space_root,
-            .fromInt(v.base_vaddr.addr + off),
+    if (v.map == .page_frame and v.device != null) {
+        const dev_ref = v.device.?;
+        // DMA VMARs have IOMMU leaves, not CPU leaves. Each installed
+        // PF may contain more VMAR-sized leaves than PF pages.
+        for (&v.installed_pfs) |*entry| {
+            const pf_ref = entry.pf orelse continue;
+            const pf_bytes = @as(u64, pf_ref.ptr.page_count) * pageSizeBytes(pf_ref.ptr.sz);
+            var byte_off: u64 = 0;
+            while (byte_off < pf_bytes) : (byte_off += sz_bytes) {
+                const iova = v.base_vaddr.addr + entry.offset + byte_off;
+                _ = dispatch.iommu.iommuUnmapPage(dev_ref.ptr, iova, v.sz);
+                dispatch.iommu.invalidateIotlbRange(dev_ref.ptr, iova, v.sz, 1);
+            }
+        }
+    } else {
+        var off: u64 = 0;
+        while (off < @as(u64, v.page_count) * sz_bytes) : (off += sz_bytes) {
+            _ = dispatch.paging.unmapPageSized(
+                process.addr_space_root,
+                .fromInt(v.base_vaddr.addr + off),
+                v.sz,
+            );
+        }
+        dispatch.paging.shootdownTlbRange(
+            process.addr_space_id,
+            v.base_vaddr,
             v.sz,
+            v.page_count,
         );
-        off += sz_bytes;
     }
     // Decrement mapcnt for every still-installed page_frame entry; the
     // PTEs are gone but the PageFrame's per-mapping counter is what
@@ -1591,12 +1634,6 @@ fn unmapAll(v: *VMAR, process: *Process) void {
         }
         entry.* = .{};
     }
-    dispatch.paging.shootdownTlbRange(
-        process.addr_space_id,
-        v.base_vaddr,
-        v.sz,
-        v.page_count,
-    );
 }
 
 /// Decode the MOV that hit a port-IO VMAR, emit the matching IN/OUT,
