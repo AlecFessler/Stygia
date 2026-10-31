@@ -189,22 +189,22 @@ pub fn setEventRip(ctx: *ArchCpuContext, value: u64) void {
     ctx.elr_el1 = value;
 }
 
-/// Companion read for `writeUserVreg14`. Spec §[event_state] aarch64
-/// maps vreg 14 onto x13, so the receiver's modification rides in the
-/// saved x13 of its syscall frame — not on the user stack. Mirrors
-/// `writeUserVreg14`'s `ctx.regs.x13` target.
+/// Companion read for `writeUserVreg14`. AArch64's saved PC is vreg 32
+/// at [user_sp+8], after the syscall word. The caller must be running in
+/// the receiver's address space before accessing this user page.
 pub fn readUserVreg14(ctx: *const ArchCpuContext) u64 {
-    return ctx.regs.x13;
+    cpu.panDisable();
+    const value = @as(*const u64, @ptrFromInt(ctx.sp_el0 + 8)).*;
+    cpu.panEnable();
+    return value;
 }
 
-/// Spec §[event_state]: vreg 14 carries the suspended thread's saved PC
-/// across both arches. On aarch64 vreg 14 is GPR-backed at x13 — write
-/// the saved PC into the receiver's saved x13 so the recv-time
-/// snapshot surfaces it. Mirrors x86-64's `[user_rsp + 8]` write but
-/// targets a register slot rather than a user page, so no PAN gate is
-/// needed and TTBR0 may reference any address space.
+/// AArch64 §[event_state] vreg 32: saved PC at [user_sp+8].
+/// Called only with the receiver's TTBR0 installed.
 pub fn writeUserVreg14(ctx: *ArchCpuContext, value: u64) void {
-    ctx.regs.x13 = value;
+    cpu.panDisable();
+    @as(*u64, @ptrFromInt(ctx.sp_el0 + 8)).* = value;
+    cpu.panEnable();
 }
 
 /// Spec §[syscall_abi]: vreg 0 sits at `[user_sp + 0]` on the user
@@ -225,9 +225,8 @@ pub fn writeUserSyscallWord(ctx: *const ArchCpuContext, value: u64) void {
 /// modifications onto the suspended thread's saved iret frame when the
 /// originating thread handle held the `write` cap.
 ///
-/// Only vregs 1..13 are propagated — those are the spec's writable
-/// event-state GPR window. The wholesale `dst.regs = src.regs` shape
-/// would clobber x13..x30 (vreg 14 = suspended PC, plus AAPCS64
+/// Only vregs 1..13 are currently propagated. The wholesale
+/// `dst.regs = src.regs` shape would clobber x13..x30 (including AAPCS64
 /// callee-saved x19..x28, FP x29, and LR x30). LR corruption in
 /// particular makes the resumed thread `RET` to the receiver's stack frame
 /// instead of returning from its own `svc`, which silently traps the
