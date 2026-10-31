@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "Stygia",
+  "project_id": "eb879be0-a307-4088-99ab-5d5592caa7bb"
+}

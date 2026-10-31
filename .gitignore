@@ -28,3 +28,10 @@ slab_proof/.lake/
 docs/kernel/tla/out/
 docs/kernel/tla/states/
 .githooks/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
