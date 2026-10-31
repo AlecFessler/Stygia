@@ -81,8 +81,8 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///      out IPIs, then spins until every remote core's
 ///      `core_acked_gen[i] >= sync_arm_gen` before releasing the lock
 ///      or publishing the next descriptor. The remote IPI handler
-///      performs the requested invalidation and stores the current
-///      `sync_arm_gen` into its own `core_acked_gen[my_core]` slot.
+///      captures `sync_arm_gen`, performs the requested invalidation,
+///      and advances its own `core_acked_gen[my_core]` slot.
 ///      This is the Linux-style "send-then-wait" pattern — without
 ///      it, a per-page loop that overwrites the shared descriptor
 ///      between IPIs leaves remote cores executing INVPCID against
@@ -95,8 +95,8 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///      the initiator holds the lock, publishes a `.invlpg_no_ack`
 ///      descriptor (does NOT bump `sync_arm_gen`), fans out IPIs,
 ///      releases the lock. The handler INVLPGs and updates its
-///      `core_acked_gen` slot to whatever `sync_arm_gen` it observes;
-///      because the no-ack path never bumps the gen, that store is
+///      `core_acked_gen` slot to the gen captured before invalidation;
+///      because the no-ack path never bumps the gen, that ack is
 ///      idempotent against the most recent sync arm and cannot
 ///      satisfy a *future* sync arm's wait. This mode is used by
 ///      `unmapPage`'s kernel-stack teardown, which is reachable from
@@ -146,11 +146,10 @@ fn kindAttrs(kind: MappingKind) KindAttrs {
 ///
 /// The fix is to make ack tracking idempotent and per-core: each sync
 /// arm advances `sync_arm_gen` (a monotonic u64), and the handler
-/// stores that gen into its own slot. A duplicate or stale handler
-/// run just re-stores the same value (or a stale lower one — masked
-/// by max-store semantics in the wait loop). Underflow is impossible
-/// because we never decrement; double-acking is harmless because the
-/// store is idempotent within an arm.
+/// advances its own slot to that gen. A duplicate or stale handler
+/// run cannot regress the slot because the update uses atomic max.
+/// Underflow is impossible because we never decrement; double-acking
+/// is harmless because the update is idempotent within an arm.
 var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
 /// Shootdown request kind. Selects which invalidation primitive the
@@ -219,9 +218,8 @@ var sync_arm_gen: u64 = 0;
 /// Per-core last-acked sync_arm_gen. Each remote core stores its own
 /// slot from inside `tlbShootdownHandler` after the invalidation
 /// completes; sync initiators spin until every remote slot reaches
-/// the gen they bumped to. Idempotent — stale handler runs just
-/// re-store the same (or smaller) value, and the wait loop checks
-/// `>= expected_gen`.
+/// the gen they bumped to. The atomic-max update keeps the slot
+/// monotonic even when an IPI interrupts a conservative flush.
 var core_acked_gen: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 
 // ── Fire-and-forget per-PCID shootdown queue ────────────────────────────
@@ -355,8 +353,8 @@ pub fn clearPcidPendingFreeBit(id: u16) void {
 
 /// IPI handler for TLB shootdown. Dispatches on `shootdown_kind`,
 /// performs the requested invalidation, then signals completion by
-/// storing the current `sync_arm_gen` into this core's
-/// `core_acked_gen` slot. The store is unconditional: a fire-and-
+/// advancing this core's `core_acked_gen` slot to the generation
+/// observed before the invalidation. The ack is unconditional: a fire-and-
 /// forget IPI from `flushRemoteTlb` is harmless because that path
 /// never bumps `sync_arm_gen`, so the value stored here will be
 /// `<=` whatever any future sync arm publishes (and a sync waiter
@@ -365,6 +363,10 @@ pub fn clearPcidPendingFreeBit(id: u16) void {
 /// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID (types 0 and 1).
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     const my_core = apic.coreID();
+    // Capture the generation before touching the descriptor. A fire-and-forget
+    // IPI can overlap publication of a new synchronous arm; loading the gen
+    // after an older invalidation would falsely acknowledge the new arm.
+    const gen = @atomicLoad(u64, &sync_arm_gen, .acquire);
     const kind = @atomicLoad(u8, &shootdown_kind, .acquire);
     switch (kind) {
         @intFromEnum(ShootdownKind.invpcid_single) => {
@@ -410,13 +412,10 @@ pub fn tlbShootdownHandler(_: *cpu.Context) void {
     // pcid) bitmap lets the producer fire-and-forget without losing
     // shootdowns to descriptor multiplexing across back-to-back arms.
     drainLocalPendingPcid(my_core);
-    // Acknowledge the most recently published sync arm. Done
-    // unconditionally — see the design note at the top of the file.
-    // Acquire-load of `sync_arm_gen` pairs with the release-store in
-    // `bumpSyncArmGen`, so we observe the descriptor that triggered
-    // this IPI (or a later one — both are safe).
-    const gen = @atomicLoad(u64, &sync_arm_gen, .acquire);
-    @atomicStore(u64, &core_acked_gen[my_core], gen, .release);
+    // An IRQ may interrupt the conservative flush after it has captured an
+    // older gen. Both paths can complete out of order, so the slot must never
+    // move backwards when the interrupted flush resumes.
+    _ = @atomicRmw(u64, &core_acked_gen[my_core], .Max, gen, .release);
 }
 
 /// Bump `sync_arm_gen` and return the new value. Called by sync
@@ -455,7 +454,7 @@ fn ackPendingSyncArmConservative(my_core: u64) void {
     }
     cpu.flushTlbIncludingGlobal();
     drainLocalPendingPcid(my_core);
-    @atomicStore(u64, &core_acked_gen[my_core], armed, .release);
+    _ = @atomicRmw(u64, &core_acked_gen[my_core], .Max, armed, .release);
 }
 
 /// Public spin-loop service hook: acknowledge any pending sync TLB
@@ -1625,7 +1624,7 @@ pub fn publishKernelUnmapEpoch() u64 {
     // We just performed the flush this arm asks for, so record our own
     // ack directly. `kernelUnmapEpochRetired` can then require EVERY
     // core to be caught up without knowing which core published.
-    @atomicStore(u64, &core_acked_gen[self_id], gen, .release);
+    _ = @atomicRmw(u64, &core_acked_gen[self_id], .Max, gen, .release);
     fanoutShootdownIpis(self_id);
     return gen;
 }
