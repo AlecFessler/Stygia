@@ -185,9 +185,9 @@ between CPU cores**, and nothing else. Out of scope, with reasons in
 same-class nesting plus lockdep's dynamic cycle detection; the chain
 project revisions 10–12 built is retracted), analyzer capability,
 migration sequencing, and anything that does not move an EC between
-cores — VMAR work, handle-table rewriting, capability cascades, power
-management. **Do not read a green battery here as a statement about any
-of those.** Several rounds' findings were about them; they are recorded
+cores — VMAR work, handle-table rewriting, capability cascades. **Do
+not read a green battery here as a statement about any of those.**
+Several rounds' findings were about them; they are recorded
 in `systems.md` §11 as deferred, not fixed.
 
 **Parity discipline.** An earlier version of this model targeting revision 4
@@ -1930,21 +1930,19 @@ that the walk "surfaces exactly one new lifecycle-affecting section
 `systems.md` §11.9 in revision 11 and **survived verbatim right here**,
 in the section that actually carries the walk — which is the one place
 it could still stop a reader looking. It was false: an independent walk
-found **six** further gaps, the largest being a **domain-pause
+found **five** further gaps, the largest being a **domain-pause
 primitive** (`acquire_vmars`/`idc_read`/`idc_write`) that is
 architecturally larger than restart and NOT additive, plus `restrict`'s
 port-refcount cascade waking suspended senders with E_CLOSED, `revoke`
 (zero mentions in `systems.md`), the no-route fallback's
 kernel-initiated terminate from EXCEPTION context (a different actor
 than T2's terminator), `delete` of an EC handle mapped to edge 9 against
-a spec that says ECs are not destroyed by handle drops, and
-`power_sleep` filed as terminal when the spec says it returns on wake.
+a spec that says ECs are not destroyed by handle drops.
 Treat this table as incomplete until it is tool-derived. The sections
 below are confirmed only in the sense that the walk reached them:
 `§[Lifetimes]` is covered by
 retire/finalize, `§[device_irq]` is a T1 row, `§[event_state]` is §2.2's
-snapshot, `§[power]` is §3.6's carve-out, and
-`§[port_io_virtualization]`, `§[vm_policy]`, `§[event_type]`,
+snapshot, `§[port_io_virtualization]`, `§[vm_policy]`, `§[event_type]`,
 `§[handle_attachments]`, `§[vm_exit_state]`, `§[time]`, `§[rng]`,
 `§[system_info]` cause no EC state change. Rows that cannot change a
 lifecycle word are still listed, because "omitted" and "cannot" are the
@@ -1975,8 +1973,6 @@ distinction a closure table exists to make.
 | **§[restart_semantics] `restart_policy = 0` (kill)** | edge 9 | `RetireEC` / `Terminate` | the exiting domain's teardown |
 | **§[restart_semantics] `restart_policy = 1` (restart_at_entry)** | **NOT A DESIGN OBLIGATION as of `systems.md` rev 16** (maintainer decision), downgraded from revisions 13–15's "IN, deferred". The tree implements only the policy PLUMBING — `caps/capability.zig:346`/`:581`/`:591`/`:604` — and all eight `tests/suite/cases/restart_semantics_*.zig` test `E_PERM` ceiling bounding, not restart behaviour; there is no domain-restart implementation anywhere. Promising it an edge committed the machine to routing one value of one policy in a feature that does not exist. The analysis is kept and its status demoted: **NO EDGE EXISTS (round-9 C-5)** — an EC in ANY state must be forced runnable with its saved frame reset to its entry point. Not edge 6 (placement preserves the frame), not edge 7, not a claim-move; edge 1 establishes an entry frame but only on a fresh slot. Needs claim-by-state-route + **frame reset under the won claim** + edge 6, and a T2 row so a restart racing a retire loses | **not modelled** | — |
 | **§[restart_semantics] `restart_policy = 2` (persist)** | **NOT ADDRESSED** — keeps an EC *running* while its domain's VMARs are freed and handle table rewritten. §8.2/§8.5 do not cover an address-space change under a live EC, and it collides directly with `active_root` / translation quiescence (W6): a running EC on a root being rewritten is what `awaitDomainQuiesced` exists to prevent | **not modelled** | — |
-| `power_shutdown` / `power_reboot` | **not an EC state change** — terminal core-stopping paths, §3.6 carve-out (added in rev 8) | not modelled, by carve-out | — |
-| `power_sleep` | **not an EC state change, but NOT by the terminal carve-out** — the spec says it RETURNS on wake, so it is not terminal. OUT by §0.2 reason B: the core idles and resumes the same EC. Revisions 14–15 filed it under §3.6's terminal carve-out while §0.2 said the opposite; **corrected in revision 16** | not modelled, by §0.2 exclusion | — |
 | **`acquire_vmars` / `idc_read` / `idc_write`** | **THEY DO CHANGE EC STATE, and an earlier version of this table said they could not.** `specv3.md` `:722`/`:1894`/`:1952` say each **pauses every EC in the target domain**: §3.1 rule 3's third boundary arm, an edge-3 park into `waiting(domain_pause)`, edge 1's gated publish, plus the W5-N wait the caller performs. There is no edge-7 domain-pause route | **NOT MODELLED — see G12** | the pauser (entry/resume); each gated EC itself (the park) |
 | `sync`, `restrict`, `ack`, `perfmon_*`, all VMAR/page-frame/VM-policy calls, `create_port`, `bind_event_route`, `snapshot`, `remap`, `map_*`/`unmap*` | **cannot change any EC's lifecycle word.** `sync` refreshes a handle snapshot; `ack` unmasks a line (the acker is `running` throughout); the rest touch capability, memory or perfmon state only. (`restrict`'s port-refcount cascade WAKES suspended senders — that wake is in scope, via edge 5a's close-propagation trigger, and is listed separately in §0.1) | not modelled, correctly | — |
 

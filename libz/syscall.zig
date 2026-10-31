@@ -97,12 +97,6 @@ pub const SyscallNum = enum(u12) {
     random = 63,
     info_system = 64,
     info_cores = 65,
-    power_shutdown = 66,
-    power_reboot = 67,
-    power_sleep = 68,
-    power_screen_off = 69,
-    power_set_freq = 70,
-    power_set_idle = 71,
 };
 
 // SPEC AMBIGUITY: spec §[syscall_abi] does not pin which bits of the
@@ -734,32 +728,4 @@ pub fn infoSystem() Regs {
 
 pub fn infoCores(core_id: u64) Regs {
     return issueReg(.info_cores, 0, .{ .v1 = core_id });
-}
-
-// ---------------------------------------------------------------
-// 52..57: power
-// ---------------------------------------------------------------
-
-pub fn powerShutdown() Regs {
-    return issueReg(.power_shutdown, 0, .{});
-}
-
-pub fn powerReboot() Regs {
-    return issueReg(.power_reboot, 0, .{});
-}
-
-pub fn powerSleep(depth: u64) Regs {
-    return issueReg(.power_sleep, 0, .{ .v1 = depth });
-}
-
-pub fn powerScreenOff() Regs {
-    return issueReg(.power_screen_off, 0, .{});
-}
-
-pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
-    return issueReg(.power_set_freq, 0, .{ .v1 = core_id, .v2 = hz });
-}
-
-pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
-    return issueReg(.power_set_idle, 0, .{ .v1 = core_id, .v2 = policy });
 }

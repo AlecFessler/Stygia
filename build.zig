@@ -146,6 +146,10 @@ pub fn build(b: *std.Build) void {
         "tests_fixture_devices",
         "Mint synthetic test-only fixture device_regions in the boot path (default: on under -Dprofile=test)",
     ) orelse (profile_name != null and std.mem.eql(u8, profile_name.?, "test"));
+    // The suite runner returns after printing its final result and its
+    // _start deletes the boot root self-handle. Reboot that one test root
+    // at the syscall boundary so QEMU exits and Pi tryboot returns to Pi OS.
+    const test_root_reboot_on_exit = profile_name != null and std.mem.eql(u8, profile_name.?, "test");
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -244,6 +248,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "kernel_spawn_diag", kernel_spawn_diag);
     build_opts.addOption(bool, "kernel_spin_entry_diag", kernel_spin_entry_diag);
     build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
+    build_opts.addOption(bool, "test_root_reboot_on_exit", test_root_reboot_on_exit);
     const build_opts_mod = build_opts.createModule();
     stygia_mod.addImport("build_options", build_opts_mod);
 
@@ -648,6 +653,9 @@ pub fn build(b: *std.Build) void {
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)
             "-enable-kvm -cpu host,pmu=on"
+        else if (test_root_reboot_on_exit)
+            // QEMU must exit on the test-root reboot after the verdict.
+            "-machine accel=tcg -cpu cortex-a72,pmu=on -d int,cpu_reset -D qemu.log"
         else
             "-machine accel=tcg -cpu cortex-a72,pmu=on -d int,cpu_reset -no-shutdown -D qemu.log";
         break :blk b.fmt(
@@ -666,6 +674,11 @@ pub fn build(b: *std.Build) void {
         const qemu_accel_args: []const u8 = if (kvm)
             \\-enable-kvm \
             \\-cpu host,+invtsc
+        else if (test_root_reboot_on_exit)
+            \\-machine accel=tcg \
+            \\-cpu qemu64,+invtsc \
+            \\-d int,cpu_reset \
+            \\-D qemu.log
         else
             \\-machine accel=tcg \
             \\-cpu qemu64,+invtsc \

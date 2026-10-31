@@ -233,12 +233,6 @@ extra complexity this machine must not carry.
   kill, and the derivation-tree walk. (Their *wakes* are IN, above.)
 - **VMAR contents and handle-table rewriting** — the address-space work
   itself, as distinct from any EC movement it triggers.
-- **`power_sleep`.** Judged on the test rather than by category
-  (round-12): the spec says it returns on wake, so it is not terminal —
-  but it neither moves an EC between cores nor changes its runnability
-  from the scheduler's view. The core idles and resumes the same EC.
-  **OUT by reason B**, and §3.6's diagnostics carve-out is corrected to
-  say so rather than filing it as terminal.
 
 ### 0.3 BORDERLINE, each judged on the test and each stated with which way it lands
 
@@ -1949,29 +1943,9 @@ X = terminate (C-1). Every remaining cross-EC operation in §8.1 —
 `priority`, `affinity`, `yieldTo` — deserves the same question asked
 explicitly rather than assumed, and each of those answers should be
 marked DERIVED or RECALLED when written.
-Ack-while-spinning applies to all rows. **Diagnostics-and-terminal
-carve-out**: the panic path and
-**`power_shutdown` / `power_reboot`** (→ `cpu.powerAction`,
-`kernel/syscall/system.zig`) deliberately stop cores and sit outside the
-machine's liveness obligations; they are not T3 rows and MUST NOT be
-reachable from any non-diagnostic, non-terminal path
-(analyzer-checkable). Round 7 minor: the `power_*` family was missing
-from this list, which mattered because it is a *syscall* — reachable
-from user code by capability, unlike the panic path — so an analyzer
-closing 9.3(6b) over the syscall surface would have flagged it as an
-unexplained core-stopping path.
-
-**`power_sleep` is NOT in that carve-out, corrected in revision 16.**
-Revisions 14 and 15 filed it here as terminal while §0.2 had already
-judged it on the test and landed it **OUT by reason B** — the spec says
-it RETURNS on wake, so it is not terminal, and it neither moves an EC
-between cores nor changes its runnability from the scheduler's view; the
-core idles and resumes the same EC. §0.2 asserted in the same breath
-that "§3.6's diagnostics carve-out is corrected to say so", and it was
-not, so the document contradicted itself across two sections for two
-revisions. It is still not a T3 row — it is a halt, not a spin on a
-remote word — but the reason is §0.2's exclusion, not terminality, and
-an analyzer closing 9.3(6b) must whitelist it on that ground.
+Ack-while-spinning applies to all rows. The panic path deliberately
+stops cores and sits outside the machine's liveness obligations; it is
+not a T3 row.
 
 ---
 
@@ -3154,7 +3128,7 @@ ideal composition is exactly this section's decision list plus
    > **~~"that walk surfaces restart and nothing else new"~~ — RETRACTED
    > IN REVISION 11, and it was the most damaging sentence in revision
    > 10.** It was false, and worse, it was the kind of false that stops
-   > the next person looking. An independent section walk found SIX more
+   > the next person looking. An independent section walk found FIVE more
    > gaps, one of them larger than restart itself:
    >
    > - **A domain-pause primitive** (`acquire_vmars` / `idc_read` /
@@ -3170,10 +3144,6 @@ ideal composition is exactly this section's decision list plus
    >   DIFFERENT ACTOR than T2's terminator, and T2 names actors.
    > - **`delete` of an EC handle** is mapped to edge 9 here, while the
    >   spec says ECs are not destroyed by handle drops.
-   > - ~~**`power_sleep`** is filed under §3.6's terminal carve-out, but
-   >   the spec says it RETURNS on wake.~~ **CLOSED in revision 16** —
-   >   §3.6 no longer files it as terminal; it is OUT by §0.2 reason B,
-   >   which is what §0.2 had claimed §3.6 already said.
    >
    > The correct standing statement: **the section walk is a better
    > derivation than the syscall walk and is still not closed.** Treat
@@ -4341,7 +4311,7 @@ cannot be re-opened as an omission.
 - **DEFERRED, explicitly, as outside §0's boundary**: the analyzer
   inversion cost and §9.4's masking decision (§11.11, recorded not
   worked), §12's step ordering, the domain-pause design, `persist`,
-  `revoke`/`restrict` cascade mechanics, `power_sleep`, the three-class
+  `revoke`/`restrict` cascade mechanics, the three-class
   lock cycle (retracted with the chain project), and README/changelog
   bookkeeping beyond keeping the results accurate.
 
@@ -4795,8 +4765,7 @@ safety state spaces 39–87%.
 - Minors: §2.5's "bounded" W5 wait corrected (it terminates under
   stated assumptions, which is not a bound); §3.6's assumption set
   corrected from two to three (the no-interrupt-storm premise that
-  SF-over-WF carries); §3.6's diagnostics carve-out gains the
-  `power_*` syscall family; T4's futex row citation made precise and
+  SF-over-WF carries); T4's futex row citation made precise and
   VERIFIED against the tree (the re-enqueue of non-matching nodes is
   real, `futex.zig:249,255,364`); T4's port-queue, run-queue and futex
   rows gain the new re-bucket sites; §11.7's case for the bounded W5

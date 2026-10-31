@@ -386,30 +386,6 @@ pub fn infoCores(core_id: u64) callconv(.c) c.Regs {
     return toCRegs(syscall.infoCores(core_id));
 }
 
-pub fn powerShutdown() callconv(.c) c.Regs {
-    return toCRegs(syscall.powerShutdown());
-}
-
-pub fn powerReboot() callconv(.c) c.Regs {
-    return toCRegs(syscall.powerReboot());
-}
-
-pub fn powerSleep(depth: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.powerSleep(depth));
-}
-
-pub fn powerScreenOff() callconv(.c) c.Regs {
-    return toCRegs(syscall.powerScreenOff());
-}
-
-pub fn powerSetFreq(core_id: u64, hz: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.powerSetFreq(core_id, hz));
-}
-
-pub fn powerSetIdle(core_id: u64, policy: u64) callconv(.c) c.Regs {
-    return toCRegs(syscall.powerSetIdle(core_id, policy));
-}
-
 // ── Dynamic-symbol exports ──────────────────────────────────────────
 //
 // Names match the Zig-native API in syscall.zig — no `_c` suffix.
@@ -472,10 +448,4 @@ comptime {
     @export(&random, .{ .name = "random" });
     @export(&infoSystem, .{ .name = "infoSystem" });
     @export(&infoCores, .{ .name = "infoCores" });
-    @export(&powerShutdown, .{ .name = "powerShutdown" });
-    @export(&powerReboot, .{ .name = "powerReboot" });
-    @export(&powerSleep, .{ .name = "powerSleep" });
-    @export(&powerScreenOff, .{ .name = "powerScreenOff" });
-    @export(&powerSetFreq, .{ .name = "powerSetFreq" });
-    @export(&powerSetIdle, .{ .name = "powerSetIdle" });
 }

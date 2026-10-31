@@ -17,7 +17,8 @@
 //!      boot-protocol initial state and replyVmExit.
 //!   9. Loop on recvVmExit; dispatch to per-subcode handlers; reply
 //!      with mods.
-//!  10. On fatal exit (triple_fault / shutdown), powerShutdown.
+//!  10. On fatal exit (triple_fault / shutdown), report final stats and
+//!      return to root-service entry for domain teardown.
 
 const lib = @import("lib");
 
@@ -100,7 +101,6 @@ pub fn main(cap_table_base: u64) void {
     // route to userspace handlers.
     const policy_pf = mem.allocPolicyPageFrame() orelse {
         log.print("policy_pf alloc failed\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     };
 
@@ -113,7 +113,6 @@ pub fn main(cap_table_base: u64) void {
         log.print("createVirtualMachine failed: ");
         log.dec(vm_r.v1);
         log.print("\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
     vm_handle = @truncate(vm_r.v1 & 0xFFF);
@@ -125,7 +124,6 @@ pub fn main(cap_table_base: u64) void {
     // VMM-side reads/writes.
     if (!mem.setupGuestMemory(GUEST_RAM_LINUX)) {
         log.print("guest RAM setup failed\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
 
@@ -153,7 +151,6 @@ pub fn main(cap_table_base: u64) void {
         log.print("createPort failed: ");
         log.dec(port_r.v1);
         log.print("\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
     exit_port = @truncate(port_r.v1 & 0xFFF);
@@ -172,7 +169,6 @@ pub fn main(cap_table_base: u64) void {
         log.print("createVcpu failed: ");
         log.dec(vcpu_r.v1);
         log.print("\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
     vcpu_handle = @truncate(vcpu_r.v1 & 0xFFF);
@@ -203,9 +199,6 @@ pub fn main(cap_table_base: u64) void {
     log.print("/");
     log.dec(other_count);
     log.print(") ===\n");
-
-    _ = syscall.powerShutdown();
-    while (true) asm volatile ("hlt");
 }
 
 /// Linux boot setup — NVMe path. Stack-isolated so the VMM driver
@@ -213,7 +206,6 @@ pub fn main(cap_table_base: u64) void {
 noinline fn bootLinux() void {
     const hdr = disk.readHeader() orelse {
         log.print("Bad disk header\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     };
 
@@ -222,7 +214,6 @@ noinline fn bootLinux() void {
     log.print("Loading bzImage");
     if (!disk.loadToGuest(hdr.bzimage_offset, hdr.bzimage_size, TEMP_ADDR)) {
         log.print(" FAILED\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
     log.print(" done\n");
@@ -230,7 +221,6 @@ noinline fn bootLinux() void {
     log.print("Loading initramfs");
     if (!disk.loadToGuest(hdr.initramfs_offset, hdr.initramfs_size, boot.INITRAMFS_ADDR)) {
         log.print(" FAILED\n");
-        _ = syscall.powerShutdown();
         while (true) asm volatile ("hlt");
     }
     log.print(" done\n");

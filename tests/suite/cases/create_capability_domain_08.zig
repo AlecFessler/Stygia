@@ -74,8 +74,7 @@ pub fn main(cap_table_base: u64) void {
     const ceilings_outer_low: u64 = 0x0000_0000_03FE_FFFF;
     const ceilings_outer: u64 = ceilings_outer_low | (caller_fut_wait_max << 32);
 
-    // Self caps and idc_rx mirroring the runner. Withhold `power` and
-    // `restart` (consistent with the runner) so the self_caps subset
+    // Self caps and idc_rx mirroring the runner. Withhold `restart` (consistent with the runner) so the self_caps subset
     // check against the caller's self caps passes regardless of any
     // bit the runner cleared.
     const child_self = caps.SelfCap{

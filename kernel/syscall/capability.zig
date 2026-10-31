@@ -1,4 +1,5 @@
 const stygia = @import("stygia");
+const build_options = @import("build_options");
 
 const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
@@ -70,6 +71,17 @@ pub fn restrict(caller: *anyopaque, handle: u64, caps: u64) i64 {
 /// [test 03] on success, the handle is released and subsequent operations on it return E_BADCAP.
 pub fn delete(caller: *anyopaque, handle: u64) i64 {
     if (handle & ~HANDLE_MASK != 0) return errors.E_INVAL;
+    // Test runner _start deletes the boot root self-handle only after
+    // app.main printed the final suite verdict. Reboot at that exact
+    // boundary to end QEMU and return a Pi tryboot run to Pi OS. This
+    // branch is absent from production builds; child self-deletions and
+    // all other handles retain the normal delete path.
+    if (build_options.test_root_reboot_on_exit and handle == 0) {
+        const ec: *stygia.sched.execution_context.ExecutionContext = @ptrCast(@alignCast(caller));
+        if (@intFromPtr(ec.domain.ptr) == stygia.boot.userspace_init.boot_root_domain_addr) {
+            return stygia.arch.dispatch.cpu.powerAction(.reboot);
+        }
+    }
     return capability.delete(caller, handle);
 }
 

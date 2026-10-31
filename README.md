@@ -34,11 +34,9 @@ Userspace interacts with the kernel through handles to typed kernel objects. Eac
 
 **Performance counters.** Hardware PMU counters exposed to userspace through the perfmon syscalls (info, start, read, stop).
 
-**Power management.** Per-core CPU frequency and idle policy controls, plus system-wide shutdown, reboot, sleep, and screen-off.
-
 ## Status
 
-Stygia implements spec v3 in full. The kernel test suite has 485 spec tests, one ELF per spec assertion. As of this writing the suite passes 485/485 on x86_64 across three repetitions; on aarch64 the current count is 480/485, with five outstanding misses on the Pi 5 KVM run.
+The kernel test suite has one ELF per retained spec assertion. Run the suite on each supported architecture to check the current implementation.
 
 ## Building
 

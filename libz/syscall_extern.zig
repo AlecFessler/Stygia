@@ -106,12 +106,6 @@ pub const SyscallNum = enum(u12) {
     random = 63,
     info_system = 64,
     info_cores = 65,
-    power_shutdown = 66,
-    power_reboot = 67,
-    power_sleep = 68,
-    power_screen_off = 69,
-    power_set_freq = 70,
-    power_set_idle = 71,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -399,12 +393,6 @@ const ext = struct {
     extern fn random(count: u8) callconv(.c) c.Regs;
     extern fn infoSystem() callconv(.c) c.Regs;
     extern fn infoCores(core_id: u64) callconv(.c) c.Regs;
-    extern fn powerShutdown() callconv(.c) c.Regs;
-    extern fn powerReboot() callconv(.c) c.Regs;
-    extern fn powerSleep(depth: u64) callconv(.c) c.Regs;
-    extern fn powerScreenOff() callconv(.c) c.Regs;
-    extern fn powerSetFreq(core_id: u64, hz: u64) callconv(.c) c.Regs;
-    extern fn powerSetIdle(core_id: u64, policy: u64) callconv(.c) c.Regs;
 };
 
 // ── Public Zig-native wrappers ──────────────────────────────────────
@@ -739,32 +727,6 @@ pub fn infoCores(core_id: u64) Regs {
     return fromCRegs(ext.infoCores(core_id));
 }
 
-// 52..57: power
-
-pub fn powerShutdown() Regs {
-    return fromCRegs(ext.powerShutdown());
-}
-
-pub fn powerReboot() Regs {
-    return fromCRegs(ext.powerReboot());
-}
-
-pub fn powerSleep(depth: u64) Regs {
-    return fromCRegs(ext.powerSleep(depth));
-}
-
-pub fn powerScreenOff() Regs {
-    return fromCRegs(ext.powerScreenOff());
-}
-
-pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
-    return fromCRegs(ext.powerSetFreq(core_id, hz));
-}
-
-pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
-    return fromCRegs(ext.powerSetIdle(core_id, policy));
-}
-
 // Compile-time guard against accidentally reordering the SyscallNum
 // enum above. Matches the spec assignments verbatim.
 comptime {
@@ -773,5 +735,4 @@ comptime {
     std.debug.assert(@intFromEnum(SyscallNum.create_capability_domain) == 19);
     std.debug.assert(@intFromEnum(SyscallNum.recv) == 49);
     std.debug.assert(@intFromEnum(SyscallNum.reply) == 52);
-    std.debug.assert(@intFromEnum(SyscallNum.power_set_idle) == 71);
 }

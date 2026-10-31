@@ -21,6 +21,10 @@ const ParsedElf = stygia.utils.elf.ParsedElf;
 const Priority = stygia.sched.execution_context.Priority;
 const VAddr = stygia.memory.address.VAddr;
 
+// Identity of the boot root, used only by the test-profile exit hook.
+// No dereference is made after teardown; production compiles the hook out.
+pub var boot_root_domain_addr: usize = 0;
+
 /// Cap word minted on the root capability domain's slot-0 self-handle.
 /// Spec §[capability_domain] self-handle cap layout — every privilege the
 /// root service is permitted to delegate downward must be set here.
@@ -33,7 +37,6 @@ const ROOT_SELF_CAPS = capdom.CapabilityDomainCaps{
     .crpt = true,
     .pmu = true,
     .setwall = true,
-    .power = true,
     .restart = true,
     .reply_policy = true,
     .fut_wake = true,
@@ -240,6 +243,9 @@ pub fn init(root_service_elf: []const u8) !void {
         root_field1_ceilings,
         slid_entry,
     );
+    if (build_options.test_root_reboot_on_exit) {
+        boot_root_domain_addr = @intFromPtr(root_cd);
+    }
 
     // Re-mirror kernel-half PML4 entries from the kernel root into the
     // new domain's PML4. Fresh L3/L2/L1 paging structures created

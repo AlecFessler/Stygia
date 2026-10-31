@@ -543,24 +543,10 @@ pub const PowerAction = switch (builtin.cpu.arch) {
     else => unreachable,
 };
 
-pub const CpuPowerAction = switch (builtin.cpu.arch) {
-    .x86_64 => x64.power.CpuPowerAction,
-    .aarch64 => aarch64.power.CpuPowerAction,
-    else => unreachable,
-};
-
 pub fn powerAction(action: PowerAction) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.power.powerAction(action),
         .aarch64 => aarch64.power.powerAction(action),
-        else => unreachable,
-    };
-}
-
-pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.power.cpuPowerAction(action, value),
-        .aarch64 => aarch64.power.cpuPowerAction(action, value),
         else => unreachable,
     };
 }
@@ -683,11 +669,10 @@ pub fn cpuVendorModel(core_id: u64) u64 {
 ///
 /// x86-64: idle states require ACPI _CST parsing or MWAIT C-state
 /// support discovery via CPUID.05h, neither of which is wired today;
-/// `power_set_idle` therefore returns E_NODEV and the advertised flag
-/// is cleared.
+/// the advertised flag is cleared.
 ///
-/// aarch64: PSCI CPU_SUSPEND backs `power_set_idle` via the firmware
-/// interface (DEN0022D §5.1.2). If PSCI initialization succeeded the
+/// aarch64: PSCI CPU_SUSPEND is available via the firmware interface
+/// (DEN0022D §5.1.2). If PSCI initialization succeeded the
 /// platform supports idle-state entry; flag bit 1 is set.
 pub fn cpuIdleStatesSupported() bool {
     return switch (builtin.cpu.arch) {
@@ -701,7 +686,7 @@ pub fn cpuIdleStatesSupported() bool {
 /// Surfaces through `info_cores` flags bit 2 (spec §[system_info]).
 /// Neither x86-64 (IA32_PERF_CTL / HWP not wired) nor aarch64 (no DVFS
 /// wiring on the supported targets) currently expose set_freq, so the
-/// flag is cleared on both arches and `power_set_freq` returns E_NODEV.
+/// flag is cleared on both arches.
 pub fn cpuFreqScalingSupported() bool {
     return false;
 }

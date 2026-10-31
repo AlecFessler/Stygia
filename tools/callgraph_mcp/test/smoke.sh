@@ -44,10 +44,10 @@ trap 'rm -f "$REQ_FILE"' EXIT
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"callgraph_loc","arguments":{"name":"arch.x64.cpu.halt"}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"callgraph_src","arguments":{"name":"arch.x64.cpu.halt"}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"callgraph_callers","arguments":{"name":"arch.x64.cpu.halt"}}}
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"callgraph_reaches","arguments":{"from":"arch.x64.power.doShutdown","to":"arch.x64.cpu.halt"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"callgraph_reaches","arguments":{"from":"arch.x64.power.doReboot","to":"arch.x64.cpu.halt"}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"callgraph_entries","arguments":{}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"callgraph_modules","arguments":{}}}
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"callgraph_trace","arguments":{"entry":"arch.x64.power.doShutdown","depth":2}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"callgraph_trace","arguments":{"entry":"arch.x64.power.doReboot","depth":2}}}
 {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"callgraph_type","arguments":{"name":"memory.address.VAddr"}}}
 {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"callgraph_src_bin","arguments":{"name":"arch.x64.cpu.halt"}}}
 {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"callgraph_src_bin_at","arguments":{"at":"arch/x64/cpu.zig:430"}}}

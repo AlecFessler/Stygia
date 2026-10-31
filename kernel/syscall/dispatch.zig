@@ -78,12 +78,6 @@ pub const SyscallNum = enum(u64) {
     random = 63,
     info_system = 64,
     info_cores = 65,
-    power_shutdown = 66,
-    power_reboot = 67,
-    power_sleep = 68,
-    power_screen_off = 69,
-    power_set_freq = 70,
-    power_set_idle = 71,
 };
 
 /// Read `args[i]`, returning 0 when the index is past the end. Lets
@@ -152,12 +146,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .random,
         .info_system,
         .info_cores,
-        .power_shutdown,
-        .power_reboot,
-        .power_sleep,
-        .power_screen_off,
-        .power_set_freq,
-        .power_set_idle,
         => 13,
 
         // create_capability_domain: passed_handles list, no syscall-word
@@ -519,12 +507,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         },
         .info_system => system.infoSystem(caller),
         .info_cores => system.infoCores(caller, arg(args, 0)),
-        .power_shutdown => system.powerShutdown(caller),
-        .power_reboot => system.powerReboot(caller),
-        .power_sleep => system.powerSleep(caller, arg(args, 0)),
-        .power_screen_off => system.powerScreenOff(caller),
-        .power_set_freq => system.powerSetFreq(caller, arg(args, 0), arg(args, 1)),
-        .power_set_idle => system.powerSetIdle(caller, arg(args, 0), arg(args, 1)),
     };
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     logSpawnError(num_raw, dispatch_res);

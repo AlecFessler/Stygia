@@ -12,37 +12,17 @@
 //! wide at 65536 Hz**, so `0xFFFFF / 65536` = 15.99 s is a HARD ceiling. It
 //! cannot be extended by arming a larger value — a larger value silently
 //! truncates. Anything the kernel does that legitimately takes longer than one
-//! timeout has to re-arm the counter. The 485-test suite is exactly that: the
+//! timeout has to re-arm the counter. The large kernel test suite is exactly that: the
 //! first bare-metal run of it reset the board partway through `batch 16..32` of
 //! ~31 batches.
 //!
 //! ## Every exit converges on a reset
 //!
-//! The petting is deliberately NOT open-ended, because the goal is a board that
-//! can run the suite N times unattended. A *clean* run does not need this file
-//! at all: the suite's `-Dreboot_at_end` makes the runner finish with
-//! `power_reboot`, which on this board is a warm PSCI `SYSTEM_RESET` that
-//! preserves DRAM (and so the loader's early log) and lands back in Pi OS via
-//! tryboot. What the pet has to guarantee is that the *unclean* outcomes also
-//! come back on their own rather than holding the board up forever. It stops in
-//! each of these cases, and once it stops the already-armed watchdog fires
-//! within ≤15 s:
-//!
-//!   - `CEILING_SECONDS` after `setBase`. **This is the real safety net.** It
-//!     covers a hang that keeps servicing timer interrupts — the one failure
-//!     mode a watchdog cannot otherwise see, because the IRQ path keeps petting
-//!     on schedule while nothing progresses. Deliberately far larger than any
-//!     legitimate run; see the constant.
-//!   - A claimed panic gate, checked in `pet()`. `panic.panic` ends in
-//!     `cpu.halt()`, a `while (true) wfi` park that does NOT mask interrupts,
-//!     so without this the timer PPI would keep petting a dead kernel until the
-//!     ceiling expired.
-//!   - `stopPetting()` from `power.doShutdown` / `power.doReboot` before they
-//!     park, for the same reason. A backstop rather than a normal path: it
-//!     matters for a bare-metal image built *without* `-Dreboot_at_end`, whose
-//!     runner asks for a genuine `SYSTEM_OFF` that would be unrecoverable
-//!     remotely. It only stops the pet — choosing between off and reset is the
-//!     suite's decision, not the watchdog's.
+//! The petting is deliberately bounded. A clean test run returns from the
+//! root service, and the test-profile root-exit hook invokes PSCI SYSTEM_RESET
+//! to return to Pi OS via tryboot. A failed or hung run stops petting at the
+//! ceiling below and the armed watchdog resets the board within 15 seconds.
+//! Panic and failed firmware reboot also stop petting immediately.
 //!
 //! A hang that stops taking interrupts needs none of these: it stops petting by
 //! construction.
@@ -124,14 +104,8 @@ const RELOAD_TICKS: u32 = (15 * TICKS_PER_SEC) & PM_WDOG_TIME_SET;
 /// that stops taking interrupts needs none of this — it stops petting on its
 /// own and resets in ≤15 s.
 ///
-/// It is NOT the normal exit. A clean run reboots itself: with the suite's
-/// `-Dreboot_at_end`, the runner ends in `power_reboot` → PSCI `SYSTEM_RESET`,
-/// which on this board is a warm reset that returns to Pi OS immediately and
-/// involves the watchdog not at all. That is what makes it correct for this
-/// constant to be far larger than any legitimate run rather than tuned close to
-/// one: a tight ceiling buys nothing (the clean path is already immediate) and
-/// risks truncating a real run, which is exactly the failure this module was
-/// written to remove.
+/// A clean test run reboots through the test-profile boot-root exit hook,
+/// so this deadline is only a safety net for hangs and failed exits.
 ///
 /// A single boot may legitimately run for many minutes: the suite has an
 /// internal loop mode that runs the whole 485-test set N times back to back in
@@ -236,13 +210,9 @@ pub inline fn pet() void {
     reg.* = PM_PASSWORD | RELOAD_TICKS;
 }
 
-/// Stop petting permanently, handing the board back to the armed watchdog so
-/// it resets within ≤15 s.
-///
-/// Called on the shutdown and reboot paths (`power.doShutdown`,
-/// `power.doReboot`) and by `pet()` itself when the ceiling expires or a panic
-/// has been claimed. Idempotent and safe from IRQ context; on every target with
-/// no PM block it is already the state we are in, so it does nothing.
+/// Stop petting permanently, handing the board back to the armed watchdog.
+/// Called on panic and as a backstop if the internal firmware reboot returns.
+/// Idempotent and safe from IRQ context.
 pub fn stopPetting() void {
     @atomicStore(usize, &pm_base, 0, .monotonic);
 }

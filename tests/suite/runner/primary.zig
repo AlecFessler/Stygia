@@ -316,7 +316,7 @@ pub fn main(cap_table_base: u64) void {
                 // E_TIMEOUT lands in vreg 1 because no reply handle was minted.
                 // Drop the batch on the floor (its survivors stay `.not_run` =
                 // MISS in summarize). Hung sender ECs are reaped at domain
-                // teardown when the runner returns / power_shutdown.
+                // teardown when the runner returns and drops its self-handle.
                 if (got.regs.v1 == @intFromEnum(errors.Error.E_TIMEOUT)) {
                     serial.print("[runner] recv timeout after ");
                     serial.printU64(RECV_TIMEOUT_NS / 1_000_000_000);
@@ -483,22 +483,10 @@ pub fn main(cap_table_base: u64) void {
         serial.print(" miss ===\n");
     }
 
-    // Stop the system. Both of these require the `power` cap on the
-    // self-handle, which the primary holds by construction.
-    //
-    // Reached once, after every run in the -Drepeat loop has reported and
-    // the aggregate is printed — not per run.
-    //
-    // The generated test manifest always requests reboot now. On the
-    // Raspberry Pi 5 that becomes PSCI SYSTEM_RESET, so tryboot falls back
-    // to Pi OS and the board comes back over ssh after a successful run.
-    // QEMU gates run with `-no-reboot`, so the same request still terminates
-    // the VM process for local/precommit runs.
-    if (embedded_tests.reboot_at_end) {
-        _ = syscall.powerReboot();
-    } else {
-        _ = syscall.powerShutdown();
-    }
+    // Return to _start after the final verdict. It drops the boot root
+    // self-handle; the test-profile kernel recognizes that one exit and
+    // reboots through its existing internal platform path. QEMU -no-reboot
+    // exits, while Pi tryboot returns to Pi OS.
 }
 
 // Spawns a single test capability domain bound to the shared result

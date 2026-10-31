@@ -352,7 +352,7 @@ cap (word 0, bits 48-63):
 ```
  15  14 13 12   11      10     9      8      7      6     5     4     3     2     1     0
 ┌──────┬────┬─────┬──────┬──────┬──────┬──────┬──────┬───────┬──────┬──────┬──────┬──────┬──────┬──────┐
-│pri(2)│_rsv│timer│fut_wk│reply │restrt│power │setwal│  pmu  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
+│pri(2)│_rsv│timer│fut_wk│reply │restrt│_rsv  │setwal│  pmu  │ crpt │ crvm │ crpf │ crvr │ crec │ crcd │
 │      │    │     │      │_plcy │      │      │      │       │      │      │      │      │      │      │
 └──────┴────┴─────┴──────┴──────┴──────┴──────┴──────┴───────┴──────┴──────┴──────┴──────┴──────┴──────┘
 ```
@@ -367,7 +367,7 @@ cap (word 0, bits 48-63):
 | 5 | `crpt` — create port | `create_port` syscall |
 | 6 | `pmu` — performance monitoring | `perfmon_*` syscalls |
 | 7 | `setwall` — set wall-clock time | `time_setwall` syscall |
-| 8 | `power` — power management | `power_*` syscalls |
+| 8 | _reserved | — |
 | 9 | `restart` — domain restart on EC exit/fault | the kernel restarts the domain rather than tearing it down (see §[restart_semantics]) |
 | 10 | `reply_policy` — reply caps survive restart | on restart, reply handles in the domain are kept (1) rather than dropped (0) |
 | 11 | `fut_wake` — futex wake | `futex_wake` syscall |
@@ -4091,177 +4091,3 @@ info_cores([1] core_id) -> [1] flags, [2] freq_hz, [3] vendor_model
 [test 05] returns E_INVAL if any reserved bits are set in [1].
 
 [test 06] on success, [1] flag bit 0 reflects whether the queried core is currently online.
-
-
-### §[power] Power Management
-
-All `power_*` syscalls require `power` on the caller's self-handle.
-
-#### power_shutdown
-
-**Summary** — Performs an immediate orderly system poweroff. Does not return on success.
-
-**Declaration**
-
-```
-power_shutdown() -> void
-  syscall_num = 66
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**Tests**
-
-[test 01] returns E_PERM if the caller's self-handle lacks `power`.
-
-
-#### power_reboot
-
-**Summary** — Performs a warm system reboot. Does not return on success.
-
-**Declaration**
-
-```
-power_reboot() -> void
-  syscall_num = 67
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**Tests**
-
-[test 02] returns E_PERM if the caller's self-handle lacks `power`.
-
-
-#### power_sleep
-
-**Summary** — Enters a system-wide low-power state at the requested depth. Returns when the system wakes.
-
-**Declaration**
-
-```
-power_sleep([1] depth) -> void
-  syscall_num = 68
-
-  [1] depth: 1 = sleep (S1/S3-equivalent), 3 = deep sleep (S4-equivalent), 4 = hibernate (S5-equivalent)
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**E_INVAL** — `[1]` is not 1, 3, or 4.
-
-**E_NODEV** — platform does not support the requested sleep depth.
-
-**Tests**
-
-[test 03] returns E_PERM if the caller's self-handle lacks `power`.
-
-[test 04] returns E_INVAL if [1] is not 1, 3, or 4.
-
-[test 05] returns E_NODEV if the platform does not support the requested sleep depth.
-
-
-#### power_screen_off
-
-**Summary** — Turns the primary display off. Subsequent input wakes it.
-
-**Declaration**
-
-```
-power_screen_off() -> void
-  syscall_num = 69
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**Tests**
-
-[test 06] returns E_PERM if the caller's self-handle lacks `power`.
-
-
-#### power_set_freq
-
-**Summary** — Sets the target frequency for a specific core in Hz.
-
-**Declaration**
-
-```
-power_set_freq([1] core_id, [2] hz) -> void
-  syscall_num = 70
-
-  [1] core_id: target core
-  [2] hz: target frequency in Hz; 0 = let the kernel pick
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**E_INVAL** — `[1] ≥ info_system().cores`; `[2]` is nonzero and outside the platform's supported frequency range.
-
-**E_NODEV** — the queried core does not support frequency scaling (per `info_cores` flag bit 2).
-
-**Tests**
-
-[test 07] returns E_PERM if the caller's self-handle lacks `power`.
-
-[test 08] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
-
-[test 09] returns E_NODEV if the queried core does not support frequency scaling (per `info_cores` flag bit 2).
-
-[test 10] returns E_INVAL if [2] is nonzero and outside the platform's supported frequency range.
-
-[test 11] on success, a subsequent `info_cores([1])` reports a `freq_hz` consistent with the requested target (within hardware tolerance).
-
-
-#### power_set_idle
-
-**Summary** — Sets the idle policy for a specific core.
-
-**Declaration**
-
-```
-power_set_idle([1] core_id, [2] policy) -> void
-  syscall_num = 71
-
-  [1] core_id: target core
-  [2] policy: 0 = busy-poll (no idle entry), 1 = halt only (shallow), 2 = deepest available c-state
-```
-
-**Capabilities** — Self-handle: `power`.
-
-**Errors**
-
-**E_PERM** — caller's self-handle lacks `power`.
-
-**E_INVAL** — `[1] ≥ info_system().cores`; `[2]` is greater than 2.
-
-**E_NODEV** — the queried core does not support idle states (per `info_cores` flag bit 1).
-
-**Tests**
-
-[test 12] returns E_PERM if the caller's self-handle lacks `power`.
-
-[test 13] returns E_INVAL if [1] is greater than or equal to `info_system`'s `cores`.
-
-[test 14] returns E_NODEV if the queried core does not support idle states (per `info_cores` flag bit 1).
-
-[test 15] returns E_INVAL if [2] is greater than 2.

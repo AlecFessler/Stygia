@@ -259,9 +259,6 @@ entity:arch/aarch64/hv/regs.zig::arch.aarch64.hv.regs.CPTR_EL2_RES1    sha256:5c
 entity:arch/aarch64/hv/vcpu.zig::arch.aarch64.hv.vcpu.GuestState    sha256:ecccea094bc3460c25838f5c2b606a7c1ba2268774275514b1a658566e522102
 entity:arch/aarch64/hv/vm.zig::arch.aarch64.hv.vm.VmDevices    sha256:e5830c6ce9f93b416e2a9b3adecc2eec1299632b17fe66a54f7144aacc9bf42e
 entity:arch/aarch64/paging.zig::arch.aarch64.paging.PageEntry.ng    sha256:428ce7efda0fd0f04662054894a4efce903773241001aebdf1cc275928a4d996
-entity:arch/aarch64/power.zig::arch.aarch64.power.PSCI_VERSION    sha256:043bf40496079c6cab9a73560b20c127cda80cfee36c315d8757c53bc245c097
-entity:arch/aarch64/power.zig::arch.aarch64.power.CPU_OFF    sha256:a497ab6e3bbac650e22c82a31174eb0e19af1863cd75a36073b894d47d07945e
-entity:arch/aarch64/power.zig::arch.aarch64.power.SYSTEM_RESET2_64    sha256:a35f601c482ad1953da62774203da14a25fded70635aaf4c1f0715ca5af9a5c1
 entity:arch/x64/acpi.zig::arch.x64.acpi.GenericAddressStruct.register_bit_width    sha256:010582d64d78b84a410ca7cae14715936f025e02b06e8ce7c614c2e4e315dee9
 entity:arch/x64/acpi.zig::arch.x64.acpi.GenericAddressStruct.register_bit_offset    sha256:c1967441e50dc3644ed62036fe931b39302dafa2e4f5ae70a41ab67d6ca9d319
 entity:arch/x64/acpi.zig::arch.x64.acpi.GenericAddressStruct.access_size    sha256:759fd92cb4aa1524420e726c9fa883804123f5d6edf8db3097231007548aa537

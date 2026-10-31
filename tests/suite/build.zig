@@ -284,21 +284,6 @@ const test_entries = [_]TestEntry{
     .{ .name = "port_io_virtualization_09", .path = "cases/port_io_virtualization_09.zig" },
     .{ .name = "port_io_virtualization_10", .path = "cases/port_io_virtualization_10.zig" },
     .{ .name = "port_io_virtualization_11", .path = "cases/port_io_virtualization_11.zig" },
-    .{ .name = "power_01", .path = "cases/power_01.zig" },
-    .{ .name = "power_02", .path = "cases/power_02.zig" },
-    .{ .name = "power_03", .path = "cases/power_03.zig" },
-    .{ .name = "power_04", .path = "cases/power_04.zig" },
-    .{ .name = "power_05", .path = "cases/power_05.zig" },
-    .{ .name = "power_06", .path = "cases/power_06.zig" },
-    .{ .name = "power_07", .path = "cases/power_07.zig" },
-    .{ .name = "power_08", .path = "cases/power_08.zig" },
-    .{ .name = "power_09", .path = "cases/power_09.zig" },
-    .{ .name = "power_10", .path = "cases/power_10.zig" },
-    .{ .name = "power_11", .path = "cases/power_11.zig" },
-    .{ .name = "power_12", .path = "cases/power_12.zig" },
-    .{ .name = "power_13", .path = "cases/power_13.zig" },
-    .{ .name = "power_14", .path = "cases/power_14.zig" },
-    .{ .name = "power_15", .path = "cases/power_15.zig" },
     .{ .name = "priority_01", .path = "cases/priority_01.zig" },
     .{ .name = "priority_02", .path = "cases/priority_02.zig" },
     .{ .name = "priority_03", .path = "cases/priority_03.zig" },
@@ -754,12 +739,6 @@ pub fn build(b: *std.Build) void {
     // iteration counts without paying kernel-build / boot cost per rep.
     const repeat = b.option(u32, "repeat", "Number of times to replay the test manifest per boot (default 1)") orelse 1;
 
-    // The test-suite image always reboots after its final aggregate. This is
-    // required for Raspberry Pi tryboot: a successful bare-metal pass must
-    // return to Pi OS without physical intervention. QEMU gates run with
-    // `-no-reboot`, so the reboot request still terminates the VM process.
-    const reboot_at_end = true;
-
     // Debug aid for lost-result bugs (stygia-ojs): when a batch drain
     // hits its recv timeout, freeze instead of carrying on, so the
     // machine stays live and inspectable over the qemu gdb stub at the
@@ -767,7 +746,7 @@ pub fn build(b: *std.Build) void {
     //
     // A MISS otherwise self-erases as evidence: the runner records the
     // test `.not_run`, finishes the remaining batches, prints a normal
-    // summary and powers off, so by the time you see "MISS x" the
+    // summary and reboots, so by the time you see "MISS x" the
     // kernel state that explains it is gone. Freezing keeps the lost
     // EC, its port and the per-core state exactly as they were —
     // the same technique that cracked stygia-3ys from a live corpse.
@@ -1113,13 +1092,6 @@ pub fn build(b: *std.Build) void {
     manifest.print(
         "pub const repeat: u32 = {d};\n",
         .{repeat},
-    ) catch unreachable;
-    // Comptime end-of-run action. Always true so Pi tryboot can recover after
-    // successful bare-metal runs without depending on every invocation to pass
-    // a build flag.
-    manifest.print(
-        "pub const reboot_at_end: bool = {};\n",
-        .{reboot_at_end},
     ) catch unreachable;
     // Comptime corpse-preservation flag; see the -Dhalt_on_miss option.
     manifest.print(
