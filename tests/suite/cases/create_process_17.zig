@@ -11,7 +11,7 @@
 //                         reserved sub-fields, e.g. bits 17-23 in
 //                         vmar_inner_ceiling)
 //     [3] ceilings_outer: bits 38-63 _reserved
-//     [5+] passed_handle: bits 12-15 and 33-63 _reserved
+//     [6+] passed_handle: bits 12-15 and 33-63 _reserved
 //
 //   We exercise three branches, one per reservoir of reserved bits in
 //   [1], [2], and a passed handle entry, asserting the kernel returns
@@ -23,19 +23,15 @@
 //   is therefore the only spec-mandated failure path that mutates
 //   between the baseline and our injected variants.
 //
-//   Test 13 (E_BADCAP on invalid page frame) requires a valid pf
-//   handle, so we stage one via `create_page_frame`. We do NOT write a
-//   valid ELF into it: tests 15 (malformed ELF) and 16 (size mismatch)
-//   also return E_INVAL, which collides with our expected return code.
-//   That collision is benign — any spec-correct implementation returns
-//   E_INVAL for the reserved-bit case, and an implementation that
-//   short-circuits on ELF validation first still surfaces E_INVAL. A
-//   stricter ordering test would belong in tests 15/16/17 inter-order
-//   coverage, which the spec does not pin.
+//   Stage a valid ELF in the page frame and first make the same call
+//   with no reserved bits set. The baseline must succeed. This rules
+//   out the malformed-ELF E_INVAL path that made the old test vacuous.
+//   The passed-handle entry goes in vreg 6; vreg 5 is affinity.
 //
 // Action
 //   Setup
-//     - create a 1-page page frame to use as `elf_page_frame`.
+//     - create a 1-page page frame and stage a valid minimal ELF.
+//     - call create_process without reserved bits; require success.
 //
 //   Branch A: reserved bit 56 of [2] (ceilings_inner) set.
 //     Call create_process with the runner's valid
@@ -51,10 +47,11 @@
 //     PassedHandle equivalent encoding manually with bit 12 set.
 //
 // Assertions
-//   1: setup `create_page_frame` failed.
-//   2: branch A returned something other than E_INVAL.
-//   3: branch B returned something other than E_INVAL.
-//   4: branch C returned something other than E_INVAL.
+//   1-4: ELF staging setup failed.
+//   5: valid baseline did not succeed.
+//   6: branch A returned something other than E_INVAL.
+//   7: branch B returned something other than E_INVAL.
+//   8: branch C returned something other than E_INVAL.
 
 const lib = @import("lib");
 
@@ -62,6 +59,7 @@ const caps = lib.caps;
 const errors = lib.errors;
 const syscall = lib.syscall;
 const testing = lib.testing;
+const minimal_elf = @import("create_process_19.zig");
 
 // Mirror runner/primary.zig's known-valid ceiling templates so the
 // only spec violation in each branch is the injected reserved bit.
@@ -71,8 +69,9 @@ const VALID_CEILINGS_OUTER: u64 = 0x0000_003F_01FE_FFFF;
 pub fn main(cap_table_base: u64) void {
     _ = cap_table_base;
 
-    // Stage a 1-page page frame to satisfy test 13's BADCAP check.
-    const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true };
+    // Stage a valid ELF in a 1-page page frame. Its writer is shared
+    // with test 19, which exercises the create_process success path.
+    const pf_caps = caps.PfCap{ .move = true, .r = true, .w = true, .x = true };
     const cpf = syscall.createPageFrame(
         @as(u64, pf_caps.toU16()),
         0, // props: sz = 0 (4 KiB)
@@ -83,6 +82,24 @@ pub fn main(cap_table_base: u64) void {
         return;
     }
     const pf_handle: u12 = @truncate(cpf.v1 & 0xFFF);
+
+    const vmar_caps = caps.VmarCap{ .r = true, .w = true };
+    const cvar = syscall.createVmar(@as(u64, vmar_caps.toU16()), 0b011, 1, 0, 0);
+    if (testing.isHandleError(cvar.v1)) {
+        testing.fail(2);
+        return;
+    }
+    const vmar_handle: u12 = @truncate(cvar.v1 & 0xFFF);
+    const mapped = syscall.mapPf(vmar_handle, &.{ 0, pf_handle });
+    if (mapped.v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(3);
+        return;
+    }
+    _ = minimal_elf.writeMinimalElf(@ptrFromInt(cvar.v2));
+    if (syscall.delete(vmar_handle).v1 != @intFromEnum(errors.Error.OK)) {
+        testing.fail(4);
+        return;
+    }
 
     // A SelfCap subset of what the runner granted us. Caller's caps
     // include crproc/crec/crvr/crpf/crvm/crpt/fut_wake; we ask
@@ -95,6 +112,25 @@ pub fn main(cap_table_base: u64) void {
     // §[create_process] convention (the runner passes the
     // result port as the sole entry).
     const port_slot: u12 = caps.SLOT_FIRST_PASSED;
+
+    const passed_valid = (caps.PassedHandle{
+        .id = port_slot,
+        .caps = (caps.PortCap{ .bind = true, .xfer = true }).toU16(),
+        .move = false,
+    }).toU64();
+    const baseline = syscall.issueReg(.create_process, 0, .{
+        .v1 = valid_self_caps,
+        .v2 = VALID_CEILINGS_INNER,
+        .v3 = VALID_CEILINGS_OUTER,
+        .v4 = @as(u64, pf_handle),
+        .v5 = 0,
+        .v6 = passed_valid,
+    });
+    if (testing.isHandleError(baseline.v1)) {
+        testing.fail(5);
+        return;
+    }
+    _ = syscall.delete(@truncate(baseline.v1 & 0xFFF));
 
     // ---------------------------------------------------------------
     // Branch A: reserved bit 56 set in [2] ceilings_inner.
@@ -111,10 +147,11 @@ pub fn main(cap_table_base: u64) void {
             .v2 = ceilings_inner_bad,
             .v3 = VALID_CEILINGS_OUTER,
             .v4 = @as(u64, pf_handle),
-            .v5 = passed,
+            .v5 = 0,
+            .v6 = passed,
         });
         if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
-            testing.fail(2);
+            testing.fail(6);
             return;
         }
     }
@@ -134,10 +171,11 @@ pub fn main(cap_table_base: u64) void {
             .v2 = VALID_CEILINGS_INNER,
             .v3 = VALID_CEILINGS_OUTER,
             .v4 = @as(u64, pf_handle),
-            .v5 = passed,
+            .v5 = 0,
+            .v6 = passed,
         });
         if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
-            testing.fail(3);
+            testing.fail(7);
             return;
         }
     }
@@ -162,10 +200,11 @@ pub fn main(cap_table_base: u64) void {
             .v2 = VALID_CEILINGS_INNER,
             .v3 = VALID_CEILINGS_OUTER,
             .v4 = @as(u64, pf_handle),
-            .v5 = passed_bad,
+            .v5 = 0,
+            .v6 = passed_bad,
         });
         if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
-            testing.fail(4);
+            testing.fail(8);
             return;
         }
     }

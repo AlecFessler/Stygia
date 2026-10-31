@@ -136,7 +136,7 @@ const PAGE_SIZE: usize = 4096;
 // without volatile, ReleaseSmall optimizes away the stores (see
 // project memory `project_zig_shm_readtable_bug.md` — same class of
 // bug as the runner's stageElfIntoPageFrame which also uses volatile).
-fn writeMinimalElf(dst: [*]volatile u8) usize {
+pub fn writeMinimalElf(dst: [*]volatile u8) usize {
     var i: usize = 0;
     while (i < PAGE_SIZE) {
         dst[i] = 0;
