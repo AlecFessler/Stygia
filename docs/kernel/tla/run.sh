@@ -194,6 +194,8 @@ expect_violation pr5 ThreadProbes.tla "Invariant ProbeNoDisarm is violated" \
 # G11: the terminal directive marker is actually reachable before slot zero.
 expect_violation g11 ThreadProbes.tla "Invariant ProbeNoFinalizingDead is violated" \
   -deadlock -config ThreadLifecycle_g11.cfg
+# Same scope: reach finalizing/dead, but exclude a still-running waiter.
+expect_pass g11pin ThreadProbes.tla -deadlock -config ThreadLifecycle_g11_pin.cfg
 # G14: omitting the wake IPI strands a ready thread on a parked core.
 expect_violation g14miss ThreadLifecycle.tla "Invariant InvParkedQueueHasWake is violated" \
   -config ThreadLifecycle_g14_missing.cfg

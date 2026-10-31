@@ -53,6 +53,16 @@ ProbeNoRetireFromPended ==
 ProbeNoFinalizingDead ==
   \A e \in Threads: ~(threads[e].st = "finalizing" /\ threads[e].dir = "dead")
 
+(* A live remote directive waiter owns the target pin through its return.
+   RetireEnabled requires that pin absent, so finalization's dead marker
+   cannot coexist with a waiter that could read it. The separate reachability
+   probe above proves the antecedent is reachable in this same scope. *)
+InvNoLiveWaiterAtFinalizingDead ==
+  \A e \in Threads:
+    (threads[e].st = "finalizing" /\ threads[e].dir = "dead") =>
+      (~threads[e].dpin /\
+       \A u \in Threads: ~(threads[u].pc = "dirW" /\ threads[u].tg = e))
+
 (* G16: phase 2 must be reachable from a staged request through self-retire,
    hop, park-stack consumption, and release of the same process reference. *)
 ProbeNoTeardownDone ==
