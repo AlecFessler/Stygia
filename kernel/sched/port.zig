@@ -703,7 +703,7 @@ fn terminalSuspendResult(process_ref: SlabRef(Process), target_slot: u12, target
     return errors.E_TERM;
 }
 
-pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
+pub fn suspendThread(caller: *Thread, target: u64, port: u64, payload_count: u7) i64 {
     const process_ref = caller.process;
     const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const process = lr.ptr;
@@ -812,6 +812,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
             target_thread.directive_owner = caller;
             target_thread.originating_write_cap = thread_caps.write;
             target_thread.originating_read_cap = thread_caps.read;
+            target_thread.event_payload_count = payload_count;
             if (!lifecycle.armRemoteSuspend(target_thread, owner_slot)) {
                 target_thread.directive_port = null;
                 target_thread.directive_owner = null;
@@ -891,6 +892,7 @@ pub fn suspendThread(caller: *Thread, target: u64, port: u64) i64 {
         // §[reply] tests 05/06) and so recv-time gates the suspended thread's
         // §[event_state] vregs 1..13 exposure (Spec §[suspend] test 10).
         // The caps were captured into `thread_caps` above under the process lock.
+        target_thread.event_payload_count = payload_count;
         const ret = thread_mod.suspendOnPortWithPairHandoffGen(target_thread, caller, p, .suspension, 0, 0, thread_caps.write, thread_caps.read, plr.irq_state, target_ref.gen);
         const should_retry = target_pinned and
             (ret == errors.E_BUSY or ret == errors.E_INVAL) and
@@ -2073,7 +2075,8 @@ fn deliverEvent(
         (@as(u64, pair_count) << PAIR_COUNT_SHIFT) |
         (@as(u64, tstart) << TSTART_SHIFT) |
         (@as(u64, reply_slot) << REPLY_HANDLE_SHIFT) |
-        (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT);
+        (@as(u64, @intFromEnum(event_type)) << EVENT_TYPE_SHIFT) |
+        (@as(u64, sender.event_payload_count) << 49);
     if (event_type == .suspension) maybePrintReportDelivered(sender, receiver, reply_slot);
 
     // §[event_state] vregs 1..13 = the suspending thread's GPRs snapshotted
