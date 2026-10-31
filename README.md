@@ -89,7 +89,7 @@ kernel/                Kernel proper
 
 bootloader/            UEFI bootloader (KASLR, kernel + root-service load)
 
-libz/                  Userspace library (caps, errors, syscall*, loader, libc compat)
+libz/                  Userspace library (caps, errors, syscall*, loader)
 
 slab_proof/            Lean proof of GenLock + SecureSlab safety
 

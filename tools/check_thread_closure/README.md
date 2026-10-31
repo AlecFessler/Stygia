@@ -114,10 +114,8 @@ UNRESOLVED, so the blind spot is visible rather than assumed empty; on the
 current tree that list is entirely `GenLock`/`SlabRef` acquires, which have
 no static class identity and are `tools/check_gen_lock`'s subject.
 
-Scope is `kernel/` + `bootloader/`. The indexer's extra source roots pull in
-userspace trees with their own unrelated `SpinLock` types —
-`libz/libc/src/heap/spin_lock.zig` ships a stub whose `lock()` body is empty
-— and reporting those as kernel preemption hazards would be noise.
+Scope is `kernel/` + `bootloader/`. The indexer's extra source roots also pull
+in userspace and tooling trees; their locks are outside this kernel analysis.
 
 ## The call graph is repaired before either rule runs
 

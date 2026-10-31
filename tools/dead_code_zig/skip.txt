@@ -552,27 +552,6 @@ entity:sched/priority_queue.zig::sched.priority_queue.enqueueFront    sha256:cb0
 #     L4-style reply+recv asm shim consumed by typed-reply userspace
 #     clients; symmetric across both arches and both extern variants.
 #
-# Libz/libc surface (Phase 4c port) — public C-ABI symbols compiled into
-# the libc.a static archive that the cross-compiled Zig+LLVM links
-# against. Reported "unused" because nothing inside the kernel build
-# graph calls them; the C/C++ consumer lives outside the analyzer's
-# scope. Kept because the libc surface IS the contract.
-#   * libz/libc/src/libc.zig (panic) — std.debug.no_panic override so
-#     debug-mode safety checks compile cleanly without dragging in
-#     Zig's stack-trace machinery (selfExePath et al. don't exist on
-#     Stygia).
-#   * libz/libc/src/malloc.zig (MallInfo2 fields) — glibc-shaped
-#     mallinfo2() return struct; layout-bearing for ABI compat even
-#     though we always return zeros.
-#   * libz/libc/src/posix_io.zig (Stat._padding) — opaque stat-buffer
-#     padding sized to glibc layout; the kernel writes the meaningful
-#     bytes via `stygia_fs_stat`.
-#   * libz/libc/src/process.zig (Rusage._padding) — opaque rusage
-#     padding sized to glibc layout for getrusage() ABI compat.
-#   * libz/libc/src/signal.zig (SIG_IGN, SIG_ERR) — POSIX-defined
-#     sentinels exposed for signal-handler registration even though
-#     Stygia never delivers signals.
-#
 entity:arch/aarch64/hyp.zig::arch.aarch64.hyp.WorldSwitchCtx.host_elr_el2    sha256:cea356b1ae806ff2b2d11d5f01908e5122516e062301b849cb0148c9523e1cf5
 entity:arch/aarch64/hyp.zig::arch.aarch64.hyp.WorldSwitchCtx.host_spsr_el2    sha256:a380736b0a29bb1187433926bdc2fbae8501b8edbe1bcedd161e53fb6b9bd434
 entity:arch/aarch64/hyp.zig::arch.aarch64.hyp.HostFpState.v    sha256:3f54fcd6d40075475920fbf1a70e83c6931a70bd7518a7a6b9a1eb4ad44a96c8
@@ -666,14 +645,6 @@ entity:libz/errors.zig::libz.errors.Error.E_REFUSED    sha256:a1d11d87ec3ed36b6e
 entity:libz/errors.zig::libz.errors.fromRaw    sha256:1065dc24ad81cfa6f2383b000c3d3f060852a33ee5cb949218b0a0464fa5068e
 entity:libz/syscall.zig::libz.syscall.extraReplyRecvPort    sha256:e81ce85d990ad19b25138abe9ec224bf2c1d8a5904a9de52eeafe765729400f5
 entity:libz/syscall_extern.zig::libz.syscall_extern.extraReplyRecvPort    sha256:e81ce85d990ad19b25138abe9ec224bf2c1d8a5904a9de52eeafe765729400f5
-entity:libz/libc/src/libc.zig::libz.libc.src.libc.panic    sha256:4ba535d9708c98dba07e44a4b0e079af66d275feb318383f5c0c1ba885a6c14b
-entity:libz/libc/src/process.zig::libz.libc.src.process.Rusage    sha256:43b3c609c0cd33ad2fb322fcd4f7d52e253f0432d746f463c6834f61bc3f0e38
-entity:libz/libc/src/process.zig::libz.libc.src.process.Rusage._padding    sha256:25625a29b118547aab4eed939e16d6fc11666dc81ad02dd2c723fd7919c08568
-entity:libz/libc/src/signal.zig::libz.libc.src.signal.SIG_IGN    sha256:bccad1cda6e61c5f42e8b5b314b3a97b3ba5aa1de0e8935f9be12013387c143e
-entity:libz/libc/src/signal.zig::libz.libc.src.signal.SIG_ERR    sha256:ef7d901e1100b9ad99c78c3e0577f3aced2ff8e04e94bd84c9ee908ae911b9cc
-entity:libz/libc/src/dl.zig::libz.libc.src.dl.empty    sha256:e4f7265885b32f27e83bcd784fcd66cf4d1ce8b6ca58ee6a3fee4b31f2268fec
-entity:libz/libc/src/fortify.zig::libz.libc.src.fortify.__memcpy_chkF    sha256:eacebfbcfe9943d6d782cd77b81041b86cdd607b2f85b3c0a0843969ca9ef30c
-entity:libz/libc/src/process.zig::libz.libc.src.process._exit    sha256:2398b0e2568bfb7aa9e89231643bf069bc358249bc725f6faa043582c15e70c8
 entity:libz/syscall_aarch64.zig::libz.syscall_aarch64.SyscallNum    sha256:73c01703e1db195abff671d108c699bdfb11c7b5f30a4b10c7ff1fe9d38e1be3
 entity:libz/syscall_aarch64_extern.zig::libz.syscall_aarch64_extern.SyscallNum    sha256:73c01703e1db195abff671d108c699bdfb11c7b5f30a4b10c7ff1fe9d38e1be3
 entity:libz/syscall_x64.zig::libz.syscall_x64.SyscallNum    sha256:73c01703e1db195abff671d108c699bdfb11c7b5f30a4b10c7ff1fe9d38e1be3
@@ -700,21 +671,6 @@ entity:libz/caps.zig::libz.caps.PassedHandle._reserved_lo    sha256:37763ee9bd66
 entity:libz/caps.zig::libz.caps.PassedHandle._reserved_hi    sha256:4ba441c0556f9eff99e7638d79e49af660c2f5e8199a5fd79c5550664b088af5
 entity:libz/caps.zig::libz.caps.PairEntry._reserved_lo    sha256:37763ee9bd66a2a0ae5bce36d96c8140b77ee714f872966f980b502277e09b27
 entity:libz/caps.zig::libz.caps.PairEntry._reserved_hi    sha256:4ba441c0556f9eff99e7638d79e49af660c2f5e8199a5fd79c5550664b088af5
-entity:libz/libc/src/heap/red_black_tree.zig::libz.libc.src.heap.red_black_tree.forEachInRange    sha256:99c2fd9ac41bc81e7e6248380a944a6279f0b0b08802a0fb37a7dfce190a4eee
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.ordblks    sha256:b9b817085bd6bccf125bbe402f49878aaf49de888ce3fa0f76f061936cfd249c
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.smblks    sha256:e19ddee01ffbdb1df1cc24948606f1e9604b3441cb686194552a0ef83610b382
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.hblks    sha256:74b37a82c42ed0735d859ddaed243b36e72a57b48516a2b956428569a056ee64
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.hblkhd    sha256:4fcbc1c87c88df7260fb219a80aa00522a6b2bf7186cd37a86c7dead67c54047
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.usmblks    sha256:5ed9588ae39f837cc4f26bbab105e0ccc7062ab9b26f17514c5dedf79f997782
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.fsmblks    sha256:f20e41858e8c614021568b9504243341900f8eb53f36354f94a05242e076279a
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.uordblks    sha256:b6196d50d7a959426a476fbb6c59aa4aca4c1433b736b28360006321a9a7b5e4
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.fordblks    sha256:d2df70fb675ca43131206b33806f85c4120a36a6a2ab699473a06b97678684ee
-entity:libz/libc/src/malloc.zig::libz.libc.src.malloc.MallInfo2.keepcost    sha256:f17bf331d96d0297d05fb44ba28e9ad73292b49b41b6eeed2741172859be02d8
-entity:libz/libc/src/posix_io.zig::libz.libc.src.posix_io.stygia_fs_stat    sha256:65009075e34bd0559b77ae9ac86dfabeb9e3414d356c7f5e0300758b2fa8d4af
-entity:libz/libc/src/posix_io.zig::libz.libc.src.posix_io.stygia_fs_unlink    sha256:587a38ca515586abcc017ca2755f474ce83d495f16b303250e2f5fe0b60b66a7
-entity:libz/libc/src/posix_io.zig::libz.libc.src.posix_io.stygia_fs_mkdir    sha256:28f1a5f2632ab93d518c644d47dde4ace6d6ea48f2ffba8840fdda120cb6b302
-entity:libz/libc/src/posix_io.zig::libz.libc.src.posix_io.Stat    sha256:059f3d9fb329f78a4b3667d33d16d1c8bf9c7d66c6bec4aea1ec0d3820635ae9
-entity:libz/libc/src/posix_io.zig::libz.libc.src.posix_io.Stat._padding    sha256:25625a29b118547aab4eed939e16d6fc11666dc81ad02dd2c723fd7919c08568
 entity:memory/vmar.zig::memory.vmar.CacheType.wb    sha256:13d873aea2949d513b3c20180f2783ec9729ac67b7b95ff0c24e78324669a840
 entity:memory/vmar.zig::memory.vmar.CacheType.uc    sha256:ef556a8b5ec3527dc87ec134b14278a191b3c54cfbecbdc304cf0f564a7680e5
 entity:memory/vmar.zig::memory.vmar.CacheType.wc    sha256:180451b53b88826271ad53cbc7970dfd03ec5744e2938527781a8be9445f07ed

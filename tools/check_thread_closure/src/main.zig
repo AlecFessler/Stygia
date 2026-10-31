@@ -159,10 +159,8 @@ const LOCK_TYPES = [_][]const u8{ "SpinLock", "GenLock" };
 const LOCK_IMPL_FILE = "utils/sync/spin_lock.zig";
 
 /// Rule B is a statement about the *kernel's* lock discipline. The
-/// indexer's extra source roots pull in userspace and tooling trees that
-/// have their own, unrelated `SpinLock` types — `libz/libc/src/heap/`
-/// ships a no-op stub whose `lock()` body is empty. Including them would
-/// report userspace locks as kernel preemption hazards.
+/// indexer's extra source roots pull in userspace and tooling trees.
+/// Including their locks would report them as kernel preemption hazards.
 fn inKernelScope(path: []const u8) bool {
     if (mem.startsWith(u8, path, "libz/")) return false;
     if (mem.startsWith(u8, path, "tools/")) return false;
