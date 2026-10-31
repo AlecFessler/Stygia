@@ -1482,7 +1482,7 @@ fn reportUnhandledFault(
     subcode: u8,
     payload: u64,
 ) void {
-    thread_mod.printPreReportTerminal(thread, null, terminal_reason);
+    thread_mod.printPreReportTerminal(thread, null, terminal_reason, subcode);
     const n = @atomicRmw(u32, &unhandled_prints, .Add, 1, .monotonic);
     if (n >= UNHANDLED_PRINT_BUDGET) return;
 

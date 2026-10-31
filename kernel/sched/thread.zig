@@ -167,6 +167,7 @@ pub fn printPreReportTerminal(
     thread: ?*Thread,
     process: ?*Process,
     reason: []const u8,
+    fault_subcode: ?u8,
 ) void {
     if (!build_options.kernel_spawn_diag) return;
     if (thread) |e| {
@@ -193,16 +194,21 @@ pub fn printPreReportTerminal(
     slot.publish_seq.store(seq, .release);
     if (n >= PRE_REPORT_TERMINAL_PRINT_BUDGET) return;
 
-    arch.boot.print(
-        "[pre-report-terminal] tag=0x{x} index={x} process=0x{x} thread=0x{x} reason={s}\n",
-        .{
-            tag,
-            tag - REPORT_TAG_MAGIC,
-            if (process) |d| @intFromPtr(d) else @as(usize, 0),
-            if (thread) |e| @intFromPtr(e) else @as(usize, 0),
-            reason,
-        },
-    );
+    const process_addr = if (process) |d| @intFromPtr(d) else @as(usize, 0);
+    const thread_addr = if (thread) |e| @intFromPtr(e) else @as(usize, 0);
+    // Keep fault identity and subcode in one locked serial write. The legacy
+    // raw [UNHANDLED] printer can interleave with another core's output.
+    if (fault_subcode) |subcode| {
+        arch.boot.print(
+            "[pre-report-terminal] tag=0x{x} index={x} process=0x{x} thread=0x{x} reason={s} subcode={x}\n",
+            .{ tag, tag - REPORT_TAG_MAGIC, process_addr, thread_addr, reason, subcode },
+        );
+    } else {
+        arch.boot.print(
+            "[pre-report-terminal] tag=0x{x} index={x} process=0x{x} thread=0x{x} reason={s}\n",
+            .{ tag, tag - REPORT_TAG_MAGIC, process_addr, thread_addr, reason },
+        );
+    }
 }
 
 pub fn recordSpawnTrace(

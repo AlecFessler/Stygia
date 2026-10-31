@@ -787,7 +787,7 @@ fn maybePrintSpawnChild(process: *Process, thread: *Thread) void {
 /// kernel slab class fills after ~10 reps of the test runner and any
 /// subsequent `createPort` returns E_NOMEM.
 fn cleanupPartiallyCreatedCd(process: *Process, partial_thread: ?*Thread) void {
-    thread_mod.printPreReportTerminal(partial_thread, process, "partial_create_cleanup");
+    thread_mod.printPreReportTerminal(partial_thread, process, "partial_create_cleanup", null);
     // `partial_thread` itself is covered by destroyThreadsInProcess's slab-walk match.
     const process_gen = process._gen_lock.currentGen();
     const process_ref: SlabRef(Process) = .{ .ptr = process, .gen = @intCast(process_gen) };
