@@ -997,18 +997,33 @@ fn restartSnapshotLocked(process: *Process, slot: u12, target: *VMAR, source: *V
     if (target.map != .unmapped) unmapAll(target, process);
     target.map = .unmapped;
 
+    var has_backing = false;
     for (source.installed_pfs) |installed| {
-        const src_pf = if (installed.pf) |ref| ref.ptr else continue;
-        const copied_pf = stygia.memory.page_frame.allocForDemand(target.sz) catch return false;
-        const bytes = pageSizeBytes(target.sz);
-        const src_addr = VAddr.fromPAddr(src_pf.phys_base, null).addr;
-        const dst_addr = VAddr.fromPAddr(copied_pf.phys_base, null).addr;
-        @memcpy(@as([*]u8, @ptrFromInt(dst_addr))[0..bytes], @as([*]const u8, @ptrFromInt(src_addr))[0..bytes]);
-        if (mappingInstall(target, installed.offset, copied_pf, 0b111) != 0) {
-            stygia.memory.page_frame.releaseHandle(copied_pf);
-            return false;
+        if (installed.pf != null) {
+            has_backing = true;
+            break;
         }
-        stygia.memory.page_frame.releaseHandle(copied_pf);
+    }
+    if (has_backing) {
+        // One source installation may span multiple PF pages, and the
+        // source/target VMARs may use different page sizes as long as
+        // their byte lengths match. Build one target-sized backing span
+        // and copy each installed source span at its byte offset. Fresh
+        // PMM pages are zeroed, preserving unbacked source holes.
+        const copied_pf = stygia.memory.page_frame.allocForDemandPages(target.sz, target.page_count) catch return false;
+        defer stygia.memory.page_frame.releaseHandle(copied_pf);
+        const target_bytes = @as(u64, target.page_count) * pageSizeBytes(target.sz);
+        const dst_addr = VAddr.fromPAddr(copied_pf.phys_base, null).addr;
+        const dst: [*]u8 = @ptrFromInt(dst_addr);
+        for (source.installed_pfs) |installed| {
+            const src_pf = if (installed.pf) |ref| ref.ptr else continue;
+            const bytes = @as(u64, src_pf.page_count) * pageSizeBytes(src_pf.sz);
+            if (installed.offset > target_bytes or bytes > target_bytes - installed.offset) return false;
+            const src_addr = VAddr.fromPAddr(src_pf.phys_base, null).addr;
+            const src: [*]const u8 = @ptrFromInt(src_addr);
+            @memcpy(dst[installed.offset..][0..bytes], src[0..bytes]);
+        }
+        if (mappingInstall(target, 0, copied_pf, 0b111) != 0) return false;
         target.map = .demand;
     }
     refreshVmarSnapshot(process, slot, target);

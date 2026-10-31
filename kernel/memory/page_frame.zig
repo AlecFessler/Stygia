@@ -174,6 +174,12 @@ pub fn allocForDemand(sz: PageSize) !*PageFrame {
     return allocPageFrame(sz, 1);
 }
 
+/// Snapshot restart may need one backing frame spanning the target VMAR,
+/// including when its page size differs from the source VMAR's page size.
+pub fn allocForDemandPages(sz: PageSize, page_count: u32) !*PageFrame {
+    return allocPageFrame(sz, page_count);
+}
+
 /// Allocate a PageFrame slot + `page_count` pages of `sz` from PMM,
 /// refcount=1, mapcnt=0. Spec §[page_frame] create.
 ///

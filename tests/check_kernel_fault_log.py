@@ -35,6 +35,7 @@ RESTART_FAULT_TESTS = frozenset({
     "vmar_restart_00", "vmar_restart_01", "vmar_restart_02",
     "vmar_restart_03", "vmar_restart_pf_shared",
     "snapshot_07", "snapshot_08", "snapshot_09", "snapshot_10", "snapshot_11",
+    "snapshot_multi_page_pf",
 })
 EXPECTED_FAULT_TESTS = RESTART_FAULT_TESTS | {"breakpoint_fault_01"}
 

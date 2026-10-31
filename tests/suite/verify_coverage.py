@@ -68,6 +68,7 @@ NON_SPEC_TEST_FILES = {
     "process_restart_06.zig",
     "process_restart_term_before.zig",
     "process_restart_term_after.zig",
+    "snapshot_multi_page_pf.zig",
     "terminate_restart_observer.zig",
     "vmar_restart_00.zig",
     "vmar_restart_01.zig",

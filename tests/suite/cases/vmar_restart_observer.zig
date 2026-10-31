@@ -22,6 +22,7 @@ pub const Mode = enum {
     snapshot_pf_write,
     snapshot_pf_shared,
     snapshot_demand_write,
+    snapshot_multi_page_pf,
 };
 const CHILD_CRIPC: u8 = 0x07;
 const CONTROL_CRIPC: u8 = 0x06;
@@ -70,8 +71,11 @@ fn word(addr: u64) *volatile u64 {
     return @ptrFromInt(addr);
 }
 fn vmar(policy: u2, addr: u64, writable: bool) ?caps.HandleId {
+    return vmarPages(policy, addr, writable, 1);
+}
+fn vmarPages(policy: u2, addr: u64, writable: bool, pages: u64) ?caps.HandleId {
     const vc = caps.VmarCap{ .r = true, .w = true, .restart_policy = policy };
-    return handle(syscall.createVmar(vc.toU16(), if (writable) 3 else 1, 1, addr, 0).v1);
+    return handle(syscall.createVmar(vc.toU16(), if (writable) 3 else 1, pages, addr, 0).v1);
 }
 fn hasMap(cap_table_base: u64, id: caps.HandleId, expected: u64) bool {
     if (!ok(syscall.sync(id).v1)) return false;
@@ -113,6 +117,20 @@ fn fault() noreturn {
     spin();
 }
 fn stage(comptime mode: Mode, cap_table_base: u64) u64 {
+    if (mode == .snapshot_multi_page_pf) {
+        const src = vmarPages(2, SRC_A, true, 2) orelse return 51;
+        const pf = handle(syscall.createPageFrame((caps.PfCap{ .r = true, .w = true, .restart_policy = true }).toU16(), 0, 2).v1) orelse return 52;
+        if (!ok(syscall.mapPf(src, &.{ 0, pf }).v1)) return 53;
+        word(SRC_A).* = A;
+        word(SRC_A + 0x1000).* = B;
+        if (word(SRC_A).* != A or word(SRC_A + 0x1000).* != B) return 54;
+        if (!ok(syscall.remap(src, 1).v1)) return 55;
+        const target = vmarPages(3, DST, true, 2) orelse return 56;
+        word(DST).* = OLD;
+        word(DST + 0x1000).* = OLD;
+        if (!ok(syscall.snapshot(target, src).v1)) return 57;
+        return 0;
+    }
     if (mode == .free or mode == .decommit or mode == .preserve) {
         const policy: u2 = switch (mode) {
             .free => 0,
@@ -178,6 +196,11 @@ fn verify(comptime mode: Mode, cap_table_base: u64) u64 {
         if ((cap.field1 >> 39) & 3 != 0) return 45;
         if (word(BASE).* != 0) return 46;
     } else {
+        if (mode == .snapshot_multi_page_pf) {
+            if (word(DST).* != A) return 48;
+            if (word(DST + 0x1000).* != B) return 49;
+            return 0;
+        }
         const expected: u64 = if (mode == .snapshot_replace) B else A;
         if (word(addr).* != expected) return 47;
     }
