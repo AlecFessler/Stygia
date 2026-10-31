@@ -11,28 +11,12 @@
 //     bit 52: bind
 //     bits 48-49, 53-55: _reserved
 //
-//   The runner (runner/primary.zig) installs ceilings_inner =
-//   0x001C_011F_2701_FFFF, so the test process's port_ceiling sub-field
-//   = 0x1C — bits 2/3/4 set (xfer/recv/bind), bits 0/1 clear. (The
-//   sub-field bits are numbered relative to the byte; in field0 bits
-//   the runner's value covers bits 50/51/52.)
+//   The runner installs port_ceiling = 0x1C for this test: xfer, recv,
+//   and bind are granted, while the documented suspend bit is clear.
 //
-//   We construct a ceilings_inner whose port_ceiling sub-field equals
-//   the caller's value with one additional clear bit set. Setting the
-//   sub-field's bit 0 (field0 bit 48) yields 0x1D — a strict superset
-//   of the caller's 0x1C, so the subset check must reject with E_PERM.
-//
-//   SPEC AMBIGUITY: bits 48-49 of field0 (the sub-field's bits 0-1)
-//   are documented as `_reserved` within port_ceiling. Test 17 covers
-//   the reserved-bits-set rejection with E_INVAL. The spec does not
-//   pin which check (subset vs reserved) the kernel evaluates first,
-//   so a spec-compliant kernel could return E_INVAL here instead of
-//   E_PERM. To keep this test exercising the subset path
-//   unambiguously, we'd prefer to flip a documented sub-field bit
-//   that is clear in the caller — but bits 50/51/52 are all set, so
-//   there is no documented bit available. We accept the ambiguity and
-//   target E_PERM on the assumption the kernel performs subset
-//   checking before reserved-bits validation for this sub-field.
+//   Requesting suspend too makes the child port ceiling 0x5C. Those
+//   bits are all valid, but 0x5C is not a subset of the caller's 0x1C,
+//   so the kernel must return E_PERM.
 //
 //   Other arguments (caps, ceilings_outer, elf_page_frame,
 //   passed_handles) are constructed to be valid in isolation so the
@@ -41,7 +25,7 @@
 //
 // Action
 //   1. create_process(self_caps subset, ceilings_inner with
-//        port_ceiling = 0x1D (caller's 0x1C | bit 0),
+//        port_ceiling = 0x5C (caller's 0x1C | suspend),
 //        ceilings_outer subset, valid pf, no passed)
 //      — must return E_PERM
 //
@@ -81,11 +65,10 @@ pub fn main(cap_table_base: u64) void {
     const v1_caps: u64 = @as(u64, self_caps.toU16());
 
     // [2] ceilings_inner: build the violator. The caller (test process)
-    // has port_ceiling = 0x1C in the sub-field at field0 bits 48-55,
-    // i.e. field0 bits 50/51/52 set (xfer/recv/bind). Set the
-    // sub-field's bit 0 (field0 bit 48) to make a strict superset:
+    // has port_ceiling = 0x1C (xfer/recv/bind). Add the documented
+    // suspend bit (field0 bit 54) to make a strict superset:
     //
-    //   port_ceiling sub-field = 0x1C | 0x01 = 0x1D
+    //   port_ceiling sub-field = 0x1C | 0x40 = 0x5C
     //
     // All other sub-fields of ceilings_inner echo the caller's
     // values to remain subsets:
@@ -94,9 +77,9 @@ pub fn main(cap_table_base: u64) void {
     //   bits 24-31 cripc_ceiling      = 0x27
     //   bits 32-39 pf_ceiling         = 0x1F
     //   bits 40-47 vm_ceiling         = 0x01
-    //   bits 48-55 port_ceiling       = 0x1D  <-- violator
+    //   bits 48-55 port_ceiling       = 0x5C  <-- violator
     //   bits 56-63 _reserved          = 0
-    const port_ceiling_violator: u64 = 0x1D;
+    const port_ceiling_violator: u64 = 0x5C;
     const ceilings_inner: u64 =
         (port_ceiling_violator << 48) |
         (@as(u64, 0x01) << 40) |

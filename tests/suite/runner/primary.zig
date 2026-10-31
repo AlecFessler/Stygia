@@ -605,18 +605,19 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
     //   bits 40-47  vm_ceiling         = 0x01   (policy bit)
     //   bits 48-55  port_ceiling       = 0x5C   (xfer | recv | bind | suspend)
     //   bits 56-63  _reserved          = 0
-    // Test cases (e.g. create_process_03/05/08/10/11/12) read
-    // their caller's installed sub-fields and construct violators or
-    // exact-match baselines; the values here must match the per-test
-    // documented baseline (`0x005C_011F_2701_FFFF`) so subset checks in
-    // syscall/process.zig fire only on intentional violators.
+    // Most tests use baseline 0x005C_011F_2701_FFFF. Test 12 gets
+    // 0x001C_011F_2701_FFFF so it can request the valid suspend right
+    // outside its caller's port ceiling and exercise E_PERM.
+    // Test 12 needs a documented right absent from its caller's ceiling
+    // so its E_PERM assertion does not depend on reserved-bit validation.
+    const port_ceiling: u64 = if (std.mem.eql(u8, entry.name, "create_process_12")) 0x1C else 0x5C;
     const ceilings_inner: u64 =
         @as(u64, 0xFF) |
         (@as(u64, 0x01FF) << 8) |
         (@as(u64, 0x27) << 24) |
         (@as(u64, 0x1F) << 32) |
         (@as(u64, 0x01) << 40) |
-        (@as(u64, 0x5C) << 48);
+        (port_ceiling << 48);
 
     const ceilings_outer: u64 = 0x0000_003F_01FE_FFFF;
 
