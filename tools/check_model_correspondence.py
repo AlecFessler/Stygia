@@ -55,6 +55,8 @@ def check(root: Path) -> list[str]:
     proc = read("kernel/caps/process.zig")
     thread = read("kernel/sched/thread.zig")
     vmar = read("kernel/memory/vmar.zig")
+    x64_guest = read("kernel/arch/x64/vm_runloop.zig")
+    arm_guest = read("kernel/arch/aarch64/vm_runloop.zig")
     errors = []
 
     # Fail closed if the model action itself changes: obligations below must
@@ -66,6 +68,7 @@ def check(root: Path) -> list[str]:
         "ConsumeTeardown": [r"cur = NULL", r"pending = NULL", r"active = IF G16_DROP_REF"],
         "RestartApply": [r"RestartQuiesced\(p\)", r"snapshotGood", r"snapshotCopied = TRUE"],
         "RestartFallback": [r"RestartQuiesced\(p\)", r"phase = .dead."],
+        "VcpuCancelExit": [r"threads\[e\]\.st = \"retired\"", r"threads\[e\]\.vm = \"cancel\"", r"\.vm = \"host\""],
     }.items():
         match = re.search(r"(?m)^" + action + r"\([^\n]*?==(?P<body>.*?)(?=\n[A-Za-z][A-Za-z0-9_]*(?:\([^\n]*?\))?\s*==|\n\(\*|\Z)", model, re.S)
         if not match:
@@ -117,6 +120,22 @@ def check(root: Path) -> list[str]:
         r"target\.map\s*!=\s*\.unmapped", r"allocForDemandPages", r"@memcpy", r"mappingInstall", r"refreshVmarSnapshot")
     if not re.search(r"destroyThreadRefLockedMode\(thread_ref,\s*null,\s*true\)", body(thread, "destroyThreadForRestart")):
         errors.append("restart thread retirement no longer uses restart mode")
+
+    # VcpuCancelExit is an owner-side acknowledgement. Both arch guest
+    # loops must check retirement before their next VM entry; the scheduler
+    # must suppress event delivery on the cancelled return and then discharge
+    # the owner's current-thread hold. This deliberately does not certify
+    # vCPU arch-state lifetime, which has a separate open kernel bug.
+    for arch, guest, entry in (
+        ("x64", x64_guest, r"vm_hw\.vmResume\("),
+        ("aarch64", arm_guest, r"hyp\.vmResume\("),
+    ):
+        errors += ordered(f"{arch} retired guest exit", body(guest, "enterGuest"),
+            r"if\s*\(lifecycle\.load\(vcpu_thread\)\s*==\s*\.retired\)",
+            r"\.cancelled\s*=\s*true", entry)
+    errors += ordered("vCPU cancelled dispatch", body(sched, "switchTo"),
+        r"if\s*\(!delivery\.cancelled\)", r"port_mod\.fireVmExit\(",
+        r"dischargeOwnedParking\(core\)")
     return errors
 
 
