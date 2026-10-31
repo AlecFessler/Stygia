@@ -15,6 +15,9 @@ const TIMEOUT_NS: u64 = 10_000_000_000;
 const MARKER: u16 = (caps.PortCap{ .recv = true, .@"suspend" = true, .restart_policy = true }).toU16();
 var worker_request: caps.HandleId = 0;
 var worker_observe: caps.HandleId = 0;
+var restart_worker_base: u64 = 0;
+var restart_worker_hold: caps.HandleId = 0;
+var restart_worker_started: bool = false;
 fn ok(x: u64) bool {
     return x == @intFromEnum(errors.Error.OK);
 }
@@ -31,6 +34,15 @@ fn pause() void {
 }
 fn spin() noreturn {
     while (true) pause();
+}
+fn ownHandle() caps.HandleId {
+    var own = syscall.self();
+    while (own.v1 == @intFromEnum(errors.Error.E_NOENT)) {
+        pause();
+        own = syscall.self();
+    }
+    if (testing.isHandleError(own.v1)) spin();
+    return @truncate(own.v1 & 0xFFF);
 }
 fn fault() noreturn {
     switch (builtin.cpu.arch) {
@@ -57,7 +69,7 @@ fn pendingReply(base: u64) ?caps.HandleId {
     return null;
 }
 fn notify(code: u64) u64 {
-    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = caps.SLOT_INITIAL_THREAD, .v2 = EVENT, .v3 = code });
+    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = ownHandle(), .v2 = EVENT, .v3 = code });
     return sent.regs.v1;
 }
 fn child(comptime keep: bool, base: u64) noreturn {
@@ -76,6 +88,40 @@ fn child(comptime keep: bool, base: u64) noreturn {
         _ = notify(11);
         spin();
     };
+    restart_worker_base = base;
+    const entry = struct {
+        fn run() callconv(.c) noreturn {
+            if (!@atomicLoad(bool, &restart_worker_started, .acquire)) {
+                @atomicStore(bool, &restart_worker_started, true, .release);
+                _ = syscall.suspendThread(ownHandle(), restart_worker_hold, &.{});
+                spin();
+            }
+            child(keep, restart_worker_base);
+        }
+    }.run;
+    const hold_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
+    restart_worker_hold = handle(syscall.createPort(hold_caps.toU16()).v1) orelse {
+        _ = notify(15);
+        spin();
+    };
+    const worker_caps = caps.ThreadCap{ .susp = true, .read = true, .restart_policy = 1 };
+    _ = handle(syscall.createThread(worker_caps.toU16(), @intFromPtr(&entry), 1, 0, 0).v1) orelse {
+        _ = notify(14);
+        spin();
+    };
+    // Blocking receive gives the lower-priority worker a dispatch turn on
+    // single-core TCG as well as SMP. It also proves the old worker is
+    // suspended before the fault triggers restart.
+    const holding = syscall.recv(restart_worker_hold, TIMEOUT_NS);
+    if (!ok(holding.regs.v1)) {
+        _ = notify(16);
+        spin();
+    }
+    const hold_reply: caps.HandleId = @truncate((holding.word >> 32) & 0xFFF);
+    if (hold_reply == 0 or !ok(syscall.delete(hold_reply).v1)) {
+        _ = notify(17);
+        spin();
+    }
     if (!ok(notify(1))) spin();
     const request = syscall.recv(REQUEST, TIMEOUT_NS);
     if (!ok(request.regs.v1)) {
@@ -132,7 +178,7 @@ pub fn run(comptime keep: bool, base: u64) void {
     if (ready_reply == 0 or !ok(syscall.reply(ready_reply).v1)) return fail(7);
     worker_request = request;
     worker_observe = observer;
-    const worker_cap = caps.ThreadCap{ .susp = true };
+    const worker_cap = caps.ThreadCap{ .susp = true, .read = true };
     if (handle(syscall.createThread(worker_cap.toU16(), @intFromPtr(&worker), 1, 0, 0).v1) == null) return fail(8);
     const armed = syscall.recv(event, TIMEOUT_NS);
     if (!ok(armed.regs.v1)) return fail(9);
@@ -149,7 +195,7 @@ pub fn run(comptime keep: bool, base: u64) void {
     const observed = outcome.regs.v3;
     const worker_reply: caps.HandleId = @truncate((outcome.word >> 32) & 0xFFF);
     if (worker_reply != 0) _ = syscall.delete(worker_reply);
-    if (observed != @intFromEnum(if (keep) errors.Error.OK else errors.Error.E_REFUSED)) return fail(12);
+    if (observed != @intFromEnum(if (keep) errors.Error.OK else errors.Error.E_REFUSED)) return fail(120 + observed);
     _ = syscall.restrict(caps.SLOT_SELF, 0);
     testing.pass();
 }

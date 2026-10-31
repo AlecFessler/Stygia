@@ -16,6 +16,17 @@ const LIBZ: caps.HandleId = PORT + 2;
 const DEVICE: caps.HandleId = PORT + 3;
 const TIMEOUT_NS: u64 = 10_000_000_000;
 const MARKER: u16 = (caps.PortCap{ .recv = true, .@"suspend" = true, .restart_policy = true }).toU16();
+var worker_base: u64 = 0;
+
+fn ownHandle() caps.HandleId {
+    var own = syscall.self();
+    while (own.v1 == @intFromEnum(errors.Error.E_NOENT)) {
+        pause();
+        own = syscall.self();
+    }
+    if (testing.isHandleError(own.v1)) spin();
+    return @truncate(own.v1 & 0xFFF);
+}
 
 fn handle(value: u64) ?caps.HandleId {
     if (testing.isHandleError(value) or value == 0) return null;
@@ -70,7 +81,7 @@ fn count(cap_table_base: u64, kind: caps.HandleType, requested: u16) u32 {
     return n;
 }
 fn report(code: u64) void {
-    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = caps.SLOT_INITIAL_THREAD, .v2 = PORT, .v3 = code });
+    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = ownHandle(), .v2 = PORT, .v3 = code });
     if (sent.regs.v1 == @intFromEnum(errors.Error.E_ABANDONED)) {
         _ = syscall.restrict(caps.SLOT_SELF, 0);
         _ = syscall.delete(caps.SLOT_SELF);
@@ -103,13 +114,29 @@ fn child(comptime kind: Kind, comptime keep: bool, base: u64) noreturn {
     report(1);
     fault();
 }
+
+fn startChild(comptime kind: Kind, comptime keep: bool, base: u64) noreturn {
+    worker_base = base;
+    const entry = struct {
+        fn run() callconv(.c) noreturn {
+            child(kind, keep, worker_base);
+        }
+    }.run;
+    const worker_caps = caps.ThreadCap{ .susp = true, .read = true, .restart_policy = 1 };
+    const worker = handle(syscall.createThread(worker_caps.toU16(), @intFromPtr(&entry), 1, 0, 0).v1) orelse spin();
+    _ = syscall.yieldThread(worker);
+    const hold_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
+    const hold = handle(syscall.createPort(hold_caps.toU16()).v1) orelse spin();
+    _ = syscall.suspendThread(caps.SLOT_INITIAL_THREAD, hold, &.{});
+    spin();
+}
 fn fail(id: u64) void {
     _ = syscall.restrict(caps.SLOT_SELF, 0);
     testing.fail(id);
 }
 pub fn run(comptime kind: Kind, comptime keep: bool, base: u64) void {
     const self = caps.readCap(base, caps.SLOT_SELF);
-    if (@as(u8, @truncate(self.field0 >> 24)) == (if (kind == .ipc) @as(u8, if (keep) 0x26 else 0x06) else CHILD_CRIPC)) child(kind, keep, base);
+    if (@as(u8, @truncate(self.field0 >> 24)) == (if (kind == .ipc) @as(u8, if (keep) 0x26 else 0x06) else CHILD_CRIPC)) startChild(kind, keep, base);
     const port_caps = caps.PortCap{ .copy = true, .bind = true, .recv = true, .@"suspend" = true, .restart_policy = true };
     const port = handle(syscall.createPort(port_caps.toU16()).v1) orelse return fail(1);
     var passed: [5]u64 = undefined;

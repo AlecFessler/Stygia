@@ -189,7 +189,11 @@ fn runImpl(comptime policy: Policy, comptime race_reply: bool, cap_table_base: u
             const continued = take(continue_port) orelse return fail(19);
             if (syscall.delete(continued).v1 != @intFromEnum(errors.Error.OK)) return fail(20);
             const absent = syscall.recv(entry_port, 5_000_000_000);
-            if (absent.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT)) return fail(21);
+            // Deleting the continuation reply may make the worker drop
+            // the process self-handle before this receive completes. A
+            // closed port and a timeout both exclude re-entry at ENTRY.
+            if (absent.regs.v1 != @intFromEnum(errors.Error.E_TIMEOUT) and
+                absent.regs.v1 != @intFromEnum(errors.Error.E_CLOSED)) return fail(21);
         }
         if (syscall.delete(witnessed).v1 != @intFromEnum(errors.Error.OK)) return fail(22);
     }

@@ -1,6 +1,7 @@
 // Parent-observed VMAR restart probes for §[restart_semantics] and §[snapshot].
 // The child stages a VMAR at a fixed static-zone address, posts READY, then
-// faults. Its initial thread has restart_at_entry from thread_inner_ceiling.
+// faults. An explicit restart_at_entry worker re-enters after the initial
+// thread (whose slot-1 restart policy is necessarily 0) is killed.
 // A kept marker port distinguishes re-entry without relying on ELF globals.
 // The parent owns the only recv endpoint. Expected-termination cases also
 // run a stable snapshot-copy control through the same restart path.
@@ -12,8 +13,14 @@ const syscall = lib.syscall;
 const testing = lib.testing;
 
 pub const Mode = enum {
-    free, decommit, preserve, snapshot_copy, snapshot_replace,
-    snapshot_missing, snapshot_pf_write, snapshot_pf_shared,
+    free,
+    decommit,
+    preserve,
+    snapshot_copy,
+    snapshot_replace,
+    snapshot_missing,
+    snapshot_pf_write,
+    snapshot_pf_shared,
     snapshot_demand_write,
 };
 const CHILD_CRIPC: u8 = 0x07;
@@ -30,6 +37,17 @@ const B: u64 = 0xb83e_4f16_c927_50ad;
 const OLD: u64 = 0xe291_70ab_5c43_d68f;
 const TIMEOUT_NS: u64 = 10_000_000_000;
 const MARKER_CAPS: u16 = (caps.PortCap{ .recv = true, .restart_policy = true }).toU16();
+var worker_base: u64 = 0;
+
+fn ownHandle() caps.HandleId {
+    var own = syscall.self();
+    while (own.v1 == @intFromEnum(errors.Error.E_NOENT)) {
+        pause();
+        own = syscall.self();
+    }
+    if (testing.isHandleError(own.v1)) spin();
+    return @truncate(own.v1 & 0xFFF);
+}
 
 fn pause() void {
     switch (builtin.cpu.arch) {
@@ -38,13 +56,19 @@ fn pause() void {
         else => @compileError("unsupported restart test architecture"),
     }
 }
-fn spin() noreturn { while (true) pause(); }
+fn spin() noreturn {
+    while (true) pause();
+}
 fn handle(result: u64) ?caps.HandleId {
     if (testing.isHandleError(result) or result == 0) return null;
     return @truncate(result & 0xFFF);
 }
-fn ok(result: u64) bool { return result == @intFromEnum(errors.Error.OK); }
-fn word(addr: u64) *volatile u64 { return @ptrFromInt(addr); }
+fn ok(result: u64) bool {
+    return result == @intFromEnum(errors.Error.OK);
+}
+fn word(addr: u64) *volatile u64 {
+    return @ptrFromInt(addr);
+}
 fn vmar(policy: u2, addr: u64, writable: bool) ?caps.HandleId {
     const vc = caps.VmarCap{ .r = true, .w = true, .restart_policy = policy };
     return handle(syscall.createVmar(vc.toU16(), if (writable) 3 else 1, 1, addr, 0).v1);
@@ -72,7 +96,7 @@ fn hasMarker(cap_table_base: u64) bool {
     return false;
 }
 fn reportChild(code: u64) void {
-    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = caps.SLOT_INITIAL_THREAD, .v2 = PORT, .v3 = code });
+    const sent = syscall.issueRawCaptureWord(0, .{ .v1 = ownHandle(), .v2 = PORT, .v3 = code });
     if (sent.regs.v1 == @intFromEnum(errors.Error.E_ABANDONED)) {
         _ = syscall.restrict(caps.SLOT_SELF, 0);
         _ = syscall.delete(caps.SLOT_SELF);
@@ -90,7 +114,12 @@ fn fault() noreturn {
 }
 fn stage(comptime mode: Mode, cap_table_base: u64) u64 {
     if (mode == .free or mode == .decommit or mode == .preserve) {
-        const policy: u2 = switch (mode) { .free => 0, .decommit => 1, .preserve => 2, else => unreachable };
+        const policy: u2 = switch (mode) {
+            .free => 0,
+            .decommit => 1,
+            .preserve => 2,
+            else => unreachable,
+        };
         const region = vmar(policy, BASE, true) orelse return 11;
         word(BASE).* = A;
         if (word(BASE).* != A) return 12;
@@ -160,10 +189,32 @@ fn child(comptime mode: Mode, cap_table_base: u64) noreturn {
         spin();
     }
     const setup = stage(mode, cap_table_base);
-    if (setup != 0) { reportChild(setup); spin(); }
-    _ = handle(syscall.createPort(MARKER_CAPS).v1) orelse { reportChild(32); spin(); };
+    if (setup != 0) {
+        reportChild(setup);
+        spin();
+    }
+    _ = handle(syscall.createPort(MARKER_CAPS).v1) orelse {
+        reportChild(32);
+        spin();
+    };
     reportChild(1); // parent has observed all pre-restart state
     fault();
+}
+
+fn startChild(comptime mode: Mode, base: u64) noreturn {
+    worker_base = base;
+    const entry = struct {
+        fn run() callconv(.c) noreturn {
+            child(mode, worker_base);
+        }
+    }.run;
+    const worker_caps = caps.ThreadCap{ .susp = true, .read = true, .restart_policy = 1 };
+    const worker = handle(syscall.createThread(worker_caps.toU16(), @intFromPtr(&entry), 1, 0, 0).v1) orelse spin();
+    _ = syscall.yieldThread(worker);
+    const hold_caps = caps.PortCap{ .bind = true, .recv = true, .@"suspend" = true };
+    const hold = handle(syscall.createPort(hold_caps.toU16()).v1) orelse spin();
+    _ = syscall.suspendThread(caps.SLOT_INITIAL_THREAD, hold, &.{});
+    spin();
 }
 const Outcome = struct { code: u64, closed: bool };
 fn observe(comptime control: bool) Outcome {
@@ -202,9 +253,9 @@ fn observe(comptime control: bool) Outcome {
 pub fn run(comptime mode: Mode, cap_table_base: u64) void {
     const self_cap = caps.readCap(cap_table_base, caps.SLOT_SELF);
     const my_cripc: u8 = @truncate((self_cap.field0 >> 24) & 0xFF);
-    if (my_cripc == CONTROL_CRIPC) child(.snapshot_copy, cap_table_base);
+    if (my_cripc == CONTROL_CRIPC) startChild(.snapshot_copy, cap_table_base);
     if (my_cripc == CHILD_CRIPC)
-        child(mode, cap_table_base);
+        startChild(mode, cap_table_base);
     const terminate = mode == .snapshot_missing or mode == .snapshot_pf_write or
         mode == .snapshot_pf_shared or mode == .snapshot_demand_write;
     const result = observe(false);
