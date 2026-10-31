@@ -685,6 +685,7 @@ fn grantTestFixtureDevices(root_process: *Process) void {
             .copy = true,
             .dma = true,
             .irq = true,
+            .restart_policy = 1,
         },
         stygia.devices.device_region.PciAddress.make(0xCA, 0x1F, 0x7),
     );
