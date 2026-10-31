@@ -100,6 +100,7 @@ pub fn createVmar(
     // bit `create_vmar` may mint. Snapshot under the same lock so the
     // tests-02/03/04 subset gates use a consistent view.
     const vmar_inner_ceiling_word: u16 = @truncate((process.user_table[SELF_HANDLE_SLOT].field0 >> 8) & 0xFFFF);
+    const vmar_restart_max: u2 = @truncate((process.user_table[SELF_HANDLE_SLOT].field1 >> 18) & 0x3);
     process_ref.unlockIrqRestore(lr.irq_state);
 
     // Spec §[create_vmar] test 01: caller's self-handle must carry `crvr`.
@@ -110,6 +111,9 @@ pub fn createVmar(
     // `[1].caps` uses so r/w/x/max_sz/mmio align bit-for-bit.
     const requested_caps: VmarCaps = @bitCast(@as(u16, @truncate(caps)));
     const ceiling_caps: VmarCaps = @bitCast(vmar_inner_ceiling_word);
+    // Spec §[restart_semantics] test 02: this numeric policy is bounded
+    // by the caller's self-handle field1, independently of the inner caps.
+    if (requested_caps.restart_policy > vmar_restart_max) return errors.E_PERM;
     // Test 02: caps' r/w/x must be a subset of the ceiling's r/w/x.
     if ((requested_caps.r and !ceiling_caps.r) or
         (requested_caps.w and !ceiling_caps.w) or

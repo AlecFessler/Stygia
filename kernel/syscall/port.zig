@@ -60,6 +60,7 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const process = lr.ptr;
     const self_caps_word = Word0.caps(process.user_table[0].word0);
+    const port_restart_max: u1 = @truncate(process.user_table[0].field1 >> 22);
     process_ref.unlockIrqRestore(lr.irq_state);
 
     const self_caps: ProcessCaps = @bitCast(self_caps_word);
@@ -73,6 +74,9 @@ pub fn createPort(caller: *anyopaque, caps: u64) i64 {
     // create syscall's success would be operationally meaningless.
     const requested_caps: PortCaps = @bitCast(@as(u16, @truncate(caps)));
     if (!requested_caps.recv) return errors.E_PERM;
+    // Spec §[restart_semantics] test 05: self-handle field1 bit 22
+    // bounds the restart policy of newly minted port handles.
+    if (requested_caps.restart_policy > port_restart_max) return errors.E_PERM;
 
     return port_obj.createPort(thread, caps);
 }

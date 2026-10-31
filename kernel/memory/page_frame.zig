@@ -119,6 +119,10 @@ pub fn createPageFrame(caller: *anyopaque, caps: u64, props: u64, pages: u64) i6
     if (selfHandleLacksCrpf(thread)) return errors.E_PERM;
     if (!rwxIsSubsetOfCeiling(thread, caps_bits)) return errors.E_PERM;
     if (!maxSzWithinCeiling(thread, caps_bits)) return errors.E_PERM;
+    // Spec §[restart_semantics] test 03: self-handle field1 bit 20
+    // bounds the restart policy of newly minted page-frame handles.
+    const pf_restart_max: u1 = @truncate(callerProcess(thread).user_table[0].field1 >> 20);
+    if (caps_bits.restart_policy > pf_restart_max) return errors.E_PERM;
 
     const pf = allocPageFrame(sz, page_count) catch return errors.E_NOMEM;
 
