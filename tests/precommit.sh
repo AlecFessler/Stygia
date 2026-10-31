@@ -23,7 +23,7 @@
 # Env knobs:
 #   PI_BARE_HOST=user@ip       # Pi 5 bare-metal tryboot SSH target (default .107)
 #   PI_BARE_SERIAL_DEV=path    # local USB serial device for the .107 console
-#   PI_QEMU_HOSTS='user@ip ...' # Pi-hosted aarch64 QEMU/KVM fallback targets (default .106 .104)
+#   PI_QEMU_HOSTS='user@ip ...' # Pi-hosted aarch64 QEMU/KVM targets (default .107 .106 .104)
 #   PI_HOST=user@ip            # legacy override for the first QEMU/KVM target
 #   PI_REMOTE_DIR=path         # override Pi-side QEMU/KVM artifact dir (default \$HOME/stygia-test)
 
@@ -38,6 +38,25 @@ esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 STYGIA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# The Pi tryboot rig, its serial cable, and some guest artifacts are shared
+# by every linked worktree. Queue whole gauntlets before any build or remote
+# operation so concurrent commits cannot reboot the Pi during another run.
+# Use the common Git directory, not $STYGIA_ROOT/.git (a file in worktrees).
+if ! command -v flock >/dev/null; then
+    echo "error: flock is required to serialize the pre-commit gate" >&2
+    exit 1
+fi
+GATE_COMMON_DIR=$(cd "$STYGIA_ROOT" && git rev-parse --git-common-dir) || exit 1
+GATE_COMMON_DIR=$(cd "$STYGIA_ROOT" && cd "$GATE_COMMON_DIR" && pwd) || exit 1
+GATE_LOCK="$GATE_COMMON_DIR/stygia-precommit.lock"
+# An inherited lock fd must stay away from low descriptor numbers used by
+# syscall tests. fd 237 is explicit; Bash's automatic allocation starts at 10.
+exec 237>"$GATE_LOCK" || exit 1
+if ! flock -n 237; then
+    echo "[gate] another pre-commit gauntlet is using this repository; waiting for $GATE_LOCK"
+    flock 237 || exit 1
+fi
 
 # ── Per-worktree Zig global cache ─────────────────────────────────────
 #
@@ -155,12 +174,11 @@ PI_BARE_RETURN_TIMEOUT="${PI_BARE_RETURN_TIMEOUT:-900}"
 PI_BARE_DEPLOY_SCRIPT="${PI_BARE_DEPLOY_SCRIPT:-~/stygia-tools/deploy_stub.sh}"
 PI_BARE_LOG_DIR="${PI_BARE_LOG_DIR:-$STYGIA_ROOT/out/precommit/pi5-bare}"
 
-# PI_HOST is kept as a compatibility knob, but it is a QEMU/KVM host, not
-# the bare-metal tryboot target. The hv=false proof must not silently move
-# onto .107, where Stygia runs on real EL2 and hardware virtualization is
-# present.
-PI_HOST="${PI_HOST:-alecfessler@192.168.86.106}"
-PI_QEMU_HOSTS="${PI_QEMU_HOSTS:-$PI_HOST alecfessler@192.168.86.104}"
+# PI_HOST is kept as a compatibility knob for the first QEMU/KVM target.
+# The same Pi may also run Stygia on bare metal: QEMU/KVM does not expose
+# nested EL2, so the guest still exercises the required hv=false path.
+PI_HOST="${PI_HOST:-alecfessler@192.168.86.107}"
+PI_QEMU_HOSTS="${PI_QEMU_HOSTS:-$PI_HOST alecfessler@192.168.86.106 alecfessler@192.168.86.104}"
 # Stays as a relative path so both ssh-shell-expansion contexts
 # (`cd $PI_REMOTE_DIR …`) and scp destinations (`host:$PI_REMOTE_DIR/x`,
 # which scp treats relative to login dir, NOT through a shell) resolve
@@ -243,6 +261,12 @@ is_required() {
 
 run_stage() {
     local name="$1"
+    if [[ "$name" == "thread_closure_report" ]]; then
+        # This approved report runs during normal commits too. Its findings,
+        # fixture failures, and tool unavailability cannot block a commit.
+        stage_thread_closure_report || echo "[0d] WARNING: report stage failed"
+        return 0
+    fi
     if [[ $REQUIRED_ONLY -eq 1 ]] && ! is_required "$name"; then
         return 0
     fi
@@ -626,10 +650,8 @@ stage_gen_lock_analyzer() {
 # So: print everything, contribute nothing to $FAILURES, and leave the
 # gating call to a human who has read a full report.
 #
-# Deliberately NOT in REQUIRED_STAGES — that list is documented as
-# blockers, and `--git-hook` runs only those. This stage therefore runs in
-# the full manual gauntlet and is skipped by the commit hook, which is
-# what "informational" should mean here.
+# Deliberately NOT in REQUIRED_STAGES — that list contains blockers only.
+# The dispatcher runs this report during both manual and hook invocations.
 #
 # One `check_thread_closure` invocation covers both arches. Note the SHAPE
 # DIFFERS from stage [0c]: check_gen_lock's `--db` is single-valued
@@ -865,7 +887,9 @@ stage_x86_kernel_tests() {
         fi
 
         local total
-        total=$(grep -E '^\[runner\] [0-9]+ total' "$qemu_log" | tail -1)
+        # Scheduler progress ticks can interleave as `~` inside a valid
+        # summary; remove those bytes before finding the runner verdict.
+        total=$(tr -d '~' < "$qemu_log" | grep -E '^\[runner\] [0-9]+ total' | tail -1)
         if [[ -z "$total" ]]; then
             echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
             echo "--- last 30 lines of QEMU output ---"
@@ -908,11 +932,11 @@ aarch64_pi_reachable() {
 select_aarch64_qemu_host() {
     local host
     for host in $PI_QEMU_HOSTS; do
-        # .107 is the bare-metal tryboot rig. It is intentionally excluded
-        # from Pi-hosted QEMU/KVM selection so the only hv=false aarch64 path
-        # remains nested-EL2-missing QEMU/KVM on .106/.104.
-        [[ "$host" == "$PI_BARE_HOST" ]] && continue
-        if aarch64_pi_reachable "$host"; then
+        # KVM inside Pi OS cannot pass EL2 through to the Stygia guest,
+        # including when this host also serves bare-metal tryboot tests.
+        # Check the actual QEMU prerequisites before selecting a host.
+        if aarch64_pi_reachable "$host" && ssh -o ConnectTimeout=5 -o BatchMode=yes "$host" \
+            'test -r /dev/kvm && command -v qemu-system-aarch64 >/dev/null && test -f /usr/share/AAVMF/AAVMF_CODE.fd' 2>/dev/null; then
             echo "$host"
             return 0
         fi
@@ -1185,7 +1209,7 @@ run_aarch64_tcg_3reps() {
             return 1
         fi
         local total
-        total=$(grep -E '^\[runner\] [0-9]+ total' "$tcg_log" | tail -1)
+        total=$(tr -d '~' < "$tcg_log" | grep -E '^\[runner\] [0-9]+ total' | tail -1)
         if [[ -z "$total" ]]; then
             echo "[FAIL] rep ${rep}/3 (${label}): no [runner] total — kernel didn't reach summarize()"
             echo "--- last 30 lines of QEMU output ---"
@@ -1259,7 +1283,7 @@ stage_aarch64_vm_nodev_pi_kvm() {
     local qemu_host
     if ! qemu_host=$(select_aarch64_qemu_host); then
         echo "[FAIL] no Pi QEMU/KVM host reachable in PI_QEMU_HOSTS='$PI_QEMU_HOSTS'"
-        echo "       This focused hv=false proof must run on .106/.104-style QEMU/KVM, not bare-metal $PI_BARE_HOST."
+        echo "       This focused hv=false proof requires an ARM host with QEMU/KVM and AAVMF firmware."
         FAILURES+=("aarch64 create_virtual_machine_03 Pi KVM proof unavailable")
         return 1
     fi
@@ -1318,7 +1342,7 @@ stage_aarch64_vm_nodev_pi_kvm() {
             return 1
         fi
         local total
-        total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
+        total=$(tr -d '~' < "$pi_log" | grep -E '^\[runner\] [0-9]+ total' | tail -1)
         if [[ -z "$total" ]]; then
             echo "[FAIL] rep ${rep}/3 (create_virtual_machine_03 Pi KVM on $qemu_host): no [runner] total"
             echo "--- last 30 lines of Pi output ---"
@@ -1460,7 +1484,7 @@ stage_aarch64_kernel_tests_pi() {
         fi
 
         local total
-        total=$(grep -E '^\[runner\] [0-9]+ total' "$pi_log" | tail -1)
+        total=$(tr -d '~' < "$pi_log" | grep -E '^\[runner\] [0-9]+ total' | tail -1)
         if [[ -z "$total" ]]; then
             echo "[FAIL] rep ${rep}/3: in-kernel runner did not report a total — kernel didn't reach summarize()"
             echo "--- last 30 lines of Pi output ---"

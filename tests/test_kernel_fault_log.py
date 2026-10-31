@@ -17,6 +17,7 @@ PRE = (
 ARM_PRE = PRE.replace("subcode=2", "subcode=0")
 X86_FAULT = "[UNHANDLED] thread_fault thread=0xabc subcode=2 payload=0x1"
 ARM_FAULT = "[UNHANDLED] thread_fault thread=0xabc subcode=0 payload=0x1"
+GARBLED_FAULT = "[UNHANDLED] ] tag=0fault index=2 pfocess=0xffff subco7e=0 payload=0x1"
 PASS = "[runner] PASS breakpoint_fault_01"
 
 
@@ -28,11 +29,13 @@ class FaultLogTests(unittest.TestCase):
         # terminal record still supplies tag, thread, reason, and subcode.
         self.assertEqual(unexpected_faults(log(PRE, PASS), "breakpoint_x86"), [])
         self.assertEqual(unexpected_faults(log(ARM_PRE, PASS), "breakpoint_arm"), [])
+        self.assertEqual(unexpected_faults(log(ARM_PRE, GARBLED_FAULT, PASS), "breakpoint_arm"), [])
 
     def test_other_contexts_and_faults_still_block(self) -> None:
         samples = (
             (log(PRE, X86_FAULT, PASS), "none"),
             (log(PRE, ARM_FAULT, PASS), "breakpoint_x86"),
+            (log(ARM_PRE, GARBLED_FAULT, GARBLED_FAULT, PASS), "breakpoint_arm"),
             (log(PRE, X86_FAULT), "breakpoint_x86"),
             (log(PASS, PRE, X86_FAULT), "breakpoint_x86"),
             (log(PRE, X86_FAULT, PASS, X86_FAULT), "breakpoint_x86"),
