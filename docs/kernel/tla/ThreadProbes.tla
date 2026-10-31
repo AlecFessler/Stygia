@@ -57,4 +57,11 @@ ProbeNoFinalizingDead ==
    hop, park-stack consumption, and release of the same process reference. *)
 ProbeNoTeardownDone ==
   \A p \in Threads: processes[p].phase # "done"
+
+(* G16: an external retire can win after the request is queued and before
+   the caller's own retirement CAS. The continuation still has to hop. *)
+ProbeNoRemoteRetiredTeardown ==
+  \A e \in Threads:
+    ~(threads[e].pc = "teardown" /\ threads[e].st = "retired"
+      /\ processes[threads[e].proc].phase = "queued")
 ====================================================================================
