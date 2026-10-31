@@ -695,9 +695,15 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%gs:192, %%r11
         \\movb $0, (%%r11)                    // clear yield handoff guard
         \\# clobbers only SYSCALL-scratch r11; no payload GPRs
+        \\cmpb $0, smap_enabled(%%rip)
+        \\je .Lsyscall_no_stac_entry
         \\stac
+        \\.Lsyscall_no_stac_entry:
         \\movq (%%rsp), %%rcx                 // rcx = syscall_word (rsp still = user_rsp)
+        \\cmpb $0, smap_enabled(%%rip)
+        \\je .Lsyscall_no_clac_entry
         \\clac
+        \\.Lsyscall_no_clac_entry:
         \\movq %%rsp, %%gs:8                  // user_rsp
         \\movq %%gs:0, %%rsp                  // switch to kernel stack
 
@@ -1698,12 +1704,18 @@ pub export fn syscallEntry() callconv(.naked) void {
         // FS.base, GS.base) — write to recv_user_rsp + 16/24/32/40. The
         // first two come from gs:24 / gs:8; FS.base/GS.base require rdmsr.
         // ────────────────────────────────────────────────────────────────
+        \\cmpb $0, smap_enabled(%%rip)
+        \\je .Lsyscall_no_stac_reply
         \\stac
+        \\.Lsyscall_no_stac_reply:
         \\movq %%gs:104, %%rcx
         \\movq %%rcx, (%%rax)
         \\movq %%gs:16, %%rcx
         \\movq %%rcx, 8(%%rax)
+        \\cmpb $0, smap_enabled(%%rip)
+        \\je .Lsyscall_no_clac_reply
         \\clac
+        \\.Lsyscall_no_clac_reply:
         \\movq %%gs:88, %%rcx
     ++ std.fmt.comptimePrint(
         \\
@@ -3335,17 +3347,20 @@ fn canConsumeSuspendDirectiveBeforeHandler(ctx: *const cpu.Context, is_async_irq
 }
 
 export fn interruptStubPrologue() callconv(.naked) void {
-    // Re-arm SMAP before any kernel work runs. CLAC is a no-op on CPUs
-    // that lack SMAP (RFLAGS.AC is already 0 for CPL-0 code that never
-    // set it) but critically defends against an adversarial user that
+    // Re-arm SMAP before any kernel work runs, if the CPU supports CLAC.
+    // This critically defends against an adversarial user that
     // sets RFLAGS.AC=1 via POPFQ before issuing a syscall — without this
     // the syscall dispatch would run with AC=1 and bypass SMAP for every
     // raw user pointer access. IRETQ in `interruptStubEpilogue` restores
     // the interrupted context's RFLAGS (including AC) from the iret
     // frame, so kernel code interrupted mid-`userAccessBegin` resumes
-    // with AC=1 as expected. Single-byte-equivalent, no register clobber.
+    // with AC=1 as expected. The feature check clobbers flags but no GPRs;
+    // interrupted RFLAGS is already in the hardware frame.
     asm volatile (
+        \\cmpb $0, smap_enabled(%%rip)
+        \\je .Linterrupt_no_clac
         \\clac
+        \\.Linterrupt_no_clac:
         \\pushq %%rax
         \\pushq %%rcx
         \\pushq %%rdx

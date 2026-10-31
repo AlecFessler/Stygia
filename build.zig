@@ -682,8 +682,8 @@ pub fn build(b: *std.Build) void {
             \\ -smp cores=4
         , .{ machine, b.install_path, out_dir, display_type, accel });
     } else blk: {
-        // QEMU's qemu64 TCG model omits SMAP and RDTSCP, which the kernel
-        // currently assumes; the max model provides their emulation.
+        // Use QEMU's broad emulated CPU for the normal TCG profile. The
+        // kernel also accepts qemu64 without SMAP/RDTSCP in focused tests.
         const qemu_accel_args: []const u8 = if (kvm)
             \\-enable-kvm \
             \\-cpu host,+invtsc

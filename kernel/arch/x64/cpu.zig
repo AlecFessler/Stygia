@@ -330,6 +330,7 @@ pub fn rdtscLFenced() u64 {
 /// before the counter is sampled, but subsequent instructions may begin speculatively.
 /// Intel SDM Vol 3B, Section 17.17 "Time-Stamp Counter".
 pub fn rdtscp() u64 {
+    if (!@atomicLoad(bool, &rdtscp_enabled, .acquire)) return rdtscLFenced();
     var a: u32 = 0;
     var d: u32 = 0;
     var c: u32 = 0;
@@ -348,6 +349,11 @@ pub fn rdtscp() u64 {
 /// prevents subsequent loads from executing before the counter read completes.
 /// Intel SDM Vol 3B, Section 17.17 "Time-Stamp Counter".
 pub fn rdtscpLFenced() u64 {
+    if (!@atomicLoad(bool, &rdtscp_enabled, .acquire)) {
+        const tsc = rdtscLFenced();
+        asm volatile ("lfence" ::: .{ .memory = true });
+        return tsc;
+    }
     var a: u32 = 0;
     var d: u32 = 0;
     var c: u32 = 0;
@@ -667,6 +673,13 @@ pub fn enableAlignmentCheck() void {
     );
 }
 
+/// Shared by the naked interrupt/syscall stubs, which cannot call a Zig helper
+/// before saving their register state. All online x86 cores must expose the
+/// same instruction features, as they do for the other shared fast paths.
+pub export var smap_enabled: u8 = 0;
+var rdtscp_enabled: bool = false;
+var optional_features_ready: bool = false;
+
 /// Enable CR4.SMEP (bit 20) and CR4.SMAP (bit 21) when supported.
 ///
 /// SMEP: Supervisor Mode Execution Prevention. With SMEP set, an instruction
@@ -697,6 +710,24 @@ pub fn enableSmapSmep() void {
         :
         : [cr4] "r" (cr4),
     );
+    // CPUID.80000001h:EDX[27] advertises RDTSCP. Its TSC_AUX result is not
+    // consumed here, so LFENCE+RDTSC is sufficient when the bit is absent.
+    const ext_max = cpuid(.ext_max, 0).eax;
+    const has_rdtscp = ext_max >= 0x80000001 and
+        (cpuid(.ext_features, 0).edx & (@as(u32, 1) << 27)) != 0;
+    if (@atomicLoad(bool, &optional_features_ready, .acquire)) {
+        // The naked stubs use a whole-system flag. A secondary CPU with a
+        // different feature set cannot safely join the same scheduler.
+        if (@atomicLoad(u8, &smap_enabled, .acquire) != @intFromBool(has_smap) or
+            @atomicLoad(bool, &rdtscp_enabled, .acquire) != has_rdtscp)
+        {
+            @panic("x86 optional instruction features differ across cores");
+        }
+    } else {
+        @atomicStore(u8, &smap_enabled, @intFromBool(has_smap), .release);
+        @atomicStore(bool, &rdtscp_enabled, has_rdtscp, .release);
+        @atomicStore(bool, &optional_features_ready, true, .release);
+    }
 }
 
 /// Set when the local CPU supports CR4.PCIDE. Read by `swapAddrSpace`
@@ -740,12 +771,12 @@ pub fn enablePcid() void {
 /// Set RFLAGS.AC so the current core may read/write user pages under SMAP.
 /// Must be paired with `clac()`; keep the window as short as possible.
 pub inline fn stac() void {
-    asm volatile ("stac");
+    if (@atomicLoad(u8, &smap_enabled, .acquire) != 0) asm volatile ("stac");
 }
 
 /// Clear RFLAGS.AC. Re-arms SMAP protection after a bracketed user access.
 pub inline fn clac() void {
-    asm volatile ("clac");
+    if (@atomicLoad(u8, &smap_enabled, .acquire) != 0) asm volatile ("clac");
 }
 
 /// Enable speculative execution barriers (IBRS, STIBP) when supported.
@@ -787,6 +818,7 @@ pub fn enableSpeculationBarriers() void {
 ///
 /// Intel SDM Vol 1 §7.3.17; AMD APM Vol 3, RDRAND instruction reference.
 pub fn rdrand() ?u64 {
+    if (!hasFeatureEcx(cpuid(.basic_features, 0).ecx, .rdrand)) return null;
     var value: u64 = 0;
     var success: u8 = 0;
     asm volatile (
