@@ -49,7 +49,7 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
 /// aarch64 history, twice wrong, recorded so it isn't repeated:
 ///
 ///  1. It originally claimed SGI 2 on the reasoning that SGIs 0 and 1
-///     were taken by the scheduler and kprof-dump paths. SGI 2 was not
+///     were taken by the scheduler path. SGI 2 was not
 ///     free either: `arch.dispatch.cpu.sendFpuFlushIpi` raises it for
 ///     the lazy-FPU cross-core flush, so a wake ran
 ///     `fpu.flushIpiHandler` against an empty mailbox. That still woke

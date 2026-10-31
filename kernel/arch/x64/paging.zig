@@ -4,7 +4,6 @@ const stygia = @import("stygia");
 const apic = stygia.arch.x64.apic;
 const cpu = stygia.arch.x64.cpu;
 const interrupts = stygia.arch.x64.interrupts;
-const kprof = stygia.kprof.trace_id;
 const paging = stygia.memory.paging;
 const physmap = stygia.memory.address.AddrSpacePartition.physmap;
 const pmm = stygia.memory.pmm;
@@ -365,7 +364,6 @@ pub fn clearPcidPendingFreeBit(id: u16) void {
 ///
 /// Intel SDM Vol 3A §5.10.4.1 (INVLPG); Vol 2A INVPCID (types 0 and 1).
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
-    kprof.point(.tlb_shootdown, 0);
     const my_core = apic.coreID();
     const kind = @atomicLoad(u8, &shootdown_kind, .acquire);
     switch (kind) {
@@ -837,7 +835,6 @@ pub fn mapPage(
     perms: MemoryPerms,
     kind: MappingKind,
 ) !void {
-    kprof.point(.map_page, virt.addr);
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 
@@ -1067,7 +1064,6 @@ pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
 ) ?PAddr {
-    kprof.point(.unmap_page, virt.addr);
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
@@ -1233,7 +1229,6 @@ pub fn mapPageSized(
     // exercises.
     std.debug.assert(sz == .sz_4k);
 
-    kprof.point(.map_page, virt.addr);
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 

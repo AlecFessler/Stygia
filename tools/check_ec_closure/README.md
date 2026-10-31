@@ -35,7 +35,7 @@ sources, so that no single one silently going stale shrinks the answer:
 | `naked_asm` | `&handler` bound as an inline-asm operand inside a `callconv(.naked)` function — the aarch64 exception vector table |
 
 The DB's own `entry_point` table is **not** sufficient on its own: it misses
-`deviceIrqHandler`, both `pmiHandler`s, the TLB-shootdown / kprof / FPU-flush
+`deviceIrqHandler`, both `pmiHandler`s, the TLB-shootdown / FPU-flush
 IPI vectors and `spuriousHandler`, because it discovers handlers by name from
 a fixed list.
 

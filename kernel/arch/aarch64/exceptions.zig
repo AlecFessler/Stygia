@@ -52,8 +52,6 @@ const fpu = stygia.sched.fpu;
 const futex = stygia.sched.futex;
 const gic = stygia.arch.aarch64.gic;
 const interrupts = stygia.arch.aarch64.interrupts;
-const kprof = stygia.kprof.trace_id;
-const kprof_dump = stygia.kprof.dump;
 const pmu = stygia.arch.aarch64.pmu;
 const port = stygia.sched.port;
 const scheduler = stygia.sched.scheduler;
@@ -560,8 +558,6 @@ fn interceptPortIoFault(ctx: *ArchCpuContext, esr: u64) bool {
 }
 
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
-    kprof.enter(.exception);
-    defer kprof.exit(.exception);
 
     const esr = readEsrEl1();
     const ec = extractEc(esr);
@@ -705,7 +701,6 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             const far = readFarEl1();
             const is_write = isWriteFault(esr);
             logLowerElAbort("data_lower", ctx, esr, far, is_write, false);
-            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
                 .is_kernel_privilege = false,
@@ -729,7 +724,6 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         .instruction_abort_lower_el => {
             const far = readFarEl1();
             logLowerElAbort("inst_lower", ctx, esr, far, false, true);
-            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
                 .is_kernel_privilege = false,
@@ -934,8 +928,6 @@ fn consumeIrqEntrySuspendDirective(ec_ptr: *ExecutionContext, ctx: *ArchCpuConte
 /// ICC_IAR1_EL1), dispatches to the registered device handler, and
 /// signals end-of-interrupt (ICC_EOIR1_EL1).
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
-    kprof.enter(.irq);
-    defer kprof.exit(.irq);
 
     // lockdep: hardware took the IRQ vector with PSTATE.I masked
     // (ARM ARM D1.10.4 — async exceptions auto-mask on entry), so any
@@ -1026,8 +1018,6 @@ fn silenceTimerLineIfFiring(intid: u32) void {
 /// Only Data Aborts (demand paging) are expected in kernel mode.
 /// All other exceptions are fatal.
 fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
-    kprof.enter(.exception);
-    defer kprof.exit(.exception);
 
     const esr = readEsrEl1();
     const ec = extractEc(esr);
@@ -1036,7 +1026,6 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
         .data_abort_same_el => {
             const is_write = isWriteFault(esr);
             const far = readFarEl1();
-            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
                 .is_kernel_privilege = true,
@@ -1056,7 +1045,6 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 
         .instruction_abort_same_el => {
             const far = readFarEl1();
-            kprof.point(.page_fault_hw, far);
             const pf_ctx = PageFaultContext{
                 .faulting_address = far,
                 .is_kernel_privilege = true,
@@ -1104,8 +1092,6 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
-    kprof.enter(.irq);
-    defer kprof.exit(.irq);
 
     // lockdep: see handleIrqLowerEl. The kernel-mode IRQ vector is just as
     // much an async-IRQ-handler entry — the interrupted code may have been
@@ -1198,8 +1184,6 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
         // it through the same path as the timer tick so the scheduler picks
         // a new runnable thread on this core.
         0 => {
-            kprof.enter(.sched_tick);
-            defer kprof.exit(.sched_tick);
 
             // Pi 5 KVM vGICv2 workaround: broadcast a scheduler tick
             // to all secondary cores whenever the BSP runs through
@@ -1220,10 +1204,6 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             futex.expireTimedWaiters();
             timer_wheel.wheelExpireDue();
             scheduler.preempt();
-        },
-        // SGI 1 — kprof-dump IPI. Park until the dumper bumps the epoch.
-        1 => {
-            kprof_dump.parkForDump();
         },
         // SGI 2 — lazy-FPU cross-core flush. The requesting core wrote
         // the target EC into this core's mailbox; we save the FPU regs
@@ -1267,8 +1247,6 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
         // rather than rarely.
         3 => {},
         gic.SGI_BCAST_TICK => {
-            kprof.enter(.sched_tick);
-            defer kprof.exit(.sched_tick);
 
             // BSP-driven broadcast scheduler tick (Pi 5 KVM vGICv2
             // workaround). The BSP's CNTP PPI 30 handler fans out an
@@ -1295,8 +1273,6 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, origin: IrqOrigin) void {
             pmu.pmiHandler(ctx);
         },
         27, 30 => {
-            kprof.enter(.sched_tick);
-            defer kprof.exit(.sched_tick);
 
             // EL1 timer preemption tick. Mask the firing line while we
             // run the scheduler tick; the scheduler re-arms via

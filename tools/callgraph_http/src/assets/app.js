@@ -38,7 +38,7 @@
     }
   })();
 
-  /** When true (default), hide debug-only call sites: std.debug.*, kprof
+  /** When true (default), hide debug-only call sites: std.debug.*
    *  tracing, *.assert helpers, panic helpers, kernel/utils/debug.zig and
    *  the downstream of kernel/panic.zig (panic.panic itself stays visible).
    *  Persisted in localStorage so reload preserves the choice. */
@@ -82,7 +82,7 @@
 
   /** A function (or call atom with a `name`/`def_loc`) counts as "debug" if
    *  any of: name/mangled is std.debug.*, name contains .assert, name starts
-   *  with kprof. or panic / contains .panic, name ends with `Panic`, defined
+   *  with panic or contains .panic, name ends with `Panic`, defined
    *  in kernel/utils/debug.zig, or defined in kernel/panic.zig (except for
    *  `panic.panic` itself — we keep the user-visible panic entry).
    *
@@ -97,7 +97,6 @@
 
     if (mangled.startsWith("std.debug.") || name.startsWith("std.debug.")) return true;
     if (name.indexOf(".assert") >= 0) return true;
-    if (name.startsWith("kprof.")) return true;
     if (name.startsWith("panic") || name.indexOf(".panic") >= 0) {
       // Spare the user-visible panic entry: `panic.panic` is the entry the
       // user wants to see. Filter only its downstream (caught by the
@@ -1753,7 +1752,7 @@
         // design — most of stdlib isn't used. Surfacing them here buries
         // the genuinely interesting cases (kernel functions nothing calls).
         if (isFiltered(f)) continue;
-        // Debug helpers (asserts, kprof tracing, panic downstream) skew
+        // Debug helpers (asserts, panic downstream) skew
         // the dead-code list when the toggle is on.
         if (isFilteredDebug(f)) continue;
         const file = f.def_loc ? f.def_loc.file : "";

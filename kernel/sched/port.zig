@@ -35,7 +35,6 @@ const capability = stygia.caps.capability;
 const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
-const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
 const scheduler = stygia.sched.scheduler;
 
@@ -746,8 +745,6 @@ pub fn createPort(caller: *ExecutionContext, caps: u64) i64 {
 /// delivered. State produced here MUST match what the fast path produces
 /// so the two are interchangeable.
 pub fn suspendEc(caller: *ExecutionContext, target: u64, port: u64) i64 {
-    kprof.enter(.suspend_ec);
-    defer kprof.exit(.suspend_ec);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -980,8 +977,6 @@ fn recvInner(
     deferred: *DeferredDerives,
     moves: *DeferredMoveClears,
 ) i64 {
-    kprof.enter(.recv);
-    defer kprof.exit(.recv);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -1161,8 +1156,6 @@ pub export fn replyAtomicRecvSendersFallback(
 
 /// `reply` syscall handler. Spec §[reply].reply.
 pub fn reply(caller: *ExecutionContext, reply_handle: u64) i64 {
-    kprof.enter(.reply);
-    defer kprof.exit(.reply);
     const cd_ref = caller.domain;
     const lr = cd_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
     const cd = lr.ptr;
@@ -2045,7 +2038,6 @@ pub fn firePmuOverflow(ec: *ExecutionContext, counter_idx: u64) void {
 /// Fire a vm_exit event for a vCPU EC. Routes to `ec.exit_port`
 /// directly (not through `event_routes`). Spec §[vm_exit_state].
 pub fn fireVmExit(ec: *ExecutionContext, subcode: u8, payload: [3]u64) void {
-    kprof.point(.vm_exit, subcode);
 
     const exit_port_ref = ec.exit_port orelse return;
     const exit_lr = exit_port_ref.lockIrqSave(@src()) catch return;
@@ -2434,8 +2426,6 @@ fn deliverEvent(
     deferred: *DeferredDerives,
     moves: *DeferredMoveClears,
 ) i64 {
-    kprof.enter(.deliver_event);
-    defer kprof.exit(.deliver_event);
     // Spec §[reply]: minted reply handle inherits `xfer = 1` iff the
     // recv'ing port carried the `xfer` cap. Caller threads that bit
     // through from the recv-time port-handle resolution (it is NOT

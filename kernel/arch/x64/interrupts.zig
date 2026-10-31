@@ -7,7 +7,6 @@ const cpu = stygia.arch.x64.cpu;
 const ctx_trace = stygia.utils.ctx_trace;
 const gdt = stygia.arch.x64.gdt;
 const idt = stygia.arch.x64.idt;
-const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
 const paging = stygia.arch.x64.paging;
 const scheduler = stygia.sched.scheduler;
@@ -101,7 +100,6 @@ pub fn dumpFaultRegs(ctx: *const ArchCpuContext) void {
 
 pub const IntVecs = enum(u8) {
     pmu = 0xFB,
-    kprof_dump = 0xFC,
     tlb_shootdown = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,
@@ -3589,8 +3587,6 @@ pub fn setSyscallVreg(ctx: *ArchCpuContext, idx: u8, value: u64) void {
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
-    kprof.enter(.irq);
-    defer kprof.exit(.irq);
 
     // Pointer-index `vector_table[]` to avoid Debug-mode codegen
     // copying the entire [256]VectorEntry array (~4 KiB) onto the IRQ

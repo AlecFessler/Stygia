@@ -13,7 +13,6 @@ const stygia = @import("stygia");
 const cpu = stygia.arch.x64.cpu;
 const hv_vcpu = stygia.arch.x64.hv.vcpu;
 const hv_vm = stygia.arch.x64.hv.vm;
-const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
 const mmio_decode = stygia.arch.x64.mmio_decode;
 const timers = stygia.arch.x64.timers;
@@ -60,8 +59,6 @@ const SUBCODE_UNKNOWN: u8 = 12;
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support hardware virt).
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
-    kprof.enter(.vm_enter);
-    defer kprof.exit(.vm_enter);
 
     if (!vm_hw.vmSupported()) return null;
 

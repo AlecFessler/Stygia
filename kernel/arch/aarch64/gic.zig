@@ -1065,7 +1065,6 @@ pub fn sendIpiToCore(core_id: u64, vector: u8) void {
 /// shared INTID 2 with the FPU flush and so ran the wrong handler):
 ///
 ///   0  scheduler rearm / preempt   `sendSchedulerIpi`
-///   1  kprof-dump broadcast        `arch.dispatch.cpu` dump fan-out
 ///   2  lazy-FPU cross-core flush   `arch.dispatch.cpu.sendFpuFlushIpi`
 ///   3  cross-core idle wake        `arch.dispatch.smp.sendWakeIpi`
 ///   7  BSP broadcast sched tick    `SGI_BCAST_TICK`

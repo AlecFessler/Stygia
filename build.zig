@@ -78,14 +78,6 @@ pub fn build(b: *std.Build) void {
     const emit_ir = b.option(bool, "emit_ir", "Emit kernel LLVM IR to zig-out/kernel.ll (consumed by tools/indexer)") orelse false;
     const emit_index = b.option(bool, "emit_index", "Build the per-(arch, commit_sha) callgraph SQLite DB to tools/callgraph_http/test/dbs/ (implies -Demit_ir=true)") orelse false;
     const commit_sha = b.option([]const u8, "commit_sha", "Commit SHA recorded in the callgraph DB when -Demit_index=true (default: 'DEV')") orelse "DEV";
-    const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
-    if (!std.mem.eql(u8, kernel_profile, "none") and
-        !std.mem.eql(u8, kernel_profile, "trace") and
-        !std.mem.eql(u8, kernel_profile, "sample"))
-    {
-        @panic("-Dkernel_profile must be one of: none, trace, sample");
-    }
-    const kprof_enabled = !std.mem.eql(u8, kernel_profile, "none");
     // L4 IPC fast-path classifier on/off switch. Default on. With
     // -Dkernel_fastpath=false the classifier in `syscallEntry` skips
     // the `cmpq $13 / jbe .Lsyscall_suspend_fast` test, so every
@@ -163,22 +155,7 @@ pub fn build(b: *std.Build) void {
         else
             @panic("Unsupported target architecture");
     };
-    // When kprof is compiled in, prefer ReleaseFast so the measured
-    // kernel matches production code generation, and retain debug info
-    // on the kernel.elf so parse_kprof.py can symbolize trace/sample
-    // IPs directly against the built binary. Plain Debug remains the
-    // default when kprof is disabled so normal builds aren't bloated.
-    // We register `-Doptimize` directly (not via standardOptimizeOption)
-    // because standardOptimizeOption hides -Doptimize whenever
-    // preferred_optimize_mode is set, and we still want users to be
-    // able to override the kprof default explicitly.
-    const user_optimize = b.option(
-        std.builtin.OptimizeMode,
-        "optimize",
-        "Prioritize performance, safety, or binary size",
-    );
-    const optimize: std.builtin.OptimizeMode = user_optimize orelse
-        (if (kprof_enabled) .ReleaseFast else .Debug);
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .Debug;
     const cpu_model: std.Target.Query.CpuModel = if (arch == .aarch64)
         .{ .explicit = &std.Target.aarch64.cpu.cortex_a72 }
     else
@@ -257,7 +234,6 @@ pub fn build(b: *std.Build) void {
     stygia_mod.addImport("stygia", stygia_mod);
 
     const build_opts = b.addOptions();
-    build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
     build_opts.addOption(bool, "kernel_fastpath", kernel_fastpath);
     build_opts.addOption(bool, "kernel_fastpath_suspend", kernel_fastpath_suspend);
     build_opts.addOption(bool, "kernel_fastpath_reply", kernel_fastpath_reply);
@@ -270,23 +246,6 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "tests_fixture_devices", tests_fixture_devices);
     const build_opts_mod = build_opts.createModule();
     stygia_mod.addImport("build_options", build_opts_mod);
-
-    const kprof_mod = b.createModule(.{
-        .root_source_file = b.path("kernel/kprof/kprof.zig"),
-        .target = b.resolveTargetQuery(.{
-            .cpu_arch = arch,
-            .os_tag = .freestanding,
-            .cpu_model = cpu_model,
-            .cpu_features_sub = cpu_features_sub,
-            .cpu_features_add = cpu_features_add,
-        }),
-        .optimize = optimize,
-    });
-    kprof_mod.omit_frame_pointer = false;
-    kprof_mod.red_zone = false;
-    kprof_mod.addImport("stygia", stygia_mod);
-    kprof_mod.addImport("build_options", build_opts_mod);
-    stygia_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
     const embedded_wf = b.addWriteFiles();
@@ -362,10 +321,6 @@ pub fn build(b: *std.Build) void {
             }),
             .optimize = optimize,
             .code_model = if (arch == .x86_64) .kernel else .small,
-            // Keep debug info in the kernel ELF under kprof so that
-            // parse_kprof.py (task #12) can resolve trace/sample IPs
-            // to source locations without a separate symbol bundle.
-            // null leaves Zig's default behavior for non-kprof builds.
             // Always false: link_emit_relocs (set below) is incompatible
             // with --strip-all, which ReleaseSmall enables by default.
             .strip = false,
@@ -493,17 +448,6 @@ pub fn build(b: *std.Build) void {
         pi5_stygia_mod.red_zone = false;
         pi5_stygia_mod.addImport("stygia", pi5_stygia_mod);
         pi5_stygia_mod.addImport("build_options", build_opts_mod);
-
-        const pi5_kprof_mod = b.createModule(.{
-            .root_source_file = b.path("kernel/kprof/kprof.zig"),
-            .target = pi5_target,
-            .optimize = pi5_optimize,
-        });
-        pi5_kprof_mod.omit_frame_pointer = false;
-        pi5_kprof_mod.red_zone = false;
-        pi5_kprof_mod.addImport("stygia", pi5_stygia_mod);
-        pi5_kprof_mod.addImport("build_options", build_opts_mod);
-        pi5_stygia_mod.addImport("kprof", pi5_kprof_mod);
 
         // Same generated file as the kernel's, recompiled for this target. On
         // aarch64 both members are empty slices today; when root_service starts

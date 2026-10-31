@@ -2,7 +2,6 @@ const stygia = @import("stygia");
 
 const capability = stygia.caps.capability;
 const errors = stygia.syscall.errors;
-const kprof = stygia.kprof.trace_id;
 const vmar = stygia.memory.vmar;
 
 const CapabilityDomainCaps = stygia.caps.capability_domain.CapabilityDomainCaps;
@@ -167,8 +166,6 @@ pub fn createVmar(
 /// [test 13] on success, when [1].caps.dma = 1, a DMA read by the bound device from `VMAR.base + offset` returns the installed page_frame's contents, and a DMA access whose access type is not in `VMAR.cur_rwx` ∩ `page_frame.r/w/x` is rejected by the IOMMU rather than reaching the page_frame.
 /// [test 14] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn mapPf(caller: *anyopaque, vmar_handle: u64, pairs: []const u64) i64 {
-    kprof.enter(.map_pf);
-    defer kprof.exit(.map_pf);
 
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     // Pairs slice always carries a (offset, page_frame) tuple per i — odd
@@ -353,8 +350,6 @@ pub fn snapshot(caller: *anyopaque, target_vmar: u64, source_vmar: u64) i64 {
 /// [test 07] on success, vregs `[3..2+count]` contain the qwords from the VMAR starting at [2] offset.
 /// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn idcRead(caller: *anyopaque, vmar_handle: u64, offset: u64, count: u8) i64 {
-    kprof.enter(.idc_read);
-    defer kprof.exit(.idc_read);
 
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     // Offset must be 8-byte aligned per spec [test 03].
@@ -395,8 +390,6 @@ pub fn idcRead(caller: *anyopaque, vmar_handle: u64, offset: u64, count: u8) i64
 /// [test 07] on success, the qwords from vregs `[3..2+count]` are written into the VMAR starting at [2] offset.
 /// [test 08] when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 pub fn idcWrite(caller: *anyopaque, vmar_handle: u64, offset: u64, count: u8, qwords: []const u64) i64 {
-    kprof.enter(.idc_write);
-    defer kprof.exit(.idc_write);
 
     if (vmar_handle & ~HANDLE_ARG_MASK != 0) return errors.E_INVAL;
     if (offset & 0x7 != 0) return errors.E_INVAL;

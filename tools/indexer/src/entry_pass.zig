@@ -5,7 +5,7 @@
 //! be as complete as the last person who edited it: on x86_64 it knew
 //! `exceptionHandler`, `pageFaultHandler` and `schedTimerHandler` and missed
 //! the other seven live IDT handlers — `deviceIrqHandler`, `spuriousHandler`,
-//! the TLB-shootdown / kprof-dump / FPU-flush IPI vectors, and both the Intel
+//! the TLB-shootdown / FPU-flush IPI vectors, and both the Intel
 //! and AMD `pmiHandler`s — because they are neither in the list nor in
 //! `arch/*/exceptions.zig`.
 //!

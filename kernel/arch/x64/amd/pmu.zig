@@ -201,8 +201,7 @@ pub fn init() void {
 
 /// Per-core PMU bring-up. On PerfMonV2 hardware the global enable mask
 /// gates every PMC; without this write PerfEvtSel.EN is necessary but
-/// not sufficient, so userspace `perfmon_start` and kprof trace counters
-/// silently read back zero. Pre-PerfMonV2 cores have no GlobalCtl — the
+/// not sufficient, so userspace `perfmon_start` reads back zero. Pre-PerfMonV2 cores have no GlobalCtl — the
 /// PerfEvtSel.EN bit is the sole gate, so this is a no-op.
 pub fn perCoreInit() void {
     if (!has_perfmon_v2) return;
@@ -347,111 +346,6 @@ fn preloadValue(cfg: PmuCounterConfig) u64 {
     return span - clamped;
 }
 
-/// PMC index reserved for kprof sample-mode. Userspace `perfmon_start`
-/// allocates from PMC0 upward, so sample mode claims the top slot of
-/// AMD's 6 extended PMCs (0xC001_0200..0xC001_020B) — same top-of-range
-/// strategy as trace mode (`KPROF_PMC_CYCLES/CACHE_MISSES/BRANCH_MISSES`
-/// at 3/4/5). Sample and trace modes are mutually exclusive build modes
-/// (`-Dkernel_profile={sample,trace}`), so sample reuses slot 5 here.
-const KPROF_SAMPLE_PMC: u8 = 5;
-
-/// Program `KPROF_SAMPLE_PMC` for cycle-overflow sampling and flip the
-/// LAPIC LVT PerfMon entry to NMI delivery so the PMI fires even when
-/// interrupts are masked. Called once per core under `-Dkernel_profile=sample`.
-///
-/// AMD APM Vol 2, Appendix A: event 0x76 = "CPU Clocks not Halted".
-/// AMD APM Vol 2 §16.4 + Intel SDM Vol 3A §12.5.1: LVT delivery-mode
-/// field is bits [10:8] — value 0b100 selects NMI delivery.
-/// Program PMCs 0/1/2 for free-running cycles / L1 DC refill /
-/// branch-mispredict counting. No overflow interrupt — the trace
-/// helpers just RDMSR these at each tracepoint. Runs exclusively
-/// under `-Dkernel_profile=trace`; sample mode uses the overflow
-/// path in `kprofSamplePerCoreInit` instead.
-///
-/// Event codes + unit masks: AMD APM Vol 2 Appendix A "Core
-/// Performance Event Reference" (Zen family).
-///   PMC0: event 0x76 umask 0x00 = CPU Clocks not Halted
-///   PMC1: event 0x43 umask 0xFF = Data Cache Refills from L2/System
-///         (all refill sources). An umask of 0 counts nothing, which
-///         is why the first attempt showed cmiss=0 everywhere.
-///   PMC2: event 0xC3 umask 0x00 = Retired Branch Mispredicts
-/// Counter slots reserved for kprof. Userspace `perfmon_start`
-/// allocates from PMC0 upward; kprof picks the top 3 of AMD's 6
-/// extended PMCs (0xC001_0200..0xC001_020B) so the two never overlap
-/// — without this split, a perfmon test running mid-trace would
-/// silently zero PMC0 and the kprof scope deltas would all read 0.
-pub const KPROF_PMC_CYCLES: u8 = 3;
-pub const KPROF_PMC_CACHE_MISSES: u8 = 4;
-pub const KPROF_PMC_BRANCH_MISSES: u8 = 5;
-
-pub fn kprofTraceCountersPerCoreInit() void {
-    const cfg = [_]struct { pmc: u8, event: u8, umask: u8 }{
-        .{ .pmc = KPROF_PMC_CYCLES, .event = 0x76, .umask = 0x00 },
-        .{ .pmc = KPROF_PMC_CACHE_MISSES, .event = 0x43, .umask = 0xFF },
-        .{ .pmc = KPROF_PMC_BRANCH_MISSES, .event = 0xC3, .umask = 0x00 },
-    };
-    const PERFEVTSEL_OS: u64 = 1 << 17;
-    var i: usize = 0;
-    while (i < cfg.len) {
-        const c = cfg[i];
-        cpu.wrmsr(perfevtselMsr(c.pmc), 0);
-        cpu.wrmsr(perfctrMsr(c.pmc), 0);
-        const word: u64 =
-            @as(u64, c.event) |
-            (@as(u64, c.umask) << 8) |
-            PERFEVTSEL_USR |
-            PERFEVTSEL_OS |
-            PERFEVTSEL_EN;
-        cpu.wrmsr(perfevtselMsr(c.pmc), word);
-        i += 1;
-    }
-}
-
-/// Snapshot the three trace counters. Masked to AMD's 48-bit
-/// counter width so the raw MSR value doesn't carry high-bit noise.
-pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
-    out[0] = cpu.rdmsr(perfctrMsr(KPROF_PMC_CYCLES)) & COUNTER_MASK;
-    out[1] = cpu.rdmsr(perfctrMsr(KPROF_PMC_CACHE_MISSES)) & COUNTER_MASK;
-    out[2] = cpu.rdmsr(perfctrMsr(KPROF_PMC_BRANCH_MISSES)) & COUNTER_MASK;
-}
-
-/// Called from the NMI handler. Reads `KPROF_SAMPLE_PMC` — if it's
-/// below the preload value, the counter wrapped past 2^48 and fired
-/// an NMI that belongs to kprof; in that case we rearm with a fresh
-/// preload and return true. Otherwise the NMI is for someone else.
-///
-/// The LAPIC auto-sets the LVT PerfMon mask bit (bit 16) when it
-/// delivers a PerfMon interrupt (Intel SDM Vol 3 §10.5.1 — AMD LAPIC
-/// is Intel-compatible). If the handler only writes the counter MSR
-/// and never touches the LVT entry, exactly one NMI fires per core
-/// and subsequent overflows are silently masked. We re-write the LVT
-/// entry here on every rearm to clear the mask and keep the overflow
-/// interrupt live.
-pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
-    const span: u64 = @as(u64, 1) << AMD_COUNTER_BITS;
-    const clamped = if (period_cycles == 0 or period_cycles >= span) span - 1 else period_cycles;
-    const preload = span - clamped;
-
-    const val = cpu.rdmsr(perfctrMsr(KPROF_SAMPLE_PMC)) & COUNTER_MASK;
-    if (val >= preload) return false;
-
-    cpu.wrmsr(perfctrMsr(KPROF_SAMPLE_PMC), preload);
-
-    // Clear the auto-set LVT PerfMon mask bit by re-writing the LVT
-    // entry with NMI delivery and no mask.
-    const NMI_DELIVERY: u32 = 0b100 << 8;
-    const lvt: u32 = @as(u32, PMI_VECTOR) | NMI_DELIVERY;
-    if (apic.x2_apic) {
-        cpu.wrmsr(
-            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
-            @as(u64, lvt),
-        );
-    } else {
-        apic.writeReg(.lvt_perf_monitoring_counters_reg, lvt);
-    }
-    return true;
-}
-
 /// AMD PMU overflow handler. Registered on the LAPIC PerfMon vector
 /// via `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
 /// `dispatchInterrupt` issues the LAPIC EOI after normal returns. If PMU
@@ -593,8 +487,7 @@ fn gpCounterMask() u64 {
 /// §13.2.4). Pre-V2: AMD does not expose an architectural overflow
 /// status MSR, so we infer overflow from the counter value — an armed
 /// counter (`has_threshold`) that currently reads below its preload
-/// must have wrapped past 2^48 and re-entered the low region. Same
-/// approach as `kprofSampleCheckAndRearm`. The 48-bit counter
+/// must have wrapped past 2^48 and re-entered the low region. The 48-bit counter
 /// guarantees no false positives at any realistic event rate within
 /// the PMI service window.
 fn detectOverflow(state: *PmuState) u64 {

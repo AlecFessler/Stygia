@@ -3,7 +3,6 @@ pub const boot = @import("boot/boot.zig");
 pub const caps = @import("caps/caps.zig");
 pub const devices = @import("devices/devices.zig");
 pub const hv = @import("hv/hv.zig");
-pub const kprof = @import("kprof");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");
 pub const sched = @import("sched/sched.zig");

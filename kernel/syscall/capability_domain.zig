@@ -4,7 +4,6 @@ const capability = stygia.caps.capability;
 const capability_domain = stygia.caps.capability_domain;
 const errors = stygia.syscall.errors;
 const execution_context = stygia.sched.execution_context;
-const kprof = stygia.kprof.trace_id;
 
 const CapabilityDomainCaps = capability_domain.CapabilityDomainCaps;
 const ExecutionContext = execution_context.ExecutionContext;
@@ -144,8 +143,6 @@ pub fn createCapabilityDomain(
     initial_ec_affinity: u64,
     passed_handles: []const u64,
 ) i64 {
-    kprof.enter(.create_cap_domain);
-    defer kprof.exit(.create_cap_domain);
 
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;

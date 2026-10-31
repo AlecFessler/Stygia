@@ -5,7 +5,6 @@ const build_options = @import("build_options");
 const address = stygia.memory.address;
 const arch = stygia.arch.dispatch;
 const errors = stygia.syscall.errors;
-const kprof = stygia.kprof.trace_id;
 const memory_init = stygia.memory.init;
 const paging = stygia.memory.paging;
 const pmm = stygia.memory.pmm;
@@ -386,9 +385,6 @@ fn accessSubcode(is_write: bool, is_exec: bool) MemoryFaultSubcode {
 }
 
 pub fn handlePageFault(fault: *const PageFaultContext) void {
-    kprof.enter(.handle_page_fault);
-    defer kprof.exit(.handle_page_fault);
-    kprof.point(.handle_page_fault, fault.faulting_address);
 
     const faulting_virt = VAddr.fromInt(fault.faulting_address);
     const is_kernel_privilege = fault.is_kernel_privilege;

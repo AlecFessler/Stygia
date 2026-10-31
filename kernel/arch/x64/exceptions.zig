@@ -11,8 +11,6 @@ const fpu = stygia.sched.fpu;
 const gdt = stygia.arch.x64.gdt;
 const idt = stygia.arch.x64.idt;
 const interrupts = stygia.arch.x64.interrupts;
-const kprof = stygia.kprof.trace_id;
-const kprof_sample = stygia.kprof.sample;
 const mmio_decode = stygia.arch.x64.mmio_decode;
 const paging_mod = stygia.arch.x64.paging;
 const port = stygia.sched.port;
@@ -234,9 +232,6 @@ fn isUserHltAt(rip: u64) bool {
 }
 
 fn exceptionHandler(ctx: *cpu.Context) void {
-    kprof.enter(.exception);
-    defer kprof.exit(.exception);
-
     const vector: u5 = @intCast(ctx.int_num);
     const exception: Exception = @enumFromInt(vector);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
@@ -360,9 +355,8 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         .machine_check => @panic("Machine check exception"),
         .non_maskable_interrupt => {
             // lockdep blindspot: NMI is NOT wired into sync_debug.enterIrqContext.
-            // Safe today only because the sole NMI consumer (kprof_sample.onNmi)
-            // is intentionally lock-free (atomic-RMW BSS log emit, MSR-only
-            // counter rearm — see kprof/sample.zig).
+            // NMI paths must avoid lock-taking code without IRQ-context
+            // tracking.
             //
             // Before adding any lock-taking code to an NMI path:
             //   1. Wrap the NMI handler body with sync_debug.enterIrqContext()
@@ -379,8 +373,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             // ours. Drive `hang_detector.tickCheck()` from here so the
             // dump still fires when the LAPIC tick + every other periodic
             // kernel-side IRQ source has stalled. Same lock-free
-            // discipline as kprof_sample.onNmi (atomic loads + a single
-            // raw COM1 emit on detect).
+            // discipline (atomic loads + a single raw COM1 emit on detect).
             if (hpet_watchdog.isArmed()) {
                 hang_detector.tickCheck();
                 return;
@@ -393,7 +386,6 @@ fn exceptionHandler(ctx: *cpu.Context) void {
                 hang_detector.forceDump();
                 return;
             }
-            if (kprof_sample.onNmi(ctx.rip, ctx.regs.rbp)) return;
             @panic("NMI");
         },
         .general_protection_fault => {
@@ -414,9 +406,6 @@ fn exceptionHandler(ctx: *cpu.Context) void {
 /// address; the error code on the stack encodes the fault reason per
 /// Figure 5-12.
 fn pageFaultHandler(ctx: *cpu.Context) void {
-    kprof.enter(.page_fault);
-    defer kprof.exit(.page_fault);
-
     if (scheduler.currentEc()) |ec_for_trace| {
         ctx_trace.mark(ec_for_trace, .pf_handler);
     }
@@ -432,7 +421,6 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     if (comptime pf_log.enabled) {
         pf_log.mark(scheduler.currentEc(), .ENTER, faulting_addr, @truncate(ctx.err_code));
     }
-    kprof.point(.page_fault_hw, faulting_addr);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 

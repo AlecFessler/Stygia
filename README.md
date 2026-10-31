@@ -88,7 +88,6 @@ kernel/                Kernel proper
   caps/                  Capability and handle types, capability domain
   devices/               Device region registry
   hv/                    Vendor-neutral hypervisor (Virtual Machine kernel object)
-  kprof/                 In-kernel tracing and sampling profiler
   memory/                PMM, VMM, VMARs, page frames, paging, allocators/ (SecureSlab lives here)
   sched/                 Scheduler, EC, futex, port, timer, perfmon, FPU
   syscall/               Per-object syscall handlers and dispatch
@@ -108,7 +107,6 @@ tests/
     build.zig            Authoritative test manifest (-Dtests=<glob> for subsets)
     verify_coverage.py   Spec to test parity check
   linux_guest/           Linux VMM root service (with bundled bzImage + initramfs)
-  perf/                  kprof-driven perf workload (idc_pp) + scripts/
   precommit.sh           Cross-arch precommit gauntlet
 
 tools/                 Dev tooling (see the Tooling section)

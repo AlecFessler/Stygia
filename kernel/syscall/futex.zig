@@ -2,7 +2,6 @@ const stygia = @import("stygia");
 
 const errors = stygia.syscall.errors;
 const futex = stygia.sched.futex;
-const kprof = stygia.kprof.trace_id;
 const paging = stygia.arch.dispatch.paging;
 
 const CapabilityDomain = stygia.caps.capability_domain.CapabilityDomain;
@@ -88,8 +87,6 @@ fn readSelfHasFutWake(domain_ref: SlabRef(CapabilityDomain)) bool {
 /// [test 07] on entry, when any pair's current `*addr != expected`, returns immediately with `[1]` set to that addr.
 /// [test 08] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
 pub fn futexWaitVal(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64 {
-    kprof.enter(.futex_wait);
-    defer kprof.exit(.futex_wait);
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
 
@@ -152,8 +149,6 @@ pub fn futexWaitVal(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64
 /// [test 07] on entry, when any pair's current `*addr == target`, returns immediately with `[1]` set to that addr.
 /// [test 08] when another EC calls `futex_wake` on any watched addr, returns with `[1]` set to that addr (caller re-checks the value to determine whether the condition is actually met or the wake was spurious).
 pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) i64 {
-    kprof.enter(.futex_wait);
-    defer kprof.exit(.futex_wait);
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
 
@@ -201,8 +196,6 @@ pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) 
 /// [test 03] returns E_BADADDR if [1] addr is not a valid user address in the caller's domain.
 /// [test 04] on success, [1] is the number of ECs actually woken (0..count).
 pub fn futexWake(caller: *anyopaque, addr: u64, count: u64) i64 {
-    kprof.enter(.futex_wake);
-    defer kprof.exit(.futex_wake);
 
     const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
 

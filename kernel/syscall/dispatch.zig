@@ -18,7 +18,6 @@ const errors = stygia.syscall.errors;
 const event_route = stygia.syscall.event_route;
 const execution_context = stygia.syscall.execution_context;
 const futex = stygia.syscall.futex;
-const kprof = stygia.kprof.trace_id;
 const page_frame = stygia.syscall.page_frame;
 const port = stygia.syscall.port;
 const reply = stygia.syscall.reply;
@@ -85,7 +84,6 @@ pub const SyscallNum = enum(u64) {
     power_screen_off = 69,
     power_set_freq = 70,
     power_set_idle = 71,
-    kprof_dump = 72,
 };
 
 /// Read `args[i]`, returning 0 when the index is past the end. Lets
@@ -160,7 +158,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .power_screen_off,
         .power_set_freq,
         .power_set_idle,
-        .kprof_dump,
         => 13,
 
         // create_capability_domain: passed_handles list, no syscall-word
@@ -229,15 +226,12 @@ fn logSpawnError(num_raw: u64, res: i64) void {
 }
 
 pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
-    kprof.enter(.syscall);
-    defer kprof.exit(.syscall);
     syscall_seq +%= 1;
 
     // Spec §[syscall]: syscall number lives in bits 0-11 of the syscall
     // word. Anything beyond that range is per-syscall metadata
     // (pair_count, kind, etc.) and is the handler's responsibility.
     const num_raw: u64 = syscall_word & 0xFFF;
-    kprof.point(.syscall, num_raw);
 
     // Fast-suspend wire format: syscall_op in 0..13 encodes a suspend
     // with payload_count = syscall_op and pair_count = 0. The asm L4
@@ -531,13 +525,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .power_screen_off => system.powerScreenOff(caller),
         .power_set_freq => system.powerSetFreq(caller, arg(args, 0), arg(args, 1)),
         .power_set_idle => system.powerSetIdle(caller, arg(args, 0), arg(args, 1)),
-        .kprof_dump => blk: {
-            // Stop-the-world quiesce + dump. IPIs every other core to
-            // park, drains in-flight emits, dumps every CPU's log to
-            // serial in core-id order, then halts. Doesn't return.
-            stygia.kprof.dump.end(.root_exit);
-            break :blk 0;
-        },
     };
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     logSpawnError(num_raw, dispatch_res);

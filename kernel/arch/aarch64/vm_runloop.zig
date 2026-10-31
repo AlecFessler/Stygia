@@ -15,7 +15,6 @@ const stygia = @import("stygia");
 const hv_vcpu = stygia.arch.aarch64.hv.vcpu;
 const hv_vm = stygia.arch.aarch64.hv.vm;
 const hyp = stygia.arch.aarch64.hyp;
-const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
 const psci = stygia.arch.aarch64.hv.psci;
 const vgic = stygia.arch.aarch64.hv.vgic;
@@ -69,8 +68,6 @@ const SUBCODE_INITIAL_STATE: u8 = 10;
 /// Returns `null` if the VM or its arch state is missing (creator
 /// teardown raced us, or the platform doesn't support EL2).
 pub fn enterGuest(vcpu_ec: *ExecutionContext) ?VmExitDelivery {
-    kprof.enter(.vm_enter);
-    defer kprof.exit(.vm_enter);
 
     if (!vm_hw.vmSupported()) return null;
 

@@ -10,9 +10,6 @@ const futex = stygia.sched.futex;
 const gdt = stygia.arch.x64.gdt;
 const idt = stygia.arch.x64.idt;
 const interrupts = stygia.arch.x64.interrupts;
-const kprof = stygia.kprof.trace_id;
-const kprof_dump = stygia.kprof.dump;
-const kprof_log = stygia.kprof.log;
 const paging_mod = stygia.arch.x64.paging;
 const port = stygia.sched.port;
 const sched = stygia.sched.scheduler;
@@ -120,20 +117,6 @@ pub fn init() void {
         .external,
     );
 
-    const kprof_vec = @intFromEnum(interrupts.IntVecs.kprof_dump);
-    idt.openInterruptGate(
-        kprof_vec,
-        interrupts.stubs[kprof_vec],
-        gdt.KERNEL_CODE_OFFSET,
-        PrivilegeLevel.ring_0,
-        GateType.interrupt_gate,
-    );
-    interrupts.registerVector(
-        kprof_vec,
-        kprofDumpHandler,
-        .external,
-    );
-
     // Lazy-FPU cross-core flush IPI vector. Sent by `cpu.fpuFlushIpi`
     // when the scheduler migrates an EC whose FP regs still live on
     // a remote core's hardware. Receiver runs `fpuFlushIpiHandler` to
@@ -217,13 +200,6 @@ fn spuriousHandler(ctx: *cpu.Context) void {
     spurious_interrupts += 1;
 }
 
-/// Kprof-dump IPI handler: park this CPU inside kprof.dump so the
-/// dumping core can quiesce every other CPU before serial-dumping.
-/// Never returns — parkForDump halts after dump_done is observed.
-fn kprofDumpHandler(_: *cpu.Context) void {
-    kprof_dump.parkForDump();
-}
-
 /// IPI handler for the lazy-FPU cross-core flush. Reads the requested
 /// EC from this core's mailbox, calls into the generic FPU module
 /// (which checks if this core is still the owner and FXSAVEs if so),
@@ -257,8 +233,6 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // whose counter is frozen in the hang dump is not taking the kick at
     // all; one whose counter advances took it and still failed to act.
     stygia.utils.spin_diag.noteEntry();
-    kprof.enter(.sched_tick);
-    defer kprof.exit(.sched_tick);
 
     // Drive hang_detector.tickCheck from every per-core scheduler tick.
     // The threshold-based detector here is meant for the case where SOME
@@ -279,13 +253,6 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     // `print_lock`), interleaving kernel bytes between userspace bytes
     // and corrupting `[runner] PASS …` lines.
     //
-    // Kprof session-end gate: once any CPU's per-CPU log fills, `emit`
-    // sets `terminate_requested`. The first scheduler tick that
-    // observes it set kicks off the IPI-coordinated stop-the-world
-    // dump and never returns. No-op when kprof is compiled out.
-    if (kprof_log.terminate_requested != 0) {
-        kprof_dump.end(.log_full);
-    }
     timers.getPreemptionTimer().armInterruptTimer(sched.TIMESLICE_NS);
     // Drive any deadline-based wakeups for recv-with-timeout and
     // futex_wait_val/futex_wait_change. No-op when nothing has expired.

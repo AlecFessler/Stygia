@@ -3,7 +3,6 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const debug_info = stygia.utils.debug_info;
-const kprof_log = stygia.kprof.log;
 const memory = stygia.memory.init;
 const sched = stygia.sched.scheduler;
 const userspace_init = stygia.boot.userspace_init;
@@ -129,8 +128,6 @@ fn kMain(boot_info: *BootInfo) !void {
     try arch.smp.smpInit();
     stygia.utils.sync.debug.markSmpReady();
     sched.perCoreInit();
-    try kprof_log.init();
-    kprof_log.start();
     // Spec v3: BSP enters the scheduler loop. Root EC was enqueued by
     // userspace_init.init; sched.run picks it up and dispatches.
     sched.run();

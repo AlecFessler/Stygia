@@ -26,7 +26,6 @@ const stygia = @import("stygia");
 
 const arch = stygia.arch.dispatch;
 const spin_diag = stygia.utils.spin_diag;
-const kprof = stygia.kprof.trace_id;
 const scheduler = stygia.sched.scheduler;
 
 const ExecutionContext = stygia.sched.execution_context.ExecutionContext;
@@ -38,8 +37,6 @@ const SlabRef = stygia.memory.allocators.secure_slab.SlabRef;
 /// trap. Safe to call with interrupts disabled (which is the natural
 /// state inside an exception entry).
 pub fn handleTrap(current: *ExecutionContext) void {
-    kprof.enter(.fpu_swap);
-    defer kprof.exit(.fpu_swap);
 
     const core_id: u8 = @truncate(arch.smp.coreID());
     const per_core = &scheduler.core_states[core_id];

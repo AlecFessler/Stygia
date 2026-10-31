@@ -13,7 +13,6 @@
 #   2b. aarch64 VM E_NODEV negative  (Pi-hosted QEMU/KVM, no nested EL2)
 #   3. linux_guest VMM boot          (x86-64, KVM on this PC)
 #   4. linux_guest VMM boot          (aarch64, local TCG with virtualization=on)
-#   5. perf regression               (idc_pp under -Dkernel_profile=trace; 5% threshold)
 #
 # Usage:
 #   ./tests/precommit.sh             # full gauntlet (all stages, including optional)
@@ -40,9 +39,8 @@ STYGIA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Per-worktree Zig global cache ─────────────────────────────────────
 #
-# Every `zig build` invocation in this gauntlet — and there are ~19 of
-# them across the stages (kernel + tools/* + tests/suite + tests/perf +
-# tests/linux_guest, x64 and arm) — would otherwise share the user's
+# Every `zig build` invocation in this gauntlet (kernel, tools, test suite,
+# and Linux guest on x64 and arm) would otherwise share the user's
 # default global cache at `~/.cache/zig/`. With the orchestrator running
 # up to 3 worker dispatches in parallel, multiple gauntlets fire `zig
 # build` concurrently against the same module-hash directories in that
@@ -227,7 +225,6 @@ REQUIRED_STAGES=(
     aarch64_vm_nodev_pi_kvm
     linux_guest_x86_boot
     linux_guest_aarch64_boot
-    perf_regression
 )
 #
 is_required() {
@@ -517,7 +514,7 @@ stage_dead_code_report() {
     # subsequent --db's alive-set by qualified_name. Without the aarch64
     # DB the analyzer falsely flags entities that are dead under x86_64
     # entry_reaches but alive under aarch64 (e.g. arch-specific dispatch
-    # arms, kprof per-arch trace shims). bd-Zag-Subsystems-Agents-l82
+    # arms). bd-Zag-Subsystems-Agents-l82
     # landed the multi-DB plumbing; this stage finally feeds it both.
     if ! (cd "$STYGIA_ROOT" && "$detector" \
         --db "$CALLGRAPH_DB" \
@@ -1618,79 +1615,6 @@ stage_linux_guest_aarch64_boot() {
     fi
 }
 
-# ── stage_perf_regression ─────────────────────────────────────────────
-#
-# Compares idc_pp roundtrip-cycle median against the parent commit's
-# stored measurement. Fails if current is >5% slower. On pass (or
-# bootstrap), writes .stygia-perf/_pending.json which the post-commit hook
-# at .githooks/post-commit renames to .stygia-perf/<new_sha>.json.
-stage_perf_regression() {
-    echo ""
-    echo "=================================================="
-    echo "[5] Perf regression (idc_pp, threshold 5%)"
-    echo "=================================================="
-    local perf_dir="$STYGIA_ROOT/.stygia-perf"
-    mkdir -p "$perf_dir"
-
-    if ! (cd "$STYGIA_ROOT/tests/perf" && zig build 2>&1); then
-        FAILURES+=("perf workload build")
-        return 1
-    fi
-    # zig-out is not pruned on an arch switch, and the indexer stage above
-    # builds both arches back-to-back, so clear it before producing an image
-    # that will actually be booted (build.zig also refuses a mixed one).
-    rm -rf "$STYGIA_ROOT/zig-out"
-    if ! (cd "$STYGIA_ROOT" && zig build -Dprofile=test \
-        -Dkernel_profile=trace -Doptimize=ReleaseFast \
-        -Droot-service=tests/perf/bin/root_service.elf 2>&1); then
-        FAILURES+=("perf kernel build")
-        return 1
-    fi
-
-    local qemu_log
-    qemu_log=$(mktemp)
-    # `timeout 120` may return 124 even after a clean workload run if
-    # `power_shutdown` doesn't tear qemu down (we still see the full
-    # kprof dump in the log). Treat a captured `[KPROF] done` marker
-    # as success regardless of the bash exit code; only fall through
-    # to FAIL when the marker is absent.
-    (cd "$STYGIA_ROOT" && PATH="$QEMU_SHIM_PATH" timeout 120 zig build run -Dprofile=test \
-        -Dkernel_profile=trace -Doptimize=ReleaseFast \
-        -Droot-service=tests/perf/bin/root_service.elf -- -display none) \
-        > "$qemu_log" 2>&1 || true
-    if ! grep -q '^\[KPROF\] done' "$qemu_log"; then
-        echo "[FAIL] perf workload did not emit '[KPROF] done' within 120s"
-        tail -20 "$qemu_log"
-        rm -f "$qemu_log"
-        FAILURES+=("perf workload boot")
-        return 1
-    fi
-
-    local current="$perf_dir/_pending.json"
-    if ! python3 "$STYGIA_ROOT/tests/perf/scripts/parse_kprof.py" \
-        "$qemu_log" --json > "$current" 2>/dev/null; then
-        echo "[FAIL] parse_kprof.py failed"
-        rm -f "$qemu_log" "$current"
-        FAILURES+=("perf parse")
-        return 1
-    fi
-    rm -f "$qemu_log"
-
-    local parent_sha
-    parent_sha="$(cd "$STYGIA_ROOT" && git rev-parse HEAD 2>/dev/null)"
-    local parent_file="$perf_dir/${parent_sha}.json"
-    if [[ ! -f "$parent_file" ]]; then
-        echo "[BOOTSTRAP] no measurement for parent commit ${parent_sha:0:8}; storing current as new baseline"
-        return 0
-    fi
-
-    if ! python3 "$STYGIA_ROOT/tests/perf/scripts/compare_baseline.py" \
-        "$parent_file" "$current" --threshold 0.05; then
-        FAILURES+=("perf regression vs parent commit")
-        return 1
-    fi
-    echo "[PASS] no regression vs parent commit ${parent_sha:0:8}"
-}
 
 # ── Dispatch ──────────────────────────────────────────────────────────
 
@@ -1707,7 +1631,6 @@ run_stage aarch64_vm_tests_tcg
 run_stage aarch64_vm_nodev_pi_kvm
 run_stage linux_guest_x86_boot
 run_stage linux_guest_aarch64_boot
-run_stage perf_regression
 
 echo ""
 echo "=================================================="

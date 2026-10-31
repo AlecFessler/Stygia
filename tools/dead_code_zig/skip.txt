@@ -545,8 +545,6 @@ entity:sched/priority_queue.zig::sched.priority_queue.enqueueFront    sha256:cb0
 #   * arch/aarch64/vm_runloop.zig (SUBCODE_INITIAL_STATE, VREG79_CNTP_TVAL_EL0_OFF, WIDE_VREG_END_OFF)
 #     — vm_exit-state ABI markers (also referenced from kernel/arch/x64/vm_runloop.zig).
 #   * arch/x64/vm_runloop.zig (WIDE_VREG_END_OFF) — vm_exit-state ABI marker (sister to aarch64).
-#   * kprof/dump.zig (EndReason.oneshot) — third dump-trigger variant reserved for one-shot syscall path.
-#   * kprof/log.zig (epoch) — rolling-dump epoch counter reserved for future rolling-dump mode.
 #
 # Libz ABI-load-bearing entries (paths shown as `libz/...` though they live
 # above `kernel/`; analyzer's view prefixes "kernel/" cosmetically):
@@ -618,8 +616,6 @@ entity:arch/aarch64/vm.zig::arch.aarch64.vm.HypCallId.vtimer_load_guest    sha25
 entity:arch/aarch64/vm.zig::arch.aarch64.vm.HypCallId.vtimer_save_guest    sha256:a02165063cd71910b5ed7d4e62ce4a12aeb123cc8d98843d5d0d328a4f0683c3
 entity:arch/aarch64/vm.zig::arch.aarch64.vm.HCR_EL2_IMO    sha256:06700c51bb9b065f2b54e20a10499220be4116a9bc6468fae78fd76e3339e7e3
 entity:arch/aarch64/vm.zig::arch.aarch64.vm.HCR_EL2_VF    sha256:6b7be96edaacc7926c0ec3d10b729106e430560b9f2f73359c816673b59316fa
-entity:kprof/dump.zig::kprof.dump.EndReason.oneshot    sha256:3b5d2e68df5da1354faeebefcced6631c0d8b579019fd6e32fcd078c36de12cd
-entity:kprof/log.zig::kprof.log.epoch    sha256:b7bfc302ec546ae6970c43df89f045a77f6b68ac73e6d62991b0eda3a68bfcad
 entity:arch/aarch64/hv/psci.zig::arch.aarch64.hv.psci.ReturnCode.invalid_parameters    sha256:8681c4c473b2b7cca9505b776c5d926460588e63beffa1ae550e6e0b3a454784
 entity:arch/aarch64/hv/psci.zig::arch.aarch64.hv.psci.ReturnCode.denied    sha256:4a458ceb8ff470111cfb449aed7b1d7b2234ba229ae5e1dd8dfae8946f137dc3
 entity:arch/aarch64/hv/psci.zig::arch.aarch64.hv.psci.ReturnCode.already_on    sha256:07355c8a85f8cf90c1862203f63aedd39b887aead7a90a52ae350b006e901494

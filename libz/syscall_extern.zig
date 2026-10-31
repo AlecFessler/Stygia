@@ -112,7 +112,6 @@ pub const SyscallNum = enum(u12) {
     power_screen_off = 69,
     power_set_freq = 70,
     power_set_idle = 71,
-    kprof_dump = 72,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -764,12 +763,6 @@ pub fn powerSetFreq(core_id: u64, hz: u64) Regs {
 
 pub fn powerSetIdle(core_id: u64, policy: u64) Regs {
     return fromCRegs(ext.powerSetIdle(core_id, policy));
-}
-
-/// Drain the kernel kprof log to serial. Wrapped via `issueRegDiscard`
-/// so ReleaseSmall can't strip the call as dead.
-pub fn kprofDump() void {
-    issueRegDiscard(.kprof_dump, 0, .{});
 }
 
 // Compile-time guard against accidentally reordering the SyscallNum

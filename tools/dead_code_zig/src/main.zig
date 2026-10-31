@@ -44,7 +44,7 @@
 //!      `<file_path>` is the DB-canonical path (matches `file.path`,
 //!      e.g. `arch/x64/apic.zig` or `libz/caps.zig`). `<qualified_name>`
 //!      is the entity's `entity.qualified_name` column value (dotted
-//!      module path, e.g. `kprof.dump.EndReason.oneshot`). The hash is
+//!      module path, e.g. `sched.execution_context.State.dead`). The hash is
 //!      over the entity's normalized source span (see Normalization
 //!      below). Survives edits that shift the entity's line position;
 //!      invalidates only on rename or content-mutation.

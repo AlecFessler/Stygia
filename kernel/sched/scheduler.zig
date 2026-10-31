@@ -18,7 +18,6 @@ const spin_diag = stygia.utils.spin_diag;
 const ec_log = stygia.utils.ec_log;
 const memory_init = stygia.memory.init;
 const execution_context = stygia.sched.execution_context;
-const kprof = stygia.kprof.trace_id;
 const lifecycle = stygia.sched.lifecycle;
 const perfmon_mod = stygia.sched.perfmon;
 const port_mod = stygia.sched.port;
@@ -363,14 +362,8 @@ pub fn perCoreInit() void {
     // Per-core PMU enable. AMD PerfMonV2 (Zen 4+) requires writing
     // PerfCntrGlobalCtl on each core or every PMC stays gated even
     // with PerfEvtSel.EN set; on Intel and pre-PerfMonV2 AMD this is
-    // a no-op. Must precede kprofTraceCountersPerCoreInit so the trace
-    // counters tick on PerfMonV2 hardware.
+    // a no-op.
     arch.pmu.pmuPerCoreInit();
-    // Program kprof trace counters (PMC0/1/2 = cycles / cache misses /
-    // branch misses). No-op unless `-Dkernel_profile=trace`. Counters
-    // free-run; tracepoints snapshot them into each emitted record so
-    // the post-processor can compute per-scope deltas.
-    arch.pmu.kprofTraceCountersPerCoreInit();
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────
@@ -973,7 +966,6 @@ fn dispatchTailBody(core: u8, current: *ExecutionContext) noreturn {
     // target before it executes one user instruction, which violates the
     // observable-progress contract of yield(target).
     arch.time.getPreemptionTimer().armInterruptTimer(TIMESLICE_NS);
-    kprof.point(.dispatch, @intFromPtr(current));
     execution_context.recordSpawnTrace(current, null, .dispatch_tail, core);
     arch.cpu.loadEcContextAndReturn(current);
 }
@@ -1138,9 +1130,6 @@ pub fn yieldToPinned(target: *ExecutionContext) void {
 }
 
 fn yieldToTarget(initial_target: YieldTarget) void {
-    kprof.enter(.yield);
-    defer kprof.exit(.yield);
-
     var target = initial_target;
     const core: u8 = @truncate(arch.smp.coreID());
     const state = &core_states[core];

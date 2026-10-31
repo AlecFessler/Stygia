@@ -57,7 +57,6 @@
 const std = @import("std");
 const stygia = @import("stygia");
 
-const kprof = stygia.kprof.trace_id;
 const paging = stygia.memory.paging;
 const physmap = stygia.memory.address.AddrSpacePartition.physmap;
 const pmm = stygia.memory.pmm;
@@ -352,7 +351,6 @@ pub fn mapPage(
 ) !void {
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
-    kprof.point(.map_page, virt.addr);
 
     const pmm_mgr = &pmm.global_pmm.?;
 
@@ -604,7 +602,6 @@ pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
 ) ?PAddr {
-    kprof.point(.unmap_page, virt.addr);
 
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
@@ -892,7 +889,6 @@ fn dsbIsh() void {
 /// The full sequence for a PTE change is:
 ///   DSB ISHST -> TLBI VAE1IS -> DSB ISH -> ISB
 fn tlbiVae1is(vaddr: u64) void {
-    kprof.point(.tlb_shootdown, vaddr);
 
     // Operand: VA[55:12] in bits [43:0]; upper bits are ASID (VAE1)
     // or RES0/TTL. The previous encoding passed the raw `vaddr >> 12`,
@@ -940,7 +936,6 @@ pub fn mapPageSized(
         @panic("paging.mapPageSized: NULL guard");
     }
 
-    kprof.point(.map_page, virt.addr);
 
     const ap = permsToAp(perms, true);
     const xn = !perms.exec;

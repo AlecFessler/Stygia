@@ -50,14 +50,8 @@ const syscall = lib.syscall;
 // must not try to mapPf libz at LIBZ_SLIDE itself.
 pub const RUNNER_STATIC = true;
 
-// Spec §[port].recv [2] timeout_ns. 30 s is the trace-mode budget;
-// `-Dkernel_profile=trace` injects 2 log records + 3 PMU MSR reads
-// per scope at every IPC/page-fault/IRQ point, and the CR3-swap-heavy
-// timer batch otherwise pushes past the 10 s no-trace budget the
-// non-trace path already needed for timer_rearm_07's 100M+ pause-loop
-// iterations on healthy runs. Trace just adds a constant per-record
-// cost on top. Overhead-free when the batch finishes early; only
-// costs extra wall-clock on a genuine hang.
+// Spec §[port].recv [2] timeout_ns. Allow enough time for the
+// CR3-swap-heavy timer batch on healthy runs while still detecting hangs.
 const RECV_TIMEOUT_NS: u64 = 30_000_000_000;
 
 // stygia-ojs post-timeout probe budget. On a batch recv timeout the
@@ -488,13 +482,6 @@ pub fn main(cap_table_base: u64) void {
         serial.printU64(agg_miss);
         serial.print(" miss ===\n");
     }
-
-    // Drain the kernel kprof log to serial after every test has
-    // reported but before tearing down child CDs in shutdown. Children
-    // intentionally do NOT call kprofDump from their start.zig — the
-    // first child to do so would win the dumpOnce cmpxchg and emit a
-    // partial log mid-run. Single-shot here captures the whole run.
-    syscall.kprofDump();
 
     // Stop the system. Both of these require the `power` cap on the
     // self-handle, which the primary holds by construction.

@@ -314,29 +314,6 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, mask);
 }
 
-/// Mirror of the AMD hook. Returns false because Intel sample-mode
-/// wiring isn't done yet; the NMI handler will fall through to its
-/// existing (panic) policy, which is the right thing under Intel
-/// until this is implemented.
-pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
-    _ = period_cycles;
-    return false;
-}
-
-/// Intel trace-counter stub. Wire IA32_PERFEVTSELx programming here
-/// when an Intel test rig exists. Currently the host test machine is
-/// AMD, so this is intentionally unimplemented.
-pub fn kprofTraceCountersPerCoreInit() void {}
-
-/// Intel trace-counter read stub. Zeros the output so trace records
-/// built on Intel at least produce well-defined numbers instead of
-/// garbage until the real backend lands.
-pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
-    out[0] = 0;
-    out[1] = 0;
-    out[2] = 0;
-}
-
 /// PMU overflow handler. Registered on the LAPIC PerfMon vector via
 /// `interrupts.registerVector(PMI_VECTOR, ..., .external)`, so
 /// `dispatchInterrupt` issues `apic.endOfInterrupt()` after normal returns.

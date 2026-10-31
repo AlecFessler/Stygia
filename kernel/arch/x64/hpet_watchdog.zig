@@ -261,7 +261,7 @@ pub fn init() void {
 /// True when the HPET-NMI watchdog has been programmed. The NMI
 /// handler reads this to decide whether to consume the NMI as a
 /// watchdog tick (call hang_detector.tickCheck and return) or to
-/// fall through to its previous behaviour (kprof_sample / panic).
+/// fall through to its previous behaviour (panic).
 pub fn isArmed() bool {
     if (!enabled) return false;
     return armed.load(.acquire);

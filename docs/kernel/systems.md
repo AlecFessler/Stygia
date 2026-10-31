@@ -1950,14 +1950,14 @@ X = terminate (C-1). Every remaining cross-EC operation in §8.1 —
 explicitly rather than assumed, and each of those answers should be
 marked DERIVED or RECALLED when written.
 Ack-while-spinning applies to all rows. **Diagnostics-and-terminal
-carve-out**: `kprof_dump.parkForDump`, the panic path, and
+carve-out**: the panic path and
 **`power_shutdown` / `power_reboot`** (→ `cpu.powerAction`,
 `kernel/syscall/system.zig`) deliberately stop cores and sit outside the
 machine's liveness obligations; they are not T3 rows and MUST NOT be
 reachable from any non-diagnostic, non-terminal path
 (analyzer-checkable). Round 7 minor: the `power_*` family was missing
 from this list, which mattered because it is a *syscall* — reachable
-from user code by capability, unlike the other two — so an analyzer
+from user code by capability, unlike the panic path — so an analyzer
 closing 9.3(6b) over the syscall surface would have flagged it as an
 unexplained core-stopping path.
 
@@ -4989,7 +4989,7 @@ this revision.
   — no user-memory access inside container/gen-lock holds, the boundary
   condition for W1 (§3.3, §3.6 rule (a), 9.3(2)); finalize's context and
   IRQ-safety obligations stated (§8.2, §9.2); diagnostics carve-out for
-  `kprof_dump.parkForDump`/panic (§3.6); the `futex_wake` syscall added
+  panic (§3.6); the `futex_wake` syscall added
   to edge 5a's sources; `suspend` against a `parking`/`pended` target
   specified as an L1-bounded transient (§8.3, §11.4).
 - Upheld in round 4 and untouched: T1 (all five rows verified against
