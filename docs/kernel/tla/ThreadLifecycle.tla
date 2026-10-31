@@ -75,6 +75,8 @@ CONSTANTS
                 \*          (Sec 3.2, F2 state-machine half)
   WAKE_IPI,     \* BOOLEAN: G14 locked enqueue sends a wake to a parked core.
                 \* FALSE is the missing-wake falsifier.
+  G16_ON,       \* BOOLEAN: model self-delete's scheduler-stack handoff.
+  G16_DROP_REF, \* BOOLEAN: falsifier: consumer loses the process ref.
   DROP_BUDGET,  \* Nat: stale/bad-port owner failure events (DirDrop is the
                 \* only unbounded generator in the directive machine --
                 \* arm/fail/ack/arm cycles freely -- and at 3 Threads that
@@ -203,6 +205,8 @@ ASSUME DIR_GENCHK \in BOOLEAN
 ASSUME SUSPEND_ON \in BOOLEAN
 ASSUME REQUEUE_ON \in BOOLEAN
 ASSUME WAKE_IPI \in BOOLEAN
+ASSUME G16_ON \in BOOLEAN
+ASSUME G16_DROP_REF \in BOOLEAN
 
 (***************************************************************************)
 (* State                                                                   *)
@@ -274,6 +278,10 @@ ASSUME WAKE_IPI \in BOOLEAN
 (*           parked - §3.4 idle_parked: empty-queue park decision under the  *)
 (*                    queue lock; dispatch waits for a wake IPI.             *)
 (*           wake - an enqueue committed a wake IPI for a parked core.       *)
+(*           pending - TeardownRequest staged before self-retire; carries    *)
+(*                     process id, generation, and producing thread.         *)
+(*           active - the same reference after park-stack consumption and    *)
+(*                    until phase 2 finishes.                                *)
 (*           irq  - nested interrupt frame: NULL or                       *)
 (*                  [op|->"wake", tgt|->e, ph|->"place"|"pend"|"relwait"] *)
 (*                  While irq[c] # NULL the base continuation of c CANNOT *)
@@ -325,11 +333,12 @@ VARIABLES
   cores,  \* per-core record; pc gains "rvdeliver" (rendezvous delivery
           \* window, a pre-hop park-sequence phase holding a claim) and
           \* "s7ret" (S7 retire-as-holder, after the queue lock drops)
+  processes, \* G16 process phase/generation/consume count
   tb,     \* remaining retire budget (environment retire + terminate)
   cb,     \* remaining edge-1 creation budget
   db,     \* remaining process-death events (S7 surface)
   pb      \* remaining stale-port drop events (round-12)
-vars == <<threads, cores, tb, cb, db, pb>>
+vars == <<threads, cores, processes, tb, cb, db, pb>>
 
 States   == {"ready","running","parking","waiting","claimed","pended",
              "retired","finalizing","freed"}
@@ -338,6 +347,9 @@ Holders  == {NULL} \cup [ty: {"thread"},  id: Threads]
                    \cup [ty: {"cpu"}, cid: Cores]   \* S7 retire-as-holder
 IrqFrames == {NULL} \cup [op: {"wake"}, tgt: Threads,
                           ph: {"place","pend","relwait"}]
+TeardownRefs == {NULL} \cup [proc: Threads, gen: 0..1,
+                            owner: Threads,
+                            kind: {"self_delete","unhandled_fault"}]
 \* thread saved-continuation values:
 \*   user   - at/returning to the user boundary
 \*   wakeC  - holds a 5a/edge-6 claim, placement pending
@@ -349,7 +361,7 @@ IrqFrames == {NULL} \cup [op: {"wake"}, tgt: Threads,
 \*   dirW   - suspender in the terminal re-check/disarm loop (W5)
 \*   termW  - terminator in the eviction + deferred-marking wait (W3/W4)
 ThreadPCs == {"user","wakeC","suspC","pendC","rvC","relwait",
-          "dirM","dirC","dirW","termR","termW"}
+          "dirM","dirC","dirW","termR","termW","teardown"}
 ClaimPCs == {"wakeC","suspC","pendC","rvC","relwait"}
 \*   dirM - CYCLE_REJECT = "self" only: the suspender has marked its OWN
 \*          directive word "suspending" (CAS 1) and has not yet claimed
@@ -414,15 +426,19 @@ TypeOK ==
                                      \* otherwise is retracted)
                       dfs: BOOLEAN,  \* GHOST: returned SUCCESS falsely
                       dsrc: Threads \cup {NULL},
+                      proc: Threads,
                       dd: BOOLEAN]]
   /\ cores \in [Cores -> [q: SUBSET Threads,
                           cur: Threads \cup {NULL},
                           parked: BOOLEAN, wake: BOOLEAN,
+                          pending: TeardownRefs, active: TeardownRefs,
                           pc: {"idle","dispatchLoad",
                                "ecrun","hopRel","hopCommit",
                                "rvdeliver","s7ret","stealCommit"},
                           outg: Threads \cup {NULL},
                           irq: IrqFrames]]
+  /\ processes \in [Threads -> [phase: {"live","queued","dead","done"},
+                               gen: 0..1, consumes: 0..1]]
   /\ tb \in 0..TERM_BUDGET
   /\ cb \in 0..CR_BUDGET
   /\ db \in 0..1
@@ -438,11 +454,13 @@ ThreadCtx(c) == /\ cores[c].pc = "ecrun"
 (* Init: every thread starts `ready` in some core's run queue.                 *)
 (***************************************************************************)
 Init ==
-  /\ \E f \in [Threads -> Cores]:
+  /\ \E f \in [Threads -> Cores], p \in [Threads -> Threads]:
+       /\ (~G16_ON => p = [e \in Threads |-> e])
        /\ cores = [c \in Cores |->
                     [q |-> {e \in Threads : f[e] = c},
                      cur |-> NULL, pc |-> "idle", outg |-> NULL, irq |-> NULL,
-                     parked |-> FALSE, wake |-> FALSE]]
+                     parked |-> FALSE, wake |-> FALSE,
+                     pending |-> NULL, active |-> NULL]]
        /\ threads = [e \in Threads |->
                   [st |-> "ready", pk |-> "none",
                    shot |-> "none", own |-> NULL, pin |-> 0, pd |-> FALSE,
@@ -454,7 +472,9 @@ Init ==
                    dres |-> "none", dpin |-> FALSE,
                    dbad |-> FALSE, gen |-> 0, dgen |-> 0,
                    dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
-                   dsrc |-> NULL, dd |-> FALSE]]
+                   dsrc |-> NULL, proc |-> p[e], dd |-> FALSE]]
+       /\ processes = [q \in Threads |->
+                         [phase |-> "live", gen |-> 0, consumes |-> 0]]
   /\ tb = TERM_BUDGET
   /\ cb = CR_BUDGET
   /\ db = IF S7_ON THEN 1 ELSE 0
@@ -468,14 +488,15 @@ Init ==
 ParkDecision(c) ==
   /\ cores[c].pc = "idle" /\ cores[c].cur = NULL
   /\ cores[c].irq = NULL /\ cores[c].q = {}
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ ~cores[c].parked
   /\ cores' = [cores EXCEPT ![c].parked = TRUE]
-  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, threads, tb, cb, db, pb>>
 
 WakeIpi(c) ==
   /\ cores[c].parked /\ cores[c].wake
   /\ cores' = [cores EXCEPT ![c].parked = FALSE, ![c].wake = FALSE]
-  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, threads, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Edge 2: dispatch. One core_locks[c] critical section (Sec 3.2). The S7  *)
@@ -485,13 +506,14 @@ WakeIpi(c) ==
 (***************************************************************************)
 DispatchThread(c, e) ==
   /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ ~threads[e].dd                                    \* S7 filter passes
   /\ c \in threads[e].am
   /\ cores' = [cores EXCEPT ![c].q = @ \ {e}, ![c].cur = e,
                             ![c].pc = "dispatchLoad"]
   /\ threads' = [threads EXCEPT ![e].st = "running", ![e].own = c, ![e].ks = c]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 DispatchAbort(c) ==
   LET e == cores[c].cur IN
@@ -507,7 +529,7 @@ DispatchAbort(c) ==
                              ![e].dsrc = NULL, ![e].pc = "user",
                              ![e].tg = NULL]
             ELSE [threads EXCEPT ![e].ks = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 DispatchLoad(c) ==
   LET e == cores[c].cur IN
@@ -516,7 +538,7 @@ DispatchLoad(c) ==
   /\ cores' = [cores EXCEPT ![c].pc = "ecrun"]
   /\ threads' = [threads EXCEPT ![e].vm =
                         IF e \in VCPU_THREADS THEN "guest" ELSE "host"]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Sec 3.2 / S7 / edge 5c (F2): a popped gen-dead-process thread is CLAIMED     *)
 (* under the queue lock the dispatcher already holds (R-claim-legal),      *)
@@ -528,6 +550,7 @@ DispatchLoad(c) ==
 S7Claim(c, e) ==
   /\ S7_ON
   /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ c \in threads[e].am
   /\ threads[e].dd                                     \* S7 filter fails
@@ -535,7 +558,7 @@ S7Claim(c, e) ==
                             ![c].outg = e]
   /\ threads' = [threads EXCEPT ![e].st = "claimed",
                         ![e].hld = [ty |-> "cpu", cid |-> c]]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Pull-side work stealing: after c drains deferred requeues and finds its *)
 (* local queue empty, it drops c's run-queue lock with IRQs still masked,  *)
@@ -546,6 +569,7 @@ S7Claim(c, e) ==
 StealClaim(c, v, e) ==
   /\ c # v
   /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ cores[c].q = {}
   /\ e \in cores[v].q                              \* ready-in-victim-queue
   /\ threads[e].st = "ready" /\ threads[e].own = NULL
@@ -556,7 +580,7 @@ StealClaim(c, v, e) ==
   /\ threads' = [threads EXCEPT ![e].st = "claimed",
                         ![e].hld = [ty |-> "cpu", cid |-> c],
                         ![e].pin = @ + 1]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Reacquired thief lock, no local work arrived: claimed -> ready ->       *)
 (* running dispatch commit. The intermediate ready state is compressed but *)
@@ -576,7 +600,7 @@ StealDispatch(c) ==
   /\ threads' = [threads EXCEPT ![e].st = "running", ![e].own = c,
                         ![e].ks = c, ![e].hld = NULL,
                         ![e].pin = @ - 1]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Reacquired thief lock, local ready work arrived while c's lock was      *)
 (* dropped: local work wins. The stolen claim is abandoned with no core    *)
@@ -594,7 +618,7 @@ StealAbandon(c) ==
                                  ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
        /\ threads' = [threads EXCEPT ![e].st = "ready", ![e].own = NULL,
                              ![e].hld = NULL, ![e].pin = @ - 1]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* ProcessDie can run while the thief has dropped and re-acquired locks around *)
 (* stealCommit. Implementation rechecks canPublishReady before dispatch and*)
@@ -616,7 +640,7 @@ StealDropDead(c) ==
                         ![e].dlv = FALSE, ![e].dsrc = NULL,
                         ![e].own = NULL, ![e].pc = "user",
                         ![e].tg = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* The dispatcher, as holder, retires + finalizes the quiescent thread (T2     *)
 (* `claimed` row, holder discharge; marking deferred-to-holder = done      *)
@@ -631,7 +655,7 @@ S7Retire(c) ==
                         ![e].own = NULL,
                         ![e].pc = "user", ![e].tg = NULL]
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Environment: a process dies (teardown phase 1 dead-mark, abstracted).    *)
 ProcessDie ==
@@ -639,7 +663,7 @@ ProcessDie ==
   /\ \E e \in Threads:
        /\ threads[e].st \notin {"retired","freed"}
        /\ threads' = [threads EXCEPT ![e].dd = TRUE]
-  /\ UNCHANGED <<cores, tb, cb, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, pb>>
 
 (***************************************************************************)
 (* Edge 3 (wait): the park sequence, steps 1-2 (Sec 3.2). Staging plus     *)
@@ -672,7 +696,7 @@ UserPark(c) ==
                           ![e].pk = "wait", ![e].lnk = TRUE,
                           ![e].shot = sh, ![e].vm = "host"]
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 VcpuGuestExit(c) ==
   LET e == cores[c].cur IN
@@ -684,7 +708,7 @@ VcpuGuestExit(c) ==
   /\ threads' = [threads EXCEPT ![e].st = "parking", ![e].pk = "wait",
                         ![e].lnk = TRUE, ![e].vm = "host"]
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Sec 3.2 step 3 (bounded post-publish pre-hop window) is zero-length     *)
 (* for plain parks in this model (rev-6 simplification: a dedicated       *)
@@ -701,7 +725,7 @@ HopRelease(c) ==
   /\ cores[c].pc = "hopRel" /\ cores[c].irq = NULL
   /\ cores' = [cores EXCEPT ![c].cur = NULL, ![c].pc = "hopCommit"]
   /\ threads' = [threads EXCEPT ![e].ks = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Hop step 2, commit arm: parking(wait) -> waiting (edge 4).              *)
 HopCommitWait(c) ==
@@ -711,7 +735,7 @@ HopCommitWait(c) ==
   /\ threads' = [threads EXCEPT ![e].st = "waiting", ![e].pk = "none",
                         ![e].own = NULL]           \* owner poisoned
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Hop step 2, requeue arm: parking(requeue) -> ready (edge 8), placement  *)
 (* CAS under THE DESTINATION queue lock. Edge 3 lists both preempt (same   *)
@@ -728,7 +752,7 @@ HopCommitRequeue(c) ==
                              ![e].own = NULL]
        /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL,
                                  ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Hop step 2, pended arm (rev 5, edge 6p): wait payload_done (spin W2,    *)
 (* scheduler context), then place. Owner core is holder-of-record.         *)
@@ -750,7 +774,7 @@ HopCommitPended(c) ==
   /\ \E d \in Cores:
        cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL,
                               ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Hop step 2, retired arm (rev 5, Sec 4): deferred marking + finalize     *)
 (* WITH NO WAIT. A retire whose observed from-state was `pended`           *)
@@ -795,7 +819,7 @@ HopCommitRetired(c) ==
                                          THEN "none" ELSE @]
      ELSE threads' = threads        \* rev 3: release-wait holder owns finalize
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Hop step 2, failed-CAS `claimed` arm: reachable only in rev 3 (a        *)
 (* release-wait claimant owns placement; the owner just releases and       *)
@@ -811,7 +835,7 @@ HopCommitClaimed(c) ==
   /\ cores[c].pc = "hopCommit" /\ cores[c].irq = NULL
   /\ threads[e].st \in {"claimed","ready","running","freed"}
   /\ cores' = [cores EXCEPT ![c].pc = "idle", ![c].outg = NULL]
-  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, threads, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Preemption (Sec 3.1 rule 1): the tick's requeue preempt. Claim-gated    *)
@@ -822,6 +846,7 @@ HopCommitClaimed(c) ==
 TickPreempt(c) ==
   LET e == cores[c].cur IN
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ e # NULL
+  /\ threads[e].pc # "teardown"  \* G16: syscall/fault entry stays IRQ-masked
   /\ threads[e].st = "running"
   /\ threads[e].vm = "host"
   /\ PIN_GATE => threads[e].pin = 0
@@ -851,7 +876,7 @@ TickPreempt(c) ==
      ELSE /\ threads' = [threads EXCEPT ![e].st = "parking", ![e].pk = "requeue",
                                 ![e].vm = "host"]
           /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Sec 3.1 rule 3: user-boundary entry check discovers `retired` and       *)
 (* walks the frame to its hop, whose retired arm finalizes.                *)
@@ -861,7 +886,7 @@ BoundaryRetired(c) ==
   /\ threads[e].vm = "host"
   /\ threads[e].pin = 0    \* own pins/pin-class locks discharged pre-hop (2.4)
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-  /\ UNCHANGED <<threads, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, threads, tb, cb, db, pb>>
 
 (* Arch vCPU cancellation acknowledgement (stygia-8xl). A remotely retired
  * vCPU can be stuck below the generic scheduler boundary while the owner
@@ -877,7 +902,7 @@ VcpuCancelExit(c) ==
   /\ threads[e].st = "retired"
   /\ threads[e].vm = "cancel"
   /\ threads' = [threads EXCEPT ![e].vm = "host"]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* The wake body, syscall context (futex wake / reply / recv-side): claim  *)
@@ -922,7 +947,7 @@ WakeStart(c) ==
                                ![t].pin = @ + 1, ![t].lnk = FALSE,
                                ![w].pc = "relwait",
                                ![w].tg = t]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Edge 6: claimed -> ready, holder places under the destination lock.     *)
 (* Rev 8 (M-2): the destination is computed here from the fresh            *)
@@ -937,7 +962,7 @@ WakePlace(c) ==
                         ![t].pin = @ - 1,
                         ![w].pc = "user", ![w].tg = NULL]
   /\ \E d \in Cores: cores' = [cores EXCEPT ![d].q = @ \cup {t}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Rev-5 5b claimant completion: payload + payload_done release-store,     *)
 (* then DONE (no wait, no placement, Sec 3.2). The claimant reads no       *)
@@ -951,7 +976,7 @@ WakePendDone(c) ==
   /\ threads' = [threads EXCEPT ![t].pd = TRUE, ![t].hld = NULL,
                         ![t].pin = @ - 1,
                         ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Holder's placement CAS fails (`retired`): deferred marking + finalize   *)
 (* (retire matrix `claimed` row).                                          *)
@@ -966,7 +991,7 @@ WakeTgtRetired(c) ==
                         ![t].pin = @ - 1,
                         ![t].shot = "none", ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                         ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Rev 3 only: thread-context release-wait -- the claimant of a parking-origin *)
 (* claim spins until the owner's hop releases the kstack, then places.     *)
@@ -990,7 +1015,7 @@ RelwaitPlace(c) ==
                                 ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                                 ![w].pc = "user", ![w].tg = NULL]
           /\ cores' = cores
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Cross-thread suspend of a ready target: edge 5c (ready -> claimed under the *)
@@ -1011,7 +1036,7 @@ SuspendStart(c) ==
                                   ![t].hld = [ty |-> "thread", id |-> w],
                                   ![t].pin = @ + 1, ![w].pc = "suspC",
                                   ![w].tg = t]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 SuspendPlace(c) ==
   LET w == cores[c].cur
@@ -1022,7 +1047,7 @@ SuspendPlace(c) ==
   /\ threads' = [threads EXCEPT ![t].st = "waiting",
                         ![t].hld = NULL, ![t].pin = @ - 1, ![t].lnk = TRUE,
                         ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 SuspendTgtRetired(c) ==
   LET w == cores[c].cur
@@ -1034,7 +1059,7 @@ SuspendTgtRetired(c) ==
                         ![t].hld = NULL, ![t].pin = @ - 1,
                         ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL,
                         ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* The rendezvous window (Sec 8.3, publish-first): stage payload, publish  *)
@@ -1074,7 +1099,7 @@ RvStart(c) ==
               ![r].hld = [ty |-> "thread", id |-> s],
               ![r].pin = @ + 1, ![r].shot = "none", ![r].lnk = FALSE]
   /\ cores' = [cores EXCEPT ![c].pc = "rvdeliver", ![c].outg = s]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* The delivery in the bounded pre-hop window. Runs regardless of the      *)
 (* sender's own state; the receiver pin prevents target retirement until   *)
@@ -1118,7 +1143,7 @@ RvDeliver(c) ==
              ![r].dir = "dead", ![r].dres = "none", ![r].dpin = FALSE, ![r].dlv = FALSE, ![r].dsrc = NULL,
              ![s].pc = "user", ![s].tg = NULL]
         /\ cores' = [cores EXCEPT ![c].pc = "hopRel"]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* The suspend directive (Sec 2.5): none -> claiming -> armed -> none |    *)
@@ -1162,7 +1187,7 @@ DirSelfMark(c) ==
        /\ threads[t].st = "running"
        /\ threads' = [threads EXCEPT ![u].dir = "suspending", ![u].pc = "dirM",
                              ![u].tg = t]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* CAS 2 failed (the target was not claimable -- it is itself suspending,  *)
 (* or already claimed, or left `running`): return E_BUSY and release the   *)
@@ -1172,7 +1197,7 @@ DirSelfAbort(c) ==
   /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL /\ u # NULL
   /\ threads[u].pc = "dirM" /\ threads[u].st \in {"running","retired"}
   /\ threads' = [threads EXCEPT ![u].dir = "none", ![u].pc = "user"]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 DirClaim(c) ==
   LET u == cores[c].cur IN
@@ -1217,7 +1242,7 @@ DirClaim(c) ==
           (* acquires its reference to the target -- not at DirArm. Taken  *)
           (* at the arm it is sampled AFTER any recycle, so a slot that    *)
           (* was freed and reused between claim and arm reads as fresh.    *)
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Write directive_port; then CAS `claiming -> armed`; wake IPI            *)
 (* (abstracted). Rev 6 (G-D1 closed): a CAS, not a store -- a finalize     *)
@@ -1247,7 +1272,7 @@ DirArm(c) ==
                              ![t].dpin = FALSE,
                              ![u].dir = IF CYCLE_REJECT = "self"
                                         THEN "none" ELSE @]     \* E_TERM
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* The terminal re-check/disarm loop (round-4 F5 form). Steps exist only   *)
 (* when the loop can decide; the pure spin (target running, still armed)   *)
@@ -1323,7 +1348,7 @@ DirLoop(c) ==
                               ![u].pc = "user", ![u].tg = NULL,
                               ![u].dir = IF CYCLE_REJECT = "self"
                                          THEN "none" ELSE @]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Owner-side stale/bad-port consume failure. This keeps the historical    *)
 (* DirDrop name and DROP_BUDGET switch because the configs use them, but   *)
@@ -1340,7 +1365,7 @@ DirDrop(c) ==
   /\ threads[e].pin = 0
   /\ threads' = [threads EXCEPT ![e].pok = FALSE,     \* the port went stale
                         ![e].dres = "fail", ![e].dir = "failed"]
-  /\ UNCHANGED <<cores, tb, cb, db>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db>>
 
 (* Other owner-side consume failure with a live target/port. Same result   *)
 (* publication/ack protocol as DirDrop; separate so stale-port failures    *)
@@ -1354,7 +1379,7 @@ DirFail(c) ==
   /\ threads[e].pok
   /\ threads[e].shot = "none" /\ threads[e].pin = 0
   /\ threads' = [threads EXCEPT ![e].dres = "fail", ![e].dir = "failed"]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* Owner-side consumption at a user-boundary entry check (Sec 3.1 rule 3): *)
 (* gen-validate the port (abstracted), standard edge-3 park into it.       *)
@@ -1377,7 +1402,7 @@ DirConsume(c) ==
                              ![e].lnk = TRUE, ![e].vm = "host",
                              ![e].dir = "none"]
   /\ cores' = [cores EXCEPT ![c].pc = "hopRel", ![c].outg = e]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* T1: interrupt-context wake sources. One generic one-shot source stands  *)
@@ -1431,7 +1456,7 @@ FireAt(c, e) ==
                               ![e].pin = @ + 1, ![e].lnk = FALSE]
         /\ cores' = [cores EXCEPT ![c].irq =
                       [op |-> "wake", tgt |-> e, ph |-> "relwait"]]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Interrupt frame body: inline placement (5a discharge).                  *)
 IrqWakePlace(c) ==
@@ -1449,7 +1474,7 @@ IrqWakePlace(c) ==
                                 ![t].shot = "none",
                                 ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Interrupt frame body: rev-5 5b claimant completion, then RETURN.        *)
 IrqPendDone(c) ==
@@ -1459,7 +1484,7 @@ IrqPendDone(c) ==
   /\ threads' = [threads EXCEPT ![t].pd = TRUE, ![t].hld = NULL,
                         ![t].pin = @ - 1]
   /\ cores' = [cores EXCEPT ![c].irq = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Rev 3 only: the interrupt-context release-wait. The frame spins on the  *)
 (* target's kstack release; the interrupted continuation beneath it (which *)
@@ -1483,7 +1508,7 @@ IrqRelwait(c) ==
                                 ![t].shot = "none",
                                 ![t].dir = "dead", ![t].dres = "none", ![t].dpin = FALSE, ![t].dlv = FALSE, ![t].dsrc = NULL]
           /\ cores' = [cores EXCEPT ![c].irq = NULL]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Edge 9 + Sec 5.2 retire matrix + Sec 8.2 step 1. Shared row operators:  *)
@@ -1557,10 +1582,80 @@ RetireCoresAfter(e) ==
 (* Environment retirer (scheduler-context teardown walks etc.).            *)
 RetireThread(e) ==
   /\ tb > 0
-  /\ tb' = tb - 1 /\ UNCHANGED <<cb, db, pb>>
+  /\ tb' = tb - 1 /\ UNCHANGED <<processes, cb, db, pb>>
   /\ RetireEnabled(e)
   /\ threads' = RetireThreadsAfter(e)
   /\ cores' = RetireCoresAfter(e)
+
+(* G16: the same lifecycle machine now represents self-delete's process
+   reference crossing the thread-stack to park-stack boundary. A request
+   is produced before the caller self-retires. The consumer can begin only
+   after the caller has left `current` and clears `pending` as it takes
+   ownership in `active`; that reference stays through phase 2. Process
+   IDs are abstract slab identities and `gen` prevents an ABA handoff. *)
+QueueTeardown(c) ==
+  LET w == cores[c].cur
+      p == threads[w].proc IN
+  /\ G16_ON /\ ThreadCtx(c)
+  /\ threads[w].pc = "user" /\ threads[w].st = "running"
+  /\ processes[p].phase = "live"
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
+  /\ \E kind \in {"self_delete","unhandled_fault"}:
+       cores' = [cores EXCEPT ![c].pending =
+                  [proc |-> p, gen |-> processes[p].gen,
+                   owner |-> w, kind |-> kind]]
+  /\ threads' = [threads EXCEPT ![w].pc = "teardown"]
+  /\ processes' = [processes EXCEPT ![p].phase = "queued"]
+  /\ UNCHANGED <<tb, cb, db, pb>>
+
+SelfRetireForTeardown(c) ==
+  LET w == cores[c].cur IN
+  /\ G16_ON /\ cores[c].pc = "ecrun" /\ cores[c].irq = NULL
+  /\ w # NULL /\ threads[w].pc = "teardown"
+  /\ cores[c].pending # NULL /\ cores[c].pending.owner = w
+  /\ RetireEnabled(w)
+  /\ threads' = [RetireThreadsAfter(w) EXCEPT ![w].pc = "user"]
+  /\ cores' = RetireCoresAfter(w)
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
+
+ConsumeTeardown(c) ==
+  LET req == cores[c].pending
+      p == req.proc IN
+  /\ G16_ON /\ req # NULL /\ cores[c].active = NULL
+  /\ cores[c].pc = "idle" /\ cores[c].cur = NULL
+  /\ threads[req.owner].proc = p
+  /\ threads[req.owner].st \in {"retired","finalizing","freed"}
+  /\ threads[req.owner].ks = NULL
+  /\ processes[p].phase = "queued"
+  /\ processes[p].gen = req.gen /\ processes[p].consumes = 0
+  /\ cores' = [cores EXCEPT ![c].pending = NULL,
+                            ![c].active = IF G16_DROP_REF THEN NULL ELSE req]
+  /\ processes' = [processes EXCEPT ![p].phase = "dead",
+                                   ![p].consumes = 1]
+  /\ threads' = [e \in Threads |->
+                   IF threads[e].proc = p
+                   THEN [threads[e] EXCEPT !.dd = TRUE]
+                   ELSE threads[e]]
+  /\ UNCHANGED <<tb, cb, db, pb>>
+
+TeardownRetire(c, e) ==
+  LET req == cores[c].active IN
+  /\ G16_ON /\ req # NULL /\ processes[req.proc].phase = "dead"
+  /\ threads[e].proc = req.proc /\ RetireEnabled(e)
+  /\ threads' = RetireThreadsAfter(e)
+  /\ cores' = RetireCoresAfter(e)
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
+
+FinishTeardown(c) ==
+  LET req == cores[c].active
+      p == req.proc IN
+  /\ G16_ON /\ req # NULL
+  /\ processes[p].phase = "dead" /\ processes[p].gen = req.gen
+  /\ \A e \in Threads: threads[e].proc = p => threads[e].st = "freed"
+  /\ cores' = [cores EXCEPT ![c].active = NULL]
+  /\ processes' = [processes EXCEPT ![p].phase = "done",
+                                   ![p].gen = (@ + 1) % 2]
+  /\ UNCHANGED <<threads, tb, cb, db, pb>>
 
 (* REVISION-5 LITERAL ONLY (~FIN_UNWIND): retire's step-3 container        *)
 (* unwind as a separate retirer continuation after its CAS, running        *)
@@ -1574,7 +1669,7 @@ RetireUnwind(e) ==
   /\ threads[e].st \in {"retired","freed"}
   /\ threads[e].lnk \/ threads[e].shot = "armed"
   /\ threads' = [threads EXCEPT ![e].lnk = FALSE, ![e].shot = "none"]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* G11: finalize publishes a terminal directive marker before the slab
    release body clears the slot to all zeroes. Keep that intermediate value
@@ -1584,7 +1679,7 @@ ClearFreedDirective(e) ==
   /\ threads[e].st = "finalizing" /\ threads[e].dir = "dead"
   /\ threads' = [threads EXCEPT ![e].st = "freed", ![e].dir = "none",
                         ![e].gen = (@ + 1) % 8]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* thread-context terminate (L5), SPLIT in revision 9 (round-8 C-1).        *)
 (*                                                                        *)
@@ -1607,7 +1702,7 @@ ClearFreedDirective(e) ==
 (* deadlock -- the falsifier.                                             *)
 TermStart(c) ==
   LET w == cores[c].cur IN
-  /\ tb > 0 /\ tb' = tb - 1 /\ UNCHANGED <<cb, db, pb>>
+  /\ tb > 0 /\ tb' = tb - 1 /\ UNCHANGED <<processes, cb, db, pb>>
   /\ ThreadCtx(c) /\ threads[w].pc = "user" /\ threads[w].st = "running"
   /\ threads[w].dir # "armed"      \* rule-3 entry check intercepts (N5)
   /\ threads[w].pin = 0            \* W3/W4 waiter context: no claims, no locks
@@ -1625,7 +1720,7 @@ TermRetire(c) ==
   /\ RetireEnabled(t)          \* includes the W7 pd pre-wait for `pended`
   /\ threads' = [RetireThreadsAfter(t) EXCEPT ![w].pc = "termW"]
   /\ cores' = RetireCoresAfter(t)
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Target already gone (freed, or otherwise not retirable): specv3       *)
 (* Sec [terminate] -- a stale handle returns E_TERM. Without this arm a  *)
@@ -1638,7 +1733,7 @@ TermStale(c) ==
   /\ threads[w].pc = "termR" /\ threads[w].st \in {"running","retired"}
   /\ ~RetireEnabled(t)
   /\ threads' = [threads EXCEPT ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* W3 (target evicted from its core's `current`) + W4 (deferred marking  *)
 (* discharged), with TWO carve-outs:                                      *)
@@ -1669,7 +1764,7 @@ TermWait(c) ==
            \* acquire-load of `mark_state` (Sec 2.4, M-3); the discharger's
            \* owed -> done is the paired release-store.
   /\ threads' = [threads EXCEPT ![w].pc = "user", ![w].tg = NULL]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Pin-class lock holds (Sec 2.4, round-4 F3): a lock class with a         *)
@@ -1709,7 +1804,7 @@ PinAcq(c) ==
   /\ IF PIN_BUMP_FIRST
      THEN threads' = [threads EXCEPT ![e].plk = "held", ![e].pin = @ + 1]
      ELSE threads' = [threads EXCEPT ![e].plk = "preB"]   \* lock(), bump pending
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* ~PIN_BUMP_FIRST only: the deferred `pin_depth += 1` after the acquire.  *)
 PinBump(c) ==
@@ -1719,7 +1814,7 @@ PinBump(c) ==
   /\ threads[e].pc = "user" /\ threads[e].st \in {"running","retired"}
   /\ threads[e].plk = "preB"
   /\ threads' = [threads EXCEPT ![e].plk = "held", ![e].pin = @ + 1]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 PinRel(c) ==
   LET e == cores[c].cur IN
@@ -1729,7 +1824,7 @@ PinRel(c) ==
   /\ IF PIN_BUMP_FIRST
      THEN threads' = [threads EXCEPT ![e].plk = "none", ![e].pin = @ - 1]
      ELSE threads' = [threads EXCEPT ![e].plk = "postD", ![e].pin = @ - 1]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (* ~PIN_BUMP_FIRST only: the release that follows the decrement -- C1's    *)
 (* mirror window on the way out.                                           *)
@@ -1740,7 +1835,7 @@ PinUnlock(c) ==
   /\ threads[e].pc = "user" /\ threads[e].st \in {"running","retired"}
   /\ threads[e].plk = "postD"
   /\ threads' = [threads EXCEPT ![e].plk = "none"]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Edge 1 beyond Init: publish-last creation into a freed slot (slab       *)
@@ -1756,7 +1851,7 @@ PinUnlock(c) ==
 (***************************************************************************)
 CreateThread(c) ==
   LET w == cores[c].cur IN
-  /\ cb > 0 /\ cb' = cb - 1 /\ UNCHANGED <<tb, db, pb>>
+  /\ cb > 0 /\ cb' = cb - 1 /\ UNCHANGED <<processes, tb, db, pb>>
   /\ ThreadCtx(c) /\ threads[w].pc = "user" /\ threads[w].st = "running"
   /\ threads[w].dir # "armed"    \* rule-3 entry check intercepts (N5)
   /\ \E e \in Threads \ {w}, d \in Cores:
@@ -1773,7 +1868,8 @@ CreateThread(c) ==
                      gen |-> threads[e].gen,   \* INHERIT, never reset (round-12)
                      dgen |-> 0,
                      dlv |-> FALSE, pok |-> TRUE, dfs |-> FALSE,
-                     dsrc |-> NULL, dd |-> FALSE]]
+                     dsrc |-> NULL, proc |-> threads[w].proc,
+                     dd |-> FALSE]]
        /\ cores' = [cores EXCEPT ![d].q = @ \cup {e}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
 
 (***************************************************************************)
@@ -1795,7 +1891,7 @@ RecvPop(c) ==
                              ![t].shot = "none", ![t].pin = @ + 1, ![t].lnk = FALSE,
                              ![w].pc = "suspC",
                              ![w].tg = t]
-  /\ UNCHANGED <<cores, tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, cores, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Sec 9.4: the fused IPC fast path (suspend FP shape): sender fused       *)
@@ -1820,7 +1916,7 @@ FastPath(c) ==
                     ![r].st = "running", ![r].own = c, ![r].ks = c,
                     ![r].shot = "none", ![r].lnk = FALSE]
        /\ cores' = [cores EXCEPT ![c].cur = r]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* Sec 9.4's SECOND fused shape, the reply FP main: sender wake (5a       *)
 (* claim) + edge-2 commit + caller requeue, one compressed composition     *)
@@ -1843,7 +1939,7 @@ ReplyFP(c) ==
             ![w].st = "ready", ![w].own = NULL, ![w].ks = NULL,
             ![w].vm = "host", ![w].pk = "none"]
        /\ cores' = [cores EXCEPT ![c].cur = r, ![d].q = @ \cup {w}, ![d].wake = IF WAKE_IPI /\ cores[d].parked THEN TRUE ELSE @]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (* M4's affinity claim-move: cross-thread `affinity` on a READY target whose   *)
 (* new mask excludes its current queue core = 5c claim under that queue's  *)
@@ -1869,7 +1965,7 @@ AffMove(c) ==
                                   ![t].hld = [ty |-> "thread", id |-> w],
                                   ![t].pin = @ + 1, ![w].pc = "wakeC",
                                   ![w].tg = t]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 (***************************************************************************)
 (* Quiescent termination: every thread freed or blamelessly asleep. Gives the  *)
@@ -1879,6 +1975,7 @@ AffMove(c) ==
 Quiescent ==
   /\ \A c \in Cores: /\ cores[c].pc = "idle" /\ cores[c].irq = NULL
                      /\ cores[c].cur = NULL
+                     /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ \A e \in Threads: \/ threads[e].st = "freed"
                    \/ (threads[e].st = "waiting" /\ threads[e].shot # "consumed")
 
@@ -1901,6 +1998,7 @@ BaseStep(c) ==
   \/ StealDispatch(c) \/ StealAbandon(c) \/ StealDropDead(c)
   \/ DirArm(c) \/ DirLoop(c) \/ DirSelfAbort(c)
   \/ TermWait(c) \/ TermRetire(c) \/ TermStale(c) \/ PinRel(c)
+  \/ SelfRetireForTeardown(c)
   \/ PinBump(c) \/ PinUnlock(c)
      \* both disabled under PIN_BUMP_FIRST (the machine); they exist only
      \* to let the C1 falsifier's lock episode complete after the window
@@ -1922,13 +2020,14 @@ StealAny(c, e) == \E v \in Cores: StealClaim(c, v, e)
 (* and hop outcomes needed to move directive waiters off-core.             *)
 DirectiveDispatchThread(c, e) ==
   /\ cores[c].pc = "idle" /\ cores[c].irq = NULL /\ ~cores[c].parked
+  /\ cores[c].pending = NULL /\ cores[c].active = NULL
   /\ e \in cores[c].q /\ threads[e].st = "ready"
   /\ ~threads[e].dd
   /\ c \in threads[e].am
   /\ cores' = [cores EXCEPT ![c].q = @ \ {e}, ![c].cur = e,
                             ![c].pc = "ecrun"]
   /\ threads' = [threads EXCEPT ![e].st = "running", ![e].own = c, ![e].ks = c]
-  /\ UNCHANGED <<tb, cb, db, pb>>
+  /\ UNCHANGED <<processes, tb, cb, db, pb>>
 
 DirectiveBaseStep(c) ==
   \/ HopRelease(c)
@@ -1963,7 +2062,7 @@ Request(c) ==
   \/ FastPath(c) \/ ReplyFP(c) \/ RvStart(c) \/ DirClaim(c)
   \/ DirSelfMark(c)
   \/ DirConsume(c) \/ DirFail(c) \/ DirDrop(c) \/ PinAcq(c) \/ CreateThread(c) \/ TermStart(c)
-  \/ AffMove(c)
+  \/ AffMove(c) \/ QueueTeardown(c)
 
 Next ==
   \/ \E c \in Cores:
@@ -1972,6 +2071,8 @@ Next ==
        \/ Request(c)
        \/ BaseStep(c) \/ IrqStep(c) \/ TickPreempt(c)
        \/ ParkDecision(c) \/ WakeIpi(c)
+       \/ ConsumeTeardown(c) \/ FinishTeardown(c)
+       \/ \E e \in Threads: TeardownRetire(c, e)
   \/ \E e \in Threads: FireAny(e) \/ RetireThread(e) \/ RetireUnwind(e)
                        \/ ClearFreedDirective(e)
   \/ ProcessDie
@@ -2120,6 +2221,12 @@ FairFire ==           \* armed T1 sources eventually fire
 FairSpinTerm == \A c \in Cores: SF_vars(TermWait(c))   \* N3, W3/W4
 FairSpinDir  == \A c \in Cores: SF_vars(DirLoop(c))    \* N3, W5
 
+FairTeardown ==
+  /\ \A c \in Cores: /\ WF_vars(ConsumeTeardown(c))
+                     /\ WF_vars(FinishTeardown(c))
+                     /\ SF_vars(SelfRetireForTeardown(c))
+  /\ \A c \in Cores, e \in Threads: WF_vars(TeardownRetire(c, e))
+
 (* Per-property specs. Each names EXACTLY the constraints its property    *)
 (* needs; a PASS is then a statement about those assumptions and no       *)
 (* others. Where a smaller set was tried and failed, the failure is the   *)
@@ -2130,6 +2237,8 @@ SpecL6  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveClaim
 SpecL5  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveMark
 SpecL4  == SpecNF /\ FairCPU /\ FairUnwind                      \* LiveWake
 SpecL3  == SpecNF /\ FairCPU /\ FairUnwind /\ FairDispWeak      \* LiveReady, G14
+SpecG16 == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp /\ FairTick
+                   /\ FairTeardown
 SpecL2  == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp /\ FairTick  \* LiveRetired
 SpecTrm == SpecNF /\ FairCPU /\ FairUnwind /\ FairDisp /\ FairTick
                   /\ FairSpinTerm                                \* LiveTerm
@@ -2410,6 +2519,39 @@ InvNoArmedFreed ==
 InvParkedQueueHasWake ==
   \A c \in Cores: (cores[c].parked /\ cores[c].q # {}) => cores[c].wake
 
+(* G16: phase `queued` owns exactly one request with the original process
+   generation; phase `dead` owns exactly one consumed reference on the park
+   stack. The consume count forbids a second phase-1 entry for that process.
+   A lost or mismatched reference fails this invariant before phase 2. *)
+PendingFor(p) ==
+  {c \in Cores: IF cores[c].pending = NULL THEN FALSE
+                ELSE cores[c].pending.proc = p}
+ActiveFor(p) ==
+  {c \in Cores: IF cores[c].active = NULL THEN FALSE
+                ELSE cores[c].active.proc = p}
+
+InvTeardownRefHandoff ==
+  \A p \in Threads:
+    /\ processes[p].phase = "queued" =>
+         /\ Cardinality(PendingFor(p)) = 1
+         /\ Cardinality(ActiveFor(p)) = 0
+         /\ LET c == CHOOSE c2 \in PendingFor(p): TRUE IN
+              /\ cores[c].pending.gen = processes[p].gen
+              /\ threads[cores[c].pending.owner].proc = p
+         /\ processes[p].consumes = 0
+    /\ processes[p].phase = "dead" =>
+         /\ Cardinality(ActiveFor(p)) = 1
+         /\ Cardinality(PendingFor(p)) = 0
+         /\ LET c == CHOOSE c2 \in ActiveFor(p): TRUE IN
+              /\ cores[c].active.gen = processes[p].gen
+              /\ threads[cores[c].active.owner].proc = p
+              /\ threads[cores[c].active.owner].ks = NULL
+         /\ processes[p].consumes = 1
+    /\ processes[p].phase = "done" =>
+         /\ Cardinality(PendingFor(p)) = 0
+         /\ Cardinality(ActiveFor(p)) = 0
+         /\ processes[p].consumes = 1
+
 InvNoUAF ==
   /\ \A e \in Threads:
        threads[e].pc = "pendC" => threads[threads[e].tg].st # "freed"
@@ -2462,6 +2604,10 @@ LiveSuspender == \* W5: the suspender's terminal re-check/disarm loop
 
 LiveTerm ==      \* L5/W3/W4: terminate returns (eviction + marking done)
   \A e \in Threads: threads[e].pc = "termW" ~> threads[e].pc # "termW"
+
+LiveTeardown ==
+  \A p \in Threads: processes[p].phase = "queued" ~>
+                     processes[p].phase = "done"
 
 (* ROUND-7: the SAME obligation as `SpecFairAligned |= LiveSuspender`,     *)
 (* with the assumption moved from the SPECIFICATION to the PROPERTY.       *)
