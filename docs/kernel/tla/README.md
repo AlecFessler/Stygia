@@ -13,7 +13,10 @@ focused pair.
 
 **The model battery is manual.** `tests/precommit.sh` runs the focused
 `tools/check_model_correspondence.py` gate for G14 park/wake, G16 teardown
-handoff, and restart ordering, with mutation fixtures. It detects source
+handoff, restart ordering, and the vCPU cancellation acknowledgement path,
+with mutation fixtures. `CORRESPONDENCE.md` records the action-to-code
+review in progress, including an arch-state lifetime bug found by that
+review. The gate detects source
 changes to those obligations; it does not establish a full refinement proof
 or run TLC. Run `run.sh` explicitly and review the parity ledger before
 citing a model verdict as evidence about the implementation.

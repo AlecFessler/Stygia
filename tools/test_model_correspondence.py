@@ -15,6 +15,8 @@ FILES = (
     "kernel/caps/process.zig",
     "kernel/sched/thread.zig",
     "kernel/memory/vmar.zig",
+    "kernel/arch/x64/vm_runloop.zig",
+    "kernel/arch/aarch64/vm_runloop.zig",
 )
 
 
@@ -48,6 +50,15 @@ with tempfile.TemporaryDirectory() as temp:
         ("model gate drift", "docs/kernel/tla/ThreadLifecycle.tla",
          "  /\\ RestartQuiesced(p)\n  /\\ processes[p].snapshotGood",
          "  /\\ processes[p].snapshotGood", "model action RestartApply changed"),
+        ("x64 missing retired guest exit", "kernel/arch/x64/vm_runloop.zig",
+         "if (lifecycle.load(vcpu_thread) == .retired) {",
+         "if (false) {", "x64 retired guest exit"),
+        ("arm missing retired guest exit", "kernel/arch/aarch64/vm_runloop.zig",
+         "if (lifecycle.load(vcpu_thread) == .retired) {",
+         "if (false) {", "aarch64 retired guest exit"),
+        ("cancelled vCPU event leak", "kernel/sched/scheduler.zig",
+         "if (!delivery.cancelled) {",
+         "if (true) {", "vCPU cancelled dispatch"),
     )
     for title, path, old, new, expected in cases:
         mutate(fixture, path, old, new)
