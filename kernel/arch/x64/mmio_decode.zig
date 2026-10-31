@@ -187,8 +187,10 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
     // 0x40..0x4F prefix byte; promotes the operand to 64-bit).
     // 0x66: operand-size override (SDM Vol 2A §2.1.1) — switches 32-bit
     // default to 16-bit in this context.
-    // 0x67/0xF0/0xF2/0xF3/segment-overrides: skipped per SDM Vol 2A §2.1.1
+    // 0x67/0xF2/0xF3/segment-overrides: skipped per SDM Vol 2A §2.1.1
     // "Instruction Prefixes" — they don't affect the MOV opcodes we decode.
+    // LOCK is invalid on MOV. Reject it here so guest MMIO and userspace
+    // port-I/O VMAR faults cannot silently emulate a LOCK-prefixed access.
     while (i < buf.len) {
         switch (buf[i]) {
             0x40...0x4F => {
@@ -200,8 +202,9 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
                 has_66 = true;
                 i += 1;
             },
-            // Address size, lock, rep, segment overrides -- skip
-            0x67, 0xF0, 0xF2, 0xF3, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65 => {
+            0xF0 => return DecodeError.UnsupportedInstruction,
+            // Address size, rep, segment overrides -- skip
+            0x67, 0xF2, 0xF3, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65 => {
                 i += 1;
             },
             else => break,
@@ -328,5 +331,24 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
         },
         else => DecodeError.UnsupportedInstruction,
     };
+}
+
+test "LOCK-prefixed port-I/O MOV forms are unsupported" {
+    const std = @import("std");
+    // A plain store remains emulatable; LOCK must be rejected before
+    // any matching opcode can reach the port-I/O in/out path.
+    try std.testing.expectEqual(@as(u8, 4), (try decodeBytes(&.{ 0x89, 0x07 })).size);
+
+    const forms = [_][]const u8{
+        &.{ 0xF0, 0x89, 0x07 }, // MOV [rdi], eax
+        &.{ 0xF0, 0x8B, 0x07 }, // MOV eax, [rdi]
+        &.{ 0xF0, 0xC7, 0x07, 1, 0, 0, 0 }, // MOV dword [rdi], 1
+        &.{ 0x66, 0xF0, 0x89, 0x07 }, // operand override before LOCK
+        &.{ 0xF0, 0x66, 0x89, 0x07 }, // LOCK before operand override
+        &.{ 0x48, 0xF0, 0x89, 0x07 }, // REX prefix before LOCK
+    };
+    for (forms) |bytes| {
+        try std.testing.expectError(DecodeError.UnsupportedInstruction, decodeBytes(bytes));
+    }
 }
 

@@ -113,16 +113,8 @@ pub fn emulatePortIoFault(
         }
     }
 
-    // Decode. Unsupported form (8-byte MOV, IN/OUT/INS/OUTS, LOCK-
-    // prefixed MOV per `decodeBytes`'s opcode table, undecodable
-    // bytes) → thread_fault.protection (spec tests 09/10/11).
-    // `mmio_decode` filters `LOCK` (0xF0) silently as a legacy
-    // prefix — for spec test 10's purposes we accept the resulting
-    // decode and emulate, since the spec only mandates that some
-    // observable trap fires; in the existing code path
-    // `kernel/arch/x64/exceptions.zig:emulateVirtualBar` shares this
-    // behavior. 8-byte (REX.W) and named IN/OUT mnemonics surface
-    // here as `UnsupportedInstruction` and route to thread_fault.
+    // Decode. Unsupported forms, including LOCK-prefixed MOV, route to
+    // thread_fault.protection (spec tests 09/10/11).
     const op = mmio_decode.decodeBytes(buf[0..fetched]) catch {
         return failProtection(thread, rip);
     };
