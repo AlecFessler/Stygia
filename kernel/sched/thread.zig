@@ -948,13 +948,6 @@ fn retireAndBumpDeadGen(
     };
 }
 
-fn retireAndBumpCurrentGen(thread: *Thread) ?RetiredDeadGen {
-    const gen = thread._gen_lock.currentGen();
-    if (gen % 2 == 0) return null;
-    const thread_ref = SlabRef(Thread).init(thread, @intCast(gen));
-    return retireAndBumpDeadGen(thread_ref, thread);
-}
-
 pub fn terminate(caller: *Thread, target: u64) i64 {
     const process_ref = caller.process;
     const lr = process_ref.lockIrqSave(@src()) catch return errors.E_BADCAP;
