@@ -677,7 +677,13 @@ fn runProcessTeardown(req: TeardownRequest) void {
         // Restart could not finish (for example a replacement thread
         // allocation failed). Destroy the same process through the normal
         // phase-1/phase-2 path below.
-        return runProcessTeardownWithoutRestart(req);
+        // The restart attempt has already retired and may have recycled
+        // the original caller slab. No thread is still on its kernel
+        // stack after the quiescence barrier, so phase 2 must reap every
+        // remaining live thread without a pointer-only caller skip.
+        var fallback = req;
+        fallback.caller_thread = null;
+        return runProcessTeardownWithoutRestart(fallback);
     }
     const deferred = stygia.caps.process.destroyPhase1(
         process_lr.ptr,
