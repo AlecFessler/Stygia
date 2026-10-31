@@ -274,6 +274,19 @@ pub fn createProcess(
         return errors.E_PERM;
     }
 
+    // Both the returned handle and the child's slot-2 self-IPC handle
+    // are minted by this call. Their caps come from the two ceilings
+    // above, so each restart policy must also fit the caller's IPC
+    // restart ceiling (self-handle field1 bit 24).
+    const ipc_restart_max: u1 = @truncate(caller_field1 >> 24);
+    const ipc_restart_bit: u8 = 1 << 5;
+    if (ipc_restart_max == 0 and
+        ((caller_cripc_ceiling | requested_cripc_ceiling) & ipc_restart_bit) != 0)
+    {
+        process_ref.unlockIrqRestore(irq_state);
+        return errors.E_PERM;
+    }
+
     // [test 10] pf_ceiling: [2] bits 32-39 ⊆ field0 bits 40-47.
     const caller_pf_ceiling: u8 = @truncate((caller_field0 >> 40) & 0xFF);
     const requested_pf_ceiling: u8 = @truncate((ceilings_inner >> 32) & 0xFF);
@@ -340,6 +353,33 @@ pub fn createProcess(
         if (capability.resolveHandleOnProcess(process, src_slot, null) == null) {
             process_ref.unlockIrqRestore(irq_state);
             return errors.E_BADCAP;
+        }
+    }
+
+    // Check the caps that will actually be installed for each passed
+    // handle. IPC caps are intersected with the child's ipc_rx mask in
+    // the caps layer; device-region caps are installed as requested.
+    const child_ipc_rx: u16 = @truncate((caps >> 16) & 0xFF);
+    const dr_restart_max: u1 = @truncate(caller_field1 >> 21);
+    for (passed_handles) |entry| {
+        if (entry == 0) break;
+        const src_slot: u12 = @truncate(entry & 0xFFF);
+        const handle_type = Word0.typeTag(process.user_table[src_slot].word0);
+        const passed_caps: u16 = @truncate(entry >> 16);
+        switch (handle_type) {
+            .process => if (ipc_restart_max == 0 and
+                ((passed_caps & child_ipc_rx) & (1 << 5)) != 0)
+            {
+                process_ref.unlockIrqRestore(irq_state);
+                return errors.E_PERM;
+            },
+            .device_region => if (dr_restart_max == 0 and
+                (passed_caps & (1 << 4)) != 0)
+            {
+                process_ref.unlockIrqRestore(irq_state);
+                return errors.E_PERM;
+            },
+            else => {},
         }
     }
 
