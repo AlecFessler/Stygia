@@ -1,7 +1,7 @@
 // Spec §[create_process] — test 17.
 //
 // "[test 17] returns E_INVAL if any reserved bits are set in [1], [2],
-//  or a passed handle entry."
+//  [3], or a passed handle entry."
 //
 // Strategy
 //   The argument layout per spec §[create_process] has
@@ -13,8 +13,8 @@
 //     [3] ceilings_outer: bits 38-63 _reserved
 //     [6+] passed_handle: bits 12-15 and 33-63 _reserved
 //
-//   We exercise three branches, one per reservoir of reserved bits in
-//   [1], [2], and a passed handle entry, asserting the kernel returns
+//   We exercise four branches, one per reservoir of reserved bits in
+//   [1], [2], [3], and a passed handle entry, asserting the kernel returns
 //   E_INVAL each time. We mirror the runner's known-valid argument
 //   template (see runner/primary.zig: `ceilings_inner =
 //   0x001C_011F_2701_FFFF`, `ceilings_outer = 0x0000_003F_01FE_FFFF`)
@@ -46,12 +46,16 @@
 //     process is guaranteed to have besides self/thread/IPC. Build a
 //     PassedHandle equivalent encoding manually with bit 12 set.
 //
+//   Branch D: reserved bits 38 and 63 of [3] (ceilings_outer) set,
+//     one at a time. The other arguments match the successful baseline.
+//
 // Assertions
 //   1-4: ELF staging setup failed.
 //   5: valid baseline did not succeed.
 //   6: branch A returned something other than E_INVAL.
 //   7: branch B returned something other than E_INVAL.
 //   8: branch C returned something other than E_INVAL.
+//   9-10: branch D returned something other than E_INVAL.
 
 const lib = @import("lib");
 
@@ -205,6 +209,21 @@ pub fn main(cap_table_base: u64) void {
         });
         if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
             testing.fail(8);
+            return;
+        }
+    }
+
+    for ([_]u6{ 38, 63 }, 0..) |bit, index| {
+        const r = syscall.issueReg(.create_process, 0, .{
+            .v1 = valid_self_caps,
+            .v2 = VALID_CEILINGS_INNER,
+            .v3 = VALID_CEILINGS_OUTER | (@as(u64, 1) << bit),
+            .v4 = @as(u64, pf_handle),
+            .v5 = 0,
+            .v6 = passed_valid,
+        });
+        if (r.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+            testing.fail(@intCast(9 + index));
             return;
         }
     }

@@ -24,6 +24,10 @@ const CREATE_CEILINGS_INNER_MASK: u64 =
     0x0000_0100_0000_0000 | // VM policy, bit 40
     0x005C_0000_0000_0000; // port, bits 50-52 and 54
 
+/// `ceilings_outer` carries thread/VMAR outer ceilings, restart policy
+/// ceilings, and futex wait capacity. Bits 25-31 and 38-63 are reserved.
+const CREATE_CEILINGS_OUTER_MASK: u64 = 0x0000_003F_01FF_FFFF;
+
 /// Self-handle is always slot 0 in the calling process. Spec §[process].
 const SELF_HANDLE_SLOT: u12 = 0;
 
@@ -130,7 +134,7 @@ const PASSED_HANDLE_MASK: u64 = 0x0000_0001_FFFF_0FFF;
 /// [test 14] returns E_BADCAP if any passed handle id is not a valid handle in the caller's table.
 /// [test 15] returns E_INVAL if the ELF header is malformed.
 /// [test 16] returns E_INVAL if `elf_page_frame` is smaller than the declared ELF image size.
-/// [test 17] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
+/// [test 17] returns E_INVAL if any reserved bits are set in [1], [2], [3], or a passed handle entry.
 /// [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 /// [test 19] on success, the caller receives an IPC handle to the new process with caps = the caller's `cripc_ceiling`.
 /// [test 20] on success, the new process's handle table contains the self-handle at slot 0 with caps = `self_caps`.
@@ -156,6 +160,7 @@ pub fn createProcess(
 ) i64 {
     if (caps & ~CREATE_CAPS_MASK != 0) return errors.E_INVAL;
     if (ceilings_inner & ~CREATE_CEILINGS_INNER_MASK != 0) return errors.E_INVAL;
+    if (ceilings_outer & ~CREATE_CEILINGS_OUTER_MASK != 0) return errors.E_INVAL;
     if (elf_pf_slot & ~@as(u64, capability.HANDLE_ARG_MASK) != 0) return errors.E_INVAL;
     // Spec §[create_process]: passed_handles uses an all-zero
     // entry as end-of-list sentinel (matches the convention the kernel

@@ -557,7 +557,7 @@ The caller receives an IPC handle to the new process with caps = the caller's ow
 
 **E_BADCAP** — `[4]` is not a valid page frame handle, or any passed handle id in `[6+]` is not a valid handle in the caller's table.
 
-**E_INVAL** — ELF header malformed; ELF image not position-independent (no `PT_DYNAMIC`, or `e_type != ET_DYN`); `[4]` smaller than the declared ELF image size; reserved bits set in `[1]`, `[2]`, or any passed handle entry; two passed handles reference the same source; `[5]` has bits set outside the system's core count.
+**E_INVAL** — ELF header malformed; ELF image not position-independent (no `PT_DYNAMIC`, or `e_type != ET_DYN`); `[4]` smaller than the declared ELF image size; reserved bits set in `[1]`, `[2]`, `[3]`, or any passed handle entry; two passed handles reference the same source; `[5]` has bits set outside the system's core count.
 
 **E_NOMEM** — insufficient kernel memory.
 
@@ -599,7 +599,7 @@ The caller receives an IPC handle to the new process with caps = the caller's ow
 
 [test 16a] returns E_INVAL if the ELF image is not position-independent (no PT_DYNAMIC, or e_type != ET_DYN).
 
-[test 17] returns E_INVAL if any reserved bits are set in [1], [2], or a passed handle entry.
+[test 17] returns E_INVAL if any reserved bits are set in [1], [2], [3], or a passed handle entry.
 
 [test 18] returns E_INVAL if any two entries in [6+] reference the same source handle.
 
