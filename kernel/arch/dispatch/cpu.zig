@@ -357,7 +357,7 @@ pub fn syncInstructionCache() void {
 /// Sequence per ARM ARM B2.4.6 / D5.10.2: clean the data lines to the
 /// PoU, barrier, invalidate the instruction lines, barrier, then `isb`
 /// so this core refetches. `ic ivau` is broadcast to the inner
-/// shareable process, so peer cores are covered without an IPI.
+/// shareable domain, so peer cores are covered without an IPI.
 ///
 /// NOTE this does NOT make code that USERSPACE writes visible — those
 /// stores land after this runs. Userspace must do its own maintenance

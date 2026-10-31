@@ -833,7 +833,7 @@ pub fn initZeroPageFeatures() void {
 ///
 /// AMD APM Vol 3, "CLZERO" — "Zeroes the cache line specified by the
 /// logical address in rAX." CLZERO implicitly flushes the line from
-/// all caches in the coherence process before zeroing, so the zeros
+/// all caches in the coherence domain before zeroing, so the zeros
 /// reach main memory on the next writeback.
 pub fn zeroPage4K(ptr: *anyopaque) void {
     if (has_clzero) {

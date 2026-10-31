@@ -596,7 +596,7 @@ pub fn mapPageBoot(
 ///
 /// ARM ARM D5.9 -- after clearing a PTE, a break-before-make sequence is
 /// required: DSB ISHST ensures the invalid write is visible, TLBI VAE1IS
-/// invalidates the VA across all cores in the inner shareable process,
+/// invalidates the VA across all cores in the inner shareable domain,
 /// DSB ISH waits for completion, and ISB synchronizes the pipeline.
 pub fn unmapPage(
     addr_space_root: PAddr,
@@ -621,7 +621,7 @@ pub fn unmapPage(
 
     // ARM ARM D5.9: TLB maintenance after PTE invalidation.
     // TLBI VAE1IS broadcasts the invalidation to all cores in the inner
-    // shareable process, eliminating the need for explicit IPI-based shootdown.
+    // shareable domain, eliminating the need for explicit IPI-based shootdown.
     tlbiVae1is(virt.addr);
 
     return phys;
@@ -869,21 +869,21 @@ fn isb() void {
 
 /// DSB ISHST -- Data Synchronization Barrier, Inner Shareable, Store.
 /// ARM ARM C6.2.3 -- ensures all prior stores are visible to other cores
-/// in the inner shareable process before the barrier completes.
+/// in the inner shareable domain before the barrier completes.
 fn dsbIshst() void {
     asm volatile ("dsb ishst" ::: .{ .memory = true });
 }
 
 /// DSB ISH -- Data Synchronization Barrier, Inner Shareable.
 /// ARM ARM C6.2.3 -- ensures all prior loads and stores are complete
-/// before the barrier completes, visible to the inner shareable process.
+/// before the barrier completes, visible to the inner shareable domain.
 fn dsbIsh() void {
     asm volatile ("dsb ish" ::: .{ .memory = true });
 }
 
 /// TLBI VAE1IS -- TLB Invalidate by VA, EL1, Inner Shareable.
 /// ARM ARM D5.9 -- invalidates all TLB entries matching the VA (page-aligned,
-/// shifted right by 12) across all cores in the inner shareable process.
+/// shifted right by 12) across all cores in the inner shareable domain.
 ///
 /// The full sequence for a PTE change is:
 ///   DSB ISHST -> TLBI VAE1IS -> DSB ISH -> ISB

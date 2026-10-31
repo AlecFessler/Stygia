@@ -13,7 +13,7 @@
 //!
 //! The allocator owns the full lifecycle: `free(id)` is the only release
 //! path, and it invalidates every TLB entry tagged with `id` across the
-//! inner shareable process before returning the slot to the bitmap. A
+//! inner shareable domain before returning the slot to the bitmap. A
 //! future re-allocation of the same id therefore cannot inherit stale
 //! mappings from the previous owner.
 //!
@@ -81,7 +81,7 @@ pub fn free(id: u16) void {
 ///
 /// ARM ARM D5.10.2 / D13.2.142: TLBI ASIDE1IS invalidates all stage 1
 /// EL1&0 entries tagged with the supplied ASID. Broadcast across the
-/// inner shareable process handles SMP automatically — no IPI needed.
+/// inner shareable domain handles SMP automatically — no IPI needed.
 fn invalidateTlb(id: u16) void {
     const operand: u64 = @as(u64, id) << 48;
     asm volatile (
