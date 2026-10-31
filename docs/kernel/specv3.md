@@ -3410,33 +3410,3 @@ time_setwall([1] ns_since_epoch) -> void
 [test 04] returns E_INVAL if any reserved bits are set in [1].
 
 [test 05] on success, a subsequent `time_getwall` returns a value within a small bounded delta of [1].
-
-
-### §[rng] RNG
-
-#### random
-
-**Summary** — Fills the requested number of vregs with cryptographically random qwords.
-
-**Declaration**
-
-```
-random() -> [1..count] qwords
-  syscall_num = 63
-
-  syscall word bits 12-19: count (1..127)
-```
-
-**Capabilities** — None.
-
-**Return value** — `[1..count]`: cryptographically-random u64 qwords.
-
-**Errors**
-
-**E_INVAL** — count is 0 or > 127.
-
-**Tests**
-
-[test 01] returns E_INVAL if count is 0 or count > 127.
-
-[test 02] on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).

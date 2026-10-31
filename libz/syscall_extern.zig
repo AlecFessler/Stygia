@@ -93,7 +93,6 @@ pub const SyscallNum = enum(u12) {
     time_monotonic = 60,
     time_getwall = 61,
     time_setwall = 62,
-    random = 63,
 };
 
 // ── Syscall-word encoding helpers ───────────────────────────────────
@@ -358,7 +357,6 @@ const ext = struct {
     extern fn timeMonotonic() callconv(.c) c.Regs;
     extern fn timeGetwall() callconv(.c) c.Regs;
     extern fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs;
-    extern fn random(count: u8) callconv(.c) c.Regs;
 };
 
 // ── Public Zig-native wrappers ──────────────────────────────────────
@@ -637,10 +635,6 @@ pub fn timeGetwall() Regs {
 
 pub fn timeSetwall(ns_since_epoch: u64) Regs {
     return fromCRegs(ext.timeSetwall(ns_since_epoch));
-}
-
-pub fn random(count: u8) Regs {
-    return fromCRegs(ext.random(count));
 }
 
 // Compile-time guard against accidentally reordering the SyscallNum

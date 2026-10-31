@@ -172,22 +172,6 @@ export fn getpwuid_r(uid: c_uint, pw: ?*anyopaque, buf: ?[*]u8, buflen: usize, r
     return 0;
 }
 
-// ── randomness ────────────────────────────────────────────────────
-
-export fn getrandom(buf: [*]u8, buflen: usize, flags: c_uint) callconv(.c) isize {
-    _ = flags;
-    var i: usize = 0;
-    while (i < buflen) : (i += 1) buf[i] = 0; // TODO: hook RDRAND or a real entropy source
-    return @intCast(buflen);
-}
-
-export fn getentropy(buf: [*]u8, buflen: usize) callconv(.c) c_int {
-    if (buflen > 256) return fail(5); // EIO
-    var i: usize = 0;
-    while (i < buflen) : (i += 1) buf[i] = 0;
-    return 0;
-}
-
 // ── fork / exec / wait — pure ENOSYS, never called when -fno-exec ──
 
 export fn fork() callconv(.c) c_int {

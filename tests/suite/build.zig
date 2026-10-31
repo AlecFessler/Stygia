@@ -283,8 +283,6 @@ const test_entries = [_]TestEntry{
     .{ .name = "revoke_04", .path = "cases/revoke_04.zig" },
     .{ .name = "revoke_05", .path = "cases/revoke_05.zig" },
     .{ .name = "revoke_06", .path = "cases/revoke_06.zig" },
-    .{ .name = "rng_01", .path = "cases/rng_01.zig" },
-    .{ .name = "rng_02", .path = "cases/rng_02.zig" },
     .{ .name = "scheduler_balance_01", .path = "cases/scheduler_balance_01.zig" },
     .{ .name = "self_02", .path = "cases/self_02.zig" },
     .{ .name = "self_handle_01", .path = "cases/self_handle_01.zig" },

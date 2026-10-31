@@ -324,10 +324,6 @@ pub fn timeSetwall(ns_since_epoch: u64) callconv(.c) c.Regs {
     return toCRegs(syscall.timeSetwall(ns_since_epoch));
 }
 
-pub fn random(count: u8) callconv(.c) c.Regs {
-    return toCRegs(syscall.random(count));
-}
-
 // ── Dynamic-symbol exports ──────────────────────────────────────────
 //
 // Names match the Zig-native API in syscall.zig — no `_c` suffix.
@@ -377,5 +373,4 @@ comptime {
     @export(&timeMonotonic, .{ .name = "timeMonotonic" });
     @export(&timeGetwall, .{ .name = "timeGetwall" });
     @export(&timeSetwall, .{ .name = "timeSetwall" });
-    @export(&random, .{ .name = "random" });
 }

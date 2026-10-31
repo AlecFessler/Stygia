@@ -1,6 +1,5 @@
 const stygia = @import("stygia");
 
-const cpu = stygia.arch.dispatch.cpu;
 const errors = stygia.syscall.errors;
 const smp = stygia.arch.dispatch.smp;
 const sync = stygia.utils.sync;
@@ -119,63 +118,6 @@ pub fn timeSetwall(caller: *anyopaque, ns_since_epoch: u64) i64 {
     // but lets aarch64's writeRtc() persist across reboots once wired.
     _ = time.writeRtc(ns_since_epoch);
     return errors.OK;
-}
-
-/// Fills the requested number of vregs with cryptographically random
-/// qwords.
-///
-/// ```
-/// random() -> [1..count] qwords
-///   syscall_num = 49
-///
-///   syscall word bits 12-19: count (1..127)
-/// ```
-///
-/// No cap required.
-///
-/// [test 01] returns E_INVAL if count is 0 or count > 127.
-/// [test 02] on success, vregs `[1..count]` contain qwords (the CSPRNG-source guarantee in the prose above is a kernel implementation contract, not a black-box-testable assertion).
-pub fn random(caller: *anyopaque, count: u8) i64 {
-    const ec: *ExecutionContext = @ptrCast(@alignCast(caller));
-    // Spec §[rng] test 01: count must be in [1, 127], otherwise E_INVAL.
-    if (count == 0 or count > 127) return errors.E_INVAL;
-
-    // Fill vregs [1..count] with hardware-random qwords. `cpu.getRandom`
-    // is x86-64 RDRAND or aarch64 RNDR (with a CNTVCT-seeded software
-    // PRNG fallback on cores lacking RNG support — see
-    // `arch.aarch64.cpu.rndr`). RDRAND can transiently fail (entropy
-    // pool empty, CF=0); on null we fold a small TSC-derived diffuser
-    // into a per-call PRNG state so the syscall always makes forward
-    // progress. The CSPRNG-quality contract is best-effort per spec.
-    //
-    // Vreg landing: indices 1..N route to GPRs (x86-64: 1..13 →
-    // rax/rbx/rdx/rbp/rsi/rdi/r8/r9/r10/r12/r13/r14/r15; aarch64:
-    // 1..31 → x0..x30). Higher indices spill to `[user_sp + (idx-N)*8]`.
-    // Stack-spill writes go through SMAP/PAN-gated user accesses inside
-    // `setSyscallVreg`, which assume the caller's address space is
-    // active — the syscall epilogue runs in the caller's CR3/TTBR0, so
-    // that contract holds here.
-    var fallback_state: u64 = 0;
-    var i: u8 = 1;
-    while (i <= count) : (i += 1) {
-        const v: u64 = blk: {
-            if (cpu.getRandom()) |r| break :blk r;
-            // Hardware entropy unavailable this attempt — diffuse a
-            // monotonic timestamp through xorshift to avoid emitting a
-            // stream of zeros while still surfacing a non-blocking
-            // value. Userspace CSPRNGs that depend on this path treat
-            // it as a low-entropy reseed source, not a primary feed.
-            if (fallback_state == 0) fallback_state = time.currentMonotonicNs() ^ 0x9E3779B97F4A7C15;
-            var x = fallback_state;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            fallback_state = x;
-            break :blk x *% 0x2545F4914F6CDD1D;
-        };
-        stygia.arch.dispatch.syscall.setSyscallVreg(ec.ctx, i, v);
-    }
-    return 0;
 }
 
 /// Read the `cap` field from the caller domain's slot-0 self-handle.

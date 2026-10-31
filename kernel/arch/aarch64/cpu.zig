@@ -112,9 +112,8 @@ pub inline fn readCntvct() u64 {
 /// Seeded lazily from CNTVCT_EL0 on first use; subsequently advanced by
 /// xorshift64* with additional mixing from the virtual counter so that
 /// successive calls within a tight loop still diverge.
-/// Not cryptographically strong — adequate for the behavioural contract
-/// of `getrandom` (non-zero bytes, non-blocking) on platforms lacking a
-/// true hardware TRNG.
+/// Not cryptographically strong; this stays available only for internal
+/// kernel entropy use on platforms lacking a hardware TRNG.
 var prng_state: u64 = 0;
 
 fn prngNext() u64 {
@@ -166,9 +165,7 @@ pub fn rndr() ?u64 {
             :
             : .{ .nzcv = true });
         // NZCV bit 30 is Z. If Z == 1 the TRNG was exhausted this cycle
-        // — fall through to the software PRNG rather than returning
-        // E_AGAIN, so userspace `getrandom` still makes forward progress
-        // on platforms where RNDR occasionally fails.
+        // — fall through to the software PRNG for internal kernel callers.
         if ((nzcv & (1 << 30)) == 0) return val;
     }
     return prngNext();

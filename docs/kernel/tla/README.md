@@ -1817,7 +1817,7 @@ below are confirmed only in the sense that the walk reached them:
 `§[Lifetimes]` is covered by
 retire/finalize, `§[device_irq]` is a T1 row, `§[event_state]` is §2.2's
 snapshot, `§[vm_policy]`, `§[event_type]`,
-`§[handle_attachments]`, `§[vm_exit_state]`, `§[time]`, and `§[rng]`
+`§[handle_attachments]`, `§[vm_exit_state]`, and `§[time]`
 cause no EC state change. Rows that cannot change a
 lifecycle word are still listed, because "omitted" and "cannot" are the
 distinction a closure table exists to make.

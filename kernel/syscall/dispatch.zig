@@ -64,7 +64,6 @@ pub const SyscallNum = enum(u64) {
     time_monotonic = 60,
     time_getwall = 61,
     time_setwall = 62,
-    random = 63,
 };
 
 /// Read `args[i]`, returning 0 when the index is past the end. Lets
@@ -122,7 +121,6 @@ pub fn expectedMaxVreg(syscall_word: u64) u8 {
         .time_monotonic,
         .time_getwall,
         .time_setwall,
-        .random,
         => 13,
 
         // create_capability_domain: passed_handles list, no syscall-word
@@ -414,11 +412,6 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
         .time_monotonic => system.timeMonotonic(caller),
         .time_getwall => system.timeGetwall(caller),
         .time_setwall => system.timeSetwall(caller, arg(args, 0)),
-        .random => blk: {
-            // Spec §[rng] random: count packed in syscall word bits 12-19.
-            const count: u8 = @truncate((syscall_word >> 12) & 0xFF);
-            break :blk system.random(caller, count);
-        },
     };
     // TEMP DIAGNOSTIC (stygia-2u0, REMOVE).
     logSpawnError(num_raw, dispatch_res);
