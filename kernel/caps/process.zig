@@ -1062,7 +1062,10 @@ pub fn restartProcess(process_ref: SlabRef(Process)) bool {
         }
         const caps_word = Word0.caps(process.user_table[slot].word0);
         const policy: u2 = @truncate(caps_word >> 8);
-        if (policy == 2) {
+        // A persist-cap thread that triggered this exit/fault has already
+        // parked in the retired lifecycle state. Its saved frame cannot
+        // resume, so it does not count as a surviving runnable thread.
+        if (policy == 2 and stygia.sched.lifecycle.load(old_lr.ptr) != .retired) {
             survivors += 1;
             old_ref.unlockIrqRestore(old_lr.irq_state);
             continue;
@@ -1079,7 +1082,7 @@ pub fn restartProcess(process_ref: SlabRef(Process)) bool {
         old_ref.unlockIrqRestore(old_lr.irq_state);
         if (!thread_mod.destroyThreadForRestart(old_ref)) continue;
         if (old_stack) |stack| releaseRestartUserStack(process, stack);
-        if (policy == 0) continue;
+        if (policy != 1) continue;
 
         const fresh = thread_mod.allocThread(process, entry, stack_pages, affinity, priority, null, null) catch return false;
         survivors += 1;

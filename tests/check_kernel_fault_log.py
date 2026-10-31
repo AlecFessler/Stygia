@@ -32,6 +32,7 @@ RESTART_FAULT_TESTS = frozenset({
     "process_restart_01", "process_restart_03", "process_restart_04",
     "process_restart_05", "process_restart_06",
     "process_restart_term_before", "process_restart_term_after",
+    "process_restart_persist_trigger",
     "vmar_restart_00", "vmar_restart_01", "vmar_restart_02",
     "vmar_restart_03", "vmar_restart_pf_shared",
     "snapshot_07", "snapshot_08", "snapshot_09", "snapshot_10", "snapshot_11",
