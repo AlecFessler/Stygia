@@ -249,9 +249,13 @@ pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
     const timer_mode_lsb: u6 = 17;
     const tsc_deadline: u2 = 0b10;
 
-    var lvt: u64 = vector;
-    lvt |= (@as(u64, tsc_deadline) << timer_mode_lsb);
-    cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), lvt);
+    var lvt: u32 = vector;
+    lvt |= (@as(u32, tsc_deadline) << timer_mode_lsb);
+    if (x2_apic) {
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), lvt);
+    } else {
+        writeReg(.lvt_timer_reg, lvt);
+    }
 
     return true;
 }
