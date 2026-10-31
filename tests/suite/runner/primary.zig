@@ -630,7 +630,13 @@ fn spawnOne(index: usize, entry: embedded_tests.Entry, port_handle: caps.HandleI
         .crpt = true,
         // The restart behavior test must be able to mint a restart-cap
         // child. It drops its own restart right before reporting.
-        .restart = std.mem.startsWith(u8, entry.name, "process_restart_"),
+        .restart = std.mem.startsWith(u8, entry.name, "process_restart_") or
+            std.mem.startsWith(u8, entry.name, "vmar_restart_") or
+            std.mem.eql(u8, entry.name, "snapshot_07") or
+            std.mem.eql(u8, entry.name, "snapshot_08") or
+            std.mem.eql(u8, entry.name, "snapshot_09") or
+            std.mem.eql(u8, entry.name, "snapshot_10") or
+            std.mem.eql(u8, entry.name, "snapshot_11"),
         .fut_wake = true,
         .pri = 3,
     };
